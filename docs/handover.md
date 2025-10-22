@@ -22,17 +22,17 @@
 ```
 CMClient/
 ├── src/
-│   ├── index.js             # CLI 入口（watch/discover/callmesh 三種模式）
-│   ├── meshtasticClient.js  # TCP 封包解析與解碼 (protobuf 轉 JSON)
+│   ├── index.js             # CLI 入口（Meshtastic ↔ CallMesh ↔ APRS Gateway）
+│   ├── meshtasticClient.js  # Meshtastic TCP 監聽/解碼 + flow 管理
 │   ├── callmesh/
-│   │   ├── client.js        # CallMesh API 封裝（偵測平台 + Agent + heartbeat/mappings）
-│   │   └── aprsBridge.js    # 共用的 CallMesh ↔ APRS 橋接模組（Electron/CLI 共用）
-│   ├── aprs/client.js       # APRS-IS 客戶端（登入、keepalive、重連）
+│   │   ├── client.js        # CallMesh API 封裝（heartbeat/mappings/provision）
+│   │   └── aprsBridge.js    # CallMesh ↔ APRS ↔ Meshtastic 共用橋接模組（CLI/GUI 共用）
+│   ├── aprs/client.js       # APRS-IS 客戶端（登入、keepalive、重連、無縫重試）
 │   ├── discovery.js         # mDNS 搜尋 Meshtastic 裝置
 │   └── electron/
-│       ├── main.js          # Electron 主行程，負責 IPC、Key 驗證、Meshtastic 連線
-│       ├── preload.js       # 提供 renderer 可調用的 API
-│       ├── renderer.js      # 前端邏輯（表格、CallMesh overlay 等）
+│       ├── main.js          # Electron 主行程，初始化橋接器、處理 IPC
+│       ├── preload.js       # 提供 renderer 調用的安全 API
+│       ├── renderer.js      # 前端邏輯（儀表板、Mapping Flow、日誌、設定）
 │       ├── index.html       # UI layout
 │       └── styles.css       # UI 樣式
 ├── docs/
