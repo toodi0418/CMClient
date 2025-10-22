@@ -114,6 +114,30 @@ CLI 預設會驗證 CallMesh API Key、啟動 heartbeat 與 Mapping 同步，再
 node src/index.js --host 172.16.8.91 --port 4403
 ```
 
+使用 `pkg` 打包後的 CLI 執行檔也支援完整的指令列參數，可透過 `--help` 查看：
+
+```bash
+./tmag-cli --help
+
+Commands:
+  tmag-cli discover  自動搜尋區網內的 Meshtastic TCP 裝置
+  tmag-cli           連線並監看 Meshtastic 封包                        [default]
+
+Options:
+      --version     Show version number                                [boolean]
+      --help        Show help                                          [boolean]
+  -K, --api-key     CallMesh API Key（若未帶入將使用環境變數 CALLMESH_API_KEY）
+                                                                        [string]
+  -H, --host        Meshtastic TCP 伺服器主機位置[string] [default: "127.0.0.1"]
+  -P, --port        Meshtastic TCP 伺服器埠號           [number] [default: 4403]
+  -m, --max-length  允許的最大封包大小 (位元組)          [number] [default: 512]
+  -r, --show-raw    在摘要輸出時同時列印 payload 十六進位
+                                                      [boolean] [default: false]
+  -f, --format      輸出格式：summary 顯示表格，json 顯示完整資料
+                               [choices: "summary", "json"] [default: "summary"]
+  -p, --pretty      搭配 --format json 時使用縮排輸出  [boolean] [default: true]
+```
+
 常用選項：
 
 | 參數 | 預設 | 說明 |
