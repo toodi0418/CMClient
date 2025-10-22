@@ -1,111 +1,194 @@
-# Meshtastic TCP 封包擷取工具
+# Meshtastic APRS Gateway (TMAG)
 
-這是一個使用 Node.js 實作的簡易 CLI，能夠連線到 Meshtastic 裝置的 TCP API（預設埠 `4403`），並解析以 protobuf 編碼的 `FromRadio` 封包後輸出成 JSON。若需要檢查原始位元組，也可同時顯示十六進位字串。
+TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合了 CallMesh 平台驗證、Mapping 同步、APRS uplink 與遙測統計。專案同時提供：
 
-## 環境需求
+- **CLI**：適合在 macOS / Linux / Windows（或 Raspberry Pi）上以無頭模式執行，固定將 Meshtastic TCP 流轉換成 APRS 封包並回報至 CallMesh。
+- **Electron 桌面版**：提供即時儀表板、封包/節點追蹤、APR S 狀態檢視等 GUI 功能。
 
-- Node.js 16 以上版本（建議 18+）
-- Meshtastic 裝置或 gateway，且已開啟 TCP API（預設在 `tcp://<裝置 IP>:4403`）
+> ✅ 只要準備 CallMesh API Key 與 Meshtastic TCP Access（預設埠 4403），就能在任何支援 Node.js 的平台啟動整個 Gateway。
 
-## 安裝
+---
+
+## 1. 主要功能
+
+- **Meshtastic 監控**：解析 TCP Stream 內的 protobuf 封包，摘要顯示節點、SNR/RSSI、Hops、座標等資訊。
+- **CallMesh 整合**：透過 Heartbeat/Mapping/Provision API 取得節點配置與 APRS 參數，並在 Key 驗證失敗時鎖定系統。
+- **APRS Uplink**：依 Mapping 決定呼號、符號與註解，上傳位置/狀態/遙測資料到 APRS-IS，具備 Beacon、Status、Telemetry 定時器與互斥上傳控制。
+- **遙測統計**：計算近 10 分鐘的封包數量、上傳比率、類型分佈（Position / Message / Control）。
+- **跨平台部署**：可自行打包 macOS / Windows / Linux x64 CLI 或 Desktop 版；CLI 同時支援自動重連。
+
+---
+
+## 2. 環境需求
+
+- Node.js 18 以上（建議使用 LTS 版本）
+- Meshtastic 裝置或 Gateway，且啟用 TCP API（預設 `tcp://<裝置 IP>:4403`）
+- CallMesh 平台有效的 API Key（環境變數 `CALLMESH_API_KEY`）
+- （若使用 APRS）穩定的網際網路連線
+
+---
+
+## 3. 安裝與初始設定
 
 ```bash
+# 1. 取得專案原始碼
+git clone https://github.com/toodi0418/CMClient.git
+cd CMClient
+
+# 2. 安裝相依套件（CLI / GUI 共用）
 npm install
 ```
 
-這會安裝 `protobufjs` 與 `yargs`，並保留 `proto/meshtastic` 目錄下所需的 `.proto` 定義。
+### 沒有安裝 Node.js / npm？
 
-## 使用方式
+1. **macOS / Linux**  
+   建議安裝 [nvm](https://github.com/nvm-sh/nvm)：  
+   ```bash
+   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
+   source ~/.nvm/nvm.sh
+   nvm install 18
+   nvm use 18
+   ```  
+   完成後 `node -v`、`npm -v` 應該能顯示版本號。
 
-最簡單的用法（連到本機的 Meshtastic TCP 伺服器）：
+2. **Windows**  
+   前往 [Node.js 官方網站](https://nodejs.org/en/download) 下載 LTS 安裝程式，依指示完成安裝後重新開啟終端機（PowerShell / CMD）。  
+   驗證：  
+   ```powershell
+   node -v
+   npm -v
+   ```
+
+### 必備環境變數
 
 ```bash
-npm start
+export CALLMESH_API_KEY="你的 CallMesh API Key"
+# 可選：變更快取與驗證檔案位置
+export CALLMESH_VERIFICATION_FILE=~/.config/callmesh/monitor.json
+export CALLMESH_ARTIFACTS_DIR=~/.config/callmesh/
 ```
 
-或直接使用 `node` 執行：
+---
+
+## 4. CLI 快速上手
+
+CLI 預設會驗證 CallMesh API Key、啟動 heartbeat 與 Mapping 同步，再連線 Meshtastic TCP 並自動轉發到 APRS。
 
 ```bash
-node src/index.js --host <裝置 IP> --port 4403
+node src/index.js --host 172.16.8.91 --port 4403
 ```
 
-常用參數：
+常用選項：
 
-- `--host, -H`：目標 Meshtastic TCP 伺服器（預設 `127.0.0.1`）
-- `--port, -P`：連接埠（預設 `4403`）
-- `--max-length, -m`：允許的最大封包大小，依 Meshtastic 協定預設為 `512` bytes，若韌體更新可自行調整
-- `--pretty, -p`：搭配 `--format json` 使用，是否以縮排輸出 JSON（預設開啟）
-- `--show-raw, -r`：在摘要模式下，同時列印 payload 的十六進位字串
-- `--format, -f`：切換輸出格式，`summary`（預設）為表格、`json` 為完整訊息
-- `--handshake, -k` / `--no-handshake`：預設會在連線後送出 `want_config` 請求以觸發裝置回傳節點/設定資訊，可依需求關閉
-- `--heartbeat, -b`：指定秒數（例如 `--heartbeat 30`）即可定期送出 heartbeat 維持連線，預設為 `0` 表示不傳送
-- 所有指令執行前需設定 `CALLMESH_API_KEY` 環境變數，確保系統已綁定合法的 CallMesh 憑證
+| 參數 | 預設 | 說明 |
+| ---- | ---- | ---- |
+| `--host, -H` | `127.0.0.1` | Meshtastic TCP 伺服器 |
+| `--port, -P` | `4403` | TCP 連接埠 |
+| `--format, -f` | `summary` | `summary` 表格、`json` 輸出完整 protobuf 內容 |
+| `--show-raw, -r` | `false` | 在 summary 下同時顯示十六進位 payload |
+| `--discover` | - | 搜尋區網內 `_meshtastic._tcp` 裝置 |
 
-若想列出區域網路內的 Meshtastic 裝置，可執行：
+CLI 具備自動重連：若 TCP 連線中斷會每 30 秒重試一次，直到 `Ctrl+C` 終止。
 
-```bash
-node src/index.js discover
-```
+### CallMesh CLI 工具
 
-程式會透過 mDNS (`_meshtastic._tcp`) 掃描裝置並顯示 Host/Port 及節點資訊。
-
-CLI 內建 `--help` 可隨時查看支援選項：
+仍可透過 CLI 單獨執行 CallMesh API：
 
 ```bash
-node src/index.js --help
-```
-
-## Electron 桌面應用
-
-若希望以 GUI 方式即時監控封包，可啟動內建的 Electron 應用程式：
-
-```bash
-npm run desktop
-```
-
-打開後輸入 Meshtastic TCP API 的 `Host` 與 `Port`（預設 127.0.0.1:4403），按下「連線」即可看到與 CLI 相同的資料表。節點欄位同樣會附上 Mesh ID，點選「中斷」即可關閉連線；應用預設會記住上一個連線設定。
-
-此外，點擊「掃描」可自動搜尋網路中的 Meshtastic 裝置（同樣依賴 mDNS），搜尋結果能直接套用到輸入欄位。
-※ 首次使用前請於畫面中的「CallMesh API Key」欄位輸入後按下「儲存」。系統會立即驗證 Key 是否有效，未通過驗證將無法建立 Meshtastic 連線。
-
-## CallMesh 客戶端整合
-
-專案內含 `callmesh` 指令，可依 [CallMesh 客戶端整合指南](docs/callmesh-client.md) 執行心跳與 mapping 更新。
-
-```bash
-# 送一次心跳並必要時同步 mapping，狀態會記錄在 ./callmesh-state.json
-export CALLMESH_API_KEY="<API_KEY>"
+# 同步 Heartbeat + Mapping
 node src/index.js callmesh sync \
   --state-file ~/.config/callmesh/state.json \
   --mappings-output ~/.config/callmesh/mappings.json
 ```
 
-- `sync`：先送心跳，若伺服器要求更新（或以 `--force` 指定）則下載 mapping。
-- `heartbeat`：只送心跳並更新本地 `hash`／`provision`（仍需 `CALLMESH_API_KEY`）。
-- `mappings`：忽略心跳直接抓取最新 mapping。
-- `--product`、`--client-version`、`--platform`、`--agent` 可客製 Agent 字串；未指定時會依系統自動推算。
+指令詳情可見 `docs/callmesh-client.md`。
 
-指令會先驗證 API Key 是否有效，成功後才送出心跳，並將 hash、provision、mapping 等資料寫入 `--state-file` 指定的 JSON，方便排程器每 60 秒週期性呼叫。
+---
 
-## 摘要輸出
+## 5. Electron 桌面版
 
-預設的 `summary` 模式會即時列出每個封包，欄位依序為日期、節點、頻道、SNR、RSSI、封包類型、Hops 與額外資訊。節點欄位會顯示暱稱（或表情符號）以及 Mesh ID，方便辨識來源。例如：
-
-```
-10/12 18:44:16 | 4cdc -> !c576aa1b          |  0 |  -4.25 |  -114 | Position     | 2/7    | (24.269, 120.493) 17m asl
+```bash
+npm run desktop
 ```
 
-目前針對 `Position`、`Routing` 與 `Telemetry` 封包會進一步解碼，顯示座標、路徑或電量等細節；其他封包則顯示 portnum 名稱。若改用 `--format json`，即回到原始的 JSON 輸出。
+GUI 提供：
 
-## 內部實作概要
+- 連線狀態、APR S 伺服器與登錄顯示
+- 封包列表與 Mapping 封包追蹤（含「已上傳／待上傳」狀態）
+- CallMesh Log、APRS Log 與遙測統計圖表
+- 設定頁：輸入 CallMesh API Key、調整 APRS Beacon 間隔、掃描 Meshtastic 裝置
 
-- 程式會先載入 `proto/meshtastic/mesh.proto` 以及其引用的其他 `.proto` 檔案，並使用 `meshtastic.FromRadio` 訊息定義解碼。
-- Meshtastic TCP 封包使用 4 bytes 標頭：前兩個 bytes 固定為 `0x94C3`，後兩個 bytes 是 payload 長度（big-endian）。程式會持續監聽資料流並依此 framing 做切割，遇到異常長度時會重新尋找同步標記。
-- 解析後的結果預設以摘要表格呈現，並針對常見的 `Position` / `Routing` / `Telemetry` 封包進行額外解碼；若需要原始資料可切到 JSON 模式。
-- 預設會在連線後送出一個 `ToRadio.want_config_id` 請求，與官方 App 類似，可確保裝置立即回傳最新的節點與設定資料。必要時也可以加上 heartbeat 以保持連線活躍。
+首次啟動需輸入並驗證 CallMesh API Key，通過後即可連線 Meshtastic。
 
-## 注意事項
+---
 
-- 這個工具僅用來接收並解析 Meshtastic 裝置送出的 `FromRadio` 封包，若需要送出 `ToRadio` 指令需額外擴充。
-- 連線中斷時會顯示提示訊息，如需自動重連可在外部用 `systemd`, `supervisord` 或 shell script 包裝。
-- 若裝置端同時輸出其他非 Meshtastic 封包資料，請確認已關閉額外的 serial debug，以免造成 framing 無法同步。
+## 6. 打包指令
+
+| 目標 | 指令 | 輸出位置 |
+| ---- | ---- | -------- |
+| macOS CLI | `npm run build:mac-cli` | `dist/cli/tmag-cli` |
+| Windows x64 GUI | `npm run build:win` | `dist/TMAG Monitor-win32-x64/` |
+| Linux x64 GUI | `npm run build:linux` | `dist/TMAG Monitor-linux-x64/` |
+
+### Linux / Raspberry Pi 版 CLI
+
+macOS 無法交叉編譯 Linux/ARM 執行檔，請在目標 Linux 主機（例如樹莓派）上執行：
+
+```bash
+git clone https://github.com/toodi0418/CMClient.git
+cd CMClient
+npm install
+
+npx pkg src/index.js \
+  --config package.json \
+  --targets node18-linux-armv7 \
+  --compress Brotli --public \
+  --output tmag-cli-linux-armv7
+```
+或針對 64 位元 Pi OS 使用 `--targets node18-linux-arm64`。
+
+---
+
+## 7. 專案結構概覽
+
+```
+CMClient/
+├── src/
+│   ├── index.js             # CLI 入口（Meshtastic/CallMesh 桥接）
+│   ├── callmesh/            # CallMesh API 與 APRS 桥接核心
+│   ├── aprs/client.js       # APRS-IS TCP 客戶端
+│   ├── meshtasticClient.js  # Meshtastic TCP 流解析
+│   └── electron/            # Electron 主行程、Renderer 與 UI
+├── proto/meshtastic         # 官方 protobuf 定義
+├── docs/                    # handover 與 CallMesh 技術說明
+└── scripts/                 # Windows / Linux 打包腳本
+```
+
+核心邏輯集中在 `src/callmesh/aprsBridge.js`，CLI 與 Electron 共用同一套橋接流程，確保兩邊行為一致。
+
+---
+
+## 8. 開發與測試
+
+1. 更動程式後可直接執行 `npm start`（CLI summary 模式）。
+2. 若要觀察 APRS 上行內容，可同時開啟 Electron GUI 的「Mapping 封包追蹤」頁面，或在 CLI 監看 log。
+3. 修改 comment 等站台資訊時，Bridge 只會送出更新後的 Beacon，不會重連或干擾定時器；Mapping 中的「已上傳」狀態會在收到對應 flow 的 APRS uplink 後自動更新。
+
+---
+
+## 9. 常見問題
+
+- **為何 GitHub Repo 只有原始碼沒有 `dist/`？**  
+  build 產物會破百 MB，已排除在 git 外。先 `npm install` 後再執行 `npm run build:*` 可在本機重新產出。
+
+- **Meshtastic 斷線會自動重連嗎？**  
+  CLI 會自動重連；Electron 版由 GUI 控制，可手動重試或啟用背景重連。
+
+- **APR S 不停重連怎麼辦？**  
+  通常是同一呼號在不同實例上登入或 comment 更新後頻繁重連；目前我們只在呼號/SSID 變更時才 teardown APRS，若仍被踢請確認無其他裝置使用相同呼號。
+
+---
+
+## 10. 授權
+
+此專案依原作者設定的授權條款釋出；若需商用或替代授權，請聯絡 maintainer。たい
