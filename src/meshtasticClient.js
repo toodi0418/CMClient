@@ -1,0 +1,1049 @@
+'use strict';
+
+const { EventEmitter } = require('events');
+const net = require('net');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const protobuf = require('protobufjs');
+
+const { unishox2_decompress_simple } = require('unishox2.siara.cc');
+
+const MAGIC = 0x94c3;
+const HEADER_SIZE = 4;
+const DEFAULT_MAX_PACKET = 512;
+const BROADCAST_ADDR = 0xffffffff;
+
+const TO_OBJECT_OPTIONS = {
+  longs: Number,
+  enums: String,
+  bytes: Buffer,
+  defaults: false,
+  oneofs: true
+};
+
+class MeshtasticClient extends EventEmitter {
+  constructor(options = {}) {
+    super();
+    this.options = {
+      host: '127.0.0.1',
+      port: 4403,
+      maxLength: DEFAULT_MAX_PACKET,
+      handshake: true,
+      heartbeat: 0,
+      protoDir: path.resolve(__dirname, '..', 'proto'),
+      ...options
+    };
+
+    this.nodeMap = new Map();
+    this._decoder = null;
+    this._socket = null;
+    this._heartbeatTimer = null;
+    this._connected = false;
+    this._seenPacketKeys = new Map();
+    this._packetKeyQueue = [];
+  }
+
+  _normalizeRelayNode(relayNode) {
+    const raw = Number(relayNode) >>> 0;
+    // the firmware sets relay_node to the full node id, but in some cases only
+    // the low byte is populated (e.g. 0x24 for node ending with 0x24).
+    if (raw === 0) return 0;
+    if (raw > 0xff) return raw;
+    for (const [num, entry] of this.nodeMap.entries()) {
+      const numeric = Number(num) >>> 0;
+      if ((numeric & 0xff) === raw) {
+        return numeric;
+      }
+      const idStr = typeof entry?.id === 'string' ? entry.id : null;
+      if (idStr) {
+        const cleaned = idStr.replace(/[^0-9a-fA-F]/g, '');
+        if (cleaned.length === 8) {
+          const parsed = parseInt(cleaned, 16) >>> 0;
+          if ((parsed & 0xff) === raw) {
+            return parsed;
+          }
+        }
+      }
+    }
+    return raw;
+  }
+
+  async start() {
+    if (!this.root) {
+      await this._loadProtobufs();
+    }
+    this._connect();
+  }
+
+  stop() {
+    this._clearHeartbeat();
+    if (this._socket) {
+      this._socket.destroy();
+      this._socket.removeAllListeners();
+      this._socket = null;
+    }
+    this._connected = false;
+    this._connectionStartedAt = null;
+    this._seenPacketKeys.clear();
+    this._packetKeyQueue.length = 0;
+  }
+
+  toObject(message, overrides = {}) {
+    if (!this.fromRadioType) {
+      throw new Error('Protobuf schema not loaded yet');
+    }
+    return this.fromRadioType.toObject(message, {
+      ...TO_OBJECT_OPTIONS,
+      ...overrides
+    });
+  }
+
+  async _loadProtobufs() {
+    const protoFiles = [
+      'meshtastic/mesh.proto',
+      'meshtastic/admin.proto',
+      'meshtastic/remote_hardware.proto',
+      'meshtastic/storeforward.proto',
+      'meshtastic/paxcount.proto'
+    ].map((file) => path.resolve(this.options.protoDir, file));
+    const root = new protobuf.Root();
+    root.resolvePath = (origin, target) => {
+      const candidate = path.resolve(this.options.protoDir, target);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+      if (origin) {
+        const alt = path.resolve(path.dirname(origin), target);
+        if (fs.existsSync(alt)) {
+          return alt;
+        }
+      }
+      return protobuf.util.path.resolve(origin, target);
+    };
+
+    await root.load(protoFiles);
+
+    this.root = root;
+    this.fromRadioType = root.lookupType('meshtastic.FromRadio');
+    this.toRadioType = root.lookupType('meshtastic.ToRadio');
+    this.portEnum = root.lookupEnum('meshtastic.PortNum');
+    this.types = {
+      position: root.lookupType('meshtastic.Position'),
+      routing: root.lookupType('meshtastic.Routing'),
+      telemetry: root.lookupType('meshtastic.Telemetry'),
+      user: root.lookupType('meshtastic.User'),
+      waypoint: root.lookupType('meshtastic.Waypoint'),
+      admin: root.lookupType('meshtastic.AdminMessage'),
+      keyVerification: root.lookupType('meshtastic.KeyVerification'),
+      remoteHardware: root.lookupType('meshtastic.HardwareMessage'),
+      storeForward: root.lookupType('meshtastic.StoreAndForward'),
+      paxcount: root.lookupType('meshtastic.Paxcount'),
+      neighborInfo: root.lookupType('meshtastic.NeighborInfo'),
+      routeDiscovery: root.lookupType('meshtastic.RouteDiscovery')
+    };
+  }
+
+  _connect() {
+    this._decoder = new MeshtasticStreamDecoder({
+      maxPacketLength: this.options.maxLength,
+      onPacket: (payload) => this._handlePayload(payload),
+      onError: (err) => this.emit('error', err)
+    });
+
+    const connectionOptions = {
+      host: this.options.host,
+      port: this.options.port,
+      timeout: this.options.connectTimeout ?? 15000
+    };
+
+    try {
+      this._socket = net.createConnection(connectionOptions, () => {
+        this._connected = true;
+        this._connectionStartedAt = Date.now();
+        if (this._socket) {
+          this._socket.setTimeout(0);
+        }
+        this.emit('connected');
+        if (this.options.handshake) {
+          this._sendWantConfig();
+        }
+        this._setupHeartbeat();
+      });
+    } catch (err) {
+      process.nextTick(() => this.emit('error', err));
+      return;
+    }
+
+    this._socket.on('data', (chunk) => this._decoder.push(chunk));
+
+    const connectTimeoutMs = this.options.connectTimeout ?? 15000;
+    this._socket.setTimeout(connectTimeoutMs, () => {
+      this.emit('error', new Error(`connect timeout after ${connectTimeoutMs}ms`));
+      this._socket?.destroy(new Error('connect timeout'));
+    });
+
+    this._socket.on('error', (err) => {
+      this.emit('error', err);
+    });
+
+    this._socket.on('close', () => {
+      this._connected = false;
+      this._connectionStartedAt = null;
+      this.emit('disconnected');
+      this._clearHeartbeat();
+    });
+  }
+
+  _handlePayload(payload) {
+    let message;
+    try {
+      message = this.fromRadioType.decode(payload);
+    } catch (err) {
+      this.emit('error', new Error(`FromRadio 解碼失敗: ${err.message}`));
+      return;
+    }
+
+    this._updateNodeCache(message);
+
+    const summary = this._buildSummary(message);
+    this.emit('fromRadio', {
+      message,
+      summary,
+      rawPayload: payload
+    });
+    if (summary) {
+      this.emit('summary', summary);
+    }
+  }
+
+  _updateNodeCache(message) {
+    switch (message.payloadVariant) {
+      case 'nodeInfo': {
+        const info = message.nodeInfo;
+        if (!info) break;
+        const num = info.num >>> 0;
+        const user = info.user || {};
+        const existing = this.nodeMap.get(num) || {};
+        const updated = {
+          ...existing,
+          id: user.id || existing.id,
+          shortName: user.shortName || existing.shortName,
+          longName: user.longName || existing.longName,
+          hwModel: user.hwModel || existing.hwModel,
+          role: user.role || existing.role
+        };
+    this.nodeMap.set(num, updated);
+    break;
+  }
+  case 'myInfo': {
+    const info = message.myInfo;
+    if (!info) break;
+    const num = info.myNodeNum >>> 0;
+    const existing = this.nodeMap.get(num) || {};
+    this.nodeMap.set(num, {
+      id: existing.id || formatHexId(num),
+      shortName: existing.shortName,
+      longName: existing.longName,
+      hwModel: existing.hwModel,
+      role: existing.role
+    });
+    const nodeInfo = this._formatNode(num);
+    this.emit('myInfo', {
+      raw: num,
+      node: nodeInfo
+    });
+    break;
+  }
+      default:
+        break;
+    }
+  }
+
+  _buildSummary(message) {
+    if (!message || message.payloadVariant !== 'packet') {
+      return null;
+    }
+
+    const packet = message.packet;
+    if (!packet || packet.payloadVariant !== 'decoded') {
+      return null;
+    }
+    if (this._connectionStartedAt && packet.rxTime) {
+      const packetTime = packet.rxTime * 1000;
+      if (packetTime <= this._connectionStartedAt) {
+        return null;
+      }
+    }
+
+    const portInfo = this._resolvePortnum(packet.decoded.portnum);
+    const payload = packet.decoded.payload;
+    const decodeInfo = this._decodePortPayload(portInfo.name, payload);
+    const extraLines = Array.isArray(decodeInfo?.extraLines)
+      ? [...decodeInfo.extraLines]
+      : [];
+    const relayNodeId = packet.relayNode != null && packet.relayNode !== 0 ? packet.relayNode : null;
+    const nextHopId = packet.nextHop != null && packet.nextHop !== 0 ? packet.nextHop : null;
+
+    if (!this._shouldEmitPacket(packet)) {
+      return null;
+    }
+
+    const timestamp = packet.rxTime ? new Date(packet.rxTime * 1000) : new Date();
+    const fromInfo = this._formatNode(packet.from);
+    const toInfo = packet.to === BROADCAST_ADDR ? null : this._formatNode(packet.to);
+    const relayInfo = relayNodeId != null ? this._formatNode(this._normalizeRelayNode(relayNodeId)) : null;
+    const nextHopInfo = nextHopId != null ? this._formatNode(nextHopId) : null;
+
+    if (relayInfo && relayInfo.meshId) {
+      // relay info exposed via summary.relay for UI display
+    }
+    if (nextHopInfo && nextHopInfo.meshId) {
+      // next hop info exposed via summary.nextHop for UI display
+    }
+
+    const rawHex =
+      Buffer.isBuffer(payload) && payload.length > 0 ? payload.toString('hex') : null;
+
+    const summary = {
+      timestamp: timestamp.toISOString(),
+      timestampLabel: formatTimestamp(timestamp),
+      channel: packet.channel ?? 0,
+      snr: packet.rxSnr ?? null,
+      rssi: packet.rxRssi ?? null,
+      hops: {
+        limit: packet.hopLimit ?? null,
+        start: packet.hopStart ?? null,
+        label: formatHops(packet.hopLimit, packet.hopStart)
+      },
+      type: decodeInfo?.type || friendlyPortLabel(portInfo.name, portInfo.id),
+      detail: decodeInfo?.details || '',
+      extraLines,
+      port: portInfo,
+      from: fromInfo,
+      to: toInfo,
+      relay: relayInfo,
+      nextHop: nextHopInfo,
+      position: decodeInfo?.position || null,
+      rawHex,
+      rawLength: Buffer.isBuffer(payload) ? payload.length : 0
+    };
+
+    return summary;
+  }
+
+  _decodePortPayload(portName, payload) {
+    if (!portName || !Buffer.isBuffer(payload) || payload.length === 0) {
+      return null;
+    }
+
+    try {
+      if (TEXT_PORTS.has(portName)) {
+        return decodeTextPayload(payload, false);
+      }
+
+      if (COMPRESSED_TEXT_PORTS.has(portName)) {
+        return decodeTextPayload(payload, true);
+      }
+
+      switch (portName) {
+        case 'POSITION_APP': {
+          const message = this.types.position.decode(payload);
+          const position = this.types.position.toObject(message, TO_OBJECT_OPTIONS);
+          const lat = extractCoordinate(position.latitudeI, position.latitude);
+          const lon = extractCoordinate(position.longitudeI, position.longitude);
+          const alt =
+            position.altitude ?? position.altitudeHae ?? position.altitudeGeoidalSeparation;
+          const course =
+            position.bearing ?? position.course ?? position.heading ?? position.velHeading;
+          const speedMps =
+            position.groundSpeed ?? position.speed ?? position.airSpeed ?? position.velHoriz;
+          const speedKph =
+            position.speedKph ?? (Number.isFinite(speedMps) ? speedMps * 3.6 : null);
+          const speedKnots =
+            position.speedKnots ??
+            (Number.isFinite(speedMps) ? speedMps * 1.943844 : null) ??
+            (Number.isFinite(speedKph) ? speedKph / 1.852 : null);
+          const coordStr =
+            lat != null && lon != null ? `(${lat.toFixed(6)}, ${lon.toFixed(6)})` : '';
+          const altStr = Number.isFinite(alt) ? `ALT ${Math.round(alt)}m` : '';
+          const detail = [coordStr, altStr].filter(Boolean).join(' · ');
+          const extraLines = [];
+          const courseInt = Number.isFinite(course)
+            ? Math.round(((course % 360) + 360) % 360)
+            : null;
+          if (courseInt !== null) {
+            extraLines.push(`航向 ${courseInt}°`);
+          }
+          // speed & vertical speed handled in UI chips, skip textual extra lines
+          // satsInView handled in UI chips
+          if (Number.isFinite(position.seqNumber)) {
+            extraLines.push(`序列編號 #${position.seqNumber}`);
+          }
+          const timestampSeconds = Number.isFinite(position.timestamp) ? position.timestamp : null;
+          const timestampAdjustMs = Number.isFinite(position.timestampMillisAdjust)
+            ? position.timestampMillisAdjust
+            : 0;
+          if (timestampSeconds !== null) {
+            // timestamp available but no longer displayed in extra lines
+          }
+          return {
+            type: 'Position',
+            details: detail,
+            extraLines,
+            position: {
+              latitude: lat ?? null,
+              longitude: lon ?? null,
+              altitude: alt ?? null,
+              course: course ?? null,
+              heading: position.heading ?? null,
+              speedMps: Number.isFinite(speedMps) ? speedMps : null,
+              speedKph: Number.isFinite(speedKph) ? speedKph : null,
+              speedKnots: Number.isFinite(speedKnots) ? speedKnots : null,
+              velocityHoriz: position.velHoriz ?? null,
+              velocityVert: position.velVert ?? null,
+              velHeading: position.velHeading ?? null,
+              precisionBits: Number.isFinite(position.precisionBits) ? position.precisionBits : null,
+              locationSource: position.locationSource ?? null,
+              satsInView: Number.isFinite(position.satsInView) ? position.satsInView : null,
+              seqNumber: Number.isFinite(position.seqNumber) ? position.seqNumber : null,
+              timestamp: timestampSeconds,
+              timestampMillisAdjust: Number.isFinite(position.timestampMillisAdjust)
+                ? position.timestampMillisAdjust
+                : null,
+              gpsAccuracy: Number.isFinite(position.gpsAccuracy) ? position.gpsAccuracy : null,
+              fixType: Number.isFinite(position.fixType) ? position.fixType : null,
+              fixQuality: Number.isFinite(position.fixQuality) ? position.fixQuality : null,
+              sensorId: Number.isFinite(position.sensorId) ? position.sensorId : null,
+              nextUpdate: Number.isFinite(position.nextUpdate) ? position.nextUpdate : null
+            }
+          };
+        }
+        case 'ROUTING_APP': {
+          const message = this.types.routing.decode(payload);
+          const routing = this.types.routing.toObject(message, TO_OBJECT_OPTIONS);
+          if (routing.routeRequest) {
+            const path = (routing.routeRequest.route || []).map((n) =>
+              this._formatNode(n).label
+            );
+            const detail = path.length ? `path: ${path.join(' -> ')}` : '';
+            return { type: 'RouteRequest', details: detail };
+          }
+          if (routing.routeReply) {
+            const path = (routing.routeReply.routeBack || routing.routeReply.route || []).map(
+              (n) => this._formatNode(n).label
+            );
+            const detail = path.length ? `reply: ${path.join(' -> ')}` : '';
+            return { type: 'RouteReply', details: detail };
+          }
+          if (routing.errorReason) {
+            const error = routing.errorReason.error || 'UNKNOWN';
+            return { type: 'RouteError', details: `error=${error}` };
+          }
+          return { type: 'Routing' };
+        }
+      case 'TELEMETRY_APP': {
+        const message = this.types.telemetry.decode(payload);
+        const telemetry = this.types.telemetry.toObject(message, TO_OBJECT_OPTIONS);
+        if (telemetry.deviceMetrics) {
+            const metrics = telemetry.deviceMetrics;
+            const parts = [];
+            if (metrics.batteryLevel != null) parts.push(`battery ${metrics.batteryLevel}%`);
+            if (metrics.voltage != null) parts.push(`${metrics.voltage.toFixed(2)}V`);
+            if (metrics.uptimeSeconds != null) {
+              parts.push(`uptime ${formatDuration(metrics.uptimeSeconds)}`);
+            }
+            return { type: 'Telemetry', details: parts.join(' ') };
+          }
+          if (telemetry.environmentMetrics) {
+            const env = telemetry.environmentMetrics;
+            const parts = [];
+            if (env.temperature != null) parts.push(`${env.temperature.toFixed(1)}°C`);
+            if (env.relativeHumidity != null) parts.push(`RH ${env.relativeHumidity.toFixed(0)}%`);
+            if (env.barometricPressure != null) {
+              parts.push(`${env.barometricPressure.toFixed(1)}hPa`);
+            }
+            return { type: 'EnvTelemetry', details: parts.join(' ') };
+          }
+          return { type: 'Telemetry' };
+        }
+        case 'WAYPOINT_APP': {
+          const message = this.types.waypoint.decode(payload);
+          const waypoint = this.types.waypoint.toObject(message, TO_OBJECT_OPTIONS);
+          const lat = extractCoordinate(waypoint.latitudeI, waypoint.latitude);
+          const lon = extractCoordinate(waypoint.longitudeI, waypoint.longitude);
+          const detailParts = [];
+          if (waypoint.name) detailParts.push(waypoint.name);
+          if (lat != null && lon != null) {
+            detailParts.push(`(${lat.toFixed(6)}, ${lon.toFixed(6)})`);
+          }
+          const extras = [];
+          if (waypoint.description) extras.push(waypoint.description);
+          if (waypoint.icon) extras.push(`icon: ${formatUnicode(waypoint.icon)}`);
+          if (waypoint.expire) extras.push(`expire: ${new Date(waypoint.expire * 1000).toISOString()}`);
+          return {
+            type: 'Waypoint',
+            details: detailParts.join(' '),
+            extraLines: extras
+          };
+        }
+        case 'ADMIN_APP': {
+          const message = this.types.admin.decode(payload);
+          const admin = this.types.admin.toObject(message, { ...TO_OBJECT_OPTIONS, oneofs: true });
+          const variant = admin.payloadVariant;
+          const detail = variant ? variant.replace(/([A-Z])/g, ' $1').trim() : 'Admin';
+          const extras = summarizeObject(admin, ['payloadVariant']);
+          return { type: 'Admin', details: detail, extraLines: extras };
+        }
+        case 'KEY_VERIFICATION_APP': {
+          const message = this.types.keyVerification.decode(payload);
+          const keyInfo = this.types.keyVerification.toObject(message, TO_OBJECT_OPTIONS);
+          return {
+            type: 'KeyVerification',
+            details: `nonce ${keyInfo.nonce ?? ''}`,
+            extraLines: summarizeObject(keyInfo, [])
+          };
+        }
+        case 'REMOTE_HARDWARE_APP': {
+          const message = this.types.remoteHardware.decode(payload);
+          const hardware = this.types.remoteHardware.toObject(message, TO_OBJECT_OPTIONS);
+          const detail = hardware.type ? hardware.type : 'RemoteHardware';
+          const extras = [];
+          if (hardware.gpioMask != null) extras.push(`mask: 0x${hardware.gpioMask.toString(16)}`);
+          if (hardware.gpioValue != null) extras.push(`value: 0x${hardware.gpioValue.toString(16)}`);
+          return { type: 'RemoteHardware', details: detail, extraLines: extras };
+        }
+        case 'STORE_FORWARD_APP': {
+          const message = this.types.storeForward.decode(payload);
+          const store = this.types.storeForward.toObject(message, TO_OBJECT_OPTIONS);
+          const detail = store.rr ? store.rr : 'StoreForward';
+          const extras = summarizeObject(store, ['rr']);
+          return { type: 'StoreForward', details: detail, extraLines: extras };
+        }
+        case 'PAXCOUNTER_APP': {
+          const message = this.types.paxcount.decode(payload);
+          const pax = this.types.paxcount.toObject(message, TO_OBJECT_OPTIONS);
+          const detail = `WiFi ${pax.wifi ?? 0}, BLE ${pax.ble ?? 0}`;
+          const extras = [];
+          if (pax.uptime != null) extras.push(`uptime ${formatDuration(pax.uptime)}`);
+          return { type: 'PaxCounter', details: detail, extraLines: extras };
+        }
+        case 'TRACEROUTE_APP': {
+          const message = this.types.routeDiscovery.decode(payload);
+          const trace = this.types.routeDiscovery.toObject(message, TO_OBJECT_OPTIONS);
+          const forwardPath = (trace.route || []).map((n) => this._formatNode(n).label);
+          const returnPath = (trace.routeBack || []).map((n) => this._formatNode(n).label);
+          const detail = forwardPath.length ? `forward: ${forwardPath.join(' -> ')}` : 'Traceroute';
+          const extras = [];
+          if (returnPath.length) extras.push(`return: ${returnPath.join(' -> ')}`);
+          if (trace.snrTowards?.length) extras.push(`SNR→: ${trace.snrTowards.map(formatSnr).join(', ')}`);
+          if (trace.snrBack?.length) extras.push(`SNR←: ${trace.snrBack.map(formatSnr).join(', ')}`);
+          return { type: 'Traceroute', details: detail, extraLines: extras };
+        }
+        case 'NEIGHBORINFO_APP': {
+          const message = this.types.neighborInfo.decode(payload);
+          const info = this.types.neighborInfo.toObject(message, TO_OBJECT_OPTIONS);
+          const origin = this._formatNode(info.nodeId);
+          const neighbors = (info.neighbors || []).map((n) => {
+            const node = this._formatNode(n.nodeId);
+            const snr = n.snr != null ? `${n.snr.toFixed(1)}dB` : '';
+            return `${node.label} ${snr}`.trim();
+          });
+          return {
+            type: 'NeighborInfo',
+            details: origin.label,
+            extraLines: neighbors.length ? neighbors : undefined
+          };
+        }
+        case 'NODEINFO_APP': {
+          const message = this.types.user.decode(payload);
+          const user = this.types.user.toObject(message, TO_OBJECT_OPTIONS);
+          const parts = [];
+          if (user.longName) {
+            parts.push(user.longName);
+          }
+          if (user.id) {
+            parts.push(`(${user.id})`);
+          }
+        const extras = [];
+        if (user.hwModel) extras.push(`model: ${String(user.hwModel)}`);
+        if (user.role) extras.push(`role: ${String(user.role)}`);
+        if (user.shortName && user.shortName !== user.longName) {
+          extras.push(`short: ${user.shortName}`);
+        }
+        return {
+          type: 'NodeInfo',
+          details: parts.join(' '),
+          extraLines: extras
+        };
+      }
+        case 'CAYENNE_APP': {
+          return decodeCayennePayload(payload);
+        }
+        default:
+          return { type: friendlyPortLabel(portName) };
+      }
+    } catch (err) {
+      return {
+        type: friendlyPortLabel(portName),
+        details: `解析失敗: ${err.message}`
+      };
+    }
+  }
+
+  _resolvePortnum(portnum) {
+    if (portnum == null) {
+      return { name: undefined, id: undefined };
+    }
+    if (typeof portnum === 'string') {
+      return { name: portnum, id: this.portEnum?.values?.[portnum] };
+    }
+    const enumType = this.portEnum;
+    const name = enumType?.valuesById?.[portnum];
+    return { name, id: portnum };
+  }
+
+  _formatNode(nodeNum) {
+    if (nodeNum == null) {
+      return { label: 'unknown', meshId: null };
+    }
+    const num = nodeNum >>> 0;
+    const entry = this.nodeMap.get(num);
+    let meshId = entry?.id || formatHexId(num);
+    if (meshId && meshId.startsWith('0x')) {
+      meshId = `!${meshId.slice(2)}`;
+    }
+    const name = entry?.shortName || entry?.longName;
+    const label = name && meshId ? `${name} (${meshId})` : name || meshId;
+    return {
+      label,
+      meshId,
+      shortName: entry?.shortName,
+      longName: entry?.longName,
+      raw: num
+    };
+  }
+
+  _shouldEmitPacket(packet) {
+    const id = packet.id >>> 0;
+    const from = packet.from >>> 0;
+
+    if (!id) {
+      return true;
+    }
+
+    const key = `${from}:${id}`;
+    if (this._seenPacketKeys.has(key)) {
+      return false;
+    }
+
+    this._seenPacketKeys.set(key, Date.now());
+    this._packetKeyQueue.push(key);
+
+    const MAX_TRACKED = 5000;
+    if (this._packetKeyQueue.length > MAX_TRACKED) {
+      const oldKey = this._packetKeyQueue.shift();
+      if (oldKey) {
+        this._seenPacketKeys.delete(oldKey);
+      }
+    }
+    return true;
+  }
+
+  _sendWantConfig() {
+    if (!this._socket || !this._connected) return;
+    const nonce = crypto.randomBytes(2).readUInt16BE(0);
+    const message = this.toRadioType.create({ wantConfigId: nonce });
+    const encoded = this.toRadioType.encode(message).finish();
+    const framed = framePacket(encoded);
+    this._socket.write(framed, (err) => {
+      if (err) {
+        this.emit('error', new Error(`want_config 傳送失敗: ${err.message}`));
+      } else {
+        this.emit('handshake', { nonce });
+      }
+    });
+  }
+
+  _setupHeartbeat() {
+    this._clearHeartbeat();
+    if (this.options.heartbeat > 0 && this._socket) {
+      const intervalMs = this.options.heartbeat * 1000;
+      this._heartbeatTimer = setInterval(() => this._sendHeartbeat(), intervalMs);
+      this._heartbeatTimer.unref?.();
+    }
+  }
+
+  _clearHeartbeat() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+  }
+
+  _sendHeartbeat() {
+    if (!this._socket || !this._connected) return;
+    const message = this.toRadioType.create({ heartbeat: {} });
+    const encoded = this.toRadioType.encode(message).finish();
+    const framed = framePacket(encoded);
+    this._socket.write(framed, (err) => {
+      if (err) {
+        this.emit('error', new Error(`heartbeat 傳送失敗: ${err.message}`));
+      }
+    });
+  }
+}
+
+class MeshtasticStreamDecoder {
+  constructor(options) {
+    this.buffer = Buffer.alloc(0);
+    this.maxPacketLength = options.maxPacketLength ?? DEFAULT_MAX_PACKET;
+    this.onPacket = options.onPacket;
+    this.onError = options.onError;
+  }
+
+  push(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    this._process();
+  }
+
+  _process() {
+    while (this.buffer.length >= HEADER_SIZE) {
+      if (!this._headerLooksValid(this.buffer)) {
+        this.buffer = this.buffer.slice(1);
+        continue;
+      }
+
+      const packetLength = this.buffer.readUInt16BE(2);
+      if (packetLength <= 0 || packetLength > this.maxPacketLength) {
+        this.buffer = this.buffer.slice(2);
+        continue;
+      }
+
+      if (this.buffer.length < HEADER_SIZE + packetLength) {
+        return;
+      }
+
+      const payload = this.buffer.slice(HEADER_SIZE, HEADER_SIZE + packetLength);
+      this.buffer = this.buffer.slice(HEADER_SIZE + packetLength);
+
+      try {
+        this.onPacket(payload);
+      } catch (err) {
+        // Propagate asynchronously so parent can handle
+        setImmediate(() => {
+          if (this.onError) {
+            this.onError(err);
+          }
+        });
+      }
+    }
+  }
+
+  _headerLooksValid(buf) {
+    return buf.readUInt16BE(0) === MAGIC;
+  }
+}
+
+function extractCoordinate(intValue, floatValue) {
+  if (intValue != null) {
+    return intValue / 1e7;
+  }
+  if (floatValue != null) {
+    return floatValue;
+  }
+  return null;
+}
+
+function friendlyPortLabel(portName, portId) {
+  if (portName) {
+    const map = {
+      POSITION_APP: 'Position',
+      ROUTING_APP: 'Routing',
+      TELEMETRY_APP: 'Telemetry',
+      TEXT_MESSAGE_APP: 'Text',
+      NODEINFO_APP: 'NodeInfo',
+      ADMIN_APP: 'Admin',
+      TRACEROUTE_APP: 'Traceroute',
+      WAYPOINT_APP: 'Waypoint',
+      STORE_FORWARD_APP: 'StoreForward',
+      PAXCOUNTER_APP: 'PaxCounter',
+      REMOTE_HARDWARE_APP: 'RemoteHardware',
+      KEY_VERIFICATION_APP: 'KeyVerification',
+      TEXT_MESSAGE_COMPRESSED_APP: 'Text',
+      DETECTION_SENSOR_APP: 'Detection',
+      ALERT_APP: 'Alert',
+      RANGE_TEST_APP: 'RangeTest',
+      REPLY_APP: 'Reply',
+      NEIGHBORINFO_APP: 'NeighborInfo'
+    };
+    return map[portName] || portName;
+  }
+  if (portId != null) {
+    return `Port ${portId}`;
+  }
+  return 'Unknown';
+}
+
+function formatHexId(num) {
+  return `!${num.toString(16).padStart(8, '0')}`;
+}
+
+function formatTimestamp(date) {
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mi = String(date.getMinutes()).padStart(2, '0');
+  const ss = String(date.getSeconds()).padStart(2, '0');
+  return `${mm}/${dd} ${hh}:${mi}:${ss}`;
+}
+
+function formatHops(hopLimit, hopStart) {
+  if (hopStart != null && hopStart !== 0) {
+    if (hopLimit != null) {
+      const used = Math.max(hopStart - hopLimit, 0);
+      return `${used}/${hopStart}`;
+    }
+    return `?/${hopStart}`;
+  }
+  if (hopLimit != null) {
+    return `${hopLimit}`;
+  }
+  return '';
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return `${seconds}s`;
+  }
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) {
+    return `${h}h${m}m`;
+  }
+  if (m > 0) {
+    return `${m}m${s}s`;
+  }
+  return `${s}s`;
+}
+
+function framePacket(payload) {
+  const framed = Buffer.alloc(HEADER_SIZE + payload.length);
+  framed.writeUInt16BE(MAGIC, 0);
+  framed.writeUInt16BE(payload.length, 2);
+  payload.copy(framed, HEADER_SIZE);
+  return framed;
+}
+
+const TEXT_PORTS = new Set([
+  'TEXT_MESSAGE_APP',
+  'DETECTION_SENSOR_APP',
+  'ALERT_APP',
+  'RANGE_TEST_APP',
+  'REPLY_APP'
+]);
+
+const COMPRESSED_TEXT_PORTS = new Set(['TEXT_MESSAGE_COMPRESSED_APP']);
+
+function decodeCayennePayload(payload) {
+  if (!Buffer.isBuffer(payload) || payload.length < 3) {
+    return { type: 'Cayenne', details: 'payload 太短' };
+  }
+
+  const readings = [];
+  const extras = [];
+  let offset = 0;
+  while (offset + 2 <= payload.length) {
+    const channel = payload[offset++];
+    if (offset >= payload.length) {
+      extras.push(`ch${channel}: 資料截斷`);
+      break;
+    }
+    const type = payload[offset++];
+    const spec = CAYENNE_TYPES[type];
+    if (!spec) {
+      const { label, extraLines } = describeUnknownCayenneType(channel, type, payload.slice(offset));
+      if (label) readings.push(label);
+      if (extraLines.length) extras.push(...extraLines);
+      break;
+    }
+    if (offset + spec.length > payload.length) {
+      extras.push(`ch${channel}: ${spec.name} 資料不足`);
+      break;
+    }
+    const segment = payload.slice(offset, offset + spec.length);
+    offset += spec.length;
+    try {
+      const label = spec.decode(segment);
+      readings.push(`ch${channel} ${spec.name} ${label}`);
+    } catch (err) {
+      extras.push(`ch${channel}: ${spec.name} 解析失敗 (${err.message})`);
+    }
+  }
+
+  if (!readings.length && !extras.length) {
+    extras.push('未解析任何 Cayenne 感測資料');
+  }
+
+  return {
+    type: 'Cayenne',
+    details: readings.join('，') || 'Cayenne payload',
+    extraLines: extras.length ? extras : undefined
+  };
+}
+
+const CAYENNE_TYPES = {
+  0x00: createCayenneSpec('DigitalInput', 1, (buf) => buf.readUInt8(0)),
+  0x01: createCayenneSpec('DigitalOutput', 1, (buf) => buf.readUInt8(0)),
+  0x02: createCayenneSpec('AnalogInput', 2, (buf) => (buf.readInt16BE(0) / 100).toFixed(2)),
+  0x03: createCayenneSpec('AnalogOutput', 2, (buf) => (buf.readInt16BE(0) / 100).toFixed(2)),
+  0x04: createCayenneSpec('Illuminance', 2, (buf) => `${buf.readUInt16BE(0)} lux`),
+  0x05: createCayenneSpec('Presence', 1, (buf) => (buf.readUInt8(0) ? 'detected' : 'clear')),
+  0x06: createCayenneSpec('Temperature', 2, (buf) => `${(buf.readInt16BE(0) / 10).toFixed(1)}°C`),
+  0x07: createCayenneSpec('Humidity', 1, (buf) => `${(buf.readUInt8(0) / 2).toFixed(1)}%`),
+  0x08: createCayenneSpec('Accelerometer', 6, (buf) => {
+    const x = buf.readInt16BE(0) / 1000;
+    const y = buf.readInt16BE(2) / 1000;
+    const z = buf.readInt16BE(4) / 1000;
+    return `x:${x.toFixed(3)}g y:${y.toFixed(3)}g z:${z.toFixed(3)}g`;
+  }),
+  0x09: createCayenneSpec('Barometer', 2, (buf) => `${(buf.readUInt16BE(0) / 10).toFixed(1)}hPa`),
+  0x0a: createCayenneSpec('Gyrometer', 6, (buf) => {
+    const x = buf.readInt16BE(0) / 100;
+    const y = buf.readInt16BE(2) / 100;
+    const z = buf.readInt16BE(4) / 100;
+    return `x:${x.toFixed(2)}°/s y:${y.toFixed(2)}°/s z:${z.toFixed(2)}°/s`;
+  }),
+  0x0c: createCayenneSpec('GPS', 9, (buf) => {
+    const lat = readInt24BE(buf, 0) / 1e4;
+    const lng = readInt24BE(buf, 3) / 1e4;
+    const alt = readInt24BE(buf, 6) / 100;
+    return `lat:${lat.toFixed(6)} lon:${lng.toFixed(6)} alt:${alt.toFixed(1)}m`;
+  }),
+  0x65: createCayenneSpec('Illuminance', 2, (buf) => `${buf.readUInt16BE(0)} lux`),
+  0x66: createCayenneSpec('Presence', 1, (buf) => (buf.readUInt8(0) ? 'detected' : 'clear')),
+  0x67: createCayenneSpec('Temperature', 2, (buf) => `${(buf.readInt16BE(0) / 10).toFixed(1)}°C`),
+  0x68: createCayenneSpec('Humidity', 1, (buf) => `${(buf.readUInt8(0) / 2).toFixed(1)}%`),
+  0x71: createCayenneSpec('Accelerometer', 6, (buf) => {
+    const x = buf.readInt16BE(0) / 1000;
+    const y = buf.readInt16BE(2) / 1000;
+    const z = buf.readInt16BE(4) / 1000;
+    return `x:${x.toFixed(3)}g y:${y.toFixed(3)}g z:${z.toFixed(3)}g`;
+  }),
+  0x73: createCayenneSpec('Barometer', 2, (buf) => `${(buf.readUInt16BE(0) / 10).toFixed(1)}hPa`),
+  0x86: createCayenneSpec('Gyrometer', 6, (buf) => {
+    const x = buf.readInt16BE(0) / 100;
+    const y = buf.readInt16BE(2) / 100;
+    const z = buf.readInt16BE(4) / 100;
+    return `x:${x.toFixed(2)}°/s y:${y.toFixed(2)}°/s z:${z.toFixed(2)}°/s`;
+  }),
+  0x88: createCayenneSpec('GPS', 9, (buf) => {
+    const lat = readInt24BE(buf, 0) / 1e4;
+    const lng = readInt24BE(buf, 3) / 1e4;
+    const alt = readInt24BE(buf, 6) / 100;
+    return `lat:${lat.toFixed(6)} lon:${lng.toFixed(6)} alt:${alt.toFixed(1)}m`;
+  })
+};
+
+function createCayenneSpec(name, length, decoder) {
+  return {
+    name,
+    length,
+    decode: decoder
+  };
+}
+
+function readInt24BE(buf, offset) {
+  const b0 = buf.readUInt8(offset);
+  const b1 = buf.readUInt8(offset + 1);
+  const b2 = buf.readUInt8(offset + 2);
+  let value = (b0 << 16) | (b1 << 8) | b2;
+  if (value & 0x800000) {
+    value |= 0xff000000;
+  }
+  return value;
+}
+
+function describeUnknownCayenneType(channel, type, buffer) {
+  const label = `ch${channel} 類型 0x${type.toString(16).padStart(2, '0')} (${buffer.length} bytes)`;
+  const extraLines = [];
+  if (buffer.length) {
+    extraLines.push(`hex: ${buffer.toString('hex')}`);
+    extraLines.push(`base64: ${buffer.toString('base64')}`);
+    const ascii = bufferToAscii(buffer);
+    if (ascii) {
+      extraLines.push(`ascii: ${ascii}`);
+    }
+    const floats = [];
+    for (let i = 0; i + 4 <= buffer.length && floats.length < 6; i += 4) {
+      const value = buffer.readFloatLE(i);
+      if (!Number.isNaN(value) && Number.isFinite(value)) {
+        floats.push(value.toFixed(3));
+      }
+    }
+    if (floats.length) {
+      extraLines.push(`float32LE: ${floats.join(', ')}`);
+    }
+  }
+  return { label, extraLines };
+}
+
+function bufferToAscii(buffer) {
+  let result = '';
+  for (const byte of buffer) {
+    if (byte >= 32 && byte <= 126) {
+      result += String.fromCharCode(byte);
+    } else {
+      result += '.';
+    }
+  }
+  result = result.trim();
+  return result ? result : '';
+}
+
+function decodeTextPayload(payload, compressed) {
+  try {
+    const text = compressed
+      ? unishox2_decompress_simple(payload, payload.length)
+      : payload.toString('utf8');
+    return { type: 'Text', details: text };
+  } catch (err) {
+    return {
+      type: 'Text',
+      details: payload.toString('utf8'),
+      extraLines: [`解碼失敗: ${err.message}`]
+    };
+  }
+}
+
+function summarizeObject(obj, excludeKeys = []) {
+  const lines = [];
+  for (const [key, value] of Object.entries(obj || {})) {
+    if (excludeKeys.includes(key) || key.startsWith('_') || value == null || value === '') {
+      continue;
+    }
+    if (typeof value === 'object' && !Buffer.isBuffer(value)) {
+      lines.push(`${key}: ${JSON.stringify(value)}`);
+    } else if (Buffer.isBuffer(value)) {
+      lines.push(`${key}: ${value.toString('hex')}`);
+    } else {
+      lines.push(`${key}: ${value}`);
+    }
+  }
+  return lines;
+}
+
+function formatUnicode(codePoint) {
+  try {
+    return String.fromCodePoint(codePoint);
+  } catch {
+    return `U+${codePoint.toString(16)}`;
+  }
+}
+
+function formatSnr(value) {
+  return `${(value / 4).toFixed(2)}dB`;
+}
+
+module.exports = MeshtasticClient;

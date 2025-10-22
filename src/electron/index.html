@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TMMARC Meshtastic APRS Gateway (TMAG)</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1 id="app-name">TMMARC Meshtastic APRS Gateway (TMAG) <span class="app-version" id="app-version"></span></h1>
+        <p class="subtitle">即時監看 TMAG 的節點流量、遙測封包與 CallMesh 狀態。</p>
+      </header>
+
+      <nav class="main-nav">
+        <button class="nav-btn active" data-target="monitor-page">監視</button>
+        <button class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
+        <button class="nav-btn" data-target="settings-page">設定</button>
+        <button class="nav-btn" data-target="info-page">資訊</button>
+        <button class="nav-btn" data-target="log-page">Log</button>
+      </nav>
+
+      <section id="monitor-page" class="page active">
+        <section class="connection-panel">
+          <form id="connection-form">
+            <div class="button-row">
+              <button type="submit" id="connect-btn">連線</button>
+              <button type="button" id="open-settings-btn" class="link-button">設定</button>
+            </div>
+          </form>
+          <div id="current-node-display" class="current-node-display hidden">
+            <span class="current-node-icon">🛰️</span>
+            <span id="current-node-text" class="current-node-text">尚未取得節點資訊</span>
+          </div>
+          <div class="summary-counters">
+            <div class="summary-counter">
+              <span class="summary-counter-label">10分鐘封包</span>
+              <span id="counter-packages-10min" class="summary-counter-value">0</span>
+            </div>
+            <div class="summary-counter">
+              <span class="summary-counter-label">已上傳 APRS</span>
+              <span id="counter-aprs-uploaded" class="summary-counter-value">0</span>
+            </div>
+            <div class="summary-counter">
+              <span class="summary-counter-label">Mapping 節點</span>
+              <span id="counter-mapping-count" class="summary-counter-value">0</span>
+            </div>
+          </div>
+          <div class="status-group">
+            <div id="status-indicator" class="status status-idle">尚未連線</div>
+            <div id="platform-status" class="platform-status"></div>
+            <div id="aprs-status" class="aprs-status">APRS: 未連線</div>
+            <div id="aprs-server-label" class="aprs-server">Server: —</div>
+          </div>
+        </section>
+
+        <section class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>時間</th>
+                <th>節點</th>
+                <th>最後轉發</th>
+                <th>Ch</th>
+                <th>SNR</th>
+                <th>RSSI</th>
+                <th>類型</th>
+                <th>Hops</th>
+                <th>資訊</th>
+              </tr>
+            </thead>
+            <tbody id="packet-table"></tbody>
+          </table>
+        </section>
+      </section>
+
+      <section id="settings-page" class="page hidden">
+        <section class="settings-panel">
+          <h2>連線與 CallMesh 設定</h2>
+          <div class="fieldset">
+            <label for="settings-host">Meshtastic Host</label>
+            <div class="host-row">
+              <input id="settings-host" name="settingsHost" type="text" value="127.0.0.1" required />
+              <button type="button" id="discover-btn">自動搜尋</button>
+            </div>
+            <small id="discover-status" class="discover-status"></small>
+          </div>
+          <div class="fieldset callmesh-group">
+            <label for="api-key">CallMesh API Key</label>
+            <div class="callmesh-row">
+              <input id="api-key" name="apiKey" type="password" placeholder="輸入後按儲存" />
+              <button type="button" id="save-api-key">儲存</button>
+            </div>
+            <small class="callmesh-hint">Key 會保存在本機設定檔</small>
+          </div>
+          <div class="fieldset">
+            <label for="aprs-server">APRS 伺服器地址</label>
+            <input id="aprs-server" type="text" value="asia.aprs2.net" />
+            <small class="callmesh-hint">預設為 asia.aprs2.net，可依需求調整</small>
+          </div>
+          <div class="fieldset">
+            <label for="aprs-beacon-interval">APRS 信標間隔（分鐘）</label>
+            <input id="aprs-beacon-interval" type="number" min="1" max="1440" value="10" />
+            <small class="callmesh-hint">預設每 10 分鐘發送一次，可調整為 1-1440 分鐘</small>
+          </div>
+          <button type="button" id="reset-data-btn" class="danger-btn">重置所有資料</button>
+        </section>
+      </section>
+
+      <section id="log-page" class="page hidden">
+        <section class="log-panel">
+          <h2>系統日誌</h2>
+          <p>顯示 Meshtastic Monitor 與 CallMesh 互動的偵錯資訊。</p>
+          <div class="log-filter-row">
+            <input id="log-search" type="search" placeholder="搜尋 Tag 或內容" />
+            <select id="log-tag-filter">
+              <option value="all">全部 Tag</option>
+              <option value="CALLMESH">CALLMESH</option>
+              <option value="APRS">APRS</option>
+              <option value="CONNECT">CONNECT</option>
+              <option value="STATUS">STATUS</option>
+              <option value="SUMMARY">SUMMARY</option>
+              <option value="SELF">SELF</option>
+              <option value="PROVISION">PROVISION</option>
+              <option value="DISCOVER">DISCOVER</option>
+              <option value="APP">APP</option>
+              <option value="DISCONNECT">DISCONNECT</option>
+            </select>
+          </div>
+          <button type="button" id="copy-log-btn" class="copy-log-btn">複製全部日誌</button>
+          <pre id="log-output" class="log-output">尚未載入任何紀錄。</pre>
+        </section>
+      </section>
+
+      <section id="flow-page" class="page hidden">
+        <section class="flow-panel">
+          <header class="flow-header">
+            <h2>Mapping 封包追蹤</h2>
+            <p class="flow-panel-hint">僅顯示具 mapping 的位置封包；若同步至 APRS 會附上上傳內容。</p>
+            <div class="flow-search-row">
+              <input id="flow-search" type="search" placeholder="搜尋節點、Mapping 或 CallSign" />
+              <select id="flow-filter-state">
+                <option value="all">全部封包</option>
+                <option value="aprs">已上傳 APRS</option>
+                <option value="pending">待上傳</option>
+              </select>
+              <button id="flow-download-btn" type="button" class="flow-download-btn">下載記錄</button>
+            </div>
+          </header>
+          <div id="flow-empty-state" class="flow-empty-state">尚未收到封包。</div>
+          <div id="flow-list" class="flow-items hidden"></div>
+        </section>
+      </section>
+
+      <section id="info-page" class="page hidden">
+        <section class="info-panel">
+          <h2>自動派發資訊</h2>
+          <p>顯示 CallMesh 自動下發的設定，並在更新時即時同步。</p>
+          <div class="info-grid">
+            <div class="info-item">
+              <span class="label">Callsign (含 SSID)</span>
+              <span id="info-callsign" class="value">—</span>
+            </div>
+            <div class="info-item">
+              <span class="label">Symbol</span>
+              <span id="info-symbol" class="value">—</span>
+            </div>
+            <div class="info-item">
+              <span class="label">座標</span>
+              <span id="info-coords" class="value">—</span>
+            </div>
+            <div class="info-item">
+              <span class="label">Comment</span>
+              <span id="info-comment" class="value multiline">—</span>
+            </div>
+            <div class="info-item">
+              <span class="label">最後更新</span>
+              <span id="info-updated-at" class="value">—</span>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <template id="packet-row-template">
+      <tr>
+        <td class="time"></td>
+        <td class="nodes"></td>
+        <td class="relay"></td>
+        <td class="channel"></td>
+        <td class="snr"></td>
+        <td class="rssi"></td>
+        <td class="type"></td>
+        <td class="hops"></td>
+        <td class="detail">
+          <div class="detail-main"></div>
+          <div class="detail-extra"></div>
+        </td>
+      </tr>
+    </template>
+
+    <div id="callmesh-overlay" class="overlay hidden">
+      <div class="overlay-content">
+        <h2>需要有效的 CallMesh API Key</h2>
+        <p>系統偵測到目前的 API Key 無效或尚未設定。請於下方輸入正確的 Key 並按下「驗證並儲存」完成設定。</p>
+        <div class="overlay-input-group">
+          <input id="overlay-api-key" type="password" placeholder="輸入 CallMesh API Key" />
+          <button id="overlay-save">驗證並儲存</button>
+        </div>
+        <div id="overlay-status" class="overlay-status"></div>
+        <button id="overlay-retry">重新驗證</button>
+      </div>
+    </div>
+    <div id="discover-modal" class="modal hidden">
+      <div class="modal-content">
+        <h2>選擇 Meshtastic 裝置</h2>
+        <div id="discover-modal-body" class="modal-body"></div>
+        <div class="modal-actions">
+          <button id="discover-modal-cancel">取消</button>
+        </div>
+      </div>
+    </div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

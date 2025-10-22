@@ -1,0 +1,2390 @@
+'use strict';
+
+const form = document.getElementById('connection-form');
+const connectBtn = document.getElementById('connect-btn');
+const statusIndicator = document.getElementById('status-indicator');
+const platformStatus = document.getElementById('platform-status');
+const tableBody = document.getElementById('packet-table');
+const rowTemplate = document.getElementById('packet-row-template');
+const currentNodeDisplay = document.getElementById('current-node-display');
+const currentNodeText = document.getElementById('current-node-text');
+const openSettingsBtn = document.getElementById('open-settings-btn');
+
+const settingsHostInput = document.getElementById('settings-host');
+const discoverBtn = document.getElementById('discover-btn');
+const discoverStatus = document.getElementById('discover-status');
+const discoverModal = document.getElementById('discover-modal');
+const discoverModalBody = document.getElementById('discover-modal-body');
+const discoverModalCancel = document.getElementById('discover-modal-cancel');
+
+const apiKeyInput = document.getElementById('api-key');
+const saveApiKeyBtn = document.getElementById('save-api-key');
+const callmeshOverlay = document.getElementById('callmesh-overlay');
+const overlayRetryBtn = document.getElementById('overlay-retry');
+const overlayKeyInput = document.getElementById('overlay-api-key');
+const overlaySaveBtn = document.getElementById('overlay-save');
+const overlayStatus = document.getElementById('overlay-status');
+
+const counterPackets10Min = document.getElementById('counter-packages-10min');
+const counterAprsUploaded = document.getElementById('counter-aprs-uploaded');
+const counterMappingCount = document.getElementById('counter-mapping-count');
+const logOutput = document.getElementById('log-output');
+const logSearchInput = document.getElementById('log-search');
+const logTagFilterSelect = document.getElementById('log-tag-filter');
+const appNameHeading = document.getElementById('app-name');
+const appVersionLabel = document.getElementById('app-version');
+const aprsStatusLabel = document.getElementById('aprs-status');
+const aprsServerLabel = document.getElementById('aprs-server-label');
+const DEFAULT_APRS_SERVER = 'asia.aprs2.net';
+const DEFAULT_APRS_BEACON_MINUTES = 10;
+
+const infoCallsign = document.getElementById('info-callsign');
+const infoSymbol = document.getElementById('info-symbol');
+const infoCoords = document.getElementById('info-coords');
+const infoComment = document.getElementById('info-comment');
+const infoUpdatedAt = document.getElementById('info-updated-at');
+
+const navButtons = Array.from(document.querySelectorAll('.nav-btn'));
+const monitorPage = document.getElementById('monitor-page');
+const settingsPage = document.getElementById('settings-page');
+const logPage = document.getElementById('log-page');
+const infoPage = document.getElementById('info-page');
+const flowPage = document.getElementById('flow-page');
+const flowList = document.getElementById('flow-list');
+const flowEmptyState = document.getElementById('flow-empty-state');
+const flowSearchInput = document.getElementById('flow-search');
+const flowFilterStateSelect = document.getElementById('flow-filter-state');
+const flowDownloadBtn = document.getElementById('flow-download-btn');
+const aprsServerInput = document.getElementById('aprs-server');
+const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
+const resetDataBtn = document.getElementById('reset-data-btn');
+const copyLogBtn = document.getElementById('copy-log-btn');
+
+const MAX_ROWS = 200;
+let discoveredDevices = [];
+let callmeshHasServerKey = false;
+let lastVerifiedKey = '';
+let callmeshDegraded = false;
+let isConnecting = false;
+let isConnected = false;
+let manualDisconnect = false;
+let autoConnectAttempts = 0;
+let autoConnectTimer = null;
+let reconnectTimer = null;
+let inactivityTimer = null;
+let lastActivityAt = null;
+let initialAutoConnectActive = false;
+let manualConnectActive = false;
+let manualConnectAbort = false;
+let manualConnectRetryTimer = null;
+let manualConnectRetryResolver = null;
+let manualConnectAttempts = 0;
+let manualConnectSession = 0;
+let allowReconnectLoop = true;
+const selfNodeState = {
+  name: null,
+  meshId: null,
+  normalizedMeshId: null,
+  raw: null
+};
+const LOG_MAX_ENTRIES = 500;
+const logEntries = [];
+let logFilterTag = 'all';
+let logSearchTerm = '';
+const packetBuckets = new Map();
+let packetSummaryLast10Min = 0;
+let mappingMeshIds = new Set();
+let mappingItems = [];
+let lastProvisionSignature = null;
+const AUTO_RECONNECT_FAILURE_LIMIT = 3;
+const AUTO_RECONNECT_ROLLING_WINDOW_MS = 2 * 60 * 1000;
+const AUTO_RECONNECT_ERROR_MESSAGE = '自動重連已停止，請確認裝置狀態後手動重試';
+const AUTO_RECONNECT_FAILURE_DEDUP_MS = 5_000;
+
+let autoReconnectSuspended = false;
+const recentReconnectFailures = [];
+const recentReconnectFailureTimestamps = new Map();
+let lastCallmeshStatusLog = '';
+
+const FLOW_MAX_ENTRIES = 300;
+const flowEntries = [];
+const flowEntryIndex = new Map();
+let flowSearchTerm = '';
+const pendingFlowSummaries = new Map();
+const pendingAprsUplinks = new Map();
+let flowFilterState = 'all';
+const FLOW_CAPTURE_DELAY_MS = 5000;
+let flowCaptureEnabledAt = 0;
+
+const AUTO_CONNECT_MAX_ATTEMPTS = 3;
+const AUTO_CONNECT_DELAY_MS = 5000;
+const MANUAL_CONNECT_MAX_ATTEMPTS = 3;
+const MANUAL_CONNECT_DELAY_MS = 5000;
+const INACTIVITY_THRESHOLD_MS = 10 * 60 * 1000;
+const RECONNECT_INTERVAL_MS = 30 * 1000;
+const INITIAL_RECONNECT_DELAY_MS = 5 * 1000;
+const PACKET_WINDOW_MS = 10 * 60 * 1000;
+const PACKET_BUCKET_MS = 60 * 1000;
+const TYPE_ICONS = {
+  Position: '📍',
+  Telemetry: '🔋',
+  EnvTelemetry: '🌡️',
+  Routing: '🧭',
+  RouteRequest: '🧭',
+  RouteReply: '🧭',
+  RouteError: '⚠️',
+  Text: '💬',
+  NodeInfo: '🧑‍🤝‍🧑',
+  Admin: '🛠️',
+  Traceroute: '🛰️',
+  Waypoint: '🗺️',
+  StoreForward: '🗃️',
+  PaxCounter: '👥',
+  RemoteHardware: '🔌',
+  KeyVerification: '🔑',
+  NeighborInfo: '🤝',
+  Encrypted: '🔒'
+};
+
+const STATUS_LABELS = {
+  connecting: (message) => message || '連線中...',
+  connected: '已連線',
+  disconnected: '已斷線',
+  error: (message) => `錯誤：${message || '未知錯誤'}`,
+  idle: '尚未連線'
+};
+
+const STATUS_ICONS = {
+  connecting: '⏳',
+  connected: '✅',
+  disconnected: '⚠️',
+  error: '❗',
+  idle: '💤'
+};
+
+function isSelfMeshId(meshId) {
+  const normalized = normalizeMeshId(meshId);
+  if (!normalized) return false;
+  const selfCandidate = selfNodeState.normalizedMeshId || selfNodeState.meshId;
+  if (!selfCandidate) return false;
+  return normalized === normalizeMeshId(selfCandidate);
+}
+
+function formatRelayLabel(relay) {
+  if (!relay) return '';
+  const label = relay.label || '';
+  const meshId = relay.meshId || '';
+  if (!meshId) return label;
+  const normalized = meshId.startsWith('!') ? meshId.slice(1) : meshId;
+  if (/^0{6}[0-9a-fA-F]{2}$/.test(normalized)) {
+    return label ? label + '?' : meshId + '?';
+  }
+  return label;
+}
+
+function computeRelayLabel(summary) {
+  const fromMeshId = summary.from?.meshId || summary.from?.meshIdNormalized || '';
+  const fromNormalized = normalizeMeshId(fromMeshId);
+  if (fromMeshId && isSelfMeshId(fromMeshId)) {
+    return 'Self';
+  }
+
+  let relayMeshIdRaw = summary.relay?.meshId || summary.relay?.meshIdNormalized || '';
+  if (relayMeshIdRaw && isSelfMeshId(relayMeshIdRaw)) {
+    return 'Self';
+  }
+  let relayNormalized = normalizeMeshId(relayMeshIdRaw);
+  if (relayNormalized && /^!0{6}[0-9a-fA-F]{2}$/.test(relayNormalized)) {
+    relayMeshIdRaw = '';
+    relayNormalized = null;
+  }
+
+  if (fromNormalized && relayNormalized && fromNormalized === relayNormalized) {
+    return '直收';
+  }
+
+  const { usedHops, hopsLabel } = extractHopInfo(summary);
+
+  if (summary.relay?.label) {
+    return formatRelayLabel(summary.relay);
+  }
+
+  if (relayMeshIdRaw) {
+    return formatRelayLabel({ label: summary.relay?.label || relayMeshIdRaw, meshId: relayMeshIdRaw });
+  }
+
+  if (usedHops === 0 || hopsLabel === '0/0' || hopsLabel.startsWith('0/')) {
+    return '直收';
+  }
+
+  if (usedHops > 0) {
+    return '未知?';
+  }
+
+  if (!hopsLabel) {
+    return '直收';
+  }
+
+  if (hopsLabel.includes('?')) {
+    return '未知?';
+  }
+
+  return '';
+}
+
+function extractHopInfo(summary) {
+  const hopStart = Number(summary.hops?.start);
+  const hopLimit = Number(summary.hops?.limit);
+  const label = typeof summary.hops?.label === 'string' ? summary.hops.label.trim() : '';
+  let used = null;
+  let total = Number.isFinite(hopStart) ? hopStart : null;
+
+  if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
+    used = Math.max(hopStart - hopLimit, 0);
+  } else {
+    const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
+    if (match) {
+      used = Number(match[1]);
+      if (!Number.isFinite(total)) {
+        total = Number(match[2]);
+      }
+    } else if (/^\d+$/.test(label)) {
+      used = 0;
+    }
+  }
+
+  if (!Number.isFinite(total)) {
+    const match = label.match(/\/\s*(\d+)/);
+    if (match) {
+      total = Number(match[1]);
+    }
+  }
+
+  return {
+    usedHops: Number.isFinite(used) ? used : null,
+    totalHops: Number.isFinite(total) ? total : null,
+    hopsLabel: label
+  };
+}
+
+function appendLog(tag, message, isoTimestamp) {
+  const normalizedTag = String(tag || 'APP').toUpperCase();
+  if (shouldSuppressLog(normalizedTag, message)) {
+    return;
+  }
+  const date = isoTimestamp ? new Date(isoTimestamp) : new Date();
+  const timestamp = formatLogTimestamp(date);
+  const messageText = typeof message === 'string' ? message : String(message ?? '');
+  const line = `[${timestamp}] [${normalizedTag}] ${messageText}`;
+  logEntries.push({
+    tag: normalizedTag,
+    message: messageText,
+    timestamp,
+    iso: date.toISOString(),
+    line,
+    searchText: line.toLowerCase()
+  });
+  if (logEntries.length > LOG_MAX_ENTRIES) {
+    logEntries.shift();
+  }
+  renderLogOutput({ scrollToEnd: true });
+}
+
+function getFilteredLogEntries() {
+  const hasTagFilter = logFilterTag !== 'all';
+  const term = logSearchTerm;
+  return logEntries.filter((entry) => {
+    if (hasTagFilter && entry.tag !== logFilterTag) {
+      return false;
+    }
+    if (!term) {
+      return true;
+    }
+    return entry.searchText.includes(term);
+  });
+}
+
+function renderLogOutput({ scrollToEnd = false } = {}) {
+  if (!logOutput) return;
+  const previousScrollBottom = logOutput.scrollTop >= (logOutput.scrollHeight - logOutput.clientHeight - 4);
+  const filtered = getFilteredLogEntries();
+  if (!filtered.length) {
+    if (!logEntries.length) {
+      logOutput.textContent = '尚未載入任何紀錄。';
+    } else if (logFilterTag !== 'all' || logSearchTerm) {
+      logOutput.textContent = '沒有符合篩選條件的日誌。';
+    } else {
+      logOutput.textContent = '尚未載入任何紀錄。';
+    }
+  } else {
+    logOutput.textContent = filtered.map((entry) => entry.line).join('\n');
+  }
+  if (scrollToEnd || previousScrollBottom) {
+    logOutput.scrollTop = logOutput.scrollHeight;
+  }
+}
+
+function setCounterValue(element, value, { positive = false, negative = false } = {}) {
+  if (!element) return;
+  element.textContent = String(value);
+  element.classList.toggle('positive', Boolean(positive));
+  element.classList.toggle('negative', Boolean(negative));
+}
+
+function updateDashboardCounters() {
+  const packets = Number.isFinite(packetSummaryLast10Min) ? packetSummaryLast10Min : 0;
+  let uploaded = 0;
+  for (const entry of flowEntries) {
+    if (entry.aprs) {
+      uploaded += 1;
+    }
+  }
+  const mappingCount = mappingMeshIds ? mappingMeshIds.size : 0;
+
+  setCounterValue(counterPackets10Min, packets, {
+    positive: packets > 0,
+    negative: packets === 0
+  });
+
+  setCounterValue(counterAprsUploaded, uploaded, {
+    positive: uploaded > 0,
+    negative: false
+  });
+
+  setCounterValue(counterMappingCount, mappingCount, {
+    positive: mappingCount > 0,
+    negative: mappingCount === 0
+  });
+}
+
+function formatLogTimestamp(date) {
+  const hh = `${date.getHours()}`.padStart(2, '0');
+  const mm = `${date.getMinutes()}`.padStart(2, '0');
+  const ss = `${date.getSeconds()}`.padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+function shouldSuppressLog(tag, message) {
+  if (tag !== 'APRS') return false;
+  const upper = String(message || '').toUpperCase();
+  if (upper.startsWith('RX # APRSC')) return true;
+  if (upper.includes('LOGRESP') && upper.includes('VERIFIED')) return true;
+  if (upper.includes('APRS-IS') && upper.includes('SERVER')) return true;
+  if (upper.includes('FILTER') && upper.includes('PERL SERVER')) return true;
+  return false;
+}
+
+function shouldRecordAutoFailure() {
+  if (manualDisconnect) return false;
+  if (manualConnectActive) return false;
+  if (initialAutoConnectActive) return false;
+  if (autoReconnectSuspended) return false;
+  return true;
+}
+
+function recordReconnectFailure(reason) {
+  if (!shouldRecordAutoFailure()) {
+    return;
+  }
+  const now = Date.now();
+  const reasonKey = reason || 'unknown';
+  const lastFailureAt = recentReconnectFailureTimestamps.get(reasonKey);
+  if (lastFailureAt && now - lastFailureAt < AUTO_RECONNECT_FAILURE_DEDUP_MS) {
+    appendLog('CONNECT', `reconnect failure deduped reason=${reasonKey}`);
+    return;
+  }
+  recentReconnectFailureTimestamps.set(reasonKey, now);
+  while (recentReconnectFailures.length && now - recentReconnectFailures[0] > AUTO_RECONNECT_ROLLING_WINDOW_MS) {
+    recentReconnectFailures.shift();
+  }
+  recentReconnectFailures.push(now);
+  const remaining = Math.max(0, AUTO_RECONNECT_FAILURE_LIMIT - recentReconnectFailures.length);
+  appendLog('CONNECT', `reconnect failure recorded reason=${reason || 'unknown'} remaining=${remaining}`);
+  if (!autoReconnectSuspended && recentReconnectFailures.length >= AUTO_RECONNECT_FAILURE_LIMIT) {
+    suspendAutoReconnect(reason);
+  }
+}
+
+function suspendAutoReconnect(reason) {
+  if (autoReconnectSuspended) {
+    return;
+  }
+  autoReconnectSuspended = true;
+  allowReconnectLoop = false;
+  stopReconnectLoop();
+  updateStatus('error', AUTO_RECONNECT_ERROR_MESSAGE);
+  appendLog('CONNECT', `auto reconnect suspended${reason ? ` (${reason})` : ''}`);
+}
+
+function resumeAutoReconnect({ reason = '', resetFailures = true, silent = false } = {}) {
+  if (resetFailures) {
+    recentReconnectFailures.length = 0;
+    recentReconnectFailureTimestamps.clear();
+  }
+  const wasSuspended = autoReconnectSuspended;
+  autoReconnectSuspended = false;
+  if (wasSuspended && !manualConnectActive) {
+    allowReconnectLoop = true;
+  }
+  if (wasSuspended && !silent) {
+    appendLog('CONNECT', `auto reconnect resumed${reason ? ` (${reason})` : ''}`);
+  }
+}
+
+function normalizeMeshId(meshId) {
+  if (!meshId) return null;
+  if (meshId.startsWith('0x') || meshId.startsWith('0X')) {
+    return `!${meshId.slice(2)}`.toLowerCase();
+  }
+  return meshId.toLowerCase();
+}
+
+function loadPreferences() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('meshtastic:preferences') || '{}');
+    if (saved.host) settingsHostInput.value = saved.host;
+    if (saved.apiKey) apiKeyInput.value = saved.apiKey;
+    if (saved.platformStatus) platformStatus.textContent = saved.platformStatus;
+    if (typeof saved.callmeshVerified === 'boolean') {
+      callmeshHasServerKey = saved.callmeshVerified;
+    }
+    if (typeof saved.callmeshDegraded === 'boolean') {
+      callmeshDegraded = saved.callmeshDegraded;
+    }
+    if (saved.lastVerifiedKey) {
+      lastVerifiedKey = saved.lastVerifiedKey;
+    } else if (callmeshHasServerKey) {
+      lastVerifiedKey = apiKeyInput.value.trim();
+    }
+    if (aprsServerInput) {
+      aprsServerInput.value = saved.aprsServer || DEFAULT_APRS_SERVER;
+    }
+    if (aprsBeaconIntervalInput) {
+      const minutes = Number(saved.aprsBeaconMinutes);
+      const normalized = Number.isFinite(minutes) && minutes >= 1 ? Math.min(Math.round(minutes), 1440) : DEFAULT_APRS_BEACON_MINUTES;
+      aprsBeaconIntervalInput.value = String(normalized);
+    }
+  } catch (err) {
+    console.warn('無法載入偏好設定:', err);
+    if (aprsServerInput) aprsServerInput.value = DEFAULT_APRS_SERVER;
+    if (aprsBeaconIntervalInput) aprsBeaconIntervalInput.value = String(DEFAULT_APRS_BEACON_MINUTES);
+  }
+}
+
+function savePreferences() {
+  const data = {
+    host: settingsHostInput.value.trim(),
+    apiKey: apiKeyInput.value.trim(),
+    platformStatus: platformStatus.textContent,
+    callmeshVerified: callmeshHasServerKey,
+    callmeshDegraded,
+    lastVerifiedKey,
+    aprsServer: aprsServerInput ? aprsServerInput.value.trim() || DEFAULT_APRS_SERVER : DEFAULT_APRS_SERVER,
+    aprsBeaconMinutes: getAprsBeaconMinutes()
+  };
+  localStorage.setItem('meshtastic:preferences', JSON.stringify(data));
+}
+
+function getHostValue() {
+  return (settingsHostInput.value || '').trim();
+}
+
+function getAprsBeaconMinutes() {
+  if (!aprsBeaconIntervalInput) return DEFAULT_APRS_BEACON_MINUTES;
+  const value = Number(aprsBeaconIntervalInput.value);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_APRS_BEACON_MINUTES;
+  const rounded = Math.round(value);
+  if (rounded < 1) return 1;
+  if (rounded > 1440) return 1440;
+  return rounded;
+}
+
+loadPreferences();
+setDiscoverStatus('', 'info');
+updatePlatformStatus();
+updateConnectAvailability();
+refreshOverlay();
+activatePage('monitor-page');
+scheduleInitialAutoConnect();
+clearSelfNodeDisplay();
+appendLog('APP', 'TMAG monitor initialized.');
+updateDashboardCounters();
+
+const initialAprsServer = aprsServerInput?.value?.trim() || DEFAULT_APRS_SERVER;
+window.meshtastic.setAprsServer?.(initialAprsServer);
+const initialBeaconMinutes = getAprsBeaconMinutes();
+window.meshtastic.setAprsBeaconInterval?.(initialBeaconMinutes);
+
+window.meshtastic.getAppInfo?.().then((info) => {
+  if (info?.version) {
+    if (appVersionLabel) {
+      appVersionLabel.textContent = `v${info.version}`;
+    }
+    if (appNameHeading) {
+      document.title = `TMMARC Meshtastic APRS Gateway (TMAG) v${info.version}`;
+    }
+    appendLog('APP', `version ${info.version} loaded`);
+  }
+}).catch((err) => {
+  appendLog('APP', `version lookup failed: ${err.message}`);
+});
+
+async function maybeAutoValidateInitialKey() {
+  const initialKey = apiKeyInput.value.trim();
+  if (!initialKey) {
+    return;
+  }
+  try {
+    const shouldAuto = await window.meshtastic.shouldAutoValidateKey?.();
+    if (shouldAuto === false) {
+      appendLog('CALLMESH', 'auto validation skipped (suppress flag active)');
+      return;
+    }
+  } catch (err) {
+    console.warn('auto-validate check failed:', err);
+  }
+  validateApiKey(initialKey, { auto: true, source: 'main' });
+}
+
+maybeAutoValidateInitialKey().catch((err) => {
+  console.warn('initial auto-validate error:', err);
+});
+
+navButtons.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const target = btn.dataset.target;
+    if (target) {
+      activatePage(target);
+    }
+  });
+});
+
+flowFilterStateSelect?.addEventListener('change', () => {
+  flowFilterState = (flowFilterStateSelect.value || 'all').toLowerCase();
+  renderFlowEntries();
+});
+
+flowDownloadBtn?.addEventListener('click', () => {
+  downloadFlowCsv();
+});
+
+logTagFilterSelect?.addEventListener('change', () => {
+  const value = (logTagFilterSelect.value || 'all').trim();
+  logFilterTag = value === 'all' ? 'all' : value.toUpperCase();
+  renderLogOutput();
+});
+
+logSearchInput?.addEventListener('input', () => {
+  const term = logSearchInput.value.trim().toLowerCase();
+  logSearchTerm = term;
+  renderLogOutput();
+});
+
+openSettingsBtn?.addEventListener('click', () => {
+  activatePage('settings-page');
+});
+
+flowSearchInput?.addEventListener('input', () => {
+  const value = flowSearchInput.value.trim().toLowerCase();
+  flowSearchTerm = value;
+  renderFlowEntries();
+});
+
+
+settingsHostInput.addEventListener('input', () => {
+  resumeAutoReconnect({ reason: 'host-updated', silent: true });
+  savePreferences();
+  updateConnectAvailability();
+});
+
+aprsServerInput?.addEventListener('input', () => {
+  savePreferences();
+  window.meshtastic.setAprsServer?.(aprsServerInput.value.trim() || DEFAULT_APRS_SERVER);
+});
+
+aprsBeaconIntervalInput?.addEventListener('change', () => {
+  const minutes = getAprsBeaconMinutes();
+  aprsBeaconIntervalInput.value = String(minutes);
+  window.meshtastic.setAprsBeaconInterval?.(minutes);
+  savePreferences();
+  appendLog('APRS', `beacon interval set to ${minutes} 分鐘`);
+});
+
+resetDataBtn?.addEventListener('click', async () => {
+  if (!window.confirm('確定要清除所有本地資料與 API Key 嗎？')) {
+    return;
+  }
+  try {
+    await window.meshtastic.resetCallMeshData?.();
+    try {
+      localStorage.clear();
+    } catch {
+      localStorage.removeItem('meshtastic:preferences');
+    }
+    callmeshHasServerKey = false;
+    callmeshDegraded = false;
+    lastVerifiedKey = '';
+    mappingMeshIds = new Set();
+    mappingItems = [];
+    lastProvisionSignature = null;
+    apiKeyInput.value = '';
+    if (overlayKeyInput) overlayKeyInput.value = '';
+    platformStatus.textContent = 'CallMesh: 未設定 Key';
+    clearSelfNodeDisplay();
+    updateProvisionInfo(null, null);
+    clearPacketFlowData();
+    loadPreferences();
+    if (aprsServerInput) {
+      aprsServerInput.value = DEFAULT_APRS_SERVER;
+      window.meshtastic.setAprsServer?.(DEFAULT_APRS_SERVER);
+    }
+    if (aprsBeaconIntervalInput) {
+      const minutes = getAprsBeaconMinutes();
+      window.meshtastic.setAprsBeaconInterval?.(minutes);
+    }
+    savePreferences();
+    updateConnectAvailability();
+    refreshOverlay();
+    appendLog('APP', '已重置本地 CallMesh 資料與 API Key');
+  } catch (err) {
+    appendLog('APP', `重置失敗: ${err.message}`);
+  }
+});
+
+copyLogBtn?.addEventListener('click', async () => {
+  try {
+    const filtered = getFilteredLogEntries();
+    const text = filtered.map((entry) => entry.line).join('\n');
+    if (!text) {
+      appendLog('APP', '目前尚無可複製的日誌資料');
+      return;
+    }
+    await navigator.clipboard.writeText(text);
+    appendLog('APP', '日誌已複製到剪貼簿');
+  } catch (err) {
+    console.error('複製日誌失敗:', err);
+    appendLog('APP', `複製日誌失敗: ${err.message || err}`);
+  }
+});
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (isConnecting || manualConnectActive) {
+    cancelManualConnect();
+    return;
+  }
+
+  if (isConnected) {
+    manualDisconnect = true;
+    await performDisconnect({ preserveManual: true });
+    return;
+  }
+
+  if (!hasApiKey()) {
+    setDiscoverStatus('請先設定 CallMesh API Key', 'error');
+    updateStatus('error', 'API Key 未設定');
+    updateConnectAvailability();
+    appendLog('CONNECT', 'blocked: missing API key');
+    allowReconnectLoop = true;
+    return;
+  }
+
+  if (!hasHost()) {
+    setDiscoverStatus('請先設定 Host', 'error');
+    updateStatus('error', 'Host 未設定');
+    updateConnectAvailability();
+    appendLog('CONNECT', 'blocked: missing host');
+    allowReconnectLoop = true;
+    return;
+  }
+
+  manualDisconnect = false;
+  clearAutoConnectTimer();
+  savePreferences();
+  await manualConnectWithRetries();
+});
+
+saveApiKeyBtn.addEventListener('click', () => {
+  validateApiKey(apiKeyInput.value, { auto: false, source: 'main' });
+});
+
+apiKeyInput.addEventListener('input', () => {
+  const trimmed = apiKeyInput.value.trim();
+  callmeshHasServerKey = trimmed.length > 0 && trimmed === lastVerifiedKey;
+  updateConnectAvailability();
+  refreshOverlay();
+});
+
+overlaySaveBtn?.addEventListener('click', () => {
+  validateApiKey(overlayKeyInput.value, { auto: false, source: 'overlay' });
+});
+
+overlayKeyInput?.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    validateApiKey(overlayKeyInput.value, { auto: false, source: 'overlay' });
+  }
+});
+
+overlayRetryBtn.addEventListener('click', () => {
+  validateApiKey(overlayKeyInput.value, { auto: false, source: 'overlay' });
+});
+
+discoverBtn.addEventListener('click', async () => {
+  setDiscoveringState(true);
+  setDiscoverStatus('掃描中...', 'info');
+  appendLog('DISCOVER', 'scanning for devices');
+  try {
+    const results = await window.meshtastic.discover({ timeout: 4000 });
+    discoveredDevices = results;
+    appendLog('DISCOVER', `found ${results.length} device(s)`);
+    if (!results.length) {
+      setDiscoverStatus('未找到裝置，可確認裝置是否連上網路。', 'warn');
+      hideDiscoverModal();
+    } else {
+      setDiscoverStatus(`找到 ${results.length} 台裝置。`, 'success');
+      showDiscoverModal(results);
+    }
+  } catch (err) {
+    console.error('搜尋裝置失敗:', err);
+    setDiscoverStatus(`搜尋失敗：${err.message}`, 'error');
+    hideDiscoverModal();
+    appendLog('DISCOVER', `error ${err.message}`);
+  } finally {
+    setDiscoveringState(false);
+  }
+});
+
+discoverModalCancel?.addEventListener('click', () => {
+  hideDiscoverModal();
+});
+
+discoverModal?.addEventListener('click', (event) => {
+  if (event.target === discoverModal) {
+    hideDiscoverModal();
+  }
+});
+
+const unsubscribeSummary = window.meshtastic.onSummary((summary) => {
+  appendSummaryRow(summary);
+});
+
+const unsubscribeStatus = window.meshtastic.onStatus((info) => {
+  appendLog('STATUS', `status=${info.status}${info.message ? ` message=${info.message}` : ''}`);
+  updateStatus(info.status, info.message, info.nonce);
+
+  if (info.status === 'connected') {
+    initialAutoConnectActive = false;
+    setConnectedState(true);
+    clearSummaryTable();
+    return;
+  }
+
+  if (info.status === 'disconnected') {
+    recordReconnectFailure('disconnected');
+  }
+
+  if (info.status === 'disconnected' || info.status === 'error') {
+    setConnectedState(false);
+    if (!manualDisconnect && !initialAutoConnectActive && !manualConnectActive && allowReconnectLoop && !autoReconnectSuspended) {
+      startReconnectLoop();
+    }
+  }
+});
+
+const unsubscribeCallMeshStatus = window.meshtastic.onCallMeshStatus?.((info) => {
+  handleCallMeshStatus(info);
+});
+
+const unsubscribeCallMeshLog = window.meshtastic.onCallMeshLog?.((entry) => {
+  if (!entry) return;
+  appendLog(entry.tag || 'CALLMESH', entry.message || '', entry.timestamp);
+});
+
+const unsubscribeMyInfo = window.meshtastic.onMyInfo?.((info) => {
+  handleSelfInfoEvent(info);
+});
+
+const unsubscribeAprsUplink = window.meshtastic.onAprsUplink?.((info) => {
+  handleAprsUplink(info);
+});
+
+window.addEventListener('beforeunload', () => {
+  unsubscribeSummary();
+  unsubscribeStatus();
+  unsubscribeCallMeshStatus?.();
+  unsubscribeCallMeshLog?.();
+  unsubscribeMyInfo?.();
+  unsubscribeAprsUplink?.();
+});
+
+function handleCallMeshStatus(info, { silent = false } = {}) {
+  if (!info) return;
+  const previousDegraded = callmeshDegraded;
+  const hasKey = Boolean(info.hasKey);
+  callmeshDegraded = Boolean(info.degraded);
+
+  const statusSummary = `status=${info.statusText || ''} hasKey=${hasKey} degraded=${callmeshDegraded}`.trim();
+  if (statusSummary !== lastCallmeshStatusLog) {
+    appendLog('CALLMESH', statusSummary);
+    lastCallmeshStatusLog = statusSummary;
+  }
+
+  if (Array.isArray(info.mappingItems)) {
+    mappingItems = info.mappingItems;
+    const normalizedList = info.mappingItems
+      .map((item) => normalizeMeshId(item.mesh_id))
+      .filter(Boolean);
+    mappingMeshIds = new Set(normalizedList);
+    refreshFlowEntryLabels();
+    flushPendingFlowSummaries();
+  } else {
+    mappingItems = [];
+    mappingMeshIds = new Set();
+    refreshFlowEntryLabels();
+  }
+  updateDashboardCounters();
+
+  if (aprsStatusLabel) {
+    const aprs = info.aprs || {};
+    aprsStatusLabel.textContent = `APRS: ${aprs.connected ? '已連線' : '未連線'}`;
+    const configuredServer = aprs.server || DEFAULT_APRS_SERVER;
+    const actualServer = aprs.actualServer;
+    const serverLabel = actualServer
+      ? (actualServer === configuredServer ? actualServer : `${actualServer} (${configuredServer})`)
+      : configuredServer;
+    aprsServerLabel.textContent = `Server: ${serverLabel}`;
+    if (aprsBeaconIntervalInput && Number.isFinite(aprs.beaconIntervalMs)) {
+      const minutes = Math.round(aprs.beaconIntervalMs / 60_000);
+      const normalized = Math.min(Math.max(minutes, 1), 1440);
+      if (!aprsBeaconIntervalInput.matches(':focus') && String(normalized) !== aprsBeaconIntervalInput.value) {
+        aprsBeaconIntervalInput.value = String(normalized);
+        savePreferences();
+      }
+    }
+  }
+
+  updateProvisionInfo(info.provision, info.lastMappingSyncedAt);
+
+  platformStatus.textContent = info.statusText || (hasKey ? 'CallMesh: Heartbeat 正常' : 'CallMesh: 未設定 Key');
+
+  if (hasKey) {
+    callmeshHasServerKey = true;
+    if (info.verifiedKey) {
+      lastVerifiedKey = info.verifiedKey;
+      const current = apiKeyInput.value.trim();
+      if (!apiKeyInput.matches(':focus') || current === '' || current === info.verifiedKey) {
+        apiKeyInput.value = info.verifiedKey;
+      }
+      if (overlayKeyInput && overlayKeyInput.value.trim() !== info.verifiedKey) {
+        overlayKeyInput.value = info.verifiedKey;
+      }
+    }
+    if (!silent) {
+      if (callmeshDegraded && !previousDegraded) {
+        setDiscoverStatus(info.statusText || 'CallMesh: Heartbeat 失敗，沿用已驗證的 Key', 'warn');
+      }
+      if (!callmeshDegraded && previousDegraded) {
+        setDiscoverStatus(info.statusText || 'CallMesh: Heartbeat 恢復正常', 'success');
+      }
+    }
+  } else {
+    callmeshHasServerKey = false;
+    callmeshDegraded = false;
+    lastVerifiedKey = '';
+    if (!apiKeyInput.matches(':focus')) {
+      apiKeyInput.value = '';
+    }
+    if (overlayKeyInput) overlayKeyInput.value = '';
+  }
+
+  savePreferences();
+  updateConnectAvailability();
+
+  if (!hasKey && !silent) {
+    const message = info.statusText || 'CallMesh: Key 驗證失敗';
+    setDiscoverStatus(message, 'error');
+    setOverlayStatus(message, 'error');
+  }
+}
+
+function updatePlatformStatus() {
+  window.meshtastic.getCallMeshStatus?.().then((info) => {
+    if (!info) return;
+    handleCallMeshStatus(info, { silent: true });
+  }).catch(() => {
+    refreshOverlay();
+  });
+}
+
+function appendSummaryRow(summary) {
+  if (!summary) return;
+  registerPacketActivity(summary);
+  maybeUpdateSelfNodeFromSummary(summary);
+  const nodesLabel = formatNodes(summary);
+  const detailSnippet = summary.detail ? ` detail=${summary.detail}` : '';
+  appendLog('SUMMARY', `${summary.timestampLabel || ''} ${nodesLabel} ${summary.type || ''}${detailSnippet}`.trim());
+  const fragment = rowTemplate.content.cloneNode(true);
+  const row = fragment.querySelector('tr');
+
+  row.querySelector('.time').textContent = summary.timestampLabel ?? '';
+  row.querySelector('.nodes').textContent = nodesLabel;
+  const relayCell = row.querySelector('.relay');
+  const relayLabel = computeRelayLabel(summary);
+  relayCell.textContent = relayLabel;
+
+  const relayMeshId = summary.relay?.meshId || summary.relay?.meshIdNormalized || '';
+  if (relayMeshId) {
+    const normalizedRelayId = relayMeshId.startsWith('0x') ? `!${relayMeshId.slice(2)}` : relayMeshId;
+    if (relayLabel && relayLabel !== normalizedRelayId) {
+      relayCell.title = `${relayLabel} (${normalizedRelayId})`;
+    } else {
+      relayCell.title = normalizedRelayId;
+    }
+  } else if (relayLabel === '直收') {
+    relayCell.title = '訊息為直收，未經其他節點轉發';
+  } else if (relayLabel === 'Self') {
+    const selfLabel = selfNodeState.name || selfNodeState.meshId || '本站節點';
+    relayCell.title = `${selfLabel} 轉發`;
+  } else if (relayLabel && relayLabel.includes('?')) {
+    relayCell.title = '最後轉發節點未知或標號不完整';
+  } else {
+    relayCell.removeAttribute('title');
+  }
+  row.querySelector('.channel').textContent = summary.channel ?? '';
+  row.querySelector('.snr').textContent = formatNumber(summary.snr, 2);
+  row.querySelector('.rssi').textContent = formatNumber(summary.rssi, 0);
+  renderTypeCell(row.querySelector('.type'), summary);
+  row.querySelector('.hops').textContent = summary.hops?.label ?? '';
+  row.querySelector('.detail-main').textContent = summary.detail || '';
+
+  const fromMeshNormalized = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
+  const isMappedNode = fromMeshNormalized ? mappingMeshIds.has(fromMeshNormalized) : false;
+  if (summary.type === 'Position' && isMappedNode) {
+    row.classList.add('position-highlight');
+  }
+
+  const extras = [];
+  if (Array.isArray(summary.extraLines) && summary.extraLines.length > 0) {
+    extras.push(...summary.extraLines);
+  }
+  row.querySelector('.detail-extra').textContent = extras.join('\n');
+
+  tableBody.insertBefore(fragment, tableBody.firstChild);
+
+  while (tableBody.children.length > MAX_ROWS) {
+    tableBody.removeChild(tableBody.lastChild);
+  }
+
+  registerPacketFlow(summary);
+}
+
+function clearSummaryTable() {
+  if (!tableBody) return;
+  while (tableBody.firstChild) {
+    tableBody.removeChild(tableBody.firstChild);
+  }
+  packetBuckets.clear();
+  packetSummaryLast10Min = 0;
+  clearPacketFlowData();
+}
+
+function clearPacketFlowData() {
+  flowEntries.length = 0;
+  flowEntryIndex.clear();
+  flowSearchTerm = '';
+  pendingFlowSummaries.clear();
+  if (flowSearchInput) flowSearchInput.value = '';
+  renderFlowEntries();
+  updateDashboardCounters();
+}
+
+function registerPacketFlow(summary, { skipPending = false } = {}) {
+  if (!summary) return;
+  if (summary.type !== 'Position') {
+    return;
+  }
+  if (flowCaptureEnabledAt && Date.now() < flowCaptureEnabledAt) {
+    return;
+  }
+  const meshId = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
+  if (!meshId) return;
+  const relayLabel = computeRelayLabel(summary);
+
+  const timestampMs = extractSummaryTimestamp(summary);
+  const flowId = typeof summary.flowId === 'string' && summary.flowId.length
+    ? summary.flowId
+    : `${timestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+  summary.flowId = flowId;
+
+  const mapping = findMappingByMeshId(meshId);
+  if (!mapping) {
+    if (!skipPending) {
+      const bucket = pendingFlowSummaries.get(meshId) || new Map();
+      if (!bucket.has(flowId)) {
+        try {
+          const snapshot = JSON.parse(JSON.stringify(summary));
+          snapshot.flowId = flowId;
+          bucket.set(flowId, snapshot);
+          while (bucket.size > 25) {
+            const oldestKey = bucket.keys().next().value;
+            if (oldestKey) {
+              bucket.delete(oldestKey);
+            }
+          }
+          pendingFlowSummaries.set(meshId, bucket);
+        } catch (err) {
+          console.warn('無法快取待處理的 Mapping 封包:', err);
+        }
+      }
+    }
+    return;
+  }
+
+  if (!skipPending) {
+    const bucket = pendingFlowSummaries.get(meshId);
+    if (bucket) {
+      bucket.delete(flowId);
+      if (bucket.size === 0) {
+        pendingFlowSummaries.delete(meshId);
+      }
+    }
+  }
+
+  const fromLabel = formatNodeDisplay(summary.from);
+  const toLabel = summary.to ? formatNodeDisplay(summary.to) : '';
+  const mappingLabel = formatMappingLabel(mapping);
+  const mappingCallsign = formatMappingCallsign(mapping);
+  const mappingComment = extractMappingComment(mapping) || '';
+  const hopInfo = extractHopInfo(summary);
+  const hopsLabel = hopInfo.hopsLabel || summary.hops?.label || null;
+  const position = summary.position || {};
+  const latitude = Number.isFinite(position.latitude) ? Number(position.latitude) : null;
+  const longitude = Number.isFinite(position.longitude) ? Number(position.longitude) : null;
+  const altitude = Number.isFinite(position.altitude) ? Number(position.altitude) : null;
+  const speedKph = Number.isFinite(position.speedKph)
+    ? Number(position.speedKph)
+    : Number.isFinite(position.speedMps)
+      ? Number(position.speedMps) * 3.6
+      : Number.isFinite(position.speedKnots)
+        ? Number(position.speedKnots) * 1.852
+        : null;
+  const sats = Number.isFinite(position.satsInView) ? Number(position.satsInView) : null;
+
+  const entry = {
+    flowId,
+    meshId,
+    timestampMs,
+    timestampLabel: summary.timestampLabel || formatFlowTimestamp(timestampMs),
+    type: summary.type || 'Unknown',
+    icon: TYPE_ICONS[summary.type] || '📦',
+    fromLabel,
+    pathLabel: toLabel ? `${fromLabel} → ${toLabel}` : fromLabel,
+    detail: summary.detail || '',
+    channel: summary.channel ?? '',
+    snr: Number.isFinite(summary.snr) ? Number(summary.snr) : null,
+    rssi: Number.isFinite(summary.rssi) ? Number(summary.rssi) : null,
+    extras: Array.isArray(summary.extraLines) ? summary.extraLines.slice(0, 4) : [],
+    mappingLabel,
+    callsign: mappingCallsign,
+    comment: mappingComment,
+    hopsLabel,
+    hopsUsed: hopInfo.usedHops,
+    hopsTotal: hopInfo.totalHops,
+    latitude,
+    longitude,
+    altitude,
+    speedKph: Number.isFinite(speedKph) ? speedKph : null,
+    satsInView: sats,
+    relayLabel,
+    aprs: null
+  };
+
+  const pendingAprs = pendingAprsUplinks.get(flowId);
+  if (pendingAprs) {
+    entry.aprs = pendingAprs;
+    pendingAprsUplinks.delete(flowId);
+  }
+
+  flowEntries.unshift(entry);
+  flowEntryIndex.set(flowId, entry);
+  if (flowEntries.length > FLOW_MAX_ENTRIES) {
+    const removed = flowEntries.pop();
+    if (removed) {
+      flowEntryIndex.delete(removed.flowId);
+      pendingAprsUplinks.delete(removed.flowId);
+    }
+  }
+
+  renderFlowEntries();
+  updateDashboardCounters();
+}
+
+function flushPendingFlowSummaries() {
+  if (!pendingFlowSummaries.size) return;
+  const meshIds = Array.from(pendingFlowSummaries.keys());
+  meshIds.forEach((meshId) => {
+    if (!findMappingByMeshId(meshId)) {
+      return;
+    }
+    const bucket = pendingFlowSummaries.get(meshId);
+    if (!bucket || !bucket.size) {
+      pendingFlowSummaries.delete(meshId);
+      return;
+    }
+    pendingFlowSummaries.delete(meshId);
+    bucket.forEach((snapshot) => {
+      registerPacketFlow(snapshot, { skipPending: true });
+    });
+  });
+  updateDashboardCounters();
+}
+
+function getFilteredFlowEntries() {
+  const term = flowSearchTerm;
+  let filtered = term
+    ? flowEntries.filter((entry) => flowEntryMatches(entry, term))
+    : flowEntries;
+
+  if (flowFilterState === 'aprs') {
+    filtered = filtered.filter((entry) => Boolean(entry.aprs));
+  } else if (flowFilterState === 'pending') {
+    filtered = filtered.filter((entry) => !entry.aprs);
+  }
+
+  return filtered;
+}
+
+function renderFlowEntries() {
+  if (!flowList) return;
+  const filtered = getFilteredFlowEntries();
+
+  flowList.innerHTML = '';
+
+  if (!flowEntries.length) {
+    flowList.classList.add('hidden');
+    if (flowEmptyState) {
+      flowEmptyState.textContent = '尚未收到封包。';
+      flowEmptyState.classList.remove('hidden');
+    }
+    return;
+  }
+
+  if (!filtered.length) {
+    flowList.classList.add('hidden');
+    if (flowEmptyState) {
+      flowEmptyState.textContent = '沒有符合搜尋條件的封包。';
+      flowEmptyState.classList.remove('hidden');
+    }
+    return;
+  }
+
+  flowEmptyState?.classList.add('hidden');
+  flowList.classList.remove('hidden');
+
+  filtered.forEach((entry) => {
+    const item = document.createElement('div');
+    item.className = 'flow-item';
+    if (entry.aprs) {
+      item.classList.add('flow-item-has-aprs');
+    } else {
+      item.classList.add('flow-item-pending');
+    }
+
+    const header = document.createElement('div');
+    header.className = 'flow-item-header';
+    const statusEl = document.createElement('div');
+    statusEl.className = `flow-item-status ${entry.aprs ? 'flow-item-status--uploaded' : 'flow-item-status--pending'}`;
+    statusEl.textContent = entry.aprs ? '已上傳 APRS' : '待上傳';
+    header.appendChild(statusEl);
+    item.appendChild(header);
+
+    const mappingComment = (entry.comment || '').trim();
+    const infoRow = document.createElement('div');
+    infoRow.className = 'flow-item-row';
+
+    const colLeft = document.createElement('div');
+    colLeft.className = 'flow-item-col flow-item-col-left';
+    const colRight = document.createElement('div');
+    colRight.className = 'flow-item-col flow-item-col-right';
+
+    const leftTexts = new Set();
+    const appendLeft = (text, className) => {
+      const value = (text || '').trim();
+      if (!value || leftTexts.has(value)) return;
+      const el = document.createElement('div');
+      el.className = className;
+      el.textContent = value;
+      colLeft.appendChild(el);
+      leftTexts.add(value);
+    };
+
+    appendLeft(entry.pathLabel, 'flow-item-path');
+    appendLeft(entry.callsign, 'flow-item-callsign');
+    if (entry.mappingLabel !== entry.callsign) {
+      appendLeft(entry.mappingLabel, 'flow-item-mapping');
+    }
+    appendLeft(mappingComment, 'flow-item-comment');
+    if (entry.detail !== mappingComment && entry.detail !== entry.mappingLabel) {
+      appendLeft(entry.detail, 'flow-item-detail');
+    }
+
+    if (!colLeft.childElementCount) {
+      const placeholder = document.createElement('div');
+      placeholder.className = 'flow-item-placeholder';
+      colLeft.appendChild(placeholder);
+    }
+
+    const metaParts = [];
+    if (entry.channel) metaParts.push(`<span class="chip chip-channel">Ch ${entry.channel}</span>`);
+    if (entry.hopsLabel) {
+      metaParts.push(`<span class="chip chip-hops">${entry.hopsLabel}</span>`);
+    } else if (Number.isFinite(entry.hopsUsed) || Number.isFinite(entry.hopsTotal)) {
+      const hopsUsedLabel = Number.isFinite(entry.hopsUsed) ? entry.hopsUsed : '?';
+      const hopsTotalLabel = Number.isFinite(entry.hopsTotal) ? entry.hopsTotal : '?';
+      metaParts.push(`<span class="chip chip-hops">Hops ${hopsUsedLabel}/${hopsTotalLabel}</span>`);
+    }
+    if (entry.relayLabel) {
+      metaParts.push(`<span class="chip chip-relay">${entry.relayLabel}</span>`);
+    }
+    if (Number.isFinite(entry.snr)) metaParts.push(`<span class="chip chip-snr">SNR ${entry.snr.toFixed(1)} dB</span>`);
+    if (Number.isFinite(entry.rssi)) metaParts.push(`<span class="chip chip-rssi">RSSI ${entry.rssi.toFixed(0)} dBm</span>`);
+    if (Number.isFinite(entry.altitude)) metaParts.push(`<span class="chip chip-alt">ALT ${Math.round(entry.altitude)} m</span>`);
+    if (Number.isFinite(entry.speedKph)) metaParts.push(`<span class="chip chip-speed">SPD ${entry.speedKph.toFixed(1)} km/h</span>`);
+    if (Number.isFinite(entry.satsInView)) metaParts.push(`<span class="chip chip-sats">SAT ${entry.satsInView}</span>`);
+    const metaWrap = document.createElement('div');
+    metaWrap.className = 'flow-item-meta';
+    metaWrap.innerHTML = metaParts.join('');
+    colRight.appendChild(metaWrap);
+
+    const timestampEl = document.createElement('div');
+    timestampEl.className = 'flow-item-timestamp';
+    timestampEl.textContent = entry.timestampLabel;
+    colRight.appendChild(timestampEl);
+
+    infoRow.append(colLeft, colRight);
+    item.appendChild(infoRow);
+
+    const extraLines = [];
+    if (entry.extras.length) extraLines.push(entry.extras.join('\n'));
+    if (extraLines.length) {
+      const extra = document.createElement('div');
+      extra.className = 'flow-item-extra';
+      extra.textContent = extraLines.join('\n');
+      item.appendChild(extra);
+    }
+
+    if (entry.aprs) {
+      const aprsBlock = document.createElement('div');
+      aprsBlock.className = 'flow-item-aprs';
+      const label = document.createElement('div');
+      label.className = 'flow-item-aprs-label';
+      label.textContent = `APRS ${entry.aprs.timestampLabel}`;
+      const frame = document.createElement('div');
+      frame.className = 'flow-item-aprs-frame';
+      frame.textContent = entry.aprs.frame || entry.aprs.payload;
+      aprsBlock.appendChild(label);
+      aprsBlock.appendChild(frame);
+      item.appendChild(aprsBlock);
+    }
+
+    flowList.appendChild(item);
+  });
+}
+
+function extractSummaryTimestamp(summary) {
+  if (!summary) return Date.now();
+  const { timestamp } = summary;
+  if (typeof timestamp === 'string') {
+    const parsed = Date.parse(timestamp);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+  if (Number.isFinite(timestamp)) {
+    return Number(timestamp);
+  }
+  if (Number.isFinite(summary.timestampMs)) {
+    return Number(summary.timestampMs);
+  }
+  return Date.now();
+}
+
+function formatFlowTimestamp(ms) {
+  const date = new Date(ms);
+  const hh = `${date.getHours()}`.padStart(2, '0');
+  const mm = `${date.getMinutes()}`.padStart(2, '0');
+  const ss = `${date.getSeconds()}`.padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+function findMappingByMeshId(meshId) {
+  if (!meshId || !Array.isArray(mappingItems)) return null;
+  return mappingItems.find((item) => normalizeMeshId(item.mesh_id ?? item.meshId) === meshId) || null;
+}
+
+function refreshFlowEntryLabels() {
+  let updated = false;
+  flowEntries.forEach((entry) => {
+    const mapping = findMappingByMeshId(entry.meshId);
+    const newMappingLabel = formatMappingLabel(mapping);
+    const newCallsign = formatMappingCallsign(mapping);
+    const newComment = extractMappingComment(mapping) || entry.detail || '';
+    if (entry.mappingLabel !== newMappingLabel) {
+      entry.mappingLabel = newMappingLabel;
+      updated = true;
+    }
+    if (entry.callsign !== newCallsign) {
+      entry.callsign = newCallsign;
+      updated = true;
+    }
+    if (entry.comment !== newComment) {
+      entry.comment = newComment;
+      updated = true;
+    }
+  });
+  if (updated) {
+    renderFlowEntries();
+  }
+}
+
+function handleAprsUplink(info) {
+  if (!info || !info.flowId) return;
+  const entry = flowEntryIndex.get(info.flowId);
+  const timestampMs = Number.isFinite(Number(info.timestamp)) ? Number(info.timestamp) : Date.now();
+  const aprsRecord = {
+    frame: info.frame || info.payload || '',
+    payload: info.payload || '',
+    timestampMs,
+    timestampLabel: formatFlowTimestamp(timestampMs)
+  };
+  if (!entry) {
+    pendingAprsUplinks.set(info.flowId, aprsRecord);
+    return;
+  }
+  entry.aprs = aprsRecord;
+  renderFlowEntries();
+  updateDashboardCounters();
+}
+
+function flowEntryMatches(entry, term) {
+  if (!term) return true;
+  const haystacks = [
+    entry.fromLabel,
+    entry.pathLabel,
+    entry.mappingLabel,
+    entry.callsign,
+    entry.relayLabel,
+    entry.detail,
+    entry.comment,
+    entry.meshId,
+    entry.aprs?.frame,
+    entry.aprs?.payload
+  ];
+  if (Array.isArray(entry.extras)) {
+    haystacks.push(entry.extras.join(' '));
+  }
+  return haystacks.some((value) => {
+    if (!value) return false;
+    return String(value).toLowerCase().includes(term);
+  });
+}
+
+function formatLatLonForCsv(value) {
+  if (!Number.isFinite(value)) return '';
+  const fixed = value.toFixed(6);
+  const trimmed = fixed.replace(/0+$/, '').replace(/\.$/, '');
+  return trimmed.length ? trimmed : '0';
+}
+
+function formatNumericForCsv(value, digits = null) {
+  if (!Number.isFinite(value)) return '';
+  if (digits === null) {
+    return String(value);
+  }
+  const fixed = value.toFixed(digits);
+  return fixed.replace(/0+$/, '').replace(/\.$/, '') || '0';
+}
+
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function downloadFlowCsv() {
+  const exportEntries = getFilteredFlowEntries();
+  if (!exportEntries.length) {
+    appendLog('FLOW', 'no mapping entries available for export');
+    return;
+  }
+
+  const header = ['時間', '呼號', 'MeshID', '最後轉發', '目前跳數', '總跳數', 'SNR', 'RSSI', 'Lat', 'Lon', '高度', '速度', 'comment'];
+  const rows = exportEntries.map((entry) => {
+    const unixTime = Number.isFinite(entry.timestampMs) ? Math.floor(entry.timestampMs / 1000) : '';
+    const snrValue = formatNumericForCsv(entry.snr, 2);
+    const rssiValue = formatNumericForCsv(entry.rssi, 0);
+    const latValue = formatLatLonForCsv(entry.latitude);
+    const lonValue = formatLatLonForCsv(entry.longitude);
+    const altitudeValue = formatNumericForCsv(entry.altitude, 1);
+    const speedValue = formatNumericForCsv(entry.speedKph, 1);
+    const hopsUsed = Number.isFinite(entry.hopsUsed) ? entry.hopsUsed : '';
+    const hopsTotal = Number.isFinite(entry.hopsTotal) ? entry.hopsTotal : '';
+
+    const fields = [
+      unixTime,
+      entry.callsign || entry.mappingLabel || '',
+      entry.meshId || '',
+      entry.relayLabel || '',
+      hopsUsed,
+      hopsTotal,
+      snrValue,
+      rssiValue,
+      latValue,
+      lonValue,
+      altitudeValue,
+      speedValue,
+      entry.comment || ''
+    ];
+
+    return fields.map(escapeCsvValue).join(',');
+  });
+
+  const csvContent = [header.map(escapeCsvValue).join(','), ...rows].join('\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `mapping-log-${timestamp}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  appendLog('FLOW', `exported ${rows.length} mapping entries to CSV`);
+}
+
+function formatMappingLabel(mapping) {
+  if (!mapping) return null;
+  const commentRaw = extractMappingComment(mapping) || '';
+  const callsign = formatMappingCallsign(mapping) || '';
+  if (commentRaw) {
+    const trimmed = callsign
+      ? commentRaw.replace(new RegExp(`^${callsign.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[\s·-]+)?`), '')
+      : commentRaw;
+    return trimmed.trim() || callsign || null;
+  }
+  return callsign || null;
+}
+
+function formatMappingCallsign(mapping) {
+  if (!mapping) return null;
+  const baseRaw = mapping.callsign_base ?? mapping.callsignBase ?? mapping.callsign ?? null;
+  const ssidValue = mapping.aprs_ssid ?? mapping.aprsSsid ?? mapping.ssid ?? mapping.SSID ?? null;
+  if (!baseRaw) return null;
+  const ssidNum = Number(ssidValue);
+  if (Number.isFinite(ssidNum) && ssidNum !== 0) {
+    const suffixPattern = new RegExp(`-${ssidNum}$`);
+    if (suffixPattern.test(baseRaw)) {
+      return baseRaw.replace(/--+/g, '-');
+    }
+    const trimmed = baseRaw.endsWith('-') ? baseRaw.slice(0, -1) : baseRaw;
+    return `${trimmed}-${ssidNum}`.replace(/--+/g, '-');
+  }
+  return (baseRaw.endsWith('-') ? baseRaw.slice(0, -1) : baseRaw).replace(/--+/g, '-');
+}
+
+function extractMappingComment(mapping) {
+  if (!mapping) return '';
+  return (
+    mapping.comment ??
+    mapping.aprs_comment ??
+    mapping.aprsComment ??
+    mapping.notes ??
+    ''
+  );
+}
+
+function formatNodes(summary) {
+  const fromLabel = formatNodeDisplay(summary.from);
+  const toLabel = summary.to ? formatNodeDisplay(summary.to) : null;
+  if (!toLabel) {
+    return fromLabel;
+  }
+  return `${fromLabel} → ${toLabel}`;
+}
+
+function formatNodeDisplay(node) {
+  if (!node) {
+    return 'unknown';
+  }
+  const name = node.longName || (node.label && node.label !== 'unknown' ? node.label : null);
+  let meshId = node.meshId;
+  if (meshId && meshId.startsWith('0x')) {
+    meshId = `!${meshId.slice(2)}`;
+  }
+  if (name && meshId) {
+    return name.includes(meshId) ? name : `${name} (${meshId})`;
+  }
+  if (name) {
+    return name;
+  }
+  if (meshId) {
+    return meshId;
+  }
+  return 'unknown';
+}
+
+function formatNumber(value, digits) {
+  if (value === undefined || value === null || Number.isNaN(value)) {
+    return '';
+  }
+  return value.toFixed(digits);
+}
+
+function setConnectingState(nextState) {
+  isConnecting = nextState;
+  if (isConnecting) {
+    isConnected = false;
+  }
+  updateToggleButton();
+}
+
+function setConnectedState(nextState) {
+  isConnected = nextState;
+  if (nextState) {
+    isConnecting = false;
+    manualDisconnect = false;
+    autoConnectAttempts = 0;
+    lastActivityAt = Date.now();
+    flowCaptureEnabledAt = Date.now() + FLOW_CAPTURE_DELAY_MS;
+    startInactivityMonitor();
+    stopReconnectLoop();
+  } else {
+    isConnecting = false;
+    flowCaptureEnabledAt = 0;
+    stopInactivityMonitor();
+  }
+  updateToggleButton();
+}
+
+function updateStatus(status, message, nonce) {
+  if (status === 'handshake') {
+    return;
+  }
+  statusIndicator.className = `status status-${status || 'idle'}`;
+  const icon = STATUS_ICONS[status] || STATUS_ICONS.idle;
+  const labelGenerator = STATUS_LABELS[status] || STATUS_LABELS.idle;
+  const label = typeof labelGenerator === 'function' ? labelGenerator(nonce ?? message) : labelGenerator;
+  statusIndicator.textContent = `${icon} ${label}`;
+}
+
+function renderTypeCell(cell, summary) {
+  const type = summary.type ?? '';
+  const icon = TYPE_ICONS[type] || '📦';
+  cell.innerHTML = '';
+
+  const iconEl = document.createElement('span');
+  iconEl.className = 'type-icon';
+  iconEl.textContent = icon;
+
+  const textEl = document.createElement('span');
+  textEl.textContent = type;
+
+  cell.append(iconEl, textEl);
+}
+
+function showDiscoverModal(devices) {
+  if (!discoverModal || !discoverModalBody) return;
+  discoverModalBody.innerHTML = '';
+
+  if (!devices.length) {
+    const empty = document.createElement('div');
+    empty.textContent = '尚未偵測到裝置';
+    discoverModalBody.appendChild(empty);
+  } else {
+    devices.forEach((device) => {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'device-option';
+
+      const label = document.createElement('span');
+      label.textContent = formatDeviceLabel(device);
+      const meta = document.createElement('span');
+      meta.className = 'device-meta';
+      meta.textContent = formatDeviceMeta(device);
+
+      option.append(label, meta);
+      option.addEventListener('click', () => {
+        applyDiscoveredDevice(device);
+      });
+      discoverModalBody.appendChild(option);
+    });
+  }
+
+  discoverModal.classList.remove('hidden');
+}
+
+function hideDiscoverModal() {
+  if (!discoverModal) return;
+  discoverModal.classList.add('hidden');
+}
+
+function formatDeviceLabel(device) {
+  return device.name || device.host || 'Meshtastic';
+}
+
+function formatDeviceMeta(device) {
+  const address = device.addresses?.find((a) => isIPv4(a)) || device.host;
+  const port = device.port ?? 4403;
+  const parts = [];
+  if (address) parts.push(`${address}:${port}`);
+  if (device.txt) {
+    const txtEntries = Object.entries(device.txt)
+      .filter(([, value]) => value)
+      .map(([key, value]) => `${key}=${value}`);
+    if (txtEntries.length) {
+      parts.push(txtEntries.join(', '));
+    }
+  }
+  return parts.join(' · ');
+}
+
+function applyDiscoveredDevice(device) {
+  const address = device.addresses?.find((a) => isIPv4(a)) || device.host;
+  if (!address) {
+    setDiscoverStatus('該裝置沒有可用的位址', 'warn');
+    appendLog('DISCOVER', 'device missing usable address');
+    return;
+  }
+  settingsHostInput.value = address;
+  savePreferences();
+  updateConnectAvailability();
+  setDiscoverStatus(`已套用 ${device.name || address}`, 'success');
+  hideDiscoverModal();
+  appendLog('DISCOVER', `selected ${device.name || address}`);
+}
+
+function setDiscoveringState(isDiscovering) {
+  discoverBtn.disabled = isDiscovering;
+  discoverBtn.textContent = isDiscovering ? '掃描中...' : '自動搜尋';
+}
+
+function setDiscoverStatus(message, variant = 'info') {
+  if (!discoverStatus) return;
+  if (!message) {
+    discoverStatus.textContent = '';
+    delete discoverStatus.dataset.variant;
+    return;
+  }
+  discoverStatus.textContent = message;
+  discoverStatus.dataset.variant = variant;
+}
+
+function activatePage(targetId) {
+  const pages = [
+    { id: 'monitor-page', element: monitorPage },
+    { id: 'flow-page', element: flowPage },
+    { id: 'settings-page', element: settingsPage },
+    { id: 'log-page', element: logPage },
+    { id: 'info-page', element: infoPage }
+  ];
+  pages.forEach(({ id, element }) => {
+    if (!element) return;
+    const active = id === targetId;
+    element.classList.toggle('hidden', !active);
+    element.classList.toggle('active', active);
+  });
+  navButtons.forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.target === targetId);
+  });
+}
+
+function isIPv4(address) {
+  return typeof address === 'string' && /^\d{1,3}(\.\d{1,3}){3}$/.test(address);
+}
+
+function hasApiKey() {
+  return callmeshHasServerKey;
+}
+
+function hasHost() {
+  return getHostValue().length > 0;
+}
+
+function updateConnectAvailability() {
+  updateToggleButton();
+  refreshOverlay();
+}
+
+function setOverlayStatus(message, variant = 'info') {
+  if (!overlayStatus) return;
+  overlayStatus.textContent = message || '';
+  overlayStatus.dataset.variant = variant;
+}
+
+function showOverlay() {
+  if (!callmeshOverlay) return;
+  if (overlayKeyInput) overlayKeyInput.value = apiKeyInput.value.trim();
+  callmeshOverlay.classList.remove('hidden');
+  setOverlayStatus('請輸入 API Key 以開始使用', 'info');
+  setTimeout(() => overlayKeyInput?.focus(), 50);
+}
+
+function hideOverlay() {
+  if (!callmeshOverlay) return;
+  callmeshOverlay.classList.add('hidden');
+  setOverlayStatus('', 'info');
+}
+
+function refreshOverlay() {
+  if (hasApiKey()) {
+    hideOverlay();
+  } else {
+    showOverlay();
+  }
+}
+
+async function validateApiKey(key, { auto = false, source = 'main' } = {}) {
+  const trimmed = (key || '').trim();
+  const statusLabel = trimmed ? '正在驗證 API Key...' : '已清除 API Key';
+  if (!auto) {
+    if (source === 'overlay') {
+      setOverlayStatus(statusLabel, 'info');
+    } else {
+      setDiscoverStatus(statusLabel, 'info');
+    }
+  }
+
+  if (source === 'overlay') {
+    if (overlaySaveBtn) overlaySaveBtn.disabled = true;
+    if (overlayRetryBtn) overlayRetryBtn.disabled = true;
+  }
+
+  try {
+    const info = await window.meshtastic.saveCallmeshKey?.(trimmed);
+    if (!info) return;
+
+    if (info.success) {
+      if (info.hasKey) {
+        const statusMsg = info.degraded
+          ? `CallMesh 暫時無回應，沿用已驗證的 Key (${info.statusText || 'degraded'})`
+          : 'API Key 驗證成功';
+        setDiscoverStatus(statusMsg, info.degraded ? 'warn' : 'success');
+        setOverlayStatus(statusMsg, info.degraded ? 'warn' : 'success');
+        appendLog('CALLMESH', `API key verified degraded=${Boolean(info.degraded)}`);
+        apiKeyInput.value = trimmed;
+        if (overlayKeyInput) overlayKeyInput.value = trimmed;
+        callmeshHasServerKey = true;
+        callmeshDegraded = Boolean(info.degraded);
+        lastVerifiedKey = trimmed;
+        hideOverlay();
+      } else {
+        setDiscoverStatus('API Key 已移除', 'warn');
+        setOverlayStatus('API Key 已移除', 'warn');
+        appendLog('CALLMESH', 'API key removed');
+        apiKeyInput.value = '';
+        if (overlayKeyInput) overlayKeyInput.value = '';
+        callmeshHasServerKey = false;
+        callmeshDegraded = false;
+        lastVerifiedKey = '';
+        showOverlay();
+    }
+    if (info.statusText) platformStatus.textContent = info.statusText;
+    savePreferences();
+    } else {
+      setDiscoverStatus(`API Key 驗證失敗：${info?.error || '未知錯誤'}`, 'error');
+      setOverlayStatus(`API Key 驗證失敗：${info?.error || '未知錯誤'}`, 'error');
+      appendLog('CALLMESH', `API key verify failed ${info?.error || 'unknown error'}`);
+      callmeshHasServerKey = false;
+      callmeshDegraded = false;
+      platformStatus.textContent = info?.statusText || 'CallMesh: Key 驗證失敗';
+      apiKeyInput.value = '';
+          if (overlayKeyInput) overlayKeyInput.value = '';
+        apiKeyInput.focus();
+      apiKeyInput.select();
+      lastVerifiedKey = '';
+      savePreferences();
+      showOverlay();
+    }
+  } catch (err) {
+    setDiscoverStatus(`驗證過程發生錯誤：${err.message}`, 'error');
+    setOverlayStatus(`驗證過程發生錯誤：${err.message}`, 'error');
+    appendLog('CALLMESH', `API key verify error ${err.message}`);
+    callmeshHasServerKey = false;
+    callmeshDegraded = false;
+    apiKeyInput.value = '';
+    if (overlayKeyInput) overlayKeyInput.value = '';
+    lastVerifiedKey = '';
+    savePreferences();
+    showOverlay();
+  } finally {
+    updateConnectAvailability();
+    if (source === 'overlay') {
+      if (overlaySaveBtn) overlaySaveBtn.disabled = false;
+      if (overlayRetryBtn) overlayRetryBtn.disabled = false;
+    }
+  }
+}
+
+function updateToggleButton() {
+  if (!connectBtn) return;
+  if (isConnecting || manualConnectActive) {
+    connectBtn.textContent = '取消連線';
+    connectBtn.disabled = false;
+    connectBtn.dataset.state = 'connecting';
+    return;
+  }
+
+  if (isConnected) {
+    connectBtn.textContent = '中斷連線';
+    connectBtn.disabled = false;
+    connectBtn.dataset.state = 'connected';
+    return;
+  }
+
+  connectBtn.textContent = '連線';
+  connectBtn.disabled = !hasApiKey() || !hasHost();
+  connectBtn.dataset.state = 'idle';
+}
+
+function scheduleInitialAutoConnect() {
+  clearAutoConnectTimer();
+  if (manualDisconnect || isConnected || isConnecting) {
+    return;
+  }
+  initialAutoConnectActive = true;
+  autoConnectAttempts = 0;
+  autoConnectTimer = setTimeout(attemptAutoConnect, 500);
+  appendLog('CONNECT', 'scheduled initial auto-connect');
+}
+
+async function attemptAutoConnect() {
+  clearAutoConnectTimer();
+  if (manualDisconnect || isConnected || isConnecting) {
+    initialAutoConnectActive = false;
+    return;
+  }
+  appendLog('CONNECT', `auto attempt ${autoConnectAttempts + 1}`);
+  const success = await connectNow({ context: 'initial' });
+  if (!success) {
+    autoConnectAttempts += 1;
+    if (autoConnectAttempts < AUTO_CONNECT_MAX_ATTEMPTS) {
+      autoConnectTimer = setTimeout(attemptAutoConnect, AUTO_CONNECT_DELAY_MS);
+      return;
+    }
+    initialAutoConnectActive = false;
+    allowReconnectLoop = false;
+    stopReconnectLoop();
+  } else {
+    initialAutoConnectActive = false;
+    allowReconnectLoop = true;
+  }
+}
+
+function clearAutoConnectTimer() {
+  if (autoConnectTimer) {
+    clearTimeout(autoConnectTimer);
+    autoConnectTimer = null;
+  }
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function clearManualConnectRetryTimer() {
+  if (manualConnectRetryTimer) {
+    clearTimeout(manualConnectRetryTimer);
+    manualConnectRetryTimer = null;
+  }
+  if (manualConnectRetryResolver) {
+    manualConnectRetryResolver();
+    manualConnectRetryResolver = null;
+  }
+}
+
+function waitManualRetryDelay() {
+  return new Promise((resolve) => {
+    manualConnectRetryResolver = () => {
+      if (manualConnectRetryResolver) {
+        manualConnectRetryResolver = null;
+        manualConnectRetryTimer = null;
+        resolve();
+      }
+    };
+    manualConnectRetryTimer = setTimeout(() => {
+      manualConnectRetryTimer = null;
+      manualConnectRetryResolver = null;
+      resolve();
+    }, MANUAL_CONNECT_DELAY_MS);
+  });
+}
+
+function cancelManualConnect({ silent = false } = {}) {
+  if (!manualConnectActive && !isConnecting) return;
+  manualConnectAbort = true;
+  manualConnectSession += 1;
+  clearManualConnectRetryTimer();
+  appendLog('CONNECT', 'manual connect cancelled by user');
+  performDisconnect({ silent: true, preserveManual: false }).finally(() => {
+    manualConnectActive = false;
+    manualConnectAttempts = 0;
+    allowReconnectLoop = false;
+    stopReconnectLoop();
+    setConnectingState(false);
+    if (!silent) updateStatus('idle');
+    updateConnectAvailability();
+    updateToggleButton();
+  });
+}
+
+async function manualConnectWithRetries() {
+  if (manualConnectActive) return false;
+  manualDisconnect = false;
+  stopReconnectLoop();
+  allowReconnectLoop = false;
+  clearManualConnectRetryTimer();
+  manualConnectActive = true;
+  manualConnectAbort = false;
+  manualConnectAttempts = 0;
+  const sessionId = ++manualConnectSession;
+  updateToggleButton();
+
+  try {
+    while (!manualConnectAbort && manualConnectAttempts < MANUAL_CONNECT_MAX_ATTEMPTS) {
+      manualConnectAttempts += 1;
+      appendLog('CONNECT', `manual attempt ${manualConnectAttempts}`);
+      const success = await connectNow({ context: 'manual' });
+
+      if (manualConnectAbort || sessionId !== manualConnectSession) {
+        appendLog('CONNECT', 'manual session aborted before completion');
+        allowReconnectLoop = false;
+        updateStatus('idle');
+        return false;
+      }
+
+      if (success) {
+        resumeAutoReconnect({ reason: 'manual-success' });
+        allowReconnectLoop = true;
+        return true;
+      }
+
+      if (manualConnectAttempts >= MANUAL_CONNECT_MAX_ATTEMPTS) {
+        break;
+      }
+
+      appendLog(
+        'CONNECT',
+        `manual retry ${manualConnectAttempts + 1} scheduled in ${MANUAL_CONNECT_DELAY_MS / 1000}s`
+      );
+      updateStatus('error', '連線失敗，將在 5 秒後重試');
+      await waitManualRetryDelay();
+      clearManualConnectRetryTimer();
+      if (manualConnectAbort || sessionId !== manualConnectSession) {
+        appendLog('CONNECT', 'manual session aborted during wait');
+        allowReconnectLoop = false;
+        updateStatus('idle');
+        return false;
+      }
+    }
+
+    allowReconnectLoop = false;
+    updateStatus('error', '手動連線失敗');
+    appendLog('CONNECT', 'manual retries exhausted');
+    return false;
+  } finally {
+    clearManualConnectRetryTimer();
+    manualConnectActive = false;
+    manualConnectAbort = false;
+    manualConnectAttempts = 0;
+    updateToggleButton();
+    updateConnectAvailability();
+  }
+}
+
+async function connectNow({ context = 'manual' } = {}) {
+  if (isConnecting || isConnected) {
+    return false;
+  }
+
+  const host = getHostValue();
+  if (!host) {
+    if (context === 'manual') {
+      setDiscoverStatus('請先設定 Host', 'error');
+      updateStatus('error', 'Host 未設定');
+    }
+    updateConnectAvailability();
+    return false;
+  }
+
+  if (!hasApiKey()) {
+    if (context === 'manual') {
+      setDiscoverStatus('請先設定 CallMesh API Key', 'error');
+      updateStatus('error', 'API Key 未設定');
+    }
+    updateConnectAvailability();
+    return false;
+  }
+
+  setConnectingState(true);
+  const statusMessage = context === 'reconnect' ? '重新連線中...' : '連線中...';
+  updateStatus('connecting', statusMessage);
+  appendLog('CONNECT', `attempt context=${context} host=${host}`);
+
+  try {
+    await window.meshtastic.connect({
+      host,
+      port: 4403,
+      handshake: true,
+      heartbeat: 0
+    });
+    appendLog('CONNECT', `success context=${context}`);
+    return true;
+  } catch (err) {
+    console.error('連線失敗:', err);
+    if (context === 'manual') {
+      updateStatus('error', err.message);
+    } else if (context === 'initial') {
+      updateStatus('error', '自動連線失敗，稍候再嘗試');
+    } else if (context === 'reconnect') {
+      updateStatus('error', '連線中斷，正在重試');
+    }
+    appendLog('CONNECT', `failure context=${context} error=${err.message}`);
+    return false;
+  } finally {
+    setConnectingState(false);
+    updateConnectAvailability();
+  }
+}
+
+async function performDisconnect({ silent = false, preserveManual = false } = {}) {
+  manualConnectAbort = true;
+  stopInactivityMonitor();
+  stopReconnectLoop();
+  clearAutoConnectTimer();
+  clearManualConnectRetryTimer();
+  appendLog('DISCONNECT', `request silent=${silent} preserveManual=${preserveManual}`);
+  try {
+    await window.meshtastic.disconnect();
+  } catch (err) {
+    console.warn('中斷連線失敗:', err);
+    if (!silent) {
+      setDiscoverStatus(`中斷失敗：${err.message}`, 'error');
+    }
+    appendLog('DISCONNECT', `error ${err.message}`);
+  }
+  if (!preserveManual) {
+    manualDisconnect = false;
+  }
+  setConnectedState(false);
+  if (!silent) {
+    updateStatus('disconnected');
+  }
+  clearSelfNodeDisplay();
+  appendLog('DISCONNECT', 'completed');
+}
+
+function startReconnectLoop() {
+  if (manualDisconnect) {
+    return;
+  }
+  if (autoReconnectSuspended) {
+    appendLog('CONNECT', 'reconnect loop suppressed (auto reconnect suspended)');
+    return;
+  }
+  if (!allowReconnectLoop || manualConnectActive) {
+    appendLog('CONNECT', 'reconnect loop suppressed');
+    return;
+  }
+  if (!hasHost() || !hasApiKey()) {
+    return;
+  }
+  if (reconnectTimer) {
+    return;
+  }
+  appendLog('CONNECT', 'start reconnect loop');
+  scheduleReconnectAttempt(INITIAL_RECONNECT_DELAY_MS);
+}
+
+function stopReconnectLoop() {
+  if (reconnectTimer) {
+    clearReconnectTimer();
+    appendLog('CONNECT', 'stop reconnect loop');
+  }
+}
+
+function startInactivityMonitor() {
+  stopInactivityMonitor();
+  inactivityTimer = setInterval(checkInactivity, RECONNECT_INTERVAL_MS);
+}
+
+function stopInactivityMonitor() {
+  if (inactivityTimer) {
+    clearInterval(inactivityTimer);
+    inactivityTimer = null;
+  }
+}
+
+function checkInactivity() {
+  if (!isConnected || manualDisconnect) {
+    return;
+  }
+  if (!lastActivityAt) {
+    return;
+  }
+  const idleDuration = Date.now() - lastActivityAt;
+  if (idleDuration >= INACTIVITY_THRESHOLD_MS) {
+    handleInactivityReconnect();
+  }
+}
+
+async function handleInactivityReconnect() {
+  updateStatus('error', '超過 10 分鐘未收到節點資料，重新連線中');
+  manualDisconnect = false;
+  appendLog('CONNECT', 'idle timeout reached, reconnecting');
+  await performDisconnect({ silent: true, preserveManual: false });
+  startReconnectLoop();
+}
+
+function scheduleReconnectAttempt(delayMs = 0) {
+  clearReconnectTimer();
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    if (!allowReconnectLoop || manualDisconnect || manualConnectActive || autoReconnectSuspended) {
+      appendLog('CONNECT', 'reconnect attempt cancelled (state changed)');
+      return;
+    }
+    if (isConnecting || isConnected) {
+      appendLog('CONNECT', 'reconnect attempt skipped (already connecting/connected)');
+      return;
+    }
+    if (!hasHost() || !hasApiKey()) {
+      appendLog('CONNECT', 'reconnect attempt skipped (missing host/api key)');
+      return;
+    }
+
+    appendLog('CONNECT', `attempt context=reconnect host=${getHostValue()}`);
+    const success = await connectNow({ context: 'reconnect' });
+
+    if (!success) {
+      recordReconnectFailure('connect-failure');
+    }
+
+    if (!success && !autoReconnectSuspended && allowReconnectLoop && !manualDisconnect && !manualConnectActive) {
+      appendLog('CONNECT', `reconnect retry scheduled in ${RECONNECT_INTERVAL_MS / 1000}s`);
+      scheduleReconnectAttempt(RECONNECT_INTERVAL_MS);
+    }
+  }, delayMs);
+}
+
+function registerPacketActivity(summary) {
+  lastActivityAt = Date.now();
+  const fromMeshId = summary?.from?.meshId || summary?.from?.meshIdNormalized;
+  if (fromMeshId && isSelfMeshId(fromMeshId)) {
+    return;
+  }
+  const timestamp = typeof summary.timestamp === 'string'
+    ? Date.parse(summary.timestamp)
+    : summary.timestamp ? Number(summary.timestamp) : Date.now();
+  const ts = Number.isFinite(timestamp) ? timestamp : Date.now();
+  const bucketKey = Math.floor(ts / PACKET_BUCKET_MS) * PACKET_BUCKET_MS;
+  const current = packetBuckets.get(bucketKey) ?? 0;
+  packetBuckets.set(bucketKey, current + 1);
+  prunePacketBuckets();
+  packetSummaryLast10Min = Array.from(packetBuckets.values()).reduce((sum, count) => sum + count, 0);
+  updateDashboardCounters();
+}
+
+function prunePacketBuckets() {
+  const cutoff = Date.now() - PACKET_WINDOW_MS;
+  for (const key of Array.from(packetBuckets.keys())) {
+    if (key < cutoff) {
+      packetBuckets.delete(key);
+    }
+  }
+}
+
+function handleSelfInfoEvent(info) {
+  if (!info || !info.node) {
+    return;
+  }
+  const node = info.node;
+  if (info.raw != null) {
+    selfNodeState.raw = info.raw;
+  }
+  if (node.meshId) {
+    selfNodeState.meshId = node.meshId;
+    selfNodeState.normalizedMeshId = normalizeMeshId(node.meshId);
+  }
+  const name = node.longName || (node.label && node.label !== 'unknown' ? node.label : null);
+  if (name) {
+    selfNodeState.name = name;
+  }
+  applySelfNodeDisplay();
+  appendLog('SELF', `myInfo meshId=${selfNodeState.meshId || 'unknown'} name=${selfNodeState.name || 'unknown'}`);
+}
+
+function maybeUpdateSelfNodeFromSummary(summary) {
+  if (!summary || !summary.from) {
+    return;
+  }
+  const node = summary.from;
+  const meshId = node.meshId || null;
+  const normalizedMeshId = meshId ? normalizeMeshId(meshId) : null;
+  const raw = node.raw ?? null;
+
+  const hasState = Boolean(selfNodeState.meshId) || selfNodeState.raw != null;
+  const matchesMesh = (selfNodeState.meshId && meshId && selfNodeState.meshId === meshId)
+    || (selfNodeState.normalizedMeshId && normalizedMeshId && selfNodeState.normalizedMeshId === normalizedMeshId);
+  const matchesRaw = selfNodeState.raw != null && raw != null && selfNodeState.raw === raw;
+  const shouldInitialize = !hasState && meshId;
+
+  if (!matchesMesh && !matchesRaw && !shouldInitialize) {
+    return;
+  }
+
+  let updated = false;
+  if (meshId) {
+    if (selfNodeState.meshId !== meshId) {
+      selfNodeState.meshId = meshId;
+      updated = true;
+    }
+    if (selfNodeState.normalizedMeshId !== normalizedMeshId) {
+      selfNodeState.normalizedMeshId = normalizedMeshId;
+      updated = true;
+    }
+  }
+  if (raw != null) {
+    if (selfNodeState.raw !== raw) {
+      selfNodeState.raw = raw;
+      updated = true;
+    }
+  }
+
+  const name = node.longName || (node.label && node.label !== 'unknown' ? node.label : null);
+  if (name) {
+    if (selfNodeState.name !== name) {
+      selfNodeState.name = name;
+      updated = true;
+    }
+  }
+
+  applySelfNodeDisplay();
+  if (updated) {
+    appendLog('SELF', `updated from packet meshId=${selfNodeState.meshId || 'unknown'} name=${selfNodeState.name || 'unknown'}`);
+  }
+}
+
+function applySelfNodeDisplay() {
+  if (!currentNodeDisplay || !currentNodeText) {
+    return;
+  }
+  if (!selfNodeState || (!selfNodeState.name && !selfNodeState.meshId)) {
+    currentNodeDisplay.classList.add('hidden');
+    currentNodeText.textContent = '尚未取得節點資訊';
+    return;
+  }
+  const parts = [];
+  if (selfNodeState.name) parts.push(selfNodeState.name);
+  if (selfNodeState.meshId) parts.push(selfNodeState.meshId);
+  currentNodeText.textContent = parts.join(' · ');
+  currentNodeDisplay.classList.remove('hidden');
+}
+
+function clearSelfNodeDisplay() {
+  selfNodeState.name = null;
+  selfNodeState.meshId = null;
+  selfNodeState.normalizedMeshId = null;
+  selfNodeState.raw = null;
+  applySelfNodeDisplay();
+  appendLog('SELF', 'cleared self node state');
+}
+
+function updateProvisionInfo(provision, mappingSyncedAt) {
+  if (!infoCallsign) return;
+  if (!provision) {
+    infoCallsign.textContent = '—';
+    infoSymbol.textContent = '—';
+    if (infoCoords) infoCoords.textContent = '—';
+    infoComment.textContent = '—';
+    infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : '—';
+    lastProvisionSignature = null;
+    return;
+  }
+
+  const callsign = provision.callsign_base || '—';
+  const ssidSuffix = formatAprsSsid(provision.ssid);
+  const aprsCallsign = callsign === '—' ? '—' : (ssidSuffix ? `${callsign}${ssidSuffix}` : callsign);
+  const symbolTable = provision.symbol_table || '';
+  const symbolCode = provision.symbol_code || '';
+  const overlayChar = provision.symbol_overlay || '';
+  const overlaySymbol = overlayChar && symbolCode ? `${overlayChar}${symbolCode}` : '';
+  const symbol = symbolTable || symbolCode ? `${symbolTable}${symbolCode}` : '';
+  const displaySymbol = overlaySymbol || symbol || '—';
+  const comment = provision.comment || '—';
+
+  infoCallsign.textContent = aprsCallsign;
+  infoSymbol.textContent = displaySymbol;
+  if (infoCoords) infoCoords.textContent = formatProvisionCoords(provision);
+  infoComment.textContent = comment;
+  infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : new Date().toLocaleString();
+
+  const signature = JSON.stringify({
+    aprsCallsign,
+    displaySymbol,
+    comment,
+    coords: infoCoords ? infoCoords.textContent : ''
+  });
+  if (signature !== lastProvisionSignature) {
+    lastProvisionSignature = signature;
+    appendLog('PROVISION', `callsign=${aprsCallsign} symbol=${displaySymbol}`);
+  }
+}
+
+function formatProvisionCoords(provision) {
+  const lat = provision.latitude; // maybe null
+  const lon = provision.longitude;
+  if (lat == null || lon == null) return '—';
+  const latFmt = Number(lat).toFixed(4);
+  const lonFmt = Number(lon).toFixed(4);
+  return `(${latFmt}, ${lonFmt})`;
+}
+
+function formatRelativeTime(isoString) {
+  if (!isoString) return '—';
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) {
+    return isoString;
+  }
+  const diff = Date.now() - date.getTime();
+  if (diff < 60_000) {
+    return '剛剛';
+  }
+  const minutes = Math.floor(diff / 60_000);
+  if (minutes < 60) {
+    return `${minutes} 分鐘前`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours} 小時前`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 7) {
+    return `${days} 天前`;
+  }
+  return date.toLocaleString();
+}
+
+function formatAprsSsid(ssid) {
+  if (ssid === null || ssid === undefined) return '';
+  if (ssid === 0) return '';
+  if (ssid < 0) return `${ssid}`;
+  return `-${ssid}`;
+}

@@ -1,0 +1,30 @@
+{
+  "name": "meshtastic-tcp-client",
+  "version": "0.2.6",
+  "private": true,
+  "description": "簡易 Meshtastic TCP 封包擷取與解析工具",
+  "main": "src/electron/main.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "desktop": "electron src/electron/main.js",
+    "build:win": "node scripts/build-win.js",
+    "build:linux": "node scripts/build-linux.js",
+    "build:mac-cli": "pkg src/index.js --config package.json --targets node18-macos-x64 --compress Brotli --public --output dist/cli/tmag-cli"
+  },
+  "dependencies": {
+    "bonjour-service": "^1.2.1",
+    "protobufjs": "^7.2.5",
+    "unishox2.siara.cc": "^1.1.5",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "electron": "^30.0.9",
+    "electron-packager": "^17.1.2",
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "assets": [
+      "proto/**/*"
+    ]
+  }
+}

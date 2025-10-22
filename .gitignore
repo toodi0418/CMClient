@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+*.zip
+*.asar
+*.exe
+*.app
+
+# Logs and temp
+*.log
+*.tmp
+*.swp
+
+# macOS metadata
+.DS_Store
