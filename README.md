@@ -70,6 +70,42 @@ export CALLMESH_ARTIFACTS_DIR=~/.config/callmesh/
 
 ---
 
+### Raspberry Pi 快速部署
+
+樹莓派預設沒有 Node.js，可依下列步驟一次完成：
+
+```bash
+# 系統更新 + 安裝 git / curl
+sudo apt update && sudo apt install -y git curl
+
+# 安裝 nvm 並使用 Node.js 18（建議 LTS）
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
+source ~/.nvm/nvm.sh
+nvm install 18
+nvm use 18
+
+# 取得 TMAG 並安裝依賴
+git clone https://github.com/toodi0418/CMClient.git
+cd CMClient
+npm install
+
+# 匯入 CallMesh API Key 後直接啟動 CLI
+export CALLMESH_API_KEY="你的 Key"
+node src/index.js --host 127.0.0.1 --port 4403
+```
+
+若想在 Pi 上打包成單一執行檔，可再執行：
+
+```bash
+npx pkg src/index.js \
+  --config package.json \
+  --targets node18-linux-armv7 \
+  --compress Brotli --public \
+  --output tmag-cli-linux-armv7
+```
+
+---
+
 ## 4. CLI 快速上手
 
 CLI 預設會驗證 CallMesh API Key、啟動 heartbeat 與 Mapping 同步，再連線 Meshtastic TCP 並自動轉發到 APRS。
