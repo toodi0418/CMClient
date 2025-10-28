@@ -449,6 +449,18 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     mainWindow?.webContents.send('meshtastic:summary', summary);
   });
 
+  client.on('fromRadio', ({ message }) => {
+    if (!message) return;
+    try {
+      const plainObject = client.toObject(message, {
+        bytes: String
+      });
+      mainWindow?.webContents.send('meshtastic:fromRadio', plainObject);
+    } catch (err) {
+      console.error('序列化 Meshtastic 訊息失敗:', err);
+    }
+  });
+
   client.on('myInfo', (info) => {
     bridge?.handleMeshtasticMyInfo(info);
     mainWindow?.webContents.send('meshtastic:myInfo', info);

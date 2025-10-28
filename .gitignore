@@ -15,3 +15,7 @@ dist/
 
 # macOS metadata
 .DS_Store
+
+# Internal documentation (keep local only)
+docs/callmesh-client.md
+docs/handover.md

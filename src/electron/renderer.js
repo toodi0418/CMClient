@@ -64,12 +64,17 @@ const monitorPage = document.getElementById('monitor-page');
 const settingsPage = document.getElementById('settings-page');
 const logPage = document.getElementById('log-page');
 const infoPage = document.getElementById('info-page');
+const jsonPage = document.getElementById('json-page');
 const flowPage = document.getElementById('flow-page');
 const flowList = document.getElementById('flow-list');
 const flowEmptyState = document.getElementById('flow-empty-state');
 const flowSearchInput = document.getElementById('flow-search');
 const flowFilterStateSelect = document.getElementById('flow-filter-state');
 const flowDownloadBtn = document.getElementById('flow-download-btn');
+const jsonList = document.getElementById('json-list');
+const jsonEmptyState = document.getElementById('json-empty-state');
+const jsonEntryCount = document.getElementById('json-entry-count');
+const jsonCopyBtn = document.getElementById('json-copy-btn');
 const aprsServerInput = document.getElementById('aprs-server');
 const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
 const resetDataBtn = document.getElementById('reset-data-btn');
@@ -142,6 +147,9 @@ let flowCaptureEnabledAt = 0;
 let totalAprsUploaded = 0;
 const aprsCompletedFlowIds = new Set();
 const aprsCompletedQueue = [];
+const JSON_MAX_ENTRIES = 300;
+const jsonEntries = [];
+let jsonEntrySequence = 0;
 
 const AUTO_CONNECT_MAX_ATTEMPTS = 3;
 const AUTO_CONNECT_DELAY_MS = 5000;
@@ -651,6 +659,8 @@ async function bootstrap() {
   clearSelfNodeDisplay();
   appendLog('APP', 'TMAG monitor initialized.');
   updateDashboardCounters();
+  updateJsonCounter();
+  updateJsonEmptyState();
 
   const initialAprsServer = aprsServerInput?.value?.trim() || DEFAULT_APRS_SERVER;
   window.meshtastic.setAprsServer?.(initialAprsServer);
@@ -860,6 +870,27 @@ downloadLogBtn?.addEventListener('click', () => {
   appendLog('APP', '日誌已下載');
 });
 
+jsonCopyBtn?.addEventListener('click', async () => {
+  if (!jsonEntries.length) {
+    appendLog('APP', '目前尚無可複製的 JSON 紀錄');
+    return;
+  }
+  try {
+    const exportPayload = jsonEntries.map((entry) => ({
+      timestampMs: entry.timestampMs,
+      timestampLabel: entry.timestampLabel,
+      fromMeshId: entry.meshId || null,
+      portLabel: entry.portLabel || null,
+      message: entry.message
+    }));
+    await navigator.clipboard.writeText(JSON.stringify(exportPayload, null, 2));
+    appendLog('APP', `已將 ${exportPayload.length} 筆 JSON 紀錄複製到剪貼簿`);
+  } catch (err) {
+    console.error('複製 JSON 紀錄失敗:', err);
+    appendLog('APP', `複製 JSON 紀錄失敗: ${err.message || err}`);
+  }
+});
+
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (isConnecting || manualConnectActive) {
@@ -992,6 +1023,10 @@ const unsubscribeSummary = window.meshtastic.onSummary((summary) => {
   appendSummaryRow(summary);
 });
 
+const unsubscribeRaw = window.meshtastic.onFromRadio?.((message) => {
+  handleRawMessage(message);
+});
+
 const unsubscribeStatus = window.meshtastic.onStatus((info) => {
   appendLog('STATUS', `status=${info.status}${info.message ? ` message=${info.message}` : ''}`);
   updateStatus(info.status, info.message, info.nonce);
@@ -1033,6 +1068,7 @@ const unsubscribeAprsUplink = window.meshtastic.onAprsUplink?.((info) => {
 
 window.addEventListener('beforeunload', () => {
   unsubscribeSummary();
+  unsubscribeRaw?.();
   unsubscribeStatus();
   unsubscribeCallMeshStatus?.();
   unsubscribeCallMeshLog?.();
@@ -1223,6 +1259,191 @@ function clearPacketFlowData() {
   if (flowSearchInput) flowSearchInput.value = '';
   renderFlowEntries();
   updateDashboardCounters();
+  clearJsonEntries();
+}
+
+function clearJsonEntries() {
+  jsonEntries.length = 0;
+  if (jsonList) {
+    while (jsonList.firstChild) {
+      jsonList.removeChild(jsonList.firstChild);
+    }
+  }
+  updateJsonCounter();
+  updateJsonEmptyState();
+}
+
+function handleRawMessage(message) {
+  if (!message) return;
+  if (isMessageFromSelf(message)) {
+    return;
+  }
+  appendJsonEntry(message);
+}
+
+function appendJsonEntry(message) {
+  const timestampMs = extractMessageTimestamp(message);
+  const meshId = extractMessageMeshId(message);
+  const entry = {
+    id: `json-${jsonEntrySequence++}`,
+    timestampMs,
+    timestampLabel: formatJsonEntryTimestamp(timestampMs),
+    meshId,
+    meshIdDisplay: meshId ? meshId.toUpperCase() : null,
+    portLabel: extractMessagePortLabel(message),
+    message
+  };
+  jsonEntries.unshift(entry);
+
+  if (jsonList) {
+    const fragment = document.createDocumentFragment();
+    fragment.appendChild(renderJsonEntry(entry));
+    jsonList.prepend(fragment);
+  }
+
+  while (jsonEntries.length > JSON_MAX_ENTRIES) {
+    const removed = jsonEntries.pop();
+    if (!removed) break;
+    if (jsonList) {
+      const node = jsonList.querySelector(`[data-entry-id="${removed.id}"]`);
+      if (node) {
+        jsonList.removeChild(node);
+      }
+    }
+  }
+
+  updateJsonCounter();
+  updateJsonEmptyState();
+}
+
+function renderJsonEntry(entry) {
+  const wrapper = document.createElement('article');
+  wrapper.className = 'json-entry';
+  wrapper.dataset.entryId = entry.id;
+
+  const header = document.createElement('div');
+  header.className = 'json-entry-meta';
+  const metaParts = [`時間 ${entry.timestampLabel}`];
+  if (entry.meshIdDisplay) {
+    metaParts.push(`來源 ${entry.meshIdDisplay}`);
+  }
+  if (entry.portLabel) {
+    metaParts.push(`Port ${entry.portLabel}`);
+  }
+  header.textContent = metaParts.join(' • ');
+
+  const body = document.createElement('pre');
+  body.className = 'json-entry-body';
+  body.textContent = JSON.stringify(entry.message, null, 2);
+
+  wrapper.append(header, body);
+  return wrapper;
+}
+
+function extractMessagePortLabel(message) {
+  const decoded = message?.packet?.decoded;
+  if (!decoded) return null;
+  const name = decoded.portnumName ?? decoded.portnum_name ?? decoded.portName ?? decoded.port_name;
+  if (typeof name === 'string' && name.trim()) {
+    return name.trim();
+  }
+  const portnum = decoded.portnum ?? decoded.port_num;
+  if (Number.isFinite(portnum)) {
+    return String(portnum);
+  }
+  return null;
+}
+
+function extractMessageMeshId(message) {
+  if (!message || !message.packet) return null;
+  const numeric =
+    message.packet.from ??
+    message.packet.fromId ??
+    message.packet.from_id ??
+    message.packet.fromNode ??
+    message.packet.from_node ??
+    null;
+  if (numeric == null) return null;
+  const meshId = meshIdFromNumeric(numeric);
+  return meshId ? normalizeMeshId(meshId) : null;
+}
+
+function meshIdFromNumeric(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  const unsigned = num >>> 0;
+  const hex = unsigned.toString(16).padStart(8, '0');
+  return `!${hex}`;
+}
+
+function extractMessageTimestamp(message) {
+  if (!message) return Date.now();
+  const packet = message.packet || {};
+  const rxTime = packet.rxTime ?? packet.rx_time;
+  if (Number.isFinite(rxTime)) {
+    return Number(rxTime) * 1000;
+  }
+  const rxTimeMs = packet.rxTimeMs ?? packet.rx_time_ms;
+  if (Number.isFinite(rxTimeMs)) {
+    return Number(rxTimeMs);
+  }
+  const timestamp = message.rxTime ?? message.rx_time;
+  if (Number.isFinite(timestamp)) {
+    return Number(timestamp) * 1000;
+  }
+  return Date.now();
+}
+
+function formatJsonEntryTimestamp(ms) {
+  const date = new Date(ms);
+  const yyyy = date.getFullYear();
+  const mm = `${date.getMonth() + 1}`.padStart(2, '0');
+  const dd = `${date.getDate()}`.padStart(2, '0');
+  const hh = `${date.getHours()}`.padStart(2, '0');
+  const mi = `${date.getMinutes()}`.padStart(2, '0');
+  const ss = `${date.getSeconds()}`.padStart(2, '0');
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+}
+
+function isMessageFromSelf(message) {
+  const meshId = extractMessageMeshId(message);
+  if (!meshId) return false;
+  return isSelfMeshId(meshId);
+}
+
+function pruneJsonEntriesForSelf() {
+  const meshId = selfNodeState?.normalizedMeshId;
+  if (!meshId || !jsonEntries.length) {
+    return;
+  }
+  let removedAny = false;
+  for (let i = jsonEntries.length - 1; i >= 0; i -= 1) {
+    const entry = jsonEntries[i];
+    if (entry.meshId === meshId) {
+      const [removed] = jsonEntries.splice(i, 1);
+      removedAny = true;
+      if (removed && jsonList) {
+        const node = jsonList.querySelector(`[data-entry-id="${removed.id}"]`);
+        node?.remove();
+      }
+    }
+  }
+  if (removedAny) {
+    updateJsonCounter();
+    updateJsonEmptyState();
+  }
+}
+
+function updateJsonCounter() {
+  if (!jsonEntryCount) return;
+  jsonEntryCount.textContent = `共 ${jsonEntries.length} 筆`;
+}
+
+function updateJsonEmptyState() {
+  if (!jsonEmptyState || !jsonList) return;
+  const hasEntries = jsonEntries.length > 0;
+  jsonEmptyState.classList.toggle('hidden', hasEntries);
+  jsonList.classList.toggle('hidden', !hasEntries);
 }
 
 function registerPacketFlow(summary, { skipPending = false } = {}) {
@@ -2009,6 +2230,7 @@ function activatePage(targetId) {
   const pages = [
     { id: 'monitor-page', element: monitorPage },
     { id: 'flow-page', element: flowPage },
+    { id: 'json-page', element: jsonPage },
     { id: 'settings-page', element: settingsPage },
     { id: 'log-page', element: logPage },
     { id: 'info-page', element: infoPage }
@@ -2657,6 +2879,7 @@ function handleSelfInfoEvent(info) {
     selfNodeState.name = name;
   }
   applySelfNodeDisplay();
+  pruneJsonEntriesForSelf();
   appendLog('SELF', `myInfo meshId=${selfNodeState.meshId || 'unknown'} name=${selfNodeState.name || 'unknown'}`);
 }
 
@@ -2706,6 +2929,7 @@ function maybeUpdateSelfNodeFromSummary(summary) {
   }
 
   applySelfNodeDisplay();
+  pruneJsonEntriesForSelf();
   if (updated) {
     appendLog('SELF', `updated from packet meshId=${selfNodeState.meshId || 'unknown'} name=${selfNodeState.name || 'unknown'}`);
   }
