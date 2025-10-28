@@ -128,7 +128,7 @@ const recentReconnectFailures = [];
 const recentReconnectFailureTimestamps = new Map();
 let lastCallmeshStatusLog = '';
 
-const FLOW_MAX_ENTRIES = 300;
+const FLOW_MAX_ENTRIES = 1000;
 const ALT_TOKEN_REGEX = /\s*(?:·\s*)?ALT\s*-?\d+(?:\.\d+)?\s*m\b/gi;
 const APRS_HISTORY_MAX = 5000;
 const flowEntries = [];
