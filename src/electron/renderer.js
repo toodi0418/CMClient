@@ -1034,7 +1034,7 @@ function handleCallMeshStatus(info, { silent = false } = {}) {
     }
     if (!silent) {
       if (callmeshDegraded && !previousDegraded) {
-        setDiscoverStatus(info.statusText || 'CallMesh: Heartbeat 失敗，沿用已驗證的 Key', 'warn');
+        setDiscoverStatus(info.statusText || 'CallMesh: Heartbeat 失敗', 'warn');
       }
       if (!callmeshDegraded && previousDegraded) {
         setDiscoverStatus(info.statusText || 'CallMesh: Heartbeat 恢復正常', 'success');
@@ -2057,7 +2057,7 @@ async function validateApiKey(key, { auto = false, source = 'main' } = {}) {
     if (info.success && info.hasKey) {
       const degraded = Boolean(info.degraded);
       const statusMsg = degraded
-        ? 'CallMesh 暫時無回應，沿用已驗證的 Key (' + (info.statusText || 'degraded') + ')'
+        ? 'CallMesh 暫時無回應'
         : 'API Key 驗證成功';
       setDiscoverStatus(statusMsg, degraded ? 'warn' : 'success');
       setOverlayStatus(statusMsg, degraded ? 'warn' : 'success');

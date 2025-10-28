@@ -192,7 +192,7 @@ class CallMeshAprsBridge extends EventEmitter {
         this.callmeshState.verified = true;
         this.callmeshState.verifiedKey = trimmed;
         this.callmeshState.degraded = true;
-        this.callmeshState.lastStatus = `CallMesh: 伺服器無回應，沿用已驗證的 Key (${err.message})`;
+        this.callmeshState.lastStatus = 'CallMesh: 驗證逾時';
         this.callmeshState.agent = cmClient.agentString;
         const applied = this.applyCachedProvisionFallback('verify degraded');
         if (!applied) {
@@ -343,7 +343,7 @@ class CallMeshAprsBridge extends EventEmitter {
         this.updateAprsProvision(null);
       } else {
         this.callmeshState.degraded = true;
-        this.callmeshState.lastStatus = `CallMesh: Heartbeat 失敗，沿用已驗證的 Key (${err.message})`;
+        this.callmeshState.lastStatus = 'CallMesh: Heartbeat 失敗';
         this.emitLog('CALLMESH', `heartbeat error: ${err.message}`);
         if (this.applyCachedProvisionFallback('heartbeat failure')) {
           shouldEmit = false;
