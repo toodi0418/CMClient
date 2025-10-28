@@ -1560,7 +1560,7 @@ const TELEMETRY_CONTROL_TYPES = new Set([
 function sanitizeAprsComment(comment) {
   if (!comment) return '';
   const cleaned = String(comment).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
-  return cleaned.slice(0, 60);
+  return cleaned;
 }
 
 function pickSymbolChar(value) {
