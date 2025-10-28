@@ -24,6 +24,12 @@ const overlayRetryBtn = document.getElementById('overlay-retry');
 const overlayKeyInput = document.getElementById('overlay-api-key');
 const overlaySaveBtn = document.getElementById('overlay-save');
 const overlayStatus = document.getElementById('overlay-status');
+const overlayStepApi = document.getElementById('overlay-step-api');
+const overlayStepHost = document.getElementById('overlay-step-host');
+const overlayHostInput = document.getElementById('overlay-host');
+const overlayApplyHostBtn = document.getElementById('overlay-apply-host');
+const overlayDiscoverHostBtn = document.getElementById('overlay-discover-host');
+const overlayHostStatus = document.getElementById('overlay-host-status');
 
 const counterPackets10Min = document.getElementById('counter-packages-10min');
 const counterAprsUploaded = document.getElementById('counter-aprs-uploaded');
@@ -40,6 +46,7 @@ const DEFAULT_APRS_BEACON_MINUTES = 10;
 const SOCKET_HEARTBEAT_SECONDS = 30;
 const SOCKET_IDLE_TIMEOUT_MS = 60 * 1000;
 const SOCKET_KEEPALIVE_DELAY_MS = 15 * 1000;
+const HOST_GUIDANCE_MESSAGE = '尚未設定節點 IP，請手動輸入或按「自動搜尋」。';
 
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
@@ -87,6 +94,7 @@ let allowReconnectLoop = true;
 let hostPreferenceRevision = 0;
 let lastConnectedHost = null;
 let lastConnectedHostRevision = -1;
+let hostGuidanceActive = false;
 const selfNodeState = {
   name: null,
   meshId: null,
@@ -464,7 +472,13 @@ function normalizeMeshId(meshId) {
 function loadPreferences() {
   try {
     const saved = JSON.parse(localStorage.getItem('meshtastic:preferences') || '{}');
-    if (saved.host) settingsHostInput.value = saved.host;
+    const savedHost = typeof saved.host === 'string' ? saved.host.trim() : '';
+    if (settingsHostInput) {
+      settingsHostInput.value = savedHost;
+    }
+    if (overlayHostInput) {
+      overlayHostInput.value = savedHost;
+    }
     if (saved.apiKey) apiKeyInput.value = saved.apiKey;
     if (saved.platformStatus) platformStatus.textContent = saved.platformStatus;
     if (typeof saved.callmeshVerified === 'boolean') {
@@ -488,6 +502,8 @@ function loadPreferences() {
     }
   } catch (err) {
     console.warn('無法載入偏好設定:', err);
+    if (settingsHostInput) settingsHostInput.value = '';
+    if (overlayHostInput) overlayHostInput.value = '';
     if (aprsServerInput) aprsServerInput.value = DEFAULT_APRS_SERVER;
     if (aprsBeaconIntervalInput) aprsBeaconIntervalInput.value = String(DEFAULT_APRS_BEACON_MINUTES);
   }
@@ -540,6 +556,7 @@ loadPreferences();
 setDiscoverStatus('', 'info');
 updatePlatformStatus();
 updateConnectAvailability();
+ensureHostGuidance();
 refreshOverlay();
 activatePage('monitor-page');
 scheduleInitialAutoConnect();
@@ -631,6 +648,9 @@ flowSearchInput?.addEventListener('input', () => {
 settingsHostInput.addEventListener('input', () => {
   markHostPreferenceUpdated();
   const trimmedHost = settingsHostInput.value.trim();
+  if (overlayHostInput && overlayHostInput.value !== trimmedHost) {
+    overlayHostInput.value = trimmedHost;
+  }
   if (!trimmedHost) {
     lastConnectedHost = null;
     lastConnectedHostRevision = -1;
@@ -638,6 +658,11 @@ settingsHostInput.addEventListener('input', () => {
   resumeAutoReconnect({ reason: 'host-updated', silent: true });
   savePreferences();
   updateConnectAvailability();
+  if (trimmedHost) {
+    ensureHostGuidance();
+  } else {
+    ensureHostGuidance({ force: true });
+  }
 });
 
 aprsServerInput?.addEventListener('input', () => {
@@ -680,6 +705,7 @@ resetDataBtn?.addEventListener('click', async () => {
     lastConnectedHost = null;
     lastConnectedHostRevision = -1;
     loadPreferences();
+    ensureHostGuidance({ force: true });
     if (aprsServerInput) {
       aprsServerInput.value = DEFAULT_APRS_SERVER;
       window.meshtastic.setAprsServer?.(DEFAULT_APRS_SERVER);
@@ -691,6 +717,7 @@ resetDataBtn?.addEventListener('click', async () => {
     savePreferences();
     updateConnectAvailability();
     refreshOverlay();
+    ensureHostGuidance();
     appendLog('APP', '已重置本地 CallMesh 資料與 API Key');
   } catch (err) {
     appendLog('APP', `重置失敗: ${err.message}`);
@@ -776,30 +803,60 @@ overlayRetryBtn.addEventListener('click', () => {
   validateApiKey(overlayKeyInput.value, { auto: false, source: 'overlay' });
 });
 
+overlayApplyHostBtn?.addEventListener('click', () => {
+  applyOverlayHost();
+});
+
+overlayHostInput?.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    applyOverlayHost();
+  }
+});
+
+overlayDiscoverHostBtn?.addEventListener('click', () => {
+  setOverlayHostStatus('正在搜尋區網內的裝置...', 'info');
+  discoverBtn?.click();
+});
+
 discoverBtn.addEventListener('click', async () => {
   setDiscoveringState(true);
-  setDiscoverStatus('掃描中...', 'info');
+  setDiscoverStatus('正在搜尋區網內的裝置...', 'info');
+  if (isOverlayHostStepVisible()) {
+    setOverlayHostStatus('正在搜尋區網內的裝置...', 'info');
+  }
   appendLog('DISCOVER', 'scanning for devices');
   try {
     const results = await window.meshtastic.discover({ timeout: 4000 });
     discoveredDevices = results;
-    appendLog('DISCOVER', `found ${results.length} device(s)`);
+    appendLog('DISCOVER', 'found ' + results.length + ' device(s)');
     if (!results.length) {
-      setDiscoverStatus('未找到裝置，可確認裝置是否連上網路。', 'warn');
+      setDiscoverStatus('未找到 Meshtastic 裝置，請確認裝置是否與本機同網段。', 'warn');
+      if (isOverlayHostStepVisible()) {
+        setOverlayHostStatus('未找到節點，請確認裝置是否與本機同網段。', 'error');
+      }
       hideDiscoverModal();
     } else {
-      setDiscoverStatus(`找到 ${results.length} 台裝置。`, 'success');
+      setDiscoverStatus('找到 ' + results.length + ' 個裝置。', 'success');
+      if (isOverlayHostStepVisible()) {
+        setOverlayHostStatus('請在清單中選擇節點。', 'info');
+      }
       showDiscoverModal(results);
     }
   } catch (err) {
     console.error('搜尋裝置失敗:', err);
-    setDiscoverStatus(`搜尋失敗：${err.message}`, 'error');
+    setDiscoverStatus('搜尋失敗：' + err.message, 'error');
+    if (isOverlayHostStepVisible()) {
+      setOverlayHostStatus('搜尋失敗：' + err.message, 'error');
+    }
     hideDiscoverModal();
-    appendLog('DISCOVER', `error ${err.message}`);
+    appendLog('DISCOVER', 'error ' + err.message);
   } finally {
     setDiscoveringState(false);
   }
 });
+
+
 
 discoverModalCancel?.addEventListener('click', () => {
   hideDiscoverModal();
@@ -1722,8 +1779,16 @@ function applyDiscoveredDevice(device) {
   settingsHostInput.value = address;
   markHostPreferenceUpdated();
   savePreferences();
+  const overlayActive = isOverlayHostStepVisible();
+  if (overlayHostInput) {
+    overlayHostInput.value = address;
+  }
+  if (overlayActive) {
+    setOverlayHostStatus(`已套用 ${device.name || address}`, 'success');
+  }
   updateConnectAvailability();
   setDiscoverStatus(`已套用 ${device.name || address}`, 'success');
+  ensureHostGuidance();
   hideDiscoverModal();
   appendLog('DISCOVER', `selected ${device.name || address}`);
 }
@@ -1738,11 +1803,65 @@ function setDiscoverStatus(message, variant = 'info') {
   if (!message) {
     discoverStatus.textContent = '';
     delete discoverStatus.dataset.variant;
+    hostGuidanceActive = false;
     return;
   }
   discoverStatus.textContent = message;
   discoverStatus.dataset.variant = variant;
+  hostGuidanceActive = message === HOST_GUIDANCE_MESSAGE && variant === 'info';
 }
+
+function ensureHostGuidance({ force = false } = {}) {
+  if (!discoverStatus) return;
+  if (hasHost()) {
+    if (hostGuidanceActive) {
+      setDiscoverStatus('', 'info');
+    }
+    return;
+  }
+  if (!force) {
+    if (hostGuidanceActive) {
+      return;
+    }
+    const currentVariant = discoverStatus.dataset?.variant || '';
+    const currentMessage = (discoverStatus.textContent || '').trim();
+    if (currentMessage && currentVariant && currentVariant !== 'info' && currentVariant !== 'warn') {
+      return;
+    }
+  }
+  setDiscoverStatus(HOST_GUIDANCE_MESSAGE, 'info');
+}
+
+function isOverlayHostStepVisible() {
+  return Boolean(overlayStepHost) && !overlayStepHost.classList.contains('hidden');
+}
+
+function applyOverlayHost() {
+  if (!overlayHostInput) return;
+  const value = overlayHostInput.value.trim();
+  if (!value) {
+    setOverlayHostStatus('請輸入節點 IP', 'error');
+    overlayHostInput.focus();
+    return;
+  }
+  const previous = getHostValue();
+  settingsHostInput.value = value;
+  if (overlayHostInput) {
+    overlayHostInput.value = value;
+  }
+  markHostPreferenceUpdated();
+  savePreferences();
+  resumeAutoReconnect({ reason: 'host-updated', silent: true });
+  updateConnectAvailability();
+  ensureHostGuidance();
+  if (isOverlayHostStepVisible()) {
+    setOverlayHostStatus('節點 IP 已儲存', 'success');
+  }
+  if (previous !== value) {
+    appendLog('CONNECT', 'host updated value=' + value);
+  }
+}
+
 
 function activatePage(targetId) {
   const pages = [
@@ -1786,27 +1905,62 @@ function setOverlayStatus(message, variant = 'info') {
   overlayStatus.dataset.variant = variant;
 }
 
-function showOverlay() {
+function setOverlayHostStatus(message, variant = 'info') {
+  if (!overlayHostStatus) return;
+  overlayHostStatus.textContent = message || '';
+  overlayHostStatus.dataset.variant = variant;
+}
+
+function setOverlayStep(step) {
   if (!callmeshOverlay) return;
-  if (overlayKeyInput) overlayKeyInput.value = apiKeyInput.value.trim();
+  const useHost = step === 'host';
+  if (overlayStepApi) {
+    overlayStepApi.classList.toggle('hidden', useHost);
+  }
+  if (overlayStepHost) {
+    overlayStepHost.classList.toggle('hidden', !useHost);
+  }
+  if (useHost) {
+    if (overlayHostInput) {
+      overlayHostInput.value = getHostValue();
+      setTimeout(() => overlayHostInput?.focus(), 50);
+    }
+    setOverlayStatus('', 'info');
+    setOverlayHostStatus('請輸入節點 IP 或使用自動搜尋。', 'info');
+  } else {
+    if (overlayKeyInput) {
+      overlayKeyInput.value = apiKeyInput.value.trim();
+      setTimeout(() => overlayKeyInput?.focus(), 50);
+    }
+    setOverlayStatus('請輸入 API Key 以開始使用', 'info');
+  }
+}
+
+function showOverlay(step = 'api') {
+  if (!callmeshOverlay) return;
   callmeshOverlay.classList.remove('hidden');
-  setOverlayStatus('請輸入 API Key 以開始使用', 'info');
-  setTimeout(() => overlayKeyInput?.focus(), 50);
+  setOverlayStep(step);
 }
 
 function hideOverlay() {
   if (!callmeshOverlay) return;
   callmeshOverlay.classList.add('hidden');
   setOverlayStatus('', 'info');
+  setOverlayHostStatus('', 'info');
 }
 
 function refreshOverlay() {
-  if (hasApiKey()) {
-    hideOverlay();
-  } else {
-    showOverlay();
+  if (!hasApiKey()) {
+    showOverlay('api');
+    return;
   }
+  if (!hasHost()) {
+    showOverlay('host');
+    return;
+  }
+  hideOverlay();
 }
+
 
 async function validateApiKey(key, { auto = false, source = 'main' } = {}) {
   const trimmed = (key || '').trim();
@@ -1828,59 +1982,76 @@ async function validateApiKey(key, { auto = false, source = 'main' } = {}) {
     const info = await window.meshtastic.saveCallmeshKey?.(trimmed);
     if (!info) return;
 
-    if (info.success) {
-      if (info.hasKey) {
-        const statusMsg = info.degraded
-          ? `CallMesh 暫時無回應，沿用已驗證的 Key (${info.statusText || 'degraded'})`
-          : 'API Key 驗證成功';
-        setDiscoverStatus(statusMsg, info.degraded ? 'warn' : 'success');
-        setOverlayStatus(statusMsg, info.degraded ? 'warn' : 'success');
-        appendLog('CALLMESH', `API key verified degraded=${Boolean(info.degraded)}`);
-        apiKeyInput.value = trimmed;
-        if (overlayKeyInput) overlayKeyInput.value = trimmed;
-        callmeshHasServerKey = true;
-        callmeshDegraded = Boolean(info.degraded);
-        lastVerifiedKey = trimmed;
-        hideOverlay();
-      } else {
-        setDiscoverStatus('API Key 已移除', 'warn');
-        setOverlayStatus('API Key 已移除', 'warn');
-        appendLog('CALLMESH', 'API key removed');
-        apiKeyInput.value = '';
-        if (overlayKeyInput) overlayKeyInput.value = '';
-        callmeshHasServerKey = false;
-        callmeshDegraded = false;
-        lastVerifiedKey = '';
-        showOverlay();
+    if (info.success && info.hasKey) {
+      const degraded = Boolean(info.degraded);
+      const statusMsg = degraded
+        ? 'CallMesh 暫時無回應，沿用已驗證的 Key (' + (info.statusText || 'degraded') + ')'
+        : 'API Key 驗證成功';
+      setDiscoverStatus(statusMsg, degraded ? 'warn' : 'success');
+      setOverlayStatus(statusMsg, degraded ? 'warn' : 'success');
+      appendLog('CALLMESH', 'API key verified degraded=' + degraded);
+
+      apiKeyInput.value = trimmed;
+      if (overlayKeyInput) overlayKeyInput.value = trimmed;
+      callmeshHasServerKey = true;
+      callmeshDegraded = degraded;
+      lastVerifiedKey = trimmed;
+      if (info.statusText) {
+        platformStatus.textContent = info.statusText;
+      }
+      savePreferences();
+      refreshOverlay();
+      ensureHostGuidance();
+      return;
     }
-    if (info.statusText) platformStatus.textContent = info.statusText;
-    savePreferences();
-    } else {
-      setDiscoverStatus(`API Key 驗證失敗：${info?.error || '未知錯誤'}`, 'error');
-      setOverlayStatus(`API Key 驗證失敗：${info?.error || '未知錯誤'}`, 'error');
-      appendLog('CALLMESH', `API key verify failed ${info?.error || 'unknown error'}`);
+
+    if (info.success && !info.hasKey) {
+      const message = 'API Key 已移除';
+      setDiscoverStatus(message, 'warn');
+      setOverlayStatus(message, 'warn');
+      appendLog('CALLMESH', 'API key removed');
+
+      apiKeyInput.value = '';
+      if (overlayKeyInput) overlayKeyInput.value = '';
       callmeshHasServerKey = false;
       callmeshDegraded = false;
-      platformStatus.textContent = info?.statusText || 'CallMesh: Key 驗證失敗';
-      apiKeyInput.value = '';
-          if (overlayKeyInput) overlayKeyInput.value = '';
-        apiKeyInput.focus();
-      apiKeyInput.select();
       lastVerifiedKey = '';
+      platformStatus.textContent = info.statusText || 'CallMesh: 未設定 Key';
       savePreferences();
-      showOverlay();
+      showOverlay('api');
+      return;
     }
-  } catch (err) {
-    setDiscoverStatus(`驗證過程發生錯誤：${err.message}`, 'error');
-    setOverlayStatus(`驗證過程發生錯誤：${err.message}`, 'error');
-    appendLog('CALLMESH', `API key verify error ${err.message}`);
+
+    const failureMessage = info?.error || '未知錯誤';
+    setDiscoverStatus('API Key 驗證失敗：' + failureMessage, 'error');
+    setOverlayStatus('API Key 驗證失敗：' + failureMessage, 'error');
+    appendLog('CALLMESH', 'API key verify failed ' + failureMessage);
+
     callmeshHasServerKey = false;
+    callmeshDegraded = false;
+    platformStatus.textContent = info?.statusText || 'CallMesh: Key 驗證失敗';
+    apiKeyInput.value = '';
+    if (overlayKeyInput) overlayKeyInput.value = '';
+    if (apiKeyInput) {
+      apiKeyInput.focus();
+      apiKeyInput.select();
+    }
+    lastVerifiedKey = '';
+    savePreferences();
+    showOverlay('api');
+  } catch (err) {
+    const message = err?.message || '未知錯誤';
+    setDiscoverStatus('驗證 API Key 時發生錯誤：' + message, 'error');
+    setOverlayStatus('驗證 API Key 時發生錯誤：' + message, 'error');
+    appendLog('CALLMESH', 'API key verify error ' + message);
+    callmeshHasServerKey = false;
+    platformStatus.textContent = 'CallMesh: Key 驗證失敗';
     callmeshDegraded = false;
     apiKeyInput.value = '';
     if (overlayKeyInput) overlayKeyInput.value = '';
     lastVerifiedKey = '';
     savePreferences();
-    showOverlay();
+    showOverlay('api');
   } finally {
     updateConnectAvailability();
     if (source === 'overlay') {
@@ -1916,6 +2087,11 @@ function scheduleInitialAutoConnect() {
   if (manualDisconnect || isConnected || isConnecting) {
     return;
   }
+  if (!hasHost()) {
+    appendLog('CONNECT', 'initial auto-connect skipped (missing host)');
+    ensureHostGuidance();
+    return;
+  }
   initialAutoConnectActive = true;
   autoConnectAttempts = 0;
   autoConnectTimer = setTimeout(attemptAutoConnect, 500);
@@ -1926,6 +2102,12 @@ async function attemptAutoConnect() {
   clearAutoConnectTimer();
   if (manualDisconnect || isConnected || isConnecting) {
     initialAutoConnectActive = false;
+    return;
+  }
+  if (!hasHost()) {
+    appendLog('CONNECT', 'auto attempt skipped (missing host)');
+    initialAutoConnectActive = false;
+    ensureHostGuidance();
     return;
   }
   appendLog('CONNECT', `auto attempt ${autoConnectAttempts + 1}`);
@@ -2080,6 +2262,9 @@ async function connectNow({ context = 'manual', overrideHost } = {}) {
     if (context === 'manual') {
       setDiscoverStatus('請先設定 Host', 'error');
       updateStatus('error', 'Host 未設定');
+      ensureHostGuidance();
+    } else {
+      ensureHostGuidance({ force: true });
     }
     updateConnectAvailability();
     return false;

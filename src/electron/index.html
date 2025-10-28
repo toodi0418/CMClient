@@ -82,7 +82,13 @@
           <div class="fieldset">
             <label for="settings-host">Meshtastic Host</label>
             <div class="host-row">
-              <input id="settings-host" name="settingsHost" type="text" value="127.0.0.1" required />
+              <input
+                id="settings-host"
+                name="settingsHost"
+                type="text"
+                placeholder="請輸入 Meshtastic 節點 IP"
+                required
+              />
               <button type="button" id="discover-btn">自動搜尋</button>
             </div>
             <small id="discover-status" class="discover-status"></small>
@@ -203,14 +209,28 @@
 
     <div id="callmesh-overlay" class="overlay hidden">
       <div class="overlay-content">
-        <h2>需要有效的 CallMesh API Key</h2>
-        <p>系統偵測到目前的 API Key 無效或尚未設定。請於下方輸入正確的 Key 並按下「驗證並儲存」完成設定。</p>
-        <div class="overlay-input-group">
-          <input id="overlay-api-key" type="password" placeholder="輸入 CallMesh API Key" />
-          <button id="overlay-save">驗證並儲存</button>
+        <div id="overlay-step-api" class="overlay-step">
+          <h2>需要輸入 CallMesh API Key</h2>
+          <p>系統偵測到目前尚未設定 API Key，請輸入正確的 Key 並按下「驗證並儲存」完成設定。</p>
+          <div class="overlay-input-group">
+            <input id="overlay-api-key" type="password" placeholder="輸入 CallMesh API Key" />
+            <button id="overlay-save">驗證並儲存</button>
+          </div>
+          <div id="overlay-status" class="overlay-status"></div>
+          <button id="overlay-retry">重新驗證</button>
         </div>
-        <div id="overlay-status" class="overlay-status"></div>
-        <button id="overlay-retry">重新驗證</button>
+        <div id="overlay-step-host" class="overlay-step hidden">
+          <h2>設定 Meshtastic 節點</h2>
+          <p>請輸入節點 IP 或按下「自動搜尋」來尋找區網內的設備。</p>
+          <div class="overlay-input-group add-gap">
+            <input id="overlay-host" type="text" placeholder="例如：192.168.1.50" />
+            <div class="overlay-host-actions">
+              <button id="overlay-apply-host">儲存節點 IP</button>
+              <button id="overlay-discover-host">自動搜尋</button>
+            </div>
+          </div>
+          <div id="overlay-host-status" class="overlay-status"></div>
+        </div>
       </div>
     </div>
     <div id="discover-modal" class="modal hidden">
