@@ -1470,7 +1470,7 @@ function buildAprsPayload(provision, overrides = {}) {
   }
   frame += altitudeSection;
   if (phgDigits) {
-    comment = comment ? `PHG${phgDigits} ${comment}` : `PHG${phgDigits}`;
+    comment = comment ? `PHG${phgDigits}${comment}` : `PHG${phgDigits}`;
   }
   if (comment) {
     frame += comment;
