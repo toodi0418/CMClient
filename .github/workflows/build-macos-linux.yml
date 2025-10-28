@@ -1,0 +1,128 @@
+name: Build macOS & Linux Targets
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build-macos:
+    name: Build macOS GUI & CLI
+    runs-on: macos-13
+
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安裝相依套件
+        run: npm ci
+
+      - name: 建置 macOS CLI
+        run: npm run build:mac-cli
+
+      - name: 建置 macOS GUI
+        run: |
+          npx electron-packager . "TMAG Monitor" \
+            --platform=darwin \
+            --arch=x64 \
+            --out dist \
+            --overwrite \
+            --prune=true
+
+      - name: 取得版本號
+        id: vars
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ -z "$version" ]; then
+            echo "無法讀取版本號" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: 壓縮 macOS GUI
+        run: |
+          app_path="dist/TMAG Monitor-darwin-x64/TMAG Monitor.app"
+          if [ ! -d "$app_path" ]; then
+            echo "找不到打包完成的 .app：$app_path" >&2
+            exit 1
+          fi
+          output_zip="dist/TMAG_Monitor-macOS-x64-v${{ steps.vars.outputs.version }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$output_zip"
+
+      - name: 壓縮 macOS CLI
+        run: |
+          cli_path="dist/cli/tmag-cli"
+          if [ ! -f "$cli_path" ]; then
+            echo "找不到 CLI 執行檔：$cli_path" >&2
+            exit 1
+          fi
+          mkdir -p dist/artifacts
+          cp "$cli_path" "dist/artifacts/tmag-cli-macos-x64"
+          (cd dist/artifacts && zip -9 "tmag-cli-macos-x64-v${{ steps.vars.outputs.version }}.zip" "tmag-cli-macos-x64")
+
+      - name: 上傳 macOS 成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmag-macos-builds-v${{ steps.vars.outputs.version }}
+          path: |
+            dist/TMAG_Monitor-macOS-x64-v${{ steps.vars.outputs.version }}.zip
+            dist/artifacts/tmag-cli-macos-x64-v${{ steps.vars.outputs.version }}.zip
+
+  build-linux-cli:
+    name: Build Linux CLI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安裝相依套件
+        run: npm ci
+
+      - name: 建置 Linux CLI
+        run: |
+          mkdir -p dist/cli
+          npx pkg src/index.js \
+            --config package.json \
+            --targets node18-linux-x64 \
+            --compress Brotli \
+            --public \
+            --output dist/cli/tmag-cli-linux-x64
+
+      - name: 取得版本號
+        id: linux_vars
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ -z "$version" ]; then
+            echo "無法讀取版本號" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: 壓縮 Linux CLI
+        run: |
+          cli_path="dist/cli/tmag-cli-linux-x64"
+          if [ ! -f "$cli_path" ]; then
+            echo "找不到 Linux CLI：$cli_path" >&2
+            exit 1
+          fi
+          (cd dist/cli && zip -9 "tmag-cli-linux-x64-v${{ steps.linux_vars.outputs.version }}.zip" "tmag-cli-linux-x64")
+
+      - name: 上傳 Linux CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmag-linux-cli-v${{ steps.linux_vars.outputs.version }}
+          path: dist/cli/tmag-cli-linux-x64-v${{ steps.linux_vars.outputs.version }}.zip

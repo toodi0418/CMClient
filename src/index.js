@@ -244,7 +244,10 @@ async function startMonitor(argv) {
     port: argv.port,
     maxLength: argv.maxLength,
     handshake: true,
-    heartbeat: HEARTBEAT_INTERVAL_SECONDS
+    heartbeat: HEARTBEAT_INTERVAL_SECONDS,
+    keepAlive: true,
+    keepAliveDelayMs: 15_000,
+    idleTimeoutMs: 90_000
   };
 
   const RECONNECT_DELAY_MS = 30_000;

@@ -1,0 +1,45 @@
+name: Build Windows App
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        shell: powershell
+
+      - name: Build Windows package
+        run: npm run build:win
+        shell: powershell
+
+      - name: Determine build version
+        id: vars
+        shell: powershell
+        run: |
+          $packageJson = Get-Content package.json -Raw | ConvertFrom-Json
+          $version = $packageJson.version
+          if (-not $version) { throw 'Unable to read version from package.json' }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Upload packaged app
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmag-windows-build-v${{ steps.vars.outputs.version }}
+          path: |
+            dist/TMAG_Monitor-v${{ steps.vars.outputs.version }}-win32-x64.zip

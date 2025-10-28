@@ -34,6 +34,8 @@ contextBridge.exposeInMainWorld('meshtastic', {
     return () => ipcRenderer.removeListener('callmesh:log', listener);
   },
   getAppInfo: () => ipcRenderer.invoke('app:get-info'),
+  getClientPreferences: () => ipcRenderer.invoke('app:get-preferences'),
+  updateClientPreferences: (preferences) => ipcRenderer.invoke('app:update-preferences', preferences),
   resetCallMeshData: () => ipcRenderer.invoke('callmesh:reset'),
   setAprsServer: (server) => ipcRenderer.invoke('aprs:set-server', server),
   setAprsBeaconInterval: (minutes) => ipcRenderer.invoke('aprs:set-beacon-interval', minutes),

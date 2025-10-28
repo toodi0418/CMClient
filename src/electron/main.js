@@ -16,6 +16,7 @@ let client = null;
 let bridge = null;
 let callmeshRestoreAllowed = true;
 let lastCallmeshStateSnapshot = null;
+let cachedClientPreferences = null;
 
 process.on('uncaughtException', (err) => {
   console.error('未攔截的例外:', err);
@@ -35,6 +36,10 @@ function getSkipEnvSentinelPath() {
 
 function getVerificationFilePath() {
   return path.join(getCallMeshDataDir(), 'verification.json');
+}
+
+function getClientPreferencesPath() {
+  return path.join(getCallMeshDataDir(), 'client-preferences.json');
 }
 
 function shouldIncludeEnvApiKey() {
@@ -93,6 +98,67 @@ async function persistVerifiedApiKey(key) {
 
 async function clearPersistedApiKey() {
   await fs.rm(getVerificationFilePath(), { force: true });
+}
+
+function normalizeClientPreferences(raw) {
+  const normalized = {};
+  if (raw && typeof raw === 'object') {
+    if (typeof raw.host === 'string') {
+      const trimmed = raw.host.trim();
+      if (trimmed) {
+        normalized.host = trimmed;
+      }
+    }
+  }
+  return normalized;
+}
+
+async function getCachedClientPreferences() {
+  if (cachedClientPreferences) {
+    return cachedClientPreferences;
+  }
+  const payload = await loadJsonSafe(getClientPreferencesPath());
+  cachedClientPreferences = normalizeClientPreferences(payload);
+  return cachedClientPreferences;
+}
+
+async function writeClientPreferences(preferences) {
+  const normalized = normalizeClientPreferences(preferences);
+  const filePath = getClientPreferencesPath();
+  if (!Object.keys(normalized).length) {
+    await fs.rm(filePath, { force: true });
+    cachedClientPreferences = {};
+    return cachedClientPreferences;
+  }
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const payload = {
+    ...normalized,
+    version: 1,
+    savedAt: new Date().toISOString()
+  };
+  await fs.writeFile(filePath, JSON.stringify(payload, null, 2), {
+    encoding: 'utf8',
+    mode: 0o600
+  });
+  cachedClientPreferences = { ...normalized };
+  return cachedClientPreferences;
+}
+
+async function updateClientPreferences(updates = {}) {
+  if (!updates || typeof updates !== 'object') {
+    return getCachedClientPreferences();
+  }
+  const existing = { ...(await getCachedClientPreferences()) };
+  if (Object.prototype.hasOwnProperty.call(updates, 'host')) {
+    const value = updates.host;
+    const trimmed = typeof value === 'string' ? value.trim() : '';
+    if (trimmed) {
+      existing.host = trimmed;
+    } else {
+      delete existing.host;
+    }
+  }
+  return writeClientPreferences(existing);
 }
 
 async function loadJsonSafe(filePath) {
@@ -319,6 +385,32 @@ ipcMain.handle('app:get-info', async () => ({
   version: appVersion
 }));
 
+ipcMain.handle('app:get-preferences', async () => {
+  try {
+    const preferences = await getCachedClientPreferences();
+    return preferences;
+  } catch (err) {
+    console.error('載入客戶端偏好失敗:', err);
+    return {};
+  }
+});
+
+ipcMain.handle('app:update-preferences', async (_event, updates) => {
+  try {
+    const next = await updateClientPreferences(updates);
+    return {
+      success: true,
+      preferences: next
+    };
+  } catch (err) {
+    console.error('更新客戶端偏好失敗:', err);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+});
+
 ipcMain.handle('meshtastic:connect', async (_event, options) => {
   if (!mainWindow) {
     throw new Error('主視窗尚未建立');
@@ -333,7 +425,10 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     port: options.port,
     maxLength: options.maxLength ?? 512,
     handshake: options.handshake ?? true,
-    heartbeat: options.heartbeat ?? 0
+    heartbeat: options.heartbeat ?? 0,
+    keepAlive: options.keepAlive ?? true,
+    keepAliveDelayMs: options.keepAliveDelayMs ?? 15000,
+    idleTimeoutMs: options.idleTimeoutMs ?? 0
   });
 
   client.on('connected', () => {
