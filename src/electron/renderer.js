@@ -51,6 +51,7 @@ const HOST_GUIDANCE_MESSAGE = '尚未設定節點 IP，請手動輸入或按「�
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
 const infoCoords = document.getElementById('info-coords');
+const infoPhg = document.getElementById('info-phg');
 const infoComment = document.getElementById('info-comment');
 const infoUpdatedAt = document.getElementById('info-updated-at');
 
@@ -2672,6 +2673,7 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
     infoCallsign.textContent = '—';
     infoSymbol.textContent = '—';
     if (infoCoords) infoCoords.textContent = '—';
+    if (infoPhg) infoPhg.textContent = '—';
     infoComment.textContent = '—';
     infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : '—';
     lastProvisionSignature = null;
@@ -2688,22 +2690,35 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
   const symbol = symbolTable || symbolCode ? `${symbolTable}${symbolCode}` : '';
   const displaySymbol = overlaySymbol || symbol || '—';
   const comment = provision.comment || '—';
+  const phgRaw = provision.phg ?? null;
+  let phgValue = '';
+  if (typeof phgRaw === 'number') {
+    phgValue = String(phgRaw);
+  } else if (typeof phgRaw === 'string') {
+    phgValue = phgRaw.trim().toUpperCase();
+  }
 
   infoCallsign.textContent = aprsCallsign;
   infoSymbol.textContent = displaySymbol;
   if (infoCoords) infoCoords.textContent = formatProvisionCoords(provision);
+  if (infoPhg) infoPhg.textContent = phgValue || '—';
   infoComment.textContent = comment;
   infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : new Date().toLocaleString();
 
   const signature = JSON.stringify({
     aprsCallsign,
     displaySymbol,
+    phg: phgValue || '',
     comment,
     coords: infoCoords ? infoCoords.textContent : ''
   });
   if (signature !== lastProvisionSignature) {
     lastProvisionSignature = signature;
-    appendLog('PROVISION', `callsign=${aprsCallsign} symbol=${displaySymbol}`);
+    const logParts = [`callsign=${aprsCallsign}`, `symbol=${displaySymbol}`];
+    if (phgValue) {
+      logParts.push(`phg=${phgValue}`);
+    }
+    appendLog('PROVISION', logParts.join(' '));
   }
 }
 
