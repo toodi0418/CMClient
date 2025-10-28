@@ -928,7 +928,6 @@ const unsubscribeStatus = window.meshtastic.onStatus((info) => {
   if (info.status === 'connected') {
     initialAutoConnectActive = false;
     setConnectedState(true);
-    clearSummaryTable();
     return;
   }
 
