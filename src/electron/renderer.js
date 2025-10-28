@@ -123,6 +123,7 @@ const recentReconnectFailureTimestamps = new Map();
 let lastCallmeshStatusLog = '';
 
 const FLOW_MAX_ENTRIES = 300;
+const ALT_TOKEN_REGEX = /\s*(?:·\s*)?ALT\s*-?\d+(?:\.\d+)?\s*m\b/gi;
 const APRS_HISTORY_MAX = 5000;
 const flowEntries = [];
 const flowEntryIndex = new Map();
@@ -1310,6 +1311,19 @@ function getFilteredFlowEntries() {
   return filtered;
 }
 
+function sanitizeFlowLeftText(value, { stripAltitude = false } = {}) {
+  if (value == null) return '';
+  let text = String(value).trim();
+  if (!text) return '';
+  if (stripAltitude) {
+    ALT_TOKEN_REGEX.lastIndex = 0;
+    text = text.replace(ALT_TOKEN_REGEX, '');
+  }
+  text = text.replace(/\s*·\s*$/, '');
+  text = text.replace(/\s{2,}/g, ' ').trim();
+  return text;
+}
+
 function renderFlowEntries() {
   if (!flowList) return;
   const filtered = getFilteredFlowEntries();
@@ -1364,8 +1378,9 @@ function renderFlowEntries() {
     colRight.className = 'flow-item-col flow-item-col-right';
 
     const leftTexts = new Set();
+    const hasAltitudeChip = Number.isFinite(entry.altitude);
     const appendLeft = (text, className) => {
-      const value = (text || '').trim();
+      const value = sanitizeFlowLeftText(text, { stripAltitude: hasAltitudeChip });
       if (!value || leftTexts.has(value)) return;
       const el = document.createElement('div');
       el.className = className;
@@ -1404,7 +1419,7 @@ function renderFlowEntries() {
     }
     if (Number.isFinite(entry.snr)) metaParts.push(`<span class="chip chip-snr">SNR ${entry.snr.toFixed(1)} dB</span>`);
     if (Number.isFinite(entry.rssi)) metaParts.push(`<span class="chip chip-rssi">RSSI ${entry.rssi.toFixed(0)} dBm</span>`);
-    if (Number.isFinite(entry.altitude)) metaParts.push(`<span class="chip chip-alt">ALT ${Math.round(entry.altitude)} m</span>`);
+    if (hasAltitudeChip) metaParts.push(`<span class="chip chip-alt">ALT ${Math.round(entry.altitude)} m</span>`);
     if (Number.isFinite(entry.speedKph)) metaParts.push(`<span class="chip chip-speed">SPD ${entry.speedKph.toFixed(1)} km/h</span>`);
     if (Number.isFinite(entry.satsInView)) metaParts.push(`<span class="chip chip-sats">SAT ${entry.satsInView}</span>`);
     const metaWrap = document.createElement('div');
