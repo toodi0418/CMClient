@@ -333,7 +333,10 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     port: options.port,
     maxLength: options.maxLength ?? 512,
     handshake: options.handshake ?? true,
-    heartbeat: options.heartbeat ?? 0
+    heartbeat: options.heartbeat ?? 0,
+    keepAlive: options.keepAlive ?? true,
+    keepAliveDelayMs: options.keepAliveDelayMs ?? 15000,
+    idleTimeoutMs: options.idleTimeoutMs ?? 0
   });
 
   client.on('connected', () => {

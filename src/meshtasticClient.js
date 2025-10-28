@@ -14,6 +14,17 @@ const HEADER_SIZE = 4;
 const DEFAULT_MAX_PACKET = 512;
 const BROADCAST_ADDR = 0xffffffff;
 
+function removeSocketListener(socket, eventName, handler) {
+  if (!socket || !handler) {
+    return;
+  }
+  if (typeof socket.off === 'function') {
+    socket.off(eventName, handler);
+  } else {
+    socket.removeListener(eventName, handler);
+  }
+}
+
 const TO_OBJECT_OPTIONS = {
   longs: Number,
   enums: String,
@@ -31,6 +42,9 @@ class MeshtasticClient extends EventEmitter {
       maxLength: DEFAULT_MAX_PACKET,
       handshake: true,
       heartbeat: 0,
+      keepAlive: true,
+      keepAliveDelayMs: 15000,
+      idleTimeoutMs: 0,
       protoDir: path.resolve(__dirname, '..', 'proto'),
       ...options
     };
@@ -42,6 +56,9 @@ class MeshtasticClient extends EventEmitter {
     this._connected = false;
     this._seenPacketKeys = new Map();
     this._packetKeyQueue = [];
+    this._handleIdleTimeoutBound = null;
+    this._currentIdleTimeout = null;
+    this._socketClosed = true;
   }
 
   _normalizeRelayNode(relayNode) {
@@ -79,10 +96,20 @@ class MeshtasticClient extends EventEmitter {
   stop() {
     this._clearHeartbeat();
     if (this._socket) {
+      if (this._handleIdleTimeoutBound) {
+        removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);
+      }
+      try {
+        this._socket.setKeepAlive(false);
+      } catch {
+        // ignore errors disabling keepalive during shutdown
+      }
       this._socket.destroy();
       this._socket.removeAllListeners();
       this._socket = null;
     }
+    this._socketClosed = true;
+    this._currentIdleTimeout = null;
     this._connected = false;
     this._connectionStartedAt = null;
     this._seenPacketKeys.clear();
@@ -156,13 +183,25 @@ class MeshtasticClient extends EventEmitter {
       port: this.options.port,
       timeout: this.options.connectTimeout ?? 15000
     };
+    const connectTimeoutMs = this.options.connectTimeout ?? 15000;
+    const handleConnectTimeout = () => {
+      const timeoutError = new Error(`connect timeout after ${connectTimeoutMs}ms`);
+      if (this._socket) {
+        this._socket.destroy(timeoutError);
+      } else {
+        this.emit('error', timeoutError);
+      }
+    };
 
     try {
+      this._socketClosed = false;
       this._socket = net.createConnection(connectionOptions, () => {
         this._connected = true;
         this._connectionStartedAt = Date.now();
         if (this._socket) {
+          removeSocketListener(this._socket, 'timeout', handleConnectTimeout);
           this._socket.setTimeout(0);
+          this._applySocketOptions();
         }
         this.emit('connected');
         if (this.options.handshake) {
@@ -171,28 +210,109 @@ class MeshtasticClient extends EventEmitter {
         this._setupHeartbeat();
       });
     } catch (err) {
+      this._socketClosed = true;
       process.nextTick(() => this.emit('error', err));
       return;
     }
 
     this._socket.on('data', (chunk) => this._decoder.push(chunk));
-
-    const connectTimeoutMs = this.options.connectTimeout ?? 15000;
-    this._socket.setTimeout(connectTimeoutMs, () => {
-      this.emit('error', new Error(`connect timeout after ${connectTimeoutMs}ms`));
-      this._socket?.destroy(new Error('connect timeout'));
-    });
+    this._socket.setTimeout(connectTimeoutMs);
+    this._socket.once('timeout', handleConnectTimeout);
 
     this._socket.on('error', (err) => {
       this.emit('error', err);
     });
 
-    this._socket.on('close', () => {
-      this._connected = false;
-      this._connectionStartedAt = null;
-      this.emit('disconnected');
-      this._clearHeartbeat();
+    this._socket.on('end', () => {
+      this._handleSocketClosed();
     });
+
+    this._socket.on('close', () => {
+      this._handleSocketClosed();
+    });
+  }
+
+  _applySocketOptions() {
+    this._enableTcpKeepAlive();
+    this._configureSocketIdleTimeout();
+  }
+
+  _enableTcpKeepAlive() {
+    if (!this._socket || typeof this._socket.setKeepAlive !== 'function') {
+      return;
+    }
+    if (this.options.keepAlive === false) {
+      try {
+        this._socket.setKeepAlive(false);
+      } catch {
+        // ignore keepalive configuration errors
+      }
+      return;
+    }
+    const delayValue = Number(this.options.keepAliveDelayMs);
+    try {
+      if (Number.isFinite(delayValue) && delayValue >= 0) {
+        const delay = Math.max(0, Math.floor(delayValue));
+        this._socket.setKeepAlive(true, delay);
+      } else {
+        this._socket.setKeepAlive(true);
+      }
+    } catch {
+      // ignore keepalive configuration errors
+    }
+  }
+
+  _configureSocketIdleTimeout() {
+    if (!this._socket) {
+      return;
+    }
+    const idleTimeoutMs = Number(this.options.idleTimeoutMs);
+    if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
+      if (this._handleIdleTimeoutBound) {
+        removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);
+      }
+      this._socket.setTimeout(0);
+      this._currentIdleTimeout = null;
+      return;
+    }
+    if (!this._handleIdleTimeoutBound) {
+      this._handleIdleTimeoutBound = () => this._handleIdleTimeout();
+    }
+    this._currentIdleTimeout = idleTimeoutMs;
+    removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);
+    this._socket.setTimeout(idleTimeoutMs);
+    this._socket.on('timeout', this._handleIdleTimeoutBound);
+  }
+
+  _handleIdleTimeout() {
+    const timeoutMs = this._currentIdleTimeout;
+    const message =
+      timeoutMs && Number.isFinite(timeoutMs)
+        ? `connection idle timeout after ${timeoutMs}ms`
+        : 'connection idle timeout';
+    const timeoutError = new Error(message);
+    timeoutError.code = 'MESHTASTIC_IDLE_TIMEOUT';
+    if (this._socket) {
+      this._socket.destroy(timeoutError);
+    } else {
+      this.emit('error', timeoutError);
+      this._handleSocketClosed();
+    }
+  }
+
+  _handleSocketClosed() {
+    if (this._socketClosed) {
+      return;
+    }
+    this._socketClosed = true;
+    this._connected = false;
+    this._connectionStartedAt = null;
+    if (this._socket && this._handleIdleTimeoutBound) {
+      removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);
+    }
+    this._currentIdleTimeout = null;
+    this._clearHeartbeat();
+    this.emit('disconnected');
   }
 
   _handlePayload(payload) {

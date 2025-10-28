@@ -37,6 +37,9 @@ const aprsStatusLabel = document.getElementById('aprs-status');
 const aprsServerLabel = document.getElementById('aprs-server-label');
 const DEFAULT_APRS_SERVER = 'asia.aprs2.net';
 const DEFAULT_APRS_BEACON_MINUTES = 10;
+const SOCKET_HEARTBEAT_SECONDS = 30;
+const SOCKET_IDLE_TIMEOUT_MS = 60 * 1000;
+const SOCKET_KEEPALIVE_DELAY_MS = 15 * 1000;
 
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
@@ -81,6 +84,9 @@ let manualConnectRetryResolver = null;
 let manualConnectAttempts = 0;
 let manualConnectSession = 0;
 let allowReconnectLoop = true;
+let hostPreferenceRevision = 0;
+let lastConnectedHost = null;
+let lastConnectedHostRevision = -1;
 const selfNodeState = {
   name: null,
   meshId: null,
@@ -489,6 +495,21 @@ function getHostValue() {
   return (settingsHostInput.value || '').trim();
 }
 
+function markHostPreferenceUpdated() {
+  hostPreferenceRevision += 1;
+}
+
+function getReconnectHost() {
+  if (lastConnectedHost && lastConnectedHostRevision === hostPreferenceRevision) {
+    return lastConnectedHost;
+  }
+  const currentHost = getHostValue();
+  if (currentHost) {
+    return currentHost;
+  }
+  return lastConnectedHost || '';
+}
+
 function getAprsBeaconMinutes() {
   if (!aprsBeaconIntervalInput) return DEFAULT_APRS_BEACON_MINUTES;
   const value = Number(aprsBeaconIntervalInput.value);
@@ -592,6 +613,12 @@ flowSearchInput?.addEventListener('input', () => {
 
 
 settingsHostInput.addEventListener('input', () => {
+  markHostPreferenceUpdated();
+  const trimmedHost = settingsHostInput.value.trim();
+  if (!trimmedHost) {
+    lastConnectedHost = null;
+    lastConnectedHostRevision = -1;
+  }
   resumeAutoReconnect({ reason: 'host-updated', silent: true });
   savePreferences();
   updateConnectAvailability();
@@ -633,6 +660,9 @@ resetDataBtn?.addEventListener('click', async () => {
     clearSelfNodeDisplay();
     updateProvisionInfo(null, null);
     clearPacketFlowData();
+    hostPreferenceRevision = 0;
+    lastConnectedHost = null;
+    lastConnectedHostRevision = -1;
     loadPreferences();
     if (aprsServerInput) {
       aprsServerInput.value = DEFAULT_APRS_SERVER;
@@ -1661,6 +1691,7 @@ function applyDiscoveredDevice(device) {
     return;
   }
   settingsHostInput.value = address;
+  markHostPreferenceUpdated();
   savePreferences();
   updateConnectAvailability();
   setDiscoverStatus(`已套用 ${device.name || address}`, 'success');
@@ -2009,12 +2040,13 @@ async function manualConnectWithRetries() {
   }
 }
 
-async function connectNow({ context = 'manual' } = {}) {
+async function connectNow({ context = 'manual', overrideHost } = {}) {
   if (isConnecting || isConnected) {
     return false;
   }
 
-  const host = getHostValue();
+  const hostSource = overrideHost != null ? overrideHost : getHostValue();
+  const host = typeof hostSource === 'string' ? hostSource.trim() : '';
   if (!host) {
     if (context === 'manual') {
       setDiscoverStatus('請先設定 Host', 'error');
@@ -2043,9 +2075,14 @@ async function connectNow({ context = 'manual' } = {}) {
       host,
       port: 4403,
       handshake: true,
-      heartbeat: 0
+      heartbeat: SOCKET_HEARTBEAT_SECONDS,
+      keepAlive: true,
+      keepAliveDelayMs: SOCKET_KEEPALIVE_DELAY_MS,
+      idleTimeoutMs: SOCKET_IDLE_TIMEOUT_MS
     });
     appendLog('CONNECT', `success context=${context}`);
+    lastConnectedHost = host;
+    lastConnectedHostRevision = hostPreferenceRevision;
     return true;
   } catch (err) {
     console.error('連線失敗:', err);
@@ -2103,7 +2140,8 @@ function startReconnectLoop() {
     appendLog('CONNECT', 'reconnect loop suppressed');
     return;
   }
-  if (!hasHost() || !hasApiKey()) {
+  const reconnectHost = getReconnectHost();
+  if (!reconnectHost || !hasApiKey()) {
     return;
   }
   if (reconnectTimer) {
@@ -2165,13 +2203,14 @@ function scheduleReconnectAttempt(delayMs = 0) {
       appendLog('CONNECT', 'reconnect attempt skipped (already connecting/connected)');
       return;
     }
-    if (!hasHost() || !hasApiKey()) {
+    const attemptHost = getReconnectHost();
+    if (!attemptHost || !hasApiKey()) {
       appendLog('CONNECT', 'reconnect attempt skipped (missing host/api key)');
       return;
     }
 
-    appendLog('CONNECT', `attempt context=reconnect host=${getHostValue()}`);
-    const success = await connectNow({ context: 'reconnect' });
+    appendLog('CONNECT', `attempt context=reconnect host=${attemptHost}`);
+    const success = await connectNow({ context: 'reconnect', overrideHost: attemptHost });
 
     if (!success) {
       recordReconnectFailure('connect-failure');

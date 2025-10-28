@@ -20,8 +20,41 @@ function log(step) {
   console.log(`[build-win] ${step}`);
 }
 
+function quoteForCmd(arg) {
+  if (!/[\s"]/u.test(arg)) return arg;
+  return `"${arg.replace(/"/g, '""')}"`;
+}
+
+function quoteForPwsh(arg) {
+  if (!/[\s']/u.test(arg)) return `'${arg}'`;
+  return `'${arg.replace(/'/g, "''")}'`;
+}
+
 function run(cmd, args, opts = {}) {
   log(`running: ${cmd} ${args.join(' ')}`);
+  if (process.platform === 'win32' && cmd === 'npm') {
+    const commandLine = [cmd, ...args.map(quoteForCmd)].join(' ');
+    const shell = process.env.ComSpec || 'cmd.exe';
+    execFileSync(shell, ['/d', '/s', '/c', commandLine], { stdio: 'inherit', ...opts });
+    return;
+  }
+  if (process.platform === 'win32' && cmd === 'zip') {
+    const destination = args[1];
+    const source = args[2];
+    const psCommand = [
+      'Compress-Archive',
+      '-Path',
+      quoteForPwsh(source),
+      '-DestinationPath',
+      quoteForPwsh(destination),
+      '-Force'
+    ].join(' ');
+    execFileSync('powershell.exe', ['-NoLogo', '-NoProfile', '-Command', psCommand], {
+      stdio: 'inherit',
+      ...opts
+    });
+    return;
+  }
   execFileSync(cmd, args, { stdio: 'inherit', ...opts });
 }
 
@@ -54,7 +87,11 @@ function ensureDir(dir) {
   ensureDir(outputDir);
 
   log('extracting electron runtime');
-  run('unzip', ['-q', '-o', electronZipPath, '-d', outputDir]);
+  if (process.platform === 'win32') {
+    run('tar', ['-xf', electronZipPath, '-C', outputDir]);
+  } else {
+    run('unzip', ['-q', '-o', electronZipPath, '-d', outputDir]);
+  }
 
   // When unzipping into outputDir, the contents land directly in place.
   const resourcesDir = path.join(outputDir, 'resources');
