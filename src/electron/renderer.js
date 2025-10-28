@@ -95,6 +95,8 @@ let hostPreferenceRevision = 0;
 let lastConnectedHost = null;
 let lastConnectedHostRevision = -1;
 let hostGuidanceActive = false;
+let initialSetupAutoConnectPending = false;
+let initialSetupAutoConnectTriggered = false;
 const selfNodeState = {
   name: null,
   meshId: null,
@@ -509,7 +511,7 @@ function loadPreferences() {
   }
 }
 
-function savePreferences() {
+function savePreferences({ persist = true } = {}) {
   const data = {
     host: settingsHostInput.value.trim(),
     apiKey: apiKeyInput.value.trim(),
@@ -521,6 +523,39 @@ function savePreferences() {
     aprsBeaconMinutes: getAprsBeaconMinutes()
   };
   localStorage.setItem('meshtastic:preferences', JSON.stringify(data));
+  if (persist) {
+    const hostPayload = data.host || null;
+    window.meshtastic.updateClientPreferences?.({ host: hostPayload }).then((result) => {
+      if (result && result.success === false && result.error) {
+        console.warn('persist client preferences failed:', result.error);
+      }
+    }).catch((err) => {
+      console.warn('persist client preferences error:', err);
+    });
+  }
+  return data;
+}
+
+async function hydratePreferencesFromMain() {
+  if (!window.meshtastic.getClientPreferences) {
+    return;
+  }
+  try {
+    const preferences = await window.meshtastic.getClientPreferences();
+    if (!preferences || typeof preferences !== 'object') {
+      return;
+    }
+    const host = typeof preferences.host === 'string' ? preferences.host.trim() : '';
+    if (host && getHostValue() !== host) {
+      settingsHostInput.value = host;
+      if (overlayHostInput) {
+        overlayHostInput.value = host;
+      }
+      savePreferences({ persist: false });
+    }
+  } catch (err) {
+    console.warn('載入偏好設定失敗:', err);
+  }
 }
 
 function getHostValue() {
@@ -552,35 +587,50 @@ function getAprsBeaconMinutes() {
   return rounded;
 }
 
-loadPreferences();
-setDiscoverStatus('', 'info');
-updatePlatformStatus();
-updateConnectAvailability();
-ensureHostGuidance();
-refreshOverlay();
-activatePage('monitor-page');
-scheduleInitialAutoConnect();
-clearSelfNodeDisplay();
-appendLog('APP', 'TMAG monitor initialized.');
-updateDashboardCounters();
+async function bootstrap() {
+  loadPreferences();
+  await hydratePreferencesFromMain();
+  setDiscoverStatus('', 'info');
+  updatePlatformStatus();
+  updateConnectAvailability();
+  ensureHostGuidance();
+  refreshOverlay();
+  activatePage('monitor-page');
+  scheduleInitialAutoConnect();
+  clearSelfNodeDisplay();
+  appendLog('APP', 'TMAG monitor initialized.');
+  updateDashboardCounters();
 
-const initialAprsServer = aprsServerInput?.value?.trim() || DEFAULT_APRS_SERVER;
-window.meshtastic.setAprsServer?.(initialAprsServer);
-const initialBeaconMinutes = getAprsBeaconMinutes();
-window.meshtastic.setAprsBeaconInterval?.(initialBeaconMinutes);
+  const initialAprsServer = aprsServerInput?.value?.trim() || DEFAULT_APRS_SERVER;
+  window.meshtastic.setAprsServer?.(initialAprsServer);
+  const initialBeaconMinutes = getAprsBeaconMinutes();
+  window.meshtastic.setAprsBeaconInterval?.(initialBeaconMinutes);
 
-window.meshtastic.getAppInfo?.().then((info) => {
-  if (info?.version) {
-    if (appVersionLabel) {
-      appVersionLabel.textContent = `v${info.version}`;
+  try {
+    const info = await window.meshtastic.getAppInfo?.();
+    if (info?.version) {
+      if (appVersionLabel) {
+        appVersionLabel.textContent = `v${info.version}`;
+      }
+      if (appNameHeading) {
+        document.title = `TMMARC Meshtastic APRS Gateway (TMAG) v${info.version}`;
+      }
+      appendLog('APP', `version ${info.version} loaded`);
     }
-    if (appNameHeading) {
-      document.title = `TMMARC Meshtastic APRS Gateway (TMAG) v${info.version}`;
-    }
-    appendLog('APP', `version ${info.version} loaded`);
+  } catch (err) {
+    appendLog('APP', `version lookup failed: ${err.message}`);
   }
-}).catch((err) => {
-  appendLog('APP', `version lookup failed: ${err.message}`);
+
+  try {
+    await maybeAutoValidateInitialKey();
+  } catch (err) {
+    console.warn('initial auto-validate error:', err);
+  }
+}
+
+bootstrap().catch((err) => {
+  console.error('renderer bootstrap failed:', err);
+  appendLog('APP', `初始化失敗: ${err.message || err}`);
 });
 
 async function maybeAutoValidateInitialKey() {
@@ -599,10 +649,6 @@ async function maybeAutoValidateInitialKey() {
   }
   validateApiKey(initialKey, { auto: true, source: 'main' });
 }
-
-maybeAutoValidateInitialKey().catch((err) => {
-  console.warn('initial auto-validate error:', err);
-});
 
 navButtons.forEach((btn) => {
   btn.addEventListener('click', () => {
@@ -684,6 +730,7 @@ resetDataBtn?.addEventListener('click', async () => {
   }
   try {
     await window.meshtastic.resetCallMeshData?.();
+    await window.meshtastic.updateClientPreferences?.({ host: null });
     try {
       localStorage.clear();
     } catch {
@@ -704,6 +751,8 @@ resetDataBtn?.addEventListener('click', async () => {
     hostPreferenceRevision = 0;
     lastConnectedHost = null;
     lastConnectedHostRevision = -1;
+    initialSetupAutoConnectPending = false;
+    initialSetupAutoConnectTriggered = false;
     loadPreferences();
     ensureHostGuidance({ force: true });
     if (aprsServerInput) {
@@ -1776,10 +1825,13 @@ function applyDiscoveredDevice(device) {
     appendLog('DISCOVER', 'device missing usable address');
     return;
   }
+  const overlayActive = isOverlayHostStepVisible();
   settingsHostInput.value = address;
   markHostPreferenceUpdated();
+  if (overlayActive || initialSetupAutoConnectPending) {
+    initialSetupAutoConnectPending = true;
+  }
   savePreferences();
-  const overlayActive = isOverlayHostStepVisible();
   if (overlayHostInput) {
     overlayHostInput.value = address;
   }
@@ -1791,6 +1843,7 @@ function applyDiscoveredDevice(device) {
   ensureHostGuidance();
   hideDiscoverModal();
   appendLog('DISCOVER', `selected ${device.name || address}`);
+  maybeTriggerInitialSetupAutoConnect('host-discovered');
 }
 
 function setDiscoveringState(isDiscovering) {
@@ -1845,21 +1898,26 @@ function applyOverlayHost() {
     return;
   }
   const previous = getHostValue();
+  const overlayActive = isOverlayHostStepVisible();
   settingsHostInput.value = value;
   if (overlayHostInput) {
     overlayHostInput.value = value;
   }
   markHostPreferenceUpdated();
+  if (overlayActive || initialSetupAutoConnectPending) {
+    initialSetupAutoConnectPending = true;
+  }
   savePreferences();
   resumeAutoReconnect({ reason: 'host-updated', silent: true });
   updateConnectAvailability();
   ensureHostGuidance();
-  if (isOverlayHostStepVisible()) {
+  if (overlayActive) {
     setOverlayHostStatus('節點 IP 已儲存', 'success');
   }
   if (previous !== value) {
     appendLog('CONNECT', 'host updated value=' + value);
   }
+  maybeTriggerInitialSetupAutoConnect('overlay-host');
 }
 
 
@@ -2002,6 +2060,10 @@ async function validateApiKey(key, { auto = false, source = 'main' } = {}) {
       savePreferences();
       refreshOverlay();
       ensureHostGuidance();
+      if (source === 'overlay') {
+        initialSetupAutoConnectPending = true;
+        maybeTriggerInitialSetupAutoConnect('api-key-overlay');
+      }
       return;
     }
 
@@ -2019,6 +2081,8 @@ async function validateApiKey(key, { auto = false, source = 'main' } = {}) {
       platformStatus.textContent = info.statusText || 'CallMesh: 未設定 Key';
       savePreferences();
       showOverlay('api');
+      initialSetupAutoConnectPending = false;
+      initialSetupAutoConnectTriggered = false;
       return;
     }
 
@@ -2052,6 +2116,8 @@ async function validateApiKey(key, { auto = false, source = 'main' } = {}) {
     lastVerifiedKey = '';
     savePreferences();
     showOverlay('api');
+    initialSetupAutoConnectPending = false;
+    initialSetupAutoConnectTriggered = false;
   } finally {
     updateConnectAvailability();
     if (source === 'overlay') {
@@ -2080,6 +2146,32 @@ function updateToggleButton() {
   connectBtn.textContent = '連線';
   connectBtn.disabled = !hasApiKey() || !hasHost();
   connectBtn.dataset.state = 'idle';
+}
+
+function maybeTriggerInitialSetupAutoConnect(reason) {
+  if (initialSetupAutoConnectTriggered || !initialSetupAutoConnectPending) {
+    return;
+  }
+  if (!hasApiKey() || !hasHost()) {
+    return;
+  }
+  if (manualDisconnect) {
+    appendLog('CONNECT', `initial setup auto-connect skipped (${reason}): manual disconnect active`);
+    initialSetupAutoConnectPending = false;
+    initialSetupAutoConnectTriggered = true;
+    return;
+  }
+  if (isConnecting || isConnected) {
+    initialSetupAutoConnectPending = false;
+    initialSetupAutoConnectTriggered = true;
+    return;
+  }
+  initialSetupAutoConnectPending = false;
+  initialSetupAutoConnectTriggered = true;
+  appendLog('CONNECT', `initial setup auto-connect triggered (${reason})`);
+  connectNow({ context: 'initial' }).catch((err) => {
+    console.warn('initial setup auto-connect failed:', err);
+  });
 }
 
 function scheduleInitialAutoConnect() {
