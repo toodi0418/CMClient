@@ -192,7 +192,7 @@ class CallMeshAprsBridge extends EventEmitter {
         this.callmeshState.verified = true;
         this.callmeshState.verifiedKey = trimmed;
         this.callmeshState.degraded = true;
-        this.callmeshState.lastStatus = `CallMesh: 伺服器無回應，沿用已驗證的 Key (${err.message})`;
+        this.callmeshState.lastStatus = 'CallMesh: 驗證逾時';
         this.callmeshState.agent = cmClient.agentString;
         const applied = this.applyCachedProvisionFallback('verify degraded');
         if (!applied) {
@@ -343,7 +343,7 @@ class CallMeshAprsBridge extends EventEmitter {
         this.updateAprsProvision(null);
       } else {
         this.callmeshState.degraded = true;
-        this.callmeshState.lastStatus = `CallMesh: Heartbeat 失敗，沿用已驗證的 Key (${err.message})`;
+        this.callmeshState.lastStatus = 'CallMesh: Heartbeat 失敗';
         this.emitLog('CALLMESH', `heartbeat error: ${err.message}`);
         if (this.applyCachedProvisionFallback('heartbeat failure')) {
           shouldEmit = false;
@@ -792,7 +792,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
 
     const provision = this.callmeshState.provision;
-    const payload = buildAprsPayload(provision, {});
+    const payload = buildAprsPayload(provision, { includePhg: true });
     if (!payload) {
       this.aprsBeaconPending = true;
       return false;
@@ -1421,6 +1421,22 @@ function buildAprsPayload(provision, overrides = {}) {
   } else if (provision?.comment) {
     comment = sanitizeAprsComment(provision.comment);
   }
+  if (comment) {
+    comment = comment.trim();
+  }
+
+  let phgDigits = null;
+  const includePhg = overrides.includePhg === true;
+  if (includePhg) {
+    const phgSource = hasOwn(overrides, 'phg') ? overrides.phg : (provision?.phg ?? null);
+    if (phgSource != null) {
+      const raw = String(phgSource).trim().toUpperCase();
+      if (/^[0-9]{3,4}$/.test(raw)) {
+        const normalized = raw.length === 3 ? `${raw}0` : raw.slice(0, 4);
+        phgDigits = normalized;
+      }
+    }
+  }
 
   const courseDegrees =
     hasOwn(overrides, 'courseDegrees') ? overrides.courseDegrees
@@ -1453,6 +1469,9 @@ function buildAprsPayload(provision, overrides = {}) {
     frame += `${String(course).padStart(3, '0')}/${String(speed).padStart(3, '0')}`;
   }
   frame += altitudeSection;
+  if (phgDigits) {
+    comment = comment ? `PHG${phgDigits}${comment}` : `PHG${phgDigits}`;
+  }
   if (comment) {
     frame += comment;
   }
@@ -1541,7 +1560,7 @@ const TELEMETRY_CONTROL_TYPES = new Set([
 function sanitizeAprsComment(comment) {
   if (!comment) return '';
   const cleaned = String(comment).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
-  return cleaned.slice(0, 60);
+  return cleaned;
 }
 
 function pickSymbolChar(value) {

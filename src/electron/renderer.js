@@ -47,10 +47,15 @@ const SOCKET_HEARTBEAT_SECONDS = 30;
 const SOCKET_IDLE_TIMEOUT_MS = 60 * 1000;
 const SOCKET_KEEPALIVE_DELAY_MS = 15 * 1000;
 const HOST_GUIDANCE_MESSAGE = '尚未設定節點 IP，請手動輸入或按「自動搜尋」。';
+const METERS_PER_FOOT = 0.3048;
+const LOG_DOWNLOAD_PREFIX = 'tmag-log';
 
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
 const infoCoords = document.getElementById('info-coords');
+const infoPhgPower = document.getElementById('info-phg-power');
+const infoPhgHeight = document.getElementById('info-phg-height');
+const infoPhgGain = document.getElementById('info-phg-gain');
 const infoComment = document.getElementById('info-comment');
 const infoUpdatedAt = document.getElementById('info-updated-at');
 
@@ -69,6 +74,7 @@ const aprsServerInput = document.getElementById('aprs-server');
 const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
 const resetDataBtn = document.getElementById('reset-data-btn');
 const copyLogBtn = document.getElementById('copy-log-btn');
+const downloadLogBtn = document.getElementById('download-log-btn');
 
 const MAX_ROWS = 200;
 let discoveredDevices = [];
@@ -103,7 +109,7 @@ const selfNodeState = {
   normalizedMeshId: null,
   raw: null
 };
-const LOG_MAX_ENTRIES = 500;
+const LOG_MAX_ENTRIES = 2000;
 const logEntries = [];
 let logFilterTag = 'all';
 let logSearchTerm = '';
@@ -122,7 +128,8 @@ const recentReconnectFailures = [];
 const recentReconnectFailureTimestamps = new Map();
 let lastCallmeshStatusLog = '';
 
-const FLOW_MAX_ENTRIES = 300;
+const FLOW_MAX_ENTRIES = 1000;
+const ALT_TOKEN_REGEX = /\s*(?:·\s*)?ALT\s*-?\d+(?:\.\d+)?\s*m\b/gi;
 const APRS_HISTORY_MAX = 5000;
 const flowEntries = [];
 const flowEntryIndex = new Map();
@@ -328,20 +335,64 @@ function renderLogOutput({ scrollToEnd = false } = {}) {
   if (!logOutput) return;
   const previousScrollBottom = logOutput.scrollTop >= (logOutput.scrollHeight - logOutput.clientHeight - 4);
   const filtered = getFilteredLogEntries();
+  const hasSearchTerm = Boolean(logSearchTerm);
   if (!filtered.length) {
+    let message;
     if (!logEntries.length) {
-      logOutput.textContent = '尚未載入任何紀錄。';
+      message = '尚未載入任何紀錄。';
     } else if (logFilterTag !== 'all' || logSearchTerm) {
-      logOutput.textContent = '沒有符合篩選條件的日誌。';
+      message = '沒有符合篩選條件的日誌。';
     } else {
-      logOutput.textContent = '尚未載入任何紀錄。';
+      message = '尚未載入任何紀錄。';
     }
+    logOutput.textContent = message;
+    if (scrollToEnd || previousScrollBottom) {
+      logOutput.scrollTop = logOutput.scrollHeight;
+    }
+    return;
+  }
+
+  if (hasSearchTerm) {
+    const html = filtered.map((entry) => highlightLogLine(entry.line, logSearchTerm)).join('\n');
+    logOutput.innerHTML = html;
   } else {
     logOutput.textContent = filtered.map((entry) => entry.line).join('\n');
   }
   if (scrollToEnd || previousScrollBottom) {
     logOutput.scrollTop = logOutput.scrollHeight;
   }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function highlightLogLine(line, term) {
+  if (!term) {
+    return escapeHtml(line);
+  }
+  const lowerLine = line.toLowerCase();
+  const termLen = term.length;
+  if (termLen === 0) {
+    return escapeHtml(line);
+  }
+  let result = '';
+  let cursor = 0;
+  let index = lowerLine.indexOf(term, cursor);
+  while (index !== -1) {
+    result += escapeHtml(line.slice(cursor, index));
+    const match = line.slice(index, index + termLen);
+    result += `<mark>${escapeHtml(match)}</mark>`;
+    cursor = index + termLen;
+    index = lowerLine.indexOf(term, cursor);
+  }
+  result += escapeHtml(line.slice(cursor));
+  return result;
 }
 
 function setCounterValue(element, value, { positive = false, negative = false } = {}) {
@@ -789,6 +840,26 @@ copyLogBtn?.addEventListener('click', async () => {
   }
 });
 
+downloadLogBtn?.addEventListener('click', () => {
+  const filtered = getFilteredLogEntries();
+  if (!filtered.length) {
+    appendLog('APP', '目前尚無可下載的日誌資料');
+    return;
+  }
+  const text = filtered.map((entry) => entry.line).join('\n');
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `${LOG_DOWNLOAD_PREFIX}-${timestamp}.txt`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  appendLog('APP', '日誌已下載');
+});
+
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (isConnecting || manualConnectActive) {
@@ -928,7 +999,6 @@ const unsubscribeStatus = window.meshtastic.onStatus((info) => {
   if (info.status === 'connected') {
     initialAutoConnectActive = false;
     setConnectedState(true);
-    clearSummaryTable();
     return;
   }
 
@@ -1034,7 +1104,7 @@ function handleCallMeshStatus(info, { silent = false } = {}) {
     }
     if (!silent) {
       if (callmeshDegraded && !previousDegraded) {
-        setDiscoverStatus(info.statusText || 'CallMesh: Heartbeat 失敗，沿用已驗證的 Key', 'warn');
+        setDiscoverStatus(info.statusText || 'CallMesh: Heartbeat 失敗', 'warn');
       }
       if (!callmeshDegraded && previousDegraded) {
         setDiscoverStatus(info.statusText || 'CallMesh: Heartbeat 恢復正常', 'success');
@@ -1311,6 +1381,19 @@ function getFilteredFlowEntries() {
   return filtered;
 }
 
+function sanitizeFlowLeftText(value, { stripAltitude = false } = {}) {
+  if (value == null) return '';
+  let text = String(value).trim();
+  if (!text) return '';
+  if (stripAltitude) {
+    ALT_TOKEN_REGEX.lastIndex = 0;
+    text = text.replace(ALT_TOKEN_REGEX, '');
+  }
+  text = text.replace(/\s*·\s*$/, '');
+  text = text.replace(/\s{2,}/g, ' ').trim();
+  return text;
+}
+
 function renderFlowEntries() {
   if (!flowList) return;
   const filtered = getFilteredFlowEntries();
@@ -1365,8 +1448,9 @@ function renderFlowEntries() {
     colRight.className = 'flow-item-col flow-item-col-right';
 
     const leftTexts = new Set();
+    const hasAltitudeChip = Number.isFinite(entry.altitude);
     const appendLeft = (text, className) => {
-      const value = (text || '').trim();
+      const value = sanitizeFlowLeftText(text, { stripAltitude: hasAltitudeChip });
       if (!value || leftTexts.has(value)) return;
       const el = document.createElement('div');
       el.className = className;
@@ -1405,7 +1489,7 @@ function renderFlowEntries() {
     }
     if (Number.isFinite(entry.snr)) metaParts.push(`<span class="chip chip-snr">SNR ${entry.snr.toFixed(1)} dB</span>`);
     if (Number.isFinite(entry.rssi)) metaParts.push(`<span class="chip chip-rssi">RSSI ${entry.rssi.toFixed(0)} dBm</span>`);
-    if (Number.isFinite(entry.altitude)) metaParts.push(`<span class="chip chip-alt">ALT ${Math.round(entry.altitude)} m</span>`);
+    if (hasAltitudeChip) metaParts.push(`<span class="chip chip-alt">ALT ${Math.round(entry.altitude)} m</span>`);
     if (Number.isFinite(entry.speedKph)) metaParts.push(`<span class="chip chip-speed">SPD ${entry.speedKph.toFixed(1)} km/h</span>`);
     if (Number.isFinite(entry.satsInView)) metaParts.push(`<span class="chip chip-sats">SAT ${entry.satsInView}</span>`);
     const metaWrap = document.createElement('div');
@@ -2043,7 +2127,7 @@ async function validateApiKey(key, { auto = false, source = 'main' } = {}) {
     if (info.success && info.hasKey) {
       const degraded = Boolean(info.degraded);
       const statusMsg = degraded
-        ? 'CallMesh 暫時無回應，沿用已驗證的 Key (' + (info.statusText || 'degraded') + ')'
+        ? 'CallMesh 暫時無回應'
         : 'API Key 驗證成功';
       setDiscoverStatus(statusMsg, degraded ? 'warn' : 'success');
       setOverlayStatus(statusMsg, degraded ? 'warn' : 'success');
@@ -2658,6 +2742,9 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
     infoCallsign.textContent = '—';
     infoSymbol.textContent = '—';
     if (infoCoords) infoCoords.textContent = '—';
+    if (infoPhgPower) infoPhgPower.textContent = '—';
+    if (infoPhgHeight) infoPhgHeight.textContent = '—';
+    if (infoPhgGain) infoPhgGain.textContent = '—';
     infoComment.textContent = '—';
     infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : '—';
     lastProvisionSignature = null;
@@ -2674,22 +2761,39 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
   const symbol = symbolTable || symbolCode ? `${symbolTable}${symbolCode}` : '';
   const displaySymbol = overlaySymbol || symbol || '—';
   const comment = provision.comment || '—';
+  const phgInfo = decodePhg(provision.phg);
 
   infoCallsign.textContent = aprsCallsign;
   infoSymbol.textContent = displaySymbol;
   if (infoCoords) infoCoords.textContent = formatProvisionCoords(provision);
+  if (infoPhgPower) infoPhgPower.textContent = phgInfo ? `${phgInfo.powerWatts} W` : '—';
+  if (infoPhgHeight) infoPhgHeight.textContent = phgInfo ? `${phgInfo.heightMeters.toFixed(1)} m` : '—';
+  if (infoPhgGain) infoPhgGain.textContent = phgInfo ? `${phgInfo.gainDb} dB` : '—';
   infoComment.textContent = comment;
   infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : new Date().toLocaleString();
 
   const signature = JSON.stringify({
     aprsCallsign,
     displaySymbol,
+    phg: phgInfo
+      ? {
+          power: phgInfo.powerWatts,
+          height: Number(phgInfo.heightMeters.toFixed(2)),
+          gain: phgInfo.gainDb
+        }
+      : null,
     comment,
     coords: infoCoords ? infoCoords.textContent : ''
   });
   if (signature !== lastProvisionSignature) {
     lastProvisionSignature = signature;
-    appendLog('PROVISION', `callsign=${aprsCallsign} symbol=${displaySymbol}`);
+    const logParts = [`callsign=${aprsCallsign}`, `symbol=${displaySymbol}`];
+    if (phgInfo) {
+      logParts.push(`power=${phgInfo.powerWatts}W`);
+      logParts.push(`height=${phgInfo.heightMeters.toFixed(1)}m`);
+      logParts.push(`gain=${phgInfo.gainDb}dB`);
+    }
+    appendLog('PROVISION', logParts.join(' '));
   }
 }
 
@@ -2700,6 +2804,32 @@ function formatProvisionCoords(provision) {
   const latFmt = Number(lat).toFixed(4);
   const lonFmt = Number(lon).toFixed(4);
   return `(${latFmt}, ${lonFmt})`;
+}
+
+function decodePhg(value) {
+  if (value == null) return null;
+  const str = String(value).trim().toUpperCase();
+  if (!/^[0-9]{3,4}$/.test(str)) {
+    return null;
+  }
+  const digits = str.split('').map((ch) => Number.parseInt(ch, 10));
+  if (digits.length < 3 || digits.some((digit) => Number.isNaN(digit))) {
+    return null;
+  }
+
+  const [powerDigit, heightDigit, gainDigit] = digits;
+  const powerWatts = powerDigit * powerDigit;
+  const heightFeet = 10 * Math.pow(2, heightDigit);
+  const heightMeters = heightFeet * METERS_PER_FOOT;
+  const gainDb = gainDigit;
+
+  return {
+    raw: str,
+    powerWatts,
+    heightFeet,
+    heightMeters,
+    gainDb
+  };
 }
 
 function formatRelativeTime(isoString) {

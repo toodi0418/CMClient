@@ -136,6 +136,7 @@
             </select>
           </div>
           <button type="button" id="copy-log-btn" class="copy-log-btn">複製全部日誌</button>
+          <button type="button" id="download-log-btn" class="copy-log-btn">下載日誌</button>
           <pre id="log-output" class="log-output">尚未載入任何紀錄。</pre>
         </section>
       </section>
@@ -166,11 +167,11 @@
           <p>顯示 CallMesh 自動下發的設定，並在更新時即時同步。</p>
           <div class="info-grid">
             <div class="info-item">
-              <span class="label">Callsign (含 SSID)</span>
+              <span class="label">呼號</span>
               <span id="info-callsign" class="value">—</span>
             </div>
             <div class="info-item">
-              <span class="label">Symbol</span>
+              <span class="label">符號</span>
               <span id="info-symbol" class="value">—</span>
             </div>
             <div class="info-item">
@@ -178,7 +179,19 @@
               <span id="info-coords" class="value">—</span>
             </div>
             <div class="info-item">
-              <span class="label">Comment</span>
+              <span class="label">輸出功率</span>
+              <span id="info-phg-power" class="value">—</span>
+            </div>
+            <div class="info-item">
+              <span class="label">天線高度</span>
+              <span id="info-phg-height" class="value">—</span>
+            </div>
+            <div class="info-item">
+              <span class="label">天線增益</span>
+              <span id="info-phg-gain" class="value">—</span>
+            </div>
+            <div class="info-item">
+              <span class="label">備註</span>
               <span id="info-comment" class="value multiline">—</span>
             </div>
             <div class="info-item">

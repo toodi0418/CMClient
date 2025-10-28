@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - dev
   pull_request:
 
 jobs:
@@ -28,6 +29,17 @@ jobs:
         run: npm run build:win
         shell: powershell
 
+      - name: Build Windows CLI
+        run: |
+          if (-not (Test-Path dist\cli)) { New-Item -ItemType Directory -Path dist\cli | Out-Null }
+          npx pkg src/index.js `
+            --config package.json `
+            --targets node18-win-x64 `
+            --compress Brotli `
+            --public `
+            --output dist/cli/tmag-cli-win-x64.exe
+        shell: powershell
+
       - name: Determine build version
         id: vars
         shell: powershell
@@ -37,9 +49,17 @@ jobs:
           if (-not $version) { throw 'Unable to read version from package.json' }
           echo "version=$version" >> $env:GITHUB_OUTPUT
 
+      - name: Package Windows CLI
+        shell: powershell
+        run: |
+          $cliPath = "dist/cli/tmag-cli-win-x64.exe"
+          if (-not (Test-Path $cliPath)) { throw "Unable to find CLI executable: $cliPath" }
+          Compress-Archive -Path $cliPath -DestinationPath ("dist/cli/tmag-cli-win-x64-v" + "${{ steps.vars.outputs.version }}" + ".zip") -Force
+
       - name: Upload packaged app
         uses: actions/upload-artifact@v4
         with:
           name: tmag-windows-build-v${{ steps.vars.outputs.version }}
           path: |
             dist/TMAG_Monitor-v${{ steps.vars.outputs.version }}-win32-x64.zip
+            dist/cli/tmag-cli-win-x64-v${{ steps.vars.outputs.version }}.zip

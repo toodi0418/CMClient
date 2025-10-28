@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - dev
   pull_request:
 
 jobs:
@@ -75,8 +76,8 @@ jobs:
             dist/TMAG_Monitor-macOS-x64-v${{ steps.vars.outputs.version }}.zip
             dist/artifacts/tmag-cli-macos-x64-v${{ steps.vars.outputs.version }}.zip
 
-  build-linux-cli:
-    name: Build Linux CLI
+  build-linux:
+    name: Build Linux GUI & CLI
     runs-on: ubuntu-latest
 
     steps:
@@ -92,7 +93,16 @@ jobs:
       - name: 安裝相依套件
         run: npm ci
 
-      - name: 建置 Linux CLI
+      - name: 建置 Linux GUI
+        run: |
+          npx electron-packager . "TMAG Monitor" \
+            --platform=linux \
+            --arch=x64 \
+            --out dist \
+            --overwrite \
+            --prune=true
+
+      - name: 建置 Linux CLI (x64)
         run: |
           mkdir -p dist/cli
           npx pkg src/index.js \
@@ -101,6 +111,16 @@ jobs:
             --compress Brotli \
             --public \
             --output dist/cli/tmag-cli-linux-x64
+
+      - name: 建置 Linux CLI (ARM64)
+        run: |
+          mkdir -p dist/cli
+          npx pkg src/index.js \
+            --config package.json \
+            --targets node18-linux-arm64 \
+            --compress Brotli \
+            --public \
+            --output dist/cli/tmag-cli-linux-arm64
 
       - name: 取得版本號
         id: linux_vars
@@ -112,17 +132,35 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: 壓縮 Linux CLI
+      - name: 壓縮 Linux 產物
         run: |
-          cli_path="dist/cli/tmag-cli-linux-x64"
-          if [ ! -f "$cli_path" ]; then
-            echo "找不到 Linux CLI：$cli_path" >&2
+          set -e
+          version="${{ steps.linux_vars.outputs.version }}"
+
+          gui_dir="TMAG Monitor-linux-x64"
+          if [ ! -d "dist/$gui_dir" ]; then
+            echo "找不到 Linux GUI 目錄：dist/$gui_dir" >&2
             exit 1
           fi
-          (cd dist/cli && zip -9 "tmag-cli-linux-x64-v${{ steps.linux_vars.outputs.version }}.zip" "tmag-cli-linux-x64")
+          (
+            cd dist
+            zip -9 -r "TMAG_Monitor-linux-x64-v${version}.zip" "$gui_dir"
+          )
 
-      - name: 上傳 Linux CLI
+          for target in linux-x64 linux-arm64; do
+            cli_path="dist/cli/tmag-cli-${target}"
+            if [ ! -f "$cli_path" ]; then
+              echo "找不到 CLI：$cli_path" >&2
+              exit 1
+            fi
+            (cd dist/cli && zip -9 "tmag-cli-${target}-v${version}.zip" "tmag-cli-${target}")
+          done
+
+      - name: 上傳 Linux 成品
         uses: actions/upload-artifact@v4
         with:
-          name: tmag-linux-cli-v${{ steps.linux_vars.outputs.version }}
-          path: dist/cli/tmag-cli-linux-x64-v${{ steps.linux_vars.outputs.version }}.zip
+          name: tmag-linux-builds-v${{ steps.linux_vars.outputs.version }}
+          path: |
+            dist/TMAG_Monitor-linux-x64-v${{ steps.linux_vars.outputs.version }}.zip
+            dist/cli/tmag-cli-linux-x64-v${{ steps.linux_vars.outputs.version }}.zip
+            dist/cli/tmag-cli-linux-arm64-v${{ steps.linux_vars.outputs.version }}.zip
