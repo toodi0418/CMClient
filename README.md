@@ -1,4 +1,4 @@
-ㄕ# Meshtastic APRS Gateway (TMAG)
+# Meshtastic APRS Gateway (TMAG)
 
 TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合了 CallMesh 平台驗證、Mapping 同步、APRS uplink 與遙測統計。專案同時提供：
 
@@ -251,4 +251,4 @@ CMClient/
 
 ## 10. 授權
 
-此專案依原作者設定的授權條款釋出；若需商用或替代授權，請聯絡 maintainer。たい
+此專案依原作者設定的授權條款釋出；若需商用或替代授權，請聯絡 maintainer。
