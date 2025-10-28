@@ -792,7 +792,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
 
     const provision = this.callmeshState.provision;
-    const payload = buildAprsPayload(provision, {});
+    const payload = buildAprsPayload(provision, { includePhg: true });
     if (!payload) {
       this.aprsBeaconPending = true;
       return false;
@@ -1421,6 +1421,22 @@ function buildAprsPayload(provision, overrides = {}) {
   } else if (provision?.comment) {
     comment = sanitizeAprsComment(provision.comment);
   }
+  if (comment) {
+    comment = comment.trim();
+  }
+
+  let phgDigits = null;
+  const includePhg = overrides.includePhg === true;
+  if (includePhg) {
+    const phgSource = hasOwn(overrides, 'phg') ? overrides.phg : (provision?.phg ?? null);
+    if (phgSource != null) {
+      const raw = String(phgSource).trim().toUpperCase();
+      if (/^[0-9]{3,4}$/.test(raw)) {
+        const normalized = raw.length === 3 ? `${raw}0` : raw.slice(0, 4);
+        phgDigits = normalized;
+      }
+    }
+  }
 
   const courseDegrees =
     hasOwn(overrides, 'courseDegrees') ? overrides.courseDegrees
@@ -1453,6 +1469,9 @@ function buildAprsPayload(provision, overrides = {}) {
     frame += `${String(course).padStart(3, '0')}/${String(speed).padStart(3, '0')}`;
   }
   frame += altitudeSection;
+  if (phgDigits) {
+    comment = comment ? `PHG${phgDigits} ${comment}` : `PHG${phgDigits}`;
+  }
   if (comment) {
     frame += comment;
   }
