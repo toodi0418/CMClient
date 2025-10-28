@@ -48,6 +48,7 @@ const SOCKET_IDLE_TIMEOUT_MS = 60 * 1000;
 const SOCKET_KEEPALIVE_DELAY_MS = 15 * 1000;
 const HOST_GUIDANCE_MESSAGE = '尚未設定節點 IP，請手動輸入或按「自動搜尋」。';
 const METERS_PER_FOOT = 0.3048;
+const LOG_DOWNLOAD_PREFIX = 'tmag-log';
 
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
@@ -73,6 +74,7 @@ const aprsServerInput = document.getElementById('aprs-server');
 const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
 const resetDataBtn = document.getElementById('reset-data-btn');
 const copyLogBtn = document.getElementById('copy-log-btn');
+const downloadLogBtn = document.getElementById('download-log-btn');
 
 const MAX_ROWS = 200;
 let discoveredDevices = [];
@@ -333,20 +335,64 @@ function renderLogOutput({ scrollToEnd = false } = {}) {
   if (!logOutput) return;
   const previousScrollBottom = logOutput.scrollTop >= (logOutput.scrollHeight - logOutput.clientHeight - 4);
   const filtered = getFilteredLogEntries();
+  const hasSearchTerm = Boolean(logSearchTerm);
   if (!filtered.length) {
+    let message;
     if (!logEntries.length) {
-      logOutput.textContent = '尚未載入任何紀錄。';
+      message = '尚未載入任何紀錄。';
     } else if (logFilterTag !== 'all' || logSearchTerm) {
-      logOutput.textContent = '沒有符合篩選條件的日誌。';
+      message = '沒有符合篩選條件的日誌。';
     } else {
-      logOutput.textContent = '尚未載入任何紀錄。';
+      message = '尚未載入任何紀錄。';
     }
+    logOutput.textContent = message;
+    if (scrollToEnd || previousScrollBottom) {
+      logOutput.scrollTop = logOutput.scrollHeight;
+    }
+    return;
+  }
+
+  if (hasSearchTerm) {
+    const html = filtered.map((entry) => highlightLogLine(entry.line, logSearchTerm)).join('\n');
+    logOutput.innerHTML = html;
   } else {
     logOutput.textContent = filtered.map((entry) => entry.line).join('\n');
   }
   if (scrollToEnd || previousScrollBottom) {
     logOutput.scrollTop = logOutput.scrollHeight;
   }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function highlightLogLine(line, term) {
+  if (!term) {
+    return escapeHtml(line);
+  }
+  const lowerLine = line.toLowerCase();
+  const termLen = term.length;
+  if (termLen === 0) {
+    return escapeHtml(line);
+  }
+  let result = '';
+  let cursor = 0;
+  let index = lowerLine.indexOf(term, cursor);
+  while (index !== -1) {
+    result += escapeHtml(line.slice(cursor, index));
+    const match = line.slice(index, index + termLen);
+    result += `<mark>${escapeHtml(match)}</mark>`;
+    cursor = index + termLen;
+    index = lowerLine.indexOf(term, cursor);
+  }
+  result += escapeHtml(line.slice(cursor));
+  return result;
 }
 
 function setCounterValue(element, value, { positive = false, negative = false } = {}) {
@@ -792,6 +838,26 @@ copyLogBtn?.addEventListener('click', async () => {
     console.error('複製日誌失敗:', err);
     appendLog('APP', `複製日誌失敗: ${err.message || err}`);
   }
+});
+
+downloadLogBtn?.addEventListener('click', () => {
+  const filtered = getFilteredLogEntries();
+  if (!filtered.length) {
+    appendLog('APP', '目前尚無可下載的日誌資料');
+    return;
+  }
+  const text = filtered.map((entry) => entry.line).join('\n');
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `${LOG_DOWNLOAD_PREFIX}-${timestamp}.txt`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  appendLog('APP', '日誌已下載');
 });
 
 form.addEventListener('submit', async (event) => {
