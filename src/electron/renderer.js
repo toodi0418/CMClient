@@ -113,6 +113,7 @@ const recentReconnectFailureTimestamps = new Map();
 let lastCallmeshStatusLog = '';
 
 const FLOW_MAX_ENTRIES = 300;
+const APRS_HISTORY_MAX = 5000;
 const flowEntries = [];
 const flowEntryIndex = new Map();
 let flowSearchTerm = '';
@@ -121,6 +122,9 @@ const pendingAprsUplinks = new Map();
 let flowFilterState = 'all';
 const FLOW_CAPTURE_DELAY_MS = 5000;
 let flowCaptureEnabledAt = 0;
+let totalAprsUploaded = 0;
+const aprsCompletedFlowIds = new Set();
+const aprsCompletedQueue = [];
 
 const AUTO_CONNECT_MAX_ATTEMPTS = 3;
 const AUTO_CONNECT_DELAY_MS = 5000;
@@ -339,12 +343,7 @@ function setCounterValue(element, value, { positive = false, negative = false } 
 
 function updateDashboardCounters() {
   const packets = Number.isFinite(packetSummaryLast10Min) ? packetSummaryLast10Min : 0;
-  let uploaded = 0;
-  for (const entry of flowEntries) {
-    if (entry.aprs) {
-      uploaded += 1;
-    }
-  }
+  const uploaded = Number.isFinite(totalAprsUploaded) ? totalAprsUploaded : 0;
   const mappingCount = mappingMeshIds ? mappingMeshIds.size : 0;
 
   setCounterValue(counterPackets10Min, packets, {
@@ -361,6 +360,23 @@ function updateDashboardCounters() {
     positive: mappingCount > 0,
     negative: mappingCount === 0
   });
+}
+
+function markAprsUploaded(flowId) {
+  if (!flowId) return false;
+  if (aprsCompletedFlowIds.has(flowId)) {
+    return false;
+  }
+  aprsCompletedFlowIds.add(flowId);
+  aprsCompletedQueue.push(flowId);
+  if (aprsCompletedQueue.length > APRS_HISTORY_MAX) {
+    const oldest = aprsCompletedQueue.shift();
+    if (oldest) {
+      aprsCompletedFlowIds.delete(oldest);
+    }
+  }
+  totalAprsUploaded += 1;
+  return true;
 }
 
 function formatLogTimestamp(date) {
@@ -1024,6 +1040,10 @@ function clearPacketFlowData() {
   flowEntryIndex.clear();
   flowSearchTerm = '';
   pendingFlowSummaries.clear();
+  pendingAprsUplinks.clear();
+  aprsCompletedFlowIds.clear();
+  aprsCompletedQueue.length = 0;
+  totalAprsUploaded = 0;
   if (flowSearchInput) flowSearchInput.value = '';
   renderFlowEntries();
   updateDashboardCounters();
@@ -1380,7 +1400,8 @@ function refreshFlowEntryLabels() {
 
 function handleAprsUplink(info) {
   if (!info || !info.flowId) return;
-  const entry = flowEntryIndex.get(info.flowId);
+  const flowId = info.flowId;
+  const entry = flowEntryIndex.get(flowId);
   const timestampMs = Number.isFinite(Number(info.timestamp)) ? Number(info.timestamp) : Date.now();
   const aprsRecord = {
     frame: info.frame || info.payload || '',
@@ -1389,12 +1410,20 @@ function handleAprsUplink(info) {
     timestampLabel: formatFlowTimestamp(timestampMs)
   };
   if (!entry) {
-    pendingAprsUplinks.set(info.flowId, aprsRecord);
+    const incremented = markAprsUploaded(flowId);
+    pendingAprsUplinks.set(flowId, aprsRecord);
+    if (incremented) {
+      updateDashboardCounters();
+    }
     return;
   }
+  const hadAprs = Boolean(entry.aprs);
+  const incremented = markAprsUploaded(flowId);
   entry.aprs = aprsRecord;
   renderFlowEntries();
-  updateDashboardCounters();
+  if (incremented || !hadAprs) {
+    updateDashboardCounters();
+  }
 }
 
 function flowEntryMatches(entry, term) {
