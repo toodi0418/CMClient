@@ -109,7 +109,7 @@ const selfNodeState = {
   normalizedMeshId: null,
   raw: null
 };
-const LOG_MAX_ENTRIES = 500;
+const LOG_MAX_ENTRIES = 2000;
 const logEntries = [];
 let logFilterTag = 'all';
 let logSearchTerm = '';
