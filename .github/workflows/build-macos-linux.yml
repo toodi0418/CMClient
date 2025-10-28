@@ -112,16 +112,6 @@ jobs:
             --public \
             --output dist/cli/tmag-cli-linux-x64
 
-      - name: 建置 Linux CLI (ARMv7)
-        run: |
-          mkdir -p dist/cli
-          npx pkg src/index.js \
-            --config package.json \
-            --targets node18-linux-armv7 \
-            --compress Brotli \
-            --public \
-            --output dist/cli/tmag-cli-linux-armv7
-
       - name: 建置 Linux CLI (ARM64)
         run: |
           mkdir -p dist/cli
@@ -157,7 +147,7 @@ jobs:
             zip -9 -r "TMAG_Monitor-linux-x64-v${version}.zip" "$gui_dir"
           )
 
-          for target in linux-x64 linux-armv7 linux-arm64; do
+          for target in linux-x64 linux-arm64; do
             cli_path="dist/cli/tmag-cli-${target}"
             if [ ! -f "$cli_path" ]; then
               echo "找不到 CLI：$cli_path" >&2
@@ -173,5 +163,4 @@ jobs:
           path: |
             dist/TMAG_Monitor-linux-x64-v${{ steps.linux_vars.outputs.version }}.zip
             dist/cli/tmag-cli-linux-x64-v${{ steps.linux_vars.outputs.version }}.zip
-            dist/cli/tmag-cli-linux-armv7-v${{ steps.linux_vars.outputs.version }}.zip
             dist/cli/tmag-cli-linux-arm64-v${{ steps.linux_vars.outputs.version }}.zip
