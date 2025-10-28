@@ -47,11 +47,14 @@ const SOCKET_HEARTBEAT_SECONDS = 30;
 const SOCKET_IDLE_TIMEOUT_MS = 60 * 1000;
 const SOCKET_KEEPALIVE_DELAY_MS = 15 * 1000;
 const HOST_GUIDANCE_MESSAGE = '尚未設定節點 IP，請手動輸入或按「自動搜尋」。';
+const METERS_PER_FOOT = 0.3048;
 
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
 const infoCoords = document.getElementById('info-coords');
-const infoPhg = document.getElementById('info-phg');
+const infoPhgPower = document.getElementById('info-phg-power');
+const infoPhgHeight = document.getElementById('info-phg-height');
+const infoPhgGain = document.getElementById('info-phg-gain');
 const infoComment = document.getElementById('info-comment');
 const infoUpdatedAt = document.getElementById('info-updated-at');
 
@@ -2673,7 +2676,9 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
     infoCallsign.textContent = '—';
     infoSymbol.textContent = '—';
     if (infoCoords) infoCoords.textContent = '—';
-    if (infoPhg) infoPhg.textContent = '—';
+    if (infoPhgPower) infoPhgPower.textContent = '—';
+    if (infoPhgHeight) infoPhgHeight.textContent = '—';
+    if (infoPhgGain) infoPhgGain.textContent = '—';
     infoComment.textContent = '—';
     infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : '—';
     lastProvisionSignature = null;
@@ -2690,33 +2695,37 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
   const symbol = symbolTable || symbolCode ? `${symbolTable}${symbolCode}` : '';
   const displaySymbol = overlaySymbol || symbol || '—';
   const comment = provision.comment || '—';
-  const phgRaw = provision.phg ?? null;
-  let phgValue = '';
-  if (typeof phgRaw === 'number') {
-    phgValue = String(phgRaw);
-  } else if (typeof phgRaw === 'string') {
-    phgValue = phgRaw.trim().toUpperCase();
-  }
+  const phgInfo = decodePhg(provision.phg);
 
   infoCallsign.textContent = aprsCallsign;
   infoSymbol.textContent = displaySymbol;
   if (infoCoords) infoCoords.textContent = formatProvisionCoords(provision);
-  if (infoPhg) infoPhg.textContent = phgValue || '—';
+  if (infoPhgPower) infoPhgPower.textContent = phgInfo ? `${phgInfo.powerWatts} W` : '—';
+  if (infoPhgHeight) infoPhgHeight.textContent = phgInfo ? `${phgInfo.heightMeters.toFixed(1)} m` : '—';
+  if (infoPhgGain) infoPhgGain.textContent = phgInfo ? `${phgInfo.gainDb} dB` : '—';
   infoComment.textContent = comment;
   infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : new Date().toLocaleString();
 
   const signature = JSON.stringify({
     aprsCallsign,
     displaySymbol,
-    phg: phgValue || '',
+    phg: phgInfo
+      ? {
+          power: phgInfo.powerWatts,
+          height: Number(phgInfo.heightMeters.toFixed(2)),
+          gain: phgInfo.gainDb
+        }
+      : null,
     comment,
     coords: infoCoords ? infoCoords.textContent : ''
   });
   if (signature !== lastProvisionSignature) {
     lastProvisionSignature = signature;
     const logParts = [`callsign=${aprsCallsign}`, `symbol=${displaySymbol}`];
-    if (phgValue) {
-      logParts.push(`phg=${phgValue}`);
+    if (phgInfo) {
+      logParts.push(`power=${phgInfo.powerWatts}W`);
+      logParts.push(`height=${phgInfo.heightMeters.toFixed(1)}m`);
+      logParts.push(`gain=${phgInfo.gainDb}dB`);
     }
     appendLog('PROVISION', logParts.join(' '));
   }
@@ -2729,6 +2738,32 @@ function formatProvisionCoords(provision) {
   const latFmt = Number(lat).toFixed(4);
   const lonFmt = Number(lon).toFixed(4);
   return `(${latFmt}, ${lonFmt})`;
+}
+
+function decodePhg(value) {
+  if (value == null) return null;
+  const str = String(value).trim().toUpperCase();
+  if (!/^[0-9]{3,4}$/.test(str)) {
+    return null;
+  }
+  const digits = str.split('').map((ch) => Number.parseInt(ch, 10));
+  if (digits.length < 3 || digits.some((digit) => Number.isNaN(digit))) {
+    return null;
+  }
+
+  const [powerDigit, heightDigit, gainDigit] = digits;
+  const powerWatts = powerDigit * powerDigit;
+  const heightFeet = 10 * Math.pow(2, heightDigit);
+  const heightMeters = heightFeet * METERS_PER_FOOT;
+  const gainDb = gainDigit;
+
+  return {
+    raw: str,
+    powerWatts,
+    heightFeet,
+    heightMeters,
+    gainDb
+  };
 }
 
 function formatRelativeTime(isoString) {
