@@ -8,8 +8,12 @@ const projectRoot = path.resolve(__dirname, '..');
 const distDir = path.join(projectRoot, 'dist');
 const stageDir = path.join(distDir, 'win-app');
 const productName = 'TMAG Monitor';
-const outputDir = path.join(distDir, `${productName}-win32-x64`);
-const zipOutput = path.join(distDir, `${productName.replace(/\s+/g, '_')}-win32-x64.zip`);
+const pkg = require(path.join(projectRoot, 'package.json'));
+const appVersion = typeof pkg?.version === 'string' && pkg.version.trim() ? pkg.version.trim() : '0.0.0';
+const versionTag = `v${appVersion}`;
+const productLabel = `${productName}-${versionTag}-win32-x64`;
+const outputDir = path.join(distDir, productLabel);
+const zipOutput = path.join(distDir, `${productName.replace(/\s+/g, '_')}-${versionTag}-win32-x64.zip`);
 
 const electronPkg = require('electron/package.json');
 const electronVersion = electronPkg.version;
