@@ -91,7 +91,7 @@ npm install
 
 # 匯入 CallMesh API Key 後直接啟動 CLI
 export CALLMESH_API_KEY="你的 Key"
-node src/index.js --host 127.0.0.1 --port 4403
+node src/index.js --host <節點ip> --port 4403
 ```
 
 若想在 Pi 上打包成單一執行檔，可再執行：
