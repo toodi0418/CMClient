@@ -5,6 +5,7 @@
   const counterPackets = document.getElementById('counter-packets');
   const counterAprs = document.getElementById('counter-aprs');
   const counterMapping = document.getElementById('counter-mapping');
+  const appVersionLabel = document.getElementById('app-version');
 
   const callmeshCallsign = document.getElementById('callmesh-callsign');
   const callmeshSymbol = document.getElementById('callmesh-symbol');
@@ -185,7 +186,7 @@
     if (!summary) return 'unknown';
     const node = summary.from || {};
     const mesh = node.meshId || node.meshIdNormalized || '';
-    const meshDisplay = mesh ? mesh.toUpperCase() : '';
+    const meshDisplay = mesh ? mesh.toLowerCase() : '';
 
     let name = null;
     if (node.longName && node.longName !== 'unknown') {
@@ -200,10 +201,12 @@
       name = 'unknown';
     }
 
-    if (meshDisplay && !name.toUpperCase().includes(meshDisplay)) {
-      return `${name} (${meshDisplay})`;
+    const nameText = typeof name === 'string' ? name : String(name);
+
+    if (meshDisplay && !nameText.toLowerCase().includes(meshDisplay)) {
+      return `${nameText} (${meshDisplay})`;
     }
-    return name;
+    return nameText;
   }
 
   function formatDetail(summary) {
@@ -250,22 +253,57 @@
     return R * c;
   }
 
-  function formatAprsSsid(ssid) {
-    if (ssid === null || ssid === undefined) return '';
-    const num = Number(ssid);
-    if (!Number.isFinite(num) || num === 0) return '';
-    return num > 0 ? `-${num}` : '';
+  function normalizeProvisionSsidValue(value) {
+    if (value === null || value === undefined) return null;
+    const str = String(value).trim();
+    if (!str || /^0+$/.test(str)) {
+      return null;
+    }
+    if (/^[0-9A-Za-z]{1,2}$/.test(str)) {
+      return str.toUpperCase();
+    }
+    const num = Number(str);
+    if (Number.isFinite(num) && num > 0) {
+      return String(Math.trunc(num));
+    }
+    return null;
+  }
+
+  function resolveProvisionSsid(provision) {
+    if (!provision) return null;
+    const candidates = [
+      provision.aprs_ssid,
+      provision.aprsSsid,
+      provision.ssid,
+      provision.callsign_ssid,
+      provision.callsignSsid
+    ];
+    for (const candidate of candidates) {
+      const normalized = normalizeProvisionSsidValue(candidate);
+      if (normalized) {
+        return normalized;
+      }
+    }
+    return null;
   }
 
   function formatProvisionCallsign(provision) {
     if (!provision) return '—';
-    const base = provision.callsign_base ?? provision.callsign ?? '';
-    const suffix =
-      formatAprsSsid(provision.aprs_ssid ?? provision.ssid) ||
-      (base.includes('-') ? '' : formatAprsSsid(provision.callsign_ssid));
-    const trimmed = base ? base.replace(/-+$/, '') : '';
-    const callsign = `${trimmed}${suffix || ''}`.replace(/--+/g, '-');
-    return callsign ? callsign.toUpperCase() : '—';
+    const baseCandidate =
+      provision.callsign_base ??
+      provision.callsign ??
+      provision.callsignBase ??
+      '';
+    const base = String(baseCandidate).trim().toUpperCase();
+    if (!base) {
+      return '—';
+    }
+    const resolvedSsid = resolveProvisionSsid(provision);
+    if (!resolvedSsid) {
+      return base;
+    }
+    const withoutSuffix = base.replace(/-[0-9A-Z]{1,2}$/, '').replace(/-+$/, '');
+    return `${withoutSuffix}-${resolvedSsid}`;
   }
 
   function formatSymbol(provision) {
@@ -527,6 +565,15 @@
     setCounter(counterMapping, metrics.mappingCount ?? 0);
   }
 
+  function updateAppInfo(info) {
+    if (!appVersionLabel) return;
+    const version =
+      typeof info?.version === 'string' && info.version.trim()
+        ? info.version.trim()
+        : '';
+    appVersionLabel.textContent = version ? `v${version}` : 'v—';
+  }
+
   function updateCallmesh(info) {
     if (!info) return;
     const parts = [];
@@ -690,6 +737,9 @@
             break;
           case 'callmesh':
             updateCallmesh(packet.payload);
+            break;
+          case 'app-info':
+            updateAppInfo(packet.payload);
             break;
           case 'self':
             currentSelfMeshId = normalizeMeshId(packet.payload?.meshId);

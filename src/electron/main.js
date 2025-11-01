@@ -361,8 +361,9 @@ async function startWebDashboard() {
     return;
   }
   try {
-    const server = new WebDashboardServer();
+    const server = new WebDashboardServer({ appVersion });
     await server.start();
+    server.setAppVersion(appVersion);
     webServer = server;
   } catch (err) {
     console.error('啟動 Web Dashboard 失敗:', err);

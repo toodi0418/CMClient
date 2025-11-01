@@ -12,11 +12,27 @@ const MAX_SUMMARY_ROWS = 200;
 const MAX_LOG_ENTRIES = 200;
 const APRS_HISTORY_MAX = 5000;
 
+const FALLBACK_VERSION = (() => {
+  try {
+    // eslint-disable-next-line global-require
+    const pkg = require('../../package.json');
+    if (pkg && typeof pkg.version === 'string' && pkg.version.trim()) {
+      return pkg.version.trim();
+    }
+  } catch {
+    // ignore - fallback below
+  }
+  return '0.0.0';
+})();
+
 class WebDashboardServer {
   constructor(options = {}) {
     this.port = options.port ?? DEFAULT_PORT;
     this.host = options.host ?? DEFAULT_HOST;
     this.inactivityPingMs = options.inactivityPingMs ?? 15_000;
+    this.appVersion = typeof options.appVersion === 'string' && options.appVersion.trim()
+      ? options.appVersion.trim()
+      : FALLBACK_VERSION;
 
     this.server = null;
     this.clients = new Set();
@@ -37,6 +53,7 @@ class WebDashboardServer {
     this.selfMeshId = null;
     this.aprsFlowIds = new Set();
     this.aprsFlowQueue = [];
+    this.lastAppInfo = this.appVersion ? { version: this.appVersion } : null;
   }
 
   async start() {
@@ -147,6 +164,24 @@ class WebDashboardServer {
     }
   }
 
+  setAppVersion(version) {
+    const normalized = typeof version === 'string' && version.trim() ? version.trim() : '';
+    if (!normalized) {
+      if (this.appVersion || this.lastAppInfo) {
+        this.appVersion = '';
+        this.lastAppInfo = { version: '' };
+        this._broadcast({ type: 'app-info', payload: this.lastAppInfo });
+      }
+      return;
+    }
+    if (normalized === this.appVersion) {
+      return;
+    }
+    this.appVersion = normalized;
+    this.lastAppInfo = { version: this.appVersion };
+    this._broadcast({ type: 'app-info', payload: this.lastAppInfo });
+  }
+
   publishLog(entry) {
     if (!entry) return;
     this.logEntries.unshift(entry);
@@ -235,6 +270,9 @@ class WebDashboardServer {
   }
 
   _sendInitialSnapshot(res) {
+    if (this.lastAppInfo) {
+      this._write(res, { type: 'app-info', payload: this.lastAppInfo });
+    }
     if (this.lastStatus) {
       this._write(res, { type: 'status', payload: this.lastStatus });
     }

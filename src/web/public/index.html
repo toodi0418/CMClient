@@ -8,7 +8,10 @@
   </head>
   <body>
     <header>
-      <h1>TMAG Web Dashboard</h1>
+      <h1>
+        TMAG Web Dashboard
+        <span id="app-version" class="app-version">v—</span>
+      </h1>
       <p>同步展示 Meshtastic 封包、CallMesh 狀態與 APRS 流程。</p>
     </header>
 
@@ -45,33 +48,37 @@
 
       <section class="info-layout">
         <article class="info-card">
-          <h2>CallMesh Provision</h2>
-          <dl class="info-grid">
-            <div>
-              <dt>呼號</dt>
-              <dd id="callmesh-callsign">—</dd>
+          <details class="info-details" open>
+            <summary>CallMesh Provision</summary>
+            <div class="info-content">
+              <dl class="info-grid">
+                <div>
+                  <dt>呼號</dt>
+                  <dd id="callmesh-callsign">—</dd>
+                </div>
+                <div>
+                  <dt>符號</dt>
+                  <dd id="callmesh-symbol">—</dd>
+                </div>
+                <div>
+                  <dt>座標</dt>
+                  <dd id="callmesh-coords">—</dd>
+                </div>
+                <div>
+                  <dt>PHG 詳細</dt>
+                  <dd id="callmesh-phg">—</dd>
+                </div>
+                <div>
+                  <dt>備註</dt>
+                  <dd id="callmesh-comment" class="multiline">—</dd>
+                </div>
+                <div>
+                  <dt>最後更新</dt>
+                  <dd id="callmesh-updated">—</dd>
+                </div>
+              </dl>
             </div>
-            <div>
-              <dt>符號</dt>
-              <dd id="callmesh-symbol">—</dd>
-            </div>
-            <div>
-              <dt>座標</dt>
-              <dd id="callmesh-coords">—</dd>
-            </div>
-            <div>
-              <dt>PHG 詳細</dt>
-              <dd id="callmesh-phg">—</dd>
-            </div>
-            <div>
-              <dt>備註</dt>
-              <dd id="callmesh-comment" class="multiline">—</dd>
-            </div>
-            <div>
-              <dt>最後更新</dt>
-              <dd id="callmesh-updated">—</dd>
-            </div>
-          </dl>
+          </details>
         </article>
       </section>
 
