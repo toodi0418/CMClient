@@ -10,7 +10,34 @@ const MeshtasticClient = require('./meshtasticClient');
 const { discoverMeshtasticDevices } = require('./discovery');
 const { CallMeshClient, buildAgentString } = require('./callmesh/client');
 const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge');
+const { WebDashboardServer } = require('./web/server');
 const pkg = require('../package.json');
+
+function toWebCallmeshState(state) {
+  if (!state || typeof state !== 'object') {
+    return null;
+  }
+  return {
+    statusText: state.lastStatus,
+    agent: state.agent,
+    hasKey: Boolean(state.verified && state.apiKey),
+    verified: Boolean(state.verified),
+    degraded: Boolean(state.degraded),
+    lastHeartbeatAt: state.lastHeartbeatAt,
+    lastMappingHash: state.lastMappingHash,
+    lastMappingSyncedAt: state.lastMappingSyncedAt,
+    provision: state.provision,
+    mappingItems: state.mappingItems,
+    aprs: {
+      server: state.aprs?.server ?? null,
+      port: state.aprs?.port ?? null,
+      callsign: state.aprs?.callsign ?? null,
+      connected: Boolean(state.aprs?.connected),
+      actualServer: state.aprs?.actualServer ?? null,
+      beaconIntervalMs: state.aprs?.beaconIntervalMs ?? null
+    }
+  };
+}
 
 async function main() {
   await yargs(hideBin(process.argv))
@@ -93,6 +120,11 @@ async function main() {
             type: 'boolean',
             default: true,
             describe: '搭配 --format json 時使用縮排輸出'
+          })
+          .option('web-ui', {
+            type: 'boolean',
+            default: false,
+            describe: '啟用內建 Web Dashboard（預設為關閉）'
           }),
       async (argv) => {
         await startMonitor(argv);
@@ -110,6 +142,10 @@ async function startMonitor(argv) {
     process.exitCode = 1;
     return;
   }
+
+  const webUiEnv = process.env.TMAG_WEB_DASHBOARD;
+  const webUiEnabled = webUiEnv === '1' ? true : webUiEnv === '0' ? false : Boolean(argv.webUi);
+  let webServer = null;
 
   const verificationPath = getVerificationPath();
   const previousVerification = await loadVerificationFile(verificationPath);
@@ -153,6 +189,7 @@ async function startMonitor(argv) {
     const timeLabel = formatTimestampLabel(timestamp);
     const prefix = entry.tag ? `[${entry.tag}]` : '[LOG]';
     console.log(`[${timeLabel}] ${prefix} ${entry.message}`);
+    webServer?.publishLog(entry);
   });
 
   bridge.on('aprs-uplink', (info) => {
@@ -160,6 +197,7 @@ async function startMonitor(argv) {
     const timestamp = info?.timestamp ? new Date(info.timestamp) : new Date();
     const timeLabel = formatTimestampLabel(timestamp);
     console.log(`[${timeLabel}] [APRS] ${info.frame}`);
+    webServer?.publishAprs(info);
   });
 
   bridge.on('state', (state) => {
@@ -178,11 +216,21 @@ async function startMonitor(argv) {
       verificationRecord.verified = Boolean(state.verified);
       shouldPersist = true;
     }
+    if (webServer) {
+      const payload = toWebCallmeshState(state);
+      if (payload) {
+        webServer.publishCallmesh(payload);
+      }
+    }
     if (shouldPersist) {
       saveVerificationFile(verificationPath, verificationRecord).catch((err) => {
         console.warn(`寫入驗證紀錄失敗：${err.message}`);
       });
     }
+  });
+
+  bridge.on('telemetry', (payload) => {
+    webServer?.publishTelemetry(payload);
   });
 
   await bridge.init({ allowRestore: true });
@@ -239,6 +287,34 @@ async function startMonitor(argv) {
     console.error('CallMesh Heartbeat 失敗：', err);
   });
 
+  if (webUiEnabled && !webServer) {
+    try {
+      webServer = new WebDashboardServer({
+        appVersion: pkg.version || '0.0.0'
+      });
+      await webServer.start();
+      webServer.setAppVersion(pkg.version || '0.0.0');
+      webServer.publishStatus({ status: 'disconnected' });
+      const snapshot = toWebCallmeshState(bridge.getStateSnapshot());
+      if (snapshot) {
+        webServer.publishCallmesh(snapshot);
+      }
+      if (typeof bridge.getTelemetrySnapshot === 'function') {
+        try {
+          const telemetrySnapshot = await bridge.getTelemetrySnapshot({
+            limitPerNode: webServer.telemetryMaxPerNode
+          });
+          webServer.seedTelemetrySnapshot(telemetrySnapshot);
+        } catch (err) {
+          console.warn(`初始化 Web Telemetry 失敗：${err.message}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`啟動 Web Dashboard 失敗：${err.message}`);
+      webServer = null;
+    }
+  }
+
   const connectionOptions = {
     host: argv.host,
     port: argv.port,
@@ -282,6 +358,19 @@ async function startMonitor(argv) {
       }
     }
     destroyBridge();
+    if (webServer) {
+      try {
+        webServer.publishStatus({ status: 'disconnected' });
+      } catch {
+        // ignore publish errors during shutdown
+      }
+      webServer
+        .stop()
+        .catch(() => {
+          // ignore stop errors
+        });
+      webServer = null;
+    }
   };
 
   process.once('SIGINT', () => {
@@ -310,6 +399,7 @@ async function startMonitor(argv) {
     selfMeshId = null;
     const client = new MeshtasticClient(connectionOptions);
     currentClient = client;
+    webServer?.publishStatus({ status: 'connecting' });
 
     return new Promise((resolve) => {
       let settled = false;
@@ -330,10 +420,12 @@ async function startMonitor(argv) {
 
       client.on('connected', () => {
         logWithTag('MESHTASTIC', `已連線至 ${argv.host}:${argv.port} (嘗試第 ${attempt} 次)，開始接收封包`);
+        webServer?.publishStatus({ status: 'connected' });
       });
 
       client.on('disconnected', () => {
         logWithTag('MESHTASTIC', '連線已關閉');
+        webServer?.publishStatus({ status: 'disconnected' });
         cleanup();
       });
 
@@ -343,12 +435,14 @@ async function startMonitor(argv) {
 
       client.on('error', (err) => {
         logWithTag('MESHTASTIC', `錯誤：${err.message}`);
+        webServer?.publishStatus({ status: 'error', message: err.message });
       });
 
       if (argv.format === 'summary') {
         client.on('summary', (summary) => {
           if (!summary) return;
           bridge.handleMeshtasticSummary(summary);
+          webServer?.publishSummary(summary);
           if (!headerPrinted) {
             console.log('Date               | Nodes                      | Relay        | Ch |   SNR | RSSI | Type         | Hops   | Details');
             console.log('-------------------+---------------------------+--------------+----+-------+------+--------------+--------+------------------------------');
@@ -382,6 +476,7 @@ async function startMonitor(argv) {
         client.on('summary', (summary) => {
           if (!summary) return;
           bridge.handleMeshtasticSummary(summary);
+          webServer?.publishSummary(summary);
         });
         client.on('fromRadio', ({ message }) => {
           const object = client.toObject(message, {
@@ -394,6 +489,7 @@ async function startMonitor(argv) {
 
       client.on('myInfo', (info) => {
         bridge.handleMeshtasticMyInfo(info);
+        webServer?.publishSelf(info);
         const meshCandidate = normalizeMeshId(info?.node?.meshId || info?.meshId);
         if (meshCandidate) {
           selfMeshId = meshCandidate;
@@ -402,6 +498,7 @@ async function startMonitor(argv) {
 
       client.start().catch((err) => {
         logWithTag('MESHTASTIC', `啟動失敗：${err.message}`);
+        webServer?.publishStatus({ status: 'error', message: err.message });
         cleanup();
       });
     });

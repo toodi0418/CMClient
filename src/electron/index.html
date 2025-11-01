@@ -6,6 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TMMARC Meshtastic APRS Gateway (TMAG)</title>
     <link rel="stylesheet" href="./styles.css" />
+    <script defer src="../../node_modules/chart.js/dist/chart.umd.js"></script>
   </head>
   <body>
     <main>
@@ -16,6 +17,7 @@
 
       <nav class="main-nav">
         <button class="nav-btn active" data-target="monitor-page">監視</button>
+        <button class="nav-btn" data-target="telemetry-page">遙測數據</button>
         <button class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
         <button class="nav-btn" data-target="settings-page">設定</button>
         <button class="nav-btn" data-target="info-page">資訊</button>
@@ -76,6 +78,65 @@
         </section>
       </section>
 
+      <section id="telemetry-page" class="page hidden">
+        <section class="telemetry-panel">
+          <header class="telemetry-header">
+            <div class="telemetry-controls">
+              <label for="telemetry-node-select">節點</label>
+              <select id="telemetry-node-select">
+              </select>
+            </div>
+            <div class="telemetry-chart-controls">
+              <label for="telemetry-chart-mode">圖表</label>
+              <select id="telemetry-chart-mode">
+                <option value="all">所有圖表</option>
+                <option value="single">單一圖表</option>
+              </select>
+              <select id="telemetry-chart-metric" class="hidden"></select>
+            </div>
+            <div class="telemetry-range-controls">
+              <label for="telemetry-range-select">範圍</label>
+              <select id="telemetry-range-select">
+                <option value="day">近 24 小時</option>
+                <option value="week">近 7 天</option>
+                <option value="month">近 30 天</option>
+                <option value="year">近 1 年</option>
+                <option value="custom">自訂區間</option>
+              </select>
+              <div id="telemetry-range-custom" class="telemetry-range-custom hidden">
+                <input type="datetime-local" id="telemetry-range-start" />
+                <span class="telemetry-range-separator">至</span>
+                <input type="datetime-local" id="telemetry-range-end" />
+              </div>
+            </div>
+            <div class="telemetry-updated">
+              <span class="label">更新：</span>
+              <span id="telemetry-updated-at">—</span>
+            </div>
+            <div class="telemetry-actions">
+              <button type="button" id="telemetry-clear-btn" class="danger-btn slim">
+                清空遙測數據
+              </button>
+            </div>
+          </header>
+          <div id="telemetry-empty-state" class="telemetry-empty">尚未收到遙測資料。</div>
+          <section id="telemetry-charts" class="telemetry-charts hidden"></section>
+          <section id="telemetry-table-wrapper" class="telemetry-table-wrapper hidden">
+            <table class="telemetry-table">
+              <thead>
+                <tr>
+                  <th>時間</th>
+                  <th>節點</th>
+                  <th>主要數據</th>
+                  <th>其他資訊</th>
+                </tr>
+              </thead>
+              <tbody id="telemetry-table-body"></tbody>
+            </table>
+          </section>
+        </section>
+      </section>
+
       <section id="settings-page" class="page hidden">
         <section class="settings-panel">
           <h2>連線與 CallMesh 設定</h2>
@@ -110,6 +171,13 @@
             <label for="aprs-beacon-interval">APRS 信標間隔（分鐘）</label>
             <input id="aprs-beacon-interval" type="number" min="1" max="1440" value="10" />
             <small class="callmesh-hint">預設每 10 分鐘發送一次，可調整為 1-1440 分鐘</small>
+          </div>
+          <div class="fieldset">
+            <label class="toggle-row">
+              <input id="web-ui-enabled" type="checkbox" />
+              <span>啟用 Web UI</span>
+            </label>
+            <small class="callmesh-hint">預設關閉，啟用後會啟動內建 Web Dashboard</small>
           </div>
           <button type="button" id="reset-data-btn" class="danger-btn">重置所有資料</button>
         </section>

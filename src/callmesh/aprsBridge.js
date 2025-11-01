@@ -2,7 +2,9 @@
 
 const path = require('path');
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const EventEmitter = require('events');
+const readline = require('readline');
 const { CallMeshClient, buildAgentString } = require('./client');
 const { APRSClient } = require('../aprs/client');
 
@@ -36,7 +38,8 @@ class CallMeshAprsBridge extends EventEmitter {
       agentProduct = 'callmesh-client',
       aprsServer = DEFAULT_APRS_SERVER,
       aprsPort = DEFAULT_APRS_PORT,
-      fetchImpl = globalThis.fetch
+      fetchImpl = globalThis.fetch,
+      telemetryMaxEntriesPerNode = 500
     } = options;
 
     if (!storageDir) {
@@ -83,6 +86,12 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsSkippedMeshIds = new Set();
 
     this.telemetryBuckets = new Map();
+    this.telemetryStore = new Map();
+    this.telemetryRecordIds = new Set();
+    this.telemetryUpdatedAt = 0;
+    this.telemetryMaxEntriesPerNode = Number.isFinite(telemetryMaxEntriesPerNode)
+      ? Math.max(10, Math.floor(telemetryMaxEntriesPerNode))
+      : 500;
 
     this.heartbeatTimer = null;
     this.heartbeatRunning = false;
@@ -102,10 +111,15 @@ class CallMeshAprsBridge extends EventEmitter {
     return path.join(this.storageDir, 'telemetry-state.json');
   }
 
+  getTelemetryStorePath() {
+    return path.join(this.storageDir, 'telemetry-records.jsonl');
+  }
+
   async init({ allowRestore = true } = {}) {
     await this.ensureStorageDir();
     await this.restoreArtifacts({ allowRestore });
     await this.restoreTelemetryState();
+    await this.loadTelemetryStore();
     this.emitState();
   }
 
@@ -255,6 +269,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsTelemetrySequence = 0;
     this.aprsLastTelemetryAt = 0;
     this.aprsLastTelemetryDataAt = 0;
+    await this.clearTelemetryStore({ silent: false });
     this.emitLog('CALLMESH', 'cleared local mapping/provision cache');
     this.updateAprsProvision(null);
   }
@@ -269,6 +284,56 @@ class CallMeshAprsBridge extends EventEmitter {
       }
     } catch (err) {
       this.emitLog('CALLMESH', `restore telemetry sequence failed: ${err.message}`);
+    }
+  }
+
+  async loadTelemetryStore() {
+    const filePath = this.getTelemetryStorePath();
+    try {
+      await fs.access(filePath);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return;
+      }
+      this.emitLog('CALLMESH', `telemetry history access failed: ${err.message}`);
+      return;
+    }
+
+    let loadedCount = 0;
+    try {
+      await new Promise((resolve, reject) => {
+        const stream = fsSync.createReadStream(filePath, { encoding: 'utf8' });
+        stream.on('error', reject);
+        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+        rl.on('line', (line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          let parsed;
+          try {
+            parsed = JSON.parse(trimmed);
+          } catch (err) {
+            return;
+          }
+          const normalized = this.normalizeTelemetryRecordFromDisk(parsed);
+          if (!normalized) {
+            return;
+          }
+          this.addTelemetryRecord(normalized.meshId, normalized, {
+            node: normalized.node || null,
+            persist: false,
+            emitEvent: false
+          });
+          loadedCount += 1;
+        });
+        rl.once('close', resolve);
+      });
+    } catch (err) {
+      this.emitLog('CALLMESH', `restore telemetry history failed: ${err.message}`);
+      return;
+    }
+
+    if (loadedCount > 0) {
+      this.emitLog('CALLMESH', `restored telemetry history count=${loadedCount}`);
     }
   }
 
@@ -1214,6 +1279,236 @@ class CallMeshAprsBridge extends EventEmitter {
     this.pruneTelemetryBuckets(timestampMs);
   }
 
+  storeTelemetrySummary(summary, timestampMs = Date.now()) {
+    if (!summary?.telemetry || !summary.telemetry.metrics) {
+      return;
+    }
+    const fromMeshId = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
+    if (!fromMeshId) {
+      return;
+    }
+    if (this.selfMeshId && fromMeshId === this.selfMeshId) {
+      return;
+    }
+    const record = this.buildTelemetryRecord(summary, {
+      meshId: fromMeshId,
+      timestampMs
+    });
+    if (!record) {
+      return;
+    }
+    const nodeInfo = extractTelemetryNode(summary.from);
+    this.addTelemetryRecord(fromMeshId, record, {
+      node: nodeInfo,
+      persist: true,
+      emitEvent: true
+    });
+  }
+
+  addTelemetryRecord(meshId, record, { node = null, persist = false, emitEvent = false } = {}) {
+    if (!meshId || !record) {
+      return;
+    }
+    const key = meshId;
+    const storedRecord = cloneTelemetryRecord(record) || record;
+    storedRecord.meshId = key;
+    if (!storedRecord.id || typeof storedRecord.id !== 'string' || !storedRecord.id.trim()) {
+      storedRecord.id = `${key}-${storedRecord.timestampMs ?? Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    }
+    if (this.telemetryRecordIds.has(storedRecord.id)) {
+      return;
+    }
+
+    let bucket = this.telemetryStore.get(key);
+    const nodeInfo = node || storedRecord.node || null;
+    if (!bucket) {
+      bucket = {
+        meshId: key,
+        node: nodeInfo,
+        records: []
+      };
+      this.telemetryStore.set(key, bucket);
+    } else if (nodeInfo) {
+      bucket.node = bucket.node
+        ? {
+            ...bucket.node,
+            ...nodeInfo
+          }
+        : nodeInfo;
+    }
+
+    bucket.records.push(storedRecord);
+    this.telemetryRecordIds.add(storedRecord.id);
+
+    const overflow = bucket.records.length - this.telemetryMaxEntriesPerNode;
+    if (overflow > 0) {
+      const removed = bucket.records.splice(0, overflow);
+      for (const removedRecord of removed) {
+        if (removedRecord?.id) {
+          this.telemetryRecordIds.delete(removedRecord.id);
+        }
+      }
+    }
+
+    this.telemetryUpdatedAt = Date.now();
+
+    if (persist) {
+      this.appendTelemetryRecord(storedRecord).catch((err) => {
+        this.emitLog('CALLMESH', `append telemetry failed: ${err.message}`);
+      });
+    }
+
+    if (emitEvent) {
+      const nodePayload = bucket.node ? { ...bucket.node } : null;
+      this.emitTelemetryUpdate({
+        meshId: key,
+        node: nodePayload,
+        record: storedRecord
+      });
+    }
+  }
+
+  normalizeTelemetryRecordFromDisk(record) {
+    if (!record || typeof record !== 'object') {
+      return null;
+    }
+    const meshId = normalizeMeshId(record.meshId || record.mesh_id || record.meshIdNormalized);
+    if (!meshId) {
+      return null;
+    }
+    if (!record.telemetry || typeof record.telemetry !== 'object' || !record.telemetry.metrics) {
+      return null;
+    }
+    const cloned = cloneTelemetryRecord(record) || record;
+    cloned.meshId = meshId;
+    const timestampMs = Number.isFinite(cloned.timestampMs) ? Number(cloned.timestampMs) : Date.now();
+    cloned.timestampMs = timestampMs;
+    cloned.timestamp = cloned.timestamp || new Date(timestampMs).toISOString();
+    const sampleTimeMs = Number.isFinite(cloned.sampleTimeMs)
+      ? Number(cloned.sampleTimeMs)
+      : Number.isFinite(cloned.telemetry?.timeMs)
+        ? Number(cloned.telemetry.timeMs)
+        : timestampMs;
+    cloned.sampleTimeMs = sampleTimeMs;
+    cloned.sampleTime = cloned.sampleTime || new Date(sampleTimeMs).toISOString();
+    if (!cloned.id || typeof cloned.id !== 'string' || !cloned.id.trim()) {
+      cloned.id = `${meshId}-${timestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+    }
+    cloned.telemetry = cloned.telemetry || {};
+    cloned.telemetry.kind = cloned.telemetry.kind || 'unknown';
+    cloned.telemetry.metrics = cloneTelemetryMetrics(cloned.telemetry.metrics || {});
+    cloned.node = extractTelemetryNode(cloned.node) || null;
+    return cloned;
+  }
+
+  async appendTelemetryRecord(record) {
+    const filePath = this.getTelemetryStorePath();
+    const payload = cloneTelemetryRecord(record) || record;
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.appendFile(filePath, `${JSON.stringify(payload)}\n`, 'utf8');
+  }
+
+  buildTelemetryRecord(summary, { meshId, timestampMs = Date.now() } = {}) {
+    if (!summary || !meshId || !summary.telemetry || !summary.telemetry.metrics) {
+      return null;
+    }
+    const metricsKeys = Object.keys(summary.telemetry.metrics || {});
+    if (!metricsKeys.length) {
+      return null;
+    }
+    const baseTimestampMs = Number.isFinite(timestampMs) ? Number(timestampMs) : Date.now();
+    const telemetry = summary.telemetry;
+    const sampleTimeMs = Number.isFinite(telemetry.timeMs) ? Number(telemetry.timeMs) : null;
+    const recordTimestampIso = new Date(baseTimestampMs).toISOString();
+    const sampleIso = sampleTimeMs != null ? new Date(sampleTimeMs).toISOString() : null;
+    const node = extractTelemetryNode(summary.from);
+    const recordId = `${meshId}-${baseTimestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+
+    return {
+      id: recordId,
+      meshId,
+      node,
+      timestampMs: baseTimestampMs,
+      timestamp: recordTimestampIso,
+      sampleTimeMs: sampleTimeMs != null ? sampleTimeMs : baseTimestampMs,
+      sampleTime: sampleIso ?? recordTimestampIso,
+      type: summary.type || '',
+      detail: summary.detail || '',
+      channel: summary.channel ?? null,
+      snr: Number.isFinite(summary.snr) ? summary.snr : null,
+      rssi: Number.isFinite(summary.rssi) ? summary.rssi : null,
+      flowId: summary.flowId || null,
+      telemetry: {
+        kind: telemetry.kind || 'unknown',
+        timeSeconds: Number.isFinite(telemetry.timeSeconds) ? telemetry.timeSeconds : null,
+        timeMs: Number.isFinite(telemetry.timeMs) ? telemetry.timeMs : null,
+        metrics: cloneTelemetryMetrics(telemetry.metrics)
+      }
+    };
+  }
+
+  emitTelemetryUpdate({ meshId, node, record, reset = false }) {
+    if (reset) {
+      this.emit('telemetry', {
+        type: 'reset',
+        updatedAt: this.telemetryUpdatedAt
+      });
+      return;
+    }
+    this.emit('telemetry', {
+      type: 'append',
+      meshId,
+      node: node ? { ...node } : null,
+      record: cloneTelemetryRecord(record),
+      updatedAt: this.telemetryUpdatedAt
+    });
+  }
+
+  async clearTelemetryStore({ silent = false } = {}) {
+    this.telemetryStore.clear();
+    this.telemetryRecordIds.clear();
+    this.telemetryUpdatedAt = Date.now();
+    try {
+      await fs.rm(this.getTelemetryStorePath(), { force: true });
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') {
+        this.emitLog('CALLMESH', `remove telemetry store failed: ${err.message}`);
+      }
+    }
+    if (!silent) {
+      this.emitTelemetryUpdate({ reset: true });
+    }
+  }
+
+  getTelemetrySnapshot({ limitPerNode } = {}) {
+    const limit =
+      Number.isFinite(limitPerNode) && limitPerNode > 0
+        ? Math.floor(limitPerNode)
+        : this.telemetryMaxEntriesPerNode;
+    const nodes = [];
+    for (const [meshId, bucket] of this.telemetryStore.entries()) {
+      const records = bucket.records || [];
+      const start = limit > 0 && records.length > limit ? records.length - limit : 0;
+      const slice = records.slice(start).map((record) => cloneTelemetryRecord(record));
+      nodes.push({
+        meshId,
+        node: bucket.node ? { ...bucket.node } : null,
+        records: slice
+      });
+    }
+    nodes.sort((a, b) => {
+      const labelA = (a.node?.label || a.meshId || '').toLowerCase();
+      const labelB = (b.node?.label || b.meshId || '').toLowerCase();
+      if (labelA < labelB) return -1;
+      if (labelA > labelB) return 1;
+      return 0;
+    });
+    return {
+      updatedAt: this.telemetryUpdatedAt,
+      nodes
+    };
+  }
+
   recordTelemetryPacket(summary) {
     if (!summary) return;
     const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
@@ -1233,6 +1528,7 @@ class CallMeshAprsBridge extends EventEmitter {
     } else if (TELEMETRY_CONTROL_TYPES.has(type)) {
       this.addTelemetryMetric('ctrl', timestampMs);
     }
+    this.storeTelemetrySummary(summary, timestampMs);
   }
 
   recordTelemetryAprsForward(timestampMs = Date.now()) {
@@ -1323,6 +1619,66 @@ function normalizeMeshId(meshId) {
   value = value.replace(/[^0-9a-f]/gi, '').toLowerCase();
   if (!value) return null;
   return `!${value}`;
+}
+
+function extractTelemetryNode(node) {
+  if (!node || typeof node !== 'object') {
+    return null;
+  }
+  const meshId = typeof node.meshId === 'string' ? node.meshId : null;
+  const normalized = normalizeMeshId(
+    meshId || node.meshIdNormalized || node.mesh_id || node.meshIdHex
+  );
+  return {
+    label: node.label ?? null,
+    meshId,
+    meshIdNormalized: normalized,
+    shortName: node.shortName ?? null,
+    longName: node.longName ?? null,
+    hwModel: node.hwModel ?? null,
+    role: node.role ?? null,
+    raw: Number.isFinite(node.raw) ? Number(node.raw) : null
+  };
+}
+
+function deepCloneTelemetryValue(value) {
+  if (value == null) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => deepCloneTelemetryValue(item));
+  }
+  if (value && typeof value === 'object') {
+    const result = {};
+    for (const [key, nested] of Object.entries(value)) {
+      result[key] = deepCloneTelemetryValue(nested);
+    }
+    return result;
+  }
+  return value;
+}
+
+function cloneTelemetryMetrics(metrics) {
+  if (!metrics || typeof metrics !== 'object') {
+    return {};
+  }
+  return deepCloneTelemetryValue(metrics);
+}
+
+function cloneTelemetryRecord(record) {
+  if (!record) {
+    return null;
+  }
+  return {
+    ...record,
+    node: record.node ? { ...record.node } : null,
+    telemetry: record.telemetry
+      ? {
+          ...record.telemetry,
+          metrics: cloneTelemetryMetrics(record.telemetry.metrics)
+        }
+      : null
+  };
 }
 
 function cloneProvision(provision) {

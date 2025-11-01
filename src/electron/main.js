@@ -8,6 +8,7 @@ const { version: appVersion } = require('../../package.json');
 const MeshtasticClient = require('../meshtasticClient');
 const { discoverMeshtasticDevices } = require('../discovery');
 const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
+const { WebDashboardServer } = require('../web/server');
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
 
@@ -17,6 +18,8 @@ let bridge = null;
 let callmeshRestoreAllowed = true;
 let lastCallmeshStateSnapshot = null;
 let cachedClientPreferences = null;
+let webServer = null;
+let lastMeshtasticStatus = { status: 'idle' };
 
 process.on('uncaughtException', (err) => {
   console.error('未攔截的例外:', err);
@@ -109,6 +112,9 @@ function normalizeClientPreferences(raw) {
         normalized.host = trimmed;
       }
     }
+    if (Object.prototype.hasOwnProperty.call(raw, 'webDashboardEnabled')) {
+      normalized.webDashboardEnabled = Boolean(raw.webDashboardEnabled);
+    }
   }
   return normalized;
 }
@@ -158,6 +164,9 @@ async function updateClientPreferences(updates = {}) {
       delete existing.host;
     }
   }
+  if (Object.prototype.hasOwnProperty.call(updates, 'webDashboardEnabled')) {
+    existing.webDashboardEnabled = Boolean(updates.webDashboardEnabled);
+  }
   return writeClientPreferences(existing);
 }
 
@@ -198,18 +207,49 @@ function toRendererCallmeshState(state) {
 }
 
 function sendCallmeshStateToRenderer(state) {
-  if (!mainWindow) return;
-  mainWindow.webContents.send('callmesh:status', toRendererCallmeshState(state));
+  const payload = toRendererCallmeshState(state);
+  if (!payload) return;
+  if (mainWindow) {
+    mainWindow.webContents.send('callmesh:status', payload);
+  }
+  webServer?.publishCallmesh(payload);
 }
 
 function sendCallmeshLog(entry) {
-  if (!mainWindow) return;
-  mainWindow.webContents.send('callmesh:log', entry);
+  if (mainWindow) {
+    mainWindow.webContents.send('callmesh:log', entry);
+  }
+  webServer?.publishLog(entry);
 }
 
 function sendAprsUplink(info) {
-  if (!mainWindow || !info) return;
-  mainWindow.webContents.send('meshtastic:aprs-uplink', info);
+  if (!info) return;
+  if (mainWindow) {
+    mainWindow.webContents.send('meshtastic:aprs-uplink', info);
+  }
+  webServer?.publishAprs(info);
+}
+
+function sendTelemetryUpdate(payload) {
+  if (!payload) return;
+  if (mainWindow) {
+    mainWindow.webContents.send('telemetry:update', payload);
+  }
+  webServer?.publishTelemetry(payload);
+}
+
+async function syncWebTelemetrySnapshot() {
+  if (!bridge || !webServer || typeof bridge.getTelemetrySnapshot !== 'function') {
+    return;
+  }
+  try {
+    const snapshot = await bridge.getTelemetrySnapshot({
+      limitPerNode: webServer.telemetryMaxPerNode
+    });
+    webServer.seedTelemetrySnapshot(snapshot);
+  } catch (err) {
+    console.warn('同步 Web Telemetry Snapshot 失敗:', err);
+  }
 }
 
 async function createWindow() {
@@ -238,6 +278,7 @@ function setupBridgeListeners() {
   bridge.removeAllListeners('state');
   bridge.removeAllListeners('log');
   bridge.removeAllListeners('aprs-uplink');
+  bridge.removeAllListeners('telemetry');
 
   bridge.on('state', (state) => {
     lastCallmeshStateSnapshot = state;
@@ -250,6 +291,10 @@ function setupBridgeListeners() {
 
   bridge.on('aprs-uplink', (info) => {
     sendAprsUplink(info);
+  });
+
+  bridge.on('telemetry', (payload) => {
+    sendTelemetryUpdate(payload);
   });
 }
 
@@ -324,6 +369,7 @@ function buildCallmeshSummary() {
 async function initialiseApp() {
   await initialiseBridge();
   await createWindow();
+  await ensureWebDashboardState();
 
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -337,6 +383,68 @@ function cleanupMeshtasticClient() {
     client.stop();
     client.removeAllListeners();
     client = null;
+  }
+}
+
+async function startWebDashboard() {
+  if (webServer) {
+    return true;
+  }
+  try {
+    const server = new WebDashboardServer({ appVersion });
+    await server.start();
+    server.setAppVersion(appVersion);
+    webServer = server;
+    return true;
+  } catch (err) {
+    console.error('啟動 Web Dashboard 失敗:', err);
+    return false;
+  }
+}
+
+async function shutdownWebDashboard() {
+  if (!webServer) return;
+  try {
+    await webServer.stop();
+  } catch (err) {
+    console.warn('關閉 Web Dashboard 失敗:', err);
+  } finally {
+    webServer = null;
+  }
+}
+
+function getWebDashboardEnvOverride() {
+  const value = process.env.TMAG_WEB_DASHBOARD;
+  if (value === '0') return false;
+  if (value === '1') return true;
+  return null;
+}
+
+async function shouldEnableWebDashboard() {
+  const override = getWebDashboardEnvOverride();
+  if (override !== null) {
+    return override;
+  }
+  const preferences = await getCachedClientPreferences();
+  return Boolean(preferences?.webDashboardEnabled);
+}
+
+async function ensureWebDashboardState() {
+  const desired = await shouldEnableWebDashboard();
+  if (desired) {
+    const started = await startWebDashboard();
+    if (started) {
+      if (lastMeshtasticStatus) {
+        webServer?.publishStatus(lastMeshtasticStatus);
+      }
+      if (lastCallmeshStateSnapshot) {
+        const snapshotPayload = toRendererCallmeshState(lastCallmeshStateSnapshot);
+        webServer?.publishCallmesh(snapshotPayload);
+      }
+      await syncWebTelemetrySnapshot();
+    }
+  } else {
+    await shutdownWebDashboard();
   }
 }
 
@@ -398,12 +506,47 @@ ipcMain.handle('app:get-preferences', async () => {
 ipcMain.handle('app:update-preferences', async (_event, updates) => {
   try {
     const next = await updateClientPreferences(updates);
+    if (updates && Object.prototype.hasOwnProperty.call(updates, 'webDashboardEnabled')) {
+      await ensureWebDashboardState();
+    }
     return {
       success: true,
       preferences: next
     };
   } catch (err) {
     console.error('更新客戶端偏好失敗:', err);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+});
+
+ipcMain.handle('web:set-enabled', async (_event, enabledInput) => {
+  const desired = Boolean(enabledInput);
+  const override = getWebDashboardEnvOverride();
+  if (override !== null && override !== desired) {
+    const reason =
+      override === true
+        ? '環境變數 TMAG_WEB_DASHBOARD=1 已強制啟用 Web UI'
+        : '環境變數 TMAG_WEB_DASHBOARD=0 已停用 Web UI';
+    return {
+      success: false,
+      error: reason,
+      override: true,
+      enabled: override
+    };
+  }
+  try {
+    const preferences = await updateClientPreferences({ webDashboardEnabled: desired });
+    await ensureWebDashboardState();
+    return {
+      success: true,
+      enabled: desired,
+      preferences
+    };
+  } catch (err) {
+    console.error('更新 Web Dashboard 狀態失敗:', err);
     return {
       success: false,
       error: err.message
@@ -418,7 +561,10 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
 
   cleanupMeshtasticClient();
 
-  mainWindow.webContents.send('meshtastic:status', { status: 'connecting' });
+  const connectingPayload = { status: 'connecting' };
+  mainWindow.webContents.send('meshtastic:status', connectingPayload);
+  lastMeshtasticStatus = connectingPayload;
+  webServer?.publishStatus(connectingPayload);
 
   client = new MeshtasticClient({
     host: options.host,
@@ -432,11 +578,17 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   });
 
   client.on('connected', () => {
-    mainWindow?.webContents.send('meshtastic:status', { status: 'connected' });
+    const payload = { status: 'connected' };
+    mainWindow?.webContents.send('meshtastic:status', payload);
+    lastMeshtasticStatus = payload;
+    webServer?.publishStatus(payload);
   });
 
   client.on('disconnected', () => {
-    mainWindow?.webContents.send('meshtastic:status', { status: 'disconnected' });
+    const payload = { status: 'disconnected' };
+    mainWindow?.webContents.send('meshtastic:status', payload);
+    lastMeshtasticStatus = payload;
+    webServer?.publishStatus(payload);
   });
 
   client.on('summary', (summary) => {
@@ -447,18 +599,35 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
       console.error('處理 APRS Summary 時發生錯誤:', err);
     }
     mainWindow?.webContents.send('meshtastic:summary', summary);
+    webServer?.publishSummary(summary);
+  });
+
+  client.on('fromRadio', ({ message }) => {
+    if (!message) return;
+    try {
+      const plainObject = client.toObject(message, {
+        bytes: String
+      });
+      mainWindow?.webContents.send('meshtastic:fromRadio', plainObject);
+    } catch (err) {
+      console.error('序列化 Meshtastic 訊息失敗:', err);
+    }
   });
 
   client.on('myInfo', (info) => {
     bridge?.handleMeshtasticMyInfo(info);
     mainWindow?.webContents.send('meshtastic:myInfo', info);
+    webServer?.publishSelf(info);
   });
 
   client.on('error', (err) => {
-    mainWindow?.webContents.send('meshtastic:status', {
+    const payload = {
       status: 'error',
       message: err.message
-    });
+    };
+    mainWindow?.webContents.send('meshtastic:status', payload);
+    lastMeshtasticStatus = payload;
+    webServer?.publishStatus(payload);
   });
 
   const connectPromise = waitForInitialMeshtasticConnection(client, {
@@ -551,6 +720,7 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
         console.error('API Key 驗證後初次 CallMesh Heartbeat 失敗:', err);
       });
       lastCallmeshStateSnapshot = bridge.getStateSnapshot();
+      await syncWebTelemetrySnapshot();
       return {
         statusText: lastCallmeshStateSnapshot.lastStatus,
         agent: lastCallmeshStateSnapshot.agent,
@@ -567,6 +737,7 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
       await persistVerifiedApiKey(trimmed);
       bridge.startHeartbeatLoop();
       lastCallmeshStateSnapshot = bridge.getStateSnapshot();
+      await syncWebTelemetrySnapshot();
       return {
         statusText: lastCallmeshStateSnapshot.lastStatus,
         agent: lastCallmeshStateSnapshot.agent,
@@ -581,6 +752,7 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
       await clearPersistedApiKey();
       bridge.stopHeartbeatLoop();
       lastCallmeshStateSnapshot = bridge.getStateSnapshot();
+      await syncWebTelemetrySnapshot();
       return {
         statusText: lastCallmeshStateSnapshot.lastStatus,
         agent: lastCallmeshStateSnapshot.agent,
@@ -598,6 +770,7 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
     await clearPersistedApiKey();
     bridge.stopHeartbeatLoop();
     lastCallmeshStateSnapshot = bridge.getStateSnapshot();
+    await syncWebTelemetrySnapshot();
     return {
       statusText: lastCallmeshStateSnapshot.lastStatus,
       agent: lastCallmeshStateSnapshot.agent,
@@ -613,6 +786,40 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
 ipcMain.handle('callmesh:get-status', async () => {
   lastCallmeshStateSnapshot = bridge?.getStateSnapshot() ?? lastCallmeshStateSnapshot;
   return buildCallmeshSummary();
+});
+
+ipcMain.handle('telemetry:get-snapshot', async (_event, options = {}) => {
+  if (!bridge) {
+    return {
+      updatedAt: Date.now(),
+      nodes: []
+    };
+  }
+  try {
+    const limit = Number.isFinite(options?.limitPerNode) ? options.limitPerNode : undefined;
+    return bridge.getTelemetrySnapshot({
+      limitPerNode: limit
+    });
+  } catch (err) {
+    console.error('取得遙測快照失敗:', err);
+    return {
+      updatedAt: Date.now(),
+      nodes: []
+    };
+  }
+});
+
+ipcMain.handle('telemetry:clear', async () => {
+  if (!bridge) {
+    return { success: false, error: 'bridge not initialised' };
+  }
+  try {
+    await bridge.clearTelemetryStore({ silent: false });
+    return { success: true };
+  } catch (err) {
+    console.error('清除遙測資料失敗:', err);
+    return { success: false, error: err.message };
+  }
 });
 
 ipcMain.handle('callmesh:reset', async () => {
@@ -668,7 +875,12 @@ app.on('window-all-closed', () => {
   if (bridge) {
     bridge.destroy();
   }
+  shutdownWebDashboard();
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('will-quit', () => {
+  shutdownWebDashboard();
 });
