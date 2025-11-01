@@ -133,6 +133,8 @@ Options:
   -m, --max-length  允許的最大封包大小 (位元組)          [number] [default: 512]
   -r, --show-raw    在摘要輸出時同時列印 payload 十六進位
                                                       [boolean] [default: false]
+      --web-ui      啟用內建 Web Dashboard（預設關閉）
+                                                      [boolean] [default: false]
   -f, --format      輸出格式：summary 顯示表格，json 顯示完整資料
                                [choices: "summary", "json"] [default: "summary"]
   -p, --pretty      搭配 --format json 時使用縮排輸出  [boolean] [default: true]
@@ -146,6 +148,7 @@ Options:
 | `--port, -P` | `4403` | TCP 連接埠 |
 | `--format, -f` | `summary` | `summary` 表格、`json` 輸出完整 protobuf 內容 |
 | `--show-raw, -r` | `false` | 在 summary 下同時顯示十六進位 payload |
+| `--web-ui` | `false` | 啟用內建 Web Dashboard（HTTP + SSE 伺服器） |
 | `--discover` | - | 搜尋區網內 `_meshtastic._tcp` 裝置 |
 
 CLI 具備自動重連：若 TCP 連線中斷會每 30 秒重試一次，直到 `Ctrl+C` 終止。
