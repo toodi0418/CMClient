@@ -8,6 +8,7 @@ const { version: appVersion } = require('../../package.json');
 const MeshtasticClient = require('../meshtasticClient');
 const { discoverMeshtasticDevices } = require('../discovery');
 const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
+const { WebDashboardServer } = require('../web/server');
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
 
@@ -17,6 +18,7 @@ let bridge = null;
 let callmeshRestoreAllowed = true;
 let lastCallmeshStateSnapshot = null;
 let cachedClientPreferences = null;
+let webServer = null;
 
 process.on('uncaughtException', (err) => {
   console.error('未攔截的例外:', err);
@@ -198,18 +200,27 @@ function toRendererCallmeshState(state) {
 }
 
 function sendCallmeshStateToRenderer(state) {
-  if (!mainWindow) return;
-  mainWindow.webContents.send('callmesh:status', toRendererCallmeshState(state));
+  const payload = toRendererCallmeshState(state);
+  if (!payload) return;
+  if (mainWindow) {
+    mainWindow.webContents.send('callmesh:status', payload);
+  }
+  webServer?.publishCallmesh(payload);
 }
 
 function sendCallmeshLog(entry) {
-  if (!mainWindow) return;
-  mainWindow.webContents.send('callmesh:log', entry);
+  if (mainWindow) {
+    mainWindow.webContents.send('callmesh:log', entry);
+  }
+  webServer?.publishLog(entry);
 }
 
 function sendAprsUplink(info) {
-  if (!mainWindow || !info) return;
-  mainWindow.webContents.send('meshtastic:aprs-uplink', info);
+  if (!info) return;
+  if (mainWindow) {
+    mainWindow.webContents.send('meshtastic:aprs-uplink', info);
+  }
+  webServer?.publishAprs(info);
 }
 
 async function createWindow() {
@@ -324,6 +335,7 @@ function buildCallmeshSummary() {
 async function initialiseApp() {
   await initialiseBridge();
   await createWindow();
+  await startWebDashboard();
 
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -337,6 +349,34 @@ function cleanupMeshtasticClient() {
     client.stop();
     client.removeAllListeners();
     client = null;
+  }
+}
+
+async function startWebDashboard() {
+  if (webServer) {
+    return;
+  }
+  const shouldStart = process.env.TMAG_WEB_DASHBOARD === '0' ? false : true;
+  if (!shouldStart) {
+    return;
+  }
+  try {
+    const server = new WebDashboardServer();
+    await server.start();
+    webServer = server;
+  } catch (err) {
+    console.error('啟動 Web Dashboard 失敗:', err);
+  }
+}
+
+async function shutdownWebDashboard() {
+  if (!webServer) return;
+  try {
+    await webServer.stop();
+  } catch (err) {
+    console.warn('關閉 Web Dashboard 失敗:', err);
+  } finally {
+    webServer = null;
   }
 }
 
@@ -432,11 +472,15 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   });
 
   client.on('connected', () => {
-    mainWindow?.webContents.send('meshtastic:status', { status: 'connected' });
+    const payload = { status: 'connected' };
+    mainWindow?.webContents.send('meshtastic:status', payload);
+    webServer?.publishStatus(payload);
   });
 
   client.on('disconnected', () => {
-    mainWindow?.webContents.send('meshtastic:status', { status: 'disconnected' });
+    const payload = { status: 'disconnected' };
+    mainWindow?.webContents.send('meshtastic:status', payload);
+    webServer?.publishStatus(payload);
   });
 
   client.on('summary', (summary) => {
@@ -447,6 +491,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
       console.error('處理 APRS Summary 時發生錯誤:', err);
     }
     mainWindow?.webContents.send('meshtastic:summary', summary);
+    webServer?.publishSummary(summary);
   });
 
   client.on('fromRadio', ({ message }) => {
@@ -464,13 +509,16 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   client.on('myInfo', (info) => {
     bridge?.handleMeshtasticMyInfo(info);
     mainWindow?.webContents.send('meshtastic:myInfo', info);
+    webServer?.publishSelf(info);
   });
 
   client.on('error', (err) => {
-    mainWindow?.webContents.send('meshtastic:status', {
+    const payload = {
       status: 'error',
       message: err.message
-    });
+    };
+    mainWindow?.webContents.send('meshtastic:status', payload);
+    webServer?.publishStatus(payload);
   });
 
   const connectPromise = waitForInitialMeshtasticConnection(client, {
@@ -680,7 +728,12 @@ app.on('window-all-closed', () => {
   if (bridge) {
     bridge.destroy();
   }
+  shutdownWebDashboard();
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('will-quit', () => {
+  shutdownWebDashboard();
 });

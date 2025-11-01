@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <title>TMAG Web Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>TMAG Web Dashboard</h1>
+      <p>同步展示 Meshtastic 封包、CallMesh 狀態與 APRS 流程。</p>
+    </header>
+
+    <main>
+      <section class="status-panel">
+        <div class="status-item">
+          <span class="label">Meshtastic：</span>
+          <span id="status-label" class="value status-value">尚未連線</span>
+        </div>
+        <div class="status-item">
+          <span class="label">CallMesh：</span>
+          <span id="callmesh-label" class="value">尚未取得</span>
+        </div>
+        <div class="status-item">
+          <span class="label">APRS：</span>
+          <span id="aprs-status-label" class="value">尚未取得</span>
+        </div>
+      </section>
+
+      <section class="counter-panel">
+        <article class="counter-card">
+          <span class="counter-label">10 分鐘封包</span>
+          <span id="counter-packets" class="counter-value">0</span>
+        </article>
+        <article class="counter-card">
+          <span class="counter-label">已上傳 APRS</span>
+          <span id="counter-aprs" class="counter-value">0</span>
+        </article>
+        <article class="counter-card">
+          <span class="counter-label">Mapping 節點</span>
+          <span id="counter-mapping" class="counter-value">0</span>
+        </article>
+      </section>
+
+      <section class="info-layout">
+        <article class="info-card">
+          <h2>CallMesh Provision</h2>
+          <dl class="info-grid">
+            <div>
+              <dt>呼號</dt>
+              <dd id="callmesh-callsign">—</dd>
+            </div>
+            <div>
+              <dt>符號</dt>
+              <dd id="callmesh-symbol">—</dd>
+            </div>
+            <div>
+              <dt>座標</dt>
+              <dd id="callmesh-coords">—</dd>
+            </div>
+            <div>
+              <dt>PHG 詳細</dt>
+              <dd id="callmesh-phg">—</dd>
+            </div>
+            <div>
+              <dt>備註</dt>
+              <dd id="callmesh-comment" class="multiline">—</dd>
+            </div>
+            <div>
+              <dt>最後更新</dt>
+              <dd id="callmesh-updated">—</dd>
+            </div>
+          </dl>
+        </article>
+      </section>
+
+      <section class="table-panel">
+        <header class="panel-header">
+          <h2>封包摘要</h2>
+          <span class="panel-meta">資料列最多保留 200 筆</span>
+        </header>
+        <table>
+          <thead>
+            <tr>
+              <th>時間</th>
+              <th>來源</th>
+              <th>最後轉發</th>
+              <th>類型</th>
+              <th>CH</th>
+              <th>Hops</th>
+              <th>SNR</th>
+              <th>RSSI</th>
+              <th>資訊</th>
+            </tr>
+        </thead>
+          <tbody id="summary-table"></tbody>
+        </table>
+      </section>
+
+      <section class="log-panel">
+        <header class="panel-header">
+          <h2>系統日誌</h2>
+          <span class="panel-meta">CallMesh / APRS / 連線事件</span>
+        </header>
+        <ul id="log-list" class="log-list"></ul>
+      </section>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>

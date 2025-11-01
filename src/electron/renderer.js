@@ -149,6 +149,15 @@ const aprsCompletedFlowIds = new Set();
 const aprsCompletedQueue = [];
 const JSON_MAX_ENTRIES = 300;
 const jsonEntries = [];
+const JSON_OMIT_KEYS = new Set([
+  'queueStatus',
+  'rxTime',
+  'rx_time',
+  'rxSnr',
+  'rx_snr',
+  'rxRssi',
+  'rx_rssi'
+]);
 let jsonEntrySequence = 0;
 
 const AUTO_CONNECT_MAX_ATTEMPTS = 3;
@@ -876,13 +885,7 @@ jsonCopyBtn?.addEventListener('click', async () => {
     return;
   }
   try {
-    const exportPayload = jsonEntries.map((entry) => ({
-      timestampMs: entry.timestampMs,
-      timestampLabel: entry.timestampLabel,
-      fromMeshId: entry.meshId || null,
-      portLabel: entry.portLabel || null,
-      message: entry.message
-    }));
+    const exportPayload = jsonEntries.map((entry) => entry.data);
     await navigator.clipboard.writeText(JSON.stringify(exportPayload, null, 2));
     appendLog('APP', `已將 ${exportPayload.length} 筆 JSON 紀錄複製到剪貼簿`);
   } catch (err) {
@@ -1275,6 +1278,9 @@ function clearJsonEntries() {
 
 function handleRawMessage(message) {
   if (!message) return;
+  if (!isDecodedPacketMessage(message)) {
+    return;
+  }
   if (isMessageFromSelf(message)) {
     return;
   }
@@ -1282,16 +1288,24 @@ function handleRawMessage(message) {
 }
 
 function appendJsonEntry(message) {
-  const timestampMs = extractMessageTimestamp(message);
-  const meshId = extractMessageMeshId(message);
+  const sanitized = sanitizeMessageForJson(message);
+  const meta = extractJsonMetadata(message);
+  const entryData = {
+    hash: meta.hash,
+    fromMeshId: meta.fromMeshId,
+    relayMeshId: meta.relayMeshId,
+    relayLabel: meta.relayLabel,
+    hopsUsed: meta.hopsUsed,
+    hopsTotal: meta.hopsTotal,
+    rssi: meta.rssi,
+    snr: meta.snr,
+    payload: meta.payload,
+    packet: sanitized?.packet ?? null,
+    message: sanitized
+  };
   const entry = {
     id: `json-${jsonEntrySequence++}`,
-    timestampMs,
-    timestampLabel: formatJsonEntryTimestamp(timestampMs),
-    meshId,
-    meshIdDisplay: meshId ? meshId.toUpperCase() : null,
-    portLabel: extractMessagePortLabel(message),
-    message
+    data: entryData
   };
   jsonEntries.unshift(entry);
 
@@ -1321,37 +1335,36 @@ function renderJsonEntry(entry) {
   wrapper.className = 'json-entry';
   wrapper.dataset.entryId = entry.id;
 
+  const data = entry.data;
   const header = document.createElement('div');
   header.className = 'json-entry-meta';
-  const metaParts = [`時間 ${entry.timestampLabel}`];
-  if (entry.meshIdDisplay) {
-    metaParts.push(`來源 ${entry.meshIdDisplay}`);
+  const metaParts = [];
+  const relayLabel = data.relayLabel || '直收';
+  metaParts.push(`最後一跳 ${relayLabel}`);
+  if (Number.isFinite(data.hopsUsed)) {
+    metaParts.push(`目前 ${data.hopsUsed} 跳`);
+  } else {
+    metaParts.push('目前 跳數未知');
   }
-  if (entry.portLabel) {
-    metaParts.push(`Port ${entry.portLabel}`);
+  if (Number.isFinite(data.hopsTotal)) {
+    metaParts.push(`總共 ${data.hopsTotal} 跳`);
+  } else {
+    metaParts.push('總共 跳數未知');
+  }
+  if (Number.isFinite(data.rssi)) {
+    metaParts.push(`RSSI ${data.rssi} dBm`);
+  }
+  if (Number.isFinite(data.snr)) {
+    metaParts.push(`SNR ${data.snr.toFixed(2)} dB`);
   }
   header.textContent = metaParts.join(' • ');
 
   const body = document.createElement('pre');
   body.className = 'json-entry-body';
-  body.textContent = JSON.stringify(entry.message, null, 2);
+  body.textContent = JSON.stringify(data, null, 2);
 
   wrapper.append(header, body);
   return wrapper;
-}
-
-function extractMessagePortLabel(message) {
-  const decoded = message?.packet?.decoded;
-  if (!decoded) return null;
-  const name = decoded.portnumName ?? decoded.portnum_name ?? decoded.portName ?? decoded.port_name;
-  if (typeof name === 'string' && name.trim()) {
-    return name.trim();
-  }
-  const portnum = decoded.portnum ?? decoded.port_num;
-  if (Number.isFinite(portnum)) {
-    return String(portnum);
-  }
-  return null;
 }
 
 function extractMessageMeshId(message) {
@@ -1376,33 +1389,85 @@ function meshIdFromNumeric(value) {
   return `!${hex}`;
 }
 
-function extractMessageTimestamp(message) {
-  if (!message) return Date.now();
-  const packet = message.packet || {};
-  const rxTime = packet.rxTime ?? packet.rx_time;
-  if (Number.isFinite(rxTime)) {
-    return Number(rxTime) * 1000;
-  }
-  const rxTimeMs = packet.rxTimeMs ?? packet.rx_time_ms;
-  if (Number.isFinite(rxTimeMs)) {
-    return Number(rxTimeMs);
-  }
-  const timestamp = message.rxTime ?? message.rx_time;
-  if (Number.isFinite(timestamp)) {
-    return Number(timestamp) * 1000;
-  }
-  return Date.now();
+function extractJsonMetadata(message) {
+  const packet = message?.packet || {};
+  const fromMeshId = extractMessageMeshId(message);
+  const payload =
+    typeof packet?.decoded?.payload === 'string' ? packet.decoded.payload : null;
+  const relayInfo = resolveRelayInfo(packet);
+  const hopStats = computeHopStats(packet);
+  const hash = computePacketHash(packet, {
+    fromMeshId,
+    payload,
+    hopsUsed: hopStats.used,
+    hopsTotal: hopStats.total
+  });
+  return {
+    fromMeshId,
+    relayMeshId: relayInfo.meshId,
+    relayLabel: relayInfo.label,
+    hopsUsed: hopStats.used,
+    hopsTotal: hopStats.total,
+    rssi: Number.isFinite(packet.rxRssi) ? Number(packet.rxRssi) : null,
+    snr: Number.isFinite(packet.rxSnr) ? Number(packet.rxSnr) : null,
+    payload,
+    hash
+  };
 }
 
-function formatJsonEntryTimestamp(ms) {
-  const date = new Date(ms);
-  const yyyy = date.getFullYear();
-  const mm = `${date.getMonth() + 1}`.padStart(2, '0');
-  const dd = `${date.getDate()}`.padStart(2, '0');
-  const hh = `${date.getHours()}`.padStart(2, '0');
-  const mi = `${date.getMinutes()}`.padStart(2, '0');
-  const ss = `${date.getSeconds()}`.padStart(2, '0');
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+function resolveRelayInfo(packet) {
+  const relayNode = packet?.relayNode;
+  if (!Number.isFinite(relayNode) || relayNode === 0) {
+    return { label: '直收', meshId: null };
+  }
+  const meshId = meshIdFromNumeric(relayNode);
+  if (!meshId) {
+    return { label: '未知節點', meshId: null };
+  }
+  const normalized = normalizeMeshId(meshId);
+  if (isSelfMeshId(meshId)) {
+    return { label: '本站節點', meshId: normalized };
+  }
+  return {
+    label: normalized.toUpperCase(),
+    meshId: normalized
+  };
+}
+
+function computeHopStats(packet) {
+  const hopStart = Number(packet?.hopStart);
+  const hopLimit = Number(packet?.hopLimit);
+  let used = null;
+  if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
+    used = Math.max(hopStart - hopLimit, 0);
+  }
+  const total = Number.isFinite(hopStart)
+    ? hopStart
+    : Number.isFinite(hopLimit)
+      ? hopLimit
+      : null;
+  return { used, total };
+}
+
+function computePacketHash(packet, context = {}) {
+  const rawFrom = context.fromMeshId || meshIdFromNumeric(packet?.from) || '';
+  const fromMeshId = rawFrom ? normalizeMeshId(rawFrom) : '';
+  const payload = context.payload || '';
+  const idPart = Number.isFinite(packet?.id) ? String(packet.id >>> 0) : '';
+  const timePart = Number.isFinite(packet?.rxTime) ? String(packet.rxTime >>> 0) : '';
+  const usedHop = Number.isFinite(context.hopsUsed) ? String(context.hopsUsed) : '';
+  const totalHop = Number.isFinite(context.hopsTotal) ? String(context.hopsTotal) : '';
+  const raw = `${fromMeshId}|${payload}|${idPart}|${timePart}|${usedHop}|${totalHop}`;
+  return fnv1aHash(raw).toUpperCase();
+}
+
+function fnv1aHash(input) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
 function isMessageFromSelf(message) {
@@ -1419,7 +1484,8 @@ function pruneJsonEntriesForSelf() {
   let removedAny = false;
   for (let i = jsonEntries.length - 1; i >= 0; i -= 1) {
     const entry = jsonEntries[i];
-    if (entry.meshId === meshId) {
+    const entryMesh = entry.data?.fromMeshId;
+    if (entryMesh && entryMesh === meshId) {
       const [removed] = jsonEntries.splice(i, 1);
       removedAny = true;
       if (removed && jsonList) {
@@ -1444,6 +1510,39 @@ function updateJsonEmptyState() {
   const hasEntries = jsonEntries.length > 0;
   jsonEmptyState.classList.toggle('hidden', hasEntries);
   jsonList.classList.toggle('hidden', !hasEntries);
+}
+
+function sanitizeMessageForJson(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeMessageForJson(item));
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  const result = {};
+  for (const [key, original] of Object.entries(value)) {
+    if (JSON_OMIT_KEYS.has(key)) {
+      continue;
+    }
+    result[key] = sanitizeMessageForJson(original);
+  }
+  return result;
+}
+
+function isDecodedPacketMessage(message) {
+  if (!message || message.payloadVariant !== 'packet') {
+    return false;
+  }
+  const packet = message.packet;
+  if (!packet || packet.payloadVariant !== 'decoded') {
+    return false;
+  }
+  const decoded = packet.decoded;
+  if (!decoded || typeof decoded !== 'object') {
+    return false;
+  }
+  const payload = decoded.payload;
+  return typeof payload === 'string' && payload.length > 0;
 }
 
 function registerPacketFlow(summary, { skipPending = false } = {}) {
