@@ -17,6 +17,11 @@
   const logList = document.getElementById('log-list');
   const navButtons = document.querySelectorAll('.nav-btn');
   const pages = document.querySelectorAll('.page');
+  const flowPage = document.getElementById('flow-page');
+  const flowList = document.getElementById('flow-list');
+  const flowEmptyState = document.getElementById('flow-empty-state');
+  const flowSearchInput = document.getElementById('flow-search');
+  const flowFilterStateSelect = document.getElementById('flow-filter-state');
   const telemetryPage = document.getElementById('telemetry-page');
   const telemetryNodeSelect = document.getElementById('telemetry-node-select');
   const telemetryRangeSelect = document.getElementById('telemetry-range-select');
@@ -35,7 +40,16 @@
   const flowRowMap = new Map();
   const aprsHighlightedFlows = new Set();
   const mappingMeshIds = new Set();
+  const mappingByMeshId = new Map();
   const flowAprsCallsigns = new Map();
+  const flowEntries = [];
+  const flowEntryIndex = new Map();
+  const pendingFlowSummaries = new Map();
+  const pendingAprsUplinks = new Map();
+  let flowFilterState = 'all';
+  let flowSearchTerm = '';
+  const FLOW_MAX_ENTRIES = 1000;
+
   let currentSelfMeshId = null;
   let selfProvisionCoords = null;
   const MAX_SUMMARY_ROWS = 200;
@@ -141,6 +155,8 @@
       page.classList.toggle('active', isActive);
       if (isActive && targetId === 'telemetry-page') {
         renderTelemetryView();
+      } else if (isActive && targetId === 'flow-page') {
+        renderFlowEntries();
       }
     });
     navButtons.forEach((btn) => {
@@ -155,6 +171,17 @@
         activatePage(target);
       }
     });
+  });
+
+  flowSearchInput?.addEventListener('input', () => {
+    const raw = flowSearchInput.value || '';
+    flowSearchTerm = raw.trim().toLowerCase();
+    renderFlowEntries();
+  });
+
+  flowFilterStateSelect?.addEventListener('change', (event) => {
+    flowFilterState = (event.target.value || 'all').toLowerCase();
+    renderFlowEntries();
   });
 
   telemetryNodeSelect?.addEventListener('change', () => {
@@ -1746,6 +1773,597 @@
         }
       }
     }
+
+    registerFlow(summary);
+  }
+
+  function registerFlow(summary, { skipPending = false } = {}) {
+    if (!summary) return;
+    const type = String(summary.type || '').toLowerCase();
+    if (type !== 'position') {
+      return;
+    }
+    const meshId = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
+    if (!meshId) return;
+
+    const timestampMs = extractSummaryTimestampMs(summary);
+    const flowId =
+      typeof summary.flowId === 'string' && summary.flowId.trim()
+        ? summary.flowId
+        : `${timestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+    summary.flowId = flowId;
+
+    const existing = flowEntryIndex.get(flowId);
+    if (existing) {
+      updateFlowEntryFromSummary(existing, summary);
+      repositionFlowEntry(existing);
+      renderFlowEntries();
+      return;
+    }
+
+    const mapping = findMappingByMeshId(meshId);
+    if (!mapping) {
+      if (!skipPending) {
+        let bucket = pendingFlowSummaries.get(meshId);
+        if (!bucket) {
+          bucket = new Map();
+          pendingFlowSummaries.set(meshId, bucket);
+        }
+        if (!bucket.has(flowId)) {
+          const clone = cloneSummaryForPending(summary);
+          if (clone) {
+            bucket.set(flowId, clone);
+            while (bucket.size > 25) {
+              const oldestKey = bucket.keys().next().value;
+              if (oldestKey) {
+                bucket.delete(oldestKey);
+              } else {
+                break;
+              }
+            }
+          }
+        }
+      }
+      return;
+    }
+
+    if (!skipPending) {
+      const bucket = pendingFlowSummaries.get(meshId);
+      if (bucket) {
+        bucket.delete(flowId);
+        if (!bucket.size) {
+          pendingFlowSummaries.delete(meshId);
+        }
+      }
+    }
+
+    const entry = buildFlowEntry(summary, {
+      meshId,
+      mapping,
+      timestampMs,
+      flowId
+    });
+    flowEntryIndex.set(flowId, entry);
+    insertFlowEntry(entry);
+
+    const aprsRecord = pendingAprsUplinks.get(flowId);
+    if (aprsRecord) {
+      entry.aprs = aprsRecord;
+      entry.status = 'aprs';
+      pendingAprsUplinks.delete(flowId);
+    }
+
+    renderFlowEntries();
+  }
+
+  function buildFlowEntry(summary, context) {
+    const { meshId, mapping, timestampMs, flowId } = context;
+    const mappingLabel = formatMappingLabel(mapping);
+    const callsign = formatMappingCallsign(mapping);
+    const mappingComment = extractMappingComment(mapping);
+    const extras = Array.isArray(summary.extraLines)
+      ? summary.extraLines.filter((line) => typeof line === 'string' && line.trim())
+      : [];
+    const relayLabel = formatRelay(summary);
+    const hopInfo = extractHopInfo(summary);
+    const position = summary.position || {};
+    const altitude = resolveAltitudeMeters(position);
+    const speedKph = computeSpeedKph(position);
+    const satsInView = Number.isFinite(position.satsInView) ? Number(position.satsInView) : null;
+    const timestampLabel = summary.timestampLabel || formatFlowTimestamp(timestampMs);
+
+    const entry = {
+      flowId,
+      meshId,
+      timestampMs,
+      timestampLabel,
+      type: summary.type || 'Position',
+      icon: resolveFlowIcon(summary.type),
+      fromLabel: formatFlowNode(summary.from),
+      toLabel: summary.to ? formatFlowNode(summary.to) : null,
+      pathLabel: formatFlowPath(summary),
+      channel: summary.channel ?? '',
+      relayLabel,
+      hopsLabel: hopInfo.hopsLabel || formatHops(summary.hops),
+      hopsUsed: hopInfo.usedHops,
+      hopsTotal: hopInfo.totalHops,
+      snr: Number.isFinite(summary.snr) ? Number(summary.snr) : null,
+      rssi: Number.isFinite(summary.rssi) ? Number(summary.rssi) : null,
+      mappingLabel,
+      callsign,
+      comment: mappingComment || summary.detail || extras.join('\n'),
+      detail: summary.detail || '',
+      extras,
+      altitude,
+      speedKph,
+      satsInView,
+      status: 'pending',
+      aprs: null
+    };
+
+    if (!entry.comment && extras.length) {
+      entry.comment = extras.join('\n');
+    }
+
+    return entry;
+  }
+
+  function updateFlowEntryFromSummary(entry, summary) {
+    const timestampMs = extractSummaryTimestampMs(summary);
+    entry.timestampMs = timestampMs;
+    entry.timestampLabel = summary.timestampLabel || formatFlowTimestamp(timestampMs);
+    entry.type = summary.type || entry.type;
+    entry.icon = resolveFlowIcon(entry.type);
+    entry.fromLabel = formatFlowNode(summary.from);
+    entry.toLabel = summary.to ? formatFlowNode(summary.to) : null;
+    entry.pathLabel = formatFlowPath(summary);
+    entry.channel = summary.channel ?? entry.channel;
+    entry.relayLabel = formatRelay(summary);
+    const hopInfo = extractHopInfo(summary);
+    entry.hopsLabel = hopInfo.hopsLabel || formatHops(summary.hops);
+    entry.hopsUsed = hopInfo.usedHops;
+    entry.hopsTotal = hopInfo.totalHops;
+    entry.snr = Number.isFinite(summary.snr) ? Number(summary.snr) : entry.snr;
+    entry.rssi = Number.isFinite(summary.rssi) ? Number(summary.rssi) : entry.rssi;
+    entry.detail = summary.detail || entry.detail;
+    entry.extras = Array.isArray(summary.extraLines)
+      ? summary.extraLines.filter((line) => typeof line === 'string' && line.trim())
+      : [];
+    const position = summary.position || {};
+    entry.altitude = resolveAltitudeMeters(position);
+    entry.speedKph = computeSpeedKph(position);
+    entry.satsInView = Number.isFinite(position.satsInView) ? Number(position.satsInView) : entry.satsInView;
+
+    const mapping = findMappingByMeshId(entry.meshId);
+    if (mapping) {
+      const nextLabel = formatMappingLabel(mapping);
+      const nextCallsign = formatMappingCallsign(mapping);
+      const nextComment = extractMappingComment(mapping);
+      if (entry.mappingLabel !== nextLabel) {
+        entry.mappingLabel = nextLabel;
+      }
+      if (nextCallsign && entry.callsign !== nextCallsign) {
+        entry.callsign = nextCallsign;
+      }
+      if (nextComment) {
+        entry.comment = nextComment;
+      }
+    }
+    if (!entry.comment) {
+      entry.comment = summary.detail || entry.extras.join('\n');
+    }
+  }
+
+  function insertFlowEntry(entry) {
+    let inserted = false;
+    for (let i = 0; i < flowEntries.length; i += 1) {
+      if (Number(entry.timestampMs) >= Number(flowEntries[i].timestampMs)) {
+        flowEntries.splice(i, 0, entry);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) {
+      flowEntries.push(entry);
+    }
+    while (flowEntries.length > FLOW_MAX_ENTRIES) {
+      const removed = flowEntries.pop();
+      if (removed) {
+        flowEntryIndex.delete(removed.flowId);
+      }
+    }
+  }
+
+  function repositionFlowEntry(entry) {
+    const index = flowEntries.indexOf(entry);
+    if (index >= 0) {
+      flowEntries.splice(index, 1);
+    }
+    insertFlowEntry(entry);
+  }
+
+  function renderFlowEntries() {
+    if (!flowList || !flowEmptyState) return;
+    const term = flowSearchTerm;
+    const filtered = flowEntries.filter((entry) => {
+      if (flowFilterState === 'aprs' && !entry.aprs) return false;
+      if (flowFilterState === 'pending' && entry.aprs) return false;
+      if (term && !flowEntryMatches(entry, term)) return false;
+      return true;
+    });
+
+    flowList.innerHTML = '';
+    if (!filtered.length) {
+      flowEmptyState.classList.remove('hidden');
+      flowList.classList.add('hidden');
+      return;
+    }
+
+    flowEmptyState.classList.add('hidden');
+    flowList.classList.remove('hidden');
+
+    const fragment = document.createDocumentFragment();
+    for (const entry of filtered) {
+      fragment.appendChild(renderFlowEntry(entry));
+    }
+    flowList.appendChild(fragment);
+  }
+
+  function renderFlowEntry(entry) {
+    const primaryLabel = entry.mappingLabel || entry.callsign || entry.pathLabel || entry.fromLabel;
+    const item = document.createElement('div');
+    item.className = `flow-item ${entry.aprs ? 'flow-item--aprs' : 'flow-item--pending'}`;
+    item.dataset.flowId = entry.flowId;
+
+    const header = document.createElement('div');
+    header.className = 'flow-item-header';
+
+    const title = document.createElement('div');
+    title.className = 'flow-item-title';
+    const icon = document.createElement('span');
+    icon.className = 'flow-item-icon';
+    icon.textContent = entry.icon || '📡';
+    const label = document.createElement('span');
+    label.textContent = primaryLabel || '未知節點';
+    title.append(icon, label);
+
+    const status = document.createElement('span');
+    status.className = `flow-item-status ${entry.aprs ? 'flow-item-status--aprs' : 'flow-item-status--pending'}`;
+    status.textContent = entry.aprs ? '已上傳 APRS' : '待上傳';
+
+    header.append(title, status);
+    item.appendChild(header);
+
+    if (entry.pathLabel) {
+      const path = document.createElement('div');
+      path.className = 'flow-item-path';
+      path.textContent = entry.pathLabel;
+      item.appendChild(path);
+    }
+
+    const chips = buildFlowChips(entry);
+    if (chips.length) {
+      const meta = document.createElement('div');
+      meta.className = 'flow-item-meta';
+      for (const chip of chips) {
+        const chipEl = document.createElement('span');
+        chipEl.className = 'flow-chip';
+        const strong = document.createElement('strong');
+        strong.textContent = chip.label;
+        chipEl.append(strong, document.createTextNode(` ${chip.value}`));
+        meta.appendChild(chipEl);
+      }
+      item.appendChild(meta);
+    }
+
+    const commentText =
+      entry.comment ||
+      entry.detail ||
+      (entry.extras && entry.extras.length ? entry.extras.join('\n') : '');
+    const comment = document.createElement('div');
+    comment.className = 'flow-item-comment';
+    if (!commentText) {
+      comment.classList.add('empty');
+      comment.textContent = '無額外註記';
+    } else {
+      comment.textContent = commentText;
+    }
+    item.appendChild(comment);
+
+    if (entry.aprs) {
+      const aprsBlock = document.createElement('div');
+      aprsBlock.className = 'flow-item-aprs';
+      const labelEl = document.createElement('div');
+      labelEl.className = 'flow-item-aprs-label';
+      labelEl.textContent = `APRS ${entry.aprs.timestampLabel}`;
+      const frameEl = document.createElement('div');
+      frameEl.className = 'flow-item-aprs-frame';
+      frameEl.textContent = entry.aprs.frame || entry.aprs.payload || '';
+      aprsBlock.append(labelEl, frameEl);
+      item.appendChild(aprsBlock);
+    }
+
+    return item;
+  }
+
+  function buildFlowChips(entry) {
+    const chips = [];
+    if (entry.timestampLabel) {
+      chips.push({ label: '時間', value: entry.timestampLabel });
+    }
+    if (entry.callsign && entry.callsign !== entry.mappingLabel) {
+      chips.push({ label: '呼號', value: entry.callsign });
+    }
+    if (entry.channel !== '' && entry.channel !== null && entry.channel !== undefined) {
+      chips.push({ label: 'Ch', value: entry.channel });
+    }
+    if (entry.relayLabel) {
+      chips.push({ label: 'Relay', value: entry.relayLabel });
+    }
+    if (entry.hopsLabel) {
+      chips.push({ label: 'Hops', value: entry.hopsLabel });
+    } else if (entry.hopsUsed != null || entry.hopsTotal != null) {
+      const used = entry.hopsUsed != null ? entry.hopsUsed : '?';
+      const total = entry.hopsTotal != null ? entry.hopsTotal : '?';
+      chips.push({ label: 'Hops', value: `${used}/${total}` });
+    }
+    if (Number.isFinite(entry.snr)) {
+      chips.push({ label: 'SNR', value: `${entry.snr.toFixed(1)} dB` });
+    }
+    if (Number.isFinite(entry.rssi)) {
+      chips.push({ label: 'RSSI', value: `${entry.rssi.toFixed(0)} dBm` });
+    }
+    if (Number.isFinite(entry.altitude)) {
+      chips.push({ label: 'ALT', value: `${Math.round(entry.altitude)} m` });
+    }
+    if (Number.isFinite(entry.speedKph)) {
+      chips.push({ label: 'SPD', value: `${entry.speedKph.toFixed(1)} km/h` });
+    }
+    if (Number.isFinite(entry.satsInView)) {
+      chips.push({ label: 'SAT', value: `${entry.satsInView}` });
+    }
+    return chips;
+  }
+
+  function flowEntryMatches(entry, term) {
+    if (!term) return true;
+    const haystack = [
+      entry.mappingLabel,
+      entry.callsign,
+      entry.fromLabel,
+      entry.toLabel,
+      entry.pathLabel,
+      entry.relayLabel,
+      entry.comment,
+      entry.detail,
+      ...(entry.extras || []),
+      entry.aprs?.frame,
+      entry.aprs?.payload
+    ]
+      .filter(Boolean)
+      .map((value) => String(value).toLowerCase());
+    return haystack.some((text) => text.includes(term));
+  }
+
+  function cloneSummaryForPending(summary) {
+    try {
+      const clone = typeof structuredClone === 'function' ? structuredClone(summary) : null;
+      if (clone) return clone;
+    } catch {
+      // ignore structuredClone failure
+    }
+    try {
+      return JSON.parse(JSON.stringify(summary));
+    } catch {
+      return null;
+    }
+  }
+
+  function extractSummaryTimestampMs(summary) {
+    if (!summary) return Date.now();
+    if (Number.isFinite(summary.timestampMs)) {
+      return Number(summary.timestampMs);
+    }
+    if (Number.isFinite(summary.timestamp)) {
+      return Number(summary.timestamp);
+    }
+    if (typeof summary.timestamp === 'string') {
+      const parsed = Date.parse(summary.timestamp);
+      if (!Number.isNaN(parsed)) {
+        return parsed;
+      }
+    }
+    if (typeof summary.timestampLabel === 'string') {
+      const parsed = Date.parse(summary.timestampLabel);
+      if (!Number.isNaN(parsed)) {
+        return parsed;
+      }
+    }
+    return Date.now();
+  }
+
+  function formatFlowTimestamp(timestampMs) {
+    const date = new Date(timestampMs);
+    if (Number.isNaN(date.getTime())) return '—';
+    const hh = `${date.getHours()}`.padStart(2, '0');
+    const mm = `${date.getMinutes()}`.padStart(2, '0');
+    const ss = `${date.getSeconds()}`.padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  function resolveFlowIcon(type) {
+    if (!type) return '📡';
+    const lower = String(type).toLowerCase();
+    if (lower.includes('position')) return '📍';
+    if (lower.includes('telemetry')) return '📈';
+    return '📡';
+  }
+
+  function formatFlowNode(node) {
+    if (!node) return 'unknown';
+    const mesh = node.meshId || node.meshIdNormalized || '';
+    const meshLabel = mesh ? mesh.toLowerCase() : '';
+    const name =
+      (node.longName && node.longName !== 'unknown' && node.longName) ||
+      (node.shortName && node.shortName !== 'unknown' && node.shortName) ||
+      (node.label && node.label !== 'unknown' && node.label) ||
+      '';
+    if (!name && !meshLabel) {
+      return 'unknown';
+    }
+    if (meshLabel && name && !name.toLowerCase().includes(meshLabel)) {
+      return `${name} (${meshLabel})`;
+    }
+    return name || meshLabel || 'unknown';
+  }
+
+  function formatFlowPath(summary) {
+    if (!summary) return '';
+    const fromLabel = formatFlowNode(summary.from);
+    const toLabel = summary.to ? formatFlowNode(summary.to) : '';
+    if (toLabel) {
+      return `${fromLabel} → ${toLabel}`;
+    }
+    return fromLabel;
+  }
+
+  function computeSpeedKph(position = {}) {
+    if (!position) return null;
+    if (Number.isFinite(position.speedKph)) {
+      return Number(position.speedKph);
+    }
+    if (Number.isFinite(position.speedMps)) {
+      return Number(position.speedMps) * 3.6;
+    }
+    if (Number.isFinite(position.speedKnots)) {
+      return Number(position.speedKnots) * 1.852;
+    }
+    return null;
+  }
+
+  function resolveAltitudeMeters(position = {}) {
+    if (!position) return null;
+    if (Number.isFinite(position.altitudeMeters)) {
+      return Number(position.altitudeMeters);
+    }
+    if (Number.isFinite(position.altitude)) {
+      return Number(position.altitude);
+    }
+    return null;
+  }
+
+  function findMappingByMeshId(meshId) {
+    if (!meshId) return null;
+    return mappingByMeshId.get(meshId) || null;
+  }
+
+  function formatMappingCallsign(mapping) {
+    if (!mapping) return null;
+    const baseRaw =
+      mapping.callsign_base ??
+      mapping.callsignBase ??
+      mapping.callsign ??
+      mapping.base ??
+      null;
+    if (!baseRaw) return null;
+    let base = String(baseRaw).trim().toUpperCase();
+    if (!base) return null;
+    if (base.endsWith('-')) {
+      base = base.slice(0, -1);
+    }
+    const ssidRaw =
+      mapping.aprs_ssid ??
+      mapping.aprsSsid ??
+      mapping.ssid ??
+      mapping.SSID ??
+      null;
+    const ssidNum = Number(ssidRaw);
+    if (Number.isFinite(ssidNum) && ssidNum > 0) {
+      const suffix = `-${ssidNum}`;
+      if (!base.endsWith(suffix)) {
+        base = `${base}${suffix}`;
+      }
+    }
+    return base.replace(/--+/g, '-');
+  }
+
+  function extractMappingComment(mapping) {
+    if (!mapping) return '';
+    return (
+      mapping.comment ??
+      mapping.aprs_comment ??
+      mapping.aprsComment ??
+      mapping.notes ??
+      ''
+    );
+  }
+
+  function formatMappingLabel(mapping) {
+    if (!mapping) return null;
+    const callsign = formatMappingCallsign(mapping) || '';
+    const comment = extractMappingComment(mapping) || '';
+    if (!comment) {
+      return callsign || null;
+    }
+    if (!callsign) {
+      return comment.trim() || null;
+    }
+    const escaped = callsign.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`^${escaped}(?:[\\s·-]+)?`, 'i');
+    const trimmed = comment.replace(pattern, '').trim();
+    return trimmed || callsign || null;
+  }
+
+  function flushPendingFlowsFor(meshId) {
+    if (!meshId) return;
+    const bucket = pendingFlowSummaries.get(meshId);
+    if (!bucket || !bucket.size) return;
+    pendingFlowSummaries.delete(meshId);
+    for (const summary of bucket.values()) {
+      registerFlow(summary, { skipPending: true });
+    }
+  }
+
+  function refreshFlowEntryLabels() {
+    let mutated = false;
+    for (const entry of flowEntries) {
+      const mapping = findMappingByMeshId(entry.meshId);
+      const nextLabel = formatMappingLabel(mapping);
+      const nextCallsign = formatMappingCallsign(mapping);
+      const nextComment = extractMappingComment(mapping);
+      if (entry.mappingLabel !== nextLabel) {
+        entry.mappingLabel = nextLabel;
+        mutated = true;
+      }
+      if (nextCallsign && entry.callsign !== nextCallsign) {
+        entry.callsign = nextCallsign;
+        mutated = true;
+      }
+      if (nextComment && entry.comment !== nextComment) {
+        entry.comment = nextComment;
+        mutated = true;
+      }
+    }
+    if (mutated) {
+      renderFlowEntries();
+    }
+  }
+
+  function buildAprsRecord(info) {
+    if (!info) return null;
+    const rawFrame = info.frame ?? info.payload ?? '';
+    const frame = String(rawFrame);
+    if (!frame.trim()) return null;
+    const timestampSource = info.timestamp ?? info.timestampMs ?? Date.now();
+    const timestampMs = Number.isFinite(Number(timestampSource))
+      ? Number(timestampSource)
+      : Date.now();
+    return {
+      frame,
+      payload: info.payload ? String(info.payload) : '',
+      timestampMs,
+      timestampLabel: formatFlowTimestamp(timestampMs)
+    };
   }
 
   function appendLog(entry) {
@@ -1780,6 +2398,17 @@
       aprsHighlightedFlows.delete(info.flowId);
       if (callsign) {
         setAprsBadge(row, callsign);
+      }
+    }
+    const aprsRecord = buildAprsRecord(info);
+    if (aprsRecord) {
+      const entry = flowEntryIndex.get(info.flowId);
+      if (entry) {
+        entry.aprs = aprsRecord;
+        entry.status = 'aprs';
+        renderFlowEntries();
+      } else {
+        pendingAprsUplinks.set(info.flowId, aprsRecord);
       }
     }
   }
@@ -1892,16 +2521,21 @@
 
     if (Array.isArray(info.mappingItems)) {
       mappingMeshIds.clear();
+      mappingByMeshId.clear();
       for (const item of info.mappingItems) {
         const meshId = normalizeMeshId(item?.mesh_id ?? item?.meshId);
-        if (meshId) {
-          mappingMeshIds.add(meshId);
-        }
+        if (!meshId) continue;
+        mappingMeshIds.add(meshId);
+        mappingByMeshId.set(meshId, item);
+        flushPendingFlowsFor(meshId);
       }
       refreshSummaryMappingHighlights();
+      refreshFlowEntryLabels();
     } else if (info.mappingItems == null) {
       mappingMeshIds.clear();
+      mappingByMeshId.clear();
       refreshSummaryMappingHighlights();
+      refreshFlowEntryLabels();
     }
 
     const provision = info.provision || {};

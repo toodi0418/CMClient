@@ -349,6 +349,238 @@ tbody tr:hover {
   font-family: 'JetBrains Mono', monospace;
 }
 
+.flow-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  background: rgba(15, 23, 42, 0.85);
+  padding: 20px;
+}
+
+.flow-header {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.flow-header h2 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.flow-hint {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 0.9rem;
+}
+
+.flow-search-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.flow-search-row input[type='search'] {
+  flex: 1 1 260px;
+  min-width: 180px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  background: rgba(15, 23, 42, 0.95);
+  color: #e2e8f0;
+  font-size: 0.95rem;
+}
+
+.flow-search-row input::placeholder {
+  color: rgba(148, 163, 184, 0.7);
+}
+
+.flow-search-row select {
+  flex: 0 0 190px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  background: rgba(15, 23, 42, 0.95);
+  color: #e2e8f0;
+  font-size: 0.95rem;
+}
+
+.flow-empty {
+  padding: 18px;
+  border-radius: 10px;
+  border: 1px dashed rgba(148, 163, 184, 0.4);
+  background: rgba(15, 23, 42, 0.6);
+  color: #94a3b8;
+  text-align: center;
+  font-size: 0.95rem;
+}
+
+.flow-empty.hidden {
+  display: none;
+}
+
+.flow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 520px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.flow-list.hidden {
+  display: none;
+}
+
+.flow-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  background: rgba(17, 24, 39, 0.88);
+  padding: 14px 16px;
+  position: relative;
+  transition: transform 0.15s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.flow-item:hover {
+  transform: translateY(-1px);
+  border-color: rgba(96, 165, 250, 0.55);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.45);
+}
+
+.flow-item::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  border-left: 4px solid transparent;
+}
+
+.flow-item.flow-item--aprs::before {
+  border-left-color: rgba(74, 222, 128, 0.9);
+}
+
+.flow-item.flow-item--pending::before {
+  border-left-color: rgba(250, 204, 21, 0.8);
+}
+
+.flow-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.flow-item-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.flow-item-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: rgba(96, 165, 250, 0.18);
+  font-size: 1rem;
+}
+
+.flow-item-status {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.18);
+  color: #bfdbfe;
+}
+
+.flow-item-status--aprs {
+  background: rgba(74, 222, 128, 0.22);
+  color: #bbf7d0;
+}
+
+.flow-item-status--pending {
+  background: rgba(250, 204, 21, 0.25);
+  color: #facc15;
+}
+
+.flow-item-path {
+  font-size: 0.95rem;
+  color: #cbd5f5;
+}
+
+.flow-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.flow-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(51, 65, 85, 0.4);
+  font-size: 0.78rem;
+  font-family: 'JetBrains Mono', monospace;
+  color: #cbd5f5;
+}
+
+.flow-chip strong {
+  font-weight: 700;
+}
+
+.flow-item-comment {
+  color: #e2e8f0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.flow-item-comment.empty {
+  color: rgba(148, 163, 184, 0.8);
+}
+
+.flow-item-aprs {
+  border-radius: 8px;
+  background: rgba(30, 64, 175, 0.25);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.flow-item-aprs-label {
+  font-size: 0.78rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #bfdbfe;
+}
+
+.flow-item-aprs-frame {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  color: #e0f2fe;
+  word-break: break-word;
+}
+
 .telemetry-panel {
   display: flex;
   flex-direction: column;

@@ -19,6 +19,7 @@ let callmeshRestoreAllowed = true;
 let lastCallmeshStateSnapshot = null;
 let cachedClientPreferences = null;
 let webServer = null;
+let lastMeshtasticStatus = { status: 'idle' };
 
 process.on('uncaughtException', (err) => {
   console.error('未攔截的例外:', err);
@@ -111,6 +112,9 @@ function normalizeClientPreferences(raw) {
         normalized.host = trimmed;
       }
     }
+    if (Object.prototype.hasOwnProperty.call(raw, 'webDashboardEnabled')) {
+      normalized.webDashboardEnabled = Boolean(raw.webDashboardEnabled);
+    }
   }
   return normalized;
 }
@@ -159,6 +163,9 @@ async function updateClientPreferences(updates = {}) {
     } else {
       delete existing.host;
     }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'webDashboardEnabled')) {
+    existing.webDashboardEnabled = Boolean(updates.webDashboardEnabled);
   }
   return writeClientPreferences(existing);
 }
@@ -362,8 +369,7 @@ function buildCallmeshSummary() {
 async function initialiseApp() {
   await initialiseBridge();
   await createWindow();
-  await startWebDashboard();
-  await syncWebTelemetrySnapshot();
+  await ensureWebDashboardState();
 
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -382,19 +388,17 @@ function cleanupMeshtasticClient() {
 
 async function startWebDashboard() {
   if (webServer) {
-    return;
-  }
-  const shouldStart = process.env.TMAG_WEB_DASHBOARD === '0' ? false : true;
-  if (!shouldStart) {
-    return;
+    return true;
   }
   try {
     const server = new WebDashboardServer({ appVersion });
     await server.start();
     server.setAppVersion(appVersion);
     webServer = server;
+    return true;
   } catch (err) {
     console.error('啟動 Web Dashboard 失敗:', err);
+    return false;
   }
 }
 
@@ -406,6 +410,41 @@ async function shutdownWebDashboard() {
     console.warn('關閉 Web Dashboard 失敗:', err);
   } finally {
     webServer = null;
+  }
+}
+
+function getWebDashboardEnvOverride() {
+  const value = process.env.TMAG_WEB_DASHBOARD;
+  if (value === '0') return false;
+  if (value === '1') return true;
+  return null;
+}
+
+async function shouldEnableWebDashboard() {
+  const override = getWebDashboardEnvOverride();
+  if (override !== null) {
+    return override;
+  }
+  const preferences = await getCachedClientPreferences();
+  return Boolean(preferences?.webDashboardEnabled);
+}
+
+async function ensureWebDashboardState() {
+  const desired = await shouldEnableWebDashboard();
+  if (desired) {
+    const started = await startWebDashboard();
+    if (started) {
+      if (lastMeshtasticStatus) {
+        webServer?.publishStatus(lastMeshtasticStatus);
+      }
+      if (lastCallmeshStateSnapshot) {
+        const snapshotPayload = toRendererCallmeshState(lastCallmeshStateSnapshot);
+        webServer?.publishCallmesh(snapshotPayload);
+      }
+      await syncWebTelemetrySnapshot();
+    }
+  } else {
+    await shutdownWebDashboard();
   }
 }
 
@@ -467,12 +506,47 @@ ipcMain.handle('app:get-preferences', async () => {
 ipcMain.handle('app:update-preferences', async (_event, updates) => {
   try {
     const next = await updateClientPreferences(updates);
+    if (updates && Object.prototype.hasOwnProperty.call(updates, 'webDashboardEnabled')) {
+      await ensureWebDashboardState();
+    }
     return {
       success: true,
       preferences: next
     };
   } catch (err) {
     console.error('更新客戶端偏好失敗:', err);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+});
+
+ipcMain.handle('web:set-enabled', async (_event, enabledInput) => {
+  const desired = Boolean(enabledInput);
+  const override = getWebDashboardEnvOverride();
+  if (override !== null && override !== desired) {
+    const reason =
+      override === true
+        ? '環境變數 TMAG_WEB_DASHBOARD=1 已強制啟用 Web UI'
+        : '環境變數 TMAG_WEB_DASHBOARD=0 已停用 Web UI';
+    return {
+      success: false,
+      error: reason,
+      override: true,
+      enabled: override
+    };
+  }
+  try {
+    const preferences = await updateClientPreferences({ webDashboardEnabled: desired });
+    await ensureWebDashboardState();
+    return {
+      success: true,
+      enabled: desired,
+      preferences
+    };
+  } catch (err) {
+    console.error('更新 Web Dashboard 狀態失敗:', err);
     return {
       success: false,
       error: err.message
@@ -487,7 +561,10 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
 
   cleanupMeshtasticClient();
 
-  mainWindow.webContents.send('meshtastic:status', { status: 'connecting' });
+  const connectingPayload = { status: 'connecting' };
+  mainWindow.webContents.send('meshtastic:status', connectingPayload);
+  lastMeshtasticStatus = connectingPayload;
+  webServer?.publishStatus(connectingPayload);
 
   client = new MeshtasticClient({
     host: options.host,
@@ -503,12 +580,14 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   client.on('connected', () => {
     const payload = { status: 'connected' };
     mainWindow?.webContents.send('meshtastic:status', payload);
+    lastMeshtasticStatus = payload;
     webServer?.publishStatus(payload);
   });
 
   client.on('disconnected', () => {
     const payload = { status: 'disconnected' };
     mainWindow?.webContents.send('meshtastic:status', payload);
+    lastMeshtasticStatus = payload;
     webServer?.publishStatus(payload);
   });
 
@@ -547,6 +626,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
       message: err.message
     };
     mainWindow?.webContents.send('meshtastic:status', payload);
+    lastMeshtasticStatus = payload;
     webServer?.publishStatus(payload);
   });
 
@@ -726,6 +806,19 @@ ipcMain.handle('telemetry:get-snapshot', async (_event, options = {}) => {
       updatedAt: Date.now(),
       nodes: []
     };
+  }
+});
+
+ipcMain.handle('telemetry:clear', async () => {
+  if (!bridge) {
+    return { success: false, error: 'bridge not initialised' };
+  }
+  try {
+    await bridge.clearTelemetryStore({ silent: false });
+    return { success: true };
+  } catch (err) {
+    console.error('清除遙測資料失敗:', err);
+    return { success: false, error: err.message };
   }
 });
 

@@ -48,6 +48,7 @@
 
       <nav class="main-nav">
         <button type="button" class="nav-btn active" data-target="summary-page">封包摘要</button>
+        <button type="button" class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
         <button type="button" class="nav-btn" data-target="telemetry-page">遙測數據</button>
         <button type="button" class="nav-btn" data-target="log-page">系統日誌</button>
       </nav>
@@ -112,6 +113,25 @@
               <tbody id="summary-table"></tbody>
             </table>
           </div>
+        </section>
+      </section>
+
+      <section id="flow-page" class="page">
+        <section class="flow-panel">
+          <header class="flow-header">
+            <h2>Mapping 封包追蹤</h2>
+            <p class="flow-hint">僅列出具 Mapping 資訊的位置封包；若已上傳 APRS 會顯示對應訊息。</p>
+            <div class="flow-search-row">
+              <input id="flow-search" type="search" placeholder="搜尋節點、呼號或註記" />
+              <select id="flow-filter-state">
+                <option value="all">全部封包</option>
+                <option value="aprs">已上傳 APRS</option>
+                <option value="pending">待上傳</option>
+              </select>
+            </div>
+          </header>
+          <div id="flow-empty-state" class="flow-empty">尚未收到符合條件的封包。</div>
+          <div id="flow-list" class="flow-list"></div>
         </section>
       </section>
 

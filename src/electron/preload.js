@@ -13,11 +13,6 @@ contextBridge.exposeInMainWorld('meshtastic', {
     ipcRenderer.on('meshtastic:summary', listener);
     return () => ipcRenderer.removeListener('meshtastic:summary', listener);
   },
-  onFromRadio: (callback) => {
-    const listener = (_event, data) => callback(data);
-    ipcRenderer.on('meshtastic:fromRadio', listener);
-    return () => ipcRenderer.removeListener('meshtastic:fromRadio', listener);
-  },
   onStatus: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('meshtastic:status', listener);
@@ -55,5 +50,7 @@ contextBridge.exposeInMainWorld('meshtastic', {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('telemetry:update', listener);
     return () => ipcRenderer.removeListener('telemetry:update', listener);
-  }
+  },
+  clearTelemetry: () => ipcRenderer.invoke('telemetry:clear'),
+  setWebDashboardEnabled: (enabled) => ipcRenderer.invoke('web:set-enabled', Boolean(enabled))
 });

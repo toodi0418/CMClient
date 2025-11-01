@@ -64,17 +64,12 @@ const monitorPage = document.getElementById('monitor-page');
 const settingsPage = document.getElementById('settings-page');
 const logPage = document.getElementById('log-page');
 const infoPage = document.getElementById('info-page');
-const jsonPage = document.getElementById('json-page');
 const flowPage = document.getElementById('flow-page');
 const flowList = document.getElementById('flow-list');
 const flowEmptyState = document.getElementById('flow-empty-state');
 const flowSearchInput = document.getElementById('flow-search');
 const flowFilterStateSelect = document.getElementById('flow-filter-state');
 const flowDownloadBtn = document.getElementById('flow-download-btn');
-const jsonList = document.getElementById('json-list');
-const jsonEmptyState = document.getElementById('json-empty-state');
-const jsonEntryCount = document.getElementById('json-entry-count');
-const jsonCopyBtn = document.getElementById('json-copy-btn');
 const telemetryPage = document.getElementById('telemetry-page');
 const telemetryNodeSelect = document.getElementById('telemetry-node-select');
 const telemetryUpdatedAtLabel = document.getElementById('telemetry-updated-at');
@@ -88,8 +83,10 @@ const telemetryRangeStartInput = document.getElementById('telemetry-range-start'
 const telemetryRangeEndInput = document.getElementById('telemetry-range-end');
 const telemetryChartModeSelect = document.getElementById('telemetry-chart-mode');
 const telemetryChartMetricSelect = document.getElementById('telemetry-chart-metric');
+const telemetryClearBtn = document.getElementById('telemetry-clear-btn');
 const aprsServerInput = document.getElementById('aprs-server');
 const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
+const webUiEnabledCheckbox = document.getElementById('web-ui-enabled');
 const resetDataBtn = document.getElementById('reset-data-btn');
 const copyLogBtn = document.getElementById('copy-log-btn');
 const downloadLogBtn = document.getElementById('download-log-btn');
@@ -160,19 +157,6 @@ let flowCaptureEnabledAt = 0;
 let totalAprsUploaded = 0;
 const aprsCompletedFlowIds = new Set();
 const aprsCompletedQueue = [];
-const JSON_MAX_ENTRIES = 300;
-const jsonEntries = [];
-const JSON_OMIT_KEYS = new Set([
-  'queueStatus',
-  'rxTime',
-  'rx_time',
-  'rxSnr',
-  'rx_snr',
-  'rxRssi',
-  'rx_rssi'
-]);
-let jsonEntrySequence = 0;
-
 const TELEMETRY_TABLE_LIMIT = 200;
 const TELEMETRY_CHART_LIMIT = 200;
 const TELEMETRY_MAX_LOCAL_RECORDS = 500;
@@ -614,12 +598,16 @@ function loadPreferences() {
       const normalized = Number.isFinite(minutes) && minutes >= 1 ? Math.min(Math.round(minutes), 1440) : DEFAULT_APRS_BEACON_MINUTES;
       aprsBeaconIntervalInput.value = String(normalized);
     }
+    if (webUiEnabledCheckbox) {
+      webUiEnabledCheckbox.checked = Boolean(saved.webDashboardEnabled);
+    }
   } catch (err) {
     console.warn('無法載入偏好設定:', err);
     if (settingsHostInput) settingsHostInput.value = '';
     if (overlayHostInput) overlayHostInput.value = '';
     if (aprsServerInput) aprsServerInput.value = DEFAULT_APRS_SERVER;
     if (aprsBeaconIntervalInput) aprsBeaconIntervalInput.value = String(DEFAULT_APRS_BEACON_MINUTES);
+    if (webUiEnabledCheckbox) webUiEnabledCheckbox.checked = false;
   }
 }
 
@@ -632,7 +620,8 @@ function savePreferences({ persist = true } = {}) {
     callmeshDegraded,
     lastVerifiedKey,
     aprsServer: aprsServerInput ? aprsServerInput.value.trim() || DEFAULT_APRS_SERVER : DEFAULT_APRS_SERVER,
-    aprsBeaconMinutes: getAprsBeaconMinutes()
+    aprsBeaconMinutes: getAprsBeaconMinutes(),
+    webDashboardEnabled: webUiEnabledCheckbox ? Boolean(webUiEnabledCheckbox.checked) : false
   };
   localStorage.setItem('meshtastic:preferences', JSON.stringify(data));
   if (persist) {
@@ -657,12 +646,23 @@ async function hydratePreferencesFromMain() {
     if (!preferences || typeof preferences !== 'object') {
       return;
     }
+    let shouldPersist = false;
     const host = typeof preferences.host === 'string' ? preferences.host.trim() : '';
     if (host && getHostValue() !== host) {
       settingsHostInput.value = host;
       if (overlayHostInput) {
         overlayHostInput.value = host;
       }
+      shouldPersist = true;
+    }
+    if (webUiEnabledCheckbox && Object.prototype.hasOwnProperty.call(preferences, 'webDashboardEnabled')) {
+      const desired = Boolean(preferences.webDashboardEnabled);
+      if (webUiEnabledCheckbox.checked !== desired) {
+        webUiEnabledCheckbox.checked = desired;
+        shouldPersist = true;
+      }
+    }
+    if (shouldPersist) {
       savePreferences({ persist: false });
     }
   } catch (err) {
@@ -712,8 +712,6 @@ async function bootstrap() {
   clearSelfNodeDisplay();
   appendLog('APP', 'TMAG monitor initialized.');
   updateDashboardCounters();
-  updateJsonCounter();
-  updateJsonEmptyState();
   await initializeTelemetry();
   setTelemetryRangeMode(telemetryRangeMode, { skipRender: true });
   setTelemetryChartMode(telemetryChartMode, { skipRender: true });
@@ -889,6 +887,35 @@ aprsBeaconIntervalInput?.addEventListener('change', () => {
   appendLog('APRS', `beacon interval set to ${minutes} 分鐘`);
 });
 
+webUiEnabledCheckbox?.addEventListener('change', async () => {
+  if (!window.meshtastic.setWebDashboardEnabled) {
+    appendLog('APP', '目前無法切換 Web UI：功能未初始化');
+    if (webUiEnabledCheckbox) {
+      webUiEnabledCheckbox.checked = !webUiEnabledCheckbox.checked;
+    }
+    return;
+  }
+  const checkbox = webUiEnabledCheckbox;
+  const enabled = Boolean(checkbox.checked);
+  const previous = !enabled;
+  checkbox.disabled = true;
+  savePreferences({ persist: false });
+  try {
+    const result = await window.meshtastic.setWebDashboardEnabled(enabled);
+    if (result && result.success === false) {
+      throw new Error(result.error || 'unknown error');
+    }
+    appendLog('APP', enabled ? 'Web UI 已啟用' : 'Web UI 已停用');
+  } catch (err) {
+    console.error('切換 Web UI 失敗:', err);
+    appendLog('APP', `切換 Web UI 失敗: ${err.message || err}`);
+    checkbox.checked = previous;
+    savePreferences({ persist: false });
+  } finally {
+    checkbox.disabled = false;
+  }
+});
+
 resetDataBtn?.addEventListener('click', async () => {
   if (!window.confirm('確定要清除所有本地資料與 API Key 嗎？')) {
     return;
@@ -976,18 +1003,24 @@ downloadLogBtn?.addEventListener('click', () => {
   appendLog('APP', '日誌已下載');
 });
 
-jsonCopyBtn?.addEventListener('click', async () => {
-  if (!jsonEntries.length) {
-    appendLog('APP', '目前尚無可複製的 JSON 紀錄');
+telemetryClearBtn?.addEventListener('click', async () => {
+  if (!window.meshtastic.clearTelemetry) {
+    appendLog('APP', '目前無法清空遙測資料：功能未初始化');
     return;
   }
+  const button = telemetryClearBtn;
+  button.disabled = true;
   try {
-    const exportPayload = jsonEntries.map((entry) => entry.data);
-    await navigator.clipboard.writeText(JSON.stringify(exportPayload, null, 2));
-    appendLog('APP', `已將 ${exportPayload.length} 筆 JSON 紀錄複製到剪貼簿`);
+    const result = await window.meshtastic.clearTelemetry();
+    if (result && result.success === false) {
+      throw new Error(result.error || 'unknown error');
+    }
+    appendLog('APP', '已清空遙測資料');
   } catch (err) {
-    console.error('複製 JSON 紀錄失敗:', err);
-    appendLog('APP', `複製 JSON 紀錄失敗: ${err.message || err}`);
+    console.error('清空遙測資料失敗:', err);
+    appendLog('APP', `清空遙測資料失敗: ${err.message || err}`);
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -1123,10 +1156,6 @@ const unsubscribeSummary = window.meshtastic.onSummary((summary) => {
   appendSummaryRow(summary);
 });
 
-const unsubscribeRaw = window.meshtastic.onFromRadio?.((message) => {
-  handleRawMessage(message);
-});
-
 const unsubscribeStatus = window.meshtastic.onStatus((info) => {
   appendLog('STATUS', `status=${info.status}${info.message ? ` message=${info.message}` : ''}`);
   updateStatus(info.status, info.message, info.nonce);
@@ -1172,7 +1201,6 @@ const unsubscribeTelemetry = window.meshtastic.onTelemetry?.((payload) => {
 
 window.addEventListener('beforeunload', () => {
   unsubscribeSummary();
-  unsubscribeRaw?.();
   unsubscribeStatus();
   unsubscribeCallMeshStatus?.();
   unsubscribeCallMeshLog?.();
@@ -1364,109 +1392,6 @@ function clearPacketFlowData() {
   if (flowSearchInput) flowSearchInput.value = '';
   renderFlowEntries();
   updateDashboardCounters();
-  clearJsonEntries();
-}
-
-function clearJsonEntries() {
-  jsonEntries.length = 0;
-  if (jsonList) {
-    while (jsonList.firstChild) {
-      jsonList.removeChild(jsonList.firstChild);
-    }
-  }
-  updateJsonCounter();
-  updateJsonEmptyState();
-}
-
-function handleRawMessage(message) {
-  if (!message) return;
-  if (!isDecodedPacketMessage(message)) {
-    return;
-  }
-  if (isMessageFromSelf(message)) {
-    return;
-  }
-  appendJsonEntry(message);
-}
-
-function appendJsonEntry(message) {
-  const sanitized = sanitizeMessageForJson(message);
-  const meta = extractJsonMetadata(message);
-  const entryData = {
-    hash: meta.hash,
-    fromMeshId: meta.fromMeshId,
-    relayMeshId: meta.relayMeshId,
-    relayLabel: meta.relayLabel,
-    hopsUsed: meta.hopsUsed,
-    hopsTotal: meta.hopsTotal,
-    rssi: meta.rssi,
-    snr: meta.snr,
-    payload: meta.payload,
-    packet: sanitized?.packet ?? null,
-    message: sanitized
-  };
-  const entry = {
-    id: `json-${jsonEntrySequence++}`,
-    data: entryData
-  };
-  jsonEntries.unshift(entry);
-
-  if (jsonList) {
-    const fragment = document.createDocumentFragment();
-    fragment.appendChild(renderJsonEntry(entry));
-    jsonList.prepend(fragment);
-  }
-
-  while (jsonEntries.length > JSON_MAX_ENTRIES) {
-    const removed = jsonEntries.pop();
-    if (!removed) break;
-    if (jsonList) {
-      const node = jsonList.querySelector(`[data-entry-id="${removed.id}"]`);
-      if (node) {
-        jsonList.removeChild(node);
-      }
-    }
-  }
-
-  updateJsonCounter();
-  updateJsonEmptyState();
-}
-
-function renderJsonEntry(entry) {
-  const wrapper = document.createElement('article');
-  wrapper.className = 'json-entry';
-  wrapper.dataset.entryId = entry.id;
-
-  const data = entry.data;
-  const header = document.createElement('div');
-  header.className = 'json-entry-meta';
-  const metaParts = [];
-  const relayLabel = data.relayLabel || '直收';
-  metaParts.push(`最後一跳 ${relayLabel}`);
-  if (Number.isFinite(data.hopsUsed)) {
-    metaParts.push(`目前 ${data.hopsUsed} 跳`);
-  } else {
-    metaParts.push('目前 跳數未知');
-  }
-  if (Number.isFinite(data.hopsTotal)) {
-    metaParts.push(`總共 ${data.hopsTotal} 跳`);
-  } else {
-    metaParts.push('總共 跳數未知');
-  }
-  if (Number.isFinite(data.rssi)) {
-    metaParts.push(`RSSI ${data.rssi} dBm`);
-  }
-  if (Number.isFinite(data.snr)) {
-    metaParts.push(`SNR ${data.snr.toFixed(2)} dB`);
-  }
-  header.textContent = metaParts.join(' • ');
-
-  const body = document.createElement('pre');
-  body.className = 'json-entry-body';
-  body.textContent = JSON.stringify(data, null, 2);
-
-  wrapper.append(header, body);
-  return wrapper;
 }
 
 function extractMessageMeshId(message) {
@@ -1489,162 +1414,6 @@ function meshIdFromNumeric(value) {
   const unsigned = num >>> 0;
   const hex = unsigned.toString(16).padStart(8, '0');
   return `!${hex}`;
-}
-
-function extractJsonMetadata(message) {
-  const packet = message?.packet || {};
-  const fromMeshId = extractMessageMeshId(message);
-  const payload =
-    typeof packet?.decoded?.payload === 'string' ? packet.decoded.payload : null;
-  const relayInfo = resolveRelayInfo(packet);
-  const hopStats = computeHopStats(packet);
-  const hash = computePacketHash(packet, {
-    fromMeshId,
-    payload,
-    hopsUsed: hopStats.used,
-    hopsTotal: hopStats.total
-  });
-  return {
-    fromMeshId,
-    relayMeshId: relayInfo.meshId,
-    relayLabel: relayInfo.label,
-    hopsUsed: hopStats.used,
-    hopsTotal: hopStats.total,
-    rssi: Number.isFinite(packet.rxRssi) ? Number(packet.rxRssi) : null,
-    snr: Number.isFinite(packet.rxSnr) ? Number(packet.rxSnr) : null,
-    payload,
-    hash
-  };
-}
-
-function resolveRelayInfo(packet) {
-  const relayNode = packet?.relayNode;
-  if (!Number.isFinite(relayNode) || relayNode === 0) {
-    return { label: '直收', meshId: null };
-  }
-  const meshId = meshIdFromNumeric(relayNode);
-  if (!meshId) {
-    return { label: '未知節點', meshId: null };
-  }
-  const normalized = normalizeMeshId(meshId);
-  if (isSelfMeshId(meshId)) {
-    return { label: '本站節點', meshId: normalized };
-  }
-  return {
-    label: normalized.toUpperCase(),
-    meshId: normalized
-  };
-}
-
-function computeHopStats(packet) {
-  const hopStart = Number(packet?.hopStart);
-  const hopLimit = Number(packet?.hopLimit);
-  let used = null;
-  if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
-    used = Math.max(hopStart - hopLimit, 0);
-  }
-  const total = Number.isFinite(hopStart)
-    ? hopStart
-    : Number.isFinite(hopLimit)
-      ? hopLimit
-      : null;
-  return { used, total };
-}
-
-function computePacketHash(packet, context = {}) {
-  const rawFrom = context.fromMeshId || meshIdFromNumeric(packet?.from) || '';
-  const fromMeshId = rawFrom ? normalizeMeshId(rawFrom) : '';
-  const payload = context.payload || '';
-  const idPart = Number.isFinite(packet?.id) ? String(packet.id >>> 0) : '';
-  const timePart = Number.isFinite(packet?.rxTime) ? String(packet.rxTime >>> 0) : '';
-  const usedHop = Number.isFinite(context.hopsUsed) ? String(context.hopsUsed) : '';
-  const totalHop = Number.isFinite(context.hopsTotal) ? String(context.hopsTotal) : '';
-  const raw = `${fromMeshId}|${payload}|${idPart}|${timePart}|${usedHop}|${totalHop}`;
-  return fnv1aHash(raw).toUpperCase();
-}
-
-function fnv1aHash(input) {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
-}
-
-function isMessageFromSelf(message) {
-  const meshId = extractMessageMeshId(message);
-  if (!meshId) return false;
-  return isSelfMeshId(meshId);
-}
-
-function pruneJsonEntriesForSelf() {
-  const meshId = selfNodeState?.normalizedMeshId;
-  if (!meshId || !jsonEntries.length) {
-    return;
-  }
-  let removedAny = false;
-  for (let i = jsonEntries.length - 1; i >= 0; i -= 1) {
-    const entry = jsonEntries[i];
-    const entryMesh = entry.data?.fromMeshId;
-    if (entryMesh && entryMesh === meshId) {
-      const [removed] = jsonEntries.splice(i, 1);
-      removedAny = true;
-      if (removed && jsonList) {
-        const node = jsonList.querySelector(`[data-entry-id="${removed.id}"]`);
-        node?.remove();
-      }
-    }
-  }
-  if (removedAny) {
-    updateJsonCounter();
-    updateJsonEmptyState();
-  }
-}
-
-function updateJsonCounter() {
-  if (!jsonEntryCount) return;
-  jsonEntryCount.textContent = `共 ${jsonEntries.length} 筆`;
-}
-
-function updateJsonEmptyState() {
-  if (!jsonEmptyState || !jsonList) return;
-  const hasEntries = jsonEntries.length > 0;
-  jsonEmptyState.classList.toggle('hidden', hasEntries);
-  jsonList.classList.toggle('hidden', !hasEntries);
-}
-
-function sanitizeMessageForJson(value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeMessageForJson(item));
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-  const result = {};
-  for (const [key, original] of Object.entries(value)) {
-    if (JSON_OMIT_KEYS.has(key)) {
-      continue;
-    }
-    result[key] = sanitizeMessageForJson(original);
-  }
-  return result;
-}
-
-function isDecodedPacketMessage(message) {
-  if (!message || message.payloadVariant !== 'packet') {
-    return false;
-  }
-  const packet = message.packet;
-  if (!packet || packet.payloadVariant !== 'decoded') {
-    return false;
-  }
-  const decoded = packet.decoded;
-  if (!decoded || typeof decoded !== 'object') {
-    return false;
-  }
-  const payload = decoded.payload;
-  return typeof payload === 'string' && payload.length > 0;
 }
 
 function registerPacketFlow(summary, { skipPending = false } = {}) {
@@ -3441,7 +3210,6 @@ function activatePage(targetId) {
     { id: 'monitor-page', element: monitorPage },
     { id: 'telemetry-page', element: telemetryPage },
     { id: 'flow-page', element: flowPage },
-    { id: 'json-page', element: jsonPage },
     { id: 'settings-page', element: settingsPage },
     { id: 'log-page', element: logPage },
     { id: 'info-page', element: infoPage }
@@ -4093,7 +3861,6 @@ function handleSelfInfoEvent(info) {
     selfNodeState.name = name;
   }
   applySelfNodeDisplay();
-  pruneJsonEntriesForSelf();
   appendLog('SELF', `myInfo meshId=${selfNodeState.meshId || 'unknown'} name=${selfNodeState.name || 'unknown'}`);
 }
 
@@ -4143,7 +3910,6 @@ function maybeUpdateSelfNodeFromSummary(summary) {
   }
 
   applySelfNodeDisplay();
-  pruneJsonEntriesForSelf();
   if (updated) {
     appendLog('SELF', `updated from packet meshId=${selfNodeState.meshId || 'unknown'} name=${selfNodeState.name || 'unknown'}`);
   }

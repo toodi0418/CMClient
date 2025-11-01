@@ -19,7 +19,6 @@
         <button class="nav-btn active" data-target="monitor-page">監視</button>
         <button class="nav-btn" data-target="telemetry-page">遙測數據</button>
         <button class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
-        <button class="nav-btn" data-target="json-page">JSON 檢視</button>
         <button class="nav-btn" data-target="settings-page">設定</button>
         <button class="nav-btn" data-target="info-page">資訊</button>
         <button class="nav-btn" data-target="log-page">Log</button>
@@ -114,6 +113,11 @@
               <span class="label">更新：</span>
               <span id="telemetry-updated-at">—</span>
             </div>
+            <div class="telemetry-actions">
+              <button type="button" id="telemetry-clear-btn" class="danger-btn slim">
+                清空遙測數據
+              </button>
+            </div>
           </header>
           <div id="telemetry-empty-state" class="telemetry-empty">尚未收到遙測資料。</div>
           <section id="telemetry-charts" class="telemetry-charts hidden"></section>
@@ -168,6 +172,13 @@
             <input id="aprs-beacon-interval" type="number" min="1" max="1440" value="10" />
             <small class="callmesh-hint">預設每 10 分鐘發送一次，可調整為 1-1440 分鐘</small>
           </div>
+          <div class="fieldset">
+            <label class="toggle-row">
+              <input id="web-ui-enabled" type="checkbox" />
+              <span>啟用 Web UI</span>
+            </label>
+            <small class="callmesh-hint">預設關閉，啟用後會啟動內建 Web Dashboard</small>
+          </div>
           <button type="button" id="reset-data-btn" class="danger-btn">重置所有資料</button>
         </section>
       </section>
@@ -215,21 +226,6 @@
           </header>
           <div id="flow-empty-state" class="flow-empty-state">尚未收到封包。</div>
           <div id="flow-list" class="flow-items hidden"></div>
-        </section>
-      </section>
-
-      <section id="json-page" class="page hidden">
-        <section class="json-panel">
-          <header class="json-header">
-            <h2>JSON 資料流</h2>
-            <p class="json-hint">即時顯示所有收到的 Meshtastic 封包（排除本站節點）。</p>
-            <div class="json-toolbar">
-              <span id="json-entry-count" class="json-counter">共 0 筆</span>
-              <button type="button" id="json-copy-btn" class="copy-log-btn">複製 JSON</button>
-            </div>
-          </header>
-          <div id="json-empty-state" class="json-empty-state">尚未收到任何封包。</div>
-          <div id="json-list" class="json-list hidden"></div>
         </section>
       </section>
 
