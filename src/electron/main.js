@@ -223,6 +223,13 @@ function sendAprsUplink(info) {
   webServer?.publishAprs(info);
 }
 
+function sendTelemetryUpdate(payload) {
+  if (!payload) return;
+  if (mainWindow) {
+    mainWindow.webContents.send('telemetry:update', payload);
+  }
+}
+
 async function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -249,6 +256,7 @@ function setupBridgeListeners() {
   bridge.removeAllListeners('state');
   bridge.removeAllListeners('log');
   bridge.removeAllListeners('aprs-uplink');
+  bridge.removeAllListeners('telemetry');
 
   bridge.on('state', (state) => {
     lastCallmeshStateSnapshot = state;
@@ -261,6 +269,10 @@ function setupBridgeListeners() {
 
   bridge.on('aprs-uplink', (info) => {
     sendAprsUplink(info);
+  });
+
+  bridge.on('telemetry', (payload) => {
+    sendTelemetryUpdate(payload);
   });
 }
 
@@ -674,6 +686,27 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
 ipcMain.handle('callmesh:get-status', async () => {
   lastCallmeshStateSnapshot = bridge?.getStateSnapshot() ?? lastCallmeshStateSnapshot;
   return buildCallmeshSummary();
+});
+
+ipcMain.handle('telemetry:get-snapshot', async (_event, options = {}) => {
+  if (!bridge) {
+    return {
+      updatedAt: Date.now(),
+      nodes: []
+    };
+  }
+  try {
+    const limit = Number.isFinite(options?.limitPerNode) ? options.limitPerNode : undefined;
+    return bridge.getTelemetrySnapshot({
+      limitPerNode: limit
+    });
+  } catch (err) {
+    console.error('取得遙測快照失敗:', err);
+    return {
+      updatedAt: Date.now(),
+      nodes: []
+    };
+  }
 });
 
 ipcMain.handle('callmesh:reset', async () => {

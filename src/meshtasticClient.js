@@ -445,6 +445,7 @@ class MeshtasticClient extends EventEmitter {
       relay: relayInfo,
       nextHop: nextHopInfo,
       position: decodeInfo?.position || null,
+      telemetry: decodeInfo?.telemetry || null,
       rawHex,
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
@@ -562,40 +563,65 @@ class MeshtasticClient extends EventEmitter {
           }
           return { type: 'Routing' };
         }
-      case 'TELEMETRY_APP': {
-        const message = this.types.telemetry.decode(payload);
-        const telemetry = this.types.telemetry.toObject(message, TO_OBJECT_OPTIONS);
-        if (telemetry.deviceMetrics) {
-            const metrics = telemetry.deviceMetrics;
+        case 'TELEMETRY_APP': {
+          const message = this.types.telemetry.decode(payload);
+          const telemetry = this.types.telemetry.toObject(message, TO_OBJECT_OPTIONS);
+          const telemetryInfo = buildTelemetryInfo(telemetry);
+          if (telemetry.deviceMetrics) {
+            const metrics = telemetryInfo?.metrics || telemetry.deviceMetrics;
             const parts = [];
-            if (metrics.batteryLevel != null) parts.push(`battery ${metrics.batteryLevel}%`);
-            if (metrics.voltage != null) parts.push(`${metrics.voltage.toFixed(2)}V`);
-            if (metrics.channelUtilization != null) {
-              const formatted = formatPercent(metrics.channelUtilization);
+            const batt = metrics.batteryLevel;
+            if (batt != null && Number.isFinite(Number(batt))) {
+              parts.push(`battery ${Number(batt).toFixed(0)}%`);
+            }
+            const voltage = metrics.voltage;
+            if (voltage != null && Number.isFinite(Number(voltage))) {
+              parts.push(`${Number(voltage).toFixed(2)}V`);
+            }
+            const cu = metrics.channelUtilization;
+            if (cu != null) {
+              const formatted = formatPercent(cu);
               if (formatted) {
                 parts.push(`CU ${formatted}`);
               }
             }
-            if (metrics.airUtilTx != null) {
-              const formatted = formatPercent(metrics.airUtilTx);
+            const air = metrics.airUtilTx;
+            if (air != null) {
+              const formatted = formatPercent(air);
               if (formatted) {
                 parts.push(`AirTx ${formatted}`);
               }
             }
-            if (metrics.uptimeSeconds != null) {
-              parts.push(`uptime ${formatDuration(metrics.uptimeSeconds)}`);
+            const uptime = metrics.uptimeSeconds ?? metrics.uptime;
+            if (uptime != null && Number.isFinite(Number(uptime))) {
+              parts.push(`uptime ${formatDuration(Number(uptime))}`);
             }
-            return { type: 'Telemetry', details: parts.join(' ') };
+            return { type: 'Telemetry', details: parts.join(' '), telemetry: telemetryInfo };
           }
           if (telemetry.environmentMetrics) {
-            const env = telemetry.environmentMetrics;
+            const metrics = telemetryInfo?.metrics || telemetry.environmentMetrics;
             const parts = [];
-            if (env.temperature != null) parts.push(`${env.temperature.toFixed(1)}°C`);
-            if (env.relativeHumidity != null) parts.push(`RH ${env.relativeHumidity.toFixed(0)}%`);
-            if (env.barometricPressure != null) {
-              parts.push(`${env.barometricPressure.toFixed(1)}hPa`);
+            const temperature = metrics.temperature;
+            if (temperature != null && Number.isFinite(Number(temperature))) {
+              parts.push(`${Number(temperature).toFixed(1)}°C`);
             }
-            return { type: 'EnvTelemetry', details: parts.join(' ') };
+            const humidity = metrics.relativeHumidity ?? metrics.humidity;
+            if (humidity != null && Number.isFinite(Number(humidity))) {
+              parts.push(`RH ${Number(humidity).toFixed(0)}%`);
+            }
+            const pressure = metrics.barometricPressure ?? metrics.pressure;
+            if (pressure != null && Number.isFinite(Number(pressure))) {
+              parts.push(`${Number(pressure).toFixed(1)}hPa`);
+            }
+            return { type: 'EnvTelemetry', details: parts.join(' '), telemetry: telemetryInfo };
+          }
+          if (telemetryInfo) {
+            const detail = formatGenericTelemetryDetail(telemetryInfo);
+            return {
+              type: 'Telemetry',
+              details: detail,
+              telemetry: telemetryInfo
+            };
           }
           return { type: 'Telemetry' };
         }
@@ -976,6 +1002,140 @@ function formatPercent(value) {
     return `${num.toFixed(2)}%`;
   }
   return `${num.toFixed(3)}%`;
+}
+
+function formatMetricNumber(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return null;
+  }
+  const abs = Math.abs(num);
+  if (abs >= 100) {
+    return num.toFixed(0);
+  }
+  if (abs >= 10) {
+    return num.toFixed(1);
+  }
+  if (abs >= 1) {
+    return num.toFixed(2);
+  }
+  return num.toFixed(3);
+}
+
+function normalizeTelemetryValue(value) {
+  if (value == null) {
+    return null;
+  }
+  if (Buffer.isBuffer(value)) {
+    return null;
+  }
+  if (Array.isArray(value)) {
+    const mapped = value
+      .map((item) => normalizeTelemetryValue(item))
+      .filter((item) => item != null);
+    return mapped.length ? mapped : null;
+  }
+  if (typeof value === 'object') {
+    const nested = {};
+    for (const [key, nestedValue] of Object.entries(value)) {
+      const normalized = normalizeTelemetryValue(nestedValue);
+      if (normalized != null) {
+        nested[key] = normalized;
+      }
+    }
+    return Object.keys(nested).length ? nested : null;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric;
+  }
+  return String(value);
+}
+
+function sanitizeTelemetryMetrics(input) {
+  if (!input || typeof input !== 'object') {
+    return {};
+  }
+  const result = {};
+  for (const [key, value] of Object.entries(input)) {
+    const normalized = normalizeTelemetryValue(value);
+    if (normalized != null) {
+      result[key] = normalized;
+    }
+  }
+  return result;
+}
+
+function buildTelemetryInfo(telemetry) {
+  if (!telemetry || typeof telemetry !== 'object') {
+    return null;
+  }
+  const timeSeconds = Number.isFinite(telemetry.time) ? Number(telemetry.time) : null;
+  const timeMs = timeSeconds != null ? timeSeconds * 1000 : null;
+  const variants = [
+    ['deviceMetrics', 'device'],
+    ['environmentMetrics', 'environment'],
+    ['airQualityMetrics', 'airQuality'],
+    ['powerMetrics', 'power'],
+    ['localStats', 'local'],
+    ['healthMetrics', 'health'],
+    ['hostMetrics', 'host']
+  ];
+  for (const [key, kind] of variants) {
+    const metrics = telemetry[key];
+    if (metrics && typeof metrics === 'object') {
+      return {
+        kind,
+        timeSeconds,
+        timeMs,
+        metrics: sanitizeTelemetryMetrics(metrics)
+      };
+    }
+  }
+  if (timeMs != null) {
+    return {
+      kind: 'unknown',
+      timeSeconds,
+      timeMs,
+      metrics: {}
+    };
+  }
+  return null;
+}
+
+function formatGenericTelemetryDetail(info) {
+  if (!info || !info.metrics) {
+    return '';
+  }
+  const parts = [];
+  for (const [key, value] of Object.entries(info.metrics)) {
+    if (value == null) continue;
+    if (typeof value === 'number') {
+      const numLabel = formatMetricNumber(value);
+      if (numLabel != null) {
+        parts.push(`${key} ${numLabel}`);
+      } else {
+        parts.push(`${key} ${value}`);
+      }
+    } else if (typeof value === 'boolean') {
+      parts.push(`${key} ${value ? 'true' : 'false'}`);
+    } else if (typeof value === 'string') {
+      parts.push(`${key} ${value}`);
+    } else {
+      parts.push(`${key}=${JSON.stringify(value)}`);
+    }
+  }
+  return parts.join(' ');
 }
 
 function framePacket(payload) {

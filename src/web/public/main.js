@@ -209,18 +209,37 @@
     return nameText;
   }
 
+  function getDetailExtraSegments(summary) {
+    if (!summary || !Array.isArray(summary.extraLines) || !summary.extraLines.length) {
+      return [];
+    }
+    return summary.extraLines
+      .map((line) => {
+        if (line === null || line === undefined) return '';
+        const text = String(line).trim();
+        return text ? `<span class="detail-extra">${escapeHtml(text)}</span>` : '';
+      })
+      .filter(Boolean);
+  }
+
   function formatDetail(summary) {
     const detail = summary.detail || '';
-    const safeDetail = detail ? escapeHtml(detail) : '';
+    const segments = [];
+    if (detail) {
+      segments.push(escapeHtml(detail));
+    }
+    const extraSegments = getDetailExtraSegments(summary);
+    if (extraSegments.length) {
+      segments.push(...extraSegments);
+    }
     const distanceLabel = formatDistance(summary);
     if (distanceLabel) {
-      const safeDistance = escapeHtml(distanceLabel);
-      if (safeDetail) {
-        return `${safeDetail}<br/><span class="detail-distance">${safeDistance}</span>`;
-      }
-      return `<span class="detail-distance">${safeDistance}</span>`;
+      segments.push(`<span class="detail-distance">${escapeHtml(distanceLabel)}</span>`);
     }
-    return safeDetail;
+    if (!segments.length) {
+      return '';
+    }
+    return segments.join('<br/>');
   }
 
   function formatDistance(summary) {

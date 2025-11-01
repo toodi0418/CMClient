@@ -49,5 +49,11 @@ contextBridge.exposeInMainWorld('meshtastic', {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('meshtastic:aprs-uplink', listener);
     return () => ipcRenderer.removeListener('meshtastic:aprs-uplink', listener);
+  },
+  getTelemetrySnapshot: (options) => ipcRenderer.invoke('telemetry:get-snapshot', options),
+  onTelemetry: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('telemetry:update', listener);
+    return () => ipcRenderer.removeListener('telemetry:update', listener);
   }
 });

@@ -278,6 +278,13 @@ tbody tr:hover {
   font-size: 0.8rem;
 }
 
+.info-cell .detail-extra {
+  display: block;
+  margin-top: 4px;
+  color: #cbd5f5;
+  font-size: 0.8rem;
+}
+
 .info-cell .aprs-badge {
   margin-top: 4px;
   display: inline-block;
