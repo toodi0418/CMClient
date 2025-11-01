@@ -570,6 +570,18 @@ class MeshtasticClient extends EventEmitter {
             const parts = [];
             if (metrics.batteryLevel != null) parts.push(`battery ${metrics.batteryLevel}%`);
             if (metrics.voltage != null) parts.push(`${metrics.voltage.toFixed(2)}V`);
+            if (metrics.channelUtilization != null) {
+              const formatted = formatPercent(metrics.channelUtilization);
+              if (formatted) {
+                parts.push(`CU ${formatted}`);
+              }
+            }
+            if (metrics.airUtilTx != null) {
+              const formatted = formatPercent(metrics.airUtilTx);
+              if (formatted) {
+                parts.push(`AirTx ${formatted}`);
+              }
+            }
             if (metrics.uptimeSeconds != null) {
               parts.push(`uptime ${formatDuration(metrics.uptimeSeconds)}`);
             }
@@ -946,6 +958,24 @@ function formatDuration(seconds) {
     return `${m}m${s}s`;
   }
   return `${s}s`;
+}
+
+function formatPercent(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return null;
+  }
+  const abs = Math.abs(num);
+  if (abs >= 100) {
+    return `${num.toFixed(0)}%`;
+  }
+  if (abs >= 10) {
+    return `${num.toFixed(1)}%`;
+  }
+  if (abs >= 1) {
+    return `${num.toFixed(2)}%`;
+  }
+  return `${num.toFixed(3)}%`;
 }
 
 function framePacket(payload) {
