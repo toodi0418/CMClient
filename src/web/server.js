@@ -11,6 +11,47 @@ const PACKET_BUCKET_MS = 60 * 1000;
 const MAX_SUMMARY_ROWS = 200;
 const MAX_LOG_ENTRIES = 200;
 const APRS_HISTORY_MAX = 5000;
+const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
+
+function cloneJson(value) {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof structuredClone === 'function') {
+    try {
+      return structuredClone(value);
+    } catch {
+      // fall through to JSON fallback
+    }
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function sanitizeTelemetryNode(node) {
+  if (!node || typeof node !== 'object') {
+    return null;
+  }
+  return {
+    label: node.label ?? null,
+    meshId: node.meshId ?? null,
+    meshIdNormalized: node.meshIdNormalized ?? null,
+    shortName: node.shortName ?? null,
+    longName: node.longName ?? null,
+    hwModel: node.hwModel ?? null,
+    role: node.role ?? null
+  };
+}
+
+function sanitizeTelemetryRecord(record) {
+  if (!record || typeof record !== 'object') {
+    return null;
+  }
+  const metrics = record.telemetry?.metrics;
+  if (!metrics || typeof metrics !== 'object' || !Object.keys(metrics).length) {
+    return null;
+  }
+  return cloneJson(record);
+}
 
 const FALLBACK_VERSION = (() => {
   try {
@@ -54,6 +95,13 @@ class WebDashboardServer {
     this.aprsFlowIds = new Set();
     this.aprsFlowQueue = [];
     this.lastAppInfo = this.appVersion ? { version: this.appVersion } : null;
+    this.telemetryMaxPerNode =
+      Number.isFinite(options.telemetryMaxPerNode) && options.telemetryMaxPerNode > 0
+        ? Math.floor(options.telemetryMaxPerNode)
+        : DEFAULT_TELEMETRY_MAX_PER_NODE;
+    this.telemetryStore = new Map();
+    this.telemetryRecordIds = new Set();
+    this.telemetryUpdatedAt = null;
   }
 
   async start() {
@@ -129,18 +177,17 @@ class WebDashboardServer {
 
   publishCallmesh(info) {
     if (!info) return;
-    this.lastCallmesh = info;
-    if (Array.isArray(info.mappingItems)) {
-      const unique = new Set(
-        info.mappingItems
-          .map((item) => normalizeMeshId(item?.mesh_id ?? item?.meshId))
-          .filter(Boolean)
-      );
-      this.metrics.mappingCount = unique.size;
-    } else {
-      this.metrics.mappingCount = 0;
-    }
-    this._broadcast({ type: 'callmesh', payload: info });
+    const sanitized = sanitizeCallmeshPayload(info);
+    if (!sanitized) return;
+    this.lastCallmesh = sanitized;
+    const mappingItems = Array.isArray(sanitized.mappingItems) ? sanitized.mappingItems : [];
+    const unique = new Set(
+      mappingItems
+        .map((item) => normalizeMeshId(item?.mesh_id))
+        .filter(Boolean)
+    );
+    this.metrics.mappingCount = unique.size;
+    this._broadcast({ type: 'callmesh', payload: sanitized });
     this._broadcastMetrics();
   }
 
@@ -153,6 +200,84 @@ class WebDashboardServer {
     this._broadcast({ type: 'aprs', payload: this.lastAprsInfo });
     this._updateAprsMetrics(info);
     this._broadcastMetrics();
+  }
+
+  publishTelemetry(payload) {
+    if (!payload || !payload.type) {
+      return;
+    }
+    if (payload.type === 'reset') {
+      this.telemetryStore.clear();
+      this.telemetryRecordIds.clear();
+      this.telemetryUpdatedAt =
+        Number.isFinite(payload.updatedAt) && payload.updatedAt > 0
+          ? Number(payload.updatedAt)
+          : Date.now();
+      this._broadcast({
+        type: 'telemetry-reset',
+        payload: { updatedAt: this.telemetryUpdatedAt }
+      });
+      return;
+    }
+    if (payload.type !== 'append') {
+      return;
+    }
+    const meshId = payload.meshId || payload.record?.meshId;
+    const record = sanitizeTelemetryRecord(payload.record);
+    if (!meshId || !record) {
+      return;
+    }
+    if (record.id && this.telemetryRecordIds.has(record.id)) {
+      return;
+    }
+    const nodeInfo = sanitizeTelemetryNode(payload.node) || sanitizeTelemetryNode(record.node);
+    this._appendTelemetryRecord(meshId, nodeInfo, record);
+    this.telemetryUpdatedAt =
+      Number.isFinite(payload.updatedAt) && payload.updatedAt > 0
+        ? Number(payload.updatedAt)
+        : Date.now();
+    this._broadcast({
+      type: 'telemetry-append',
+      payload: {
+        meshId,
+        node: nodeInfo,
+        record,
+        updatedAt: this.telemetryUpdatedAt
+      }
+    });
+  }
+
+  seedTelemetrySnapshot(snapshot = {}) {
+    this.telemetryStore.clear();
+    this.telemetryRecordIds.clear();
+
+    const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
+    for (const node of nodes) {
+      const meshId = node?.meshId;
+      if (!meshId) continue;
+      const nodeInfo = sanitizeTelemetryNode(node.node);
+      const records = Array.isArray(node.records) ? node.records : [];
+      for (const record of records) {
+        const sanitized = sanitizeTelemetryRecord(record);
+        if (!sanitized) continue;
+        if (sanitized.id && this.telemetryRecordIds.has(sanitized.id)) {
+          continue;
+        }
+        this._appendTelemetryRecord(meshId, nodeInfo, sanitized);
+      }
+    }
+
+    this.telemetryUpdatedAt =
+      Number.isFinite(snapshot.updatedAt) && snapshot.updatedAt > 0
+        ? Number(snapshot.updatedAt)
+        : this.telemetryUpdatedAt ?? Date.now();
+
+    if (this.clients.size) {
+      this._broadcast({
+        type: 'telemetry-snapshot',
+        payload: this._buildTelemetrySnapshot()
+      });
+    }
   }
 
   publishSelf(info) {
@@ -292,6 +417,88 @@ class WebDashboardServer {
     if (this.lastAprsInfo) {
       this._write(res, { type: 'aprs', payload: this.lastAprsInfo });
     }
+    this._write(res, {
+      type: 'telemetry-snapshot',
+      payload: this._buildTelemetrySnapshot()
+    });
+  }
+
+  _appendTelemetryRecord(meshId, node, record) {
+    if (!meshId || !record) {
+      return;
+    }
+    const key = String(meshId);
+    let bucket = this.telemetryStore.get(key);
+    if (!bucket) {
+      bucket = {
+        meshId: key,
+        node: node ? sanitizeTelemetryNode(node) : null,
+        records: []
+      };
+      this.telemetryStore.set(key, bucket);
+    } else if (node) {
+      const sanitizedNode = sanitizeTelemetryNode(node);
+      if (sanitizedNode) {
+        bucket.node = {
+          ...(bucket.node || {}),
+          ...sanitizedNode
+        };
+      }
+    }
+    if (record.node) {
+      const recordNode = sanitizeTelemetryNode(record.node);
+      if (recordNode) {
+        bucket.node = {
+          ...(bucket.node || {}),
+          ...recordNode
+        };
+      }
+    }
+    if (record.id) {
+      this.telemetryRecordIds.add(record.id);
+    }
+    bucket.records.push(record);
+    if (this.telemetryMaxPerNode > 0 && bucket.records.length > this.telemetryMaxPerNode) {
+      const excess = bucket.records.length - this.telemetryMaxPerNode;
+      const removed = bucket.records.splice(0, excess);
+      for (const item of removed) {
+        if (item?.id) {
+          this.telemetryRecordIds.delete(item.id);
+        }
+      }
+    }
+  }
+
+  _buildTelemetrySnapshot(limitPerNode = this.telemetryMaxPerNode) {
+    const nodes = [];
+    for (const bucket of this.telemetryStore.values()) {
+      if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+        continue;
+      }
+      const records = bucket.records;
+      const limit =
+        Number.isFinite(limitPerNode) && limitPerNode > 0
+          ? Math.floor(limitPerNode)
+          : records.length;
+      const start = records.length > limit ? records.length - limit : 0;
+      const slice = records.slice(start).map((record) => cloneJson(record));
+      nodes.push({
+        meshId: bucket.meshId,
+        node: bucket.node ? cloneJson(bucket.node) : null,
+        records: slice
+      });
+    }
+    nodes.sort((a, b) => {
+      const labelA = (a.node?.label || a.meshId || '').toLowerCase();
+      const labelB = (b.node?.label || b.meshId || '').toLowerCase();
+      if (labelA < labelB) return -1;
+      if (labelA > labelB) return 1;
+      return 0;
+    });
+    return {
+      updatedAt: this.telemetryUpdatedAt,
+      nodes
+    };
   }
 
   _broadcast(event) {
@@ -409,4 +616,118 @@ function normalizeMeshId(meshId) {
     value = value.slice(2);
   }
   return value.toLowerCase();
+}
+function sanitizeCallmeshProvision(provision) {
+  if (!provision || typeof provision !== 'object') {
+    return null;
+  }
+  const pickString = (...keys) => {
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(provision, key)) {
+        const value = provision[key];
+        if (value !== undefined && value !== null) {
+          const text = String(value).trim();
+          if (text) {
+            return text;
+          }
+        }
+      }
+    }
+    return null;
+  };
+  const pickNumber = (...keys) => {
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(provision, key)) {
+        const value = Number(provision[key]);
+        if (Number.isFinite(value)) {
+          return value;
+        }
+      }
+    }
+    return null;
+  };
+
+  return {
+    callsign: pickString('callsign', 'callsign_base', 'callsignBase'),
+    callsign_base: pickString('callsign_base', 'callsignBase'),
+    callsign_with_ssid: pickString('callsign_with_ssid', 'callsignWithSsid'),
+    aprs_callsign: pickString('aprs_callsign', 'aprsCallsign'),
+    aprs_ssid: pickString('aprs_ssid', 'aprsSsid', 'ssid'),
+    symbol_table: pickString('symbol_table', 'symbolTable'),
+    symbol_overlay: pickString('symbol_overlay', 'symbolOverlay'),
+    symbol_code: pickString('symbol_code', 'symbolCode'),
+    latitude: pickNumber('latitude', 'lat'),
+    longitude: pickNumber('longitude', 'lon'),
+    phg: pickString('phg'),
+    comment: pickString('comment', 'provision_comment', 'notes', 'description')
+  };
+}
+
+function sanitizeCallmeshMappingItem(item) {
+  if (!item || typeof item !== 'object') {
+    return null;
+  }
+  const meshId = item.mesh_id ?? item.meshId ?? null;
+  const callsignBase =
+    item.callsign_base ??
+    item.callsignBase ??
+    item.callsign ??
+    null;
+  const ssidRaw = item.aprs_ssid ?? item.aprsSsid ?? item.ssid ?? null;
+  const ssidNumeric = Number(ssidRaw);
+  return {
+    mesh_id: meshId != null ? String(meshId) : null,
+    callsign_base: callsignBase != null ? String(callsignBase) : null,
+    ssid: Number.isFinite(ssidNumeric) ? ssidNumeric : (ssidRaw != null ? ssidRaw : null),
+    symbol_table: item.symbol_table ?? item.symbolTable ?? null,
+    symbol_code: item.symbol_code ?? item.symbolCode ?? null,
+    symbol_overlay: item.symbol_overlay ?? item.symbolOverlay ?? null,
+    comment: item.comment ?? null,
+    enabled: item.enabled !== false
+  };
+}
+
+function sanitizeCallmeshAprs(aprs) {
+  if (!aprs || typeof aprs !== 'object') {
+    return {
+      connected: false,
+      actualServer: null,
+      server: null,
+      callsign: null,
+      beaconIntervalMs: null
+    };
+  }
+  const beaconMs = Number(aprs.beaconIntervalMs);
+  return {
+    connected: Boolean(aprs.connected),
+    actualServer: aprs.actualServer ?? null,
+    server: aprs.server ?? null,
+    callsign:
+      typeof aprs.callsign === 'string' && aprs.callsign.trim()
+        ? aprs.callsign.trim()
+        : null,
+    beaconIntervalMs: Number.isFinite(beaconMs) ? beaconMs : null
+  };
+}
+
+function sanitizeCallmeshPayload(info) {
+  if (!info || typeof info !== 'object') {
+    return null;
+  }
+  const mappingItems = Array.isArray(info.mappingItems)
+    ? info.mappingItems
+        .map((item) => sanitizeCallmeshMappingItem(item))
+        .filter(Boolean)
+    : [];
+  return {
+    statusText: info.statusText ?? '',
+    hasKey: Boolean(info.hasKey),
+    verified: Boolean(info.verified),
+    degraded: Boolean(info.degraded),
+    lastHeartbeatAt: info.lastHeartbeatAt ?? null,
+    lastMappingSyncedAt: info.lastMappingSyncedAt ?? null,
+    provision: sanitizeCallmeshProvision(info.provision),
+    mappingItems,
+    aprs: sanitizeCallmeshAprs(info.aprs)
+  };
 }

@@ -228,6 +228,21 @@ function sendTelemetryUpdate(payload) {
   if (mainWindow) {
     mainWindow.webContents.send('telemetry:update', payload);
   }
+  webServer?.publishTelemetry(payload);
+}
+
+async function syncWebTelemetrySnapshot() {
+  if (!bridge || !webServer || typeof bridge.getTelemetrySnapshot !== 'function') {
+    return;
+  }
+  try {
+    const snapshot = await bridge.getTelemetrySnapshot({
+      limitPerNode: webServer.telemetryMaxPerNode
+    });
+    webServer.seedTelemetrySnapshot(snapshot);
+  } catch (err) {
+    console.warn('同步 Web Telemetry Snapshot 失敗:', err);
+  }
 }
 
 async function createWindow() {
@@ -348,6 +363,7 @@ async function initialiseApp() {
   await initialiseBridge();
   await createWindow();
   await startWebDashboard();
+  await syncWebTelemetrySnapshot();
 
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -624,6 +640,7 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
         console.error('API Key 驗證後初次 CallMesh Heartbeat 失敗:', err);
       });
       lastCallmeshStateSnapshot = bridge.getStateSnapshot();
+      await syncWebTelemetrySnapshot();
       return {
         statusText: lastCallmeshStateSnapshot.lastStatus,
         agent: lastCallmeshStateSnapshot.agent,
@@ -640,6 +657,7 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
       await persistVerifiedApiKey(trimmed);
       bridge.startHeartbeatLoop();
       lastCallmeshStateSnapshot = bridge.getStateSnapshot();
+      await syncWebTelemetrySnapshot();
       return {
         statusText: lastCallmeshStateSnapshot.lastStatus,
         agent: lastCallmeshStateSnapshot.agent,
@@ -654,6 +672,7 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
       await clearPersistedApiKey();
       bridge.stopHeartbeatLoop();
       lastCallmeshStateSnapshot = bridge.getStateSnapshot();
+      await syncWebTelemetrySnapshot();
       return {
         statusText: lastCallmeshStateSnapshot.lastStatus,
         agent: lastCallmeshStateSnapshot.agent,
@@ -671,6 +690,7 @@ ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
     await clearPersistedApiKey();
     bridge.stopHeartbeatLoop();
     lastCallmeshStateSnapshot = bridge.getStateSnapshot();
+    await syncWebTelemetrySnapshot();
     return {
       statusText: lastCallmeshStateSnapshot.lastStatus,
       agent: lastCallmeshStateSnapshot.agent,

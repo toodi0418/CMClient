@@ -46,74 +46,150 @@
         </article>
       </section>
 
-      <section class="info-layout">
-        <article class="info-card">
-          <details class="info-details" open>
-            <summary>CallMesh Provision</summary>
-            <div class="info-content">
-              <dl class="info-grid">
-                <div>
-                  <dt>呼號</dt>
-                  <dd id="callmesh-callsign">—</dd>
-                </div>
-                <div>
-                  <dt>符號</dt>
-                  <dd id="callmesh-symbol">—</dd>
-                </div>
-                <div>
-                  <dt>座標</dt>
-                  <dd id="callmesh-coords">—</dd>
-                </div>
-                <div>
-                  <dt>PHG 詳細</dt>
-                  <dd id="callmesh-phg">—</dd>
-                </div>
-                <div>
-                  <dt>備註</dt>
-                  <dd id="callmesh-comment" class="multiline">—</dd>
-                </div>
-                <div>
-                  <dt>最後更新</dt>
-                  <dd id="callmesh-updated">—</dd>
-                </div>
-              </dl>
+      <nav class="main-nav">
+        <button type="button" class="nav-btn active" data-target="summary-page">封包摘要</button>
+        <button type="button" class="nav-btn" data-target="telemetry-page">遙測數據</button>
+        <button type="button" class="nav-btn" data-target="log-page">系統日誌</button>
+      </nav>
+
+      <section id="summary-page" class="page active">
+        <section class="info-layout">
+          <article class="info-card">
+            <details class="info-details" open>
+              <summary>CallMesh Provision</summary>
+              <div class="info-content">
+                <dl class="info-grid">
+                  <div>
+                    <dt>呼號</dt>
+                    <dd id="callmesh-callsign">—</dd>
+                  </div>
+                  <div>
+                    <dt>符號</dt>
+                    <dd id="callmesh-symbol">—</dd>
+                  </div>
+                  <div>
+                    <dt>座標</dt>
+                    <dd id="callmesh-coords">—</dd>
+                  </div>
+                  <div>
+                    <dt>PHG 詳細</dt>
+                    <dd id="callmesh-phg">—</dd>
+                  </div>
+                  <div>
+                    <dt>備註</dt>
+                    <dd id="callmesh-comment" class="multiline">—</dd>
+                  </div>
+                  <div>
+                    <dt>最後更新</dt>
+                    <dd id="callmesh-updated">—</dd>
+                  </div>
+                </dl>
+              </div>
+            </details>
+          </article>
+        </section>
+
+        <section class="table-panel">
+          <header class="panel-header">
+            <h2>封包摘要</h2>
+            <span class="panel-meta">資料列最多保留 200 筆</span>
+          </header>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>時間</th>
+                  <th>來源</th>
+                  <th>最後轉發</th>
+                  <th>類型</th>
+                  <th>CH</th>
+                  <th>Hops</th>
+                  <th>SNR</th>
+                  <th>RSSI</th>
+                  <th>資訊</th>
+                </tr>
+              </thead>
+              <tbody id="summary-table"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="telemetry-page" class="page">
+        <article class="telemetry-panel">
+          <header class="telemetry-header">
+            <div class="telemetry-controls">
+              <label for="telemetry-node-select">節點</label>
+              <select id="telemetry-node-select" disabled>
+                <option value="" selected>尚未收到遙測資料</option>
+              </select>
             </div>
-          </details>
+            <div class="telemetry-controls">
+              <label for="telemetry-range-select">區間</label>
+              <select id="telemetry-range-select">
+                <option value="day">24 小時</option>
+                <option value="week">7 天</option>
+                <option value="month">30 天</option>
+                <option value="year">1 年</option>
+                <option value="custom">自訂</option>
+              </select>
+            </div>
+            <div id="telemetry-range-custom" class="telemetry-range-custom hidden">
+              <label class="telemetry-custom-field">
+                <span>開始</span>
+                <input type="datetime-local" id="telemetry-range-start" />
+              </label>
+              <span class="telemetry-range-separator">~</span>
+              <label class="telemetry-custom-field">
+                <span>結束</span>
+                <input type="datetime-local" id="telemetry-range-end" />
+              </label>
+            </div>
+            <div class="telemetry-chart-controls">
+              <label for="telemetry-chart-mode">圖表</label>
+              <select id="telemetry-chart-mode">
+                <option value="all">全部</option>
+                <option value="single">單一指標</option>
+              </select>
+              <select id="telemetry-chart-metric" class="hidden"></select>
+            </div>
+            <div class="telemetry-updated">
+              <span class="label">更新</span>
+              <span id="telemetry-updated-at">—</span>
+            </div>
+          </header>
+          <div id="telemetry-empty-state" class="telemetry-empty">
+            尚未收到遙測資料。
+          </div>
+          <section id="telemetry-charts" class="telemetry-charts hidden"></section>
+          <div id="telemetry-table-wrapper" class="telemetry-table-wrapper hidden">
+            <table class="telemetry-table">
+              <thead>
+                <tr>
+                  <th>時間</th>
+                  <th>節點</th>
+                  <th>指標</th>
+                  <th>額外資訊</th>
+                </tr>
+              </thead>
+              <tbody id="telemetry-table-body"></tbody>
+            </table>
+          </div>
         </article>
       </section>
 
-      <section class="table-panel">
-        <header class="panel-header">
-          <h2>封包摘要</h2>
-          <span class="panel-meta">資料列最多保留 200 筆</span>
-        </header>
-        <table>
-          <thead>
-            <tr>
-              <th>時間</th>
-              <th>來源</th>
-              <th>最後轉發</th>
-              <th>類型</th>
-              <th>CH</th>
-              <th>Hops</th>
-              <th>SNR</th>
-              <th>RSSI</th>
-              <th>資訊</th>
-            </tr>
-        </thead>
-          <tbody id="summary-table"></tbody>
-        </table>
-      </section>
-
-      <section class="log-panel">
-        <header class="panel-header">
-          <h2>系統日誌</h2>
-          <span class="panel-meta">CallMesh / APRS / 連線事件</span>
-        </header>
-        <ul id="log-list" class="log-list"></ul>
+      <section id="log-page" class="page">
+        <section class="log-panel">
+          <header class="panel-header">
+            <h2>系統日誌</h2>
+            <span class="panel-meta">CallMesh / APRS / 連線事件</span>
+          </header>
+          <ul id="log-list" class="log-list"></ul>
+        </section>
       </section>
     </main>
 
+    <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
     <script src="main.js"></script>
   </body>
 </html>
