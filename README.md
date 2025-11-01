@@ -70,6 +70,25 @@ export CALLMESH_ARTIFACTS_DIR=~/.config/callmesh/
 
 ---
 
+### 更新到最新版本
+
+#### 透過原始碼部署（git clone）
+```bash
+cd CMClient
+git pull          # 取得最新程式
+npm install       # 套件若有更新會同步安裝
+```
+更新完成後即可照原流程啟動 `npm start` / `npm run desktop` 或重新執行 `npm run build:*` 產出新版套裝。
+
+#### 使用 Release 可攜版
+1. 前往最新 Release：<https://github.com/toodi0418/CMClient/releases>
+2. 下載目標平台的 ZIP（GUI 或 CLI）。
+3. 解壓後直接覆蓋舊版本或以全新資料夾啟動；設定檔（CallMesh API Key、Mapping artifacts）仍沿用原本位置。
+
+> 提醒：更新前請確認既有執行中的 CLI / GUI 已中止，避免 APRS uplink flowId 重複。
+
+---
+
 ### Raspberry Pi 快速部署
 
 樹莓派預設沒有 Node.js，可依下列步驟一次完成：
