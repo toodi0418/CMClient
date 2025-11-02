@@ -625,6 +625,7 @@
     refreshFlowEntryLabels();
     renderFlowEntries();
     refreshTelemetrySelectors();
+    refreshSummaryRows();
     renderNodeDatabase();
     renderTelemetryView();
   }
@@ -637,6 +638,7 @@
     refreshFlowEntryLabels();
     renderFlowEntries();
     refreshTelemetrySelectors();
+    refreshSummaryRows();
     renderNodeDatabase();
     renderTelemetryView();
   }
@@ -2847,6 +2849,23 @@
     }
 
     registerFlow(summary);
+  }
+
+  function refreshSummaryRows() {
+    if (!Array.isArray(summaryRows) || !summaryRows.length) {
+      return;
+    }
+    for (const row of summaryRows) {
+      if (!row || !row.__summaryData) continue;
+      const summary = row.__summaryData;
+      hydrateSummaryNodes(summary);
+      const cells = row.children;
+      if (!cells || cells.length < 3) {
+        continue;
+      }
+      cells[1].textContent = formatSource(summary);
+      cells[2].textContent = formatRelay(summary);
+    }
   }
 
   function registerFlow(summary, { skipPending = false } = {}) {
