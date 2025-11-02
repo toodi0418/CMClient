@@ -563,7 +563,7 @@
         nameSegments.push(`<div class="nodes-name-secondary">${escapeHtml(secondaryParts.join(' / '))}</div>`);
       }
 
-      const meshLabel = formatNodeDisplayLabel(entry) || meshIdOriginal || meshId || '—';
+      const meshLabel = meshIdOriginal || meshId || '—';
       const hwModelDisplay = entry.hwModelLabel || normalizeEnumLabel(entry.hwModel) || '—';
       const roleDisplay = entry.roleLabel || normalizeEnumLabel(entry.role) || '—';
       const distanceDisplay = formatNodeDistanceValue(entry);
