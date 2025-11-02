@@ -928,7 +928,17 @@
     if (!relay) return '';
     const meshId = relay.meshId || relay.meshIdOriginal || relay.meshIdNormalized || '';
     const stripped = typeof meshId === 'string' && meshId.startsWith('!') ? meshId.slice(1) : meshId;
-    const display = formatNodeDisplayLabel(relay);
+    const shortDisplay = sanitizeNodeName(relay.shortName);
+    let display = formatNodeDisplayLabel(relay);
+    if (!display) {
+      display = sanitizeNodeName(relay.longName) || sanitizeNodeName(relay.label) || meshId || '';
+    }
+    if (shortDisplay) {
+      const lowerShort = shortDisplay.toLowerCase();
+      if (!display.toLowerCase().includes(lowerShort)) {
+        display = display ? `${display} / ${shortDisplay}` : shortDisplay;
+      }
+    }
     if (stripped && /^0{6}[0-9a-fA-F]{2}$/.test(String(stripped).toLowerCase())) {
       const fallback = display || meshId || '';
       return fallback ? (fallback.includes('?') ? fallback : `${fallback}?`) : '?';

@@ -276,12 +276,17 @@ function formatRelayLabel(relay) {
     relay.meshId || relay.meshIdOriginal || relay.meshIdNormalized || relay.mesh_id || '';
   const normalized =
     typeof meshId === 'string' && meshId.startsWith('!') ? meshId.slice(1) : meshId;
-  const name =
-    sanitizeNodeName(relay.shortName) ||
-    sanitizeNodeName(relay.longName) ||
-    sanitizeNodeName(relay.label);
-  const baseDisplay = formatNodeDisplay(relay);
-  const display = name || baseDisplay;
+  const shortDisplay = sanitizeNodeName(relay.shortName);
+  let display = formatNodeDisplay(relay);
+  if (!display || display === 'unknown') {
+    display = sanitizeNodeName(relay.longName) || sanitizeNodeName(relay.label) || meshId || '';
+  }
+  if (shortDisplay) {
+    const lowerShort = shortDisplay.toLowerCase();
+    if (!display.toLowerCase().includes(lowerShort)) {
+      display = display ? `${display} / ${shortDisplay}` : shortDisplay;
+    }
+  }
   if (normalized && /^0{6}[0-9a-fA-F]{2}$/.test(String(normalized).toLowerCase())) {
     if (display && display !== 'unknown') {
       return display.includes('?') ? display : `${display}?`;
