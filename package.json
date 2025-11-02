@@ -1,6 +1,6 @@
 {
   "name": "meshtastic-tcp-client",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "private": true,
   "description": "簡易 Meshtastic TCP 封包擷取與解析工具",
   "main": "src/electron/main.js",
