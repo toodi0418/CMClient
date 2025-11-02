@@ -337,6 +337,23 @@
     return trimmed;
   }
 
+  function formatNodeDisplayLabel(node) {
+    if (!node || typeof node !== 'object') return '';
+    const name =
+      sanitizeNodeName(node.longName) ||
+      sanitizeNodeName(node.shortName) ||
+      sanitizeNodeName(node.label);
+    const meshId = node.meshId || node.meshIdOriginal || node.meshIdNormalized || '';
+    if (!meshId) {
+      return name || '';
+    }
+    if (!name) {
+      return meshId;
+    }
+    const meshDisplay = meshId.toLowerCase();
+    return name.toLowerCase().includes(meshDisplay) ? name : `${name} (${meshId})`;
+  }
+
   function getNodeLastSeenTimestamp(entry) {
     const value = entry?.lastSeenAt;
     if (Number.isFinite(value)) {
@@ -874,7 +891,7 @@
     const hopsLabel = hopInfo.hopsLabel || '';
     const zeroHop = usedHops === 0 || /^0(?:\s*\/|$)/.test(hopsLabel);
 
-    if (summary.relay?.label) {
+    if (summary.relay) {
       if (zeroHop) {
         return '直收';
       }
@@ -909,14 +926,17 @@
 
   function formatRelayLabel(relay) {
     if (!relay) return '';
-    const label = relay.label || '';
-    const meshId = relay.meshId || '';
-    if (!meshId) return label;
-    const stripped = meshId.startsWith('!') ? meshId.slice(1) : meshId;
-    if (/^0{6}[0-9a-fA-F]{2}$/.test(stripped)) {
-      return label ? `${label}?` : `${meshId}?`;
+    const meshId = relay.meshId || relay.meshIdOriginal || relay.meshIdNormalized || '';
+    const stripped = typeof meshId === 'string' && meshId.startsWith('!') ? meshId.slice(1) : meshId;
+    const display = formatNodeDisplayLabel(relay);
+    if (stripped && /^0{6}[0-9a-fA-F]{2}$/.test(String(stripped).toLowerCase())) {
+      const fallback = display || meshId || '';
+      return fallback ? (fallback.includes('?') ? fallback : `${fallback}?`) : '?';
     }
-    return label || meshId;
+    if (display) {
+      return display;
+    }
+    return meshId || relay.label || '';
   }
 
   function trimTrailingZeros(value) {
@@ -2465,29 +2485,12 @@
 
   function formatSource(summary) {
     if (!summary) return 'unknown';
-    const node = summary.from || {};
-    const mesh = node.meshId || node.meshIdNormalized || '';
-    const meshDisplay = mesh ? mesh.toLowerCase() : '';
-
-    let name = null;
-    if (node.longName && node.longName !== 'unknown') {
-      name = node.longName;
-    } else if (node.shortName && node.shortName !== 'unknown') {
-      name = node.shortName;
-    } else if (node.label) {
-      name = node.label;
-    } else if (meshDisplay) {
-      name = meshDisplay;
-    } else {
-      name = 'unknown';
+    const display = formatNodeDisplayLabel(summary.from);
+    if (display) {
+      return display;
     }
-
-    const nameText = typeof name === 'string' ? name : String(name);
-
-    if (meshDisplay && !nameText.toLowerCase().includes(meshDisplay)) {
-      return `${nameText} (${meshDisplay})`;
-    }
-    return nameText;
+    const mesh = summary.from?.meshId || summary.from?.meshIdNormalized || summary.from?.meshIdOriginal || '';
+    return mesh || 'unknown';
   }
 
   function getDetailExtraSegments(summary) {

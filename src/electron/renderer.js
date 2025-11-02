@@ -272,14 +272,21 @@ function isSelfMeshId(meshId) {
 
 function formatRelayLabel(relay) {
   if (!relay) return '';
-  const label = relay.label || '';
-  const meshId = relay.meshId || '';
-  if (!meshId) return label;
-  const normalized = meshId.startsWith('!') ? meshId.slice(1) : meshId;
-  if (/^0{6}[0-9a-fA-F]{2}$/.test(normalized)) {
-    return label ? label + '?' : meshId + '?';
+  const meshId =
+    relay.meshId || relay.meshIdOriginal || relay.meshIdNormalized || relay.mesh_id || '';
+  const normalized =
+    typeof meshId === 'string' && meshId.startsWith('!') ? meshId.slice(1) : meshId;
+  const display = formatNodeDisplay(relay);
+  if (normalized && /^0{6}[0-9a-fA-F]{2}$/.test(String(normalized).toLowerCase())) {
+    if (display && display !== 'unknown') {
+      return display.includes('?') ? display : `${display}?`;
+    }
+    return meshId ? `${meshId}?` : '?';
   }
-  return label;
+  if (display && display !== 'unknown') {
+    return display;
+  }
+  return meshId || relay.label || '';
 }
 
 function computeRelayLabel(summary) {
