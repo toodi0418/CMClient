@@ -2713,6 +2713,33 @@
     return value.toLowerCase();
   }
 
+  function hydrateSummaryNode(node, fallbackMeshId = null) {
+    const meshCandidate = node?.meshId ?? node?.meshIdNormalized ?? fallbackMeshId;
+    const registryNode = getRegistryNode(meshCandidate);
+    const upserted = node ? upsertNodeRegistry(node) : null;
+    const merged = mergeNodeMetadata(node, upserted, registryNode);
+    return merged || node || registryNode || null;
+  }
+
+  function hydrateSummaryNodes(summary) {
+    if (!summary || typeof summary !== 'object') {
+      return summary;
+    }
+    if (summary.from || summary.fromMeshId) {
+      summary.from = hydrateSummaryNode(summary.from, summary.fromMeshId);
+    }
+    if (summary.to || summary.toMeshId) {
+      summary.to = hydrateSummaryNode(summary.to, summary.toMeshId);
+    }
+    if (summary.relay || summary.relayMeshId) {
+      summary.relay = hydrateSummaryNode(summary.relay, summary.relayMeshId);
+    }
+    if (summary.nextHop || summary.nextHopMeshId) {
+      summary.nextHop = hydrateSummaryNode(summary.nextHop, summary.nextHopMeshId);
+    }
+    return summary;
+  }
+
   function createSummaryRow(summary) {
     const tr = document.createElement('tr');
     const snrClass =
@@ -2761,10 +2788,7 @@
       summary.selfMeshId = currentSelfMeshId;
     }
 
-    if (summary.from) upsertNodeRegistry(summary.from);
-    if (summary.to) upsertNodeRegistry(summary.to);
-    if (summary.relay) upsertNodeRegistry(summary.relay);
-    if (summary.nextHop) upsertNodeRegistry(summary.nextHop);
+    hydrateSummaryNodes(summary);
 
     const row = createSummaryRow(summary);
     row.__summaryData = summary;
