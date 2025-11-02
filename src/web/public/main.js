@@ -864,7 +864,12 @@
   function formatRelay(summary) {
     if (!summary) return '直收';
     const fromMeshId = summary.from?.meshId || summary.from?.meshIdNormalized || '';
-    const relayMeshRaw = summary.relay?.meshId || summary.relay?.meshIdNormalized || '';
+    const relayMeshRaw =
+      summary.relay?.meshId ||
+      summary.relay?.meshIdNormalized ||
+      summary.relayMeshId ||
+      summary.relayMeshIdNormalized ||
+      '';
     const relayNormalized = normalizeMeshId(relayMeshRaw);
     const fromNormalized = normalizeMeshId(fromMeshId);
     const rawRelayCanonical = relayMeshRaw.startsWith('!') ? relayMeshRaw.slice(1) : relayMeshRaw;
@@ -877,8 +882,13 @@
       return 'Self';
     }
 
-    let relayMeshDisplay = relayMeshRaw;
-    let relayNormWork = relayNormalized;
+    const relayNode = relayMeshRaw ? hydrateSummaryNode(summary.relay, relayMeshRaw) : null;
+    if (relayNode) {
+      summary.relay = relayNode;
+    }
+
+    let relayMeshDisplay = relayNode?.meshId || relayMeshRaw;
+    let relayNormWork = relayNode?.meshIdNormalized || relayNormalized;
     if (relayMeshRaw && /^0{6}[0-9a-fA-F]{2}$/.test(rawRelayCanonical.toLowerCase())) {
       relayMeshDisplay = '';
       relayNormWork = null;

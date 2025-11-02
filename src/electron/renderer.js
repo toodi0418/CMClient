@@ -306,7 +306,18 @@ function computeRelayLabel(summary) {
     return 'Self';
   }
 
-  let relayMeshIdRaw = summary.relay?.meshId || summary.relay?.meshIdNormalized || '';
+  let relayMeshIdRaw =
+    summary.relay?.meshId ||
+    summary.relay?.meshIdNormalized ||
+    summary.relayMeshId ||
+    summary.relayMeshIdNormalized ||
+    '';
+  const hydratedRelay = hydrateSummaryNode(summary.relay, relayMeshIdRaw);
+  if (hydratedRelay) {
+    summary.relay = hydratedRelay;
+    relayMeshIdRaw =
+      hydratedRelay.meshId || hydratedRelay.meshIdOriginal || hydratedRelay.meshIdNormalized || relayMeshIdRaw;
+  }
   if (relayMeshIdRaw && isSelfMeshId(relayMeshIdRaw)) {
     return 'Self';
   }
