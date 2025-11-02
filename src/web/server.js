@@ -188,7 +188,8 @@ class WebDashboardServer {
 
   publishSummary(summary) {
     if (!summary) return;
-    const payload = this.selfMeshId ? { ...summary, selfMeshId: this.selfMeshId } : summary;
+    const base = this.selfMeshId ? { ...summary, selfMeshId: this.selfMeshId } : { ...summary };
+    const payload = this._hydrateSummaryNodes(base);
     this._appendSummary(payload);
     this._broadcast({ type: 'summary', payload });
     this._broadcastMetrics();
@@ -342,7 +343,8 @@ class WebDashboardServer {
   }
 
   _appendSummary(summary) {
-    this.summaryRows.unshift(summary);
+    const copy = cloneJson(summary);
+    this.summaryRows.unshift(copy);
     while (this.summaryRows.length > MAX_SUMMARY_ROWS) {
       this.summaryRows.pop();
     }
@@ -723,6 +725,42 @@ class WebDashboardServer {
     const self = normalizeMeshId(this.selfMeshId);
     if (!self) return false;
     return meshId === self;
+  }
+
+  _hydrateSummaryNodes(summary) {
+    if (!summary || typeof summary !== 'object') {
+      return summary;
+    }
+    const next = { ...summary };
+    next.from = this._hydrateSummaryNode(next.from, next.fromMeshId || next.fromMeshIdNormalized);
+    next.to = this._hydrateSummaryNode(next.to, next.toMeshId || next.toMeshIdNormalized);
+    next.relay = this._hydrateSummaryNode(next.relay, next.relayMeshId || next.relayMeshIdNormalized);
+    next.nextHop = this._hydrateSummaryNode(next.nextHop, next.nextHopMeshId || next.nextHopMeshIdNormalized);
+    return next;
+  }
+
+  _hydrateSummaryNode(node, fallbackMeshId = null) {
+    const meshCandidate =
+      node?.meshId || node?.meshIdNormalized || node?.meshIdOriginal || fallbackMeshId;
+    const normalized = normalizeMeshId(meshCandidate);
+
+    let registryNode = normalized ? this.nodeRegistry.get(normalized) : null;
+    if (node && normalized) {
+      registryNode = this._upsertNode({
+        meshId: meshCandidate,
+        meshIdNormalized: normalized,
+        ...node
+      });
+    }
+
+    if (!registryNode && !node) {
+      return null;
+    }
+
+    return mergeNodeInfo({}, registryNode || {}, node || {}, {
+      meshId: meshCandidate || registryNode?.meshId || null,
+      meshIdNormalized: normalized || registryNode?.meshIdNormalized || null
+    });
   }
 }
 
