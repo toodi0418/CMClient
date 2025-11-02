@@ -233,6 +233,12 @@ async function startMonitor(argv) {
     webServer?.publishTelemetry(payload);
   });
 
+  bridge.on('node', (payload) => {
+    if (payload) {
+      webServer?.publishNode(payload);
+    }
+  });
+
   await bridge.init({ allowRestore: true });
 
   try {
@@ -298,6 +304,14 @@ async function startMonitor(argv) {
       const snapshot = toWebCallmeshState(bridge.getStateSnapshot());
       if (snapshot) {
         webServer.publishCallmesh(snapshot);
+      }
+      try {
+        const nodeSnapshot = bridge.getNodeSnapshot();
+        if (Array.isArray(nodeSnapshot) && nodeSnapshot.length) {
+          webServer.seedNodeSnapshot(nodeSnapshot);
+        }
+      } catch (err) {
+        console.warn(`初始化 Web 節點快照失敗：${err.message}`);
       }
       if (typeof bridge.getTelemetrySnapshot === 'function') {
         try {
