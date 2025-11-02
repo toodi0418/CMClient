@@ -276,28 +276,36 @@ function computeRelayLabel(summary) {
   }
 
   const { usedHops, hopsLabel } = extractHopInfo(summary);
+  const normalizedHopsLabel = hopsLabel || '';
+  const zeroHop = usedHops === 0 || /^0(?:\s*\/|$)/.test(normalizedHopsLabel);
 
   if (summary.relay?.label) {
+    if (zeroHop) {
+      return '直收';
+    }
     return formatRelayLabel(summary.relay);
   }
 
   if (relayMeshIdRaw) {
+    if (zeroHop) {
+      return '直收';
+    }
     return formatRelayLabel({ label: summary.relay?.label || relayMeshIdRaw, meshId: relayMeshIdRaw });
   }
 
-  if (usedHops === 0 || hopsLabel === '0/0' || hopsLabel.startsWith('0/')) {
+  if (zeroHop) {
     return '直收';
   }
 
-  if (usedHops > 0) {
+  if (usedHops != null && usedHops > 0) {
     return '未知?';
   }
 
-  if (!hopsLabel) {
+  if (!normalizedHopsLabel) {
     return '直收';
   }
 
-  if (hopsLabel.includes('?')) {
+  if (normalizedHopsLabel.includes('?')) {
     return '未知?';
   }
 
@@ -4058,12 +4066,4 @@ function formatRelativeTime(isoString) {
   if (days < 7) {
     return `${days} 天前`;
   }
-  return date.toLocaleString();
-}
-
-function formatAprsSsid(ssid) {
-  if (ssid === null || ssid === undefined) return '';
-  if (ssid === 0) return '';
-  if (ssid < 0) return `${ssid}`;
-  return `-${ssid}`;
-}
+  ret

@@ -259,28 +259,37 @@
     }
 
     const hopInfo = extractHopInfo(summary);
+    const usedHops = Number.isFinite(hopInfo.usedHops) ? hopInfo.usedHops : null;
+    const hopsLabel = hopInfo.hopsLabel || '';
+    const zeroHop = usedHops === 0 || /^0(?:\s*\/|$)/.test(hopsLabel);
 
     if (summary.relay?.label) {
+      if (zeroHop) {
+        return '直收';
+      }
       return formatRelayLabel(summary.relay);
     }
 
     if (relayMeshDisplay) {
+      if (zeroHop) {
+        return '直收';
+      }
       return formatRelayLabel({ label: summary.relay?.label || relayMeshDisplay, meshId: relayMeshDisplay });
     }
 
-    if (hopInfo.usedHops === 0 || hopInfo.hopsLabel === '0/0' || (hopInfo.hopsLabel && hopInfo.hopsLabel.startsWith('0/'))) {
+    if (zeroHop) {
       return '直收';
     }
 
-    if (hopInfo.usedHops > 0) {
+    if (usedHops != null && usedHops > 0) {
       return '未知?';
     }
 
-    if (!hopInfo.hopsLabel) {
+    if (!hopsLabel) {
       return '直收';
     }
 
-    if (hopInfo.hopsLabel.includes('?')) {
+    if (hopsLabel.includes('?')) {
       return '未知?';
     }
 
