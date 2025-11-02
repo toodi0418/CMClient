@@ -1,9 +1,36 @@
 'use strict';
 
+const electronModule = require('electron');
+
+if (
+  !electronModule ||
+  typeof electronModule !== 'object' ||
+  typeof electronModule.app === 'undefined'
+) {
+  // 若以 Node 方式啟動（常見於 ELECTRON_RUN_AS_NODE=1），自動重新以 GUI 模式啟動。
+  const { spawnSync } = require('child_process');
+  const electronBinary =
+    typeof electronModule === 'string' && electronModule.length
+      ? electronModule
+      : process.execPath;
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  const result = spawnSync(
+    electronBinary,
+    [__filename, ...process.argv.slice(2)],
+    { stdio: 'inherit', env }
+  );
+  if (result.error) {
+    console.error('重新啟動 Electron 失敗:', result.error);
+    process.exit(1);
+  }
+  process.exit(result.status ?? 0);
+}
+
+const { app, BrowserWindow, ipcMain, Menu } = electronModule;
 const path = require('path');
 const fs = require('fs/promises');
 const fsSync = require('fs');
-const { app, BrowserWindow, ipcMain, Menu } = require('electron');
 const { version: appVersion } = require('../../package.json');
 const MeshtasticClient = require('../meshtasticClient');
 const { discoverMeshtasticDevices } = require('../discovery');
@@ -525,6 +552,29 @@ ipcMain.handle('nodes:get-snapshot', async () => {
   } catch (err) {
     console.error('取得節點快照失敗:', err);
     return [];
+  }
+});
+
+ipcMain.handle('nodes:clear', async () => {
+  if (!bridge) {
+    return { success: false, error: 'bridge not initialised' };
+  }
+  try {
+    const result = bridge.clearNodeDatabase();
+    const snapshot = Array.isArray(result?.nodes) ? result.nodes : [];
+    mainWindow?.webContents.send('meshtastic:node-snapshot', snapshot);
+    webServer?.seedNodeSnapshot(snapshot);
+    return {
+      success: true,
+      cleared: Number.isFinite(result?.cleared) ? result.cleared : 0,
+      nodes: snapshot
+    };
+  } catch (err) {
+    console.error('清除節點資料庫失敗:', err);
+    return {
+      success: false,
+      error: err.message
+    };
   }
 });
 

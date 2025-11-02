@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('meshtastic', {
   },
   clearTelemetry: () => ipcRenderer.invoke('telemetry:clear'),
   getNodeSnapshot: () => ipcRenderer.invoke('nodes:get-snapshot'),
+  clearNodeDatabase: () => ipcRenderer.invoke('nodes:clear'),
   onNodeSnapshot: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('meshtastic:node-snapshot', listener);

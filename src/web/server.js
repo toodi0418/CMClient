@@ -38,8 +38,21 @@ function sanitizeTelemetryNode(node) {
     shortName: node.shortName ?? null,
     longName: node.longName ?? null,
     hwModel: node.hwModel ?? null,
-    role: node.role ?? null
+    hwModelLabel: node.hwModelLabel ?? null,
+    role: node.role ?? null,
+    roleLabel: node.roleLabel ?? null,
+    latitude: Number.isFinite(node.latitude) ? Number(node.latitude) : null,
+    longitude: Number.isFinite(node.longitude) ? Number(node.longitude) : null,
+    altitude: Number.isFinite(node.altitude) ? Number(node.altitude) : null,
+    lastSeenAt: Number.isFinite(node.lastSeenAt) ? Number(node.lastSeenAt) : node.lastSeenAt ?? null
   };
+}
+
+function formatEnumLabel(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return String(value).replace(/_/g, ' ').trim();
 }
 
 function sanitizeTelemetryRecord(record) {
@@ -747,7 +760,12 @@ function mergeNodeInfo(existing = {}, incoming = {}) {
     shortName: existing.shortName ?? null,
     longName: existing.longName ?? null,
     hwModel: existing.hwModel ?? null,
+    hwModelLabel: existing.hwModelLabel ?? null,
     role: existing.role ?? null,
+    roleLabel: existing.roleLabel ?? null,
+    latitude: existing.latitude ?? null,
+    longitude: existing.longitude ?? null,
+    altitude: existing.altitude ?? null,
     label: existing.label ?? null,
     lastSeenAt: existing.lastSeenAt ?? null
   };
@@ -772,8 +790,44 @@ function mergeNodeInfo(existing = {}, incoming = {}) {
     if (source.hwModel != null) {
       result.hwModel = source.hwModel;
     }
+    if (source.hwModelLabel != null) {
+      result.hwModelLabel = source.hwModelLabel;
+    }
     if (source.role != null) {
       result.role = source.role;
+    }
+    if (source.roleLabel != null) {
+      result.roleLabel = source.roleLabel;
+    }
+    if (source.position && typeof source.position === 'object') {
+      const pos = source.position;
+      if (Number.isFinite(pos.latitude)) {
+        result.latitude = Number(pos.latitude);
+      }
+      if (Number.isFinite(pos.longitude)) {
+        result.longitude = Number(pos.longitude);
+      }
+      if (Number.isFinite(pos.altitude)) {
+        result.altitude = Number(pos.altitude);
+      }
+    }
+    if (source.latitude != null) {
+      const numeric = Number(source.latitude);
+      if (Number.isFinite(numeric)) {
+        result.latitude = numeric;
+      }
+    }
+    if (source.longitude != null) {
+      const numeric = Number(source.longitude);
+      if (Number.isFinite(numeric)) {
+        result.longitude = numeric;
+      }
+    }
+    if (source.altitude != null) {
+      const numeric = Number(source.altitude);
+      if (Number.isFinite(numeric)) {
+        result.altitude = numeric;
+      }
     }
     if (source.lastSeenAt != null && Number.isFinite(source.lastSeenAt)) {
       result.lastSeenAt = Number(source.lastSeenAt);
@@ -787,6 +841,21 @@ function mergeNodeInfo(existing = {}, incoming = {}) {
   }
   if (!result.meshIdNormalized && result.meshId) {
     result.meshIdNormalized = normalizeMeshId(result.meshId);
+  }
+  if (result.hwModel && !result.hwModelLabel) {
+    result.hwModelLabel = formatEnumLabel(result.hwModel);
+  }
+  if (result.role && !result.roleLabel) {
+    result.roleLabel = formatEnumLabel(result.role);
+  }
+  if (result.latitude != null && !Number.isFinite(result.latitude)) {
+    result.latitude = null;
+  }
+  if (result.longitude != null && !Number.isFinite(result.longitude)) {
+    result.longitude = null;
+  }
+  if (result.altitude != null && !Number.isFinite(result.altitude)) {
+    result.altitude = null;
   }
   if (!result.label) {
     result.label = buildNodeLabel(result);

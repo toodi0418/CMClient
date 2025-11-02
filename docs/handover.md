@@ -131,15 +131,19 @@ CMClient/
   - `TMAG_WEB_DASHBOARD=0` 可禁用
 - `meshtastic:*`、`callmesh:*`、`aprs:*`、`app:*` IPC 入口都集中於此。
 - 注意：關閉應用或 IPC 錯誤時，務必呼叫 `cleanupMeshtasticClient()`、`shutdownWebDashboard()` 避免殘留連線。
+- `callmesh/bridge` 會在背景將節點快照持久化至 `CALLMESH_ARTIFACTS_DIR/node-database.json`，採 Debounce 寫入；清除 node DB 時記得同時刪除該檔案並重新推播節點快照。
 
 ### 3.6 Electron Renderer (`src/electron/renderer.js`)
 - 主要分頁：
   1. **監視**：封包表與計數（10 分鐘封包 / APRS 上傳 / Mapping 節點）。節點名稱會套用節點資料庫資料。
-  2. **遙測數據**：Chart.js 畫面與資料表，可依節點、時間範圍、指標模式切換；頁面右上角顯示「筆數 / 節點 / 檔案大小」統計並提供「清空遙測數據」按鈕。
+  2. **遙測數據**：Chart.js 畫面與資料表，可依節點、時間範圍、指標模式切換；節點輸入框整合了 datalist 與搜尋，鍵入 Mesh ID、暱稱或任意關鍵字即可切換節點或直接套用全域篩選，輸入清空時會自動還原到最近選取節點並顯示完整資料；頁面右上角顯示「筆數 / 節點 / 檔案大小」統計並提供「清空遙測數據」按鈕。
   3. **Mapping 封包追蹤**：具 Mapping 的位置封包列表，支援搜尋、狀態篩選與 CSV 匯出；節點資訊與 APRS 狀態會即時更新。
   4. **設定**：設定 Meshtastic Host、CallMesh API Key、APRS Server、信標間隔，並可切換是否啟用 Web UI。
   5. **資訊**：顯示 CallMesh Provision 詳細資料（呼號、座標、PHG 等）。
   6. **Log**：顯示 Meshtastic / CallMesh / APRS / APP 事件，支援搜尋與匯出。
+- **節點資料庫分頁**：顯示目前快取節點、線上狀態與距離資訊。
+  - 表格以最後出現時間由新到舊排序，線上統計以「一小時內更新」為準並同步顯示「符合條件 / 總線上」。
+  - 搜尋框支援名稱、Mesh ID、型號、角色與 Label 模糊匹配；結果會同步影響統計與表格內容。
 - 節點事件：Renderer 會接收 `node`、`node-snapshot` 事件，更新本地節點快取並同步至封包表、Flow 追蹤與 Telemetry 表格。
 - 遙測處理：
   - 初始化時透過 `getTelemetrySnapshot()` 與 `getNodeSnapshot()` 建立快取；
@@ -171,6 +175,17 @@ CMClient/
 - 目前支援的量測包含 `batteryLevel`、`voltage`、`channelUtilization`、`airUtilTx`、`temperature`、`relativeHumidity`、`barometricPressure` 等（其餘欄位會以 `metrics.*` 原樣保留）。
 - 事件 payload 會附帶統計資訊：`totalRecords`、`totalNodes`、`diskBytes`。GUI 與 Web 直接顯示，不需自行計算。
 - Telemetry 記錄內的節點欄位會與節點資料庫合併，確保長名稱及模型資訊一致。
+- GUI 端節點輸入框同時充當搜尋欄位：輸入任意關鍵字時會保留原先節點選擇並使用文字篩選 Chart/Table；選取 datalist 項目則會直接切換節點並重置搜尋。
+
+### 3.9 節點資料庫（Node Database）
+- 透過 `src/nodeDatabase.js` 單例集中管理節點資訊，Electron / Web / CLI 共用。
+- CallMeshAprsBridge 會將節點快照持久化至 `storageDir/node-database.json`（同 `CALLMESH_ARTIFACTS_DIR`），重啟後會還原舊資料並自動清洗無效座標或 `unknown` 名稱。
+- 持久化內容包含：
+  - `meshId` / `meshIdOriginal` / 長短名稱 / Label
+  - 解析後的硬體型號與角色（使用 proto enum 映射）
+  - 最後出現時間（毫秒）、最後一次位置資訊（緯度/經度/高度）
+  - 透過 CallMesh Provision 座標可計算與本地的距離；若座標無效或為 (0,0) 會自動忽略。
+- `node-database.json` 以及遙測 JSONL 均可透過節點資料庫分頁的「清除節點資料庫」按鈕、或 `callmesh:clear` 流程一併刪除。
 
 ---
 
@@ -235,9 +250,11 @@ node src/index.js --host 192.168.1.50 --port 4403 --web-ui
 
 ### 6.4 遙測與節點資料
 
-- Electron 遙測頁會顯示節點列表、圖表、明細表格，以及「筆數 / 節點 / 檔案大小」統計，可在同頁清空遙測資料。
-- Web Dashboard 遙測頁提供相同的節點篩選與統計資訊；首次連線會先收到節點快照與最新遙測資料。
+- Electron 遙測頁整合了節點輸入與搜尋：在輸入框選擇 datalist 項目可直接切換節點，輸入其他關鍵字則會即時篩選圖表與資料表；搜尋欄位清空時會回到最近選取節點（無紀錄時回退到第一筆）並展示全部資料。
+- Web Dashboard 遙測頁提供相同的節點快照與統計資訊；首次連線會先收到節點快照與最新遙測資料。
+- 節點資料庫分頁支援模糊搜尋與線上節點統計（預設視為 1 小時內更新），距離會以 Provision 座標為基準計算；表格顯示的筆數與線上數會在使用搜尋時同步標示「符合 / 總數」。
 - 節點長名稱、型號等資訊由 `nodeDatabase` 推播，CLI / GUI / Web 顯示一致；若需要擴充欄位，請從 Bridge emit 的 `node` 事件開始串接。
+- 所有節點快照會持久化於 `CALLMESH_ARTIFACTS_DIR/node-database.json`，同 `telemetry-records.jsonl` 一樣可透過節點分頁的「清除節點資料庫」或 `callmesh:clear` IPC 重新初始化。
 
 ---
 
@@ -283,6 +300,7 @@ npx pkg src/index.js --targets node18-linux-x64
 2. **Web Dashboard / Electron UI**
    - 需確保 `src/web/server.js`、`src/web/public/main.js` 與 `src/electron/renderer.js` 的節點快照、遙測統計與計數邏輯保持同步。
    - 若新增事件或 UI 欄位，請同步擴充 Bridge (`telemetry` / `node` 事件 payload) 及三端 renderer 的處理函式。
+   - 遙測節點輸入框同時負責下拉選單與搜尋，調整時需維護 `refreshTelemetrySelectors()` / `handleTelemetryNodeInputChange()` 的對應行為與 datalist 更新。
 
 3. **APR S Flow**
    - Flow 以 `flowId` 辨識（`summary.timestampMs + random`）；APR S uplink 後 `aprs-uplink` 事件會附帶 flowId，GUI/Web 用以染色、顯示呼號。
@@ -308,6 +326,8 @@ npx pkg src/index.js --targets node18-linux-x64
      - Meshtastic 斷線 → 自動重連
      - APRS 成功登入、keepalive、上傳封包
      - Web Dashboard 開啟後是否與 GUI 數值一致
+      - 節點資料庫搜尋、線上統計與距離是否合理（特別是 Provision 座標缺失或為 0,0 情境）
+      - 遙測節點輸入框在「選取節點」與「純搜尋」兩種使用方式下渲染結果是否一致
 9. **遙測資料**
   - 若需清空歷史記錄，請使用 GUI/Web 的「清空遙測數據」或手動刪除 `callmesh/telemetry-records.jsonl`；
   - 調整每節點快取上限可修改 `CallMeshAprsBridge` 建構子參數 `telemetryMaxEntriesPerNode`；

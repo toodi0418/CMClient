@@ -49,6 +49,7 @@
       <nav class="main-nav">
         <button type="button" class="nav-btn active" data-target="summary-page">封包摘要</button>
         <button type="button" class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
+        <button type="button" class="nav-btn" data-target="nodes-page">節點資料庫</button>
         <button type="button" class="nav-btn" data-target="telemetry-page">遙測數據</button>
         <button type="button" class="nav-btn" data-target="log-page">系統日誌</button>
       </nav>
@@ -135,14 +136,54 @@
         </section>
       </section>
 
+      <section id="nodes-page" class="page">
+        <article class="nodes-panel">
+          <header class="nodes-header">
+            <div>
+              <h2>節點資料庫</h2>
+              <p class="nodes-subtitle">顯示目前快取的 Mesh 節點資訊。</p>
+            </div>
+            <div class="nodes-actions">
+              <span class="nodes-count">節點數：<strong id="nodes-total-count">0</strong></span>
+              <span class="nodes-online">線上 (1 小時內)：<strong id="nodes-online-count">0</strong><span id="nodes-online-total" class="nodes-online-total"></span></span>
+            </div>
+          </header>
+          <div class="nodes-search-row">
+            <input id="nodes-search" type="search" placeholder="搜尋節點名稱、Mesh ID 或角色" disabled />
+          </div>
+          <small id="nodes-status" class="nodes-status"></small>
+          <div id="nodes-empty-state" class="nodes-empty">目前沒有節點資料。</div>
+          <div id="nodes-table-wrapper" class="table-wrapper hidden">
+            <table class="nodes-table">
+              <thead>
+                <tr>
+                  <th>節點</th>
+                  <th>Mesh ID</th>
+                  <th>型號</th>
+                  <th>角色</th>
+                  <th>距離</th>
+                  <th>最後出現</th>
+                </tr>
+              </thead>
+              <tbody id="nodes-table-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
       <section id="telemetry-page" class="page">
         <article class="telemetry-panel">
           <header class="telemetry-header">
             <div class="telemetry-controls">
-              <label for="telemetry-node-select">節點</label>
-              <select id="telemetry-node-select" disabled>
-                <option value="" selected>尚未收到遙測資料</option>
-              </select>
+              <label for="telemetry-node-input">節點</label>
+              <input
+                id="telemetry-node-input"
+                type="search"
+                placeholder="輸入節點 Mesh ID 或搜尋關鍵字"
+                autocomplete="off"
+                disabled
+              />
+              <div id="telemetry-node-dropdown" class="telemetry-node-dropdown hidden"></div>
             </div>
             <div class="telemetry-controls">
               <label for="telemetry-range-select">區間</label>

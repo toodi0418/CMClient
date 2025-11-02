@@ -27,6 +27,110 @@ const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
 
+const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
+
+function extractEnumBlock(source, enumName) {
+  const enumIndex = source.indexOf(`enum ${enumName}`);
+  if (enumIndex === -1) {
+    return '';
+  }
+  const braceStart = source.indexOf('{', enumIndex);
+  if (braceStart === -1) {
+    return '';
+  }
+  let depth = 1;
+  let cursor = braceStart + 1;
+  while (cursor < source.length && depth > 0) {
+    const char = source[cursor];
+    if (char === '{') {
+      depth += 1;
+    } else if (char === '}') {
+      depth -= 1;
+    }
+    cursor += 1;
+  }
+  if (depth !== 0) {
+    return '';
+  }
+  return source.slice(braceStart + 1, cursor - 1);
+}
+
+function buildEnumMap(relativePath, enumName) {
+  const map = Object.create(null);
+  try {
+    const protoPath = path.resolve(PROTO_DIR, relativePath);
+    const content = fsSync.readFileSync(protoPath, 'utf8');
+    const block = extractEnumBlock(content, enumName);
+    if (!block) {
+      return map;
+    }
+    const lines = block.split('\n');
+    for (const line of lines) {
+      const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(\d+)/);
+      if (match) {
+        const [, label, number] = match;
+        map[Number(number)] = label;
+      }
+    }
+  } catch (err) {
+    console.warn(`無法解析枚舉 ${enumName}: ${err.message}`);
+  }
+  return map;
+}
+
+const HARDWARE_MODEL_ENUM = buildEnumMap(path.join('meshtastic', 'mesh.proto'), 'HardwareModel');
+const DEVICE_ROLE_ENUM = buildEnumMap(path.join('meshtastic', 'config.proto'), 'Role');
+
+function formatEnumLabel(value) {
+  if (!value) return '';
+  return String(value).replace(/_/g, ' ').trim();
+}
+
+function resolveEnum(map, value) {
+  if (value === undefined || value === null) {
+    return { code: null, label: null };
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return { code: null, label: null };
+    }
+    const upper = trimmed.toUpperCase();
+    return {
+      code: upper,
+      label: formatEnumLabel(upper) || upper
+    };
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    const fallback = String(value);
+    return {
+      code: fallback,
+      label: formatEnumLabel(fallback) || fallback
+    };
+  }
+  const code = map[numeric];
+  if (!code) {
+    const fallback = String(numeric);
+    return {
+      code: fallback,
+      label: `未知 (${fallback})`
+    };
+  }
+  return {
+    code,
+    label: formatEnumLabel(code) || code
+  };
+}
+
+function resolveHardwareModel(value) {
+  return resolveEnum(HARDWARE_MODEL_ENUM, value);
+}
+
+function resolveDeviceRole(value) {
+  return resolveEnum(DEVICE_ROLE_ENUM, value);
+}
+
 class CallMeshAprsBridge extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -86,6 +190,8 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsLastPositionDigest = new Map();
     this.aprsSkippedMeshIds = new Set();
     this.nodeDatabase = nodeDatabase;
+    this.nodeDatabasePersistTimer = null;
+    this.nodeDatabasePersistDelayMs = 250;
 
     this.telemetryBuckets = new Map();
     this.telemetryStore = new Map();
@@ -122,6 +228,7 @@ class CallMeshAprsBridge extends EventEmitter {
     await this.restoreArtifacts({ allowRestore });
     await this.restoreTelemetryState();
     await this.loadTelemetryStore();
+    await this.restoreNodeDatabase();
     this.emitState();
   }
 
@@ -139,6 +246,109 @@ class CallMeshAprsBridge extends EventEmitter {
     return this.nodeDatabase.list();
   }
 
+  clearNodeDatabase() {
+    const cleared = this.nodeDatabase.clear();
+    this.scheduleNodeDatabasePersist();
+    this.emitLog('NODE-DB', `cleared node database count=${cleared}`);
+    return {
+      cleared,
+      nodes: this.nodeDatabase.list()
+    };
+  }
+
+  getNodeDatabaseFilePath() {
+    return path.join(this.storageDir, 'node-database.json');
+  }
+
+  async restoreNodeDatabase() {
+    if (!this.storageDir) {
+      return;
+    }
+    try {
+      const filePath = this.getNodeDatabaseFilePath();
+      const content = await fs.readFile(filePath, 'utf8');
+      const payload = JSON.parse(content);
+      const entries = Array.isArray(payload?.nodes)
+        ? payload.nodes
+        : Array.isArray(payload)
+          ? payload
+          : [];
+      const restored = this.nodeDatabase.replace(entries);
+      if (restored.length) {
+        this.emitLog('NODE-DB', `restored ${restored.length} nodes from disk`);
+      }
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') {
+        console.warn('載入節點資料庫失敗:', err);
+      }
+    }
+  }
+
+  scheduleNodeDatabasePersist() {
+    if (!this.storageDir) {
+      return;
+    }
+    if (this.nodeDatabasePersistTimer) {
+      return;
+    }
+    this.nodeDatabasePersistTimer = setTimeout(() => {
+      this.nodeDatabasePersistTimer = null;
+      this.persistNodeDatabase().catch((err) => {
+        console.error('寫入節點資料庫失敗:', err);
+      });
+    }, this.nodeDatabasePersistDelayMs);
+    this.nodeDatabasePersistTimer.unref?.();
+  }
+
+  cancelNodeDatabasePersist() {
+    if (this.nodeDatabasePersistTimer) {
+      clearTimeout(this.nodeDatabasePersistTimer);
+      this.nodeDatabasePersistTimer = null;
+    }
+  }
+
+  async persistNodeDatabase({ sync = false } = {}) {
+    if (!this.storageDir) {
+      return;
+    }
+    const snapshot = this.nodeDatabase.serialize();
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      nodes: snapshot
+    };
+    const filePath = this.getNodeDatabaseFilePath();
+    const dir = path.dirname(filePath);
+    if (sync) {
+      try {
+        fsSync.mkdirSync(dir, { recursive: true });
+        fsSync.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+      } catch (err) {
+        console.error('寫入節點資料庫失敗:', err);
+      }
+      return;
+    }
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf8');
+    } catch (err) {
+      console.error('寫入節點資料庫失敗:', err);
+    }
+  }
+
+  flushNodeDatabasePersistSync() {
+    if (!this.storageDir) {
+      return;
+    }
+    this.cancelNodeDatabasePersist();
+    const maybePromise = this.persistNodeDatabase({ sync: true });
+    if (maybePromise && typeof maybePromise.catch === 'function') {
+      maybePromise.catch((err) => {
+        console.error('寫入節點資料庫失敗:', err);
+      });
+    }
+  }
+
   setSelfMeshId(meshId) {
     this.selfMeshId = normalizeMeshId(meshId);
   }
@@ -153,12 +363,35 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!normalized) {
       return null;
     }
+    const parseNumber = (value) => {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const position = node.position ?? node.gps ?? node.location ?? null;
+    const latitude = parseNumber(
+      node.latitude ?? node.lat ?? position?.latitude ?? position?.lat
+    );
+    const longitude = parseNumber(
+      node.longitude ?? node.lon ?? position?.longitude ?? position?.lon
+    );
+    const altitude = parseNumber(
+      node.altitude ?? node.alt ?? position?.altitude ?? position?.alt
+    );
+    const hwModelRaw = node.hwModel ?? node.hw_model ?? null;
+    const roleRaw = node.role ?? null;
+    const hwModelInfo = resolveHardwareModel(hwModelRaw);
+    const roleInfo = resolveDeviceRole(roleRaw);
     const info = {
       meshIdOriginal: meshIdCandidate ?? null,
       shortName: node.shortName ?? node.short_name ?? null,
       longName: node.longName ?? node.long_name ?? null,
-      hwModel: node.hwModel ?? node.hw_model ?? null,
-      role: node.role ?? null,
+      hwModel: hwModelInfo.code ?? (hwModelRaw != null ? String(hwModelRaw) : null),
+      hwModelLabel: hwModelInfo.label ?? null,
+      role: roleInfo.code ?? (roleRaw != null ? String(roleRaw) : null),
+      roleLabel: roleInfo.label ?? null,
+      latitude,
+      longitude,
+      altitude,
       lastSeenAt: Number.isFinite(timestamp) ? Number(timestamp) : Date.now()
     };
     const result = this.nodeDatabase.upsert(normalized, info);
@@ -168,11 +401,17 @@ class CallMeshAprsBridge extends EventEmitter {
         shortName: result.node.shortName,
         longName: result.node.longName,
         hwModel: result.node.hwModel,
+        hwModelLabel: result.node.hwModelLabel,
         role: result.node.role,
+        roleLabel: result.node.roleLabel,
+        latitude: result.node.latitude,
+        longitude: result.node.longitude,
+        altitude: result.node.altitude,
         label: buildNodeLabel(result.node),
         lastSeenAt: result.node.lastSeenAt
       };
       this.emit('node', payload);
+      this.scheduleNodeDatabasePersist();
     }
     return result.node;
   }
@@ -298,6 +537,7 @@ class CallMeshAprsBridge extends EventEmitter {
     await fs.rm(this.getMappingFilePath(), { force: true });
     await fs.rm(this.getProvisionFilePath(), { force: true });
     await fs.rm(this.getTelemetryStateFilePath(), { force: true });
+    await fs.rm(this.getNodeDatabaseFilePath(), { force: true });
     this.callmeshState.lastMappingHash = null;
     this.callmeshState.lastMappingSyncedAt = null;
     this.callmeshState.provision = null;
@@ -309,6 +549,8 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsTelemetrySequence = 0;
     this.aprsLastTelemetryAt = 0;
     this.aprsLastTelemetryDataAt = 0;
+    this.nodeDatabase.clear();
+    this.scheduleNodeDatabasePersist();
     await this.clearTelemetryStore({ silent: false });
     this.emitLog('CALLMESH', 'cleared local mapping/provision cache');
     this.updateAprsProvision(null);
@@ -520,7 +762,23 @@ class CallMeshAprsBridge extends EventEmitter {
     if (summary.nextHop) candidates.push(summary.nextHop);
     for (const node of candidates) {
       if (!node || typeof node !== 'object') continue;
-      const merged = this.upsertNodeInfo(node, { timestamp: timestampMs });
+      let sourceNode = node;
+      if (summary.type === 'Position' && summary.position && node === summary.from) {
+        const position = summary.position;
+        sourceNode = {
+          ...node,
+          position: {
+            ...(typeof node.position === 'object' && node.position ? node.position : {}),
+            latitude: position.latitude ?? position.lat ?? node.position?.latitude,
+            longitude: position.longitude ?? position.lon ?? node.position?.longitude,
+            altitude: position.altitude ?? position.alt ?? node.position?.altitude
+          },
+          latitude: node.latitude ?? position.latitude ?? position.lat ?? null,
+          longitude: node.longitude ?? position.longitude ?? position.lon ?? null,
+          altitude: node.altitude ?? position.altitude ?? position.alt ?? null
+        };
+      }
+      const merged = this.upsertNodeInfo(sourceNode, { timestamp: timestampMs });
       if (merged) {
         const enriched = mergeNodeInfo(node, merged);
         if (enriched) {
@@ -628,6 +886,7 @@ class CallMeshAprsBridge extends EventEmitter {
   destroy() {
     this.stopHeartbeatLoop();
     this.teardownAprsConnection();
+    this.flushNodeDatabasePersistSync();
   }
 
   // Internal helpers
@@ -1776,7 +2035,12 @@ function mergeNodeInfo(...sources) {
     shortName: null,
     longName: null,
     hwModel: null,
+    hwModelLabel: null,
     role: null,
+    roleLabel: null,
+    latitude: null,
+    longitude: null,
+    altitude: null,
     raw: null,
     lastSeenAt: null
   };
@@ -1794,6 +2058,45 @@ function mergeNodeInfo(...sources) {
           result[key] = value;
           hasValue = true;
         }
+        if (key === 'lastSeenAt' && Number.isFinite(value)) {
+          result.lastSeenAt = Number(value);
+        }
+      }
+      const position = item.position ?? item.gps ?? item.location ?? null;
+      if (position && typeof position === 'object') {
+        if (Number.isFinite(position.latitude)) {
+          result.latitude = Number(position.latitude);
+          hasValue = true;
+        }
+        if (Number.isFinite(position.longitude)) {
+          result.longitude = Number(position.longitude);
+          hasValue = true;
+        }
+        if (Number.isFinite(position.altitude)) {
+          result.altitude = Number(position.altitude);
+          hasValue = true;
+        }
+      }
+      if (item.latitude != null) {
+        const numeric = Number(item.latitude);
+        if (Number.isFinite(numeric)) {
+          result.latitude = numeric;
+          hasValue = true;
+        }
+      }
+      if (item.longitude != null) {
+        const numeric = Number(item.longitude);
+        if (Number.isFinite(numeric)) {
+          result.longitude = numeric;
+          hasValue = true;
+        }
+      }
+      if (item.altitude != null) {
+        const numeric = Number(item.altitude);
+        if (Number.isFinite(numeric)) {
+          result.altitude = numeric;
+          hasValue = true;
+        }
       }
     }
   }
@@ -1802,6 +2105,37 @@ function mergeNodeInfo(...sources) {
   }
   if (!result.meshId && result.meshIdNormalized) {
     result.meshId = result.meshIdNormalized;
+  }
+  if (result.hwModel && !result.hwModelLabel) {
+    const resolved = resolveHardwareModel(result.hwModel);
+    result.hwModel = resolved.code ?? result.hwModel;
+    result.hwModelLabel = resolved.label ?? result.hwModelLabel ?? null;
+  }
+  if (result.role && !result.roleLabel) {
+    const resolvedRole = resolveDeviceRole(result.role);
+    result.role = resolvedRole.code ?? result.role;
+    result.roleLabel = resolvedRole.label ?? result.roleLabel ?? null;
+  }
+  if (!Number.isFinite(result.latitude) || Math.abs(result.latitude) > 90) {
+    result.latitude = null;
+  }
+  if (!Number.isFinite(result.longitude) || Math.abs(result.longitude) > 180) {
+    result.longitude = null;
+  }
+  if (
+    result.latitude !== null &&
+    result.longitude !== null &&
+    Math.abs(result.latitude) < 1e-6 &&
+    Math.abs(result.longitude) < 1e-6
+  ) {
+    result.latitude = null;
+    result.longitude = null;
+  }
+  if (!Number.isFinite(result.altitude)) {
+    result.altitude = null;
+  }
+  if (result.latitude === null || result.longitude === null) {
+    result.altitude = null;
   }
   if (!result.label) {
     result.label = buildNodeLabel(result);
