@@ -238,6 +238,14 @@ function sendTelemetryUpdate(payload) {
   webServer?.publishTelemetry(payload);
 }
 
+function sendNodeInfo(payload) {
+  if (!payload) return;
+  if (mainWindow) {
+    mainWindow.webContents.send('meshtastic:node', payload);
+  }
+  webServer?.publishNode(payload);
+}
+
 async function syncWebTelemetrySnapshot() {
   if (!bridge || !webServer || typeof bridge.getTelemetrySnapshot !== 'function') {
     return;
@@ -271,6 +279,12 @@ async function createWindow() {
   if (lastCallmeshStateSnapshot) {
     sendCallmeshStateToRenderer(lastCallmeshStateSnapshot);
   }
+  if (bridge) {
+    const nodes = bridge.getNodeSnapshot();
+    if (Array.isArray(nodes)) {
+      mainWindow.webContents.send('meshtastic:node-snapshot', nodes);
+    }
+  }
 }
 
 function setupBridgeListeners() {
@@ -279,6 +293,7 @@ function setupBridgeListeners() {
   bridge.removeAllListeners('log');
   bridge.removeAllListeners('aprs-uplink');
   bridge.removeAllListeners('telemetry');
+  bridge.removeAllListeners('node');
 
   bridge.on('state', (state) => {
     lastCallmeshStateSnapshot = state;
@@ -295,6 +310,10 @@ function setupBridgeListeners() {
 
   bridge.on('telemetry', (payload) => {
     sendTelemetryUpdate(payload);
+  });
+
+  bridge.on('node', (payload) => {
+    sendNodeInfo(payload);
   });
 }
 
@@ -441,6 +460,10 @@ async function ensureWebDashboardState() {
         const snapshotPayload = toRendererCallmeshState(lastCallmeshStateSnapshot);
         webServer?.publishCallmesh(snapshotPayload);
       }
+      if (bridge) {
+        const nodes = bridge.getNodeSnapshot();
+        webServer?.seedNodeSnapshot(nodes);
+      }
       await syncWebTelemetrySnapshot();
     }
   } else {
@@ -492,6 +515,18 @@ function waitForInitialMeshtasticConnection(nativeClient, { timeoutMs = 15_000 }
 ipcMain.handle('app:get-info', async () => ({
   version: appVersion
 }));
+
+ipcMain.handle('nodes:get-snapshot', async () => {
+  if (!bridge) {
+    return [];
+  }
+  try {
+    return bridge.getNodeSnapshot();
+  } catch (err) {
+    console.error('取得節點快照失敗:', err);
+    return [];
+  }
+});
 
 ipcMain.handle('app:get-preferences', async () => {
   try {

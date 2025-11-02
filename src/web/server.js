@@ -102,6 +102,12 @@ class WebDashboardServer {
     this.telemetryStore = new Map();
     this.telemetryRecordIds = new Set();
     this.telemetryUpdatedAt = null;
+    this.telemetryStats = {
+      totalRecords: 0,
+      totalNodes: 0,
+      diskBytes: 0
+    };
+    this.nodeRegistry = new Map();
   }
 
   async start() {
@@ -206,6 +212,7 @@ class WebDashboardServer {
     if (!payload || !payload.type) {
       return;
     }
+    this._applyTelemetryStatsPayload(payload.stats);
     if (payload.type === 'reset') {
       this.telemetryStore.clear();
       this.telemetryRecordIds.clear();
@@ -213,9 +220,10 @@ class WebDashboardServer {
         Number.isFinite(payload.updatedAt) && payload.updatedAt > 0
           ? Number(payload.updatedAt)
           : Date.now();
+      const stats = this._computeTelemetryStats();
       this._broadcast({
         type: 'telemetry-reset',
-        payload: { updatedAt: this.telemetryUpdatedAt }
+        payload: { updatedAt: this.telemetryUpdatedAt, stats }
       });
       return;
     }
@@ -236,13 +244,15 @@ class WebDashboardServer {
       Number.isFinite(payload.updatedAt) && payload.updatedAt > 0
         ? Number(payload.updatedAt)
         : Date.now();
+    const stats = this._computeTelemetryStats();
     this._broadcast({
       type: 'telemetry-append',
       payload: {
         meshId,
         node: nodeInfo,
         record,
-        updatedAt: this.telemetryUpdatedAt
+        updatedAt: this.telemetryUpdatedAt,
+        stats
       }
     });
   }
@@ -271,6 +281,8 @@ class WebDashboardServer {
       Number.isFinite(snapshot.updatedAt) && snapshot.updatedAt > 0
         ? Number(snapshot.updatedAt)
         : this.telemetryUpdatedAt ?? Date.now();
+    this._applyTelemetryStatsPayload(snapshot.stats);
+    this._computeTelemetryStats();
 
     if (this.clients.size) {
       this._broadcast({
@@ -417,6 +429,10 @@ class WebDashboardServer {
     if (this.lastAprsInfo) {
       this._write(res, { type: 'aprs', payload: this.lastAprsInfo });
     }
+    const nodeSnapshot = this._buildNodeSnapshot();
+    if (nodeSnapshot.length) {
+      this._write(res, { type: 'node-snapshot', payload: nodeSnapshot });
+    }
     this._write(res, {
       type: 'telemetry-snapshot',
       payload: this._buildTelemetrySnapshot()
@@ -428,31 +444,37 @@ class WebDashboardServer {
       return;
     }
     const key = String(meshId);
+    const normalizedMeshId = normalizeMeshId(meshId);
+    const sanitizedNode = node ? sanitizeTelemetryNode(node) : null;
+    let registryNode = null;
+    if (sanitizedNode && normalizedMeshId) {
+      registryNode = this._upsertNode({
+        ...sanitizedNode,
+        meshId: sanitizedNode.meshId ?? meshId,
+        meshIdNormalized: sanitizedNode.meshIdNormalized ?? normalizedMeshId
+      });
+    } else if (normalizedMeshId) {
+      registryNode = this.nodeRegistry.get(normalizedMeshId) || null;
+    }
     let bucket = this.telemetryStore.get(key);
+    const mergedNode = mergeNodeInfo(
+      bucket?.node || {},
+      sanitizedNode ? { ...sanitizedNode, meshId: sanitizedNode.meshId ?? meshId } : null,
+      record.node ? sanitizeTelemetryNode(record.node) : null,
+      registryNode
+    );
     if (!bucket) {
       bucket = {
         meshId: key,
-        node: node ? sanitizeTelemetryNode(node) : null,
+        node: mergedNode,
         records: []
       };
       this.telemetryStore.set(key, bucket);
-    } else if (node) {
-      const sanitizedNode = sanitizeTelemetryNode(node);
-      if (sanitizedNode) {
-        bucket.node = {
-          ...(bucket.node || {}),
-          ...sanitizedNode
-        };
-      }
+    } else if (mergedNode) {
+      bucket.node = mergedNode;
     }
-    if (record.node) {
-      const recordNode = sanitizeTelemetryNode(record.node);
-      if (recordNode) {
-        bucket.node = {
-          ...(bucket.node || {}),
-          ...recordNode
-        };
-      }
+    if (mergedNode) {
+      record.node = mergeNodeInfo(record.node ? sanitizeTelemetryNode(record.node) : {}, mergedNode);
     }
     if (record.id) {
       this.telemetryRecordIds.add(record.id);
@@ -495,10 +517,99 @@ class WebDashboardServer {
       if (labelA > labelB) return 1;
       return 0;
     });
+    const stats = this._computeTelemetryStats();
     return {
       updatedAt: this.telemetryUpdatedAt,
-      nodes
+      nodes,
+      stats
     };
+  }
+
+  _applyTelemetryStatsPayload(stats) {
+    if (!stats || typeof stats !== 'object') {
+      return;
+    }
+    if (Number.isFinite(stats.diskBytes)) {
+      this.telemetryStats.diskBytes = Number(stats.diskBytes);
+    }
+  }
+
+  _computeTelemetryStats() {
+    let totalRecords = 0;
+    for (const bucket of this.telemetryStore.values()) {
+      if (!bucket || !Array.isArray(bucket.records)) continue;
+      totalRecords += bucket.records.length;
+    }
+    const totalNodes = this.telemetryStore.size;
+    const diskBytes = Number.isFinite(this.telemetryStats.diskBytes) ? this.telemetryStats.diskBytes : 0;
+    this.telemetryStats = {
+      totalRecords,
+      totalNodes,
+      diskBytes
+    };
+    return { ...this.telemetryStats };
+  }
+
+  publishNode(info) {
+    const merged = this._upsertNode(info);
+    if (!merged) {
+      return;
+    }
+    this._broadcast({ type: 'node', payload: merged });
+  }
+
+  seedNodeSnapshot(list = []) {
+    this.nodeRegistry.clear();
+    const snapshot = [];
+    if (Array.isArray(list)) {
+      for (const entry of list) {
+        const merged = this._upsertNode(entry);
+        if (merged) {
+          snapshot.push(merged);
+        }
+      }
+    }
+    const payload = snapshot.length ? snapshot : this._buildNodeSnapshot();
+    if (this.clients.size) {
+      this._broadcast({ type: 'node-snapshot', payload });
+    }
+  }
+
+  _buildNodeSnapshot() {
+    const nodes = [];
+    for (const value of this.nodeRegistry.values()) {
+      nodes.push(cloneJson(value));
+    }
+    nodes.sort((a, b) => {
+      const labelA = (a.label || a.longName || a.shortName || a.meshId || '').toLowerCase();
+      const labelB = (b.label || b.longName || b.shortName || b.meshId || '').toLowerCase();
+      if (labelA < labelB) return -1;
+      if (labelA > labelB) return 1;
+      return 0;
+    });
+    return nodes;
+  }
+
+  _upsertNode(info) {
+    if (!info || typeof info !== 'object') {
+      return null;
+    }
+    const candidate = info.meshId || info.meshIdNormalized || info.meshIdOriginal;
+    const normalized = normalizeMeshId(candidate);
+    if (!normalized) {
+      return null;
+    }
+    const existing = this.nodeRegistry.get(normalized) || {
+      meshId: normalized,
+      meshIdNormalized: normalized
+    };
+    const merged = mergeNodeInfo(existing, {
+      ...info,
+      meshIdNormalized: normalized,
+      meshId: info.meshId || existing.meshId || normalized
+    });
+    this.nodeRegistry.set(normalized, merged);
+    return cloneJson(merged);
   }
 
   _broadcast(event) {
@@ -616,6 +727,71 @@ function normalizeMeshId(meshId) {
     value = value.slice(2);
   }
   return value.toLowerCase();
+}
+
+function buildNodeLabel(node) {
+  if (!node || typeof node !== 'object') return null;
+  const name = node.longName || node.shortName || null;
+  const meshLabel = node.meshIdOriginal || node.meshId || node.meshIdNormalized || null;
+  if (name && meshLabel) {
+    return `${name} (${meshLabel})`;
+  }
+  return name || meshLabel || null;
+}
+
+function mergeNodeInfo(existing = {}, incoming = {}) {
+  const result = {
+    meshId: existing.meshId ?? null,
+    meshIdOriginal: existing.meshIdOriginal ?? null,
+    meshIdNormalized: existing.meshIdNormalized ?? null,
+    shortName: existing.shortName ?? null,
+    longName: existing.longName ?? null,
+    hwModel: existing.hwModel ?? null,
+    role: existing.role ?? null,
+    label: existing.label ?? null,
+    lastSeenAt: existing.lastSeenAt ?? null
+  };
+  const sources = Array.isArray(incoming) ? incoming : [incoming];
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue;
+    if (source.meshIdNormalized) {
+      result.meshIdNormalized = source.meshIdNormalized;
+    }
+    if (source.meshIdOriginal) {
+      result.meshIdOriginal = source.meshIdOriginal;
+    }
+    if (source.meshId) {
+      result.meshId = source.meshId;
+    }
+    if (source.shortName != null) {
+      result.shortName = source.shortName;
+    }
+    if (source.longName != null) {
+      result.longName = source.longName;
+    }
+    if (source.hwModel != null) {
+      result.hwModel = source.hwModel;
+    }
+    if (source.role != null) {
+      result.role = source.role;
+    }
+    if (source.lastSeenAt != null && Number.isFinite(source.lastSeenAt)) {
+      result.lastSeenAt = Number(source.lastSeenAt);
+    }
+    if (source.label) {
+      result.label = source.label;
+    }
+  }
+  if (!result.meshId && result.meshIdNormalized) {
+    result.meshId = result.meshIdNormalized;
+  }
+  if (!result.meshIdNormalized && result.meshId) {
+    result.meshIdNormalized = normalizeMeshId(result.meshId);
+  }
+  if (!result.label) {
+    result.label = buildNodeLabel(result);
+  }
+  return result;
 }
 function sanitizeCallmeshProvision(provision) {
   if (!provision || typeof provision !== 'object') {

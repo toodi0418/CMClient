@@ -35,6 +35,9 @@
   const telemetryChartsContainer = document.getElementById('telemetry-charts');
   const telemetryTableWrapper = document.getElementById('telemetry-table-wrapper');
   const telemetryTableBody = document.getElementById('telemetry-table-body');
+  const telemetryStatsRecords = document.getElementById('telemetry-stats-records');
+  const telemetryStatsNodes = document.getElementById('telemetry-stats-nodes');
+  const telemetryStatsDisk = document.getElementById('telemetry-stats-disk');
 
   const summaryRows = [];
   const flowRowMap = new Map();
@@ -64,6 +67,8 @@
   let telemetryChartMode = 'all';
   let telemetryChartMetric = null;
   let telemetryUpdatedAt = null;
+  const nodeRegistry = new Map();
+  let nodeSnapshotLoaded = false;
   const TELEMETRY_TABLE_LIMIT = 200;
   const TELEMETRY_CHART_LIMIT = 200;
   const TELEMETRY_MAX_LOCAL_RECORDS = 500;
@@ -122,6 +127,165 @@
     const days = Math.floor(hours / 24);
     if (days < 7) return `${days} 天前`;
     return date.toLocaleString();
+  }
+
+  function formatBytes(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return '—';
+    }
+    if (numeric === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const index = Math.min(Math.floor(Math.log10(numeric) / Math.log10(1024)), units.length - 1);
+    const scaled = numeric / 1024 ** index;
+    const formatted = scaled >= 100 ? scaled.toFixed(0) : scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2);
+    return `${formatted} ${units[index]}`;
+  }
+
+  function mergeNodeMetadata(...sources) {
+    const result = {
+      meshId: null,
+      meshIdOriginal: null,
+      meshIdNormalized: null,
+      shortName: null,
+      longName: null,
+      hwModel: null,
+      role: null,
+      label: null
+    };
+    let hasValue = false;
+    for (const source of sources) {
+      if (!source || typeof source !== 'object') continue;
+      const items = Array.isArray(source) ? source : [source];
+      for (const item of items) {
+        if (!item || typeof item !== 'object') continue;
+        if (item.meshIdNormalized) {
+          result.meshIdNormalized = item.meshIdNormalized;
+          hasValue = true;
+        }
+        if (item.meshIdOriginal) {
+          result.meshIdOriginal = item.meshIdOriginal;
+          hasValue = true;
+        }
+        if (item.meshId) {
+          result.meshId = item.meshId;
+          hasValue = true;
+        }
+        if (item.shortName != null) {
+          result.shortName = item.shortName;
+          hasValue = true;
+        }
+        if (item.longName != null) {
+          result.longName = item.longName;
+          hasValue = true;
+        }
+        if (item.hwModel != null) {
+          result.hwModel = item.hwModel;
+          hasValue = true;
+        }
+        if (item.role != null) {
+          result.role = item.role;
+          hasValue = true;
+        }
+        if (item.label) {
+          result.label = item.label;
+          hasValue = true;
+        }
+      }
+    }
+    if (!hasValue) {
+      return null;
+    }
+    if (!result.meshIdNormalized && result.meshId) {
+      result.meshIdNormalized = normalizeMeshId(result.meshId);
+    }
+    if (!result.meshId && result.meshIdNormalized) {
+      result.meshId = result.meshIdNormalized;
+    }
+    if (!result.label) {
+      const name = result.longName || result.shortName || null;
+      const meshLabel = result.meshIdOriginal || result.meshId || result.meshIdNormalized || null;
+      result.label = name && meshLabel ? `${name} (${meshLabel})` : name || meshLabel || null;
+    }
+    return result;
+  }
+
+  function upsertNodeRegistry(entry) {
+    if (!entry || typeof entry !== 'object') return null;
+    const candidate = entry.meshId || entry.meshIdNormalized || entry.meshIdOriginal;
+    const normalized = normalizeMeshId(candidate);
+    if (!normalized) return null;
+    const existing = nodeRegistry.get(normalized) || {};
+    const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
+    if (merged) {
+      nodeRegistry.set(normalized, merged);
+      updateTelemetryNodesWithRegistry(normalized, merged);
+    }
+    return merged;
+  }
+
+  function applyNodeSnapshot(list) {
+    nodeRegistry.clear();
+    if (Array.isArray(list)) {
+      for (const entry of list) {
+        upsertNodeRegistry(entry);
+      }
+    }
+    nodeSnapshotLoaded = true;
+    refreshSummaryMappingHighlights();
+    refreshFlowEntryLabels();
+    renderFlowEntries();
+    refreshTelemetrySelectors();
+    renderTelemetryView();
+  }
+
+  function handleNodeUpdate(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const merged = upsertNodeRegistry(payload);
+    if (!merged) return;
+    refreshSummaryMappingHighlights();
+    refreshFlowEntryLabels();
+    renderFlowEntries();
+    refreshTelemetrySelectors();
+    renderTelemetryView();
+  }
+
+  function getRegistryNode(meshId) {
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) return null;
+    const entry = nodeRegistry.get(normalized);
+    return entry ? { ...entry } : null;
+  }
+
+  function updateTelemetryNodesWithRegistry(normalizedMeshId, registryInfo) {
+    if (!normalizedMeshId || !registryInfo) return;
+    const bucketKey = resolveTelemetryMeshKey(normalizedMeshId);
+    const bucket = telemetryStore.get(bucketKey);
+    if (bucket) {
+      bucket.node = mergeNodeMetadata(bucket.node, registryInfo);
+      if (Array.isArray(bucket.records)) {
+        for (const record of bucket.records) {
+          record.node = mergeNodeMetadata(record.node, registryInfo);
+        }
+      }
+    }
+  }
+
+  function updateTelemetryStats(stats) {
+    if (!telemetryStatsRecords || !telemetryStatsNodes || !telemetryStatsDisk) {
+      return;
+    }
+    if (!stats) {
+      telemetryStatsRecords.textContent = '0';
+      telemetryStatsNodes.textContent = '0';
+      telemetryStatsDisk.textContent = '—';
+      return;
+    }
+    const totalRecords = Number.isFinite(stats.totalRecords) ? stats.totalRecords : 0;
+    const totalNodes = Number.isFinite(stats.totalNodes) ? stats.totalNodes : nodeRegistry.size;
+    telemetryStatsRecords.textContent = totalRecords.toLocaleString();
+    telemetryStatsNodes.textContent = totalNodes.toLocaleString();
+    telemetryStatsDisk.textContent = formatBytes(stats.diskBytes);
   }
 
   function decodePhg(value) {
@@ -383,15 +547,18 @@
     if (!node || typeof node !== 'object') {
       return null;
     }
-    return {
+    const base = {
       label: node.label ?? null,
       meshId: node.meshId ?? null,
-      meshIdNormalized: node.meshIdNormalized ?? null,
+      meshIdOriginal: node.meshIdOriginal ?? node.meshId ?? null,
+      meshIdNormalized: node.meshIdNormalized ?? normalizeMeshId(node.meshId),
       shortName: node.shortName ?? null,
       longName: node.longName ?? null,
       hwModel: node.hwModel ?? null,
       role: node.role ?? null
     };
+    const registry = getRegistryNode(base.meshIdNormalized || base.meshId);
+    return mergeNodeMetadata(base, registry);
   }
 
   function formatTelemetryNodeLabel(meshId, node) {
@@ -471,14 +638,19 @@
       bucket.rawMeshId = rawMeshId;
     }
     const nodeInfo = sanitizeTelemetryNodeData(node) || sanitizeTelemetryNodeData(record.node);
-    if (nodeInfo) {
-      bucket.node = {
-        ...(bucket.node || {}),
-        ...nodeInfo
-      };
-    }
-    if (record.node) {
+    const registryNode = getRegistryNode(rawMeshId || meshKey);
+    const mergedNode = mergeNodeMetadata(bucket.node, nodeInfo, registryNode, {
+      meshId: rawMeshId || meshKey,
+      meshIdNormalized: normalizeMeshId(rawMeshId || meshKey)
+    });
+    if (mergedNode) {
+      bucket.node = mergedNode;
+      record.node = mergeNodeMetadata(record.node ? sanitizeTelemetryNodeData(record.node) : null, mergedNode);
+    } else if (record.node) {
       record.node = sanitizeTelemetryNodeData(record.node);
+    }
+    if (mergedNode && mergedNode.meshIdNormalized) {
+      upsertNodeRegistry(mergedNode);
     }
     record.meshId = record.meshId ?? key;
     record.rawMeshId = rawMeshId || record.rawMeshId || null;
@@ -1369,6 +1541,7 @@
     }
     renderTelemetryView();
     updateTelemetryUpdatedAtLabel();
+    updateTelemetryStats(snapshot.stats);
   }
 
   function handleTelemetryAppend(payload) {
@@ -1401,6 +1574,7 @@
       renderTelemetryView();
     }
     updateTelemetryUpdatedAtLabel();
+    updateTelemetryStats(payload.stats);
   }
 
   function handleTelemetryReset(payload) {
@@ -1418,6 +1592,7 @@
     refreshTelemetrySelectors();
     renderTelemetryView();
     updateTelemetryUpdatedAtLabel();
+    updateTelemetryStats(payload.stats);
   }
 
   function formatHops(hops) {
@@ -1739,6 +1914,11 @@
     if (!summary.selfMeshId && currentSelfMeshId) {
       summary.selfMeshId = currentSelfMeshId;
     }
+
+    if (summary.from) upsertNodeRegistry(summary.from);
+    if (summary.to) upsertNodeRegistry(summary.to);
+    if (summary.relay) upsertNodeRegistry(summary.relay);
+    if (summary.nextHop) upsertNodeRegistry(summary.nextHop);
 
     const row = createSummaryRow(summary);
     row.__summaryData = summary;
@@ -2707,6 +2887,12 @@
             break;
           case 'aprs':
             markAprsUploaded(packet.payload);
+            break;
+          case 'node-snapshot':
+            applyNodeSnapshot(packet.payload);
+            break;
+          case 'node':
+            handleNodeUpdate(packet.payload);
             break;
           default:
             break;

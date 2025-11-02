@@ -667,6 +667,33 @@ tbody tr:hover {
   color: #8da2fb;
 }
 
+.telemetry-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: #cbd5f5;
+  font-size: 0.9rem;
+}
+
+.telemetry-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 88px;
+}
+
+.telemetry-stat .label {
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8da2fb;
+}
+
+.telemetry-stat .telemetry-stat-value {
+  font-family: 'JetBrains Mono', monospace;
+}
+
 .telemetry-empty {
   padding: 48px 20px;
   text-align: center;

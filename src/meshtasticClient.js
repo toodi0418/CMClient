@@ -778,6 +778,8 @@ class MeshtasticClient extends EventEmitter {
       meshId,
       shortName: entry?.shortName,
       longName: entry?.longName,
+      hwModel: entry?.hwModel ?? null,
+      role: entry?.role ?? null,
       raw: num
     };
   }
