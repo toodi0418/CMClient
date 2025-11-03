@@ -52,5 +52,17 @@ contextBridge.exposeInMainWorld('meshtastic', {
     return () => ipcRenderer.removeListener('telemetry:update', listener);
   },
   clearTelemetry: () => ipcRenderer.invoke('telemetry:clear'),
+  getNodeSnapshot: () => ipcRenderer.invoke('nodes:get-snapshot'),
+  clearNodeDatabase: () => ipcRenderer.invoke('nodes:clear'),
+  onNodeSnapshot: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('meshtastic:node-snapshot', listener);
+    return () => ipcRenderer.removeListener('meshtastic:node-snapshot', listener);
+  },
+  onNode: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('meshtastic:node', listener);
+    return () => ipcRenderer.removeListener('meshtastic:node', listener);
+  },
   setWebDashboardEnabled: (enabled) => ipcRenderer.invoke('web:set-enabled', Boolean(enabled))
 });

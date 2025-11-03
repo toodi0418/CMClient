@@ -1,4 +1,4 @@
-ㄕ# Meshtastic APRS Gateway (TMAG)
+# Meshtastic APRS Gateway (TMAG)
 
 TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合了 CallMesh 平台驗證、Mapping 同步、APRS uplink 與遙測統計。專案同時提供：
 
@@ -70,6 +70,25 @@ export CALLMESH_ARTIFACTS_DIR=~/.config/callmesh/
 
 ---
 
+### 更新到最新版本
+
+#### 透過原始碼部署（git clone）
+```bash
+cd CMClient
+git pull          # 取得最新程式
+npm install       # 套件若有更新會同步安裝
+```
+更新完成後即可照原流程啟動 `npm start` / `npm run desktop` 或重新執行 `npm run build:*` 產出新版套裝。
+
+#### 使用 Release 可攜版
+1. 前往最新 Release：<https://github.com/toodi0418/CMClient/releases>
+2. 下載目標平台的 ZIP（GUI 或 CLI）。
+3. 解壓後直接覆蓋舊版本或以全新資料夾啟動；設定檔（CallMesh API Key、Mapping artifacts）仍沿用原本位置。
+
+> 提醒：更新前請確認既有執行中的 CLI / GUI 已中止，避免 APRS uplink flowId 重複。
+
+---
+
 ### Raspberry Pi 快速部署
 
 樹莓派預設沒有 Node.js，可依下列步驟一次完成：
@@ -91,7 +110,7 @@ npm install
 
 # 匯入 CallMesh API Key 後直接啟動 CLI
 export CALLMESH_API_KEY="你的 Key"
-node src/index.js --host 127.0.0.1 --port 4403
+node src/index.js --host <節點ip> --port 4403
 ```
 
 若想在 Pi 上打包成單一執行檔，可再執行：
@@ -133,6 +152,8 @@ Options:
   -m, --max-length  允許的最大封包大小 (位元組)          [number] [default: 512]
   -r, --show-raw    在摘要輸出時同時列印 payload 十六進位
                                                       [boolean] [default: false]
+      --web-ui      啟用內建 Web Dashboard（預設關閉）
+                                                      [boolean] [default: false]
   -f, --format      輸出格式：summary 顯示表格，json 顯示完整資料
                                [choices: "summary", "json"] [default: "summary"]
   -p, --pretty      搭配 --format json 時使用縮排輸出  [boolean] [default: true]
@@ -146,6 +167,7 @@ Options:
 | `--port, -P` | `4403` | TCP 連接埠 |
 | `--format, -f` | `summary` | `summary` 表格、`json` 輸出完整 protobuf 內容 |
 | `--show-raw, -r` | `false` | 在 summary 下同時顯示十六進位 payload |
+| `--web-ui` | `false` | 啟用內建 Web Dashboard（HTTP + SSE 伺服器） |
 | `--discover` | - | 搜尋區網內 `_meshtastic._tcp` 裝置 |
 
 CLI 具備自動重連：若 TCP 連線中斷會每 30 秒重試一次，直到 `Ctrl+C` 終止。
@@ -251,4 +273,4 @@ CMClient/
 
 ## 10. 授權
 
-此專案依原作者設定的授權條款釋出；若需商用或替代授權，請聯絡 maintainer。たい
+此專案依原作者設定的授權條款釋出；若需商用或替代授權，請聯絡 maintainer。

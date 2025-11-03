@@ -1,315 +1,371 @@
-# Meshtastic Monitor & CallMesh Client 整合總覽
+# Meshtastic Monitor / CallMesh Client 交接手冊
 
-> 本文件用來交接專案背景、架構與作業指引，讓下一位開發者（Codex）可以「開箱即上手」。請務必完整閱讀，避免踩雷。
-
----
-
-## 1. 專案定位
-
-- 這是一個 **Meshtastic TCP Stream 監控器**，以 Node.js 撰寫，涵蓋 **CLI** 與 **Electron 桌面應用**。
-- 在 Meshtastic 之外，還整合了 **CallMesh 管理後台**：
-  - Heartbeat / Mapping API
-  - API Key 驗證（同步於 CLI 與 Electron）
-  - Key 未驗證時，整個系統必須鎖定。
-
-一句話交接話術：
-> 「這個工具是 Meshtastic 資料監控的瑞士刀，CallMesh API Key 就是唯一的開機鑰匙。沒有 Key，所有功能一律鎖死。幫我看緊這顆鑰匙。」
+> 本文件彙整專案背景、架構、模組行為與作業流程，供後續接手者快速上手。請在進行任何修改前完整閱讀，並依照文內指引操作。
 
 ---
 
-## 2. Repo 架構速覽
+## 0. 目前狀態更新（2025-11）
+
+- **Web Dashboard 事件精簡**：`callmesh` SSE payload 僅保留前端使用欄位（狀態、Mapping 摘要、Provision、APRS 狀態），敏感資訊如 `verifiedKey`、agent 字串已移除。
+- **CallMesh 狀態顯示調整**：GUI/Web 均以「正常／異常」兩態對外呈現；異常代表未驗證 Key 或處於 degraded。
+- **遙測圖表**：Chart.js Tooltip 會依實際最小差距動態套用小數位數，避免相同值因四捨五入看似變化；Y 軸／最新值同步採用此精度。
+- **Web Telemetry 初始同步**：Electron 啟動以及 API Key 驗證流程完成後，都會將最新遙測快照播送給 Web Server，確保頁面立即有資料。
+- **SSE 管線**：Electron 端每當遙測 `append/reset` 出現時，會同時廣播給 Renderer 與 Web Server，兩側資料來源一致。
+- **節點資料庫**：新增 `src/nodeDatabase.js`，集中維護 Mesh 節點的長名稱、模型、角色與最後出現時間；CLI、Electron、Web 均透過 Bridge 發佈 `node` / `node-snapshot` 事件使用同一份資料。
+- **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.jsonl` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
+- **CLI 旗標**：預設關閉 Web UI；若需啟動可加上 `--web-ui`。Electron 亦可透過設定頁切換，或以 `TMAG_WEB_DASHBOARD` 強制指定。
+
+## 1. 專案定位與核心價值
+
+- 以 **Node.js** 打造的 **Meshtastic TCP Stream 監控工具**，同時提供 **CLI**、**Electron 桌面應用**與 **輕量級 Web Dashboard**。
+- 整合 **CallMesh 後台**：API Key 驗證、Heartbeat、Mapping/Provision 同步，以及 APRS Gateway。
+- 核心精神：「**CallMesh API Key 是唯一開機鑰匙**」。未通過驗證時，CLI / GUI / Web 介面一律鎖定、不進行任何連動。
+
+整體資料流：
+
+```
+Meshtastic 裝置 (TCP) ──► MeshtasticClient
+                            │
+                            ▼
+                     CallMeshAprsBridge ──► CallMesh API
+                            │                  │
+                            │                  └─► Heartbeat / Mapping / Provision
+                            ▼
+             Electron Renderer / CLI / Web Dashboard
+                            │
+                            └─► APRS-IS (uplink / telemetry)
+```
+
+---
+
+## 2. 目錄結構與角色
 
 ```
 CMClient/
 ├── src/
-│   ├── index.js             # CLI 入口（Meshtastic ↔ CallMesh ↔ APRS Gateway）
-│   ├── meshtasticClient.js  # Meshtastic TCP 監聽/解碼 + flow 管理
+│   ├── index.js               # CLI 入口，包裝 Meshtastic ↔ CallMesh ↔ APRS 流程
+│   ├── meshtasticClient.js    # Meshtastic TCP 監聽/解碼，輸出 summary 與 fromRadio
 │   ├── callmesh/
-│   │   ├── client.js        # CallMesh API 封裝（heartbeat/mappings/provision）
-│   │   └── aprsBridge.js    # CallMesh ↔ APRS ↔ Meshtastic 共用橋接模組（CLI/GUI 共用）
-│   ├── aprs/client.js       # APRS-IS 客戶端（登入、keepalive、重連、無縫重試）
-│   ├── discovery.js         # mDNS 搜尋 Meshtastic 裝置
+│   │   ├── client.js          # CallMesh API 包裝：heartbeat、mapping、provision 等
+│   │   └── aprsBridge.js      # 共用橋接層：CallMesh ↔ APRS ↔ Meshtastic，CLI 與 GUI/Web 共用
+│   ├── aprs/client.js         # APRS-IS TCP Client：登入、keepalive、重試機制
+│   ├── discovery.js           # mDNS 掃描 `_meshtastic._tcp`
 │   └── electron/
-│       ├── main.js          # Electron 主行程，初始化橋接器、處理 IPC
-│       ├── preload.js       # 提供 renderer 調用的安全 API
-│       ├── renderer.js      # 前端邏輯（儀表板、Mapping Flow、日誌、設定）
-│       ├── index.html       # UI layout
-│       └── styles.css       # UI 樣式
+│       ├── main.js            # Electron 主行程：初始化、IPC、啟動 Web Dashboard
+│       ├── preload.js         # Renderer 可用之安全 API
+│       ├── renderer.js        # 桌面儀表板：封包表、遙測、Mapping Flow、設定、Log UI
+│       ├── index.html         # 桌面 UI 結構
+│       └── styles.css         # 桌面 UI 樣式
+├── src/nodeDatabase.js        # 節點資料庫：統一儲存 Mesh 節點長短名、型號、角色、最後出現時間
+├── src/web/
+│   ├── server.js              # 輕量 Web 服務 (HTTP + Server-Sent Events)
+│   └── public/
+│       ├── index.html         # Web Dashboard UI
+│       ├── main.js            # Web 前端邏輯：SSE 訂閱、封包/狀態展示
+│       └── styles.css         # Web UI 樣式
 ├── docs/
-│   ├── callmesh-client.md   # CallMesh API 技術規範（agent、流程）
-│   └── handover.md          # ← 本文件
-└── README.md                # 使用說明（CLI/Electron/CallMesh）
+│   ├── callmesh-client.md     # CallMesh API 規格與流程說明
+│   └── handover.md            # 交接文件（本檔）
+├── README.md                  # 快速使用說明（CLI / Electron）
+├── package.json               # 專案設定、腳本（版本號維護於此）
+└── package-lock.json
 ```
 
 ---
 
-## 3. 模組與元件細項
+## 3. 模組詳解
 
-### 3.1 CLI (`src/index.js`)
-- 使用 `yargs` 提供兩個指令：
-  - 預設（`tmag-cli`）：連線監看 Meshtastic TCP 封包，並自動進行 CallMesh heartbeat、mapping/provision 同步與 APRS uplink。
-  - `discover`：透過 mDNS (`discovery.js`) 掃描 `_meshtastic._tcp` 裝置。
-- 透過環境變數或 CLI 參數取得 `CALLMESH_API_KEY` 與連線資訊；未驗證前會拒絕進入監看模式。
-- 監控流程透過共用的 `CallMeshAprsBridge` 模組執行 CallMesh heartbeat、mapping/provision 落地、APRS uplink 與 Telemetry，行為與桌面版一致。CLI 預設將 artifacts 寫入 `~/.config/callmesh/`，可用 `CALLMESH_ARTIFACTS_DIR` 覆寫。
+### 3.1 Meshtastic 客戶端 (`src/meshtasticClient.js`)
+- 使用 `net.createConnection` 與 Meshtastic 節點進行 TCP 連線，解碼 Protobuf (`proto/meshtastic/*.proto`)。
+- 對外事件：
+  - `connected` / `disconnected`
+  - `summary`：桌面與 Web 儀表板使用的封包摘要
+  - `fromRadio`：原始 Protobuf 轉 JSON
+  - `myInfo`：自家節點資訊 (`meshId`、使用者設定)
+- 內建：
+  - 重複封包檢查 (`_seenPacketKeys`)
+  - Heartbeat / WantConfig，確保連線穩定
+  - 解析 Telemetry payload，將 `batteryLevel`、`voltage`、`channelUtilization`、`airUtilTx` 等量測轉換為 `summary.telemetry`（包含 `kind`、時間戳與原始 `metrics`），供 `CallMeshAprsBridge` 及前端儲存與顯示。
+  - `_formatNode()` 會同時輸出 `shortName`、`longName`、`hwModel`、`role`，並交由 Bridge 回寫到節點資料庫，確保 CLI / GUI / Web 呈現一致的節點資訊。
 
-### 3.2 Meshtastic 客戶端 (`src/meshtasticClient.js`)
-- 以 `net.createConnection` 建立 TCP 連線，解碼 protobuf (`proto/meshtastic/*.proto`)。
-- 事件：
-  - `connected` / `disconnected`：連線狀態改變。
-  - `summary`：整理過的封包摘要（供 Electron UI 表格、圖表）。
-  - `fromRadio`：原始 protobuf 轉 JSON 後的資料。
-- 抗抖機制：維護 `_seenPacketKeys` 以避免重複訊息；自動處理 heartbeat、handshake。
+### 3.2 CallMesh ↔ APRS Bridge (`src/callmesh/aprsBridge.js`)
+- **單一事實來源**：CLI、Electron、Web 端都透過此 Bridge 操作 CallMesh、APRS 與節點資料。
+- 功能：
+  - 驗證 API Key → Heartbeat → Mapping / Provision 同步
+  - 持久化 artifacts (`~/<userData>/callmesh/` / `~/.config/callmesh/`)
+  - APRS-IS 連線管理：登入、keepalive、斷線重試
+  - Beacon/Telemetry 排程、CallMesh degraded 模式
+  - Flow 管理：為每個 `summary` 製作 `flowId`，APR S 上傳後透過 `aprs-uplink` 事件回報
+  - 節點資料庫整合：
+    - 所有 `nodeInfo`、`myInfo` 與 `summary` 內的節點欄位會寫入 `nodeDatabase`，統一記錄長短名、型號、角色與最後出現時間；
+    - 透過 `node`、`node-snapshot` 事件推播給 Electron / Web Dashboard，確保多個介面共用同一份節點資訊。
+  - 遙測資料庫：
+    - 所有含 `summary.telemetry` 的封包均寫入 `telemetry-records.jsonl`（一行一筆 JSON），並同步更新記憶體快取；
+    - 事件透過 `bridge.emit('telemetry')` 推播給 Electron / Web Dashboard，類型分為 `append` 與 `reset`；
+    - 預設每節點僅保留 500 筆最新紀錄（避免佔用過多記憶體），但 JSONL 會完整累積，以便跨重啟保留歷史；
+    - 同步回傳 `stats`（筆數、節點數、JSONL 檔案大小），前端可直接顯示。
 
-### 3.3 CallMesh API (`src/callmesh/client.js`)
-- 封裝 `fetch` 呼叫，統一處理 user-agent 與逾時。
-- 提供 `heartbeat()`、`fetchMappings()` 等 API；同時解析 OS/arch 資訊。
-- 回傳資料會被主行程記錄在 `~/<userData>/callmesh/mappings.json`、`provision.json`。
+### 3.3 節點資料庫 (`src/nodeDatabase.js`)
+- 採用 `Map` 快取 Mesh 節點資訊，索引鍵為正規化後的 `meshId`（`!xxxxxxxx`）。
+- 儲存欄位：`shortName`、`longName`、`hwModel`、`role`、原始 Mesh ID、最後出現時間；同時生成 `label` 供 UI 直接顯示。
+- `CallMeshAprsBridge` 為唯一寫入入口，會在收到 `nodeInfo`、`myInfo` 或 `summary` 時更新節點並廣播 `node` 事件。
+- 提供 `getNodeSnapshot()` 供 CLI/Electron/Web 取得一次性列表；Electron 啟動、Web SSE 初始連線時會送出 `node-snapshot`。
+- 若需持久化，可自行在 Bridge 初始化時擴充序列化流程，目前預設為記憶體常駐。
 
-### 3.4 APRS 客戶端 (`src/aprs/client.js`)
-- 純 TCP 實作，負責登入、keepalive（30 秒）、自動 reconnect。
-- 對外事件：`connected`、`disconnected`、`line`（伺服器訊息）。
-- `updateConfig()` 允許不關閉 UI 即時調整伺服器、呼號等設定。
-- 連線成功會先送一筆 keepalive，再以固定間隔維持連線；若伺服器尚未回 `logresp … verified`，訊標與狀態封包都會暫停排隊，避免尚未驗證就上行。
+### 3.4 CLI (`src/index.js`)
+- 指令：
+  - `node src/index.js` (或 `npm start`) → 監看 Meshtastic，需先設定 `CALLMESH_API_KEY`
+  - `node src/index.js discover` → mDNS 掃描 `_meshtastic._tcp`
+- 功能與桌面版一致，使用 Shared Bridge:
+  - Session 內自動 Heartbeat & Mapping 同步
+  - APRS 上傳與計數
+- 重要環境變數：
+  - `CALLMESH_API_KEY`、`CALLMESH_ARTIFACTS_DIR`、`CALLMESH_VERIFICATION_FILE`
+  - `TMAG_WEB_DASHBOARD=0`（禁用 Web Dashboard，CLI 情境可忽略）
+- 指令列旗標：`--web-ui` 可強制啟用內建 Web Dashboard；若無帶入則沿用偏好與環境變數設定。
 
-### 3.5 CallMesh ↔ APRS Bridge (`src/callmesh/aprsBridge.js`)
-- 將原本散落於 Electron 主行程的 CallMesh 狀態管理、artifact 持久化、APRS uplink 與 Telemetry 定時器封裝成 `CallMeshAprsBridge`。
-- 透過事件介面 (`state` / `log` / `aprs-uplink`) 提供 UI 與 CLI 監聽：Electron 用來更新 renderer，CLI 則直接輸出到終端。
-- 內建 heartbeat 迴圈、mapping/provision 同步、APRS 連線管理、beacon/telemetry 排程，以及 CallMesh degraded fallback（會回退到快取的 provision 並維持 APRS 線路）。
-- 可自訂 artifacts 目錄：Electron 使用 `app.getPath('userData')/callmesh`，CLI 預設 `~/.config/callmesh/`，亦可由 `CALLMESH_ARTIFACTS_DIR` 覆寫。
+### 3.5 Electron 主行程 (`src/electron/main.js`)
+- 建立 `BrowserWindow`、註冊 IPC handler、啟動 MeshtasticClient 與 CallMeshAprsBridge。
+- 自動啟動 **Web Dashboard Server (`WebDashboardServer`)**：
+  - 預設 `http://0.0.0.0:7080` (可用 `TMAG_WEB_HOST` / `TMAG_WEB_PORT` 調整)
+  - `TMAG_WEB_DASHBOARD=0` 可禁用
+- `meshtastic:*`、`callmesh:*`、`aprs:*`、`app:*` IPC 入口都集中於此。
+- 注意：關閉應用或 IPC 錯誤時，務必呼叫 `cleanupMeshtasticClient()`、`shutdownWebDashboard()` 避免殘留連線。
+- `callmesh/bridge` 會在背景將節點快照持久化至 `CALLMESH_ARTIFACTS_DIR/node-database.json`，採 Debounce 寫入；清除 node DB 時記得同時刪除該檔案並重新推播節點快照。
 
-### 3.6 Electron 主行程 (`src/electron/main.js`)
-- 啟動流程：
-  - 建立 `BrowserWindow`（`autoHideMenuBar=true`，同步移除預設選單）。
-  - 根據 sentinel `.skip-env-key` 判斷是否讀取環境變數的 API key。
-  - 初始化 `CallMeshAprsBridge` 並呼叫 `bridge.init()`（決定是否復原 artifacts）。
-- CallMesh 驗證：
-  - `callmesh:save-key`：透過 bridge 執行驗證，成功後清除 sentinel、寫入新的 artifacts 並啟動 heartbeat。
-  - `callmesh:reset`：呼叫 bridge 清理 artifacts、刪除 sentinel、重置狀態。
-- Meshtastic 連線：透過 IPC 指令 `meshtastic:connect` / `disconnect` 控制；失敗時有 30 秒節流的背景重試與 manual session。
-- APRS Bridge：委派給 `CallMeshAprsBridge`，`state` 更新會同步到 renderer，`log` 與 `aprs-uplink` 事件亦直接轉發至 UI。
+### 3.6 Electron Renderer (`src/electron/renderer.js`)
+- 主要分頁：
+  1. **監視**：封包表與計數（10 分鐘封包 / APRS 上傳 / Mapping 節點）。節點名稱會套用節點資料庫資料。
+  2. **遙測數據**：Chart.js 畫面與資料表，可依節點、時間範圍、指標模式切換；節點輸入框整合了 datalist 與搜尋，鍵入 Mesh ID、暱稱或任意關鍵字即可切換節點或直接套用全域篩選，輸入清空時會自動還原到最近選取節點並顯示完整資料；頁面右上角顯示「筆數 / 節點 / 檔案大小」統計並提供「清空遙測數據」按鈕。
+  3. **Mapping 封包追蹤**：具 Mapping 的位置封包列表，支援搜尋、狀態篩選與 CSV 匯出；節點資訊與 APRS 狀態會即時更新。
+  4. **設定**：設定 Meshtastic Host、CallMesh API Key、APRS Server、信標間隔，並可切換是否啟用 Web UI。
+  5. **資訊**：顯示 CallMesh Provision 詳細資料（呼號、座標、PHG 等）。
+  6. **Log**：顯示 Meshtastic / CallMesh / APRS / APP 事件，支援搜尋與匯出。
+- **節點資料庫分頁**：顯示目前快取節點、線上狀態與距離資訊。
+  - 表格以最後出現時間由新到舊排序，線上統計以「一小時內更新」為準並同步顯示「符合條件 / 總線上」。
+  - 搜尋框支援名稱、Mesh ID、型號、角色與 Label 模糊匹配；結果會同步影響統計與表格內容。
+- 節點事件：Renderer 會接收 `node`、`node-snapshot` 事件，更新本地節點快取並同步至封包表、Flow 追蹤與 Telemetry 表格。
+- 遙測處理：
+  - 初始化時透過 `getTelemetrySnapshot()` 與 `getNodeSnapshot()` 建立快取；
+  - `telemetry:update` 事件附帶統計數據，直接反映在頁面統計區；
+  - 每個節點最多保留 500 筆資料，Chart/Table 依快取渲染，並提供單一指標模式。
+- Flow 追蹤資料與 APRS 狀態會與節點資料庫共用節點名稱與型號資訊。
+- 圖表使用 `chart.js`（`node_modules/chart.js/dist/chart.umd.js`），若升級版本請重新打包並驗證。
 
-### 3.7 Electron Renderer (`src/electron/renderer.js`)
-- 主要負責 UI 狀態：
-- CallMesh overlay、設定頁、Log、封包表格與 10 分鐘分析圖。
-- 監視頁開頭提供簡易儀表板：顯示 10 分鐘內封包總數、Mapping 節點已上傳 APRS 與目前 Mapping 節點數量，狀態異常時會以顏色提醒。監控表格新增「最後轉發」欄位，會依 hop 判斷顯示 `直收`、`Self`（本站台轉發）或實際節點名稱（缺完整 ID 時會以 `?` 提醒）。
-- 「Mapping 封包追蹤」頁面：僅顯示具 mapping 的位置封包，可依搜尋欄即時篩選，並可用「全部 / 已上傳 APRS / 待上傳」下拉篩選；若封包同步至 APRS 會附上上傳內容，並保留 mapping 標籤、跳數資訊與「最後轉發節點」。
-- Log 分頁提供 Tag 篩選與全文搜尋，可快速鎖定 CALLMESH、APRS 等特定訊息；複製按鈕會抓取已過濾的內容，方便匯出。
-  - Reset 流程會清空 `localStorage`、通知主行程刪除 sentinel。
-  - 初始啟動會詢問 `shouldAutoValidateKey()` 判斷是否自動帶入 localStorage 中的 API Key。
-- 連線邏輯：
-  - 自動連線：啟動後延遲 500ms 嘗試，失敗 3 次後停止。
-  - 重連節奏：失敗時記錄在 rolling window，2 分鐘內連續 3 次失敗即暫停背景重試並提示使用者。
+### 3.7 Web Dashboard (`src/web`)
+- **伺服器 (`src/web/server.js`)**
+  - HTTP 靜態資產 + `GET /api/events` (Server-Sent Events)。
+  - 推播事件：`status`、`callmesh`、`summary` / `summary-batch`、`log`、`log-batch`、`aprs`、`metrics`、`self`、`telemetry-*`、`node`、`node-snapshot`。
+  - 伺服器端維護節點資料庫：收到 `node` 事件或 Telemetry/summary 內含節點資訊時即時更新，初次連線會先送完整快照。
+  - 遙測資料庫同樣保留 500 筆/節點，並在 `telemetry-snapshot/append/reset` 事件中附帶統計（筆數、節點數、磁碟大小）。
+  - 計數邏輯與 Electron 對齊：`packetLast10Min`、`aprsUploaded`、`mappingCount`。
+- **前端 (`src/web/public/main.js`)**
+  - 監視頁一次呈現 CallMesh Provision、封包表與 APRS 狀態，節點欄位會套用節點資料庫資訊。
+  - 遙測頁提供節點篩選、時間範圍、圖表模式切換，以及「筆數 / 節點 / 檔案大小」統計；清空遙測資料會觸發 `telemetry-reset`。
+  - Mapping 封包追蹤支援搜尋、狀態篩選與節點 metadata（長名稱、模型、角色）；APRS 上傳狀態與 CLI 保持一致。
+  - `node`、`node-snapshot` 事件會同步更新節點暱稱與型號，Flow/Telemetry/封包表都會受益。
+- Web Dashboard 可獨立瀏覽 (`npm run desktop` 後開 `http://localhost:7080`)，但不另提供設定 UI，所有設定仍在 Electron/CLI。
 
-### 3.8 Windows 打包工具 (`scripts/build-win.js`)
-- 純 Node 腳本，主要步驟：
-  1. 下載對應版本的 Electron Windows runtime。
-  2. 整理 staging 目錄，複製 `package.json` / `package-lock.json` / `src` / `proto`。
-  3. 執行 `npm install --omit=dev` 安裝 production 依賴。
-  4. 將 staging 的內容移入 `resources/app/`。
-  5. 壓縮輸出為 `TMAG_Monitor-win32-x64.zip`，同時保留解壓後資料夾。
+### 3.8 遙測資料庫（Telemetry Archive）
+- 遙測摘要（`summary.telemetry`）會由 `CallMeshAprsBridge` 寫入 `storageDir/telemetry-records.jsonl`，採 **JSON Lines** 形式持久化，重啟後仍能恢復歷史紀錄。
+- 新資料會同步保留在記憶體的節點快取中，每個節點最多保存 **500** 筆最新紀錄，超出時會淘汰最舊資料；刪除資料或按下「重置所有資料」時會一併移除 JSONL 檔。
+- Telemetry 事件會透過 IPC/SSE 推播至 Electron Renderer 與 Web Dashboard：
+  - `telemetry:type=append`：即時新增單筆並附上節點資訊；
+  - `telemetry:type=reset`：資料被清除時，通知前端刷新。
+- 目前支援的量測包含 `batteryLevel`、`voltage`、`channelUtilization`、`airUtilTx`、`temperature`、`relativeHumidity`、`barometricPressure` 等（其餘欄位會以 `metrics.*` 原樣保留）。
+- 事件 payload 會附帶統計資訊：`totalRecords`、`totalNodes`、`diskBytes`。GUI 與 Web 直接顯示，不需自行計算。
+- Telemetry 記錄內的節點欄位會與節點資料庫合併，確保長名稱及模型資訊一致。
+- GUI 端節點輸入框同時充當搜尋欄位：輸入任意關鍵字時會保留原先節點選擇並使用文字篩選 Chart/Table；選取 datalist 項目則會直接切換節點並重置搜尋。
 
----
-
-## 4. 執行流程
-
-### 4.1 Electron 啟動
-1. 主行程初始化 `callmeshState`（若存在 `.skip-env-key` 或環境變數自動判斷為禁止自動驗證）。
-2. 載入 `index.html` 後，renderer 啟動 UI、載入 `localStorage` 偏好並決定是否自動驗證。
-3. 若已有驗證紀錄：
-   - 呼叫 `callmesh:save-key` → heartbeat → mapping → provision。
-   - Meshtastic 連線成功後開始轉發封包。
-
-### 4.2 CallMesh 驗證 & Heartbeat
-1. 使用者在 overlay 或設定頁輸入 Key。
-2. 主行程即刻送 `heartbeat` 驗證；成功後：
-   - 寫入 `mappings.json`、`provision.json`。
-   - 計算 APRS passcode，啟動 APRS 客戶端。
-3. Heartbeat 每 60 秒執行一次，依序處理 mapping 更新、provision 更新與 APRS 同步。
-4. 若 Heartbeat 失敗：
-   - 若先前已成功驗證 → 進入 degraded 狀態，保留快取並持續 Meshtastic/APRS 功能。
-   - 若屬於授權錯誤 → 清除 Key，立即鎖定 UI。
-
-### 4.3 Meshtastic → APRS 橋接
-1. `meshtasticClient` 接收封包後透過 `summary` 事件送往 renderer 與主行程。
-2. 主行程依 mapping 決定呼號、符號、註解，以及 30 秒內的去重策略。
-3. 組合 APRS payload（支援 overlay、table、code、heading/speed/altitude）；成功送出即寫回 log。
-
-### 4.4 重置／離線行為
-1. 使用者按「重置本地資料」：
-   - Renderer 清空 `localStorage`，並呼叫 `callmesh:reset`。
-   - 主行程刪除 `mappings.json`、`provision.json`、建立 `.skip-env-key`。
-2. 關閉再啟動時，由於 sentinel 存在，系統不會讀取環境變數或舊 artifacts，保持鎖定狀態。
-3. 離線時若曾有驗證紀錄，可保留快取（不要重置）；Heartbeat 失敗會優先搬出 `cachedProvision` 讓 APRS/Renderer 繼續使用。
-
----
-
-## 5. 核心流程總結
-
-### 5.1 Meshtastic TCP Monitoring
-- 透過 `MeshtasticClient` 連線 `host:4403`，解碼 Meshtastic protobuf。
-- CLI 預設 (`node src/index.js`) 顯示 summary 表格；可改 `--format json`。
-- 每次接收到 `FromRadio` 封包 → 解碼 (Position/Telemetry/NodeInfo…等) → 避免重複輸出（依 `from+id` 去重）。
-
-### 5.2 CallMesh API & APRS 流程
-- `CallMeshClient`：
-  - 建構 agent 字串 `callmesh-client/version (OS; arch)`。
-  - `heartbeat()` / `fetchMappings()` 透過 fetch 實作，預設逾時分別為 10s / 15s。
-  - 串 OS detection（Windows/Mac/Linux；自動抓 `os-release`）。
-
-- 驗證時機：
-  1. Electron 啟動：若無已驗證紀錄 → overlay 遮罩整個 UI，要輸入 Key。
-  2. 按「驗證並儲存」或 CLI `callmesh` → 立刻送 `heartbeat` 驗證。成功才拿掉遮罩並啟動連線循環。
-  3. CLI `startMonitor` / `callmesh` 子指令＆Electron 背景服務：若伺服器暫時無回應但先前已驗證成功，允許「降級模式（degraded）」繼續用，並提示使用者。
-  4. Key 失敗 / 清空時 → 即刻鎖定整個功能，heartbeat 亦會停止。
-
-- 驗證結果快取：
-  - Electron：localStorage + IPC 共享狀態 (`callmeshState`)，並把 mapping / provision 寫入 `~/Library/Application Support/<app>/callmesh/`。
-  - CLI：`~/.config/callmesh/monitor.json`（可透過 `CALLMESH_VERIFICATION_FILE` 指定）。
-
-- **Heartbeat → Mapping → Provision → APRS 完整流程（60 秒循環）**
-  1. 背景排程每 60 秒觸發一次 heartbeat，攜帶當前 mapping hash（若有）。
-  2. Heartbeat 回傳 `needs_update=true` 或首次啟動 → 呼叫 `fetchMappings()`，把新 mapping 寫入 `mappings.json`，並同步 `callmeshState.mappingItems`。
-  3. Heartbeat 回傳 `provision` → 存成 `provision.json`，廣播到前端（資訊頁即時更新呼號、Symbol、座標、評論、最後同步時間）。
-  4. 當 provision 包含呼號（base + SSID）時，主行程計算 APRS passcode，更新 APRS 連線設定並觸發登入。
-
-- **APRS 連線要點**
-  - `src/aprs/client.js` 會在 `connect()` 時建立 TCP 連線，送出 `user <callsign> pass <passcode> vers TMAG <version>` 與連線訊息。
-  - 每 30 秒送一次 `# keepalive`；若寫入失敗或 socket 中斷，就會在 30 秒後自動重連。
-  - `updateConfig()` 可在不中斷 UI 的情況下調整 server/port/callsign/passcode，若連線中則會自動斷線＋重連。
-  - 驗證成功後會立即送出一筆 APRS 位置信標（預設 10 分鐘週期），資料包含最新 provision 的呼號、Symbol、座標與 comment；設定頁可自訂 1–1440 分鐘的間隔。
-  - 每 1 小時還會送出系統狀態封包（`>TMAG Client vX.Y.Z`），確認機器仍在線。
-- Meshtastic 位置封包會即時轉換成 APRS `Position` 封包：frame source 僅使用 mapping 對應的呼號（含 SSID）；無 mapping 的節點（包含本站台自身）不會再上傳，以避免重複呼號造成衝突。Path 固定為 `APTMAG,MESHD*,qAR,<登入呼號>`；Symbol / Comment 取自 mapping，海拔若存在會轉換為 `/A=xxxxxx`（英尺），若封包帶有 Heading/Speed 亦會轉成 `ccc/sss`（度 / 節）附在座標後方。
-  - 主畫面右上角會顯示 APRS 伺服器與連線狀態；Log 頁會記錄 connect/disconnect、keepalive、beacon、錯誤與 reconnect 事件。
-- **TCP 連線管理**
-  - 啟動時會自動嘗試連線 Meshtastic TCP API，最多 3 次、每次間隔 5 秒。若全部失敗，會暫停背景重試並等待使用者介入。
-  - 手動按下「連線」時，UI 會進入手動重試流程（最多 3 次，間隔 5 秒），並支援「取消連線」立即終止；成功才重新開啟背景重連。
-  - 背景 reconnect loop 使用單次排程機制，失敗後才會在 30 秒後再次嘗試，並受 `allowReconnectLoop` 控制，避免無限快速重試。
-
-### 5.3 mDNS 自動搜尋
-- 使用 `bonjour-service` 搜尋 `_meshtastic._tcp`。
-- Electron UI 提供「掃描」按鈕 → 更新下拉選單 → 套用 Host/Port。
-- CLI `node src/index.js discover` 也會列出所有裝置。
+### 3.9 節點資料庫（Node Database）
+- 透過 `src/nodeDatabase.js` 單例集中管理節點資訊，Electron / Web / CLI 共用。
+- CallMeshAprsBridge 會將節點快照持久化至 `storageDir/node-database.json`（同 `CALLMESH_ARTIFACTS_DIR`），重啟後會還原舊資料並自動清洗無效座標或 `unknown` 名稱。
+- 持久化內容包含：
+  - `meshId` / `meshIdOriginal` / 長短名稱 / Label
+  - 解析後的硬體型號與角色（使用 proto enum 映射）
+  - 最後出現時間（毫秒）、最後一次位置資訊（緯度/經度/高度）
+  - 透過 CallMesh Provision 座標可計算與本地的距離；若座標無效或為 (0,0) 會自動忽略。
+- `node-database.json` 以及遙測 JSONL 均可透過節點資料庫分頁的「清除節點資料庫」按鈕、或 `callmesh:clear` 流程一併刪除。
 
 ---
 
-## 6. 使用者流程（話術版）
+## 4. GUI / Web 儀表板計數方式
 
-1. **第一次開啟**  
-   - Overlay 直接蓋住畫面：「請輸入 API Key 才能使用」。  
-   - 你只要提醒：「Copy 後 paste 到欄位，按下『驗證並儲存』就會解除鎖定。」
+| 指標             | 計算方式                                                         |
+| ---------------- | ---------------------------------------------------------------- |
+| **10 分鐘封包** | 以 60 秒桶 (`PACKET_BUCKET_MS`) 統計 10 分鐘 (`PACKET_WINDOW_MS`) 內非自家節點封包數 |
+| **已上傳 APRS** | FlowId 去重；每次 APRS uplink 事件 (`aprs-uplink` / SSE `aprs`) 會累加一次 |
+| **Mapping 節點**| Mapping items 依 `mesh_id` 正規化後去重                           |
 
-2. **輸入錯誤 / 伺服器無回應**  
-   - Overlay 下方狀態訊息會說明「驗證失敗」或「暫時無回應」。  
-   - 如果是暫時無回應、但 Key 曾經驗證過 → 使用者依然可以進入（畫面顯示警示文字）。  
-   - 話術：「伺服器暫時失聯，不用緊張，稍後再按一次『重新驗證』即可。」
-
-3. **CLI 劇本**  
-   - `export CALLMESH_API_KEY="xxxx"`  
-   - `node src/index.js --host 172.16.8.91 --port 4403`（會自動驗證、同步 mapping/provision、登入 APRS）  
-   - 如果 Key 或伺服器有問題 → CLI 會直接停止，提醒調整。
-   - 話術：「CLI 版本同樣有保護，沒設定 Key 或 Key 失效，根本不讓你往下走。」
-
-4. **Meshtastic 監看**  
-   - `npm start` 即可看封包摘要表格。  
-  - `node src/index.js --format json --show-raw` 可轉 raw Hex。  
-  - Electron UI 分成四個分頁：
-    - **監視**：封包表格、10 分鐘平均圖表、CallMesh / APRS 狀態（右上角同步顯示 APRS 實際連線伺服器與連線結果）。
-    - **資訊**：顯示最新 provision（Callsign、Symbol、座標、Comment、更新時間），座標會從 provision 的 `latitude` / `longitude` 取值並寫入 Log。
-    - **Log**：列出 heartbeat、mapping、provision、APRS keepalive / beacon / status / uplink / reconnect、自身節點更新、重置等事件並自動捲動，並提供「複製全部日誌」按鈕快速複製紀錄。
-    - **設定**：設定 Meshtastic Host、CallMesh API Key、APRS server、APRS 信標間隔（1-1440 分，預設 10 分鐘），並提供「重置本地資料」按鈕（會清掉 key、mapping、provision 與 localStorage）。
-  - UI 中「連線」按鈕支援手動重試（最多 3 次、間隔 5 秒）以及「取消連線」，取消後狀態會回到 idle 並停止所有背景重連。
-  - 話術：「抓到 LoRa 封包後，直接同步 CallMesh 和 APRS，整個 TMAG 生態都看得到。」
+以上邏輯在 Electron 與 Web 端均對齊；若 GUI 與 Web 數值不同，請確認：
+- 是否同時啟動多個實例（會競爭 APRS uplink flowId）
+- Web 是否被 `TMAG_WEB_DASHBOARD=0` 禁用
+- Meshtastic 節點是否重複推送自家封包（GUI/Web 均會濾掉）
 
 ---
 
-## 7. 重要設定／環境變數
+## 5. 設定與環境變數
 
-| 環境變數 | 用途 |
-| --- | --- |
-| `CALLMESH_API_KEY` | CLI 預設的 API Key（必填） |
-| `CALLMESH_VERIFICATION_FILE` | CLI 驗證快取檔路徑，預設 `~/.config/callmesh/monitor.json` |
-| `CALLMESH_ARTIFACTS_DIR` | 覆寫 CallMesh artifacts 資料夾（CLI 預設 `~/.config/callmesh/`，Electron 預設 `userData/callmesh`） |
-| `CALLMESH_BASE_URL` | 可覆寫 CallMesh API base URL（預設 `https://callmesh.tmmarc.org`） |
-| `APRS_SERVER` | 可覆寫 APRS-IS 伺服器（預設 `asia.aprs2.net`） |
+| 變數                         | 預設值 / 說明                                                   |
+| ---------------------------- | ---------------------------------------------------------------- |
+| `CALLMESH_API_KEY`           | CallMesh 驗證用。未設定時 CLI/GUI/WEB 一律鎖定                   |
+| `CALLMESH_ARTIFACTS_DIR`     | CLI 模式下的 CallMesh artifacts 目錄 (`~/.config/callmesh/`)       |
+| `CALLMESH_VERIFICATION_FILE` | CLI 驗證快取檔；未指定時預設 `~/.config/callmesh/monitor.json`     |
+| `TMAG_WEB_HOST` / `PORT`     | Web Dashboard 服務位置，預設 `0.0.0.0:7080`                      |
+| `TMAG_WEB_DASHBOARD`         | 設為 `0` 可禁用 Web Dashboard（不啟動 HTTP/SSE）                 |
+| `MESHTASTIC_HOST` / `PORT`   | 若未提供 CLI 參數，Electron 設定頁或 CLI Flag 需手動輸入           |
 
-Electron 端會透過 IPC 顯示目前狀態（`callmeshState.lastStatus`），方便 debug。
-
-> **Sentinel 行為 (`.skip-env-key`)**  
-> - 按「重置本地資料」或清空 API Key 時，主行程會在 `~/Library/Application Support/Electron/callmesh/.skip-env-key` 寫入記號。  
-> - 下次啟動時如偵測到記號，或環境變數 `CALLMESH_API_KEY` / `CALLMESH_VERIFICATION_FILE` 存在，即不會自動帶入金鑰；需使用者手動再次驗證。  
-> - 驗證成功後會移除此記號，離線模式可延續使用本地快取。
+Electron 會將 CallMesh 驗證資訊與 artifacts 存於 `~/Library/Application Support/<app>/callmesh/`（macOS），Windows/Linux 對應 OS 預設資料夾。
 
 ---
 
-## 8. 常見情境處理
+## 6. 常用操作
 
-1. **Key 設錯**  
-   - Electron：遮罩一直在 → hint「請輸入 API Key」。  
-   - CLI：終端顯示 `CallMesh API Key 驗證失敗`，請重新設定環境變數。
+### 6.1 開發環境啟動
 
-2. **伺服器暫時掛掉**  
-   - 若 Key 曾驗證過 → 顯示警告，但允許繼續；下次會再驗一次。  
-   - 若從未驗證 → 直接鎖住功能。
+```bash
+npm install
+npm run desktop        # 啟動 Electron + Web Dashboard
+# 或
+npm start              # CLI 模式
+```
 
-3. **Meshtastic 連不上**  
-   - 檢查裝置是否開啟 TCP API（預設 port 4403）。  
-   - 可先用 `node src/index.js discover` 確認 mDNS 有抓到。  
-   - Electron 下拉選單有列出所有裝置。
-4. **APRS 連線異常**  
-   - 確認 provision 是否包含呼號與 SSID。  
-   - 設定頁可手動切換 APRS 伺服器（例：`noam.aprs2.net`）。  
-   - Log 會顯示 `APRS` keepalive、beacon、status、uplink、disconnect、reconnect 訊息，方便定位。
-5. **需要重置設定/換人接手**  
-   - 設定頁點「重置本地資料」即可清除 API Key、mapping、provision、偏好設定與 APRS server，回到初始狀態。  
-   - CLI 端如需同步清空，可手動刪除 `~/.config/callmesh/monitor.json`。
-6. **調整 APRS 信標頻率**  
-   - 進入「設定」頁修改「APRS 信標間隔（分鐘）」即可；最小 1 分鐘、最大 1440 分鐘。  
-   - 儲存後系統會立即套用新的間隔並重新排程下一筆 Beacon。
-7. **TCP 連線重試策略**  
-   - 自動連線失敗三次後會停止背景重試並等待使用者手動介入。  
-   - 手動按「連線」時最多重試三次（每次間隔 5 秒），期間可隨時按「取消連線」中止流程。  
-   - 背景 reconnect loop 以 30 秒冷卻排程執行，若狀態切換成手動或取消會立即停下，避免無限快速重連。
----
+### 6.2 Web Dashboard
 
-## 9. Handover Talk Script（交接話術）
+1. 啟動 `npm run desktop`
+2. 開瀏覽器至 `http://localhost:7080`
+3. 若需禁用：`TMAG_WEB_DASHBOARD=0 npm run desktop`
 
-> 「Codex，這套系統就是 Meshtastic 的雷達站。  
-> CallMesh API Key 是唯一的解鎖碼，流程我都接好：  
-> ① 開啟時馬上驗證，過不了就沒 UI；  
-> ② heartbeat 會自動抓 mapping、套用 provision；  
-> ③ 有了呼號就自動登入 APRS，主畫面立刻看得到狀態。  
-> 你只要顧好 `CALLMESH_API_KEY`、APRS server 需要時再換，其他我都鋪好。皮要繃緊，這是 TMAG 後台的命脈。」 
+### 6.3 CLI
+
+```bash
+export CALLMESH_API_KEY="xxxxx"
+node src/index.js --host 192.168.1.50 --port 4403
+
+node src/index.js discover           # 掃描 Meshtastic 裝置
+
+# 啟動內建 Web Dashboard（預設關閉）
+node src/index.js --host 192.168.1.50 --port 4403 --web-ui
+```
+
+### 6.4 遙測與節點資料
+
+- Electron 遙測頁整合了節點輸入與搜尋：在輸入框選擇 datalist 項目可直接切換節點，輸入其他關鍵字則會即時篩選圖表與資料表；搜尋欄位清空時會回到最近選取節點（無紀錄時回退到第一筆）並展示全部資料。
+- Web Dashboard 遙測頁提供相同的節點快照與統計資訊；首次連線會先收到節點快照與最新遙測資料。
+- 節點資料庫分頁支援模糊搜尋與線上節點統計（預設視為 1 小時內更新），距離會以 Provision 座標為基準計算；表格顯示的筆數與線上數會在使用搜尋時同步標示「符合 / 總數」。
+- 節點長名稱、型號等資訊由 `nodeDatabase` 推播，CLI / GUI / Web 顯示一致；若需要擴充欄位，請從 Bridge emit 的 `node` 事件開始串接。
+- 所有節點快照會持久化於 `CALLMESH_ARTIFACTS_DIR/node-database.json`，同 `telemetry-records.jsonl` 一樣可透過節點分頁的「清除節點資料庫」或 `callmesh:clear` IPC 重新初始化。
 
 ---
 
-## 10. 下一步建議
+## 7. Build / Release 流程
 
-- 若要擴充：可考慮新增自動同步排程（目前 CLI 可自行排 cron）。  
-- 若要導入更多 CallMesh API：直接在 `callmesh/client.js` 延伸即可。  
-- Electron UI 如需顯示更多狀態，可參考 `summary` 事件資料。
+### 7.1 GitHub Actions
+
+分支 `main`/`dev` push 或 PR → 自動觸發：
+
+| Workflow                     | 產物                                               |
+| ---------------------------- | -------------------------------------------------- |
+| Build macOS & Linux Targets | macOS、Linux GUI/CLI ZIP（各自打包）                |
+| Build Windows App           | Windows GUI/CLI ZIP                                |
+
+發版步驟：
+
+1. `npm version <patch|minor>` → 推送 tag (ex: `v0.2.10`)
+2. 待 CI 完成後下載 artifacts
+3. `gh release create` 建立 Release，逐一上傳 GUI/CLI ZIP
+
+### 7.2 本地打包
+
+僅作備援（仍以 Actions 產物為主）：
+
+```bash
+npm install
+npm run build:mac-cli
+npx electron-packager . "TMAG Monitor" --platform=darwin --arch=x64 ...
+npm run build:win
+npx electron-packager . "TMAG Monitor" --platform=linux --arch=x64 ...
+npx pkg src/index.js --targets node18-linux-x64
+```
 
 ---
 
-## 11. Windows / Linux 客戶端打包
+## 8. 開發注意事項與 QA
 
-macOS 上已配置好跨平台打包流程，可直接產出可攜式的 Windows / Linux x64 版本：
+1. **API Key 流程**
+   - 首次啟動需在設定頁輸入 Key；驗證成功才會解鎖 UI 與 CLI。
+   - CallMesh 回傳 degraded 仍允許使用快取 Provision 與 Mapping。
+   - `Reset Data` 會清除 API Key、Mapping/Provision artifacts 及 localStorage。
 
-1. 安裝依賴（第一次）：`npm install`
-2. Windows 打包：`npm run build:win`
-   - 可直接攜帶的資料夾：`dist/TMAG Monitor-win32-x64/`
-   - 封裝壓縮檔：`dist/TMAG_Monitor-win32-x64.zip`
-3. Linux 打包：`npm run build:linux`
-   - 可直接攜帶的資料夾：`dist/TMAG Monitor-linux-x64/`
-   - 封裝壓縮檔：`dist/TMAG_Monitor-linux-x64.zip`
+2. **Web Dashboard / Electron UI**
+   - 需確保 `src/web/server.js`、`src/web/public/main.js` 與 `src/electron/renderer.js` 的節點快照、遙測統計與計數邏輯保持同步。
+   - 若新增事件或 UI 欄位，請同步擴充 Bridge (`telemetry` / `node` 事件 payload) 及三端 renderer 的處理函式。
+   - 遙測節點輸入框同時負責下拉選單與搜尋，調整時需維護 `refreshTelemetrySelectors()` / `handleTelemetryNodeInputChange()` 的對應行為與 datalist 更新。
 
-打包腳本會：
-- 自動下載對應版 Electron Windows runtime（快取於 `dist/electron-v<version>-win32-x64.zip`）
-- 自動下載對應版 Electron Linux runtime（快取於 `dist/electron-v<version>-linux-x64.zip`）
-- 安裝專案的 production 依賴（不含 devDependencies）
-- 將應用程式置入 `resources/app`
-- 自動壓縮成 ZIP，方便交付或遠端部署
+3. **APR S Flow**
+   - Flow 以 `flowId` 辨識（`summary.timestampMs + random`）；APR S uplink 後 `aprs-uplink` 事件會附帶 flowId，GUI/Web 用以染色、顯示呼號。
+   - 避免同時啟動多個實例向同一 Meshtastic 上傳，避免 flowId 重複。
 
-> 備註：若要自訂圖示或產生安裝程式，可在 Windows 環境中再進一步加工。現有流程無需安裝 Wine，適合快速產出可攜式執行檔。
+4. **計數驗證**
+   - 若 web 與 GUI 計數不一致（特別是 10 分鐘封包），檢查是否有自家節點封包、時間戳異常（未同步 NTP 時可能造成桶計算漂移）。
 
+5. **程式碼風格**
+   - JS/Node 皆採現有程式風格（無額外 lint 工具）。若要導入 ESLint/Prettier，請先告知團隊。
+   - `renderer.js` 體積較大，新增功能請盡量模組化為 helper，注意避免產生循環引用。
 
-祝你接手順利，有問題就從這份文件往對應的原始碼找起即可。
+6. **版本號**
+   - 每個功能變更需更新 `package.json` 版本號；確保 `package-lock.json` 同步。
+
+7. **文件 / Log**
+   - `docs/callmesh-client.md` 為 CallMesh API 參考文件，請保持更新。
+   - `docs/handover.md`（本文件）需隨架構調整更新，避免資訊落差。
+
+8. **測試建議**
+   - 目前無自動化測試；請手動測試以下情境：
+     - CallMesh Key 驗證成功 / 失敗 / degraded
+     - Meshtastic 斷線 → 自動重連
+     - APRS 成功登入、keepalive、上傳封包
+     - Web Dashboard 開啟後是否與 GUI 數值一致
+      - 節點資料庫搜尋、線上統計與距離是否合理（特別是 Provision 座標缺失或為 0,0 情境）
+      - 遙測節點輸入框在「選取節點」與「純搜尋」兩種使用方式下渲染結果是否一致
+9. **遙測資料**
+  - 若需清空歷史記錄，請使用 GUI/Web 的「清空遙測數據」或手動刪除 `callmesh/telemetry-records.jsonl`；
+  - 調整每節點快取上限可修改 `CallMeshAprsBridge` 建構子參數 `telemetryMaxEntriesPerNode`；
+  - 若要顯示額外統計欄位，請從 Bridge `getTelemetryStats()` 擴充，並同步更新 Electron/Web 的顯示邏輯。
+
+---
+
+## 9. 常見問題 (FAQ)
+
+| 問題 | 說明 |
+| ---- | ---- |
+| Web UI 與 GUI 計數不同 | 確認是否濾掉自家節點、時間設定是否正確，或是否同時啟動多個實例。 |
+| APRS 已上傳但未變色 | 檢查 Flow 是否有 `flowId`、`aprs-uplink` 是否回報。同時確認 `flowAprsCallsigns` 是否被清空。 |
+| Web Dashboard port 被占用 | 調整 `TMAG_WEB_PORT`，或先停用其它應用；若需完全關閉 Web Dashboard，可設 `TMAG_WEB_DASHBOARD=0`。 |
+| CallMesh Key 被鎖 | 使用設定頁「重置本地資料」或刪除 `~/<userData>/callmesh/` 目錄，再重新輸入 Key。 |
+| 遙測圖表沒有資料 | 確認選擇的時間區間內有紀錄；若僅存在歷史資料，請切換至符合的日/週/月/年或自訂時間。 |
+| Telemetry JSONL 長期成長 | 可定期歸檔或壓縮 `telemetry-records.jsonl`，必要時調整 `telemetryMaxEntriesPerNode` 限制。 |
+| Chart.js 未載入 | 確保 `node_modules/chart.js/dist/chart.umd.js` 存在；若 `desktop` 包裝成可攜版，記得把整個 `node_modules/chart.js` 併入發佈資產。 |
+| 節點名稱仍顯示 MeshID | 確認 `node` / `node-snapshot` 事件是否正常送達；若 API Key 尚未驗證或節點尚未回報 `nodeInfo`，會暫時只顯示 MeshID。 |
+| 遙測統計未更新 | Bridge `telemetry` 事件未觸發或被攔截，可檢查 Renderer Console；統計資料由 Bridge 計算，前端僅顯示。 |
+
+---
+
+## 10. 後續建議
+
+- 建立測試用 Meshtastic 模擬器（自動發送位置、訊息封包），便於 CI 或單機測試。
+- 引入 ESLint/Prettier / TypeScript，降低 `renderer.js` 體積與維護成本。
+- Web Dashboard 可增設登入驗證（目前無權限控管），避免網段內任意人存取。
+- 規畫 REST / WebSocket（非 SSE）接口，讓第三方服務能重複利用 summary / mapping 資料。
+
+---
+
+## 版本註記
+
+- **v0.2.13**：導入節點資料庫 (`nodeDatabase`)、推播 `node`/`node-snapshot` 事件，並在 GUI/Web 顯示遙測統計（筆數 / 節點 / 檔案大小）。
+- **v0.2.10**：新增 Web Dashboard、同步 GUI 計數邏輯。
+- 更早版本請參考 Git history。
+
+--- 
+
+交接到此，如需更多資訊請參考程式碼註解或 `docs/callmesh-client.md`。祝接手順利！  

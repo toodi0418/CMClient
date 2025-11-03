@@ -7,6 +7,8 @@ const EventEmitter = require('events');
 const readline = require('readline');
 const { CallMeshClient, buildAgentString } = require('./client');
 const { APRSClient } = require('../aprs/client');
+const { nodeDatabase } = require('../nodeDatabase');
+const WebSocket = require('ws');
 
 const DEFAULT_APRS_SERVER = 'asia.aprs2.net';
 const DEFAULT_APRS_PORT = 14580;
@@ -25,6 +27,117 @@ const APRS_TELEMETRY_INTERVAL_MS = 6 * 60 * 60_000;
 const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
+
+const TENMAN_FORWARD_NODE_ID = '!b29f440c';
+const TENMAN_FORWARD_WS_ENDPOINT =
+  process.env.TENMAN_WS_URL || 'wss://tenmanmap.yakumo.tw/ws';
+const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
+const TENMAN_FORWARD_QUEUE_LIMIT = 64;
+const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
+
+const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
+
+function extractEnumBlock(source, enumName) {
+  const enumIndex = source.indexOf(`enum ${enumName}`);
+  if (enumIndex === -1) {
+    return '';
+  }
+  const braceStart = source.indexOf('{', enumIndex);
+  if (braceStart === -1) {
+    return '';
+  }
+  let depth = 1;
+  let cursor = braceStart + 1;
+  while (cursor < source.length && depth > 0) {
+    const char = source[cursor];
+    if (char === '{') {
+      depth += 1;
+    } else if (char === '}') {
+      depth -= 1;
+    }
+    cursor += 1;
+  }
+  if (depth !== 0) {
+    return '';
+  }
+  return source.slice(braceStart + 1, cursor - 1);
+}
+
+function buildEnumMap(relativePath, enumName) {
+  const map = Object.create(null);
+  try {
+    const protoPath = path.resolve(PROTO_DIR, relativePath);
+    const content = fsSync.readFileSync(protoPath, 'utf8');
+    const block = extractEnumBlock(content, enumName);
+    if (!block) {
+      return map;
+    }
+    const lines = block.split('\n');
+    for (const line of lines) {
+      const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(\d+)/);
+      if (match) {
+        const [, label, number] = match;
+        map[Number(number)] = label;
+      }
+    }
+  } catch (err) {
+    console.warn(`無法解析枚舉 ${enumName}: ${err.message}`);
+  }
+  return map;
+}
+
+const HARDWARE_MODEL_ENUM = buildEnumMap(path.join('meshtastic', 'mesh.proto'), 'HardwareModel');
+const DEVICE_ROLE_ENUM = buildEnumMap(path.join('meshtastic', 'config.proto'), 'Role');
+
+function formatEnumLabel(value) {
+  if (!value) return '';
+  return String(value).replace(/_/g, ' ').trim();
+}
+
+function resolveEnum(map, value) {
+  if (value === undefined || value === null) {
+    return { code: null, label: null };
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return { code: null, label: null };
+    }
+    const upper = trimmed.toUpperCase();
+    return {
+      code: upper,
+      label: formatEnumLabel(upper) || upper
+    };
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    const fallback = String(value);
+    return {
+      code: fallback,
+      label: formatEnumLabel(fallback) || fallback
+    };
+  }
+  const code = map[numeric];
+  if (!code) {
+    const fallback = String(numeric);
+    return {
+      code: fallback,
+      label: `未知 (${fallback})`
+    };
+  }
+  return {
+    code,
+    label: formatEnumLabel(code) || code
+  };
+}
+
+function resolveHardwareModel(value) {
+  return resolveEnum(HARDWARE_MODEL_ENUM, value);
+}
+
+function resolveDeviceRole(value) {
+  return resolveEnum(DEVICE_ROLE_ENUM, value);
+}
 
 class CallMeshAprsBridge extends EventEmitter {
   constructor(options = {}) {
@@ -84,6 +197,9 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsTelemetrySequence = 0;
     this.aprsLastPositionDigest = new Map();
     this.aprsSkippedMeshIds = new Set();
+    this.nodeDatabase = nodeDatabase;
+    this.nodeDatabasePersistTimer = null;
+    this.nodeDatabasePersistDelayMs = 250;
 
     this.telemetryBuckets = new Map();
     this.telemetryStore = new Map();
@@ -92,6 +208,16 @@ class CallMeshAprsBridge extends EventEmitter {
     this.telemetryMaxEntriesPerNode = Number.isFinite(telemetryMaxEntriesPerNode)
       ? Math.max(10, Math.floor(telemetryMaxEntriesPerNode))
       : 500;
+
+    this.tenmanForwardState = {
+      lastKey: null,
+      websocket: null,
+      connecting: false,
+      queue: [],
+      pendingKeys: new Set(),
+      sending: false,
+      reconnectTimer: null
+    };
 
     this.heartbeatTimer = null;
     this.heartbeatRunning = false;
@@ -120,6 +246,7 @@ class CallMeshAprsBridge extends EventEmitter {
     await this.restoreArtifacts({ allowRestore });
     await this.restoreTelemetryState();
     await this.loadTelemetryStore();
+    await this.restoreNodeDatabase();
     this.emitState();
   }
 
@@ -133,8 +260,178 @@ class CallMeshAprsBridge extends EventEmitter {
     };
   }
 
+  getNodeSnapshot() {
+    return this.nodeDatabase.list();
+  }
+
+  clearNodeDatabase() {
+    const cleared = this.nodeDatabase.clear();
+    this.scheduleNodeDatabasePersist();
+    this.emitLog('NODE-DB', `cleared node database count=${cleared}`);
+    return {
+      cleared,
+      nodes: this.nodeDatabase.list()
+    };
+  }
+
+  getNodeDatabaseFilePath() {
+    return path.join(this.storageDir, 'node-database.json');
+  }
+
+  async restoreNodeDatabase() {
+    if (!this.storageDir) {
+      return;
+    }
+    try {
+      const filePath = this.getNodeDatabaseFilePath();
+      const content = await fs.readFile(filePath, 'utf8');
+      const payload = JSON.parse(content);
+      const entries = Array.isArray(payload?.nodes)
+        ? payload.nodes
+        : Array.isArray(payload)
+          ? payload
+          : [];
+      const restored = this.nodeDatabase.replace(entries);
+      if (restored.length) {
+        this.emitLog('NODE-DB', `restored ${restored.length} nodes from disk`);
+      }
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') {
+        console.warn('載入節點資料庫失敗:', err);
+      }
+    }
+  }
+
+  scheduleNodeDatabasePersist() {
+    if (!this.storageDir) {
+      return;
+    }
+    if (this.nodeDatabasePersistTimer) {
+      return;
+    }
+    this.nodeDatabasePersistTimer = setTimeout(() => {
+      this.nodeDatabasePersistTimer = null;
+      this.persistNodeDatabase().catch((err) => {
+        console.error('寫入節點資料庫失敗:', err);
+      });
+    }, this.nodeDatabasePersistDelayMs);
+    this.nodeDatabasePersistTimer.unref?.();
+  }
+
+  cancelNodeDatabasePersist() {
+    if (this.nodeDatabasePersistTimer) {
+      clearTimeout(this.nodeDatabasePersistTimer);
+      this.nodeDatabasePersistTimer = null;
+    }
+  }
+
+  async persistNodeDatabase({ sync = false } = {}) {
+    if (!this.storageDir) {
+      return;
+    }
+    const snapshot = this.nodeDatabase.serialize();
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      nodes: snapshot
+    };
+    const filePath = this.getNodeDatabaseFilePath();
+    const dir = path.dirname(filePath);
+    if (sync) {
+      try {
+        fsSync.mkdirSync(dir, { recursive: true });
+        fsSync.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+      } catch (err) {
+        console.error('寫入節點資料庫失敗:', err);
+      }
+      return;
+    }
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf8');
+    } catch (err) {
+      console.error('寫入節點資料庫失敗:', err);
+    }
+  }
+
+  flushNodeDatabasePersistSync() {
+    if (!this.storageDir) {
+      return;
+    }
+    this.cancelNodeDatabasePersist();
+    const maybePromise = this.persistNodeDatabase({ sync: true });
+    if (maybePromise && typeof maybePromise.catch === 'function') {
+      maybePromise.catch((err) => {
+        console.error('寫入節點資料庫失敗:', err);
+      });
+    }
+  }
+
   setSelfMeshId(meshId) {
     this.selfMeshId = normalizeMeshId(meshId);
+  }
+
+  upsertNodeInfo(node, { timestamp } = {}) {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+    const meshIdCandidate =
+      node.meshId ?? node.mesh_id ?? node.meshIdNormalized ?? node.mesh_id_normalized ?? null;
+    const normalized = normalizeMeshId(meshIdCandidate);
+    if (!normalized) {
+      return null;
+    }
+    const parseNumber = (value) => {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const position = node.position ?? node.gps ?? node.location ?? null;
+    const latitude = parseNumber(
+      node.latitude ?? node.lat ?? position?.latitude ?? position?.lat
+    );
+    const longitude = parseNumber(
+      node.longitude ?? node.lon ?? position?.longitude ?? position?.lon
+    );
+    const altitude = parseNumber(
+      node.altitude ?? node.alt ?? position?.altitude ?? position?.alt
+    );
+    const hwModelRaw = node.hwModel ?? node.hw_model ?? null;
+    const roleRaw = node.role ?? null;
+    const hwModelInfo = resolveHardwareModel(hwModelRaw);
+    const roleInfo = resolveDeviceRole(roleRaw);
+    const info = {
+      meshIdOriginal: meshIdCandidate ?? null,
+      shortName: node.shortName ?? node.short_name ?? null,
+      longName: node.longName ?? node.long_name ?? null,
+      hwModel: hwModelInfo.code ?? (hwModelRaw != null ? String(hwModelRaw) : null),
+      hwModelLabel: hwModelInfo.label ?? null,
+      role: roleInfo.code ?? (roleRaw != null ? String(roleRaw) : null),
+      roleLabel: roleInfo.label ?? null,
+      latitude,
+      longitude,
+      altitude,
+      lastSeenAt: Number.isFinite(timestamp) ? Number(timestamp) : Date.now()
+    };
+    const result = this.nodeDatabase.upsert(normalized, info);
+    if (result.changed) {
+      const payload = {
+        meshId: normalized,
+        shortName: result.node.shortName,
+        longName: result.node.longName,
+        hwModel: result.node.hwModel,
+        hwModelLabel: result.node.hwModelLabel,
+        role: result.node.role,
+        roleLabel: result.node.roleLabel,
+        latitude: result.node.latitude,
+        longitude: result.node.longitude,
+        altitude: result.node.altitude,
+        label: buildNodeLabel(result.node),
+        lastSeenAt: result.node.lastSeenAt
+      };
+      this.emit('node', payload);
+      this.scheduleNodeDatabasePersist();
+    }
+    return result.node;
   }
 
   setApiKey(apiKey, { markVerified = true } = {}) {
@@ -258,6 +555,7 @@ class CallMeshAprsBridge extends EventEmitter {
     await fs.rm(this.getMappingFilePath(), { force: true });
     await fs.rm(this.getProvisionFilePath(), { force: true });
     await fs.rm(this.getTelemetryStateFilePath(), { force: true });
+    await fs.rm(this.getNodeDatabaseFilePath(), { force: true });
     this.callmeshState.lastMappingHash = null;
     this.callmeshState.lastMappingSyncedAt = null;
     this.callmeshState.provision = null;
@@ -269,6 +567,8 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsTelemetrySequence = 0;
     this.aprsLastTelemetryAt = 0;
     this.aprsLastTelemetryDataAt = 0;
+    this.nodeDatabase.clear();
+    this.scheduleNodeDatabasePersist();
     await this.clearTelemetryStore({ silent: false });
     this.emitLog('CALLMESH', 'cleared local mapping/provision cache');
     this.updateAprsProvision(null);
@@ -449,11 +749,270 @@ class CallMeshAprsBridge extends EventEmitter {
 
   handleMeshtasticSummary(summary) {
     if (!summary) return;
+    const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
+    this.captureSummaryNodeInfo(summary, timestampMs);
     this.ensureSummaryFlowMetadata(summary);
     this.recordTelemetryPacket(summary);
     if (summary.type === 'Position') {
       this.handleAprsSummary(summary);
     }
+    this.forwardTenmanPosition(summary);
+  }
+
+  async forwardTenmanPosition(summary) {
+    if (!summary) {
+      return;
+    }
+
+    try {
+      const meshIdNormalized = normalizeMeshId(
+        summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
+      );
+      if (meshIdNormalized !== TENMAN_FORWARD_NODE_ID) {
+        return;
+      }
+
+      const position = summary.position;
+      if (!position) {
+        return;
+      }
+
+      const latitude = toFiniteNumber(position.latitude ?? position.lat);
+      const longitude = toFiniteNumber(position.longitude ?? position.lon);
+      if (latitude == null || longitude == null) {
+        return;
+      }
+
+      const altitudeValue = toFiniteNumber(
+        position.altitude ?? position.alt ?? position.altitudeHae ?? position.altitudeGeoidalSeparation
+      );
+      const altitude = roundTo(altitudeValue ?? 0, 2);
+      const speed = roundTo(resolveSpeed(position), 2);
+      const heading = resolveHeading(position);
+
+      const timestampSource =
+        summary.timestamp ??
+        (Number.isFinite(summary.timestampMs) ? new Date(Number(summary.timestampMs)).toISOString() : null) ??
+        new Date().toISOString();
+      const timestamp = formatTimestampWithOffset(
+        timestampSource,
+        TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES
+      );
+      if (!timestamp) {
+        return;
+      }
+
+      const dedupeKey = `${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
+      if (this.tenmanForwardState.lastKey === dedupeKey || this.tenmanForwardState.pendingKeys?.has?.(dedupeKey)) {
+        return;
+      }
+
+      const payload = {
+        device_id: TENMAN_FORWARD_NODE_ID,
+        timestamp,
+        latitude,
+        longitude,
+        altitude,
+        speed,
+        heading,
+        extra: {
+          source: 'TMAG',
+          mesh_id: meshIdNormalized
+        }
+      };
+
+      const message = {
+        action: 'publish',
+        payload
+      };
+
+      this.enqueueTenmanPublish(message, dedupeKey);
+    } catch (err) {
+      this.emitLog('TENMAN', `位置回報處理失敗: ${err.message}`);
+    }
+  }
+
+  enqueueTenmanPublish(message, dedupeKey) {
+    if (!message || !dedupeKey) {
+      return;
+    }
+    const state = this.tenmanForwardState;
+    if (!state) {
+      return;
+    }
+
+    if (!state.pendingKeys) {
+      state.pendingKeys = new Set();
+    }
+
+    if (state.lastKey === dedupeKey || state.pendingKeys.has(dedupeKey)) {
+      return;
+    }
+
+    if (!Array.isArray(state.queue)) {
+      state.queue = [];
+    }
+
+    if (state.queue.length >= TENMAN_FORWARD_QUEUE_LIMIT) {
+      const dropped = state.queue.shift();
+      if (dropped?.key) {
+        state.pendingKeys.delete(dropped.key);
+      }
+      this.emitLog('TENMAN', '佇列已滿，將移除最舊的 publish 訊息');
+    }
+
+    const entry = {
+      key: dedupeKey,
+      message,
+      serialized: JSON.stringify(message)
+    };
+    state.queue.push(entry);
+    state.pendingKeys.add(dedupeKey);
+
+    this.ensureTenmanWebsocket();
+    this.flushTenmanQueue();
+  }
+
+  ensureTenmanWebsocket() {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue)) {
+      return;
+    }
+    if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+      return;
+    }
+    if (state.connecting) {
+      return;
+    }
+
+    this.clearTenmanReconnectTimer();
+    state.connecting = true;
+
+    try {
+      const ws = new WebSocket(TENMAN_FORWARD_WS_ENDPOINT);
+      state.websocket = ws;
+
+      ws.on('open', () => {
+        state.connecting = false;
+        this.emitLog('TENMAN', 'WebSocket 已連線');
+        this.flushTenmanQueue();
+      });
+
+      ws.on('close', (code, reason) => {
+        state.websocket = null;
+        state.connecting = false;
+        state.sending = false;
+        this.emitLog(
+          'TENMAN',
+          `WebSocket 已關閉 code=${code}${reason ? ` reason=${reason.toString()}` : ''}`
+        );
+        this.scheduleTenmanReconnect('closed');
+      });
+
+      ws.on('error', (err) => {
+        this.emitLog('TENMAN', `WebSocket 錯誤: ${err.message}`);
+      });
+
+      ws.on('unexpected-response', (_req, res) => {
+        this.emitLog('TENMAN', `WebSocket unexpected status=${res?.statusCode ?? 'unknown'}`);
+      });
+    } catch (err) {
+      state.connecting = false;
+      this.emitLog('TENMAN', `WebSocket 建立失敗: ${err.message}`);
+      this.scheduleTenmanReconnect('connect-error');
+    }
+  }
+
+  flushTenmanQueue() {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
+      return;
+    }
+
+    const ws = state.websocket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      this.ensureTenmanWebsocket();
+      return;
+    }
+
+    if (state.sending) {
+      return;
+    }
+
+    const entry = state.queue[0];
+    if (!entry) {
+      return;
+    }
+
+    state.sending = true;
+    try {
+      ws.send(entry.serialized, (err) => {
+        state.sending = false;
+        if (err) {
+          this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+          this.scheduleTenmanReconnect('send-error');
+          this.resetTenmanWebsocket();
+          return;
+        }
+
+        state.queue.shift();
+        state.pendingKeys.delete(entry.key);
+        state.lastKey = entry.key;
+        this.flushTenmanQueue();
+      });
+    } catch (err) {
+      state.sending = false;
+      this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+      this.scheduleTenmanReconnect('exception');
+      this.resetTenmanWebsocket();
+    }
+  }
+
+  resetTenmanWebsocket() {
+    const state = this.tenmanForwardState;
+    if (!state) {
+      return;
+    }
+    const ws = state.websocket;
+    if (ws) {
+      try {
+        ws.removeAllListeners();
+        ws.terminate();
+      } catch {
+        // ignore
+      }
+    }
+    state.websocket = null;
+    state.connecting = false;
+    state.sending = false;
+  }
+
+  scheduleTenmanReconnect(reason = 'retry') {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
+      return;
+    }
+    if (state.reconnectTimer) {
+      return;
+    }
+    this.emitLog(
+      'TENMAN',
+      `WebSocket 將於 ${Math.round(TENMAN_FORWARD_RECONNECT_DELAY_MS / 1000)} 秒後重試 (${reason})`
+    );
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      this.ensureTenmanWebsocket();
+    }, TENMAN_FORWARD_RECONNECT_DELAY_MS);
+    state.reconnectTimer?.unref?.();
+  }
+
+  clearTenmanReconnectTimer() {
+    const state = this.tenmanForwardState;
+    if (!state?.reconnectTimer) {
+      return;
+    }
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
   }
 
   handleMeshtasticMyInfo(info) {
@@ -461,6 +1020,51 @@ class CallMeshAprsBridge extends EventEmitter {
     const meshCandidate = normalizeMeshId(info?.node?.meshId || info?.meshId);
     if (meshCandidate) {
       this.selfMeshId = meshCandidate;
+    }
+    if (info?.node) {
+      const merged = this.upsertNodeInfo(info.node, { timestamp: Date.now() });
+      if (merged) {
+        info.node = mergeNodeInfo(info.node, merged) || info.node;
+      }
+    }
+  }
+
+  captureSummaryNodeInfo(summary, timestampMs) {
+    const candidates = [];
+    if (summary.from) candidates.push(summary.from);
+    if (summary.to) candidates.push(summary.to);
+    if (summary.relay) candidates.push(summary.relay);
+    if (summary.nextHop) candidates.push(summary.nextHop);
+    for (const node of candidates) {
+      if (!node || typeof node !== 'object') continue;
+      let sourceNode = node;
+      if (summary.type === 'Position' && summary.position && node === summary.from) {
+        const position = summary.position;
+        sourceNode = {
+          ...node,
+          position: {
+            ...(typeof node.position === 'object' && node.position ? node.position : {}),
+            latitude: position.latitude ?? position.lat ?? node.position?.latitude,
+            longitude: position.longitude ?? position.lon ?? node.position?.longitude,
+            altitude: position.altitude ?? position.alt ?? node.position?.altitude
+          },
+          latitude: node.latitude ?? position.latitude ?? position.lat ?? null,
+          longitude: node.longitude ?? position.longitude ?? position.lon ?? null,
+          altitude: node.altitude ?? position.altitude ?? position.alt ?? null
+        };
+      }
+      const merged = this.upsertNodeInfo(sourceNode, { timestamp: timestampMs });
+      if (merged) {
+        const enriched = mergeNodeInfo(node, merged);
+        if (enriched) {
+          Object.assign(node, enriched);
+          node.label = enriched.label || node.label || buildNodeLabel(enriched);
+          if (enriched.meshId) {
+            node.meshId = node.meshId ?? enriched.meshId;
+            node.meshIdNormalized = enriched.meshId;
+          }
+        }
+      }
     }
   }
 
@@ -557,6 +1161,7 @@ class CallMeshAprsBridge extends EventEmitter {
   destroy() {
     this.stopHeartbeatLoop();
     this.teardownAprsConnection();
+    this.flushNodeDatabasePersistSync();
   }
 
   // Internal helpers
@@ -1319,22 +1924,27 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
 
+    const registryNode = this.nodeDatabase.get(key);
+    const mergedNode = mergeNodeInfo(
+      storedRecord.node,
+      node,
+      registryNode,
+      { meshId: key, meshIdOriginal: registryNode?.meshIdOriginal ?? key }
+    );
+    if (mergedNode) {
+      storedRecord.node = mergedNode;
+    }
+
     let bucket = this.telemetryStore.get(key);
-    const nodeInfo = node || storedRecord.node || null;
     if (!bucket) {
       bucket = {
         meshId: key,
-        node: nodeInfo,
+        node: mergedNode,
         records: []
       };
       this.telemetryStore.set(key, bucket);
-    } else if (nodeInfo) {
-      bucket.node = bucket.node
-        ? {
-            ...bucket.node,
-            ...nodeInfo
-          }
-        : nodeInfo;
+    } else if (mergedNode) {
+      bucket.node = mergeNodeInfo(bucket.node, mergedNode);
     }
 
     bucket.records.push(storedRecord);
@@ -1397,7 +2007,11 @@ class CallMeshAprsBridge extends EventEmitter {
     cloned.telemetry = cloned.telemetry || {};
     cloned.telemetry.kind = cloned.telemetry.kind || 'unknown';
     cloned.telemetry.metrics = cloneTelemetryMetrics(cloned.telemetry.metrics || {});
-    cloned.node = extractTelemetryNode(cloned.node) || null;
+    cloned.node = mergeNodeInfo(
+      extractTelemetryNode(cloned.node),
+      this.nodeDatabase.get(meshId),
+      { meshId }
+    );
     return cloned;
   }
 
@@ -1421,7 +2035,11 @@ class CallMeshAprsBridge extends EventEmitter {
     const sampleTimeMs = Number.isFinite(telemetry.timeMs) ? Number(telemetry.timeMs) : null;
     const recordTimestampIso = new Date(baseTimestampMs).toISOString();
     const sampleIso = sampleTimeMs != null ? new Date(sampleTimeMs).toISOString() : null;
-    const node = extractTelemetryNode(summary.from);
+    const node = mergeNodeInfo(
+      extractTelemetryNode(summary.from),
+      this.nodeDatabase.get(meshId),
+      { meshId }
+    );
     const recordId = `${meshId}-${baseTimestampMs}-${Math.random().toString(16).slice(2, 10)}`;
 
     return {
@@ -1451,7 +2069,8 @@ class CallMeshAprsBridge extends EventEmitter {
     if (reset) {
       this.emit('telemetry', {
         type: 'reset',
-        updatedAt: this.telemetryUpdatedAt
+        updatedAt: this.telemetryUpdatedAt,
+        stats: this.getTelemetryStats()
       });
       return;
     }
@@ -1460,7 +2079,8 @@ class CallMeshAprsBridge extends EventEmitter {
       meshId,
       node: node ? { ...node } : null,
       record: cloneTelemetryRecord(record),
-      updatedAt: this.telemetryUpdatedAt
+      updatedAt: this.telemetryUpdatedAt,
+      stats: this.getTelemetryStats()
     });
   }
 
@@ -1505,7 +2125,34 @@ class CallMeshAprsBridge extends EventEmitter {
     });
     return {
       updatedAt: this.telemetryUpdatedAt,
-      nodes
+      nodes,
+      stats: this.getTelemetryStats({ cachedNodes: nodes })
+    };
+  }
+
+  getTelemetryStats({ cachedNodes = null } = {}) {
+    let totalRecords = 0;
+    const source = cachedNodes;
+    if (Array.isArray(source)) {
+      totalRecords = source.reduce((acc, item) => acc + (Array.isArray(item.records) ? item.records.length : 0), 0);
+    } else {
+      for (const bucket of this.telemetryStore.values()) {
+        totalRecords += Array.isArray(bucket.records) ? bucket.records.length : 0;
+      }
+    }
+    let diskBytes = 0;
+    try {
+      const stats = fsSync.statSync(this.getTelemetryStorePath());
+      diskBytes = Number.isFinite(stats.size) ? stats.size : 0;
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') {
+        this.emitLog('CALLMESH', `stat telemetry store failed: ${err.message}`);
+      }
+    }
+    return {
+      totalRecords,
+      totalNodes: this.telemetryStore.size,
+      diskBytes
     };
   }
 
@@ -1633,12 +2280,142 @@ function extractTelemetryNode(node) {
     label: node.label ?? null,
     meshId,
     meshIdNormalized: normalized,
+    meshIdOriginal: node.meshIdOriginal ?? node.meshId ?? null,
     shortName: node.shortName ?? null,
     longName: node.longName ?? null,
     hwModel: node.hwModel ?? null,
     role: node.role ?? null,
     raw: Number.isFinite(node.raw) ? Number(node.raw) : null
   };
+}
+
+function buildNodeLabel(node) {
+  if (!node || typeof node !== 'object') return null;
+  const name = node.longName || node.shortName || null;
+  const meshOriginal = node.meshIdOriginal || node.meshId || null;
+  const meshNormalized = node.meshId || node.meshIdNormalized || null;
+  const meshLabel = meshOriginal || meshNormalized || null;
+  if (name && meshLabel) {
+    return `${name} (${meshLabel})`;
+  }
+  return name || meshLabel || null;
+}
+
+function mergeNodeInfo(...sources) {
+  const result = {
+    label: null,
+    meshId: null,
+    meshIdNormalized: null,
+    meshIdOriginal: null,
+    shortName: null,
+    longName: null,
+    hwModel: null,
+    hwModelLabel: null,
+    role: null,
+    roleLabel: null,
+    latitude: null,
+    longitude: null,
+    altitude: null,
+    raw: null,
+    lastSeenAt: null
+  };
+  let hasValue = false;
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue;
+    const entries = Array.isArray(source) ? source : [source];
+    for (const item of entries) {
+      if (!item || typeof item !== 'object') continue;
+      for (const [key, value] of Object.entries(item)) {
+        if (value === undefined || value === null) {
+          continue;
+        }
+        if (Object.prototype.hasOwnProperty.call(result, key)) {
+          result[key] = value;
+          hasValue = true;
+        }
+        if (key === 'lastSeenAt' && Number.isFinite(value)) {
+          result.lastSeenAt = Number(value);
+        }
+      }
+      const position = item.position ?? item.gps ?? item.location ?? null;
+      if (position && typeof position === 'object') {
+        if (Number.isFinite(position.latitude)) {
+          result.latitude = Number(position.latitude);
+          hasValue = true;
+        }
+        if (Number.isFinite(position.longitude)) {
+          result.longitude = Number(position.longitude);
+          hasValue = true;
+        }
+        if (Number.isFinite(position.altitude)) {
+          result.altitude = Number(position.altitude);
+          hasValue = true;
+        }
+      }
+      if (item.latitude != null) {
+        const numeric = Number(item.latitude);
+        if (Number.isFinite(numeric)) {
+          result.latitude = numeric;
+          hasValue = true;
+        }
+      }
+      if (item.longitude != null) {
+        const numeric = Number(item.longitude);
+        if (Number.isFinite(numeric)) {
+          result.longitude = numeric;
+          hasValue = true;
+        }
+      }
+      if (item.altitude != null) {
+        const numeric = Number(item.altitude);
+        if (Number.isFinite(numeric)) {
+          result.altitude = numeric;
+          hasValue = true;
+        }
+      }
+    }
+  }
+  if (!hasValue) {
+    return null;
+  }
+  if (!result.meshId && result.meshIdNormalized) {
+    result.meshId = result.meshIdNormalized;
+  }
+  if (result.hwModel && !result.hwModelLabel) {
+    const resolved = resolveHardwareModel(result.hwModel);
+    result.hwModel = resolved.code ?? result.hwModel;
+    result.hwModelLabel = resolved.label ?? result.hwModelLabel ?? null;
+  }
+  if (result.role && !result.roleLabel) {
+    const resolvedRole = resolveDeviceRole(result.role);
+    result.role = resolvedRole.code ?? result.role;
+    result.roleLabel = resolvedRole.label ?? result.roleLabel ?? null;
+  }
+  if (!Number.isFinite(result.latitude) || Math.abs(result.latitude) > 90) {
+    result.latitude = null;
+  }
+  if (!Number.isFinite(result.longitude) || Math.abs(result.longitude) > 180) {
+    result.longitude = null;
+  }
+  if (
+    result.latitude !== null &&
+    result.longitude !== null &&
+    Math.abs(result.latitude) < 1e-6 &&
+    Math.abs(result.longitude) < 1e-6
+  ) {
+    result.latitude = null;
+    result.longitude = null;
+  }
+  if (!Number.isFinite(result.altitude)) {
+    result.altitude = null;
+  }
+  if (result.latitude === null || result.longitude === null) {
+    result.altitude = null;
+  }
+  if (!result.label) {
+    result.label = buildNodeLabel(result);
+  }
+  return result;
 }
 
 function deepCloneTelemetryValue(value) {
@@ -2044,6 +2821,88 @@ function formatTelemetryValue(value) {
   if (!Number.isFinite(value)) return '0';
   const clamped = Math.max(0, Math.min(999, Math.round(value)));
   return String(clamped);
+}
+
+function toFiniteNumber(value) {
+  if (value == null) return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return null;
+  }
+  return num;
+}
+
+function roundTo(value, digits = 2) {
+  if (!Number.isFinite(value)) {
+    return value;
+  }
+  const factor = 10 ** Math.max(0, digits);
+  return Math.round(value * factor) / factor;
+}
+
+function resolveSpeed(position) {
+  if (!position || typeof position !== 'object') {
+    return 0;
+  }
+  const candidates = [
+    position.speedMps,
+    position.groundSpeed,
+    position.speed,
+    position.airSpeed,
+    position.velHoriz
+  ];
+  for (const candidate of candidates) {
+    const value = toFiniteNumber(candidate);
+    if (value != null) {
+      return value;
+    }
+  }
+  const speedKph = toFiniteNumber(position.speedKph);
+  if (speedKph != null) {
+    return speedKph / 3.6;
+  }
+  const speedKnots = toFiniteNumber(position.speedKnots);
+  if (speedKnots != null) {
+    return speedKnots * 0.514444;
+  }
+  return 0;
+}
+
+function resolveHeading(position) {
+  if (!position || typeof position !== 'object') {
+    return 0;
+  }
+  const raw = toFiniteNumber(position.heading ?? position.course ?? position.velHeading);
+  if (raw == null) {
+    return 0;
+  }
+  const normalized = raw % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function formatTimestampWithOffset(source, offsetMinutes) {
+  if (source == null || !Number.isFinite(offsetMinutes)) {
+    return null;
+  }
+
+  let date;
+  if (source instanceof Date) {
+    date = new Date(source.getTime());
+  } else {
+    const parsed = new Date(source);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+    date = parsed;
+  }
+
+  const shifted = new Date(date.getTime() + offsetMinutes * 60_000);
+  const iso = shifted.toISOString().replace(/\.\d{3}Z$/, '');
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(abs / 60)).padStart(2, '0');
+  const minutes = String(abs % 60).padStart(2, '0');
+  return `${iso}${sign}${hours}:${minutes}`;
 }
 
 module.exports = {

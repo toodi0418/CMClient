@@ -49,6 +49,7 @@ const SOCKET_KEEPALIVE_DELAY_MS = 15 * 1000;
 const HOST_GUIDANCE_MESSAGE = '尚未設定節點 IP，請手動輸入或按「自動搜尋」。';
 const METERS_PER_FOOT = 0.3048;
 const LOG_DOWNLOAD_PREFIX = 'tmag-log';
+const NODE_ONLINE_WINDOW_MS = 60 * 60 * 1000;
 
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
@@ -61,6 +62,16 @@ const infoUpdatedAt = document.getElementById('info-updated-at');
 
 const navButtons = Array.from(document.querySelectorAll('.nav-btn'));
 const monitorPage = document.getElementById('monitor-page');
+const nodesPage = document.getElementById('nodes-page');
+const nodesTableWrapper = document.getElementById('nodes-table-wrapper');
+const nodesTableBody = document.getElementById('nodes-table-body');
+const nodesEmptyState = document.getElementById('nodes-empty-state');
+const nodesTotalCountLabel = document.getElementById('nodes-total-count');
+const nodesOnlineCountLabel = document.getElementById('nodes-online-count');
+const nodesOnlineTotalLabel = document.getElementById('nodes-online-total');
+const nodesSearchInput = document.getElementById('nodes-search');
+const nodesClearBtn = document.getElementById('nodes-clear-btn');
+const nodesStatusLabel = document.getElementById('nodes-status');
 const settingsPage = document.getElementById('settings-page');
 const logPage = document.getElementById('log-page');
 const infoPage = document.getElementById('info-page');
@@ -71,7 +82,8 @@ const flowSearchInput = document.getElementById('flow-search');
 const flowFilterStateSelect = document.getElementById('flow-filter-state');
 const flowDownloadBtn = document.getElementById('flow-download-btn');
 const telemetryPage = document.getElementById('telemetry-page');
-const telemetryNodeSelect = document.getElementById('telemetry-node-select');
+const telemetryNodeInput = document.getElementById('telemetry-node-input');
+const telemetryNodeDropdown = document.getElementById('telemetry-node-dropdown');
 const telemetryUpdatedAtLabel = document.getElementById('telemetry-updated-at');
 const telemetryChartsContainer = document.getElementById('telemetry-charts');
 const telemetryTableWrapper = document.getElementById('telemetry-table-wrapper');
@@ -84,6 +96,9 @@ const telemetryRangeEndInput = document.getElementById('telemetry-range-end');
 const telemetryChartModeSelect = document.getElementById('telemetry-chart-mode');
 const telemetryChartMetricSelect = document.getElementById('telemetry-chart-metric');
 const telemetryClearBtn = document.getElementById('telemetry-clear-btn');
+const telemetryStatsRecords = document.getElementById('telemetry-stats-records');
+const telemetryStatsNodes = document.getElementById('telemetry-stats-nodes');
+const telemetryStatsDisk = document.getElementById('telemetry-stats-disk');
 const aprsServerInput = document.getElementById('aprs-server');
 const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
 const webUiEnabledCheckbox = document.getElementById('web-ui-enabled');
@@ -115,6 +130,12 @@ let allowReconnectLoop = true;
 let hostPreferenceRevision = 0;
 let lastConnectedHost = null;
 let lastConnectedHostRevision = -1;
+let nodeDistanceReference = null;
+let nodesSearchTerm = '';
+let telemetrySearchTerm = '';
+let telemetrySearchRaw = '';
+let telemetryLastExplicitMeshId = null;
+let telemetryNodeInputHoldEmpty = false;
 let hostGuidanceActive = false;
 let initialSetupAutoConnectPending = false;
 let initialSetupAutoConnectTriggered = false;
@@ -187,6 +208,13 @@ let telemetryCustomRange = {
 let telemetryChartMode = 'all';
 let telemetryChartMetric = null;
 const telemetryCharts = new Map();
+const telemetryNodeLookup = new Map();
+const telemetryNodeDisplayByMesh = new Map();
+let telemetryNodeOptions = [];
+let telemetryDropdownVisible = false;
+let telemetryDropdownInteracting = false;
+const nodeRegistry = new Map();
+let nodeSnapshotLoaded = false;
 
 const AUTO_CONNECT_MAX_ATTEMPTS = 3;
 const AUTO_CONNECT_DELAY_MS = 5000;
@@ -244,14 +272,31 @@ function isSelfMeshId(meshId) {
 
 function formatRelayLabel(relay) {
   if (!relay) return '';
-  const label = relay.label || '';
-  const meshId = relay.meshId || '';
-  if (!meshId) return label;
-  const normalized = meshId.startsWith('!') ? meshId.slice(1) : meshId;
-  if (/^0{6}[0-9a-fA-F]{2}$/.test(normalized)) {
-    return label ? label + '?' : meshId + '?';
+  const meshId =
+    relay.meshId || relay.meshIdOriginal || relay.meshIdNormalized || relay.mesh_id || '';
+  const normalized =
+    typeof meshId === 'string' && meshId.startsWith('!') ? meshId.slice(1) : meshId;
+  const shortDisplay = sanitizeNodeName(relay.shortName);
+  let display = formatNodeDisplay(relay);
+  if (!display || display === 'unknown') {
+    display = sanitizeNodeName(relay.longName) || sanitizeNodeName(relay.label) || meshId || '';
   }
-  return label;
+  if (shortDisplay) {
+    const lowerShort = shortDisplay.toLowerCase();
+    if (!display.toLowerCase().includes(lowerShort)) {
+      display = display ? `${display} / ${shortDisplay}` : shortDisplay;
+    }
+  }
+  if (normalized && /^0{6}[0-9a-fA-F]{2}$/.test(String(normalized).toLowerCase())) {
+    if (display && display !== 'unknown') {
+      return display.includes('?') ? display : `${display}?`;
+    }
+    return meshId ? `${meshId}?` : '?';
+  }
+  if (display && display !== 'unknown') {
+    return display;
+  }
+  return meshId || relay.label || '';
 }
 
 function computeRelayLabel(summary) {
@@ -261,7 +306,18 @@ function computeRelayLabel(summary) {
     return 'Self';
   }
 
-  let relayMeshIdRaw = summary.relay?.meshId || summary.relay?.meshIdNormalized || '';
+  let relayMeshIdRaw =
+    summary.relay?.meshId ||
+    summary.relay?.meshIdNormalized ||
+    summary.relayMeshId ||
+    summary.relayMeshIdNormalized ||
+    '';
+  const hydratedRelay = hydrateSummaryNode(summary.relay, relayMeshIdRaw);
+  if (hydratedRelay) {
+    summary.relay = hydratedRelay;
+    relayMeshIdRaw =
+      hydratedRelay.meshId || hydratedRelay.meshIdOriginal || hydratedRelay.meshIdNormalized || relayMeshIdRaw;
+  }
   if (relayMeshIdRaw && isSelfMeshId(relayMeshIdRaw)) {
     return 'Self';
   }
@@ -276,28 +332,36 @@ function computeRelayLabel(summary) {
   }
 
   const { usedHops, hopsLabel } = extractHopInfo(summary);
+  const normalizedHopsLabel = hopsLabel || '';
+  const zeroHop = usedHops === 0 || /^0(?:\s*\/|$)/.test(normalizedHopsLabel);
 
   if (summary.relay?.label) {
+    if (zeroHop) {
+      return '直收';
+    }
     return formatRelayLabel(summary.relay);
   }
 
   if (relayMeshIdRaw) {
+    if (zeroHop) {
+      return '直收';
+    }
     return formatRelayLabel({ label: summary.relay?.label || relayMeshIdRaw, meshId: relayMeshIdRaw });
   }
 
-  if (usedHops === 0 || hopsLabel === '0/0' || hopsLabel.startsWith('0/')) {
+  if (zeroHop) {
     return '直收';
   }
 
-  if (usedHops > 0) {
+  if (usedHops != null && usedHops > 0) {
     return '未知?';
   }
 
-  if (!hopsLabel) {
+  if (!normalizedHopsLabel) {
     return '直收';
   }
 
-  if (hopsLabel.includes('?')) {
+  if (normalizedHopsLabel.includes('?')) {
     return '未知?';
   }
 
@@ -712,6 +776,7 @@ async function bootstrap() {
   clearSelfNodeDisplay();
   appendLog('APP', 'TMAG monitor initialized.');
   updateDashboardCounters();
+  await initializeNodeRegistry();
   await initializeTelemetry();
   setTelemetryRangeMode(telemetryRangeMode, { skipRender: true });
   setTelemetryChartMode(telemetryChartMode, { skipRender: true });
@@ -775,11 +840,83 @@ navButtons.forEach((btn) => {
   });
 });
 
-telemetryNodeSelect?.addEventListener('change', () => {
-  const value = telemetryNodeSelect.value || null;
-  telemetrySelectedMeshId = value;
-  renderTelemetryView();
+nodesSearchInput?.addEventListener('input', () => {
+  nodesSearchTerm = nodesSearchInput.value.trim().toLowerCase();
+  renderNodeDatabase();
 });
+
+telemetryNodeInput?.addEventListener('focus', () => {
+  renderTelemetryDropdown();
+  if (getTelemetryNavigationCandidates().length) {
+    showTelemetryDropdown();
+  }
+});
+
+telemetryNodeInput?.addEventListener('input', (event) => {
+  handleTelemetryNodeInputChange(event);
+  renderTelemetryDropdown();
+});
+
+telemetryNodeInput?.addEventListener('change', (event) => {
+  handleTelemetryNodeInputChange(event);
+});
+
+telemetryNodeInput?.addEventListener('blur', () => {
+  setTimeout(() => {
+    if (telemetryDropdownInteracting) {
+      telemetryDropdownInteracting = false;
+      return;
+    }
+    hideTelemetryDropdown();
+    if (telemetryNodeInputHoldEmpty) {
+      telemetryNodeInputHoldEmpty = false;
+      updateTelemetryNodeInputDisplay();
+    }
+  }, 80);
+});
+
+telemetryNodeInput?.addEventListener('keydown', (event) => {
+  if (!event) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    telemetrySearchRaw = '';
+    telemetrySearchTerm = '';
+    telemetryNodeInputHoldEmpty = false;
+    hideTelemetryDropdown();
+    updateTelemetryNodeInputDisplay();
+    renderTelemetryView();
+    return;
+  }
+  const keys = ['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End', 'Enter'];
+  if (keys.includes(event.key)) {
+    handleTelemetryNodeNavigationKey(event);
+  }
+});
+
+telemetryNodeInput?.addEventListener(
+  'wheel',
+  (event) => {
+    handleTelemetryNodeWheel(event);
+  },
+  { passive: false }
+);
+
+telemetryNodeDropdown?.addEventListener('mousedown', (event) => {
+  const option = event.target.closest('.telemetry-node-option');
+  if (!option) {
+    return;
+  }
+  event.preventDefault();
+  const meshId = option.dataset.meshId || null;
+  if (!meshId) {
+    return;
+  }
+  telemetryDropdownInteracting = true;
+  applyTelemetryNodeSelection(meshId, { hideDropdown: true });
+  telemetryNodeInput?.focus();
+  telemetryDropdownInteracting = false;
+});
+
 
 telemetryRangeSelect?.addEventListener('change', (event) => {
   const mode = event.target.value;
@@ -806,7 +943,7 @@ function handleTelemetryRangeInputChange() {
   };
   ensureTelemetryCustomDefaults();
   updateTelemetryRangeInputs();
-  refreshTelemetrySelectors();
+  refreshTelemetrySelectors(telemetrySelectedMeshId);
   renderTelemetryView();
 }
 
@@ -830,6 +967,8 @@ flowFilterStateSelect?.addEventListener('change', () => {
 flowDownloadBtn?.addEventListener('click', () => {
   downloadFlowCsv();
 });
+
+nodesClearBtn?.addEventListener('click', handleNodeDatabaseClear);
 
 logTagFilterSelect?.addEventListener('change', () => {
   const value = (logTagFilterSelect.value || 'all').trim();
@@ -1199,6 +1338,14 @@ const unsubscribeTelemetry = window.meshtastic.onTelemetry?.((payload) => {
   handleTelemetryEvent(payload);
 });
 
+const unsubscribeNodeSnapshot = window.meshtastic.onNodeSnapshot?.((list) => {
+  applyNodeRegistrySnapshot(list);
+});
+
+const unsubscribeNode = window.meshtastic.onNode?.((payload) => {
+  handleNodeEvent(payload);
+});
+
 window.addEventListener('beforeunload', () => {
   unsubscribeSummary();
   unsubscribeStatus();
@@ -1207,6 +1354,8 @@ window.addEventListener('beforeunload', () => {
   unsubscribeMyInfo?.();
   unsubscribeAprsUplink?.();
   unsubscribeTelemetry?.();
+  unsubscribeNodeSnapshot?.();
+  unsubscribeNode?.();
 });
 
 function handleCallMeshStatus(info, { silent = false } = {}) {
@@ -1308,8 +1457,36 @@ function updatePlatformStatus() {
   });
 }
 
+function hydrateSummaryNode(node, fallbackMeshId = null) {
+  const meshCandidate = node?.meshId ?? node?.meshIdNormalized ?? fallbackMeshId;
+  const registryNode = getRegistryNode(meshCandidate);
+  const upserted = node ? upsertNodeRegistry(node) : null;
+  const merged = mergeNodeMetadata(node, upserted, registryNode);
+  return merged || node || registryNode || null;
+}
+
+function hydrateSummaryNodes(summary) {
+  if (!summary || typeof summary !== 'object') {
+    return summary;
+  }
+  if (summary.from || summary.fromMeshId) {
+    summary.from = hydrateSummaryNode(summary.from, summary.fromMeshId);
+  }
+  if (summary.to || summary.toMeshId) {
+    summary.to = hydrateSummaryNode(summary.to, summary.toMeshId);
+  }
+  if (summary.relay || summary.relayMeshId) {
+    summary.relay = hydrateSummaryNode(summary.relay, summary.relayMeshId);
+  }
+  if (summary.nextHop || summary.nextHopMeshId) {
+    summary.nextHop = hydrateSummaryNode(summary.nextHop, summary.nextHopMeshId);
+  }
+  return summary;
+}
+
 function appendSummaryRow(summary) {
   if (!summary) return;
+  hydrateSummaryNodes(summary);
   registerPacketActivity(summary);
   maybeUpdateSelfNodeFromSummary(summary);
   const nodesLabel = formatNodes(summary);
@@ -2139,6 +2316,17 @@ function setDiscoverStatus(message, variant = 'info') {
   hostGuidanceActive = message === HOST_GUIDANCE_MESSAGE && variant === 'info';
 }
 
+function setNodeDatabaseStatus(message, variant = 'info') {
+  if (!nodesStatusLabel) return;
+  if (!message) {
+    nodesStatusLabel.textContent = '';
+    delete nodesStatusLabel.dataset.variant;
+    return;
+  }
+  nodesStatusLabel.textContent = message;
+  nodesStatusLabel.dataset.variant = variant;
+}
+
 function ensureHostGuidance({ force = false } = {}) {
   if (!discoverStatus) return;
   if (hasHost()) {
@@ -2209,6 +2397,804 @@ function clonePlainObject(value) {
   return result;
 }
 
+function formatBytes(bytes) {
+  const numeric = Number(bytes);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return '—';
+  }
+  if (numeric === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const index = Math.min(Math.floor(Math.log10(numeric) / Math.log10(1024)), units.length - 1);
+  const value = numeric / 1024 ** index;
+  return `${value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[index]}`;
+}
+
+function normalizeEnumLabel(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return String(value).replace(/_/g, ' ').trim();
+}
+
+function setNodeDistanceReferenceFromProvision(provision) {
+  if (!provision) {
+    nodeDistanceReference = null;
+    return;
+  }
+  const lat = Number(provision.latitude ?? provision.lat);
+  const lon = Number(provision.longitude ?? provision.lon);
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    nodeDistanceReference = { lat, lon };
+  } else {
+    nodeDistanceReference = null;
+  }
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function formatNodeDistanceValue(entry) {
+  if (
+    !nodeDistanceReference ||
+    !Number.isFinite(nodeDistanceReference.lat) ||
+    !Number.isFinite(nodeDistanceReference.lon)
+  ) {
+    return '';
+  }
+  const latRaw = entry.latitude;
+  const lonRaw = entry.longitude;
+  if (latRaw == null || lonRaw == null) {
+    return '';
+  }
+  const lat = typeof latRaw === 'number' ? latRaw : Number(latRaw);
+  const lon = typeof lonRaw === 'number' ? lonRaw : Number(lonRaw);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return '';
+  }
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+    return '';
+  }
+  if (Math.abs(lat) < 1e-6 && Math.abs(lon) < 1e-6) {
+    return '';
+  }
+  const distanceKm = haversineKm(nodeDistanceReference.lat, nodeDistanceReference.lon, lat, lon);
+  if (!Number.isFinite(distanceKm)) {
+    return '';
+  }
+  if (distanceKm < 1) {
+    const meters = Math.round(distanceKm * 1000);
+    return `${meters} m`;
+  }
+  if (distanceKm >= 100) {
+    return `${distanceKm.toFixed(0)} km`;
+  }
+  return `${distanceKm.toFixed(distanceKm >= 10 ? 1 : 2)} km`;
+}
+
+function formatNodeLastSeen(value) {
+  if (value == null) {
+    return { display: '—', tooltip: '', timestamp: null };
+  }
+  let timestamp = null;
+  if (Number.isFinite(value)) {
+    timestamp = Number(value);
+  } else if (typeof value === 'string' && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      timestamp = numeric;
+    } else {
+      const parsed = Date.parse(value);
+      if (!Number.isNaN(parsed)) {
+        timestamp = parsed;
+      }
+    }
+  }
+  if (!Number.isFinite(timestamp)) {
+    return { display: '—', tooltip: '', timestamp: null };
+  }
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return { display: '—', tooltip: '', timestamp: null };
+  }
+  const display = date.toLocaleString();
+  const relative = formatRelativeTime(date.toISOString());
+  const tooltip = display;
+  return { display: relative, tooltip, timestamp };
+}
+
+function mergeNodeMetadata(...sources) {
+  const result = {
+    label: null,
+    meshId: null,
+    meshIdNormalized: null,
+    meshIdOriginal: null,
+    shortName: null,
+    longName: null,
+    hwModel: null,
+    hwModelLabel: null,
+    role: null,
+    roleLabel: null,
+    latitude: null,
+    longitude: null,
+    altitude: null,
+    lastSeenAt: null
+  };
+  let hasValue = false;
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue;
+    const items = Array.isArray(source) ? source : [source];
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      for (const [key, value] of Object.entries(item)) {
+        if (value === undefined || value === null) continue;
+        if (Object.prototype.hasOwnProperty.call(result, key)) {
+          result[key] = value;
+          hasValue = true;
+        }
+        if (key === 'lastSeenAt' && Number.isFinite(value)) {
+          result.lastSeenAt = Number(value);
+        }
+      }
+      if (item.position && typeof item.position === 'object') {
+        const pos = item.position;
+        if (Number.isFinite(pos.latitude)) {
+          result.latitude = Number(pos.latitude);
+          hasValue = true;
+        }
+        if (Number.isFinite(pos.longitude)) {
+          result.longitude = Number(pos.longitude);
+          hasValue = true;
+        }
+        if (Number.isFinite(pos.altitude)) {
+          result.altitude = Number(pos.altitude);
+          hasValue = true;
+        }
+      }
+      if (item.latitude != null) {
+        const numeric = Number(item.latitude);
+        if (Number.isFinite(numeric)) {
+          result.latitude = numeric;
+          hasValue = true;
+        }
+      }
+      if (item.longitude != null) {
+        const numeric = Number(item.longitude);
+        if (Number.isFinite(numeric)) {
+          result.longitude = numeric;
+          hasValue = true;
+        }
+      }
+      if (item.altitude != null) {
+        const numeric = Number(item.altitude);
+        if (Number.isFinite(numeric)) {
+          result.altitude = numeric;
+          hasValue = true;
+        }
+      }
+    }
+  }
+  if (!hasValue) {
+    return null;
+  }
+  if (!result.meshIdNormalized && result.meshId) {
+    result.meshIdNormalized = normalizeMeshId(result.meshId);
+  }
+  if (!result.meshId && result.meshIdNormalized) {
+    result.meshId = result.meshIdNormalized;
+  }
+  if (result.hwModel && !result.hwModelLabel) {
+    result.hwModelLabel = normalizeEnumLabel(result.hwModel);
+  }
+  if (result.role && !result.roleLabel) {
+    result.roleLabel = normalizeEnumLabel(result.role);
+  }
+  if (!Number.isFinite(result.latitude) || Math.abs(result.latitude) > 90) {
+    result.latitude = null;
+  }
+  if (!Number.isFinite(result.longitude) || Math.abs(result.longitude) > 180) {
+    result.longitude = null;
+  }
+  if (
+    result.latitude !== null &&
+    result.longitude !== null &&
+    Math.abs(result.latitude) < 1e-6 &&
+    Math.abs(result.longitude) < 1e-6
+  ) {
+    result.latitude = null;
+    result.longitude = null;
+  }
+  if (!Number.isFinite(result.altitude)) {
+    result.altitude = null;
+  }
+  if (result.latitude === null || result.longitude === null) {
+    result.altitude = null;
+  }
+  if (!result.label) {
+    const name = result.longName || result.shortName || null;
+    const meshLabel = result.meshIdOriginal || result.meshId || null;
+    if (name && meshLabel) {
+      result.label = `${name} (${meshLabel})`;
+    } else {
+      result.label = name || meshLabel || null;
+    }
+  }
+  return result;
+}
+
+function upsertNodeRegistry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const keyCandidate = entry.meshId || entry.meshIdNormalized || entry.meshIdOriginal;
+  const normalized = normalizeMeshId(keyCandidate);
+  if (!normalized) return null;
+  const existing = nodeRegistry.get(normalized) || null;
+  const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
+  if (merged) {
+    nodeRegistry.set(normalized, merged);
+    updateTelemetryNodesWithRegistry(normalized, merged);
+  }
+  return merged;
+}
+
+function getSortedNodeRegistryEntries() {
+  const entries = Array.from(nodeRegistry.values());
+  entries.sort((a, b) => {
+    const timeA = typeof a.lastSeenAt === 'number'
+      ? a.lastSeenAt
+      : typeof a.lastSeenAt === 'string'
+        ? (Date.parse(a.lastSeenAt) || 0)
+        : 0;
+    const timeB = typeof b.lastSeenAt === 'number'
+      ? b.lastSeenAt
+      : typeof b.lastSeenAt === 'string'
+        ? (Date.parse(b.lastSeenAt) || 0)
+        : 0;
+    if (timeA !== timeB) {
+      return timeB - timeA;
+    }
+    const labelA = (a.longName || a.shortName || a.meshIdOriginal || a.meshId || '').toLowerCase();
+    const labelB = (b.longName || b.shortName || b.meshIdOriginal || b.meshId || '').toLowerCase();
+    if (labelA < labelB) return -1;
+    if (labelA > labelB) return 1;
+    return 0;
+  });
+  return entries;
+}
+
+function renderNodeDatabase() {
+  if (!nodesTableBody || !nodesTotalCountLabel) {
+    return;
+  }
+  const entries = getSortedNodeRegistryEntries();
+  const totalCount = entries.length;
+  const hasFilter = Boolean(nodesSearchTerm);
+  const filteredEntries = hasFilter
+    ? entries.filter((entry) => matchesNodeSearch(entry, nodesSearchTerm))
+    : entries;
+
+  nodesTotalCountLabel.textContent = hasFilter
+    ? `${filteredEntries.length} / ${totalCount}`
+    : String(totalCount);
+
+  const now = Date.now();
+  const totalOnline = entries.reduce((acc, entry) => {
+    const ts = getNodeLastSeenTimestamp(entry);
+    return acc + (ts != null && now - ts <= NODE_ONLINE_WINDOW_MS ? 1 : 0);
+  }, 0);
+
+  if (!filteredEntries.length) {
+    nodesTableBody.innerHTML = '';
+    nodesTableWrapper?.classList.add('hidden');
+    nodesEmptyState?.classList.remove('hidden');
+    if (nodesEmptyState) {
+      nodesEmptyState.textContent = hasFilter ? '沒有符合搜尋的節點。' : '目前沒有節點資料。';
+    }
+    if (nodesOnlineCountLabel) {
+      nodesOnlineCountLabel.textContent = '0';
+    }
+    if (nodesOnlineTotalLabel) {
+      nodesOnlineTotalLabel.textContent = hasFilter ? ` / ${totalOnline}` : '';
+    }
+    return;
+  }
+
+  nodesTableWrapper?.classList.remove('hidden');
+  nodesEmptyState?.classList.add('hidden');
+  let onlineCount = 0;
+
+  const rows = filteredEntries.map((entry) => {
+    const longName = sanitizeNodeName(entry.longName);
+    const shortName = sanitizeNodeName(entry.shortName);
+    const labelName = sanitizeNodeName(entry.label);
+    const meshIdOriginal = entry.meshIdOriginal || '';
+    const meshId = entry.meshId || '';
+
+    const primaryName =
+      longName ||
+      shortName ||
+      labelName ||
+      meshIdOriginal ||
+      meshId ||
+      '—';
+
+    const secondaryParts = [];
+    if (shortName && shortName !== primaryName) {
+      secondaryParts.push(shortName);
+    }
+    if (labelName && labelName !== primaryName && secondaryParts.indexOf(labelName) === -1) {
+      secondaryParts.push(labelName);
+    }
+    const nameSegments = [`<div class="nodes-name-primary">${escapeHtml(primaryName)}</div>`];
+    if (secondaryParts.length) {
+      nameSegments.push(`<div class="nodes-name-secondary">${escapeHtml(secondaryParts.join(' / '))}</div>`);
+    }
+
+    const meshLabel = meshIdOriginal || meshId || '—';
+    const hwModelDisplay = entry.hwModelLabel || normalizeEnumLabel(entry.hwModel) || '—';
+    const roleDisplay = entry.roleLabel || normalizeEnumLabel(entry.role) || '—';
+    const distanceDisplay = formatNodeDistanceValue(entry);
+
+    const { display: lastSeenDisplay, tooltip: lastSeenTooltip, timestamp: lastSeenTimestamp } = formatNodeLastSeen(entry.lastSeenAt);
+    if (lastSeenTimestamp != null && now - lastSeenTimestamp <= NODE_ONLINE_WINDOW_MS) {
+      onlineCount += 1;
+    }
+    const lastSeenCell =
+      lastSeenDisplay === '—'
+        ? '—'
+        : `<span title="${escapeHtml(lastSeenTooltip || '')}">${escapeHtml(lastSeenDisplay)}</span>`;
+
+    return (
+      '<tr>' +
+      `<td>${nameSegments.join('')}</td>` +
+      `<td>${escapeHtml(meshLabel)}</td>` +
+      `<td>${escapeHtml(hwModelDisplay)}</td>` +
+      `<td>${escapeHtml(roleDisplay)}</td>` +
+      `<td>${escapeHtml(distanceDisplay)}</td>` +
+      `<td>${lastSeenCell}</td>` +
+      '</tr>'
+    );
+  });
+
+  nodesTableBody.innerHTML = rows.join('');
+  if (nodesOnlineCountLabel) {
+    nodesOnlineCountLabel.textContent = String(onlineCount);
+  }
+  if (nodesOnlineTotalLabel) {
+    nodesOnlineTotalLabel.textContent = hasFilter ? ` / ${totalOnline}` : '';
+  }
+}
+
+function sanitizeNodeName(value) {
+  if (!value || typeof value !== 'string') {
+    return '';
+  }
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  const lowered = trimmed.toLowerCase();
+  if (lowered === 'unknown' || lowered === 'null') {
+    return '';
+  }
+  return trimmed;
+}
+
+function resolveTelemetryNodeSelection(raw, { allowPartial = false } = {}) {
+  if (!raw) return null;
+  const lowered = raw.toLowerCase();
+  if (telemetryNodeLookup.has(lowered)) {
+    return telemetryNodeLookup.get(lowered) || null;
+  }
+  const normalized = normalizeMeshId(raw);
+  if (normalized && telemetryStore.has(normalized)) {
+    return normalized;
+  }
+  if (allowPartial) {
+    for (const [displayLower, meshId] of telemetryNodeLookup.entries()) {
+      if (displayLower.includes(lowered)) {
+        return meshId;
+      }
+    }
+  }
+  return null;
+}
+
+function updateTelemetryNodeInputDisplay() {
+  if (!telemetryNodeInput) {
+    return;
+  }
+  if (telemetryNodeInputHoldEmpty) {
+    if (document.activeElement === telemetryNodeInput) {
+      telemetryNodeInput.value = '';
+      return;
+    }
+    telemetryNodeInputHoldEmpty = false;
+  }
+  if (telemetrySearchRaw) {
+    telemetryNodeInput.value = telemetrySearchRaw;
+    return;
+  }
+  if (telemetrySelectedMeshId && telemetryNodeDisplayByMesh.has(telemetrySelectedMeshId)) {
+    telemetryNodeInput.value = telemetryNodeDisplayByMesh.get(telemetrySelectedMeshId);
+    return;
+  }
+  if (telemetrySelectedMeshId) {
+    telemetryNodeInput.value = telemetrySelectedMeshId;
+    return;
+  }
+  telemetryNodeInput.value = '';
+}
+
+function getTelemetryNavigationCandidates() {
+  if (!telemetryNodeOptions.length) {
+    return [];
+  }
+  if (!telemetrySearchTerm) {
+    return telemetryNodeOptions;
+  }
+  return telemetryNodeOptions.filter((entry) => {
+    if (!entry || !Array.isArray(entry.searchKeys)) return false;
+    return entry.searchKeys.some((key) => key && key.includes(telemetrySearchTerm));
+  });
+}
+
+function findTelemetryCandidateIndex(candidates, meshId) {
+  if (!meshId) return -1;
+  return candidates.findIndex((entry) => entry.meshId === meshId);
+}
+
+function showTelemetryDropdown() {
+  if (!telemetryNodeDropdown) return;
+  if (telemetryDropdownVisible) return;
+  telemetryNodeDropdown.classList.remove('hidden');
+  telemetryDropdownVisible = true;
+}
+
+function hideTelemetryDropdown() {
+  if (!telemetryNodeDropdown) return;
+  if (!telemetryDropdownVisible && !telemetryNodeDropdown.hasChildNodes()) {
+    return;
+  }
+  telemetryNodeDropdown.classList.add('hidden');
+  telemetryNodeDropdown.innerHTML = '';
+  telemetryDropdownVisible = false;
+  telemetryDropdownInteracting = false;
+}
+
+function highlightTelemetryDropdown(meshId) {
+  if (!telemetryNodeDropdown) return;
+  const options = telemetryNodeDropdown.querySelectorAll('.telemetry-node-option');
+  let activeOption = null;
+  options.forEach((option) => {
+    const isActive = option.dataset.meshId === meshId;
+    option.classList.toggle('active', isActive);
+    if (isActive) {
+      activeOption = option;
+    }
+  });
+  if (activeOption) {
+    activeOption.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function renderTelemetryDropdown() {
+  if (!telemetryNodeDropdown) {
+    return;
+  }
+  const candidates = getTelemetryNavigationCandidates();
+  const shouldShow = Boolean(candidates.length) && document.activeElement === telemetryNodeInput;
+  if (!shouldShow) {
+    hideTelemetryDropdown();
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const candidate of candidates) {
+    const option = document.createElement('div');
+    option.className = 'telemetry-node-option';
+    option.dataset.meshId = candidate.meshId || '';
+    const displayText = candidate.display || candidate.meshId || '未知節點';
+    option.textContent = displayText;
+    option.title = displayText;
+    fragment.appendChild(option);
+  }
+  telemetryNodeDropdown.innerHTML = '';
+  telemetryNodeDropdown.appendChild(fragment);
+  showTelemetryDropdown();
+  highlightTelemetryDropdown(telemetrySelectedMeshId);
+}
+
+function applyTelemetryNodeSelection(meshId, { preserveSearch = false, hideDropdown = false } = {}) {
+  if (!meshId) {
+    return;
+  }
+  telemetrySelectedMeshId = meshId;
+  telemetryLastExplicitMeshId = meshId;
+  telemetryNodeInputHoldEmpty = false;
+  if (!preserveSearch) {
+    telemetrySearchRaw = '';
+    telemetrySearchTerm = '';
+  }
+  updateTelemetryNodeInputDisplay();
+  renderTelemetryView();
+  if (hideDropdown) {
+    hideTelemetryDropdown();
+  } else {
+    renderTelemetryDropdown();
+  }
+}
+
+function handleTelemetryNodeNavigationKey(event) {
+  if (!telemetryNodeInput) {
+    return;
+  }
+  renderTelemetryDropdown();
+  const candidates = getTelemetryNavigationCandidates();
+  if (!candidates.length) {
+    return;
+  }
+
+  const key = event.key;
+  let nextIndex = null;
+  const pageJump = Math.max(1, Math.floor(candidates.length / 10)) || 1;
+  const currentIndex = findTelemetryCandidateIndex(candidates, telemetrySelectedMeshId);
+  const fallbackMeshId = telemetrySelectedMeshId || telemetryLastExplicitMeshId || getFirstTelemetryMeshId();
+  let effectiveIndex = currentIndex;
+  if (effectiveIndex === -1 && fallbackMeshId) {
+    effectiveIndex = findTelemetryCandidateIndex(candidates, fallbackMeshId);
+  }
+
+  if (key === 'ArrowDown') {
+    nextIndex = effectiveIndex === -1 ? 0 : Math.min(effectiveIndex + 1, candidates.length - 1);
+  } else if (key === 'ArrowUp') {
+    nextIndex = effectiveIndex === -1 ? candidates.length - 1 : Math.max(effectiveIndex - 1, 0);
+  } else if (key === 'PageDown') {
+    nextIndex = effectiveIndex === -1 ? Math.min(pageJump, candidates.length - 1) : Math.min(effectiveIndex + pageJump, candidates.length - 1);
+  } else if (key === 'PageUp') {
+    nextIndex = effectiveIndex === -1 ? Math.max(candidates.length - 1 - pageJump, 0) : Math.max(effectiveIndex - pageJump, 0);
+  } else if (key === 'Home') {
+    nextIndex = 0;
+  } else if (key === 'End') {
+    nextIndex = candidates.length - 1;
+  } else if (key === 'Enter') {
+    nextIndex = effectiveIndex === -1 ? 0 : effectiveIndex;
+  } else {
+    return;
+  }
+
+  if (nextIndex == null || nextIndex < 0 || nextIndex >= candidates.length) {
+    return;
+  }
+
+  event.preventDefault();
+  const target = candidates[nextIndex];
+  if (!target || !target.meshId) {
+    return;
+  }
+  const hideDropdown = key === 'Enter';
+  applyTelemetryNodeSelection(target.meshId, { hideDropdown });
+}
+
+function handleTelemetryNodeWheel(event) {
+  if (!telemetryNodeInput || document.activeElement !== telemetryNodeInput) {
+    return;
+  }
+  renderTelemetryDropdown();
+  const candidates = getTelemetryNavigationCandidates();
+  if (!candidates.length) {
+    return;
+  }
+  const direction = event.deltaY;
+  if (!direction) {
+    return;
+  }
+  event.preventDefault();
+  const currentIndex = findTelemetryCandidateIndex(candidates, telemetrySelectedMeshId);
+  const fallbackMeshId = telemetrySelectedMeshId || telemetryLastExplicitMeshId || getFirstTelemetryMeshId();
+  let effectiveIndex = currentIndex;
+  if (effectiveIndex === -1 && fallbackMeshId) {
+    effectiveIndex = findTelemetryCandidateIndex(candidates, fallbackMeshId);
+  }
+  let nextIndex;
+  if (direction > 0) {
+    nextIndex = effectiveIndex === -1 ? 0 : Math.min(effectiveIndex + 1, candidates.length - 1);
+  } else {
+    nextIndex = effectiveIndex === -1 ? candidates.length - 1 : Math.max(effectiveIndex - 1, 0);
+  }
+  const target = candidates[nextIndex];
+  if (!target || !target.meshId) {
+    return;
+  }
+  applyTelemetryNodeSelection(target.meshId);
+}
+
+function handleTelemetryNodeInputChange(event) {
+  if (!telemetryNodeInput) {
+    return;
+  }
+  const rawValue = telemetryNodeInput.value;
+  const raw = rawValue.trim();
+  const isInputEvent = event?.type === 'input';
+
+  if (!raw) {
+    telemetryNodeInputHoldEmpty =
+      isInputEvent && document.activeElement === telemetryNodeInput;
+    telemetrySearchRaw = '';
+    telemetrySearchTerm = '';
+    if (!telemetrySelectedMeshId) {
+      const fallback = telemetryLastExplicitMeshId || getFirstTelemetryMeshId();
+      telemetrySelectedMeshId = fallback;
+      if (fallback) {
+        telemetryLastExplicitMeshId = fallback;
+      }
+    }
+    updateTelemetryNodeInputDisplay();
+    renderTelemetryView();
+    return;
+  }
+  telemetryNodeInputHoldEmpty = false;
+  const isChangeEvent = event?.type === 'change';
+  const matched = resolveTelemetryNodeSelection(raw, {
+    allowPartial: isChangeEvent
+  });
+  if (matched) {
+    applyTelemetryNodeSelection(matched, { hideDropdown: isChangeEvent });
+    return;
+  }
+  telemetrySearchRaw = raw;
+  telemetrySearchTerm = raw.toLowerCase();
+  updateTelemetryNodeInputDisplay();
+  renderTelemetryView();
+}
+
+function matchesNodeSearch(entry, term) {
+  if (!term) return true;
+  const lowerTerm = term.toLowerCase();
+  const fields = [
+    sanitizeNodeName(entry.longName),
+    sanitizeNodeName(entry.shortName),
+    sanitizeNodeName(entry.label),
+    entry.meshId,
+    entry.meshIdOriginal,
+    entry.meshIdNormalized,
+    entry.hwModel,
+    entry.hwModelLabel,
+    entry.role,
+    entry.roleLabel
+  ];
+  return fields.some((value) => {
+    if (!value) return false;
+    return String(value).toLowerCase().includes(lowerTerm);
+  });
+}
+
+function getNodeLastSeenTimestamp(entry) {
+  const value = entry?.lastSeenAt;
+  if (Number.isFinite(value)) {
+    return Number(value);
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+async function handleNodeDatabaseClear() {
+  if (!window.meshtastic?.clearNodeDatabase) {
+    setNodeDatabaseStatus('無法清除節點資料庫：IPC 尚未就緒', 'error');
+    return;
+  }
+
+  if (nodesClearBtn) {
+    nodesClearBtn.disabled = true;
+  }
+  setNodeDatabaseStatus('正在清除節點資料庫...', 'info');
+
+  try {
+    const result = await window.meshtastic.clearNodeDatabase();
+    if (!result || result.success !== true) {
+      throw new Error(result?.error || '未知錯誤');
+    }
+    const snapshot = Array.isArray(result.nodes) ? result.nodes : [];
+    applyNodeRegistrySnapshot(snapshot);
+    const cleared =
+      typeof result.cleared === 'number' && Number.isFinite(result.cleared)
+        ? result.cleared
+        : snapshot.length;
+    setNodeDatabaseStatus(`已清除 ${cleared} 個節點`, 'success');
+    appendLog('NODE-DB', `cleared node database count=${cleared}`);
+  } catch (err) {
+    setNodeDatabaseStatus(`清除節點資料庫失敗：${err.message}`, 'error');
+    appendLog('NODE-DB', `clear node database failed: ${err.message}`);
+  } finally {
+    if (nodesClearBtn) {
+      nodesClearBtn.disabled = false;
+    }
+    renderNodeDatabase();
+  }
+}
+
+function applyNodeRegistrySnapshot(list) {
+  nodeRegistry.clear();
+  if (Array.isArray(list)) {
+    for (const entry of list) {
+      upsertNodeRegistry(entry);
+    }
+  }
+  nodeSnapshotLoaded = true;
+  refreshTelemetrySelectors(telemetrySelectedMeshId);
+  renderNodeDatabase();
+  renderTelemetryView();
+}
+
+function handleNodeEvent(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return;
+  }
+  const merged = upsertNodeRegistry(payload);
+  if (!merged) {
+    return;
+  }
+  renderNodeDatabase();
+  if (telemetrySelectedMeshId) {
+    renderTelemetryView();
+  }
+  refreshSummarySelfLabels();
+  refreshFlowEntryLabels();
+  renderFlowEntries();
+}
+
+function updateTelemetryNodesWithRegistry(normalizedMeshId, registryInfo) {
+  if (!normalizedMeshId) return;
+  const meshKey = resolveTelemetryMeshKey(normalizedMeshId);
+  const bucket = telemetryStore.get(meshKey) || telemetryStore.get(normalizedMeshId) || null;
+  if (bucket) {
+    bucket.node = mergeNodeMetadata(bucket.node, registryInfo);
+    if (Array.isArray(bucket.records)) {
+      for (const record of bucket.records) {
+        record.node = mergeNodeMetadata(record.node, registryInfo);
+      }
+    }
+  }
+}
+
+function getRegistryNode(meshId) {
+  const normalized = normalizeMeshId(meshId);
+  if (!normalized) return null;
+  const entry = nodeRegistry.get(normalized);
+  return entry ? { ...entry } : null;
+}
+
+function updateTelemetryStats(stats) {
+  if (!telemetryStatsRecords || !telemetryStatsNodes || !telemetryStatsDisk) {
+    return;
+  }
+  if (!stats) {
+    telemetryStatsRecords.textContent = '0';
+    telemetryStatsNodes.textContent = '0';
+    telemetryStatsDisk.textContent = '—';
+    return;
+  }
+  const records = Number.isFinite(stats.totalRecords) ? stats.totalRecords : 0;
+  const nodes = Number.isFinite(stats.totalNodes) ? stats.totalNodes : nodeRegistry.size;
+  telemetryStatsRecords.textContent = records.toLocaleString();
+  telemetryStatsNodes.textContent = nodes.toLocaleString();
+  telemetryStatsDisk.textContent = formatBytes(stats.diskBytes);
+}
+
 function resolveTelemetryMeshKey(meshId) {
   if (meshId == null) {
     return '__unknown__';
@@ -2224,15 +3210,20 @@ function sanitizeTelemetryNode(node) {
   const meshId = typeof node.meshId === 'string' ? node.meshId : null;
   const normalized =
     node.meshIdNormalized || normalizeMeshId(meshId) || normalizeMeshId(node.mesh_id);
-  return {
-    label: node.label ?? null,
-    meshId,
-    meshIdNormalized: normalized,
-    shortName: node.shortName ?? null,
-    longName: node.longName ?? null,
-    hwModel: node.hwModel ?? null,
-    role: node.role ?? null
-  };
+  const merged = mergeNodeMetadata(
+    {
+      label: node.label ?? null,
+      meshId,
+      meshIdNormalized: normalized,
+      meshIdOriginal: node.meshIdOriginal ?? meshId ?? null,
+      shortName: node.shortName ?? null,
+      longName: node.longName ?? null,
+      hwModel: node.hwModel ?? null,
+      role: node.role ?? null
+    },
+    getRegistryNode(normalized)
+  );
+  return merged;
 }
 
 function sanitizeTelemetryPayload(payload) {
@@ -2303,6 +3294,12 @@ function sanitizeTelemetryRecord(record, meshId) {
 function clearTelemetryDataLocal({ silent = false } = {}) {
   telemetryStore.clear();
   telemetryRecordIds.clear();
+  telemetryNodeLookup.clear();
+  telemetryNodeDisplayByMesh.clear();
+  telemetryNodeOptions = [];
+  hideTelemetryDropdown();
+  telemetryNodeOptions = [];
+  telemetryLastExplicitMeshId = null;
   if (!silent) {
     telemetryUpdatedAt = Date.now();
   }
@@ -2312,7 +3309,7 @@ function clearTelemetryDataLocal({ silent = false } = {}) {
     telemetryChartMetricSelect.innerHTML = '';
     telemetryChartMetricSelect.classList.add('hidden');
   }
-  refreshTelemetrySelectors();
+  refreshTelemetrySelectors(telemetrySelectedMeshId);
   renderTelemetryView();
   updateTelemetryUpdatedAtLabel();
 }
@@ -2323,7 +3320,7 @@ function applyTelemetrySnapshot(snapshot) {
   if (!snapshot || !Array.isArray(snapshot.nodes)) {
     telemetrySelectedMeshId = null;
     telemetryUpdatedAt = snapshot?.updatedAt ?? telemetryUpdatedAt ?? null;
-    refreshTelemetrySelectors();
+    refreshTelemetrySelectors(telemetrySelectedMeshId);
     renderTelemetryView();
     updateTelemetryUpdatedAtLabel();
     return;
@@ -2358,15 +3355,14 @@ function applyTelemetrySnapshot(snapshot) {
   }
   telemetryUpdatedAt = snapshot.updatedAt ?? Date.now();
   telemetrySelectedMeshId = previousSelection;
-  refreshTelemetrySelectors();
-  if (!telemetrySelectedMeshId && telemetryStore.size) {
+  refreshTelemetrySelectors(previousSelection);
+  if (!telemetrySearchRaw && !telemetrySelectedMeshId && telemetryStore.size) {
     telemetrySelectedMeshId = telemetryStore.keys().next().value || null;
-    if (telemetryNodeSelect && telemetrySelectedMeshId) {
-      telemetryNodeSelect.value = telemetrySelectedMeshId;
-    }
+    updateTelemetryNodeInputDisplay();
   }
   renderTelemetryView();
   updateTelemetryUpdatedAtLabel();
+  updateTelemetryStats(snapshot?.stats);
 }
 
 function handleTelemetryEvent(payload) {
@@ -2377,10 +3373,12 @@ function handleTelemetryEvent(payload) {
     telemetryUpdatedAt = Number.isFinite(payload.updatedAt) ? Number(payload.updatedAt) : Date.now();
     clearTelemetryDataLocal({ silent: true });
     updateTelemetryUpdatedAtLabel();
+    updateTelemetryStats(payload.stats);
     return;
   }
   if (payload.type === 'append') {
     appendTelemetryRecord(payload.meshId, payload.record, payload.node, payload.updatedAt);
+    updateTelemetryStats(payload.stats);
   }
 }
 
@@ -2418,37 +3416,34 @@ function appendTelemetryRecord(meshId, rawRecord, rawNode, updatedAt) {
   }
   telemetryUpdatedAt = Number.isFinite(updatedAt) ? Number(updatedAt) : Date.now();
   const previousSelection = telemetrySelectedMeshId;
-  refreshTelemetrySelectors();
-  if (!telemetrySelectedMeshId && previousSelection) {
-    telemetrySelectedMeshId = previousSelection;
-    if (telemetryNodeSelect) {
-      telemetryNodeSelect.value = telemetrySelectedMeshId;
-    }
+  const preferredMesh = previousSelection || targetMeshKey;
+  refreshTelemetrySelectors(preferredMesh);
+  if (!telemetrySearchRaw && !telemetrySelectedMeshId && preferredMesh) {
+    telemetrySelectedMeshId = preferredMesh;
+    telemetryLastExplicitMeshId = preferredMesh;
+    updateTelemetryNodeInputDisplay();
+    renderTelemetryDropdown();
   }
-  if (!telemetrySelectedMeshId) {
-    telemetrySelectedMeshId = targetMeshKey;
-    if (telemetryNodeSelect) {
-      telemetryNodeSelect.value = targetMeshKey;
-    }
-  }
-  if (telemetrySelectedMeshId === targetMeshKey) {
-    renderTelemetryView();
-  }
+  renderTelemetryView();
   updateTelemetryUpdatedAtLabel();
 }
 
-function refreshTelemetrySelectors() {
-  if (!telemetryNodeSelect) {
+function refreshTelemetrySelectors(preferredMeshId = null) {
+  if (!telemetryNodeInput) {
     return;
   }
-  const previous = telemetrySelectedMeshId;
+
+  const previousSelection = telemetrySelectedMeshId;
+  const searchActive = Boolean(telemetrySearchRaw);
   const { startMs, endMs } = getTelemetryRangeWindow();
+
   const nodes = Array.from(telemetryStore.values())
     .map((bucket) => {
       if (!Array.isArray(bucket.records) || !bucket.records.length) {
         return null;
       }
       const metricKeys = new Set();
+      let latestTime = null;
       for (const record of bucket.records) {
         const time = Number(record.sampleTimeMs);
         if (!Number.isFinite(time)) {
@@ -2466,74 +3461,138 @@ function refreshTelemetrySelectors() {
             metricKeys.add(key);
           }
         }
+        if (latestTime == null || time > latestTime) {
+          latestTime = time;
+        }
       }
-      const metricsCount = metricKeys.size;
-      if (metricsCount === 0) {
+      if (!metricKeys.size) {
         return null;
       }
       const meshKey = bucket.meshId || resolveTelemetryMeshKey(bucket.rawMeshId);
-      const meshIdDisplay = bucket.rawMeshId || meshKey || 'unknown';
+      const rawMeshId = bucket.rawMeshId || meshKey || 'unknown';
       const nodeInfo = bucket.node || {};
       const displayNode = {
         ...nodeInfo,
-        meshId: nodeInfo.meshId || meshKey || meshIdDisplay,
-        longName: nodeInfo.longName || nodeInfo.label || meshIdDisplay,
-        label: nodeInfo.label || nodeInfo.longName || meshIdDisplay
+        meshId: nodeInfo.meshId || meshKey || rawMeshId,
+        meshIdOriginal: nodeInfo.meshIdOriginal || rawMeshId,
+        longName: nodeInfo.longName || nodeInfo.label || rawMeshId,
+        label: nodeInfo.label || nodeInfo.longName || rawMeshId
       };
       const label = formatNodeDisplay(displayNode);
       return {
         meshId: meshKey,
+        rawMeshId,
         label,
-        count: metricsCount
+        count: metricKeys.size,
+        latestMs: Number.isFinite(latestTime) ? latestTime : null
       };
     })
     .filter(Boolean);
+
+  telemetryNodeLookup.clear();
+  telemetryNodeDisplayByMesh.clear();
+  telemetryNodeOptions = [];
+
   if (!nodes.length) {
-    telemetryNodeSelect.innerHTML = '';
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = '尚未收到遙測資料';
-    placeholder.disabled = true;
-    placeholder.selected = true;
-    telemetryNodeSelect.appendChild(placeholder);
-    telemetryNodeSelect.disabled = true;
-    telemetrySelectedMeshId = null;
+    hideTelemetryDropdown();
+    if (!searchActive) {
+      telemetrySelectedMeshId = null;
+      telemetryLastExplicitMeshId = null;
+      updateTelemetryNodeInputDisplay();
+    }
     return;
   }
+
   nodes.sort((a, b) => {
+    const aTime = Number.isFinite(a.latestMs) ? a.latestMs : -Infinity;
+    const bTime = Number.isFinite(b.latestMs) ? b.latestMs : -Infinity;
+    if (bTime !== aTime) {
+      return bTime - aTime;
+    }
     if (b.count !== a.count) {
       return b.count - a.count;
     }
     return a.label.localeCompare(b.label, 'zh-Hant', { sensitivity: 'base' });
   });
-  const fragment = document.createDocumentFragment();
+
   for (const item of nodes) {
-    const option = document.createElement('option');
-    option.value = item.meshId;
-    option.textContent = item.label;
-    fragment.appendChild(option);
+    const meshIdNormalized = normalizeMeshId(item.meshId) || normalizeMeshId(item.rawMeshId) || item.meshId || item.rawMeshId || '';
+    const display = formatTelemetryNodeDisplay(item.label, meshIdNormalized, item.rawMeshId);
+
+    if (meshIdNormalized) {
+      telemetryNodeDisplayByMesh.set(meshIdNormalized, display);
+      telemetryNodeLookup.set(meshIdNormalized.toLowerCase(), meshIdNormalized);
+    }
+    if (item.rawMeshId) {
+      telemetryNodeLookup.set(String(item.rawMeshId).toLowerCase(), meshIdNormalized);
+    }
+    if (item.label) {
+      telemetryNodeLookup.set(item.label.toLowerCase(), meshIdNormalized);
+    }
+    telemetryNodeLookup.set(display.toLowerCase(), meshIdNormalized);
+
+    const searchKeys = new Set();
+    if (display) {
+      searchKeys.add(display.toLowerCase());
+    }
+    if (meshIdNormalized) {
+      searchKeys.add(meshIdNormalized.toLowerCase());
+    }
+    if (item.rawMeshId) {
+      searchKeys.add(String(item.rawMeshId).toLowerCase());
+    }
+    if (item.label) {
+      searchKeys.add(item.label.toLowerCase());
+    }
+    telemetryNodeOptions.push({
+      meshId: meshIdNormalized,
+      display,
+      searchKeys: Array.from(searchKeys).filter(Boolean),
+      latestMs: item.latestMs ?? null
+    });
   }
-  telemetryNodeSelect.innerHTML = '';
-  telemetryNodeSelect.appendChild(fragment);
-  if (!nodes.length) {
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = '尚無節點';
-    placeholder.disabled = true;
-    placeholder.selected = true;
-    telemetryNodeSelect.appendChild(placeholder);
-    telemetryNodeSelect.disabled = true;
-    telemetrySelectedMeshId = null;
+
+  if (searchActive) {
+    updateTelemetryNodeInputDisplay();
+    renderTelemetryDropdown();
     return;
   }
-  telemetryNodeSelect.disabled = false;
-  const hasPrevious = previous && nodes.some((node) => node.meshId === previous);
-  if (hasPrevious) {
-    telemetrySelectedMeshId = previous;
-  } else {
-    telemetrySelectedMeshId = nodes[0].meshId;
+
+  let nextSelection = previousSelection;
+  if (preferredMeshId && nodes.some((node) => node.meshId === preferredMeshId)) {
+    nextSelection = preferredMeshId;
   }
-  telemetryNodeSelect.value = telemetrySelectedMeshId;
+  if (nextSelection && !nodes.some((node) => node.meshId === nextSelection)) {
+    nextSelection = null;
+  }
+  if (!nextSelection && nodes.length) {
+    nextSelection = nodes[0].meshId;
+  }
+  telemetrySelectedMeshId = nextSelection;
+  if (!searchActive) {
+    telemetryLastExplicitMeshId = nextSelection;
+  }
+  telemetrySearchRaw = '';
+  telemetrySearchTerm = '';
+  updateTelemetryNodeInputDisplay();
+  renderTelemetryDropdown();
+}
+
+function formatTelemetryNodeDisplay(label, meshId, rawMeshId) {
+  const normalized = normalizeMeshId(meshId) || meshId || rawMeshId || '';
+  const cleanLabel = label && label !== normalized ? label : null;
+  if (cleanLabel) {
+    if (cleanLabel.includes(normalized)) {
+      return cleanLabel;
+    }
+    return `${cleanLabel} (${normalized})`;
+  }
+  return normalized || '未知節點';
+}
+function getFirstTelemetryMeshId() {
+  const iterator = telemetryStore.keys();
+  const first = iterator.next();
+  return first && !first.done ? first.value : null;
 }
 
 function getTelemetryRecordsForSelection() {
@@ -2549,27 +3608,69 @@ function getTelemetryRecordsForSelection() {
     .sort((a, b) => b.sampleTimeMs - a.sampleTimeMs);
 }
 
+function filterTelemetryBySearch(records) {
+  if (!telemetrySearchTerm) {
+    return records;
+  }
+  const term = telemetrySearchTerm.toLowerCase();
+  return records.filter((record) => matchesTelemetrySearch(record, term));
+}
+
+function matchesTelemetrySearch(record, term) {
+  if (!record) return false;
+  const haystack = [];
+  const node = record.node || {};
+  haystack.push(node.label, node.longName, node.shortName, node.hwModelLabel, node.roleLabel);
+  haystack.push(record.meshId, node.meshId, node.meshIdOriginal, node.meshIdNormalized);
+  if (record.detail) haystack.push(record.detail);
+  if (record.channel != null) haystack.push(`ch ${record.channel}`);
+  if (Number.isFinite(record.snr)) haystack.push(`snr ${record.snr}`);
+  if (Number.isFinite(record.rssi)) haystack.push(`rssi ${record.rssi}`);
+  const summary = formatTelemetrySummary(record);
+  if (summary && summary !== '—') {
+    haystack.push(summary);
+  }
+  const metrics = record.telemetry?.metrics;
+  if (metrics) {
+    for (const [key, value] of flattenTelemetryMetrics(metrics)) {
+      if (key) {
+        haystack.push(key);
+      }
+      if (value != null) {
+        haystack.push(String(value));
+      }
+    }
+  }
+  return haystack.some((value) => {
+    if (value == null) return false;
+    return String(value).toLowerCase().includes(term);
+  });
+}
+
 function renderTelemetryView() {
   if (!telemetryTableBody || !telemetryEmptyState) {
     return;
   }
-  if (!telemetrySelectedMeshId && telemetryStore.size) {
+  if (!telemetrySelectedMeshId && telemetryStore.size && !telemetrySearchRaw) {
     const firstKey = telemetryStore.keys().next().value;
     telemetrySelectedMeshId = firstKey || null;
-    if (telemetryNodeSelect && firstKey) {
-      telemetryNodeSelect.value = firstKey;
-    }
+    telemetryLastExplicitMeshId = telemetrySelectedMeshId;
+    updateTelemetryNodeInputDisplay();
+    renderTelemetryDropdown();
   }
   const baseRecords = getTelemetryRecordsForSelection();
   const filteredRecords = applyTelemetryFilters(baseRecords);
-  const hasData = filteredRecords.length > 0;
-  const hasBase = baseRecords.length > 0;
+  const searchFilteredRecords = filterTelemetryBySearch(filteredRecords);
+  const hasData = searchFilteredRecords.length > 0;
+  const hasBase = filteredRecords.length > 0;
   telemetryEmptyState.classList.toggle('hidden', hasData);
   telemetryChartsContainer?.classList.toggle('hidden', !hasData);
   telemetryTableWrapper?.classList.toggle('hidden', !hasData);
   if (!hasData) {
     if (!hasBase) {
       telemetryEmptyState.textContent = '尚未收到遙測資料。';
+    } else if (telemetrySearchTerm) {
+      telemetryEmptyState.textContent = '沒有符合搜尋的遙測資料。';
     } else {
       telemetryEmptyState.textContent = '所選區間沒有資料。';
     }
@@ -2580,8 +3681,8 @@ function renderTelemetryView() {
     telemetryTableBody.innerHTML = '';
     return;
   }
-  renderTelemetryCharts(filteredRecords);
-  renderTelemetryTable(filteredRecords);
+  renderTelemetryCharts(searchFilteredRecords);
+  renderTelemetryTable(searchFilteredRecords);
 }
 
 function collectTelemetrySeries(records) {
@@ -3106,7 +4207,7 @@ function setTelemetryRangeMode(mode, { skipRender = false } = {}) {
     ensureTelemetryCustomDefaults();
   }
   updateTelemetryRangeInputs();
-  refreshTelemetrySelectors();
+  refreshTelemetrySelectors(telemetrySelectedMeshId);
   if (!skipRender) {
     renderTelemetryView();
   }
@@ -3205,11 +4306,24 @@ async function initializeTelemetry() {
   }
 }
 
+async function initializeNodeRegistry() {
+  if (!window.meshtastic.getNodeSnapshot) {
+    return;
+  }
+  try {
+    const nodes = await window.meshtastic.getNodeSnapshot();
+    applyNodeRegistrySnapshot(nodes);
+  } catch (err) {
+    console.warn('載入節點資訊失敗:', err);
+  }
+}
+
 function activatePage(targetId) {
   const pages = [
     { id: 'monitor-page', element: monitorPage },
     { id: 'telemetry-page', element: telemetryPage },
     { id: 'flow-page', element: flowPage },
+    { id: 'nodes-page', element: nodesPage },
     { id: 'settings-page', element: settingsPage },
     { id: 'log-page', element: logPage },
     { id: 'info-page', element: infoPage }
@@ -3222,6 +4336,8 @@ function activatePage(targetId) {
   });
   if (targetId === 'telemetry-page') {
     renderTelemetryView();
+  } else if (targetId === 'nodes-page') {
+    renderNodeDatabase();
   }
   navButtons.forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.target === targetId);
@@ -3941,6 +5057,7 @@ function clearSelfNodeDisplay() {
 }
 
 function updateProvisionInfo(provision, mappingSyncedAt) {
+  setNodeDistanceReferenceFromProvision(provision);
   if (!infoCallsign) return;
   if (!provision) {
     infoCallsign.textContent = '—';
@@ -3952,6 +5069,7 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
     infoComment.textContent = '—';
     infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : '—';
     lastProvisionSignature = null;
+    renderNodeDatabase();
     return;
   }
 
@@ -3999,6 +5117,15 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
     }
     appendLog('PROVISION', logParts.join(' '));
   }
+
+  renderNodeDatabase();
+}
+
+function formatAprsSsid(ssid) {
+  if (ssid === null || ssid === undefined) return '';
+  if (ssid === 0) return '';
+  if (ssid < 0) return `${ssid}`;
+  return `-${ssid}`;
 }
 
 function formatProvisionCoords(provision) {
@@ -4058,12 +5185,17 @@ function formatRelativeTime(isoString) {
   if (days < 7) {
     return `${days} 天前`;
   }
+  const weeks = Math.floor(days / 7);
+  if (weeks < 5) {
+    return `${weeks} 週前`;
+  }
+  const months = Math.floor(days / 30);
+  if (months < 12) {
+    return `${months} 個月前`;
+  }
+  const years = Math.floor(days / 365);
+  if (years >= 1) {
+    return `${years} 年前`;
+  }
   return date.toLocaleString();
-}
-
-function formatAprsSsid(ssid) {
-  if (ssid === null || ssid === undefined) return '';
-  if (ssid === 0) return '';
-  if (ssid < 0) return `${ssid}`;
-  return `-${ssid}`;
 }
