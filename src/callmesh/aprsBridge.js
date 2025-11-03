@@ -5,6 +5,7 @@ const fs = require('fs/promises');
 const fsSync = require('fs');
 const EventEmitter = require('events');
 const readline = require('readline');
+const WebSocket = require('ws');
 const { CallMeshClient, buildAgentString } = require('./client');
 const { APRSClient } = require('../aprs/client');
 const { nodeDatabase } = require('../nodeDatabase');
@@ -2876,6 +2877,88 @@ function formatTelemetryValue(value) {
   if (!Number.isFinite(value)) return '0';
   const clamped = Math.max(0, Math.min(999, Math.round(value)));
   return String(clamped);
+}
+
+function toFiniteNumber(value) {
+  if (value == null) return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return null;
+  }
+  return number;
+}
+
+function roundTo(value, digits = 2) {
+  if (!Number.isFinite(value)) {
+    return value;
+  }
+  const factor = 10 ** Math.max(0, digits);
+  return Math.round(value * factor) / factor;
+}
+
+function resolveSpeed(position) {
+  if (!position || typeof position !== 'object') {
+    return 0;
+  }
+  const candidates = [
+    position.speedMps,
+    position.groundSpeed,
+    position.speed,
+    position.airSpeed,
+    position.velHoriz
+  ];
+  for (const value of candidates) {
+    const numeric = toFiniteNumber(value);
+    if (numeric != null) {
+      return numeric;
+    }
+  }
+  const speedKph = toFiniteNumber(position.speedKph);
+  if (speedKph != null) {
+    return speedKph / 3.6;
+  }
+  const speedKnots = toFiniteNumber(position.speedKnots);
+  if (speedKnots != null) {
+    return speedKnots * 0.514444;
+  }
+  return 0;
+}
+
+function resolveHeading(position) {
+  if (!position || typeof position !== 'object') {
+    return 0;
+  }
+  const raw = toFiniteNumber(position.heading ?? position.course ?? position.velHeading);
+  if (raw == null) {
+    return 0;
+  }
+  const normalized = raw % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function formatTimestampWithOffset(source, offsetMinutes) {
+  if (source == null || !Number.isFinite(offsetMinutes)) {
+    return null;
+  }
+
+  let date;
+  if (source instanceof Date) {
+    date = new Date(source.getTime());
+  } else {
+    const parsed = new Date(source);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+    date = parsed;
+  }
+
+  const shifted = new Date(date.getTime() + offsetMinutes * 60_000);
+  const iso = shifted.toISOString().replace(/\.\d{3}Z$/, '');
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(abs / 60)).padStart(2, '0');
+  const minutes = String(abs % 60).padStart(2, '0');
+  return `${iso}${sign}${hours}:${minutes}`;
 }
 
 module.exports = {

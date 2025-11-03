@@ -16,6 +16,7 @@
     "chart.js": "^4.4.4",
     "protobufjs": "^7.2.5",
     "unishox2.siara.cc": "^1.1.5",
+    "ws": "^8.18.3",
     "yargs": "^17.7.2"
   },
   "devDependencies": {
