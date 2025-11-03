@@ -27,6 +27,23 @@ const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
 
+const TENMAN_FORWARD_NODE_IDS = new Set(
+  [
+    '!b29f440c',
+    '!c1ede368'
+    // 如需新增節點，可直接在此陣列加入 `!xxxxxxxx` Mesh ID
+  ]
+    .map((id) => normalizeMeshId(id))
+    .filter(Boolean)
+);
+const TENMAN_FORWARD_WS_ENDPOINT =
+  process.env.TENMAN_WS_URL || 'wss://tenmanmap.yakumo.tw/ws';
+const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
+const TENMAN_FORWARD_QUEUE_LIMIT = 64;
+const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
+const TENMAN_FORWARD_GATEWAY_ID = process.env.TENMAN_GATEWAY_ID || null;
+const TENMAN_FORWARD_API_KEY = process.env.CALLMESH_API_KEY || process.env.TENMAN_API_KEY || null;
+
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
 function extractEnumBlock(source, enumName) {
@@ -201,6 +218,21 @@ class CallMeshAprsBridge extends EventEmitter {
       ? Math.max(10, Math.floor(telemetryMaxEntriesPerNode))
       : 500;
 
+<<<<<<< Updated upstream
+=======
+    this.tenmanForwardState = {
+      lastKey: null,
+      websocket: null,
+      connecting: false,
+      queue: [],
+      pendingKeys: new Set(),
+      sending: false,
+      reconnectTimer: null,
+      missingGatewayWarned: false,
+      missingApiKeyWarned: false
+    };
+
+>>>>>>> Stashed changes
     this.heartbeatTimer = null;
     this.heartbeatRunning = false;
 
@@ -738,6 +770,310 @@ class CallMeshAprsBridge extends EventEmitter {
     if (summary.type === 'Position') {
       this.handleAprsSummary(summary);
     }
+<<<<<<< Updated upstream
+=======
+    this.forwardTenmanPosition(summary);
+  }
+
+  async forwardTenmanPosition(summary) {
+    if (!summary) {
+      return;
+    }
+
+    try {
+      const meshIdNormalized = normalizeMeshId(
+        summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
+      );
+      if (!TENMAN_FORWARD_NODE_IDS.has(meshIdNormalized)) {
+        return;
+      }
+
+      const position = summary.position;
+      if (!position) {
+        return;
+      }
+
+      const latitude = toFiniteNumber(position.latitude ?? position.lat);
+      const longitude = toFiniteNumber(position.longitude ?? position.lon);
+      if (latitude == null || longitude == null) {
+        return;
+      }
+
+      const altitudeValue = toFiniteNumber(
+        position.altitude ?? position.alt ?? position.altitudeHae ?? position.altitudeGeoidalSeparation
+      );
+      const altitude = roundTo(altitudeValue ?? 0, 2);
+      const speed = roundTo(resolveSpeed(position), 2);
+      const heading = resolveHeading(position);
+
+      const timestampSource =
+        summary.timestamp ??
+        (Number.isFinite(summary.timestampMs) ? new Date(Number(summary.timestampMs)).toISOString() : null) ??
+        new Date().toISOString();
+      const timestamp = formatTimestampWithOffset(
+        timestampSource,
+        TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES
+      );
+      if (!timestamp) {
+        return;
+      }
+
+      const state = this.tenmanForwardState;
+      const dedupeKey = `${meshIdNormalized}:${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
+      if (state?.lastKey === dedupeKey || state?.pendingKeys?.has?.(dedupeKey)) {
+        return;
+      }
+
+      const gatewayId = TENMAN_FORWARD_GATEWAY_ID || this.selfMeshId;
+      if (!gatewayId) {
+        if (state && !state.missingGatewayWarned) {
+          state.missingGatewayWarned = true;
+          this.emitLog('TENMAN', '缺少 gateway_id，無法送出 publish，請設定 TENMAN_GATEWAY_ID 或確認 selfMeshId');
+        }
+        return;
+      }
+      if (state) {
+        state.missingGatewayWarned = false;
+      }
+
+      const apiKey = TENMAN_FORWARD_API_KEY || this.callmeshState?.apiKey || null;
+      if (!apiKey) {
+        if (state && !state.missingApiKeyWarned) {
+          state.missingApiKeyWarned = true;
+          this.emitLog(
+            'TENMAN',
+            '缺少 api_key，無法送出 publish，請設定 CALLMESH_API_KEY/TENMAN_API_KEY 或完成 CallMesh 驗證'
+          );
+        }
+        return;
+      }
+      if (state) {
+        state.missingApiKeyWarned = false;
+      }
+
+      const payload = {
+        device_id: meshIdNormalized,
+        timestamp,
+        latitude,
+        longitude,
+        altitude,
+        speed,
+        heading,
+        gateway_id: gatewayId,
+        api_key: apiKey,
+        extra: {
+          source: 'TMAG',
+          mesh_id: meshIdNormalized
+        }
+      };
+
+      const message = {
+        action: 'publish',
+        payload
+      };
+
+      this.enqueueTenmanPublish(message, dedupeKey);
+    } catch (err) {
+      this.emitLog('TENMAN', `位置回報處理失敗: ${err.message}`);
+    }
+  }
+
+  enqueueTenmanPublish(message, dedupeKey) {
+    if (!message || !dedupeKey) {
+      return;
+    }
+    const state = this.tenmanForwardState;
+    if (!state) {
+      return;
+    }
+
+    if (!state.pendingKeys) {
+      state.pendingKeys = new Set();
+    }
+
+    if (state.lastKey === dedupeKey || state.pendingKeys.has(dedupeKey)) {
+      return;
+    }
+
+    if (!Array.isArray(state.queue)) {
+      state.queue = [];
+    }
+
+    if (state.queue.length >= TENMAN_FORWARD_QUEUE_LIMIT) {
+      const dropped = state.queue.shift();
+      if (dropped?.key) {
+        state.pendingKeys.delete(dropped.key);
+      }
+      this.emitLog('TENMAN', '佇列已滿，將移除最舊的 publish 訊息');
+    }
+
+    const entry = {
+      key: dedupeKey,
+      message,
+      serialized: JSON.stringify(message)
+    };
+    state.queue.push(entry);
+    state.pendingKeys.add(dedupeKey);
+
+    this.ensureTenmanWebsocket();
+    this.flushTenmanQueue();
+  }
+
+  ensureTenmanWebsocket() {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue)) {
+      return;
+    }
+    if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+      return;
+    }
+    if (state.connecting) {
+      return;
+    }
+
+    this.clearTenmanReconnectTimer();
+    state.connecting = true;
+
+    try {
+      const ws = new WebSocket(TENMAN_FORWARD_WS_ENDPOINT);
+      state.websocket = ws;
+
+      ws.on('open', () => {
+        state.connecting = false;
+        this.emitLog('TENMAN', 'WebSocket 已連線');
+        this.flushTenmanQueue();
+      });
+
+      ws.on('close', (code, reason) => {
+        state.websocket = null;
+        state.connecting = false;
+        state.sending = false;
+        this.emitLog(
+          'TENMAN',
+          `WebSocket 已關閉 code=${code}${reason ? ` reason=${reason.toString()}` : ''}`
+        );
+        this.scheduleTenmanReconnect('closed');
+      });
+
+      ws.on('error', (err) => {
+        this.emitLog('TENMAN', `WebSocket 錯誤: ${err.message}`);
+      });
+
+      ws.on('unexpected-response', (_req, res) => {
+        this.emitLog('TENMAN', `WebSocket unexpected status=${res?.statusCode ?? 'unknown'}`);
+      });
+
+      ws.on('message', (data) => {
+        try {
+          const text = typeof data === 'string' ? data : data.toString('utf8');
+          if (!text) return;
+          const parsed = JSON.parse(text);
+          if (parsed?.type === 'ack') {
+            const deviceId = parsed?.payload?.device_id ?? parsed?.device_id ?? '';
+            this.emitLog('TENMAN', `收到 ack${deviceId ? ` device=${deviceId}` : ''}`);
+          }
+        } catch (err) {
+          this.emitLog('TENMAN', `WebSocket 訊息解析失敗: ${err.message}`);
+        }
+      });
+    } catch (err) {
+      state.connecting = false;
+      this.emitLog('TENMAN', `WebSocket 建立失敗: ${err.message}`);
+      this.scheduleTenmanReconnect('connect-error');
+    }
+  }
+
+  flushTenmanQueue() {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
+      return;
+    }
+
+    const ws = state.websocket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      this.ensureTenmanWebsocket();
+      return;
+    }
+
+    if (state.sending) {
+      return;
+    }
+
+    const entry = state.queue[0];
+    if (!entry) {
+      return;
+    }
+
+    state.sending = true;
+    try {
+      ws.send(entry.serialized, (err) => {
+        state.sending = false;
+        if (err) {
+          this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+          this.scheduleTenmanReconnect('send-error');
+          this.resetTenmanWebsocket();
+          return;
+        }
+
+        state.queue.shift();
+        state.pendingKeys.delete(entry.key);
+        state.lastKey = entry.key;
+        this.flushTenmanQueue();
+      });
+    } catch (err) {
+      state.sending = false;
+      this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+      this.scheduleTenmanReconnect('exception');
+      this.resetTenmanWebsocket();
+    }
+  }
+
+  resetTenmanWebsocket() {
+    const state = this.tenmanForwardState;
+    if (!state) {
+      return;
+    }
+    const ws = state.websocket;
+    if (ws) {
+      try {
+        ws.removeAllListeners();
+        ws.terminate();
+      } catch {
+        // ignore
+      }
+    }
+    state.websocket = null;
+    state.connecting = false;
+    state.sending = false;
+  }
+
+  scheduleTenmanReconnect(reason = 'retry') {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
+      return;
+    }
+    if (state.reconnectTimer) {
+      return;
+    }
+    this.emitLog(
+      'TENMAN',
+      `WebSocket 將於 ${Math.round(TENMAN_FORWARD_RECONNECT_DELAY_MS / 1000)} 秒後重試 (${reason})`
+    );
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      this.ensureTenmanWebsocket();
+    }, TENMAN_FORWARD_RECONNECT_DELAY_MS);
+    state.reconnectTimer?.unref?.();
+  }
+
+  clearTenmanReconnectTimer() {
+    const state = this.tenmanForwardState;
+    if (!state?.reconnectTimer) {
+      return;
+    }
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+>>>>>>> Stashed changes
   }
 
   handleMeshtasticMyInfo(info) {
