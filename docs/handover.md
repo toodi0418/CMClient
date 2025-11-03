@@ -12,6 +12,8 @@
 - **Web Telemetry 初始同步**：Electron 啟動以及 API Key 驗證流程完成後，都會將最新遙測快照播送給 Web Server，確保頁面立即有資料。
 - **SSE 管線**：Electron 端每當遙測 `append/reset` 出現時，會同時廣播給 Renderer 與 Web Server，兩側資料來源一致。
 - **節點資料庫**：新增 `src/nodeDatabase.js`，集中維護 Mesh 節點的長名稱、模型、角色與最後出現時間；CLI、Electron、Web 均透過 Bridge 發佈 `node` / `node-snapshot` 事件使用同一份資料。
+- **CLI 啟動 Web Dashboard**：啟用 `--web-ui` 時會先載入現有 `node-database.json` 與 `telemetry-records.jsonl`，並持續透過 `node` 事件推播更新，確保重整後節點資訊完整呈現。
+- **最後轉發顯示**：封包摘要的 Relay 欄位會整合節點短名稱，GUI / Web 表現一致。
 - **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.jsonl` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
 - **CLI 旗標**：預設關閉 Web UI；若需啟動可加上 `--web-ui`。Electron 亦可透過設定頁切換，或以 `TMAG_WEB_DASHBOARD` 強制指定。
 
@@ -132,6 +134,7 @@ CMClient/
 - `meshtastic:*`、`callmesh:*`、`aprs:*`、`app:*` IPC 入口都集中於此。
 - 注意：關閉應用或 IPC 錯誤時，務必呼叫 `cleanupMeshtasticClient()`、`shutdownWebDashboard()` 避免殘留連線。
 - `callmesh/bridge` 會在背景將節點快照持久化至 `CALLMESH_ARTIFACTS_DIR/node-database.json`，採 Debounce 寫入；清除 node DB 時記得同時刪除該檔案並重新推播節點快照。
+- 啟動 Web Dashboard 時會先呼叫 `bridge.getNodeSnapshot()`、`bridge.getTelemetrySnapshot()` 將既有節點／遙測資料播送給 Web Server，確保剛啟動或重整頁面時資料即刻可用。
 
 ### 3.6 Electron Renderer (`src/electron/renderer.js`)
 - 主要分頁：
@@ -156,7 +159,7 @@ CMClient/
 - **伺服器 (`src/web/server.js`)**
   - HTTP 靜態資產 + `GET /api/events` (Server-Sent Events)。
   - 推播事件：`status`、`callmesh`、`summary` / `summary-batch`、`log`、`log-batch`、`aprs`、`metrics`、`self`、`telemetry-*`、`node`、`node-snapshot`。
-  - 伺服器端維護節點資料庫：收到 `node` 事件或 Telemetry/summary 內含節點資訊時即時更新，初次連線會先送完整快照。
+  - 伺服器端維護節點資料庫：收到 `node` 事件或 Telemetry/summary 內含節點資訊時即時更新，初次連線會先送完整快照；CLI 啟用 Web UI 亦會直接餵入 bridge 的 `getNodeSnapshot()`。
   - 遙測資料庫同樣保留 500 筆/節點，並在 `telemetry-snapshot/append/reset` 事件中附帶統計（筆數、節點數、磁碟大小）。
   - 計數邏輯與 Electron 對齊：`packetLast10Min`、`aprsUploaded`、`mappingCount`。
 - **前端 (`src/web/public/main.js`)**
@@ -186,6 +189,10 @@ CMClient/
   - 最後出現時間（毫秒）、最後一次位置資訊（緯度/經度/高度）
   - 透過 CallMesh Provision 座標可計算與本地的距離；若座標無效或為 (0,0) 會自動忽略。
 - `node-database.json` 以及遙測 JSONL 均可透過節點資料庫分頁的「清除節點資料庫」按鈕、或 `callmesh:clear` 流程一併刪除。
+- **儲存路徑**：
+  - CLI：預設在 `~/.config/callmesh/node-database.json`（可透過 `CALLMESH_ARTIFACTS_DIR` 調整）。
+  - Electron：位於 OS 對應的 AppData，例如 macOS `~/Library/Application Support/<App>/callmesh/node-database.json`。
+  - Web Dashboard（含 CLI 啟動）直接讀取上述檔案播送的節點快照，不另儲存副本。
 
 ---
 
@@ -362,6 +369,7 @@ npx pkg src/index.js --targets node18-linux-x64
 
 ## 版本註記
 
+- **v0.2.16**：CLI 啟動 Web Dashboard 會載入節點／遙測快照並持續推播 `node` 事件；封包摘要 relay 顯示短名稱；Web 節點資料庫 Mesh ID 欄位回復為純 Mesh ID。
 - **v0.2.13**：導入節點資料庫 (`nodeDatabase`)、推播 `node`/`node-snapshot` 事件，並在 GUI/Web 顯示遙測統計（筆數 / 節點 / 檔案大小）。
 - **v0.2.10**：新增 Web Dashboard、同步 GUI 計數邏輯。
 - 更早版本請參考 Git history。
