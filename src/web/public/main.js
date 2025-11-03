@@ -13,6 +13,7 @@
   const callmeshPhg = document.getElementById('callmesh-phg');
   const callmeshComment = document.getElementById('callmesh-comment');
   const callmeshUpdated = document.getElementById('callmesh-updated');
+  const callmeshProvisionDetails = document.getElementById('callmesh-provision-details');
   const summaryTable = document.getElementById('summary-table');
   const logList = document.getElementById('log-list');
   const navButtons = document.querySelectorAll('.nav-btn');
@@ -111,6 +112,38 @@
 
   const METERS_PER_FOOT = 0.3048;
   const NODE_ONLINE_WINDOW_MS = 60 * 60 * 1000;
+  const STORAGE_KEYS = {
+    callmeshProvisionOpen: 'tmag:web:callmeshProvision:open'
+  };
+
+  function safeStorageGet(key) {
+    try {
+      return window.localStorage?.getItem(key);
+    } catch {
+      return null;
+    }
+  }
+
+  function safeStorageSet(key, value) {
+    try {
+      window.localStorage?.setItem(key, value);
+    } catch {
+      // ignore storage errors (例如隱私模式)
+    }
+  }
+
+  if (callmeshProvisionDetails) {
+    const stored = safeStorageGet(STORAGE_KEYS.callmeshProvisionOpen);
+    if (stored === '0') {
+      callmeshProvisionDetails.open = false;
+    } else if (stored === '1') {
+      callmeshProvisionDetails.open = true;
+    }
+    callmeshProvisionDetails.addEventListener('toggle', () => {
+      safeStorageSet(STORAGE_KEYS.callmeshProvisionOpen, callmeshProvisionDetails.open ? '1' : '0');
+    });
+  }
+
   function escapeHtml(input) {
     return String(input)
       .replace(/&/g, '&amp;')
