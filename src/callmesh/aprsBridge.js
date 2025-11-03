@@ -218,8 +218,6 @@ class CallMeshAprsBridge extends EventEmitter {
       ? Math.max(10, Math.floor(telemetryMaxEntriesPerNode))
       : 500;
 
-<<<<<<< Updated upstream
-=======
     this.tenmanForwardState = {
       lastKey: null,
       websocket: null,
@@ -232,7 +230,6 @@ class CallMeshAprsBridge extends EventEmitter {
       missingApiKeyWarned: false
     };
 
->>>>>>> Stashed changes
     this.heartbeatTimer = null;
     this.heartbeatRunning = false;
 
@@ -770,8 +767,6 @@ class CallMeshAprsBridge extends EventEmitter {
     if (summary.type === 'Position') {
       this.handleAprsSummary(summary);
     }
-<<<<<<< Updated upstream
-=======
     this.forwardTenmanPosition(summary);
   }
 
@@ -1073,7 +1068,6 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
->>>>>>> Stashed changes
   }
 
   handleMeshtasticMyInfo(info) {
