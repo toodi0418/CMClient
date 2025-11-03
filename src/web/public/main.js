@@ -18,6 +18,11 @@
   const logList = document.getElementById('log-list');
   const navButtons = document.querySelectorAll('.nav-btn');
   const pages = document.querySelectorAll('.page');
+  const messagesPage = document.getElementById('messages-page');
+  const channelNav = document.getElementById('channel-nav');
+  const channelTitleLabel = document.getElementById('channel-title');
+  const channelNoteLabel = document.getElementById('channel-note');
+  const channelMessageList = document.getElementById('channel-message-list');
   const flowPage = document.getElementById('flow-page');
   const flowList = document.getElementById('flow-list');
   const flowEmptyState = document.getElementById('flow-empty-state');
@@ -109,6 +114,22 @@
       formatter: (value) => formatSecondsAsDuration(value)
     }
   };
+  const CHANNEL_CONFIG = [
+    { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
+    { id: 1, code: 'CH1', name: 'Mesh TW', note: '跨節點廣播與共通交換' },
+    { id: 2, code: 'CH2', name: 'Signal Test', note: '訊號測試、天線調校專用' },
+    { id: 3, code: 'CH3', name: 'Emergency', note: '緊急狀況 / 救援聯絡' }
+  ];
+  const channelConfigs = CHANNEL_CONFIG.map((item) => ({ ...item }));
+  const channelConfigMap = new Map(channelConfigs.map((item) => [item.id, item]));
+  const channelMessageStore = new Map();
+  const channelNavButtons = new Map();
+  const CHANNEL_MESSAGE_LIMIT = 200;
+  let selectedChannelId = channelConfigs[0]?.id ?? null;
+  let messagesNavNeedsRender = true;
+  for (const channel of channelConfigs) {
+    channelMessageStore.set(channel.id, []);
+  }
 
   const METERS_PER_FOOT = 0.3048;
   const NODE_ONLINE_WINDOW_MS = 60 * 60 * 1000;
@@ -385,6 +406,381 @@
     }
     const meshDisplay = meshId.toLowerCase();
     return name.toLowerCase().includes(meshDisplay) ? name : `${name} (${meshId})`;
+  }
+
+  function ensureChannelConfig(channelId) {
+    const numeric = Number(channelId);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return null;
+    }
+    if (channelConfigMap.has(numeric)) {
+      return channelConfigMap.get(numeric);
+    }
+    const fallback = {
+      id: numeric,
+      code: `CH${numeric}`,
+      name: `Channel ${numeric}`,
+      note: ''
+    };
+    channelConfigs.push(fallback);
+    channelConfigs.sort((a, b) => a.id - b.id);
+    channelConfigMap.set(numeric, fallback);
+    messagesNavNeedsRender = true;
+    return fallback;
+  }
+
+  function getChannelConfig(channelId) {
+    const config = ensureChannelConfig(channelId);
+    return config || null;
+  }
+
+  function ensureChannelStore(channelId) {
+    const numeric = Number(channelId);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return [];
+    }
+    if (!channelMessageStore.has(numeric)) {
+      channelMessageStore.set(numeric, []);
+    }
+    const store = channelMessageStore.get(numeric);
+    return Array.isArray(store) ? store : [];
+  }
+
+  function isMessagesPageActive() {
+    return messagesPage?.classList.contains('active');
+  }
+
+  function appendMessageMeta(metaEl, text) {
+    if (!metaEl || !text) return;
+    const trimmed = String(text).trim();
+    if (!trimmed) return;
+    if (metaEl.children.length) {
+      const separator = document.createElement('span');
+      separator.className = 'meta-separator';
+      separator.textContent = '•';
+      metaEl.appendChild(separator);
+    }
+    const span = document.createElement('span');
+    span.textContent = trimmed;
+    metaEl.appendChild(span);
+  }
+
+  function updateChannelNavMeta(channelId, { unread = false } = {}) {
+    const navItem = channelNavButtons.get(channelId);
+    if (!navItem) return;
+    const store = ensureChannelStore(channelId);
+    const latest = store[0];
+    if (latest) {
+      const timeLabel = latest.timestampLabel || '—';
+      const fromLabel = latest.from || 'unknown';
+      navItem.meta.textContent = `${timeLabel} · ${fromLabel}`;
+    } else {
+      navItem.meta.textContent = '尚無訊息';
+    }
+    if (unread) {
+      navItem.button.classList.add('channel-nav-btn--unread');
+    } else {
+      navItem.button.classList.remove('channel-nav-btn--unread');
+    }
+  }
+
+  function renderChannelMessages(channelId) {
+    if (channelId !== selectedChannelId) {
+      return;
+    }
+    if (!channelMessageList) {
+      return;
+    }
+    const entries = ensureChannelStore(channelId);
+    channelMessageList.innerHTML = '';
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'channel-message-empty';
+      empty.textContent = '尚未收到訊息';
+      channelMessageList.appendChild(empty);
+      return;
+    }
+    entries.forEach((entry) => {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'channel-message';
+
+      const text = document.createElement('div');
+      text.className = 'channel-message-text';
+      text.textContent = entry.text;
+
+      const meta = document.createElement('div');
+      meta.className = 'channel-message-meta';
+      appendMessageMeta(meta, `來自：${entry.from}`);
+      appendMessageMeta(meta, entry.hops);
+      appendMessageMeta(meta, entry.relay);
+      appendMessageMeta(meta, `時間：${entry.timestampLabel}`);
+
+      wrapper.append(text, meta);
+      channelMessageList.appendChild(wrapper);
+    });
+  }
+
+  function selectChannel(channelId, { fromNavRender = false } = {}) {
+    const numeric = Number(channelId);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return;
+    }
+    const config = getChannelConfig(numeric);
+    ensureChannelStore(numeric);
+    selectedChannelId = numeric;
+    channelNavButtons.forEach(({ button }) => {
+      const isActive = Number(button.dataset.channelId) === numeric;
+      button.classList.toggle('active', isActive);
+      if (isActive) {
+        button.classList.remove('channel-nav-btn--unread');
+      }
+    });
+    if (channelTitleLabel && config) {
+      channelTitleLabel.textContent = `${config.name} (${config.code})`;
+    }
+    if (channelNoteLabel) {
+      channelNoteLabel.textContent = config?.note || '';
+    }
+    updateChannelNavMeta(numeric, { unread: false });
+    renderChannelMessages(numeric);
+    if (!fromNavRender && isMessagesPageActive()) {
+      const store = ensureChannelStore(numeric);
+      if (store.length) {
+        const navItem = channelNavButtons.get(numeric);
+        navItem?.button.classList.remove('channel-nav-btn--unread');
+      }
+    }
+  }
+
+  function renderChannelNav({ force = false } = {}) {
+    if (!channelNav) return;
+    if (force) {
+      messagesNavNeedsRender = true;
+    }
+    if (!messagesNavNeedsRender && channelNavButtons.size && channelNav.children.length) {
+      return;
+    }
+    messagesNavNeedsRender = false;
+    const previousSelected = selectedChannelId;
+    channelNavButtons.clear();
+    channelNav.innerHTML = '';
+
+    const sorted = channelConfigs.slice().sort((a, b) => a.id - b.id);
+    sorted.forEach((channel) => {
+      ensureChannelStore(channel.id);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'channel-nav-btn';
+      button.dataset.channelId = String(channel.id);
+
+      const codeEl = document.createElement('span');
+      codeEl.className = 'channel-nav-code';
+      codeEl.textContent = channel.code;
+
+      const textWrap = document.createElement('span');
+      textWrap.className = 'channel-nav-text';
+
+      const nameEl = document.createElement('span');
+      nameEl.className = 'channel-nav-name';
+      nameEl.textContent = channel.name;
+
+      const noteEl = document.createElement('span');
+      noteEl.className = 'channel-nav-note';
+      noteEl.textContent = channel.note;
+
+      const metaEl = document.createElement('span');
+      metaEl.className = 'channel-nav-meta';
+      metaEl.textContent = '尚無訊息';
+
+      textWrap.append(nameEl, noteEl, metaEl);
+      button.append(codeEl, textWrap);
+      button.addEventListener('click', () => selectChannel(channel.id));
+
+      channelNav.appendChild(button);
+      channelNavButtons.set(channel.id, { button, meta: metaEl });
+      updateChannelNavMeta(channel.id, { unread: false });
+    });
+
+    if (!sorted.length) {
+      selectedChannelId = null;
+      return;
+    }
+    const targetId = sorted.some((item) => item.id === previousSelected) ? previousSelected : sorted[0].id;
+    selectChannel(targetId, { fromNavRender: true });
+  }
+
+  function initializeChannelMessages() {
+    renderChannelNav({ force: true });
+    channelNavButtons.forEach((_, channelId) => updateChannelNavMeta(channelId, { unread: false }));
+  }
+
+  function formatMessageText(summary) {
+    const detail = typeof summary.detail === 'string' ? summary.detail.trim() : '';
+    const extra = Array.isArray(summary.extraLines)
+      ? summary.extraLines
+          .map((line) => (typeof line === 'string' ? line.trim() : ''))
+          .filter(Boolean)
+          .join('\n')
+      : '';
+    return detail || extra || '（無內容）';
+  }
+
+  function resolveMessageTimestamp(summary, timestampMs) {
+    if (typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()) {
+      return summary.timestampLabel.trim();
+    }
+    return formatFlowTimestamp(timestampMs);
+  }
+
+  function buildMessageRelayLabel(summary) {
+    let relayLabel = formatRelay({ ...summary });
+    if (!relayLabel || relayLabel === '未知?' || relayLabel === '?') {
+      relayLabel = formatNodeDisplayLabel(summary.relay);
+    }
+    if (!relayLabel || relayLabel === 'unknown') {
+      relayLabel = '未知';
+    }
+    return relayLabel === '直收' ? '最後一跳：直收' : `最後一跳：${relayLabel}`;
+  }
+
+  function buildMessageHopLabel(summary, hopInfo) {
+    if (hopInfo.usedHops === 0) {
+      return '跳數：0 (直收)';
+    }
+    if (hopInfo.usedHops != null && hopInfo.totalHops != null) {
+      return `跳數：${hopInfo.usedHops}/${hopInfo.totalHops}`;
+    }
+    if (hopInfo.usedHops != null) {
+      return `跳數：${hopInfo.usedHops}`;
+    }
+    if (hopInfo.hopsLabel) {
+      return `跳數：${hopInfo.hopsLabel}`;
+    }
+    return '跳數：未知';
+  }
+
+  function recordChannelMessage(summary, { markUnread = true, deferRender = false } = {}) {
+    if (!summary || summary.type !== 'Text') {
+      return;
+    }
+    const channelId = Number(summary.channel);
+    if (!Number.isFinite(channelId) || channelId < 0) {
+      return;
+    }
+    ensureChannelConfig(channelId);
+    const store = ensureChannelStore(channelId);
+
+    const text = formatMessageText(summary);
+    const fromLabel = formatNodeDisplayLabel(summary.from) || 'unknown';
+    const timestampMs = Number.isFinite(Number(summary.timestampMs)) ? Number(summary.timestampMs) : Date.now();
+    const timestampLabel = resolveMessageTimestamp(summary, timestampMs);
+    const flowIdRaw = summary.flowId || `${channelId}-${timestampMs}-${text}`;
+    const flowId = String(flowIdRaw);
+    const hopStats = extractHopInfo(summary);
+    const hopSummary = buildMessageHopLabel(summary, hopStats);
+    const relaySummary = buildMessageRelayLabel(summary);
+
+    const existingIndex = store.findIndex((entry) => entry.flowId === flowId);
+    if (existingIndex !== -1) {
+      store.splice(existingIndex, 1);
+    }
+    store.unshift({
+      flowId,
+      timestampMs,
+      timestampLabel,
+      text,
+      from: fromLabel,
+      hops: hopSummary,
+      relay: relaySummary
+    });
+    if (store.length > CHANNEL_MESSAGE_LIMIT) {
+      store.length = CHANNEL_MESSAGE_LIMIT;
+    }
+
+    const isSelected = channelId === selectedChannelId;
+    updateChannelNavMeta(channelId, { unread: markUnread && !isSelected && store.length > 0 });
+    if (isSelected && !deferRender) {
+      renderChannelMessages(channelId);
+    }
+  }
+
+  function clearChannelMessages() {
+    channelMessageStore.forEach((store, channelId) => {
+      if (Array.isArray(store)) {
+        store.length = 0;
+      }
+      updateChannelNavMeta(channelId, { unread: false });
+    });
+    if (selectedChannelId != null) {
+      renderChannelMessages(selectedChannelId);
+    }
+  }
+
+  function applyMessageSnapshot(payload) {
+    const channels = payload?.channels || {};
+    clearChannelMessages();
+    const channelIds = Object.keys(channels);
+    if (channelIds.length) {
+      channelIds.forEach((key) => {
+        const channelId = Number(key);
+        if (!Number.isFinite(channelId) || channelId < 0) {
+          return;
+        }
+        ensureChannelConfig(channelId);
+        const store = ensureChannelStore(channelId);
+        store.length = 0;
+        const list = Array.isArray(channels[key]) ? channels[key] : [];
+        for (let i = list.length - 1; i >= 0; i -= 1) {
+          const entry = list[i];
+          if (!entry) continue;
+          const hydrated = {
+            type: entry.type || 'Text',
+            channel: Number.isFinite(entry.channel) ? entry.channel : channelId,
+            detail: entry.detail,
+            extraLines: Array.isArray(entry.extraLines) ? entry.extraLines : [],
+            from: entry.from,
+            relay: entry.relay,
+            relayMeshId: entry.relayMeshId,
+            relayMeshIdNormalized: entry.relayMeshIdNormalized,
+            hops: entry.hops,
+            timestampMs: entry.timestampMs,
+            timestampLabel: entry.timestampLabel,
+            flowId: entry.flowId
+          };
+          recordChannelMessage(hydrated, { markUnread: false, deferRender: true });
+        }
+      });
+    }
+    renderChannelNav();
+    channelNavButtons.forEach((_, channelId) => updateChannelNavMeta(channelId, { unread: false }));
+    if (selectedChannelId != null) {
+      renderChannelMessages(selectedChannelId);
+    }
+  }
+
+  function handleMessageAppend(payload) {
+    if (!payload) return;
+    const entry = payload.entry || payload;
+    const channelId = Number(payload.channelId ?? entry?.channel);
+    if (!Number.isFinite(channelId) || channelId < 0) {
+      return;
+    }
+    const hydrated = {
+      type: entry.type || 'Text',
+      channel: channelId,
+      detail: entry.detail,
+      extraLines: Array.isArray(entry.extraLines) ? entry.extraLines : [],
+      from: entry.from,
+      relay: entry.relay,
+      relayMeshId: entry.relayMeshId,
+      relayMeshIdNormalized: entry.relayMeshIdNormalized,
+      hops: entry.hops,
+      timestampMs: entry.timestampMs,
+      timestampLabel: entry.timestampLabel,
+      flowId: entry.flowId
+    };
+    recordChannelMessage(hydrated, { markUnread: true });
+    renderChannelNav();
   }
 
   function getNodeLastSeenTimestamp(entry) {
@@ -749,6 +1145,11 @@
         renderFlowEntries();
       } else if (isActive && targetId === 'nodes-page') {
         renderNodeDatabase();
+      } else if (isActive && targetId === 'messages-page') {
+        renderChannelNav();
+        if (selectedChannelId != null) {
+          renderChannelMessages(selectedChannelId);
+        }
       }
     });
     navButtons.forEach((btn) => {
@@ -764,6 +1165,8 @@
       }
     });
   });
+
+  initializeChannelMessages();
 
   flowSearchInput?.addEventListener('input', () => {
     const raw = flowSearchInput.value || '';
@@ -1984,9 +2387,9 @@
     }
     if (typeof window.Chart !== 'function') {
       console.warn('Chart.js 尚未載入，遙測圖表無法顯示');
+      destroyAllTelemetryCharts();
       telemetryChartsContainer.classList.add('hidden');
       telemetryChartsContainer.innerHTML = '';
-      destroyAllTelemetryCharts();
       return;
     }
 
@@ -2011,51 +2414,103 @@
       metricsToRender = metricsList;
     }
     if (!metricsToRender.length) {
+      destroyAllTelemetryCharts();
       telemetryChartsContainer.classList.add('hidden');
       telemetryChartsContainer.innerHTML = '';
-      destroyAllTelemetryCharts();
       return;
     }
-    telemetryChartsContainer.classList.remove('hidden');
-    destroyAllTelemetryCharts();
-    telemetryChartsContainer.innerHTML = '';
 
-    const renderedMetrics = [];
+    const activeMetrics = new Set();
+
     for (const metricName of metricsToRender) {
       const series = seriesMap.get(metricName);
       if (!Array.isArray(series) || !series.length) {
         continue;
       }
+      activeMetrics.add(metricName);
       const def = TELEMETRY_METRIC_DEFINITIONS[metricName] || { label: metricName };
       const decimalsForSeries = computeSeriesDecimals(metricName, series);
-      const card = document.createElement('article');
-      card.className = 'telemetry-chart-card';
-      const header = document.createElement('div');
-      header.className = 'telemetry-chart-header';
-      const title = document.createElement('span');
-      title.className = 'telemetry-chart-title';
-      title.textContent = def.label || metricName;
-      header.appendChild(title);
-      const canvasWrap = document.createElement('div');
-      canvasWrap.className = 'telemetry-chart-canvas-wrap';
-      const canvas = document.createElement('canvas');
-      canvasWrap.appendChild(canvas);
-      card.appendChild(header);
-      card.appendChild(canvasWrap);
-      telemetryChartsContainer.appendChild(card);
+      const latestPoint = series[series.length - 1] || null;
+      const latestValue = latestPoint ? latestPoint.value : null;
+      const datasetPoints = series.map((point) => ({ x: point.time, y: point.value }));
 
-      const ctx = canvas.getContext('2d');
-      const chart = new window.Chart(
-        ctx,
-        buildTelemetryChartConfig(metricName, def, series, decimalsForSeries)
-      );
-      telemetryCharts.set(metricName, chart);
-      renderedMetrics.push(metricName);
+      let view = telemetryCharts.get(metricName);
+      if (!view) {
+        const card = document.createElement('article');
+        card.className = 'telemetry-chart-card';
+        const header = document.createElement('div');
+        header.className = 'telemetry-chart-header';
+        const title = document.createElement('span');
+        title.className = 'telemetry-chart-title';
+        title.textContent = def.label || metricName;
+        const latest = document.createElement('span');
+        latest.className = 'telemetry-chart-latest';
+        latest.textContent = formatTelemetryFixed(metricName, latestValue, decimalsForSeries) || '—';
+        header.append(title, latest);
+        const canvasWrap = document.createElement('div');
+        canvasWrap.className = 'telemetry-chart-canvas-wrap';
+        const canvas = document.createElement('canvas');
+        canvasWrap.appendChild(canvas);
+        card.append(header, canvasWrap);
+        const ctx = canvas.getContext('2d');
+        const chart = new window.Chart(
+          ctx,
+          buildTelemetryChartConfig(metricName, def, series, decimalsForSeries)
+        );
+        view = {
+          chart,
+          card,
+          titleEl: title,
+          latestEl: latest
+        };
+        telemetryCharts.set(metricName, view);
+      } else if (view.titleEl) {
+        view.titleEl.textContent = def.label || metricName;
+      }
+
+      const chart = view.chart;
+      const dataset = chart.data?.datasets?.[0];
+      if (dataset) {
+        dataset.label = def.label || metricName;
+        dataset.data = datasetPoints;
+        dataset.telemetryDecimals = decimalsForSeries;
+      } else {
+        const fallback = buildTelemetryChartConfig(
+          metricName,
+          def,
+          series,
+          decimalsForSeries
+        ).data.datasets[0];
+        chart.data.datasets = [{ ...fallback }];
+      }
+      chart.update('none');
+
+      if (view.latestEl) {
+        view.latestEl.textContent =
+          formatTelemetryFixed(metricName, latestValue, decimalsForSeries) || '—';
+      }
+
+      telemetryChartsContainer.appendChild(view.card);
     }
 
-    if (!renderedMetrics.length) {
+    for (const [metricName, view] of Array.from(telemetryCharts.entries())) {
+      if (!activeMetrics.has(metricName)) {
+        try {
+          view.chart?.destroy();
+        } catch {
+          // ignore
+        }
+        if (view.card?.parentNode) {
+          view.card.parentNode.removeChild(view.card);
+        }
+        telemetryCharts.delete(metricName);
+      }
+    }
+
+    if (!telemetryCharts.size) {
       telemetryChartsContainer.classList.add('hidden');
-      telemetryChartsContainer.innerHTML = '';
+    } else {
+      telemetryChartsContainer.classList.remove('hidden');
     }
   }
 
@@ -2139,11 +2594,14 @@
   }
 
   function destroyAllTelemetryCharts() {
-    for (const chart of telemetryCharts.values()) {
+    for (const [, view] of telemetryCharts.entries()) {
       try {
-        chart.destroy();
+        view.chart?.destroy();
       } catch {
         // ignore
+      }
+      if (view.card?.parentNode) {
+        view.card.parentNode.removeChild(view.card);
       }
     }
     telemetryCharts.clear();
@@ -3839,6 +4297,12 @@
             break;
           case 'node':
             handleNodeUpdate(packet.payload);
+            break;
+          case 'message-snapshot':
+            applyMessageSnapshot(packet.payload);
+            break;
+          case 'message-append':
+            handleMessageAppend(packet.payload);
             break;
           default:
             break;
