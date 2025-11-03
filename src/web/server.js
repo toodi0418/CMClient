@@ -11,6 +11,7 @@ const PACKET_BUCKET_MS = 60 * 1000;
 const MAX_SUMMARY_ROWS = 200;
 const MAX_LOG_ENTRIES = 200;
 const APRS_HISTORY_MAX = 5000;
+const APRS_RECORD_HISTORY_MAX = 5000;
 const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
 
 function cloneJson(value) {
@@ -94,6 +95,8 @@ class WebDashboardServer {
     this.selfMeshId = null;
     this.aprsFlowIds = new Set();
     this.aprsFlowQueue = [];
+    this.aprsFlowRecords = new Map();
+    this.aprsRecordQueue = [];
     this.lastAppInfo = this.appVersion ? { version: this.appVersion } : null;
     this.telemetryMaxPerNode =
       Number.isFinite(options.telemetryMaxPerNode) && options.telemetryMaxPerNode > 0
@@ -193,12 +196,23 @@ class WebDashboardServer {
 
   publishAprs(info) {
     if (!info) return;
-    this.lastAprsInfo = {
+    const timestamp =
+      Number.isFinite(Number(info.timestamp))
+        ? Number(info.timestamp)
+        : Number.isFinite(Number(info.timestampMs))
+          ? Number(info.timestampMs)
+          : Date.now();
+    const sanitized = cloneJson({
       ...info,
-      timestamp: info.timestamp ?? Date.now()
-    };
-    this._broadcast({ type: 'aprs', payload: this.lastAprsInfo });
-    this._updateAprsMetrics(info);
+      timestamp,
+      timestampMs: Number.isFinite(Number(info.timestampMs)) ? Number(info.timestampMs) : timestamp
+    });
+    this.lastAprsInfo = sanitized;
+    if (sanitized?.flowId) {
+      this._rememberAprsRecord(sanitized);
+    }
+    this._broadcast({ type: 'aprs', payload: sanitized });
+    this._updateAprsMetrics(sanitized);
     this._broadcastMetrics();
   }
 
@@ -414,6 +428,14 @@ class WebDashboardServer {
     if (this.logEntries.length) {
       this._write(res, { type: 'log-batch', payload: this.logEntries });
     }
+    if (this.aprsRecordQueue.length) {
+      for (const flowId of this.aprsRecordQueue) {
+        const record = this.aprsFlowRecords.get(flowId);
+        if (record) {
+          this._write(res, { type: 'aprs', payload: record });
+        }
+      }
+    }
     if (this.lastAprsInfo) {
       this._write(res, { type: 'aprs', payload: this.lastAprsInfo });
     }
@@ -587,6 +609,28 @@ class WebDashboardServer {
       }
     }
     this.metrics.aprsUploaded += 1;
+  }
+
+  _rememberAprsRecord(info) {
+    if (!info || !info.flowId) {
+      return;
+    }
+    const flowId = String(info.flowId).trim();
+    if (!flowId) {
+      return;
+    }
+    if (this.aprsFlowRecords.has(flowId)) {
+      this.aprsFlowRecords.set(flowId, info);
+      return;
+    }
+    this.aprsFlowRecords.set(flowId, info);
+    this.aprsRecordQueue.push(flowId);
+    while (this.aprsRecordQueue.length > APRS_RECORD_HISTORY_MAX) {
+      const oldest = this.aprsRecordQueue.shift();
+      if (oldest) {
+        this.aprsFlowRecords.delete(oldest);
+      }
+    }
   }
 
   _isSelfSummary(summary) {
