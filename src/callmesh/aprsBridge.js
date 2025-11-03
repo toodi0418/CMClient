@@ -8,6 +8,7 @@ const readline = require('readline');
 const { CallMeshClient, buildAgentString } = require('./client');
 const { APRSClient } = require('../aprs/client');
 const { nodeDatabase } = require('../nodeDatabase');
+const WebSocket = require('ws');
 
 const DEFAULT_APRS_SERVER = 'asia.aprs2.net';
 const DEFAULT_APRS_PORT = 14580;
@@ -26,6 +27,13 @@ const APRS_TELEMETRY_INTERVAL_MS = 6 * 60 * 60_000;
 const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
+
+const TENMAN_FORWARD_NODE_ID = '!b29f440c';
+const TENMAN_FORWARD_WS_ENDPOINT =
+  process.env.TENMAN_WS_URL || 'wss://tenmanmap.yakumo.tw/ws';
+const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
+const TENMAN_FORWARD_QUEUE_LIMIT = 64;
+const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
@@ -200,6 +208,16 @@ class CallMeshAprsBridge extends EventEmitter {
     this.telemetryMaxEntriesPerNode = Number.isFinite(telemetryMaxEntriesPerNode)
       ? Math.max(10, Math.floor(telemetryMaxEntriesPerNode))
       : 500;
+
+    this.tenmanForwardState = {
+      lastKey: null,
+      websocket: null,
+      connecting: false,
+      queue: [],
+      pendingKeys: new Set(),
+      sending: false,
+      reconnectTimer: null
+    };
 
     this.heartbeatTimer = null;
     this.heartbeatRunning = false;
@@ -738,6 +756,263 @@ class CallMeshAprsBridge extends EventEmitter {
     if (summary.type === 'Position') {
       this.handleAprsSummary(summary);
     }
+    this.forwardTenmanPosition(summary);
+  }
+
+  async forwardTenmanPosition(summary) {
+    if (!summary) {
+      return;
+    }
+
+    try {
+      const meshIdNormalized = normalizeMeshId(
+        summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
+      );
+      if (meshIdNormalized !== TENMAN_FORWARD_NODE_ID) {
+        return;
+      }
+
+      const position = summary.position;
+      if (!position) {
+        return;
+      }
+
+      const latitude = toFiniteNumber(position.latitude ?? position.lat);
+      const longitude = toFiniteNumber(position.longitude ?? position.lon);
+      if (latitude == null || longitude == null) {
+        return;
+      }
+
+      const altitudeValue = toFiniteNumber(
+        position.altitude ?? position.alt ?? position.altitudeHae ?? position.altitudeGeoidalSeparation
+      );
+      const altitude = roundTo(altitudeValue ?? 0, 2);
+      const speed = roundTo(resolveSpeed(position), 2);
+      const heading = resolveHeading(position);
+
+      const timestampSource =
+        summary.timestamp ??
+        (Number.isFinite(summary.timestampMs) ? new Date(Number(summary.timestampMs)).toISOString() : null) ??
+        new Date().toISOString();
+      const timestamp = formatTimestampWithOffset(
+        timestampSource,
+        TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES
+      );
+      if (!timestamp) {
+        return;
+      }
+
+      const dedupeKey = `${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
+      if (this.tenmanForwardState.lastKey === dedupeKey || this.tenmanForwardState.pendingKeys?.has?.(dedupeKey)) {
+        return;
+      }
+
+      const payload = {
+        device_id: TENMAN_FORWARD_NODE_ID,
+        timestamp,
+        latitude,
+        longitude,
+        altitude,
+        speed,
+        heading,
+        extra: {
+          source: 'TMAG',
+          mesh_id: meshIdNormalized
+        }
+      };
+
+      const message = {
+        action: 'publish',
+        payload
+      };
+
+      this.enqueueTenmanPublish(message, dedupeKey);
+    } catch (err) {
+      this.emitLog('TENMAN', `位置回報處理失敗: ${err.message}`);
+    }
+  }
+
+  enqueueTenmanPublish(message, dedupeKey) {
+    if (!message || !dedupeKey) {
+      return;
+    }
+    const state = this.tenmanForwardState;
+    if (!state) {
+      return;
+    }
+
+    if (!state.pendingKeys) {
+      state.pendingKeys = new Set();
+    }
+
+    if (state.lastKey === dedupeKey || state.pendingKeys.has(dedupeKey)) {
+      return;
+    }
+
+    if (!Array.isArray(state.queue)) {
+      state.queue = [];
+    }
+
+    if (state.queue.length >= TENMAN_FORWARD_QUEUE_LIMIT) {
+      const dropped = state.queue.shift();
+      if (dropped?.key) {
+        state.pendingKeys.delete(dropped.key);
+      }
+      this.emitLog('TENMAN', '佇列已滿，將移除最舊的 publish 訊息');
+    }
+
+    const entry = {
+      key: dedupeKey,
+      message,
+      serialized: JSON.stringify(message)
+    };
+    state.queue.push(entry);
+    state.pendingKeys.add(dedupeKey);
+
+    this.ensureTenmanWebsocket();
+    this.flushTenmanQueue();
+  }
+
+  ensureTenmanWebsocket() {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue)) {
+      return;
+    }
+    if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+      return;
+    }
+    if (state.connecting) {
+      return;
+    }
+
+    this.clearTenmanReconnectTimer();
+    state.connecting = true;
+
+    try {
+      const ws = new WebSocket(TENMAN_FORWARD_WS_ENDPOINT);
+      state.websocket = ws;
+
+      ws.on('open', () => {
+        state.connecting = false;
+        this.emitLog('TENMAN', 'WebSocket 已連線');
+        this.flushTenmanQueue();
+      });
+
+      ws.on('close', (code, reason) => {
+        state.websocket = null;
+        state.connecting = false;
+        state.sending = false;
+        this.emitLog(
+          'TENMAN',
+          `WebSocket 已關閉 code=${code}${reason ? ` reason=${reason.toString()}` : ''}`
+        );
+        this.scheduleTenmanReconnect('closed');
+      });
+
+      ws.on('error', (err) => {
+        this.emitLog('TENMAN', `WebSocket 錯誤: ${err.message}`);
+      });
+
+      ws.on('unexpected-response', (_req, res) => {
+        this.emitLog('TENMAN', `WebSocket unexpected status=${res?.statusCode ?? 'unknown'}`);
+      });
+    } catch (err) {
+      state.connecting = false;
+      this.emitLog('TENMAN', `WebSocket 建立失敗: ${err.message}`);
+      this.scheduleTenmanReconnect('connect-error');
+    }
+  }
+
+  flushTenmanQueue() {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
+      return;
+    }
+
+    const ws = state.websocket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      this.ensureTenmanWebsocket();
+      return;
+    }
+
+    if (state.sending) {
+      return;
+    }
+
+    const entry = state.queue[0];
+    if (!entry) {
+      return;
+    }
+
+    state.sending = true;
+    try {
+      ws.send(entry.serialized, (err) => {
+        state.sending = false;
+        if (err) {
+          this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+          this.scheduleTenmanReconnect('send-error');
+          this.resetTenmanWebsocket();
+          return;
+        }
+
+        state.queue.shift();
+        state.pendingKeys.delete(entry.key);
+        state.lastKey = entry.key;
+        this.flushTenmanQueue();
+      });
+    } catch (err) {
+      state.sending = false;
+      this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+      this.scheduleTenmanReconnect('exception');
+      this.resetTenmanWebsocket();
+    }
+  }
+
+  resetTenmanWebsocket() {
+    const state = this.tenmanForwardState;
+    if (!state) {
+      return;
+    }
+    const ws = state.websocket;
+    if (ws) {
+      try {
+        ws.removeAllListeners();
+        ws.terminate();
+      } catch {
+        // ignore
+      }
+    }
+    state.websocket = null;
+    state.connecting = false;
+    state.sending = false;
+  }
+
+  scheduleTenmanReconnect(reason = 'retry') {
+    const state = this.tenmanForwardState;
+    if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
+      return;
+    }
+    if (state.reconnectTimer) {
+      return;
+    }
+    this.emitLog(
+      'TENMAN',
+      `WebSocket 將於 ${Math.round(TENMAN_FORWARD_RECONNECT_DELAY_MS / 1000)} 秒後重試 (${reason})`
+    );
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      this.ensureTenmanWebsocket();
+    }, TENMAN_FORWARD_RECONNECT_DELAY_MS);
+    state.reconnectTimer?.unref?.();
+  }
+
+  clearTenmanReconnectTimer() {
+    const state = this.tenmanForwardState;
+    if (!state?.reconnectTimer) {
+      return;
+    }
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
   }
 
   handleMeshtasticMyInfo(info) {
@@ -2546,6 +2821,88 @@ function formatTelemetryValue(value) {
   if (!Number.isFinite(value)) return '0';
   const clamped = Math.max(0, Math.min(999, Math.round(value)));
   return String(clamped);
+}
+
+function toFiniteNumber(value) {
+  if (value == null) return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return null;
+  }
+  return num;
+}
+
+function roundTo(value, digits = 2) {
+  if (!Number.isFinite(value)) {
+    return value;
+  }
+  const factor = 10 ** Math.max(0, digits);
+  return Math.round(value * factor) / factor;
+}
+
+function resolveSpeed(position) {
+  if (!position || typeof position !== 'object') {
+    return 0;
+  }
+  const candidates = [
+    position.speedMps,
+    position.groundSpeed,
+    position.speed,
+    position.airSpeed,
+    position.velHoriz
+  ];
+  for (const candidate of candidates) {
+    const value = toFiniteNumber(candidate);
+    if (value != null) {
+      return value;
+    }
+  }
+  const speedKph = toFiniteNumber(position.speedKph);
+  if (speedKph != null) {
+    return speedKph / 3.6;
+  }
+  const speedKnots = toFiniteNumber(position.speedKnots);
+  if (speedKnots != null) {
+    return speedKnots * 0.514444;
+  }
+  return 0;
+}
+
+function resolveHeading(position) {
+  if (!position || typeof position !== 'object') {
+    return 0;
+  }
+  const raw = toFiniteNumber(position.heading ?? position.course ?? position.velHeading);
+  if (raw == null) {
+    return 0;
+  }
+  const normalized = raw % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function formatTimestampWithOffset(source, offsetMinutes) {
+  if (source == null || !Number.isFinite(offsetMinutes)) {
+    return null;
+  }
+
+  let date;
+  if (source instanceof Date) {
+    date = new Date(source.getTime());
+  } else {
+    const parsed = new Date(source);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+    date = parsed;
+  }
+
+  const shifted = new Date(date.getTime() + offsetMinutes * 60_000);
+  const iso = shifted.toISOString().replace(/\.\d{3}Z$/, '');
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(abs / 60)).padStart(2, '0');
+  const minutes = String(abs % 60).padStart(2, '0');
+  return `${iso}${sign}${hours}:${minutes}`;
 }
 
 module.exports = {
