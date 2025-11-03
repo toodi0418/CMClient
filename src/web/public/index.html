@@ -48,6 +48,7 @@
 
       <nav class="main-nav">
         <button type="button" class="nav-btn active" data-target="summary-page">封包摘要</button>
+        <button type="button" class="nav-btn" data-target="messages-page">訊息</button>
         <button type="button" class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
         <button type="button" class="nav-btn" data-target="nodes-page">節點資料庫</button>
         <button type="button" class="nav-btn" data-target="telemetry-page">遙測數據</button>
@@ -57,7 +58,7 @@
       <section id="summary-page" class="page active">
         <section class="info-layout">
           <article class="info-card">
-            <details class="info-details" open>
+            <details id="callmesh-provision-details" class="info-details" open>
               <summary>CallMesh Provision</summary>
               <div class="info-content">
                 <dl class="info-grid">
@@ -115,6 +116,27 @@
             </table>
           </div>
         </section>
+      </section>
+
+      <section id="messages-page" class="page">
+        <article class="messages-panel">
+          <header class="messages-header">
+            <h2>訊息頻道</h2>
+            <p class="messages-subtitle">查看 TMAG 預設對講頻道與最近文字封包紀錄。</p>
+          </header>
+          <div class="messages-layout">
+            <aside id="channel-nav" class="channel-nav"></aside>
+            <section class="channel-content">
+              <header class="channel-content-header">
+                <h3 id="channel-title">Primary Channel (CH0)</h3>
+                <p id="channel-note">日常主要通訊頻道</p>
+              </header>
+              <div id="channel-message-list" class="channel-messages">
+                <div class="channel-message-empty">尚未收到訊息</div>
+              </div>
+            </section>
+          </div>
+        </article>
       </section>
 
       <section id="flow-page" class="page">
