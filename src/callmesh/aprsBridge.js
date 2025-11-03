@@ -228,7 +228,8 @@ class CallMeshAprsBridge extends EventEmitter {
       sending: false,
       reconnectTimer: null,
       missingGatewayWarned: false,
-      missingApiKeyWarned: false
+      missingApiKeyWarned: false,
+      skippedNodeIds: new Set()
     };
 
     this.heartbeatTimer = null;
@@ -780,8 +781,19 @@ class CallMeshAprsBridge extends EventEmitter {
       const meshIdNormalized = normalizeMeshId(
         summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
       );
+      const state = this.tenmanForwardState;
       if (!TENMAN_FORWARD_NODE_IDS.has(meshIdNormalized)) {
+        if (state && !state.skippedNodeIds.has(meshIdNormalized)) {
+          state.skippedNodeIds.add(meshIdNormalized);
+          this.emitLog(
+            'TENMAN',
+            `節點 ${meshIdNormalized} 不在 TENMAN_FORWARD_NODE_IDS 清單中，略過 publish`
+          );
+        }
         return;
+      }
+      if (state) {
+        state.skippedNodeIds.delete(meshIdNormalized);
       }
 
       const position = summary.position;
@@ -814,7 +826,6 @@ class CallMeshAprsBridge extends EventEmitter {
         return;
       }
 
-      const state = this.tenmanForwardState;
       const dedupeKey = `${meshIdNormalized}:${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
       if (state?.lastKey === dedupeKey || state?.pendingKeys?.has?.(dedupeKey)) {
         return;
@@ -910,6 +921,12 @@ class CallMeshAprsBridge extends EventEmitter {
     };
     state.queue.push(entry);
     state.pendingKeys.add(dedupeKey);
+    const payload = message?.payload || {};
+    const latLog =
+      typeof payload.latitude === 'number' ? payload.latitude.toFixed(6) : String(payload.latitude ?? '');
+    const lonLog =
+      typeof payload.longitude === 'number' ? payload.longitude.toFixed(6) : String(payload.longitude ?? '');
+    this.emitLog('TENMAN', `佇列 publish device=${payload.device_id ?? ''} lat=${latLog} lon=${lonLog}`);
 
     this.ensureTenmanWebsocket();
     this.flushTenmanQueue();
@@ -967,6 +984,8 @@ class CallMeshAprsBridge extends EventEmitter {
           if (parsed?.type === 'ack') {
             const deviceId = parsed?.payload?.device_id ?? parsed?.device_id ?? '';
             this.emitLog('TENMAN', `收到 ack${deviceId ? ` device=${deviceId}` : ''}`);
+          } else {
+            this.emitLog('TENMAN', `伺服器訊息: ${text}`);
           }
         } catch (err) {
           this.emitLog('TENMAN', `WebSocket 訊息解析失敗: ${err.message}`);
