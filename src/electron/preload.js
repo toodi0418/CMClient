@@ -51,6 +51,7 @@ contextBridge.exposeInMainWorld('meshtastic', {
     ipcRenderer.on('telemetry:update', listener);
     return () => ipcRenderer.removeListener('telemetry:update', listener);
   },
+  getMessageSnapshot: () => ipcRenderer.invoke('messages:get-snapshot'),
   clearTelemetry: () => ipcRenderer.invoke('telemetry:clear'),
   getNodeSnapshot: () => ipcRenderer.invoke('nodes:get-snapshot'),
   clearNodeDatabase: () => ipcRenderer.invoke('nodes:clear'),

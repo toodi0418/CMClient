@@ -17,6 +17,7 @@
 
       <nav class="main-nav">
         <button class="nav-btn active" data-target="monitor-page">監視</button>
+        <button class="nav-btn" data-target="messages-page">訊息</button>
         <button class="nav-btn" data-target="telemetry-page">遙測數據</button>
         <button class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
         <button class="nav-btn" data-target="nodes-page">節點資料庫</button>
@@ -76,6 +77,29 @@
             </thead>
             <tbody id="packet-table"></tbody>
           </table>
+        </section>
+      </section>
+
+      <section id="messages-page" class="page hidden">
+        <section class="messages-panel">
+          <header class="messages-header">
+            <h2>訊息頻道</h2>
+            <p class="messages-subtitle">
+              快速查看 TMAG 預設的對講頻道代號，協助團隊用同一套頻率規則溝通。
+            </p>
+          </header>
+          <div class="messages-layout">
+            <aside id="channel-nav" class="channel-nav"></aside>
+            <section class="channel-content">
+              <header class="channel-content-header">
+                <h3 id="channel-title">Primary Channel (CH0)</h3>
+                <p id="channel-note">日常主要通訊頻道</p>
+              </header>
+              <div id="channel-message-list" class="channel-messages">
+                <div class="channel-message-empty">尚未收到訊息</div>
+              </div>
+            </section>
+          </div>
         </section>
       </section>
 

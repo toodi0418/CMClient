@@ -13,6 +13,13 @@ const MAX_LOG_ENTRIES = 200;
 const APRS_HISTORY_MAX = 5000;
 const APRS_RECORD_HISTORY_MAX = 5000;
 const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
+const MESSAGE_MAX_PER_CHANNEL = 200;
+const CHANNEL_CONFIG = [
+  { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
+  { id: 1, code: 'CH1', name: 'Mesh TW', note: '跨節點廣播與共通交換' },
+  { id: 2, code: 'CH2', name: 'Signal Test', note: '訊號測試、天線調校專用' },
+  { id: 3, code: 'CH3', name: 'Emergency', note: '緊急狀況 / 救援聯絡' }
+];
 
 function cloneJson(value) {
   if (value === null || value === undefined) {
@@ -124,6 +131,9 @@ class WebDashboardServer {
       diskBytes: 0
     };
     this.nodeRegistry = new Map();
+    this.channelConfig = CHANNEL_CONFIG;
+    this.messageStore = new Map();
+    this._ensureConfiguredChannels();
   }
 
   async start() {
@@ -356,6 +366,68 @@ class WebDashboardServer {
     this._broadcast({ type: 'log', payload: entry });
   }
 
+  publishMessage(entry) {
+    const sanitized = this._cloneMessageEntry(entry);
+    if (!sanitized) {
+      return;
+    }
+    const channelId = sanitized.channel;
+    const store = this._getChannelStore(channelId);
+    const existingIndex = store.findIndex((item) => item.flowId === sanitized.flowId);
+    if (existingIndex !== -1) {
+      store.splice(existingIndex, 1);
+    }
+    store.unshift(sanitized);
+    if (store.length > MESSAGE_MAX_PER_CHANNEL) {
+      store.length = MESSAGE_MAX_PER_CHANNEL;
+    }
+    this._broadcast({
+      type: 'message-append',
+      payload: {
+        channelId,
+        entry: this._cloneMessageEntry(sanitized)
+      }
+    });
+  }
+
+  seedMessageSnapshot(snapshot = {}) {
+    this.messageStore.clear();
+    const channels = snapshot.channels || snapshot;
+    if (channels && typeof channels === 'object') {
+      for (const [key, list] of Object.entries(channels)) {
+        const channelId = Number(key);
+        if (!Number.isFinite(channelId) || channelId < 0) {
+          continue;
+        }
+        const store = [];
+        if (Array.isArray(list)) {
+          for (const entry of list) {
+            const cloned = this._cloneMessageEntry(entry);
+            if (!cloned) {
+              continue;
+            }
+            const duplicateIndex = store.findIndex((item) => item.flowId === cloned.flowId);
+            if (duplicateIndex !== -1) {
+              store.splice(duplicateIndex, 1);
+            }
+            store.push(cloned);
+            if (store.length >= MESSAGE_MAX_PER_CHANNEL) {
+              break;
+            }
+          }
+        }
+        this.messageStore.set(channelId, store);
+      }
+    }
+    this._ensureConfiguredChannels();
+    if (this.clients.size) {
+      this._broadcast({
+        type: 'message-snapshot',
+        payload: this._buildMessageSnapshotPayload()
+      });
+    }
+  }
+
   _appendSummary(summary) {
     const copy = cloneJson(summary);
     this.summaryRows.unshift(copy);
@@ -470,6 +542,10 @@ class WebDashboardServer {
     if (nodeSnapshot.length) {
       this._write(res, { type: 'node-snapshot', payload: nodeSnapshot });
     }
+    this._write(res, {
+      type: 'message-snapshot',
+      payload: this._buildMessageSnapshotPayload()
+    });
     this._write(res, {
       type: 'telemetry-snapshot',
       payload: this._buildTelemetrySnapshot()
@@ -654,6 +730,94 @@ class WebDashboardServer {
     for (const client of this.clients) {
       this._write(client, event);
     }
+  }
+
+  _ensureConfiguredChannels() {
+    if (!this.channelConfig || !Array.isArray(this.channelConfig)) {
+      return;
+    }
+    for (const channel of this.channelConfig) {
+      if (!channel || !Number.isFinite(channel.id)) {
+        continue;
+      }
+      if (!this.messageStore.has(channel.id)) {
+        this.messageStore.set(channel.id, []);
+      }
+    }
+  }
+
+  _getChannelStore(channelId) {
+    const key = Number(channelId);
+    if (!Number.isFinite(key) || key < 0) {
+      return [];
+    }
+    if (!this.messageStore.has(key)) {
+      this.messageStore.set(key, []);
+    }
+    return this.messageStore.get(key);
+  }
+
+  _cloneMessageEntry(entry) {
+    if (!entry || typeof entry !== 'object') {
+      return null;
+    }
+    const channelId = Number(entry.channel);
+    if (!Number.isFinite(channelId) || channelId < 0) {
+      return null;
+    }
+    const timestampMs = Number.isFinite(entry.timestampMs) ? Number(entry.timestampMs) : Date.now();
+    const flowId =
+      typeof entry.flowId === 'string' && entry.flowId.trim()
+        ? entry.flowId.trim()
+        : `${channelId}-${timestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+    const detail = typeof entry.detail === 'string' ? entry.detail : '';
+    const extraLines = Array.isArray(entry.extraLines)
+      ? entry.extraLines.filter((line) => typeof line === 'string' && line.trim())
+      : [];
+    const timestampLabel =
+      typeof entry.timestampLabel === 'string' && entry.timestampLabel.trim()
+        ? entry.timestampLabel.trim()
+        : new Date(timestampMs).toISOString();
+    return {
+      ...entry,
+      type: entry.type === 'Text' ? 'Text' : 'Text',
+      channel: channelId,
+      detail,
+      extraLines,
+      from: entry.from ? cloneJson(entry.from) : null,
+      relay: entry.relay ? cloneJson(entry.relay) : null,
+      relayMeshId: entry.relayMeshId ?? null,
+      relayMeshIdNormalized: entry.relayMeshIdNormalized ?? null,
+      hops: entry.hops ? cloneJson(entry.hops) : null,
+      timestampMs,
+      timestampLabel,
+      flowId
+    };
+  }
+
+  _buildMessageSnapshotPayload(limitPerChannel = MESSAGE_MAX_PER_CHANNEL) {
+    const channels = {};
+    for (const [channelId, entries] of this.messageStore.entries()) {
+      if (!Number.isFinite(channelId) || channelId < 0) {
+        continue;
+      }
+      const list = Array.isArray(entries) ? entries : [];
+      const limit =
+        Number.isFinite(limitPerChannel) && limitPerChannel > 0
+          ? Math.floor(limitPerChannel)
+          : list.length;
+      const slice =
+        list.length > limit ? list.slice(0, limit) : list.slice();
+      channels[channelId] = slice.map((entry) => this._cloneMessageEntry(entry)).filter(Boolean);
+    }
+    this._ensureConfiguredChannels();
+    for (const channel of this.channelConfig || []) {
+      if (!Number.isFinite(channel?.id)) continue;
+      if (!Object.prototype.hasOwnProperty.call(channels, channel.id)) {
+        channels[channel.id] = [];
+      }
+    }
+    return { channels };
   }
 
   _broadcastMetrics() {

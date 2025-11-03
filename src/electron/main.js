@@ -38,6 +38,167 @@ const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
 const { WebDashboardServer } = require('../web/server');
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
+const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
+const MESSAGE_MAX_PER_CHANNEL = 200;
+
+const messageStore = new Map();
+let messageWritePromise = Promise.resolve();
+
+function getMessageLogPath() {
+  return path.join(getCallMeshDataDir(), MESSAGE_LOG_FILENAME);
+}
+
+function sanitizeMessageNodeForPersist(node) {
+  if (!node || typeof node !== 'object') {
+    return null;
+  }
+  return {
+    meshId: node.meshId ?? null,
+    meshIdNormalized: node.meshIdNormalized ?? null,
+    meshIdOriginal: node.meshIdOriginal ?? null,
+    longName: node.longName ?? null,
+    shortName: node.shortName ?? null,
+    label: node.label ?? null
+  };
+}
+
+function sanitizeHopsForPersist(hops) {
+  if (!hops || typeof hops !== 'object') {
+    return null;
+  }
+  return {
+    start: Number.isFinite(hops.start) ? Number(hops.start) : null,
+    limit: Number.isFinite(hops.limit) ? Number(hops.limit) : null,
+    label: typeof hops.label === 'string' ? hops.label : null
+  };
+}
+
+function sanitizeMessageSummary(summary) {
+  if (!summary || summary.type !== 'Text') {
+    return null;
+  }
+  const channelId = Number(summary.channel);
+  if (!Number.isFinite(channelId) || channelId < 0) {
+    return null;
+  }
+  const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
+  const flowIdRaw = typeof summary.flowId === 'string' && summary.flowId.trim()
+    ? summary.flowId.trim()
+    : `${channelId}-${timestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+
+  return {
+    type: 'Text',
+    channel: channelId,
+    detail: typeof summary.detail === 'string' ? summary.detail : '',
+    extraLines: Array.isArray(summary.extraLines)
+      ? summary.extraLines.filter((line) => typeof line === 'string' && line.trim())
+      : [],
+    from: sanitizeMessageNodeForPersist(summary.from),
+    relay: sanitizeMessageNodeForPersist(summary.relay),
+    relayMeshId: summary.relay?.meshId ?? summary.relayMeshId ?? null,
+    relayMeshIdNormalized: summary.relay?.meshIdNormalized ?? summary.relayMeshIdNormalized ?? null,
+    hops: sanitizeHopsForPersist(summary.hops),
+    timestampMs,
+    timestampLabel:
+      typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
+        ? summary.timestampLabel.trim()
+        : new Date(timestampMs).toISOString(),
+    flowId: flowIdRaw
+  };
+}
+
+function cloneMessageEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  return {
+    ...entry,
+    extraLines: Array.isArray(entry.extraLines) ? [...entry.extraLines] : [],
+    from: entry.from ? { ...entry.from } : null,
+    relay: entry.relay ? { ...entry.relay } : null,
+    hops: entry.hops ? { ...entry.hops } : null
+  };
+}
+
+function addMessageEntry(entry) {
+  const channelId = entry.channel;
+  if (!messageStore.has(channelId)) {
+    messageStore.set(channelId, []);
+  }
+  const list = messageStore.get(channelId);
+  const existingIndex = list.findIndex((item) => item.flowId === entry.flowId);
+  if (existingIndex !== -1) {
+    list.splice(existingIndex, 1);
+  }
+  list.unshift(entry);
+  while (list.length > MESSAGE_MAX_PER_CHANNEL) {
+    list.pop();
+  }
+}
+
+async function flushMessageLog() {
+  const filePath = getMessageLogPath();
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const channelEntries = Array.from(messageStore.entries()).sort((a, b) => a[0] - b[0]);
+  const lines = [];
+  for (const [, list] of channelEntries) {
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      lines.push(JSON.stringify(list[i]));
+    }
+  }
+  await fs.writeFile(filePath, lines.join('\n'), 'utf8');
+}
+
+function persistMessageSummary(summary) {
+  const entry = sanitizeMessageSummary(summary);
+  if (!entry) {
+    return null;
+  }
+  addMessageEntry(entry);
+  messageWritePromise = messageWritePromise
+    .then(() => flushMessageLog())
+    .catch((err) => {
+      console.error('寫入訊息紀錄失敗:', err);
+    });
+  return entry;
+}
+
+function getMessageSnapshot() {
+  const snapshot = {};
+  messageStore.forEach((list, channelId) => {
+    snapshot[channelId] = list.map((entry) => cloneMessageEntry(entry)).filter(Boolean);
+  });
+  return snapshot;
+}
+
+async function loadMessageLog() {
+  const filePath = getMessageLogPath();
+  messageStore.clear();
+  try {
+    const content = await fs.readFile(filePath, 'utf8');
+    if (!content) {
+      return;
+    }
+    const lines = content.split(/\n+/).filter((line) => line.trim().length > 0);
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed === 'object') {
+          const entry = sanitizeMessageSummary(parsed);
+          if (entry) {
+            addMessageEntry(entry);
+          }
+        }
+      } catch (err) {
+        console.warn('跳過無法解析的訊息紀錄:', err.message);
+      }
+    }
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      console.warn('載入訊息紀錄失敗:', err.message);
+    }
+  }
+}
 
 let mainWindow = null;
 let client = null;
@@ -413,6 +574,7 @@ function buildCallmeshSummary() {
 }
 
 async function initialiseApp() {
+  await loadMessageLog();
   await initialiseBridge();
   await createWindow();
   await ensureWebDashboardState();
@@ -491,6 +653,7 @@ async function ensureWebDashboardState() {
         const nodes = bridge.getNodeSnapshot();
         webServer?.seedNodeSnapshot(nodes);
       }
+      webServer?.seedMessageSnapshot(getMessageSnapshot());
       await syncWebTelemetrySnapshot();
     }
   } else {
@@ -678,13 +841,22 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
 
   client.on('summary', (summary) => {
     if (!summary) return;
+    let messageEntry = null;
     try {
       bridge?.handleMeshtasticSummary(summary);
     } catch (err) {
       console.error('處理 APRS Summary 時發生錯誤:', err);
     }
+    try {
+      messageEntry = persistMessageSummary(summary);
+    } catch (err) {
+      console.error('寫入訊息摘要失敗:', err);
+    }
     mainWindow?.webContents.send('meshtastic:summary', summary);
     webServer?.publishSummary(summary);
+    if (messageEntry) {
+      webServer?.publishMessage(messageEntry);
+    }
   });
 
   client.on('fromRadio', ({ message }) => {
@@ -759,6 +931,10 @@ ipcMain.handle('meshtastic:disconnect', async () => {
 ipcMain.handle('meshtastic:discover', async (_event, options) => {
   const devices = await discoverMeshtasticDevices(options);
   return devices;
+});
+
+ipcMain.handle('messages:get-snapshot', async () => {
+  return { channels: getMessageSnapshot() };
 });
 
 ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {
@@ -953,6 +1129,14 @@ app.whenReady().then(() => {
     console.error('初始化失敗:', err);
     app.quit();
   });
+});
+
+app.on('before-quit', () => {
+  messageWritePromise = messageWritePromise
+    .then(() => flushMessageLog())
+    .catch((err) => {
+      console.error('關閉前寫入訊息紀錄失敗:', err);
+    });
 });
 
 app.on('window-all-closed', () => {

@@ -140,6 +140,226 @@ main {
   display: flex;
 }
 
+.messages-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(15, 23, 42, 0.65));
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  min-height: 0;
+}
+
+.messages-header h2 {
+  margin: 0;
+  font-size: 1.5rem;
+  color: #e2e8f0;
+}
+
+.messages-subtitle {
+  margin: 4px 0 0;
+  color: rgba(191, 219, 254, 0.75);
+}
+
+.messages-layout {
+  display: flex;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.channel-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 240px;
+  min-width: 200px;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  overflow-y: auto;
+}
+
+.channel-nav-btn {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: rgba(59, 130, 246, 0.12);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border 0.2s ease, background 0.2s ease, transform 0.2s ease;
+}
+
+.channel-nav-btn:hover {
+  background: rgba(59, 130, 246, 0.18);
+}
+
+.channel-nav-btn.active {
+  background: rgba(59, 130, 246, 0.35);
+  border-color: rgba(147, 197, 253, 0.7);
+  transform: translateX(2px);
+}
+
+.channel-nav-btn--unread {
+  border-color: rgba(191, 219, 254, 0.85);
+  box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.4);
+}
+
+.channel-nav-code {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  background: rgba(59, 130, 246, 0.28);
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  font-weight: 700;
+  font-size: 1rem;
+  color: #bfdbfe;
+  flex: none;
+}
+
+.channel-nav-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.channel-nav-name {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.channel-nav-note {
+  font-size: 0.85rem;
+  color: rgba(191, 219, 254, 0.7);
+}
+
+.channel-nav-meta {
+  font-size: 0.8rem;
+  color: rgba(148, 163, 184, 0.85);
+}
+
+.channel-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.channel-content-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.channel-content-header h3 {
+  margin: 0;
+  font-size: 1.3rem;
+  color: #f8fafc;
+}
+
+.channel-content-header p {
+  margin: 0;
+  color: rgba(191, 219, 254, 0.75);
+}
+
+.channel-messages {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.channel-message {
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(96, 165, 250, 0.32);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.channel-message-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #e2e8f0;
+}
+
+.channel-message-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 0.85rem;
+  color: rgba(191, 219, 254, 0.8);
+}
+
+.channel-message-meta span {
+  display: inline-flex;
+  align-items: center;
+}
+
+.channel-message-meta .meta-separator {
+  color: rgba(148, 163, 184, 0.6);
+}
+
+.channel-message-empty {
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px dashed rgba(148, 163, 184, 0.6);
+  color: rgba(191, 219, 254, 0.7);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.messages-panel .channel-messages::-webkit-scrollbar {
+  width: 6px;
+}
+
+.messages-panel .channel-messages::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.5);
+  border-radius: 3px;
+}
+
+.messages-panel .channel-messages::-webkit-scrollbar-thumb:hover {
+  background: rgba(226, 232, 240, 0.6);
+}
+
+@media (max-width: 900px) {
+  .messages-layout {
+    flex-direction: column;
+  }
+
+  .channel-nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    width: auto;
+    min-width: 0;
+    overflow-y: visible;
+  }
+
+  .channel-nav-btn {
+    flex: 1 1 calc(50% - 8px);
+  }
+}
+
 .counter-label {
   color: #cbd5f5;
   font-size: 0.85rem;

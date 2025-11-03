@@ -1,5 +1,17 @@
 'use strict';
 
+const CHANNEL_CONFIG = [
+  { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
+  { id: 1, code: 'CH1', name: 'Mesh TW', note: '跨節點廣播與共通交換' },
+  { id: 2, code: 'CH2', name: 'Signal Test', note: '訊號測試、天線調校專用' },
+  { id: 3, code: 'CH3', name: 'Emergency', note: '緊急狀況 / 救援聯絡' }
+];
+const CHANNEL_MESSAGE_LIMIT = 200;
+const channelMessageStore = new Map();
+CHANNEL_CONFIG.forEach((channel) => {
+  channelMessageStore.set(channel.id, []);
+});
+
 const form = document.getElementById('connection-form');
 const connectBtn = document.getElementById('connect-btn');
 const statusIndicator = document.getElementById('status-indicator');
@@ -62,6 +74,7 @@ const infoUpdatedAt = document.getElementById('info-updated-at');
 
 const navButtons = Array.from(document.querySelectorAll('.nav-btn'));
 const monitorPage = document.getElementById('monitor-page');
+const messagesPage = document.getElementById('messages-page');
 const nodesPage = document.getElementById('nodes-page');
 const nodesTableWrapper = document.getElementById('nodes-table-wrapper');
 const nodesTableBody = document.getElementById('nodes-table-body');
@@ -105,6 +118,15 @@ const webUiEnabledCheckbox = document.getElementById('web-ui-enabled');
 const resetDataBtn = document.getElementById('reset-data-btn');
 const copyLogBtn = document.getElementById('copy-log-btn');
 const downloadLogBtn = document.getElementById('download-log-btn');
+const channelNav = document.getElementById('channel-nav');
+const channelMessageList = document.getElementById('channel-message-list');
+const channelTitleLabel = document.getElementById('channel-title');
+const channelNoteLabel = document.getElementById('channel-note');
+const channelNavButtons = new Map();
+let selectedChannelId = CHANNEL_CONFIG[0]?.id ?? 0;
+
+initializeChannelMessages();
+loadPersistedMessages();
 
 const MAX_ROWS = 200;
 let discoveredDevices = [];
@@ -401,6 +423,281 @@ function extractHopInfo(summary) {
     totalHops: Number.isFinite(total) ? total : null,
     hopsLabel: label
   };
+}
+
+function initializeChannelMessages() {
+  CHANNEL_CONFIG.forEach((channel) => {
+    if (!channelMessageStore.has(channel.id)) {
+      channelMessageStore.set(channel.id, []);
+    }
+  });
+
+  if (channelNav) {
+    channelNav.innerHTML = '';
+    CHANNEL_CONFIG.forEach((channel) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'channel-nav-btn';
+      button.dataset.channelId = String(channel.id);
+
+      const codeEl = document.createElement('span');
+      codeEl.className = 'channel-nav-code';
+      codeEl.textContent = channel.code;
+
+      const textWrap = document.createElement('span');
+      textWrap.className = 'channel-nav-text';
+
+      const nameEl = document.createElement('span');
+      nameEl.className = 'channel-nav-name';
+      nameEl.textContent = channel.name;
+
+      const noteEl = document.createElement('span');
+      noteEl.className = 'channel-nav-note';
+      noteEl.textContent = channel.note;
+
+      const metaEl = document.createElement('span');
+      metaEl.className = 'channel-nav-meta';
+      metaEl.textContent = '尚無訊息';
+
+      textWrap.append(nameEl, noteEl, metaEl);
+      button.append(codeEl, textWrap);
+      button.addEventListener('click', () => selectChannel(channel.id));
+      channelNav.appendChild(button);
+      channelNavButtons.set(channel.id, { button, meta: metaEl });
+    });
+  }
+
+  if (!CHANNEL_CONFIG.some((channel) => channel.id === selectedChannelId)) {
+    selectedChannelId = CHANNEL_CONFIG[0]?.id ?? null;
+  }
+
+  if (selectedChannelId != null) {
+    selectChannel(selectedChannelId);
+  }
+}
+
+function selectChannel(channelId) {
+  if (!channelMessageStore.has(channelId)) {
+    return;
+  }
+  selectedChannelId = channelId;
+  channelNavButtons.forEach(({ button }) => {
+    const isActive = Number(button.dataset.channelId) === channelId;
+    button.classList.toggle('active', isActive);
+    if (isActive) {
+      button.classList.remove('channel-nav-btn--unread');
+    }
+  });
+
+  const channel = CHANNEL_CONFIG.find((item) => item.id === channelId);
+  if (channelTitleLabel) {
+    channelTitleLabel.textContent = channel ? `${channel.name} (${channel.code})` : `Channel ${channelId}`;
+  }
+  if (channelNoteLabel) {
+    channelNoteLabel.textContent = channel?.note || '';
+  }
+
+  updateChannelNavMeta(channelId, { unread: false });
+  renderChannelMessages(channelId);
+}
+
+function updateChannelNavMeta(channelId, { unread = false } = {}) {
+  const navItem = channelNavButtons.get(channelId);
+  if (!navItem) return;
+  const latest = channelMessageStore.get(channelId)?.[0];
+  if (latest) {
+    const timeLabel = latest.timestampLabel || '—';
+    const fromLabel = latest.from || 'unknown';
+    navItem.meta.textContent = `${timeLabel} · ${fromLabel}`;
+  } else {
+    navItem.meta.textContent = '尚無訊息';
+  }
+  if (unread) {
+    navItem.button.classList.add('channel-nav-btn--unread');
+  } else {
+    navItem.button.classList.remove('channel-nav-btn--unread');
+  }
+}
+
+function appendMeta(metaEl, text) {
+  if (!text) return;
+  if (metaEl.children.length) {
+    const separator = document.createElement('span');
+    separator.className = 'meta-separator';
+    separator.textContent = '•';
+    metaEl.appendChild(separator);
+  }
+  const span = document.createElement('span');
+  span.textContent = text;
+  metaEl.appendChild(span);
+}
+
+function renderChannelMessages(channelId) {
+  if (channelId !== selectedChannelId) {
+    return;
+  }
+  if (!channelMessageList) {
+    return;
+  }
+  const entries = channelMessageStore.get(channelId) || [];
+  channelMessageList.innerHTML = '';
+  if (!entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'channel-message-empty';
+    empty.textContent = '尚未收到訊息';
+    channelMessageList.appendChild(empty);
+    return;
+  }
+
+  entries.forEach((entry) => {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'channel-message';
+
+    const text = document.createElement('div');
+    text.className = 'channel-message-text';
+    text.textContent = entry.text;
+
+    const meta = document.createElement('div');
+    meta.className = 'channel-message-meta';
+    appendMeta(meta, `來自：${entry.from}`);
+    appendMeta(meta, entry.hops);
+    appendMeta(meta, entry.relay);
+    appendMeta(meta, `時間：${entry.timestampLabel}`);
+
+    wrapper.append(text, meta);
+    channelMessageList.appendChild(wrapper);
+  });
+}
+
+function clearChannelMessages() {
+  channelMessageStore.forEach((store, channelId) => {
+    if (Array.isArray(store)) {
+      store.length = 0;
+    }
+    updateChannelNavMeta(channelId, { unread: false });
+  });
+  renderChannelMessages(selectedChannelId);
+}
+
+function recordChannelMessage(summary, { markUnread = true } = {}) {
+  if (!summary || summary.type !== 'Text') {
+    return;
+  }
+  const channelId = Number(summary.channel);
+  if (!Number.isFinite(channelId)) {
+    return;
+  }
+
+  const rawDetail = typeof summary.detail === 'string' ? summary.detail.trim() : '';
+  const extraDetail = Array.isArray(summary.extraLines)
+    ? summary.extraLines
+        .map((line) => (typeof line === 'string' ? line.trim() : ''))
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  const text = rawDetail || extraDetail || '（無內容）';
+
+  const fromLabel = formatNodeDisplay(summary.from) || 'unknown';
+  const timestampMs = Number.isFinite(Number(summary.timestampMs)) ? Number(summary.timestampMs) : Date.now();
+  const timestampLabel =
+    typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
+      ? summary.timestampLabel.trim()
+      : formatLogTimestamp(new Date(timestampMs));
+  const flowIdRaw = summary.flowId || `${channelId}-${timestampMs}-${text}`;
+  const flowId = String(flowIdRaw);
+
+  const hopStats = extractHopInfo(summary);
+  let hopSummary;
+  if (hopStats.usedHops === 0) {
+    hopSummary = '跳數：0 (直收)';
+  } else if (hopStats.usedHops != null && hopStats.totalHops != null) {
+    hopSummary = `跳數：${hopStats.usedHops}/${hopStats.totalHops}`;
+  } else if (hopStats.usedHops != null) {
+    hopSummary = `跳數：${hopStats.usedHops}`;
+  } else if (hopStats.hopsLabel) {
+    hopSummary = `跳數：${hopStats.hopsLabel}`;
+  } else {
+    hopSummary = '跳數：未知';
+  }
+
+  let relaySummary = computeRelayLabel(summary);
+  if (!relaySummary || relaySummary === '未知?' || relaySummary === '?') {
+    relaySummary = formatNodeDisplay(summary.relay);
+  }
+  if (!relaySummary || relaySummary === 'unknown') {
+    relaySummary = '未知';
+  }
+  relaySummary = relaySummary === '直收' ? '最後一跳：直收' : `最後一跳：${relaySummary}`;
+
+  const store = channelMessageStore.get(channelId) || [];
+  const existingIndex = store.findIndex((entry) => entry.flowId === flowId);
+  if (existingIndex !== -1) {
+    store.splice(existingIndex, 1);
+  }
+  store.unshift({
+    flowId,
+    timestampMs,
+    timestampLabel,
+    text,
+    from: fromLabel,
+    hops: hopSummary,
+    relay: relaySummary
+  });
+  if (store.length > CHANNEL_MESSAGE_LIMIT) {
+    store.length = CHANNEL_MESSAGE_LIMIT;
+  }
+  channelMessageStore.set(channelId, store);
+
+  const isSelected = channelId === selectedChannelId;
+  updateChannelNavMeta(channelId, { unread: markUnread && !isSelected && store.length > 0 });
+  if (isSelected) {
+    renderChannelMessages(channelId);
+  }
+}
+
+async function loadPersistedMessages() {
+  if (!window.meshtastic.getMessageSnapshot) {
+    return;
+  }
+  try {
+    const snapshot = await window.meshtastic.getMessageSnapshot();
+    if (!snapshot || typeof snapshot !== 'object') {
+      return;
+    }
+    const channels = snapshot.channels || snapshot;
+    const channelIds = Object.keys(channels)
+      .map((key) => Number(key))
+      .filter((value) => Number.isFinite(value));
+    channelIds.sort((a, b) => a - b);
+    channelIds.forEach((channelId) => {
+      const entries = Array.isArray(channels[channelId]) ? channels[channelId] : [];
+      for (let i = entries.length - 1; i >= 0; i -= 1) {
+        const entry = entries[i];
+        if (!entry) continue;
+        const hydratedChannel = Number(entry.channel);
+        const hydrated = {
+          type: entry.type || 'Text',
+          channel: Number.isFinite(hydratedChannel) ? hydratedChannel : Number(channelId),
+          detail: entry.detail,
+          extraLines: Array.isArray(entry.extraLines) ? entry.extraLines : [],
+          from: entry.from,
+          relay: entry.relay,
+          relayMeshId: entry.relayMeshId,
+          relayMeshIdNormalized: entry.relayMeshIdNormalized,
+          hops: entry.hops,
+          timestampMs: entry.timestampMs,
+          timestampLabel: entry.timestampLabel,
+          flowId: entry.flowId
+        };
+        recordChannelMessage(hydrated, { markUnread: false });
+      }
+    });
+    if (selectedChannelId != null) {
+      selectChannel(selectedChannelId);
+    }
+  } catch (err) {
+    console.warn('載入訊息快取失敗:', err);
+  }
 }
 
 function appendLog(tag, message, isoTimestamp) {
@@ -1498,6 +1795,7 @@ function appendSummaryRow(summary) {
   row.querySelector('.time').textContent = summary.timestampLabel ?? '';
   row.querySelector('.nodes').textContent = nodesLabel;
   const relayCell = row.querySelector('.relay');
+  const hopInfo = extractHopInfo(summary);
   const relayLabel = computeRelayLabel(summary);
   relayCell.textContent = relayLabel;
 
@@ -1523,7 +1821,7 @@ function appendSummaryRow(summary) {
   row.querySelector('.snr').textContent = formatNumber(summary.snr, 2);
   row.querySelector('.rssi').textContent = formatNumber(summary.rssi, 0);
   renderTypeCell(row.querySelector('.type'), summary);
-  row.querySelector('.hops').textContent = summary.hops?.label ?? '';
+  row.querySelector('.hops').textContent = hopInfo.hopsLabel || summary.hops?.label || '';
   row.querySelector('.detail-main').textContent = summary.detail || '';
 
   const fromMeshNormalized = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
@@ -1544,6 +1842,7 @@ function appendSummaryRow(summary) {
     tableBody.removeChild(tableBody.lastChild);
   }
 
+  recordChannelMessage(summary);
   registerPacketFlow(summary);
 }
 
@@ -3757,9 +4056,9 @@ function renderTelemetryCharts(records) {
   }
   if (typeof window.Chart !== 'function') {
     console.warn('Chart.js 尚未載入，遙測圖表無法顯示');
+    destroyAllTelemetryCharts();
     telemetryChartsContainer.classList.add('hidden');
     telemetryChartsContainer.innerHTML = '';
-    destroyAllTelemetryCharts();
     return;
   }
 
@@ -3776,58 +4075,101 @@ function renderTelemetryCharts(records) {
     if (telemetryChartMetricSelect && telemetryChartMetric) {
       telemetryChartMetricSelect.value = telemetryChartMetric;
     }
-    metricsToRender = telemetryChartMetric && seriesMap.has(telemetryChartMetric)
-      ? [telemetryChartMetric]
-      : [];
+    metricsToRender =
+      telemetryChartMetric && seriesMap.has(telemetryChartMetric)
+        ? [telemetryChartMetric]
+        : [];
   } else {
     metricsToRender = metricsList;
   }
+
   if (!metricsToRender.length) {
+    destroyAllTelemetryCharts();
     telemetryChartsContainer.classList.add('hidden');
     telemetryChartsContainer.innerHTML = '';
-    destroyAllTelemetryCharts();
     return;
   }
-  telemetryChartsContainer.classList.remove('hidden');
-  destroyAllTelemetryCharts();
-  telemetryChartsContainer.innerHTML = '';
 
-  const renderedMetrics = [];
+  const activeMetrics = new Set();
+
   for (const metricName of metricsToRender) {
     const series = seriesMap.get(metricName);
     if (!Array.isArray(series) || !series.length) {
       continue;
     }
+    activeMetrics.add(metricName);
     const def = TELEMETRY_METRIC_DEFINITIONS[metricName] || { label: metricName };
-    const card = document.createElement('article');
-    card.className = 'telemetry-chart-card';
-    const header = document.createElement('div');
-    header.className = 'telemetry-chart-header';
-    const title = document.createElement('span');
-    title.className = 'telemetry-chart-title';
-    title.textContent = def.label || metricName;
-    const latest = document.createElement('span');
-    latest.className = 'telemetry-chart-latest';
-    latest.textContent = formatTelemetryValue(metricName, series[series.length - 1].value);
-    header.appendChild(title);
-    header.appendChild(latest);
-    const canvasWrap = document.createElement('div');
-    canvasWrap.className = 'telemetry-chart-canvas-wrap';
-    const canvas = document.createElement('canvas');
-    canvasWrap.appendChild(canvas);
-    card.appendChild(header);
-    card.appendChild(canvasWrap);
-    telemetryChartsContainer.appendChild(card);
+    const latestPoint = series[series.length - 1] || null;
+    const latestValue = latestPoint ? latestPoint.value : null;
+    const datasetPoints = series.map((point) => ({ x: point.time, y: point.value }));
 
-    const ctx = canvas.getContext('2d');
-    const chart = new window.Chart(ctx, buildTelemetryChartConfig(metricName, def, series));
-    telemetryCharts.set(metricName, chart);
-    renderedMetrics.push(metricName);
+    let view = telemetryCharts.get(metricName);
+    if (!view) {
+      const card = document.createElement('article');
+      card.className = 'telemetry-chart-card';
+      const header = document.createElement('div');
+      header.className = 'telemetry-chart-header';
+      const title = document.createElement('span');
+      title.className = 'telemetry-chart-title';
+      title.textContent = def.label || metricName;
+      const latest = document.createElement('span');
+      latest.className = 'telemetry-chart-latest';
+      latest.textContent = formatTelemetryValue(metricName, latestValue) || '—';
+      header.append(title, latest);
+      const canvasWrap = document.createElement('div');
+      canvasWrap.className = 'telemetry-chart-canvas-wrap';
+      const canvas = document.createElement('canvas');
+      canvasWrap.appendChild(canvas);
+      card.append(header, canvasWrap);
+      const ctx = canvas.getContext('2d');
+      const chart = new window.Chart(ctx, buildTelemetryChartConfig(metricName, def, series));
+      view = {
+        chart,
+        card,
+        titleEl: title,
+        latestEl: latest
+      };
+      telemetryCharts.set(metricName, view);
+    } else if (view.titleEl) {
+      view.titleEl.textContent = def.label || metricName;
+    }
+
+    const chart = view.chart;
+    const dataset = chart.data?.datasets?.[0];
+    if (dataset) {
+      dataset.label = def.label || metricName;
+      dataset.data = datasetPoints;
+    } else {
+      const fallback = buildTelemetryChartConfig(metricName, def, series).data.datasets[0];
+      chart.data.datasets = [{ ...fallback }];
+    }
+    chart.update('none');
+
+    if (view.latestEl) {
+      view.latestEl.textContent = formatTelemetryValue(metricName, latestValue) || '—';
+    }
+
+    telemetryChartsContainer.appendChild(view.card);
   }
 
-  if (!renderedMetrics.length) {
+  for (const [metricName, view] of Array.from(telemetryCharts.entries())) {
+    if (!activeMetrics.has(metricName)) {
+      try {
+        view.chart?.destroy();
+      } catch {
+        /* ignore */
+      }
+      if (view.card?.parentNode) {
+        view.card.parentNode.removeChild(view.card);
+      }
+      telemetryCharts.delete(metricName);
+    }
+  }
+
+  if (!telemetryCharts.size) {
     telemetryChartsContainer.classList.add('hidden');
-    telemetryChartsContainer.innerHTML = '';
+  } else {
+    telemetryChartsContainer.classList.remove('hidden');
   }
 }
 
@@ -3906,11 +4248,14 @@ function buildTelemetryChartConfig(metricName, def, series) {
 }
 
 function destroyAllTelemetryCharts() {
-  for (const chart of telemetryCharts.values()) {
+  for (const [, view] of telemetryCharts.entries()) {
     try {
-      chart.destroy();
+      view.chart?.destroy();
     } catch {
       /* ignore */
+    }
+    if (view.card?.parentNode) {
+      view.card.parentNode.removeChild(view.card);
     }
   }
   telemetryCharts.clear();
@@ -4321,6 +4666,7 @@ async function initializeNodeRegistry() {
 function activatePage(targetId) {
   const pages = [
     { id: 'monitor-page', element: monitorPage },
+    { id: 'messages-page', element: messagesPage },
     { id: 'telemetry-page', element: telemetryPage },
     { id: 'flow-page', element: flowPage },
     { id: 'nodes-page', element: nodesPage },
