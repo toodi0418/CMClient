@@ -1983,23 +1983,57 @@
       hideTelemetryDropdown();
       return;
     }
-    const fragment = document.createDocumentFragment();
-    let activeOption = null;
-    for (const candidate of candidates) {
-      const option = document.createElement('div');
-      option.className = 'telemetry-node-option';
-      option.dataset.meshId = candidate.meshId || '';
-      const displayText = candidate.display || candidate.meshId || '未知節點';
-      option.textContent = displayText;
-      option.title = displayText;
-      if (candidate.meshId === telemetrySelectedMeshId) {
-        option.classList.add('active');
-        activeOption = option;
+    const existingOptions = telemetryNodeDropdown.children;
+    let needsRebuild = existingOptions.length !== candidates.length;
+    if (!needsRebuild) {
+      for (let i = 0; i < candidates.length; i += 1) {
+        const candidate = candidates[i];
+        const option = existingOptions[i];
+        if (!option) {
+          needsRebuild = true;
+          break;
+        }
+        const displayText = candidate.display || candidate.meshId || '未知節點';
+        if (option.dataset.meshId !== (candidate.meshId || '') || option.textContent !== displayText) {
+          needsRebuild = true;
+          break;
+        }
       }
-      fragment.appendChild(option);
     }
-    telemetryNodeDropdown.innerHTML = '';
-    telemetryNodeDropdown.appendChild(fragment);
+    let activeOption = null;
+    if (needsRebuild) {
+      const fragment = document.createDocumentFragment();
+      for (const candidate of candidates) {
+        const option = document.createElement('div');
+        option.className = 'telemetry-node-option';
+        option.dataset.meshId = candidate.meshId || '';
+        const displayText = candidate.display || candidate.meshId || '未知節點';
+        option.textContent = displayText;
+        option.title = displayText;
+        if (candidate.meshId === telemetrySelectedMeshId) {
+          option.classList.add('active');
+          activeOption = option;
+        }
+        fragment.appendChild(option);
+      }
+      telemetryNodeDropdown.innerHTML = '';
+      telemetryNodeDropdown.appendChild(fragment);
+    } else {
+      for (let i = 0; i < candidates.length; i += 1) {
+        const candidate = candidates[i];
+        const option = existingOptions[i];
+        const displayText = candidate.display || candidate.meshId || '未知節點';
+        option.textContent = displayText;
+        option.title = displayText;
+        option.dataset.meshId = candidate.meshId || '';
+        if (candidate.meshId === telemetrySelectedMeshId) {
+          option.classList.add('active');
+          activeOption = option;
+        } else {
+          option.classList.remove('active');
+        }
+      }
+    }
     showTelemetryDropdown();
     if (activeOption) {
       activeOption.scrollIntoView({ block: 'nearest' });
