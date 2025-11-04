@@ -30,9 +30,10 @@ const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
 
 const TENMAN_FORWARD_NODE_IDS = new Set(
   [
-    '!b29f440c',
-    '!c1ede368'
-    // 如需新增節點，可直接在此陣列加入 `!xxxxxxxx` Mesh ID
+    // 壓力測試：留空代表所有節點都會上傳
+    // '!b29f440c',
+    // '!c1ede368'
+    // 如需改回白名單，請在此陣列加入 `!xxxxxxxx` Mesh ID
   ]
     .map((id) => normalizeMeshId(id))
     .filter(Boolean)
@@ -782,7 +783,8 @@ class CallMeshAprsBridge extends EventEmitter {
         summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
       );
       const state = this.tenmanForwardState;
-      if (!TENMAN_FORWARD_NODE_IDS.has(meshIdNormalized)) {
+      const useWhitelist = TENMAN_FORWARD_NODE_IDS.size > 0;
+      if (useWhitelist && !TENMAN_FORWARD_NODE_IDS.has(meshIdNormalized)) {
         if (state && !state.skippedNodeIds.has(meshIdNormalized)) {
           state.skippedNodeIds.add(meshIdNormalized);
           this.emitLog(
@@ -792,7 +794,7 @@ class CallMeshAprsBridge extends EventEmitter {
         }
         return;
       }
-      if (state) {
+      if (state && useWhitelist) {
         state.skippedNodeIds.delete(meshIdNormalized);
       }
 
