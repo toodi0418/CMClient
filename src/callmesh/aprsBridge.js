@@ -429,6 +429,9 @@ class CallMeshAprsBridge extends EventEmitter {
       altitude,
       lastSeenAt: Number.isFinite(timestamp) ? Number(timestamp) : Date.now()
     };
+    if (/^!0{6}[0-9a-f]{2}$/i.test(info.meshIdOriginal || '') || /^!0{6}[0-9a-f]{2}$/i.test(normalized)) {
+      return null;
+    }
     const result = this.nodeDatabase.upsert(normalized, info);
     if (result.changed) {
       const label = buildNodeLabel(result.node);
