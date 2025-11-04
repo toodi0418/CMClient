@@ -107,7 +107,6 @@ class MeshtasticClient extends EventEmitter {
     }
     const bestGuess = this._guessRelayCandidate(Array.from(matches), { snr, rssi });
     if (bestGuess != null) {
-      this._recordRelayLinkMetrics(bestGuess, { snr, rssi });
       return { nodeId: bestGuess >>> 0, guessed: true };
     }
     return { nodeId: raw, guessed: false };
