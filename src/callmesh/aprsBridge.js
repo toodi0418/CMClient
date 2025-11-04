@@ -431,6 +431,13 @@ class CallMeshAprsBridge extends EventEmitter {
     };
     const result = this.nodeDatabase.upsert(normalized, info);
     if (result.changed) {
+      const label = buildNodeLabel(result.node);
+      if (label && label.includes('?')) {
+        return result.node;
+      }
+      if (!label) {
+        return result.node;
+      }
       const payload = {
         meshId: normalized,
         shortName: result.node.shortName,
@@ -442,7 +449,7 @@ class CallMeshAprsBridge extends EventEmitter {
         latitude: result.node.latitude,
         longitude: result.node.longitude,
         altitude: result.node.altitude,
-        label: buildNodeLabel(result.node),
+        label,
         lastSeenAt: result.node.lastSeenAt
       };
       this.emit('node', payload);
