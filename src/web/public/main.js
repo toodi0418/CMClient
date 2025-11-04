@@ -1984,6 +1984,9 @@
       return;
     }
     const existingOptions = telemetryNodeDropdown.children;
+    if (telemetryDropdownVisible && telemetryDropdownInteracting) {
+      return;
+    }
     let needsRebuild = existingOptions.length !== candidates.length;
     if (!needsRebuild) {
       for (let i = 0; i < candidates.length; i += 1) {
