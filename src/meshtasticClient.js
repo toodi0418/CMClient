@@ -17,6 +17,20 @@ const BROADCAST_ADDR = 0xffffffff;
 const RELAY_GUESS_EXPLANATION =
   '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
 
+function normalizeMeshId(meshId) {
+  if (meshId == null) return null;
+  let value = String(meshId).trim();
+  if (!value) return null;
+  if (value.startsWith('!')) {
+    value = value.slice(1);
+  } else if (value.toLowerCase().startsWith('0x')) {
+    value = value.slice(2);
+  }
+  value = value.replace(/[^0-9a-f]/gi, '').toLowerCase();
+  if (!value) return null;
+  return `!${value}`;
+}
+
 function removeSocketListener(socket, eventName, handler) {
   if (!socket || !handler) {
     return;
@@ -207,6 +221,36 @@ class MeshtasticClient extends EventEmitter {
       }
     }
     return bestCandidate;
+  }
+
+  _isDirectReception(summary, { relayNodeId, usedHops, hasRelayResult }) {
+    if (!summary || typeof summary !== 'object') {
+      return false;
+    }
+    const relayExists = relayNodeId != null && relayNodeId !== 0;
+    const hopsLabelRaw = typeof summary.hops?.label === 'string' ? summary.hops.label.trim() : '';
+    const zeroHop =
+      usedHops === 0 ||
+      /^0(?:\s*\/|$)/.test(hopsLabelRaw) ||
+      (!relayExists && !hopsLabelRaw);
+    if (!relayExists || zeroHop) {
+      return true;
+    }
+    const fromNormalized = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
+    const relayMeshRaw =
+      summary.relay?.meshId ||
+      summary.relay?.meshIdNormalized ||
+      summary.relayMeshId ||
+      summary.relayMeshIdNormalized ||
+      '';
+    const relayNormalized = normalizeMeshId(relayMeshRaw);
+    if (fromNormalized && relayNormalized && fromNormalized === relayNormalized) {
+      return true;
+    }
+    if (!hasRelayResult && !relayMeshRaw) {
+      return true;
+    }
+    return false;
   }
 
   _loadRelayStatsFromDisk() {
@@ -676,13 +720,10 @@ class MeshtasticClient extends EventEmitter {
     } else if (Number.isFinite(hopStart) && !Number.isFinite(hopLimit)) {
       usedHops = 0;
     }
-    const isDirectHop = usedHops === 0;
 
     let relayResult = null;
-    if (relayNodeId != null && !isDirectHop) {
+    if (relayNodeId != null) {
       relayResult = this._normalizeRelayNode(relayNodeId, linkMetrics);
-    } else if (packet.from != null) {
-      this._recordRelayLinkMetrics(packet.from, linkMetrics);
     }
     const relayInfo =
       relayNodeId != null && relayResult ? this._formatNode(relayResult.nodeId) : null;
@@ -727,6 +768,16 @@ class MeshtasticClient extends EventEmitter {
       rawHex,
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
+
+    const isDirect = this._isDirectReception(summary, {
+      relayNodeId,
+      usedHops,
+      hasRelayResult: Boolean(relayResult)
+    });
+
+    if (isDirect && packet.from != null) {
+      this._recordRelayLinkMetrics(packet.from, linkMetrics);
+    }
 
     return summary;
   }
