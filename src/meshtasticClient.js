@@ -9,6 +9,7 @@ const fsPromises = require('fs/promises');
 const protobuf = require('protobufjs');
 
 const { unishox2_decompress_simple } = require('unishox2.siara.cc');
+const { nodeDatabase } = require('./nodeDatabase');
 
 const MAGIC = 0x94c3;
 const HEADER_SIZE = 4;
@@ -114,15 +115,64 @@ class MeshtasticClient extends EventEmitter {
         }
       }
     }
+    for (const key of this._relayLinkStats.keys()) {
+      const candidate = Number(key) >>> 0;
+      if ((candidate & 0xff) === raw && !matches.has(candidate)) {
+        matches.add(candidate);
+      }
+    }
+    try {
+      const dbEntries = typeof nodeDatabase?.list === 'function' ? nodeDatabase.list() : [];
+      if (Array.isArray(dbEntries)) {
+        for (const entry of dbEntries) {
+          const meshCandidate =
+            entry?.meshId ||
+            entry?.meshIdNormalized ||
+            entry?.meshIdOriginal ||
+            entry?.mesh_id ||
+            entry?.mesh_id_normalized ||
+            entry?.mesh_id_original;
+          const normalized = normalizeMeshId(meshCandidate);
+          if (!normalized) continue;
+          const numeric = parseInt(normalized.slice(1), 16);
+          if (!Number.isFinite(numeric)) continue;
+          const candidate = numeric >>> 0;
+          if ((candidate & 0xff) === raw && !matches.has(candidate)) {
+            matches.add(candidate);
+          }
+        }
+      }
+    } catch (err) {
+      if (process.env.DEBUG_RELAY_GUESS) {
+        console.warn('[relay-guess] node database access failed:', err.message);
+      }
+    }
     if (matches.size === 1) {
       const [match] = matches;
       return { nodeId: match >>> 0, guessed: false };
     }
-    const bestGuess = this._guessRelayCandidate(Array.from(matches), { snr, rssi });
-    if (bestGuess != null) {
-      return { nodeId: bestGuess >>> 0, guessed: true };
+    const candidates = Array.from(matches);
+    const guessResult = this._guessRelayCandidate(candidates, { snr, rssi });
+    if (guessResult) {
+      return guessResult;
     }
-    return { nodeId: raw, guessed: false };
+    if (matches.size > 1) {
+      const suffix = raw.toString(16).padStart(2, '0').toUpperCase();
+      const labels = this._describeRelayCandidates(candidates);
+      const parts = [];
+      if (labels.length) {
+        parts.push(`尾碼 0x${suffix} 對應 ${labels.join('、')}`);
+      } else {
+        parts.push(`尾碼 0x${suffix} 對應 ${matches.size} 個節點`);
+      }
+      parts.push('尚無歷史直收樣本可比對 SNR/RSSI');
+      return {
+        nodeId: raw >>> 0,
+        guessed: true,
+        reason: parts.join('；')
+      };
+    }
+    return { nodeId: raw >>> 0, guessed: false };
   }
 
   _recordRelayLinkMetrics(nodeId, { snr = null, rssi = null } = {}) {
@@ -173,6 +223,19 @@ class MeshtasticClient extends EventEmitter {
     if (!Array.isArray(candidates) || candidates.length === 0) {
       return null;
     }
+    const uniqueCandidates = Array.from(
+      new Set(
+        candidates
+          .map((value) => {
+            const num = Number(value);
+            return Number.isFinite(num) ? (num >>> 0) : null;
+          })
+          .filter((value) => value != null)
+      )
+    );
+    if (!uniqueCandidates.length) {
+      return null;
+    }
     const toNumber = (value) => {
       if (value === null || value === undefined) return null;
       const num = Number(value);
@@ -187,7 +250,7 @@ class MeshtasticClient extends EventEmitter {
     let bestCandidate = null;
     let bestScore = Infinity;
     let bestStats = null;
-    for (const candidate of candidates) {
+    for (const candidate of uniqueCandidates) {
       const stats = this._relayLinkStats.get(candidate >>> 0);
       if (!stats) continue;
       let score = 0;
@@ -220,7 +283,72 @@ class MeshtasticClient extends EventEmitter {
         bestStats = stats;
       }
     }
-    return bestCandidate;
+    if (bestCandidate == null) {
+      return null;
+    }
+
+    const infoParts = [];
+    const metricsParts = [];
+    if (snrValue !== null && bestStats?.snr != null) {
+      metricsParts.push(`SNR ${snrValue.toFixed(1)} vs ${bestStats.snr.toFixed(1)}`);
+    }
+    if (rssiValue !== null && bestStats?.rssi != null) {
+      metricsParts.push(`RSSI ${Math.round(rssiValue)} vs ${Math.round(bestStats.rssi)}`);
+    }
+    if (metricsParts.length) {
+      infoParts.push(metricsParts.join('，'));
+    }
+    if (bestStats?.count) {
+      infoParts.push(`樣本 ${Math.max(1, Math.round(bestStats.count))} 筆`);
+    }
+    if (bestStats?.updatedAt) {
+      const ageMs = now - Number(bestStats.updatedAt);
+      if (Number.isFinite(ageMs) && ageMs >= 0) {
+        infoParts.push(`最近更新 ${formatRelativeAge(ageMs)}`);
+      }
+    }
+    if (uniqueCandidates.length > 1) {
+      const labels = this._describeRelayCandidates(uniqueCandidates);
+      if (labels.length) {
+        infoParts.push(`候選節點 ${labels.length} 個：${labels.join('、')}`);
+      } else {
+        infoParts.push(`候選節點 ${uniqueCandidates.length} 個`);
+      }
+    }
+    const reason =
+      `依據歷史直收統計推測 ${formatHexId(bestCandidate)}；${infoParts.join('；') || '韌體僅提供節點尾碼'}`;
+
+    return {
+      nodeId: bestCandidate >>> 0,
+      guessed: true,
+      reason
+    };
+  }
+
+  _describeRelayCandidates(candidates) {
+    if (!Array.isArray(candidates)) {
+      return [];
+    }
+    const labels = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+      const numeric = Number(candidate);
+      if (!Number.isFinite(numeric)) continue;
+      const meshId = formatHexId(numeric >>> 0);
+      if (seen.has(meshId)) continue;
+      seen.add(meshId);
+      const entry = this.nodeMap.get(numeric >>> 0) || {};
+      const meshIdKey = meshId;
+      const dbRecord = nodeDatabase?.get?.(meshIdKey) || {};
+      const name =
+        dbRecord.longName ||
+        dbRecord.shortName ||
+        entry.longName ||
+        entry.shortName ||
+        null;
+      labels.push(name ? `${name} (${meshId})` : meshId);
+    }
+    return labels;
   }
 
   _isDirectReception(summary, { relayNodeId, usedHops, hasRelayResult }) {
@@ -729,6 +857,9 @@ class MeshtasticClient extends EventEmitter {
       relayNodeId != null && relayResult ? this._formatNode(relayResult.nodeId) : null;
     if (relayInfo && relayResult) {
       relayInfo.guessed = Boolean(relayResult.guessed);
+      if (relayResult.reason) {
+        relayInfo.reason = relayResult.reason;
+      }
     }
     const nextHopInfo = nextHopId != null ? this._formatNode(nextHopId) : null;
 
@@ -761,7 +892,9 @@ class MeshtasticClient extends EventEmitter {
       to: toInfo,
       relay: relayInfo,
       relayGuess: Boolean(relayResult?.guessed),
-      relayGuessReason: relayResult?.guessed ? RELAY_GUESS_EXPLANATION : undefined,
+      relayGuessReason: relayResult?.guessed
+        ? relayResult.reason || RELAY_GUESS_EXPLANATION
+        : undefined,
       nextHop: nextHopInfo,
       position: decodeInfo?.position || null,
       telemetry: decodeInfo?.telemetry || null,
