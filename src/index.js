@@ -13,6 +13,12 @@ const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge')
 const { WebDashboardServer } = require('./web/server');
 const pkg = require('../package.json');
 
+const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
+
+function getMessageLogPath() {
+  return path.join(getArtifactsDir(), MESSAGE_LOG_FILENAME);
+}
+
 function tryPublishWebMessage(webServer, summary) {
   if (!webServer || !summary || typeof summary !== 'object') {
     return;
@@ -349,7 +355,8 @@ async function startMonitor(argv) {
     try {
       webServer = new WebDashboardServer({
         appVersion: pkg.version || '0.0.0',
-        relayStatsPath
+        relayStatsPath,
+        messageLogPath: getMessageLogPath()
       });
       await webServer.start();
       webServer.setAppVersion(pkg.version || '0.0.0');

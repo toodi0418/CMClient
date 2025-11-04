@@ -16,6 +16,7 @@ const APRS_HISTORY_MAX = 5000;
 const APRS_RECORD_HISTORY_MAX = 5000;
 const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
 const MESSAGE_MAX_PER_CHANNEL = 200;
+const MESSAGE_PERSIST_INTERVAL_MS = 2000;
 const CHANNEL_CONFIG = [
   { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
   { id: 1, code: 'CH1', name: 'Mesh TW', note: '跨節點廣播與共通交換' },
@@ -139,6 +140,12 @@ class WebDashboardServer {
     this.nodeRegistry = new Map();
     this.channelConfig = CHANNEL_CONFIG;
     this.messageStore = new Map();
+    this.messageLogPath =
+      typeof options.messageLogPath === 'string' && options.messageLogPath.trim()
+        ? options.messageLogPath.trim()
+        : null;
+    this._messageDirty = false;
+    this._messagePersistTimer = null;
     this._ensureConfiguredChannels();
   }
 
@@ -146,6 +153,8 @@ class WebDashboardServer {
     if (this.server) {
       return;
     }
+
+    await this._loadMessageLog();
 
     this.server = http.createServer((req, res) => {
       const parsedUrl = (() => {
@@ -193,6 +202,7 @@ class WebDashboardServer {
 
   async stop() {
     this._stopPing();
+    this._flushMessagePersistSync();
 
     for (const client of this.clients) {
       try {
@@ -399,13 +409,15 @@ class WebDashboardServer {
     if (store.length > MESSAGE_MAX_PER_CHANNEL) {
       store.length = MESSAGE_MAX_PER_CHANNEL;
     }
+    const cloned = this._cloneMessageEntry(sanitized);
     this._broadcast({
       type: 'message-append',
       payload: {
         channelId,
-        entry: this._cloneMessageEntry(sanitized)
+        entry: cloned
       }
     });
+    this._scheduleMessagePersist();
   }
 
   _handleDebugRequest(req, res) {
@@ -897,6 +909,119 @@ class WebDashboardServer {
       }
     }
     return { channels };
+  }
+
+  async _loadMessageLog() {
+    if (!this.messageLogPath) {
+      return;
+    }
+    this.messageStore.clear();
+    try {
+      const content = await fsPromises.readFile(this.messageLogPath, 'utf8');
+      if (!content) {
+        this._ensureConfiguredChannels();
+        return;
+      }
+      const lines = content.split(/\n+/).filter((line) => line.trim().length > 0);
+      for (const line of lines) {
+        let parsed;
+        try {
+          parsed = JSON.parse(line);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`跳過無法解析的訊息紀錄: ${err.message}`);
+          continue;
+        }
+        const entry = this._cloneMessageEntry(parsed);
+        if (!entry) {
+          continue;
+        }
+        const channelId = entry.channel;
+        const store = this._getChannelStore(channelId);
+        const duplicateIndex = store.findIndex((item) => item.flowId === entry.flowId);
+        if (duplicateIndex !== -1) {
+          store.splice(duplicateIndex, 1);
+        }
+        store.push(entry);
+        if (store.length > MESSAGE_MAX_PER_CHANNEL) {
+          store.splice(0, store.length - MESSAGE_MAX_PER_CHANNEL);
+        }
+      }
+      this._ensureConfiguredChannels();
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        // eslint-disable-next-line no-console
+        console.warn(`載入訊息紀錄失敗: ${err.message}`);
+      }
+    }
+  }
+
+  _scheduleMessagePersist() {
+    if (!this.messageLogPath) {
+      return;
+    }
+    this._messageDirty = true;
+    if (this._messagePersistTimer) {
+      return;
+    }
+    this._messagePersistTimer = setTimeout(() => {
+      this._messagePersistTimer = null;
+      this._persistMessageLog().catch((err) => {
+        console.error(`寫入訊息紀錄失敗: ${err.message}`);
+        this._scheduleMessagePersist();
+      });
+    }, MESSAGE_PERSIST_INTERVAL_MS);
+    this._messagePersistTimer.unref?.();
+  }
+
+  async _persistMessageLog() {
+    if (!this.messageLogPath || !this._messageDirty) {
+      return;
+    }
+    this._messageDirty = false;
+    const lines = [];
+    const sortedChannels = Array.from(this.messageStore.entries()).sort((a, b) => a[0] - b[0]);
+    for (const [, list] of sortedChannels) {
+      const entries = Array.isArray(list) ? list : [];
+      for (const entry of entries) {
+        lines.push(JSON.stringify(entry));
+      }
+    }
+    try {
+      await fsPromises.mkdir(path.dirname(this.messageLogPath), { recursive: true });
+      await fsPromises.writeFile(this.messageLogPath, lines.join('\n'), 'utf8');
+    } catch (err) {
+      this._messageDirty = true;
+      throw err;
+    }
+  }
+
+  _flushMessagePersistSync() {
+    if (!this.messageLogPath) {
+      return;
+    }
+    if (this._messagePersistTimer) {
+      clearTimeout(this._messagePersistTimer);
+      this._messagePersistTimer = null;
+    }
+    if (!this._messageDirty) {
+      return;
+    }
+    const lines = [];
+    const sortedChannels = Array.from(this.messageStore.entries()).sort((a, b) => a[0] - b[0]);
+    for (const [, list] of sortedChannels) {
+      const entries = Array.isArray(list) ? list : [];
+      for (const entry of entries) {
+        lines.push(JSON.stringify(entry));
+      }
+    }
+    try {
+      fs.mkdirSync(path.dirname(this.messageLogPath), { recursive: true });
+      fs.writeFileSync(this.messageLogPath, lines.join('\n'), 'utf8');
+      this._messageDirty = false;
+    } catch (err) {
+      console.error(`同步寫入訊息紀錄失敗: ${err.message}`);
+    }
   }
 
   _broadcastMetrics() {
