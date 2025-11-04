@@ -792,7 +792,7 @@ class CallMeshAprsBridge extends EventEmitter {
           state.skippedNodeIds.add(meshIdNormalized);
           this.emitLog(
             'TENMAN',
-            `節點 ${meshIdNormalized} 不在 TENMAN_NODE_IDS 清單中，略過 publish`
+            `節點 ${meshIdNormalized} 不在 TENMAN_FORWARD_NODE_IDS 清單中，略過 publish`
           );
         }
         return;
@@ -3024,11 +3024,11 @@ function formatTelemetryValue(value) {
 
 function toFiniteNumber(value) {
   if (value == null) return null;
-  const num = Number(value);
-  if (!Number.isFinite(num)) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
     return null;
   }
-  return num;
+  return number;
 }
 
 function roundTo(value, digits = 2) {
@@ -3050,10 +3050,10 @@ function resolveSpeed(position) {
     position.airSpeed,
     position.velHoriz
   ];
-  for (const candidate of candidates) {
-    const value = toFiniteNumber(candidate);
-    if (value != null) {
-      return value;
+  for (const value of candidates) {
+    const numeric = toFiniteNumber(value);
+    if (numeric != null) {
+      return numeric;
     }
   }
   const speedKph = toFiniteNumber(position.speedKph);
