@@ -5,6 +5,7 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const fsPromises = require('fs/promises');
 const protobuf = require('protobufjs');
 
 const { unishox2_decompress_simple } = require('unishox2.siara.cc');
@@ -53,6 +54,13 @@ class MeshtasticClient extends EventEmitter {
 
     this.nodeMap = new Map();
     this._relayLinkStats = new Map();
+    this._relayStatsPath = options.relayStatsPath ? path.resolve(options.relayStatsPath) : null;
+    this._relayStatsPersistIntervalMs = Number.isFinite(options.relayStatsPersistIntervalMs)
+      ? Math.max(Number(options.relayStatsPersistIntervalMs), 1000)
+      : 30_000;
+    this._relayStatsPersistTimer = null;
+    this._relayStatsPersisting = false;
+    this._relayStatsDirty = false;
     this._decoder = null;
     this._socket = null;
     this._heartbeatTimer = null;
@@ -62,6 +70,8 @@ class MeshtasticClient extends EventEmitter {
     this._handleIdleTimeoutBound = null;
     this._currentIdleTimeout = null;
     this._socketClosed = true;
+
+    this._loadRelayStatsFromDisk();
   }
 
   _normalizeRelayNode(relayNode, { snr = null, rssi = null } = {}) {
@@ -141,6 +151,7 @@ class MeshtasticClient extends EventEmitter {
     }
     stats.count = (stats.count || 0) + 1;
     stats.updatedAt = now;
+    this._scheduleRelayStatsPersist();
   }
 
   _guessRelayCandidate(candidates, { snr = null, rssi = null } = {}) {
@@ -197,6 +208,133 @@ class MeshtasticClient extends EventEmitter {
     return bestCandidate;
   }
 
+  _loadRelayStatsFromDisk() {
+    if (!this._relayStatsPath) {
+      return;
+    }
+    try {
+      const raw = fs.readFileSync(this._relayStatsPath, 'utf8');
+      if (!raw) {
+        return;
+      }
+      const data = JSON.parse(raw);
+      if (!data || typeof data !== 'object') {
+        return;
+      }
+      this._relayLinkStats.clear();
+      const now = Date.now();
+      for (const [key, value] of Object.entries(data)) {
+        if (!value || typeof value !== 'object') continue;
+        const numericKey = Number(key);
+        if (!Number.isFinite(numericKey) || numericKey <= 0) continue;
+        const entry = {
+          snr: Number.isFinite(value.snr) ? Number(value.snr) : null,
+          rssi: Number.isFinite(value.rssi) ? Number(value.rssi) : null,
+          count: Number.isFinite(value.count) ? Math.max(1, Number(value.count)) : 1,
+          updatedAt: Number.isFinite(value.updatedAt) ? Number(value.updatedAt) : now
+        };
+        this._relayLinkStats.set(numericKey >>> 0, entry);
+      }
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        console.warn(`載入 relay link stats 失敗: ${err.message}`);
+      }
+    }
+  }
+
+  _scheduleRelayStatsPersist() {
+    if (!this._relayStatsPath) {
+      return;
+    }
+    this._relayStatsDirty = true;
+    if (this._relayStatsPersistTimer) {
+      return;
+    }
+    this._relayStatsPersistTimer = setTimeout(() => {
+      this._relayStatsPersistTimer = null;
+      this._persistRelayStats().catch((err) => {
+        console.error(`持久化 relay link stats 失敗: ${err.message}`);
+        this._scheduleRelayStatsPersist();
+      });
+    }, this._relayStatsPersistIntervalMs);
+    this._relayStatsPersistTimer.unref?.();
+  }
+
+  async _persistRelayStats() {
+    if (!this._relayStatsPath || !this._relayStatsDirty || this._relayStatsPersisting) {
+      return;
+    }
+    this._relayStatsPersisting = true;
+    const payload = {};
+    for (const [key, stats] of this._relayLinkStats.entries()) {
+      payload[key] = {
+        snr: Number.isFinite(stats.snr) ? Number(stats.snr) : null,
+        rssi: Number.isFinite(stats.rssi) ? Number(stats.rssi) : null,
+        count: Number.isFinite(stats.count) ? Math.max(1, Math.round(Number(stats.count))) : 1,
+        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : Date.now()
+      };
+    }
+    try {
+      await fsPromises.mkdir(path.dirname(this._relayStatsPath), { recursive: true });
+      if (Object.keys(payload).length === 0) {
+        try {
+          await fsPromises.unlink(this._relayStatsPath);
+        } catch (err) {
+          if (err?.code !== 'ENOENT') {
+            throw err;
+          }
+        }
+      } else {
+        await fsPromises.writeFile(this._relayStatsPath, JSON.stringify(payload, null, 2), 'utf8');
+      }
+      this._relayStatsDirty = false;
+    } catch (err) {
+      this._relayStatsDirty = true;
+      throw err;
+    } finally {
+      this._relayStatsPersisting = false;
+    }
+  }
+
+  _flushRelayStatsPersistSync() {
+    if (!this._relayStatsPath) {
+      return;
+    }
+    if (this._relayStatsPersistTimer) {
+      clearTimeout(this._relayStatsPersistTimer);
+      this._relayStatsPersistTimer = null;
+    }
+    if (!this._relayStatsDirty || this._relayStatsPersisting) {
+      return;
+    }
+    const payload = {};
+    for (const [key, stats] of this._relayLinkStats.entries()) {
+      payload[key] = {
+        snr: Number.isFinite(stats.snr) ? Number(stats.snr) : null,
+        rssi: Number.isFinite(stats.rssi) ? Number(stats.rssi) : null,
+        count: Number.isFinite(stats.count) ? Math.max(1, Math.round(Number(stats.count))) : 1,
+        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : Date.now()
+      };
+    }
+    try {
+      fs.mkdirSync(path.dirname(this._relayStatsPath), { recursive: true });
+      if (Object.keys(payload).length === 0) {
+        try {
+          fs.unlinkSync(this._relayStatsPath);
+        } catch (err) {
+          if (err?.code !== 'ENOENT') {
+            throw err;
+          }
+        }
+      } else {
+        fs.writeFileSync(this._relayStatsPath, JSON.stringify(payload, null, 2), 'utf8');
+      }
+      this._relayStatsDirty = false;
+    } catch (err) {
+      console.error(`同步寫入 relay link stats 失敗: ${err.message}`);
+    }
+  }
+
   async start() {
     if (!this.root) {
       await this._loadProtobufs();
@@ -206,6 +344,7 @@ class MeshtasticClient extends EventEmitter {
 
   stop() {
     this._clearHeartbeat();
+    this._flushRelayStatsPersistSync();
     if (this._socket) {
       if (this._handleIdleTimeoutBound) {
         removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);

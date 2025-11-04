@@ -329,6 +329,8 @@ async function startMonitor(argv) {
     }
   }
 
+  const relayStatsPath = path.join(getArtifactsDir(), 'relay-link-stats.json');
+
   const connectionOptions = {
     host: argv.host,
     port: argv.port,
@@ -337,7 +339,8 @@ async function startMonitor(argv) {
     heartbeat: HEARTBEAT_INTERVAL_SECONDS,
     keepAlive: true,
     keepAliveDelayMs: 15_000,
-    idleTimeoutMs: 90_000
+    idleTimeoutMs: 90_000,
+    relayStatsPath
   };
 
   const RECONNECT_DELAY_MS = 30_000;

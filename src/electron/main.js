@@ -822,7 +822,8 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     heartbeat: options.heartbeat ?? 0,
     keepAlive: options.keepAlive ?? true,
     keepAliveDelayMs: options.keepAliveDelayMs ?? 15000,
-    idleTimeoutMs: options.idleTimeoutMs ?? 0
+    idleTimeoutMs: options.idleTimeoutMs ?? 0,
+    relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json')
   });
 
   client.on('connected', () => {
