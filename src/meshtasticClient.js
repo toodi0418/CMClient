@@ -668,8 +668,18 @@ class MeshtasticClient extends EventEmitter {
       snr: Number.isFinite(packet.rxSnr) ? Number(packet.rxSnr) : null,
       rssi: Number.isFinite(packet.rxRssi) ? Number(packet.rxRssi) : null
     };
+    const hopStart = Number(packet.hopStart);
+    const hopLimit = Number(packet.hopLimit);
+    let usedHops = null;
+    if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
+      usedHops = Math.max(hopStart - hopLimit, 0);
+    } else if (Number.isFinite(hopStart) && !Number.isFinite(hopLimit)) {
+      usedHops = 0;
+    }
+    const isDirectHop = usedHops === 0;
+
     let relayResult = null;
-    if (relayNodeId != null) {
+    if (relayNodeId != null && !isDirectHop) {
       relayResult = this._normalizeRelayNode(relayNodeId, linkMetrics);
     } else if (packet.from != null) {
       this._recordRelayLinkMetrics(packet.from, linkMetrics);
