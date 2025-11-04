@@ -62,6 +62,7 @@ class MeshtasticClient extends EventEmitter {
     this._relayStatsPersisting = false;
     this._relayStatsDirty = false;
     this._decoder = null;
+    this._selfNodeId = null;
     this._socket = null;
     this._heartbeatTimer = null;
     this._connected = false;
@@ -116,6 +117,9 @@ class MeshtasticClient extends EventEmitter {
     if (nodeId == null) return;
     const numeric = Number(nodeId);
     if (!Number.isFinite(numeric) || numeric <= 0) {
+      return;
+    }
+    if (this._selfNodeId != null && (numeric >>> 0) === (this._selfNodeId >>> 0)) {
       return;
     }
     const toNumber = (value) => {
@@ -622,6 +626,7 @@ class MeshtasticClient extends EventEmitter {
       raw: num,
       node: nodeInfo
     });
+    this._selfNodeId = num;
     break;
   }
       default:
