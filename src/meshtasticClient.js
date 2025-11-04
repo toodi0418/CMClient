@@ -13,6 +13,8 @@ const MAGIC = 0x94c3;
 const HEADER_SIZE = 4;
 const DEFAULT_MAX_PACKET = 512;
 const BROADCAST_ADDR = 0xffffffff;
+const RELAY_GUESS_EXPLANATION =
+  '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
 
 function removeSocketListener(socket, eventName, handler) {
   if (!socket || !handler) {
@@ -66,10 +68,10 @@ class MeshtasticClient extends EventEmitter {
     const raw = Number(relayNode) >>> 0;
     // the firmware sets relay_node to the full node id, but in some cases only
     // the low byte is populated (e.g. 0x24 for node ending with 0x24).
-    if (raw === 0) return 0;
+    if (raw === 0) return { nodeId: 0, guessed: false };
     if (raw > 0xff) {
       this._recordRelayLinkMetrics(raw, { snr, rssi });
-      return raw;
+      return { nodeId: raw >>> 0, guessed: false };
     }
     const matches = new Set();
     for (const [num, entry] of this.nodeMap.entries()) {
@@ -91,14 +93,14 @@ class MeshtasticClient extends EventEmitter {
     if (matches.size === 1) {
       const [match] = matches;
       this._recordRelayLinkMetrics(match, { snr, rssi });
-      return match;
+      return { nodeId: match >>> 0, guessed: false };
     }
     const bestGuess = this._guessRelayCandidate(Array.from(matches), { snr, rssi });
     if (bestGuess != null) {
       this._recordRelayLinkMetrics(bestGuess, { snr, rssi });
-      return bestGuess;
+      return { nodeId: bestGuess >>> 0, guessed: true };
     }
-    return raw;
+    return { nodeId: raw, guessed: false };
   }
 
   _recordRelayLinkMetrics(nodeId, { snr = null, rssi = null } = {}) {
@@ -525,13 +527,17 @@ class MeshtasticClient extends EventEmitter {
       snr: Number.isFinite(packet.rxSnr) ? Number(packet.rxSnr) : null,
       rssi: Number.isFinite(packet.rxRssi) ? Number(packet.rxRssi) : null
     };
-    let relayTarget = null;
+    let relayResult = null;
     if (relayNodeId != null) {
-      relayTarget = this._normalizeRelayNode(relayNodeId, linkMetrics);
+      relayResult = this._normalizeRelayNode(relayNodeId, linkMetrics);
     } else if (packet.from != null) {
       this._recordRelayLinkMetrics(packet.from, linkMetrics);
     }
-    const relayInfo = relayNodeId != null ? this._formatNode(relayTarget) : null;
+    const relayInfo =
+      relayNodeId != null && relayResult ? this._formatNode(relayResult.nodeId) : null;
+    if (relayInfo && relayResult) {
+      relayInfo.guessed = Boolean(relayResult.guessed);
+    }
     const nextHopInfo = nextHopId != null ? this._formatNode(nextHopId) : null;
 
     if (relayInfo && relayInfo.meshId) {
@@ -562,6 +568,8 @@ class MeshtasticClient extends EventEmitter {
       from: fromInfo,
       to: toInfo,
       relay: relayInfo,
+      relayGuess: Boolean(relayResult?.guessed),
+      relayGuessReason: relayResult?.guessed ? RELAY_GUESS_EXPLANATION : undefined,
       nextHop: nextHopInfo,
       position: decodeInfo?.position || null,
       telemetry: decodeInfo?.telemetry || null,

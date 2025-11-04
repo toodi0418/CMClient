@@ -67,6 +67,8 @@
   let flowFilterState = 'all';
   let flowSearchTerm = '';
   const FLOW_MAX_ENTRIES = 1000;
+  const RELAY_GUESS_EXPLANATION =
+    '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
 
   let currentSelfMeshId = null;
   let selfProvisionCoords = null;
@@ -1297,6 +1299,25 @@
     renderTelemetryView();
   });
 
+  function isRelayGuessed(summary) {
+    return Boolean(summary?.relay?.guessed || summary?.relayGuess);
+  }
+
+  function getRelayGuessReason(summary) {
+    return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
+  }
+
+  function ensureRelayGuessSuffix(label, summary) {
+    if (!isRelayGuessed(summary)) {
+      return label;
+    }
+    const value = label || '';
+    if (!value) {
+      return '?';
+    }
+    return value.endsWith('?') ? value : `${value}?`;
+  }
+
   function formatRelay(summary) {
     if (!summary) return '直收';
     const fromMeshId = summary.from?.meshId || summary.from?.meshIdNormalized || '';
@@ -1311,11 +1332,11 @@
     const rawRelayCanonical = relayMeshRaw.startsWith('!') ? relayMeshRaw.slice(1) : relayMeshRaw;
 
     if (fromMeshId && isSelfMesh(fromMeshId, summary)) {
-      return 'Self';
+      return ensureRelayGuessSuffix('Self', summary);
     }
 
     if (relayMeshRaw && isSelfMesh(relayMeshRaw, summary)) {
-      return 'Self';
+      return ensureRelayGuessSuffix('Self', summary);
     }
 
     const relayNode = relayMeshRaw ? hydrateSummaryNode(summary.relay, relayMeshRaw) : null;
@@ -1331,7 +1352,7 @@
     }
 
     if (fromNormalized && relayNormWork && fromNormalized === relayNormWork) {
-      return '直收';
+      return ensureRelayGuessSuffix('直收', summary);
     }
 
     const hopInfo = extractHopInfo(summary);
@@ -1341,35 +1362,84 @@
 
     if (summary.relay) {
       if (zeroHop) {
-        return '直收';
+        return ensureRelayGuessSuffix('直收', summary);
       }
-      return formatRelayLabel(summary.relay);
+      return ensureRelayGuessSuffix(formatRelayLabel(summary.relay), summary);
     }
 
     if (relayMeshDisplay) {
       if (zeroHop) {
-        return '直收';
+        return ensureRelayGuessSuffix('直收', summary);
       }
-      return formatRelayLabel({ label: summary.relay?.label || relayMeshDisplay, meshId: relayMeshDisplay });
-    }
+    return ensureRelayGuessSuffix(
+      formatRelayLabel({ label: summary.relay?.label || relayMeshDisplay, meshId: relayMeshDisplay }),
+      summary
+    );
+  }
 
     if (zeroHop) {
-      return '直收';
+      return ensureRelayGuessSuffix('直收', summary);
     }
 
     if (usedHops != null && usedHops > 0) {
-      return '未知?';
+      return ensureRelayGuessSuffix('未知?', summary);
     }
 
     if (!hopsLabel) {
-      return '直收';
+      return ensureRelayGuessSuffix('直收', summary);
     }
 
     if (hopsLabel.includes('?')) {
-      return '未知?';
+      return ensureRelayGuessSuffix('未知?', summary);
     }
 
-    return '';
+    return ensureRelayGuessSuffix('', summary);
+  }
+
+  function updateRelayCellDisplay(cell, summary) {
+    if (!cell) return;
+    const label = formatRelay(summary);
+    cell.textContent = label;
+
+    let relayMeshRaw =
+      summary?.relay?.meshId ||
+      summary?.relay?.meshIdNormalized ||
+      summary?.relayMeshId ||
+      summary?.relayMeshIdNormalized ||
+      '';
+    let relayTitle = '';
+    if (typeof relayMeshRaw === 'string' && relayMeshRaw) {
+      if (relayMeshRaw.startsWith('0x')) {
+        relayMeshRaw = `!${relayMeshRaw.slice(2)}`;
+      }
+      if (label && relayMeshRaw && label !== relayMeshRaw) {
+        relayTitle = `${label} (${relayMeshRaw})`;
+      } else {
+        relayTitle = relayMeshRaw;
+      }
+    } else if (label === '直收') {
+      relayTitle = '訊息為直收，未經其他節點轉發';
+    } else if (label === 'Self') {
+      relayTitle = '本站節點轉發';
+    } else if (label && label.includes('?')) {
+      relayTitle = '最後轉發節點未知或標號不完整';
+    }
+
+    if (isRelayGuessed(summary)) {
+      const reason = getRelayGuessReason(summary);
+      cell.classList.add('relay-guess');
+      cell.dataset.relayGuess = 'true';
+      relayTitle = relayTitle ? `${relayTitle}\n${reason}` : reason;
+    } else {
+      cell.classList.remove('relay-guess');
+      cell.removeAttribute('data-relay-guess');
+    }
+
+    if (relayTitle) {
+      cell.title = relayTitle;
+    } else {
+      cell.removeAttribute('title');
+    }
   }
 
   function formatRelayLabel(relay) {
@@ -3029,6 +3099,9 @@
     if (extraSegments.length) {
       segments.push(...extraSegments);
     }
+    if (isRelayGuessed(summary)) {
+      segments.push(`<span class="detail-extra">${escapeHtml(getRelayGuessReason(summary))}</span>`);
+    }
     const distanceLabel = formatDistance(summary);
     if (distanceLabel) {
       segments.push(`<span class="detail-distance">${escapeHtml(distanceLabel)}</span>`);
@@ -3282,6 +3355,7 @@
       <td>${formatNumber(summary.rssi, 0)}</td>
       <td class="info-cell">${formatDetail(summary)}</td>
     `;
+    updateRelayCellDisplay(tr.cells[2], summary);
     return tr;
   }
 
@@ -3365,7 +3439,7 @@
         continue;
       }
       cells[1].textContent = formatSource(summary);
-      cells[2].textContent = formatRelay(summary);
+      updateRelayCellDisplay(cells[2], summary);
     }
   }
 
@@ -3457,6 +3531,8 @@
       ? summary.extraLines.filter((line) => typeof line === 'string' && line.trim())
       : [];
     const relayLabel = formatRelay(summary);
+    const relayGuessed = isRelayGuessed(summary);
+    const relayGuessReason = relayGuessed ? getRelayGuessReason(summary) : '';
     const hopInfo = extractHopInfo(summary);
     const position = summary.position || {};
     const altitude = resolveAltitudeMeters(position);
@@ -3476,6 +3552,8 @@
       pathLabel: formatFlowPath(summary),
       channel: summary.channel ?? '',
       relayLabel,
+      relayGuess: relayGuessed,
+      relayGuessReason,
       hopsLabel: hopInfo.hopsLabel || formatHops(summary.hops),
       hopsUsed: hopInfo.usedHops,
       hopsTotal: hopInfo.totalHops,
@@ -3511,6 +3589,8 @@
     entry.pathLabel = formatFlowPath(summary);
     entry.channel = summary.channel ?? entry.channel;
     entry.relayLabel = formatRelay(summary);
+    entry.relayGuess = isRelayGuessed(summary);
+    entry.relayGuessReason = entry.relayGuess ? getRelayGuessReason(summary) : '';
     const hopInfo = extractHopInfo(summary);
     entry.hopsLabel = hopInfo.hopsLabel || formatHops(summary.hops);
     entry.hopsUsed = hopInfo.usedHops;
@@ -3643,6 +3723,10 @@
         const strong = document.createElement('strong');
         strong.textContent = chip.label;
         chipEl.append(strong, document.createTextNode(` ${chip.value}`));
+        if (chip.label === 'Relay' && entry.relayGuessReason) {
+          chipEl.title = entry.relayGuessReason;
+          chipEl.classList.add('flow-chip-relay-guess');
+        }
         meta.appendChild(chipEl);
       }
       item.appendChild(meta);
@@ -4216,7 +4300,7 @@
       }
       const relayCell = row.cells?.[2];
       if (relayCell) {
-        relayCell.textContent = formatRelay(summary);
+        updateRelayCellDisplay(relayCell, summary);
       }
       const sourceCell = row.cells?.[1];
       if (sourceCell) {

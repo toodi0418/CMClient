@@ -268,6 +268,9 @@ const TYPE_ICONS = {
   Encrypted: '🔒'
 };
 
+const RELAY_GUESS_EXPLANATION =
+  '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
+
 const STATUS_LABELS = {
   connecting: (message) => message || '連線中...',
   connected: '已連線',
@@ -290,6 +293,25 @@ function isSelfMeshId(meshId) {
   const selfCandidate = selfNodeState.normalizedMeshId || selfNodeState.meshId;
   if (!selfCandidate) return false;
   return normalized === normalizeMeshId(selfCandidate);
+}
+
+function isRelayGuessed(summary) {
+  return Boolean(summary?.relay?.guessed || summary?.relayGuess);
+}
+
+function getRelayGuessReason(summary) {
+  return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
+}
+
+function ensureRelayGuessSuffix(label, summary) {
+  if (!isRelayGuessed(summary)) {
+    return label;
+  }
+  const value = label || '';
+  if (!value) {
+    return '?';
+  }
+  return value.endsWith('?') ? value : `${value}?`;
 }
 
 function formatRelayLabel(relay) {
@@ -325,7 +347,7 @@ function computeRelayLabel(summary) {
   const fromMeshId = summary.from?.meshId || summary.from?.meshIdNormalized || '';
   const fromNormalized = normalizeMeshId(fromMeshId);
   if (fromMeshId && isSelfMeshId(fromMeshId)) {
-    return 'Self';
+    return ensureRelayGuessSuffix('Self', summary);
   }
 
   let relayMeshIdRaw =
@@ -341,7 +363,7 @@ function computeRelayLabel(summary) {
       hydratedRelay.meshId || hydratedRelay.meshIdOriginal || hydratedRelay.meshIdNormalized || relayMeshIdRaw;
   }
   if (relayMeshIdRaw && isSelfMeshId(relayMeshIdRaw)) {
-    return 'Self';
+    return ensureRelayGuessSuffix('Self', summary);
   }
   let relayNormalized = normalizeMeshId(relayMeshIdRaw);
   if (relayNormalized && /^!0{6}[0-9a-fA-F]{2}$/.test(relayNormalized)) {
@@ -350,7 +372,7 @@ function computeRelayLabel(summary) {
   }
 
   if (fromNormalized && relayNormalized && fromNormalized === relayNormalized) {
-    return '直收';
+    return ensureRelayGuessSuffix('直收', summary);
   }
 
   const { usedHops, hopsLabel } = extractHopInfo(summary);
@@ -359,35 +381,38 @@ function computeRelayLabel(summary) {
 
   if (summary.relay?.label) {
     if (zeroHop) {
-      return '直收';
+      return ensureRelayGuessSuffix('直收', summary);
     }
-    return formatRelayLabel(summary.relay);
+    return ensureRelayGuessSuffix(formatRelayLabel(summary.relay), summary);
   }
 
   if (relayMeshIdRaw) {
     if (zeroHop) {
-      return '直收';
+      return ensureRelayGuessSuffix('直收', summary);
     }
-    return formatRelayLabel({ label: summary.relay?.label || relayMeshIdRaw, meshId: relayMeshIdRaw });
+    return ensureRelayGuessSuffix(
+      formatRelayLabel({ label: summary.relay?.label || relayMeshIdRaw, meshId: relayMeshIdRaw }),
+      summary
+    );
   }
 
   if (zeroHop) {
-    return '直收';
+    return ensureRelayGuessSuffix('直收', summary);
   }
 
   if (usedHops != null && usedHops > 0) {
-    return '未知?';
+    return ensureRelayGuessSuffix('未知?', summary);
   }
 
   if (!normalizedHopsLabel) {
-    return '直收';
+    return ensureRelayGuessSuffix('直收', summary);
   }
 
   if (normalizedHopsLabel.includes('?')) {
-    return '未知?';
+    return ensureRelayGuessSuffix('未知?', summary);
   }
 
-  return '';
+  return ensureRelayGuessSuffix('', summary);
 }
 
 function extractHopInfo(summary) {
@@ -1797,23 +1822,40 @@ function appendSummaryRow(summary) {
   const relayCell = row.querySelector('.relay');
   const hopInfo = extractHopInfo(summary);
   const relayLabel = computeRelayLabel(summary);
+  const relayGuessed = isRelayGuessed(summary);
+  const relayGuessReason = relayGuessed ? summary.relayGuessReason || RELAY_GUESS_EXPLANATION : '';
   relayCell.textContent = relayLabel;
 
   const relayMeshId = summary.relay?.meshId || summary.relay?.meshIdNormalized || '';
+  let relayTitle = '';
   if (relayMeshId) {
     const normalizedRelayId = relayMeshId.startsWith('0x') ? `!${relayMeshId.slice(2)}` : relayMeshId;
     if (relayLabel && relayLabel !== normalizedRelayId) {
-      relayCell.title = `${relayLabel} (${normalizedRelayId})`;
+      relayTitle = `${relayLabel} (${normalizedRelayId})`;
     } else {
-      relayCell.title = normalizedRelayId;
+      relayTitle = normalizedRelayId;
     }
   } else if (relayLabel === '直收') {
-    relayCell.title = '訊息為直收，未經其他節點轉發';
+    relayTitle = '訊息為直收，未經其他節點轉發';
   } else if (relayLabel === 'Self') {
     const selfLabel = selfNodeState.name || selfNodeState.meshId || '本站節點';
-    relayCell.title = `${selfLabel} 轉發`;
+    relayTitle = `${selfLabel} 轉發`;
   } else if (relayLabel && relayLabel.includes('?')) {
-    relayCell.title = '最後轉發節點未知或標號不完整';
+    relayTitle = '最後轉發節點未知或標號不完整';
+  }
+
+  if (isRelayGuessed(summary)) {
+    const reason = getRelayGuessReason(summary);
+    relayCell.classList.add('relay-guess');
+    relayCell.dataset.relayGuess = 'true';
+    relayTitle = relayTitle ? `${relayTitle}\n${reason}` : reason;
+  } else {
+    relayCell.classList.remove('relay-guess');
+    relayCell.removeAttribute('data-relay-guess');
+  }
+
+  if (relayTitle) {
+    relayCell.title = relayTitle;
   } else {
     relayCell.removeAttribute('title');
   }
@@ -1831,6 +1873,9 @@ function appendSummaryRow(summary) {
   }
 
   const extras = [];
+  if (isRelayGuessed(summary)) {
+    extras.push(summary.relayGuessReason || RELAY_GUESS_EXPLANATION);
+  }
   if (Array.isArray(summary.extraLines) && summary.extraLines.length > 0) {
     extras.push(...summary.extraLines);
   }
@@ -1990,6 +2035,8 @@ function registerPacketFlow(summary, { skipPending = false } = {}) {
     speedKph: Number.isFinite(speedKph) ? speedKph : null,
     satsInView: sats,
     relayLabel,
+    relayGuess: relayGuessed,
+    relayGuessReason,
     aprs: null
   };
 
@@ -2162,6 +2209,13 @@ function renderFlowEntries() {
     const metaWrap = document.createElement('div');
     metaWrap.className = 'flow-item-meta';
     metaWrap.innerHTML = metaParts.join('');
+    if (entry.relayGuessReason) {
+      const relayChip = metaWrap.querySelector('.chip-relay');
+      if (relayChip) {
+        relayChip.title = entry.relayGuessReason;
+        relayChip.classList.add('chip-relay-guess');
+      }
+    }
     colRight.appendChild(metaWrap);
 
     const timestampEl = document.createElement('div');
