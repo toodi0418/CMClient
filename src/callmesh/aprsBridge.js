@@ -432,6 +432,15 @@ class CallMeshAprsBridge extends EventEmitter {
     const result = this.nodeDatabase.upsert(normalized, info);
     if (result.changed) {
       const label = buildNodeLabel(result.node);
+      const rawId = result.node.meshId || result.node.meshIdOriginal || '';
+      const normalizedId = normalizeMeshId(rawId);
+      const looksLikePlaceholder =
+        (label && label.includes('?')) ||
+        (rawId && /^!0{6}[0-9a-f]{2}$/.test(rawId.toLowerCase())) ||
+        (normalizedId && /^!0{6}[0-9a-f]{2}$/.test(normalizedId.toLowerCase()));
+      if (!label || looksLikePlaceholder) {
+        return result.node;
+      }
       if (label && label.includes('?')) {
         return result.node;
       }
