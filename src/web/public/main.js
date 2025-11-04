@@ -1201,7 +1201,7 @@
 
   telemetryNodeInput?.addEventListener('input', (event) => {
     handleTelemetryNodeInputChange(event);
-    renderTelemetryDropdown();
+    renderTelemetryDropdown({ force: true });
   });
 
   telemetryNodeInput?.addEventListener('change', (event) => {
@@ -1972,7 +1972,7 @@
     telemetryDropdownInteracting = false;
   }
 
-  function renderTelemetryDropdown() {
+  function renderTelemetryDropdown({ force = false } = {}) {
     if (!telemetryNodeDropdown || !telemetryNodeInput || telemetryNodeInput.disabled) {
       hideTelemetryDropdown();
       return;
@@ -1983,10 +1983,10 @@
       hideTelemetryDropdown();
       return;
     }
-    const existingOptions = telemetryNodeDropdown.children;
-    if (telemetryDropdownVisible && telemetryDropdownInteracting) {
+    if (telemetryDropdownVisible && !force) {
       return;
     }
+    const existingOptions = telemetryNodeDropdown.children;
     let needsRebuild = existingOptions.length !== candidates.length;
     if (!needsRebuild) {
       for (let i = 0; i < candidates.length; i += 1) {
@@ -2059,7 +2059,7 @@
     if (hideDropdown) {
       hideTelemetryDropdown();
     } else {
-      renderTelemetryDropdown();
+      renderTelemetryDropdown({ force: true });
     }
   }
 
@@ -2067,7 +2067,7 @@
     if (!telemetryNodeInput || telemetryNodeInput.disabled) {
       return;
     }
-    renderTelemetryDropdown();
+    renderTelemetryDropdown({ force: true });
     const candidates = getTelemetryNavigationCandidates();
     if (!candidates.length) {
       return;
@@ -2114,7 +2114,7 @@
     if (!telemetryNodeInput || telemetryNodeInput.disabled || document.activeElement !== telemetryNodeInput) {
       return;
     }
-    renderTelemetryDropdown();
+    renderTelemetryDropdown({ force: true });
     const candidates = getTelemetryNavigationCandidates();
     if (!candidates.length) {
       return;
@@ -2340,7 +2340,7 @@
 
     if (searchActive) {
       updateTelemetryNodeInputDisplay();
-      renderTelemetryDropdown();
+      renderTelemetryDropdown({ force: true });
       return;
     }
 
@@ -2373,7 +2373,9 @@
     telemetrySearchRaw = '';
     telemetrySearchTerm = '';
     updateTelemetryNodeInputDisplay();
-    renderTelemetryDropdown();
+    if (!telemetryDropdownVisible) {
+      renderTelemetryDropdown();
+    }
   }
 
   function getTelemetryRecordsForSelection() {
@@ -2971,7 +2973,9 @@
       telemetrySelectedMeshId = firstKey || null;
       telemetryLastExplicitMeshId = telemetrySelectedMeshId;
       updateTelemetryNodeInputDisplay();
-      renderTelemetryDropdown();
+      if (!telemetryDropdownVisible) {
+        renderTelemetryDropdown();
+      }
     }
     const baseRecords = getTelemetryRecordsForSelection();
     const filteredRecords = applyTelemetryFilters(baseRecords);
@@ -3028,7 +3032,9 @@
       telemetrySelectedMeshId = previousSelection;
       telemetryLastExplicitMeshId = previousSelection;
       updateTelemetryNodeInputDisplay();
-      renderTelemetryDropdown();
+      if (!telemetryDropdownVisible) {
+        renderTelemetryDropdown();
+      }
     }
     renderTelemetryView();
     updateTelemetryUpdatedAtLabel();
@@ -3061,7 +3067,9 @@
       telemetryLastExplicitMeshId = meshId;
     }
     updateTelemetryNodeInputDisplay();
-    renderTelemetryDropdown();
+    if (!telemetryDropdownVisible) {
+      renderTelemetryDropdown();
+    }
     if (telemetrySelectedMeshId === meshId) {
       renderTelemetryView();
     }
