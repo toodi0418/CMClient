@@ -81,7 +81,6 @@ class MeshtasticClient extends EventEmitter {
     // the low byte is populated (e.g. 0x24 for node ending with 0x24).
     if (raw === 0) return { nodeId: 0, guessed: false };
     if (raw > 0xff) {
-      this._recordRelayLinkMetrics(raw, { snr, rssi });
       return { nodeId: raw >>> 0, guessed: false };
     }
     const matches = new Set();
@@ -103,7 +102,6 @@ class MeshtasticClient extends EventEmitter {
     }
     if (matches.size === 1) {
       const [match] = matches;
-      this._recordRelayLinkMetrics(match, { snr, rssi });
       return { nodeId: match >>> 0, guessed: false };
     }
     const bestGuess = this._guessRelayCandidate(Array.from(matches), { snr, rssi });
