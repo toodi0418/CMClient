@@ -13,6 +13,56 @@ const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge')
 const { WebDashboardServer } = require('./web/server');
 const pkg = require('../package.json');
 
+function tryPublishWebMessage(webServer, summary) {
+  if (!webServer || !summary || typeof summary !== 'object') {
+    return;
+  }
+  const type = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+  if (type !== 'text') {
+    return;
+  }
+  const channelId = Number(summary.channel);
+  if (!Number.isFinite(channelId) || channelId < 0) {
+    return;
+  }
+  const sanitizeStringArray = (arr) =>
+    Array.isArray(arr)
+      ? arr
+          .map((line) => (typeof line === 'string' ? line.trim() : ''))
+          .filter(Boolean)
+      : [];
+  const detail = typeof summary.detail === 'string' ? summary.detail : '';
+  const extraLines = sanitizeStringArray(summary.extraLines);
+  const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
+  const timestampLabel =
+    typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
+      ? summary.timestampLabel.trim()
+      : new Date(timestampMs).toISOString();
+  const flowId =
+    typeof summary.flowId === 'string' && summary.flowId.trim()
+      ? summary.flowId.trim()
+      : `${channelId}-${timestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+  const entry = {
+    type: 'Text',
+    channel: channelId,
+    detail,
+    extraLines,
+    from: summary.from ? { ...summary.from } : null,
+    relay: summary.relay ? { ...summary.relay } : null,
+    relayMeshId: summary.relay?.meshId ?? summary.relayMeshId ?? null,
+    relayMeshIdNormalized: summary.relay?.meshIdNormalized ?? summary.relayMeshIdNormalized ?? null,
+    hops: summary.hops ? { ...summary.hops } : null,
+    timestampMs,
+    timestampLabel,
+    flowId
+  };
+  try {
+    webServer.publishMessage(entry);
+  } catch (err) {
+    console.warn(`推播文字訊息失敗：${err.message}`);
+  }
+}
+
 function toWebCallmeshState(state) {
   if (!state || typeof state !== 'object') {
     return null;
@@ -461,6 +511,7 @@ async function startMonitor(argv) {
           if (!summary) return;
           bridge.handleMeshtasticSummary(summary);
           webServer?.publishSummary(summary);
+          tryPublishWebMessage(webServer, summary);
           if (!headerPrinted) {
             console.log('Date               | Nodes                      | Relay        | Ch |   SNR | RSSI | Type         | Hops   | Details');
             console.log('-------------------+---------------------------+--------------+----+-------+------+--------------+--------+------------------------------');
@@ -495,6 +546,7 @@ async function startMonitor(argv) {
           if (!summary) return;
           bridge.handleMeshtasticSummary(summary);
           webServer?.publishSummary(summary);
+          tryPublishWebMessage(webServer, summary);
         });
         client.on('fromRadio', ({ message }) => {
           const object = client.toObject(message, {
