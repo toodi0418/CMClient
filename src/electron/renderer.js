@@ -604,8 +604,14 @@ function clearChannelMessages() {
   renderChannelMessages(selectedChannelId);
 }
 
+function isTextSummary(summary) {
+  if (!summary || typeof summary !== 'object') return false;
+  const type = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+  return type === 'text';
+}
+
 function recordChannelMessage(summary, { markUnread = true } = {}) {
-  if (!summary || summary.type !== 'Text') {
+  if (!isTextSummary(summary)) {
     return;
   }
   const channelId = Number(summary.channel);

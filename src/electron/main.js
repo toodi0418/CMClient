@@ -74,7 +74,11 @@ function sanitizeHopsForPersist(hops) {
 }
 
 function sanitizeMessageSummary(summary) {
-  if (!summary || summary.type !== 'Text') {
+  if (!summary || typeof summary !== 'object') {
+    return null;
+  }
+  const type = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+  if (type !== 'text') {
     return null;
   }
   const channelId = Number(summary.channel);

@@ -303,12 +303,12 @@ class MeshtasticClient extends EventEmitter {
     if (!this._relayStatsPath) {
       return;
     }
+    if (!this._relayStatsDirty || this._relayStatsPersisting) {
+      return;
+    }
     if (this._relayStatsPersistTimer) {
       clearTimeout(this._relayStatsPersistTimer);
       this._relayStatsPersistTimer = null;
-    }
-    if (!this._relayStatsDirty || this._relayStatsPersisting) {
-      return;
     }
     const payload = {};
     for (const [key, stats] of this._relayLinkStats.entries()) {

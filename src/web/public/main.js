@@ -616,6 +616,12 @@
     channelNavButtons.forEach((_, channelId) => updateChannelNavMeta(channelId, { unread: false }));
   }
 
+  function isTextSummary(summary) {
+    if (!summary || typeof summary !== 'object') return false;
+    const type = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+    return type === 'text';
+  }
+
   function formatMessageText(summary) {
     const detail = typeof summary.detail === 'string' ? summary.detail.trim() : '';
     const extra = Array.isArray(summary.extraLines)
@@ -662,7 +668,7 @@
   }
 
   function recordChannelMessage(summary, { markUnread = true, deferRender = false } = {}) {
-    if (!summary || summary.type !== 'Text') {
+    if (!isTextSummary(summary)) {
       return;
     }
     const channelId = Number(summary.channel);
