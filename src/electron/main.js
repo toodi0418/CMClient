@@ -599,7 +599,10 @@ async function startWebDashboard() {
     return true;
   }
   try {
-    const server = new WebDashboardServer({ appVersion });
+    const server = new WebDashboardServer({
+      appVersion,
+      relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json')
+    });
     await server.start();
     server.setAppVersion(appVersion);
     webServer = server;

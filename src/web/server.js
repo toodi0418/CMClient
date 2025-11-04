@@ -3,6 +3,8 @@
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const { URL } = require('url');
+const fsPromises = fs.promises;
 
 const DEFAULT_PORT = Number(process.env.TMAG_WEB_PORT) || 7080;
 const DEFAULT_HOST = process.env.TMAG_WEB_HOST || '0.0.0.0';
@@ -95,6 +97,10 @@ class WebDashboardServer {
     this.appVersion = typeof options.appVersion === 'string' && options.appVersion.trim()
       ? options.appVersion.trim()
       : FALLBACK_VERSION;
+    this.relayStatsPath =
+      typeof options.relayStatsPath === 'string' && options.relayStatsPath.trim()
+        ? options.relayStatsPath.trim()
+        : null;
 
     this.server = null;
     this.clients = new Set();
@@ -142,8 +148,20 @@ class WebDashboardServer {
     }
 
     this.server = http.createServer((req, res) => {
-      if (req.url === '/api/events') {
+      const parsedUrl = (() => {
+        try {
+          return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+        } catch {
+          return { pathname: req.url };
+        }
+      })();
+      const pathname = parsedUrl.pathname || req.url;
+      if (pathname === '/api/events') {
         this._handleEventStream(req, res);
+        return;
+      }
+      if (pathname === '/debug') {
+        this._handleDebugRequest(req, res);
         return;
       }
       this._serveStatic(req, res);
@@ -388,6 +406,67 @@ class WebDashboardServer {
         entry: this._cloneMessageEntry(sanitized)
       }
     });
+  }
+
+  _handleDebugRequest(req, res) {
+    if (req.method && req.method.toUpperCase() !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Method Not Allowed', allowed: ['GET'] }));
+      return;
+    }
+    this._readRelayStats()
+      .then(({ stats, message }) => {
+        const payload = {
+          relayStatsPath: this.relayStatsPath || null,
+          relayLinkStats: stats,
+          message: message || undefined,
+          generatedAt: new Date().toISOString()
+        };
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store, max-age=0'
+        });
+        res.end(JSON.stringify(payload, null, 2));
+      })
+      .catch((err) => {
+        res.writeHead(500, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store, max-age=0'
+        });
+        res.end(
+          JSON.stringify(
+            {
+              error: 'Failed to load relayLinkStats',
+              message: err.message,
+              relayStatsPath: this.relayStatsPath || null
+            },
+            null,
+            2
+          )
+        );
+      });
+  }
+
+  async _readRelayStats() {
+    if (!this.relayStatsPath) {
+      return { stats: null, message: 'relayStatsPath not configured' };
+    }
+    try {
+      const raw = await fsPromises.readFile(this.relayStatsPath, 'utf8');
+      if (!raw || !raw.trim()) {
+        return { stats: {}, message: null };
+      }
+      try {
+        return { stats: JSON.parse(raw), message: null };
+      } catch (parseErr) {
+        throw new Error(`Invalid relay stats JSON: ${parseErr.message}`);
+      }
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return { stats: {}, message: null };
+      }
+      throw err;
+    }
   }
 
   seedMessageSnapshot(snapshot = {}) {

@@ -293,10 +293,13 @@ async function startMonitor(argv) {
     console.error('CallMesh Heartbeat 失敗：', err);
   });
 
+  const relayStatsPath = path.join(getArtifactsDir(), 'relay-link-stats.json');
+
   if (webUiEnabled && !webServer) {
     try {
       webServer = new WebDashboardServer({
-        appVersion: pkg.version || '0.0.0'
+        appVersion: pkg.version || '0.0.0',
+        relayStatsPath
       });
       await webServer.start();
       webServer.setAppVersion(pkg.version || '0.0.0');
@@ -328,8 +331,6 @@ async function startMonitor(argv) {
       webServer = null;
     }
   }
-
-  const relayStatsPath = path.join(getArtifactsDir(), 'relay-link-stats.json');
 
   const connectionOptions = {
     host: argv.host,
