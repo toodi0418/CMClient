@@ -50,6 +50,7 @@ class MeshtasticClient extends EventEmitter {
     };
 
     this.nodeMap = new Map();
+    this._relayLinkStats = new Map();
     this._decoder = null;
     this._socket = null;
     this._heartbeatTimer = null;
@@ -61,40 +62,137 @@ class MeshtasticClient extends EventEmitter {
     this._socketClosed = true;
   }
 
-  _normalizeRelayNode(relayNode) {
+  _normalizeRelayNode(relayNode, { snr = null, rssi = null } = {}) {
     const raw = Number(relayNode) >>> 0;
     // the firmware sets relay_node to the full node id, but in some cases only
     // the low byte is populated (e.g. 0x24 for node ending with 0x24).
     if (raw === 0) return 0;
-    if (raw > 0xff) return raw;
+    if (raw > 0xff) {
+      this._recordRelayLinkMetrics(raw, { snr, rssi });
+      return raw;
+    }
     const matches = new Set();
     for (const [num, entry] of this.nodeMap.entries()) {
       const numeric = Number(num) >>> 0;
-      if ((numeric & 0xff) === raw) {
+      if ((numeric & 0xff) === raw && !matches.has(numeric)) {
         matches.add(numeric);
-      }
-      if (matches.size > 1) {
-        break;
       }
       const idStr = typeof entry?.id === 'string' ? entry.id : null;
       if (idStr) {
         const cleaned = idStr.replace(/[^0-9a-fA-F]/g, '');
         if (cleaned.length === 8) {
           const parsed = parseInt(cleaned, 16) >>> 0;
-          if ((parsed & 0xff) === raw) {
+          if ((parsed & 0xff) === raw && !matches.has(parsed)) {
             matches.add(parsed);
-            if (matches.size > 1) {
-              break;
-            }
           }
         }
       }
     }
     if (matches.size === 1) {
       const [match] = matches;
+      this._recordRelayLinkMetrics(match, { snr, rssi });
       return match;
     }
+    const bestGuess = this._guessRelayCandidate(Array.from(matches), { snr, rssi });
+    if (bestGuess != null) {
+      this._recordRelayLinkMetrics(bestGuess, { snr, rssi });
+      return bestGuess;
+    }
     return raw;
+  }
+
+  _recordRelayLinkMetrics(nodeId, { snr = null, rssi = null } = {}) {
+    if (nodeId == null) return;
+    const numeric = Number(nodeId);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return;
+    }
+    const toNumber = (value) => {
+      if (value === null || value === undefined) return null;
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const snrValue = toNumber(snr);
+    const rssiValue = toNumber(rssi);
+    if (snrValue === null && rssiValue === null) {
+      return;
+    }
+    const key = numeric >>> 0;
+    const now = Date.now();
+    const alpha = 0.25;
+    let stats = this._relayLinkStats.get(key);
+    if (!stats) {
+      stats = {
+        snr: snrValue,
+        rssi: rssiValue,
+        count: 1,
+        updatedAt: now
+      };
+      this._relayLinkStats.set(key, stats);
+      return;
+    }
+    if (snrValue !== null) {
+      stats.snr = stats.snr == null ? snrValue : stats.snr + alpha * (snrValue - stats.snr);
+    }
+    if (rssiValue !== null) {
+      stats.rssi = stats.rssi == null ? rssiValue : stats.rssi + alpha * (rssiValue - stats.rssi);
+    }
+    stats.count = (stats.count || 0) + 1;
+    stats.updatedAt = now;
+  }
+
+  _guessRelayCandidate(candidates, { snr = null, rssi = null } = {}) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return null;
+    }
+    const toNumber = (value) => {
+      if (value === null || value === undefined) return null;
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const snrValue = toNumber(snr);
+    const rssiValue = toNumber(rssi);
+    if (snrValue === null && rssiValue === null) {
+      return null;
+    }
+    const now = Date.now();
+    let bestCandidate = null;
+    let bestScore = Infinity;
+    let bestStats = null;
+    for (const candidate of candidates) {
+      const stats = this._relayLinkStats.get(candidate >>> 0);
+      if (!stats) continue;
+      let score = 0;
+      let components = 0;
+      if (snrValue !== null && stats.snr != null) {
+        score += Math.abs(snrValue - stats.snr);
+        components += 1;
+      }
+      if (rssiValue !== null && stats.rssi != null) {
+        // scale RSSI diff down so it doesn't dominate SNR
+        score += Math.abs(rssiValue - stats.rssi) * 0.1;
+        components += 1;
+      }
+      if (components === 0) continue;
+      let normalizedScore = score / components;
+      const ageMs = now - (stats.updatedAt || 0);
+      if (Number.isFinite(ageMs) && ageMs > 0) {
+        normalizedScore += Math.min(ageMs / 600000, 5); // +1 per 10 分鐘，最多 +5
+      }
+      const sampleBonus = Math.min(stats.count || 0, 10) * 0.05;
+      normalizedScore -= sampleBonus;
+      if (
+        normalizedScore < bestScore - 0.05 ||
+        (Math.abs(normalizedScore - bestScore) <= 0.05 &&
+          bestStats &&
+          ((stats.count || 0) > (bestStats.count || 0) || (stats.updatedAt || 0) > (bestStats.updatedAt || 0)))
+      ) {
+        bestCandidate = candidate >>> 0;
+        bestScore = normalizedScore;
+        bestStats = stats;
+      }
+    }
+    return bestCandidate;
   }
 
   async start() {
@@ -423,7 +521,17 @@ class MeshtasticClient extends EventEmitter {
     const timestamp = packet.rxTime ? new Date(packet.rxTime * 1000) : new Date();
     const fromInfo = this._formatNode(packet.from);
     const toInfo = packet.to === BROADCAST_ADDR ? null : this._formatNode(packet.to);
-    const relayInfo = relayNodeId != null ? this._formatNode(this._normalizeRelayNode(relayNodeId)) : null;
+    const linkMetrics = {
+      snr: Number.isFinite(packet.rxSnr) ? Number(packet.rxSnr) : null,
+      rssi: Number.isFinite(packet.rxRssi) ? Number(packet.rxRssi) : null
+    };
+    let relayTarget = null;
+    if (relayNodeId != null) {
+      relayTarget = this._normalizeRelayNode(relayNodeId, linkMetrics);
+    } else if (packet.from != null) {
+      this._recordRelayLinkMetrics(packet.from, linkMetrics);
+    }
+    const relayInfo = relayNodeId != null ? this._formatNode(relayTarget) : null;
     const nextHopInfo = nextHopId != null ? this._formatNode(nextHopId) : null;
 
     if (relayInfo && relayInfo.meshId) {
