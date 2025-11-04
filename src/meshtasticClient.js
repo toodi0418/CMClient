@@ -67,10 +67,14 @@ class MeshtasticClient extends EventEmitter {
     // the low byte is populated (e.g. 0x24 for node ending with 0x24).
     if (raw === 0) return 0;
     if (raw > 0xff) return raw;
+    const matches = new Set();
     for (const [num, entry] of this.nodeMap.entries()) {
       const numeric = Number(num) >>> 0;
       if ((numeric & 0xff) === raw) {
-        return numeric;
+        matches.add(numeric);
+      }
+      if (matches.size > 1) {
+        break;
       }
       const idStr = typeof entry?.id === 'string' ? entry.id : null;
       if (idStr) {
@@ -78,10 +82,17 @@ class MeshtasticClient extends EventEmitter {
         if (cleaned.length === 8) {
           const parsed = parseInt(cleaned, 16) >>> 0;
           if ((parsed & 0xff) === raw) {
-            return parsed;
+            matches.add(parsed);
+            if (matches.size > 1) {
+              break;
+            }
           }
         }
       }
+    }
+    if (matches.size === 1) {
+      const [match] = matches;
+      return match;
     }
     return raw;
   }
