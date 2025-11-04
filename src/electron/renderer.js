@@ -304,14 +304,66 @@ function getRelayGuessReason(summary) {
 }
 
 function ensureRelayGuessSuffix(label, summary) {
-  if (!isRelayGuessed(summary)) {
-    return label;
-  }
   const value = label || '';
-  if (!value) {
-    return '?';
+  if (!isRelayGuessed(summary)) {
+    return value;
   }
-  return value.endsWith('?') ? value : `${value}?`;
+  return value || '未知';
+}
+
+function renderRelayCell(cell, summary, label) {
+  if (!cell) return;
+  const relayLabel = label || '';
+  cell.innerHTML = '';
+
+  const labelSpan = document.createElement('span');
+  labelSpan.textContent = relayLabel;
+  cell.appendChild(labelSpan);
+
+  const relayMeshId =
+    summary.relay?.meshId ||
+    summary.relay?.meshIdNormalized ||
+    summary.relayMeshId ||
+    summary.relayMeshIdNormalized ||
+    '';
+  let relayTitle = '';
+  if (relayMeshId) {
+    const normalizedRelayId = relayMeshId.startsWith('0x') ? `!${relayMeshId.slice(2)}` : relayMeshId;
+    if (relayLabel && relayLabel !== normalizedRelayId) {
+      relayTitle = `${relayLabel} (${normalizedRelayId})`;
+    } else {
+      relayTitle = normalizedRelayId;
+    }
+  } else if (relayLabel === '直收') {
+    relayTitle = '訊息為直收，未經其他節點轉發';
+  } else if (relayLabel === 'Self') {
+    const selfLabel = selfNodeState.name || selfNodeState.meshId || '本站節點';
+    relayTitle = `${selfLabel} 轉發`;
+  }
+
+  const guessed = isRelayGuessed(summary);
+  cell.classList.toggle('relay-guess', guessed);
+  if (guessed) {
+    cell.dataset.relayGuess = 'true';
+    const hintButton = document.createElement('button');
+    hintButton.type = 'button';
+    hintButton.className = 'relay-hint-btn';
+    hintButton.textContent = '?';
+    hintButton.title = getRelayGuessReason(summary);
+    hintButton.setAttribute('aria-label', '顯示推測原因');
+    hintButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+    });
+    cell.appendChild(hintButton);
+  } else {
+    cell.removeAttribute('data-relay-guess');
+  }
+
+  if (relayTitle) {
+    cell.title = relayTitle;
+  } else {
+    cell.removeAttribute('title');
+  }
 }
 
 function formatRelayLabel(relay) {
@@ -1828,43 +1880,7 @@ function appendSummaryRow(summary) {
   const relayCell = row.querySelector('.relay');
   const hopInfo = extractHopInfo(summary);
   const relayLabel = computeRelayLabel(summary);
-  const relayGuessed = isRelayGuessed(summary);
-  const relayGuessReason = relayGuessed ? summary.relayGuessReason || RELAY_GUESS_EXPLANATION : '';
-  relayCell.textContent = relayLabel;
-
-  const relayMeshId = summary.relay?.meshId || summary.relay?.meshIdNormalized || '';
-  let relayTitle = '';
-  if (relayMeshId) {
-    const normalizedRelayId = relayMeshId.startsWith('0x') ? `!${relayMeshId.slice(2)}` : relayMeshId;
-    if (relayLabel && relayLabel !== normalizedRelayId) {
-      relayTitle = `${relayLabel} (${normalizedRelayId})`;
-    } else {
-      relayTitle = normalizedRelayId;
-    }
-  } else if (relayLabel === '直收') {
-    relayTitle = '訊息為直收，未經其他節點轉發';
-  } else if (relayLabel === 'Self') {
-    const selfLabel = selfNodeState.name || selfNodeState.meshId || '本站節點';
-    relayTitle = `${selfLabel} 轉發`;
-  } else if (relayLabel && relayLabel.includes('?')) {
-    relayTitle = '最後轉發節點未知或標號不完整';
-  }
-
-  if (isRelayGuessed(summary)) {
-    const reason = getRelayGuessReason(summary);
-    relayCell.classList.add('relay-guess');
-    relayCell.dataset.relayGuess = 'true';
-    relayTitle = relayTitle ? `${relayTitle}\n${reason}` : reason;
-  } else {
-    relayCell.classList.remove('relay-guess');
-    relayCell.removeAttribute('data-relay-guess');
-  }
-
-  if (relayTitle) {
-    relayCell.title = relayTitle;
-  } else {
-    relayCell.removeAttribute('title');
-  }
+  renderRelayCell(relayCell, summary, relayLabel);
   row.querySelector('.channel').textContent = summary.channel ?? '';
   row.querySelector('.snr').textContent = formatNumber(summary.snr, 2);
   row.querySelector('.rssi').textContent = formatNumber(summary.rssi, 0);
@@ -1879,9 +1895,6 @@ function appendSummaryRow(summary) {
   }
 
   const extras = [];
-  if (isRelayGuessed(summary)) {
-    extras.push(summary.relayGuessReason || RELAY_GUESS_EXPLANATION);
-  }
   if (Array.isArray(summary.extraLines) && summary.extraLines.length > 0) {
     extras.push(...summary.extraLines);
   }
@@ -2218,8 +2231,17 @@ function renderFlowEntries() {
     if (entry.relayGuessReason) {
       const relayChip = metaWrap.querySelector('.chip-relay');
       if (relayChip) {
-        relayChip.title = entry.relayGuessReason;
         relayChip.classList.add('chip-relay-guess');
+        if (!relayChip.querySelector('.relay-hint-btn')) {
+          const hintBtn = document.createElement('button');
+          hintBtn.type = 'button';
+          hintBtn.className = 'relay-hint-btn relay-hint-btn--chip';
+          hintBtn.textContent = '?';
+          hintBtn.title = entry.relayGuessReason;
+          hintBtn.setAttribute('aria-label', '顯示推測原因');
+          hintBtn.addEventListener('click', (event) => event.stopPropagation());
+          relayChip.appendChild(hintBtn);
+        }
       }
     }
     colRight.appendChild(metaWrap);
@@ -3514,6 +3536,20 @@ function handleNodeEvent(payload) {
   refreshSummarySelfLabels();
   refreshFlowEntryLabels();
   renderFlowEntries();
+}
+
+function refreshSummarySelfLabels() {
+  for (const row of summaryRows) {
+    if (!row || !row.__summaryData) continue;
+    const summary = row.__summaryData;
+    const relayCell = row.querySelector('.relay');
+    const relayLabel = computeRelayLabel(summary);
+    renderRelayCell(relayCell, summary, relayLabel);
+    const sourceCell = row.querySelector('.nodes');
+    if (sourceCell) {
+      sourceCell.textContent = formatNodes(summary);
+    }
+  }
 }
 
 function updateTelemetryNodesWithRegistry(normalizedMeshId, registryInfo) {

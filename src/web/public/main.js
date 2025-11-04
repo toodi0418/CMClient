@@ -1314,14 +1314,11 @@
   }
 
   function ensureRelayGuessSuffix(label, summary) {
-    if (!isRelayGuessed(summary)) {
-      return label;
-    }
     const value = label || '';
-    if (!value) {
-      return '?';
+    if (!isRelayGuessed(summary)) {
+      return value;
     }
-    return value.endsWith('?') ? value : `${value}?`;
+    return value || '未知';
   }
 
   function formatRelay(summary) {
@@ -1405,7 +1402,11 @@
   function updateRelayCellDisplay(cell, summary) {
     if (!cell) return;
     const label = formatRelay(summary);
-    cell.textContent = label;
+    cell.innerHTML = '';
+
+    const labelSpan = document.createElement('span');
+    labelSpan.textContent = label;
+    cell.appendChild(labelSpan);
 
     let relayMeshRaw =
       summary?.relay?.meshId ||
@@ -1427,17 +1428,21 @@
       relayTitle = '訊息為直收，未經其他節點轉發';
     } else if (label === 'Self') {
       relayTitle = '本站節點轉發';
-    } else if (label && label.includes('?')) {
-      relayTitle = '最後轉發節點未知或標號不完整';
     }
 
-    if (isRelayGuessed(summary)) {
-      const reason = getRelayGuessReason(summary);
-      cell.classList.add('relay-guess');
+    const guessed = isRelayGuessed(summary);
+    cell.classList.toggle('relay-guess', guessed);
+    if (guessed) {
       cell.dataset.relayGuess = 'true';
-      relayTitle = relayTitle ? `${relayTitle}\n${reason}` : reason;
+      const hintButton = document.createElement('button');
+      hintButton.type = 'button';
+      hintButton.className = 'relay-hint-btn';
+      hintButton.textContent = '?';
+      hintButton.title = getRelayGuessReason(summary);
+      hintButton.setAttribute('aria-label', '顯示推測原因');
+      hintButton.addEventListener('click', (event) => event.stopPropagation());
+      cell.appendChild(hintButton);
     } else {
-      cell.classList.remove('relay-guess');
       cell.removeAttribute('data-relay-guess');
     }
 
@@ -3775,8 +3780,17 @@
         strong.textContent = chip.label;
         chipEl.append(strong, document.createTextNode(` ${chip.value}`));
         if (chip.label === 'Relay' && entry.relayGuessReason) {
-          chipEl.title = entry.relayGuessReason;
           chipEl.classList.add('flow-chip-relay-guess');
+          if (!chipEl.querySelector('.relay-hint-btn')) {
+            const hintBtn = document.createElement('button');
+            hintBtn.type = 'button';
+            hintBtn.className = 'relay-hint-btn relay-hint-btn--chip';
+            hintBtn.textContent = '?';
+            hintBtn.title = entry.relayGuessReason;
+            hintBtn.setAttribute('aria-label', '顯示推測原因');
+            hintBtn.addEventListener('click', (event) => event.stopPropagation());
+            chipEl.appendChild(hintBtn);
+          }
         }
         meta.appendChild(chipEl);
       }
