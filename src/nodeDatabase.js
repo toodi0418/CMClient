@@ -13,6 +13,11 @@ const normalizeMeshId = (meshId) => {
   return value.startsWith('!') ? value.toLowerCase() : `!${value.toLowerCase()}`;
 };
 
+const isPlaceholderMeshId = (meshId) => {
+  if (!meshId) return false;
+  return /^!0{6}[0-9a-f]{2}$/.test(String(meshId).toLowerCase());
+};
+
 class NodeDatabase {
   constructor() {
     this.nodes = new Map();
@@ -21,6 +26,12 @@ class NodeDatabase {
   upsert(meshId, payload = {}) {
     const normalized = normalizeMeshId(meshId);
     if (!normalized) {
+      return { changed: false, node: null };
+    }
+    if (isPlaceholderMeshId(normalized) || isPlaceholderMeshId(payload.meshIdOriginal)) {
+      if (this.nodes.has(normalized)) {
+        this.nodes.delete(normalized);
+      }
       return { changed: false, node: null };
     }
     const existing = this.nodes.get(normalized) || {
@@ -154,6 +165,9 @@ class NodeDatabase {
     for (const entry of entries) {
       const normalized = normalizeMeshId(entry?.meshId ?? entry?.meshIdNormalized ?? entry?.meshIdOriginal);
       if (!normalized) continue;
+      if (isPlaceholderMeshId(normalized) || isPlaceholderMeshId(entry?.meshIdOriginal)) {
+        continue;
+      }
       let lastSeenAt = null;
       const candidate = entry?.lastSeenAt;
       if (Number.isFinite(candidate)) {
