@@ -105,6 +105,7 @@
   const telemetryNodeInputDefaultPlaceholder =
     telemetryNodeInput?.getAttribute('placeholder') || '輸入節點 Mesh ID 或搜尋關鍵字';
   const nodeRegistry = new Map();
+  const MESH_ID_PATTERN = /^![0-9a-f]{8}$/i;
 
   function isIgnoredMeshId(meshId) {
     const normalized = normalizeMeshId(meshId);
@@ -507,7 +508,7 @@
     const latest = store[0];
     if (latest) {
       const timeLabel = latest.timestampLabel || '—';
-      const fromLabel = latest.from || '未知節點';
+      const fromLabel = resolveStoredMessageFromLabel(latest);
       navItem.meta.textContent = `${timeLabel} · ${fromLabel}`;
     } else {
       navItem.meta.textContent = '尚無訊息';
@@ -517,6 +518,81 @@
     } else {
       navItem.button.classList.remove('channel-nav-btn--unread');
     }
+  }
+
+  function resolveMessageSource(summary) {
+    const fallback = { label: '未知節點', meshId: null };
+    if (!summary || typeof summary !== 'object') {
+      return fallback;
+    }
+    const node = summary.from || {};
+    const directName =
+      sanitizeNodeName(node.longName) ||
+      sanitizeNodeName(node.shortName) ||
+      sanitizeNodeName(node.label);
+    const meshIdRaw =
+      node.meshIdNormalized ||
+      node.meshId ||
+      node.meshIdOriginal ||
+      summary.fromMeshIdNormalized ||
+      summary.fromMeshId ||
+      summary.fromMeshIdOriginal ||
+      null;
+    const normalized = normalizeMeshId(meshIdRaw);
+    if (normalized) {
+      fallback.meshId = normalized;
+    }
+    if (directName) {
+      return {
+        label: directName,
+        meshId: normalized || null
+      };
+    }
+    if (normalized) {
+      const registryNode = nodeRegistry.get(normalized);
+      if (registryNode) {
+        const registryName =
+          sanitizeNodeName(registryNode.longName) ||
+          sanitizeNodeName(registryNode.shortName) ||
+          sanitizeNodeName(registryNode.label);
+        if (registryName) {
+          return {
+            label: registryName,
+            meshId: normalized
+          };
+        }
+      }
+      return {
+        label: normalized,
+        meshId: normalized
+      };
+    }
+    return fallback;
+  }
+
+  function resolveStoredMessageFromLabel(entry) {
+    if (!entry || typeof entry !== 'object') {
+      return '未知節點';
+    }
+    const stored = sanitizeNodeName(entry.from);
+    if (stored && !MESH_ID_PATTERN.test(stored)) {
+      return stored;
+    }
+    const normalized = entry.fromMeshId || normalizeMeshId(stored);
+    if (normalized) {
+      const registryNode = nodeRegistry.get(normalized);
+      if (registryNode) {
+        const registryName =
+          sanitizeNodeName(registryNode.longName) ||
+          sanitizeNodeName(registryNode.shortName) ||
+          sanitizeNodeName(registryNode.label);
+        if (registryName) {
+          return registryName;
+        }
+      }
+      return normalized;
+    }
+    return stored || '未知節點';
   }
 
   function renderChannelMessages(channelId) {
@@ -545,7 +621,7 @@
 
       const meta = document.createElement('div');
       meta.className = 'channel-message-meta';
-      appendMessageMeta(meta, `來自：${entry.from}`);
+      appendMessageMeta(meta, `來自：${resolveStoredMessageFromLabel(entry)}`);
       appendMessageMeta(meta, entry.hops);
       appendMessageMeta(meta, entry.relay);
       appendMessageMeta(meta, `時間：${entry.timestampLabel}`);
@@ -712,11 +788,7 @@
     const store = ensureChannelStore(channelId);
 
     const text = formatMessageText(summary);
-    const fromLabel =
-      sanitizeNodeName(summary.from?.longName) ||
-      sanitizeNodeName(summary.from?.shortName) ||
-      sanitizeNodeName(summary.from?.label) ||
-      '未知節點';
+    const { label: fromLabel, meshId: fromMeshId } = resolveMessageSource(summary);
     const timestampMs = Number.isFinite(Number(summary.timestampMs)) ? Number(summary.timestampMs) : Date.now();
     const timestampLabel = resolveMessageTimestamp(summary, timestampMs);
     const flowIdRaw = summary.flowId || `${channelId}-${timestampMs}-${text}`;
@@ -735,6 +807,7 @@
       timestampLabel,
       text,
       from: fromLabel,
+      fromMeshId: fromMeshId || null,
       hops: hopSummary,
       relay: relaySummary
     });
@@ -784,6 +857,13 @@
             detail: entry.detail,
             extraLines: Array.isArray(entry.extraLines) ? entry.extraLines : [],
             from: entry.from,
+            fromMeshId:
+              entry.from?.meshId ||
+              entry.from?.meshIdNormalized ||
+              entry.from?.meshIdOriginal ||
+              entry.fromMeshId ||
+              entry.fromMeshIdNormalized ||
+              null,
             relay: entry.relay,
             relayMeshId: entry.relayMeshId,
             relayMeshIdNormalized: entry.relayMeshIdNormalized,
@@ -792,6 +872,7 @@
             timestampLabel: entry.timestampLabel,
             flowId: entry.flowId
           };
+          hydrateSummaryNodes(hydrated);
           recordChannelMessage(hydrated, { markUnread: false, deferRender: true });
         }
       });
