@@ -1007,11 +1007,7 @@ class CallMeshAprsBridge extends EventEmitter {
 
   flushTenmanQueue() {
     const state = this.tenmanForwardState;
-    const allowWhenEmpty = typeof reason === 'string' && reason.startsWith('auth');
-    if (
-      !state ||
-      (!allowWhenEmpty && (!Array.isArray(state.queue) || state.queue.length === 0))
-    ) {
+    if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
       return;
     }
 

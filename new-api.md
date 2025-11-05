@@ -77,6 +77,7 @@
   "action": "publish",
   "payload": {
     "device_id": "N0C12345",
+    "node_name": "隨身節點",
     "timestamp": "2025-11-04T04:45:06.123456+00:00",
     "latitude": 25.033964,
     "longitude": 121.564468,
@@ -94,6 +95,7 @@
 - `timestamp` 必須是含時區的 ISO 8601 字串。
 - `latitude` / `longitude` 為合法的 WGS84 座標。
 - `extra` 可選，為自定義 JSON 物件。
+- `node_name` 可選，建議提供使用者能理解的節點名稱；若缺省則介面會 fallback 到 `device_id`。
 
 ### 成功回應
 
@@ -101,6 +103,7 @@
 {
   "type": "ack",
   "device_id": "N0C12345",
+  "node_name": "隨身節點",
   "timestamp": "2025-11-04T04:45:06.123456+00:00",
   "latitude": 25.033964,
   "longitude": 121.564468,
@@ -113,6 +116,8 @@
   }
 }
 ```
+
+伺服器會在 ACK 與推播的 `point` 訊息中回傳相同的 `node_name`，地圖前端會優先使用此名稱顯示節點標籤。
 
 若上傳前未先驗證，伺服器會回覆：
 
