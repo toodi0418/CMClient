@@ -804,6 +804,36 @@ tbody tr:hover {
   font-weight: 700;
 }
 
+.relay-hint-btn {
+  margin-left: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: #e0f2fe;
+  font-size: 0.75rem;
+  line-height: 1;
+  cursor: help;
+  padding: 0;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.relay-hint-btn:hover,
+.relay-hint-btn:focus-visible {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: rgba(59, 130, 246, 0.5);
+  color: #f8fafc;
+  outline: none;
+}
+
+.flow-item-meta .relay-hint-btn {
+  margin-left: 4px;
+}
+
 .flow-item-comment {
   color: #e2e8f0;
   font-size: 0.9rem;
