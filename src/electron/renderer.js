@@ -340,11 +340,11 @@ function ensureRelayGuessSuffix(label, summary) {
   if (!isRelayGuessed(summary)) {
     return label;
   }
-  const value = label || '';
+  const value = (label || '').trim();
   if (!value) {
-    return '?';
+    return '未知';
   }
-  return value.endsWith('?') ? value : `${value}?`;
+  return value;
 }
 
 function formatRelayLabel(relay) {
@@ -366,9 +366,9 @@ function formatRelayLabel(relay) {
   }
   if (normalized && /^0{6}[0-9a-fA-F]{2}$/.test(String(normalized).toLowerCase())) {
     if (display && display !== 'unknown') {
-      return display.includes('?') ? display : `${display}?`;
+      return display;
     }
-    return meshId ? `${meshId}?` : '?';
+    return meshId || '未知';
   }
   if (display && display !== 'unknown') {
     return display;
@@ -434,7 +434,7 @@ function computeRelayLabel(summary) {
   }
 
   if (usedHops != null && usedHops > 0) {
-    return ensureRelayGuessSuffix('未知?', summary);
+    return ensureRelayGuessSuffix('未知', summary);
   }
 
   if (!normalizedHopsLabel) {
@@ -442,7 +442,7 @@ function computeRelayLabel(summary) {
   }
 
   if (normalizedHopsLabel.includes('?')) {
-    return ensureRelayGuessSuffix('未知?', summary);
+    return ensureRelayGuessSuffix('未知', summary);
   }
 
   return ensureRelayGuessSuffix('', summary);
@@ -685,7 +685,7 @@ function recordChannelMessage(summary, { markUnread = true } = {}) {
   }
 
   let relaySummary = computeRelayLabel(summary);
-  if (!relaySummary || relaySummary === '未知?' || relaySummary === '?') {
+  if (!relaySummary || relaySummary === '未知' || relaySummary === '?') {
     relaySummary = formatNodeDisplay(summary.relay);
   }
   if (!relaySummary || relaySummary === 'unknown') {
@@ -1877,11 +1877,15 @@ function appendSummaryRow(summary) {
   const relayCell = row.querySelector('.relay');
   const hopInfo = extractHopInfo(summary);
   const relayLabel = computeRelayLabel(summary);
-  const relayGuessed = isRelayGuessed(summary);
+  let relayGuessed = isRelayGuessed(summary);
+  if (relayLabel === '直收' || relayLabel === 'Self') {
+    relayGuessed = false;
+  }
   const relayGuessReason = relayGuessed ? summary.relayGuessReason || RELAY_GUESS_EXPLANATION : '';
   relayCell.innerHTML = '';
   const relayLabelSpan = document.createElement('span');
-  relayLabelSpan.textContent = relayLabel || (relayGuessed ? '?' : '');
+  const relayDisplay = relayLabel || (relayGuessed ? '未知' : '—');
+  relayLabelSpan.textContent = relayDisplay;
   relayCell.appendChild(relayLabelSpan);
 
   const relayMeshId =
@@ -1904,24 +1908,24 @@ function appendSummaryRow(summary) {
   } else if (relayLabel === 'Self') {
     const selfLabel = selfNodeState.name || selfNodeState.meshId || '本站節點';
     relayTitle = `${selfLabel} 轉發`;
-  } else if (relayLabel && relayLabel.includes('?')) {
+  } else if (relayGuessed) {
     relayTitle = '最後轉發節點未知或標號不完整';
   }
 
   if (relayGuessed) {
-    const reason = getRelayGuessReason(summary);
+    const reason = relayGuessReason || RELAY_GUESS_EXPLANATION;
     relayCell.classList.add('relay-guess');
     relayCell.dataset.relayGuess = 'true';
     const hintButton = document.createElement('button');
     hintButton.type = 'button';
     hintButton.className = 'relay-hint-btn';
     hintButton.textContent = '?';
-    hintButton.title = reason || RELAY_GUESS_EXPLANATION;
+    hintButton.title = reason;
     hintButton.setAttribute('aria-label', '顯示推測原因');
     hintButton.addEventListener('click', (event) => {
       event.stopPropagation();
       showRelayHint({
-        reason: reason || RELAY_GUESS_EXPLANATION,
+        reason,
         relayLabel: relayLabel || normalizedRelayId || '',
         meshId: normalizedRelayId || ''
       });
@@ -1951,9 +1955,6 @@ function appendSummaryRow(summary) {
   }
 
   const extras = [];
-  if (isRelayGuessed(summary)) {
-    extras.push(summary.relayGuessReason || RELAY_GUESS_EXPLANATION);
-  }
   if (Array.isArray(summary.extraLines) && summary.extraLines.length > 0) {
     extras.push(...summary.extraLines);
   }
@@ -2026,6 +2027,11 @@ function registerPacketFlow(summary, { skipPending = false } = {}) {
   const meshId = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
   if (!meshId) return;
   const relayLabel = computeRelayLabel(summary);
+  let relayGuessed = isRelayGuessed(summary);
+  if (relayLabel === '直收' || relayLabel === 'Self') {
+    relayGuessed = false;
+  }
+  const relayGuessReason = relayGuessed ? summary.relayGuessReason || RELAY_GUESS_EXPLANATION : '';
 
   const timestampMs = extractSummaryTimestamp(summary);
   const flowId = typeof summary.flowId === 'string' && summary.flowId.length

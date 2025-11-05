@@ -669,7 +669,7 @@
 
   function buildMessageRelayLabel(summary) {
     let relayLabel = formatRelay({ ...summary });
-    if (!relayLabel || relayLabel === '未知?' || relayLabel === '?') {
+    if (!relayLabel || relayLabel === '未知' || relayLabel === '?') {
       relayLabel = formatNodeDisplayLabel(summary.relay);
     }
     if (!relayLabel || relayLabel === 'unknown') {
@@ -1374,86 +1374,81 @@ function ensureRelayGuessSuffix(label, summary) {
   if (!isRelayGuessed(summary)) {
     return label;
   }
-  const value = label || '';
-    if (!value) {
-      return '?';
-    }
-    return value.endsWith('?') ? value : `${value}?`;
+  const value = (label || '').trim();
+  if (!value) {
+    return '未知';
   }
+  return value;
+}
 
   function formatRelay(summary) {
     if (!summary) return '直收';
     const fromMeshId = summary.from?.meshId || summary.from?.meshIdNormalized || '';
-    const relayMeshRaw =
+    const fromNormalized = normalizeMeshId(fromMeshId);
+    if (fromMeshId && isSelfMesh(fromMeshId, summary)) {
+      return ensureRelayGuessSuffix('Self', summary);
+    }
+
+    let relayMeshIdRaw =
       summary.relay?.meshId ||
       summary.relay?.meshIdNormalized ||
       summary.relayMeshId ||
       summary.relayMeshIdNormalized ||
       '';
-    const relayNormalized = normalizeMeshId(relayMeshRaw);
-    const fromNormalized = normalizeMeshId(fromMeshId);
-    const rawRelayCanonical = relayMeshRaw.startsWith('!') ? relayMeshRaw.slice(1) : relayMeshRaw;
-
-    if (fromMeshId && isSelfMesh(fromMeshId, summary)) {
-      return ensureRelayGuessSuffix('Self', summary);
-    }
-
-    if (relayMeshRaw && isSelfMesh(relayMeshRaw, summary)) {
-      return ensureRelayGuessSuffix('Self', summary);
-    }
-
-    const relayNode = relayMeshRaw ? hydrateSummaryNode(summary.relay, relayMeshRaw) : null;
+    const relayNode = relayMeshIdRaw ? hydrateSummaryNode(summary.relay, relayMeshIdRaw) : null;
     if (relayNode) {
       summary.relay = relayNode;
+      relayMeshIdRaw =
+        relayNode.meshId || relayNode.meshIdOriginal || relayNode.meshIdNormalized || relayMeshIdRaw;
+    }
+    if (relayMeshIdRaw && isSelfMesh(relayMeshIdRaw, summary)) {
+      return ensureRelayGuessSuffix('Self', summary);
+    }
+    let relayNormalized = normalizeMeshId(relayMeshIdRaw);
+    if (relayNormalized && /^!0{6}[0-9a-fA-F]{2}$/.test(relayNormalized)) {
+      relayMeshIdRaw = '';
+      relayNormalized = null;
     }
 
-    let relayMeshDisplay = relayNode?.meshId || relayMeshRaw;
-    let relayNormWork = relayNode?.meshIdNormalized || relayNormalized;
-    if (relayMeshRaw && /^0{6}[0-9a-fA-F]{2}$/.test(rawRelayCanonical.toLowerCase())) {
-      relayMeshDisplay = '';
-      relayNormWork = null;
-    }
-
-    if (fromNormalized && relayNormWork && fromNormalized === relayNormWork) {
+    if (fromNormalized && relayNormalized && fromNormalized === relayNormalized) {
       return ensureRelayGuessSuffix('直收', summary);
     }
 
     const hopInfo = extractHopInfo(summary);
-    const usedHops = Number.isFinite(hopInfo.usedHops) ? hopInfo.usedHops : null;
-    const hopsLabel = hopInfo.hopsLabel || '';
-    const zeroHop = usedHops === 0 || /^0(?:\s*\/|$)/.test(hopsLabel);
+    const normalizedHopsLabel = hopInfo.hopsLabel || '';
+    const zeroHop = hopInfo.usedHops === 0 || /^0(?:\s*\/|$)/.test(normalizedHopsLabel);
 
-    if (summary.relay) {
+    if (summary.relay?.label) {
       if (zeroHop) {
         return ensureRelayGuessSuffix('直收', summary);
       }
       return ensureRelayGuessSuffix(formatRelayLabel(summary.relay), summary);
     }
 
-    if (relayMeshDisplay) {
+    if (relayMeshIdRaw) {
       if (zeroHop) {
         return ensureRelayGuessSuffix('直收', summary);
       }
-    return ensureRelayGuessSuffix(
-      formatRelayLabel({ label: summary.relay?.label || relayMeshDisplay, meshId: relayMeshDisplay }),
-      summary
-    );
-  }
+      return ensureRelayGuessSuffix(
+        formatRelayLabel({ label: summary.relay?.label || relayMeshIdRaw, meshId: relayMeshIdRaw }),
+        summary
+      );
+    }
 
     if (zeroHop) {
       return ensureRelayGuessSuffix('直收', summary);
     }
 
-    if (usedHops != null && usedHops > 0) {
-      return ensureRelayGuessSuffix('未知?', summary);
+    if (hopInfo.usedHops != null && hopInfo.usedHops > 0) {
+      return ensureRelayGuessSuffix('未知', summary);
     }
 
-    if (!hopsLabel) {
+    if (!normalizedHopsLabel) {
       return ensureRelayGuessSuffix('直收', summary);
     }
 
-    if (hopsLabel.includes('?')) {
-      return ensureRelayGuessSuffix('未知?', summary);
+    if (normalizedHopsLabel.includes('?')) {
+      return ensureRelayGuessSuffix('未知', summary);
     }
 
     return ensureRelayGuessSuffix('', summary);
@@ -1462,10 +1457,16 @@ function ensureRelayGuessSuffix(label, summary) {
   function updateRelayCellDisplay(cell, summary) {
     if (!cell) return;
     const label = formatRelay(summary);
+    let relayGuessed = isRelayGuessed(summary);
+    if (label === '直收' || label === 'Self') {
+      relayGuessed = false;
+    }
+    const relayGuessReason = relayGuessed ? getRelayGuessReason(summary) : '';
     cell.innerHTML = '';
 
     const labelSpan = document.createElement('span');
-    labelSpan.textContent = label || (isRelayGuessed(summary) ? '?' : '');
+    const relayDisplay = label || (relayGuessed ? '未知' : '—');
+    labelSpan.textContent = relayDisplay;
     cell.appendChild(labelSpan);
 
     let relayMeshRaw =
@@ -1493,23 +1494,24 @@ function ensureRelayGuessSuffix(label, summary) {
       relayTitle = '訊息為直收，未經其他節點轉發';
     } else if (label === 'Self') {
       relayTitle = '本站節點轉發';
+    } else if (relayGuessed) {
+      relayTitle = '最後轉發節點未知或標號不完整';
     }
 
-    const guessed = isRelayGuessed(summary);
-    const reason = getRelayGuessReason(summary);
-    cell.classList.toggle('relay-guess', guessed);
-    if (guessed) {
+    const reason = relayGuessReason || RELAY_GUESS_EXPLANATION;
+    cell.classList.toggle('relay-guess', relayGuessed);
+    if (relayGuessed) {
       cell.dataset.relayGuess = 'true';
       const hintButton = document.createElement('button');
       hintButton.type = 'button';
       hintButton.className = 'relay-hint-btn';
       hintButton.textContent = '?';
-      hintButton.title = reason || RELAY_GUESS_EXPLANATION;
+      hintButton.title = reason;
       hintButton.setAttribute('aria-label', '顯示推測原因');
       hintButton.addEventListener('click', (event) => {
         event.stopPropagation();
         openRelayHintDialog({
-          reason: reason || RELAY_GUESS_EXPLANATION,
+          reason,
           relayLabel: label || normalizedRelayMeshId || '',
           meshId: normalizedRelayMeshId || ''
         });
@@ -1544,7 +1546,7 @@ function ensureRelayGuessSuffix(label, summary) {
     }
     if (stripped && /^0{6}[0-9a-fA-F]{2}$/.test(String(stripped).toLowerCase())) {
       const fallback = display || meshId || '';
-      return fallback ? (fallback.includes('?') ? fallback : `${fallback}?`) : '?';
+      return fallback || '未知';
     }
     if (display) {
       return display;
@@ -3229,9 +3231,6 @@ function ensureRelayGuessSuffix(label, summary) {
     if (extraSegments.length) {
       segments.push(...extraSegments);
     }
-    if (isRelayGuessed(summary)) {
-      segments.push(`<span class="detail-extra">${escapeHtml(getRelayGuessReason(summary))}</span>`);
-    }
     const distanceLabel = formatDistance(summary);
     if (distanceLabel) {
       segments.push(`<span class="detail-distance">${escapeHtml(distanceLabel)}</span>`);
@@ -3661,7 +3660,10 @@ function ensureRelayGuessSuffix(label, summary) {
       ? summary.extraLines.filter((line) => typeof line === 'string' && line.trim())
       : [];
     const relayLabel = formatRelay(summary);
-    const relayGuessed = isRelayGuessed(summary);
+    let relayGuessed = isRelayGuessed(summary);
+    if (relayLabel === '直收' || relayLabel === 'Self') {
+      relayGuessed = false;
+    }
     const relayGuessReason = relayGuessed ? getRelayGuessReason(summary) : '';
     const hopInfo = extractHopInfo(summary);
     const position = summary.position || {};
@@ -3728,9 +3730,14 @@ function ensureRelayGuessSuffix(label, summary) {
     entry.toLabel = summary.to ? formatFlowNode(summary.to) : null;
     entry.pathLabel = formatFlowPath(summary);
     entry.channel = summary.channel ?? entry.channel;
-    entry.relayLabel = formatRelay(summary);
-    entry.relayGuess = isRelayGuessed(summary);
-    entry.relayGuessReason = entry.relayGuess ? getRelayGuessReason(summary) : '';
+    const relayLabel = formatRelay(summary);
+    let relayGuessed = isRelayGuessed(summary);
+    if (relayLabel === '直收' || relayLabel === 'Self') {
+      relayGuessed = false;
+    }
+    entry.relayLabel = relayLabel;
+    entry.relayGuess = relayGuessed;
+    entry.relayGuessReason = relayGuessed ? getRelayGuessReason(summary) : '';
     entry.relayMeshId =
       summary.relay?.meshId ||
       summary.relay?.meshIdNormalized ||

@@ -14,6 +14,8 @@
 - **節點資料庫**：新增 `src/nodeDatabase.js`，集中維護 Mesh 節點的長名稱、模型、角色與最後出現時間；CLI、Electron、Web 均透過 Bridge 發佈 `node` / `node-snapshot` 事件使用同一份資料。
 - **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.jsonl` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
 - **GUI 訊息頻道持久化**：桌面版新增「訊息」分頁，將 CH0~CH3 文字封包以 `message-log.jsonl` （`app.getPath('userData')/callmesh/`）保存並自動復原，預設每頻道保留 200 筆，並顯示來源節點、跳數與最後轉發節點。
+- **最後轉發推測升級**：`meshtasticClient` 會比對 `relay-link-stats.json` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
+- **Relay 提示 UI**：CLI/Electron/Web 均以圓形 `?` 按鈕提示推測結果；桌面與 Web 啟用半透明 Modal 顯示推測原因、候選節點與 Mesh ID。
 - **CLI 旗標**：預設關閉 Web UI；若需啟動可加上 `--web-ui`。Electron 亦可透過設定頁切換，或以 `TMAG_WEB_DASHBOARD` 強制指定。
 
 ## 1. 專案定位與核心價值
@@ -88,6 +90,11 @@ CMClient/
   - Heartbeat / WantConfig，確保連線穩定
   - 解析 Telemetry payload，將 `batteryLevel`、`voltage`、`channelUtilization`、`airUtilTx` 等量測轉換為 `summary.telemetry`（包含 `kind`、時間戳與原始 `metrics`），供 `CallMeshAprsBridge` 及前端儲存與顯示。
   - `_formatNode()` 會同時輸出 `shortName`、`longName`、`hwModel`、`role`，並交由 Bridge 回寫到節點資料庫，確保 CLI / GUI / Web 呈現一致的節點資訊。
+  - 針對 `relay_node` 僅回傳尾碼的情境，`_normalizeRelayNode()` 會整合 `nodeMap`、節點資料庫 (`nodeDatabase.list()`)、`relay-link-stats.json` 的歷史 SNR/RSSI：
+    1. 先彙整所有尾碼符合的候選節點；
+    2. 以歷史樣本計算差距，選出最接近者；
+    3. 回傳 `guessed=true` 並產生 `relayGuessReason`（缺樣本時列出候選清單），供前端顯示問號提示。
+  - 補上一系列工具函式（`formatRelativeAge()`、`formatHexId()` 等），協助在 CLI/UI 呈現推測原因與時間差。
 
 ### 3.2 CallMesh ↔ APRS Bridge (`src/callmesh/aprsBridge.js`)
 - **單一事實來源**：CLI、Electron、Web 端都透過此 Bridge 操作 CallMesh、APRS 與節點資料。
@@ -138,7 +145,7 @@ CMClient/
 
 ### 3.6 Electron Renderer (`src/electron/renderer.js`)
 - 主要分頁：
-  1. **監視**：封包表與計數（10 分鐘封包 / APRS 上傳 / Mapping 節點）。節點名稱會套用節點資料庫資料。
+  1. **監視**：封包表與計數（10 分鐘封包 / APRS 上傳 / Mapping 節點）。節點名稱會套用節點資料庫資料；若最後轉發為推測結果，欄位會顯示圓形 `?` 按鈕，點擊後使用內建 Modal 呈現推測原因、候選節點與 Mesh ID。
   2. **訊息**：左側列出 CH0~CH3 頻道，支援未讀標記與快速切換；右側顯示訊息內容、來源節點、跳數與最後一跳摘要。初始化會呼叫 `getMessageSnapshot()` 載入 `message-log.jsonl` 的快取，並對每筆文字封包進行去重（以 `flowId` 為主）與上限裁切（預設 200 筆／頻道）。
   3. **遙測數據**：Chart.js 畫面與資料表，可依節點、時間範圍、指標模式切換；節點輸入框整合了 datalist 與搜尋，鍵入 Mesh ID、暱稱或任意關鍵字即可切換節點或直接套用全域篩選，輸入清空時會自動還原到最近選取節點並顯示完整資料；頁面右上角顯示「筆數 / 節點 / 檔案大小」統計並提供「清空遙測數據」按鈕。
   4. **Mapping 封包追蹤**：具 Mapping 的位置封包列表，支援搜尋、狀態篩選與 CSV 匯出；節點資訊與 APRS 狀態會即時更新。
@@ -164,9 +171,9 @@ CMClient/
   - 遙測資料庫同樣保留 500 筆/節點，並在 `telemetry-snapshot/append/reset` 事件中附帶統計（筆數、節點數、磁碟大小）。
   - 計數邏輯與 Electron 對齊：`packetLast10Min`、`aprsUploaded`、`mappingCount`。
 - **前端 (`src/web/public/main.js`)**
-  - 監視頁一次呈現 CallMesh Provision、封包表與 APRS 狀態，節點欄位會套用節點資料庫資訊。
+  - 監視頁一次呈現 CallMesh Provision、封包表與 APRS 狀態，節點欄位會套用節點資料庫資訊。若最後轉發為推測，欄位會顯示圓形 `?` 按鈕，點擊後以自訂 Modal 顯示推測原因、候選節點與 Mesh ID。
   - 遙測頁提供節點篩選、時間範圍、圖表模式切換，以及「筆數 / 節點 / 檔案大小」統計；清空遙測資料會觸發 `telemetry-reset`。
-  - Mapping 封包追蹤支援搜尋、狀態篩選與節點 metadata（長名稱、模型、角色）；APRS 上傳狀態與 CLI 保持一致。
+  - Mapping 封包追蹤支援搜尋、狀態篩選與節點 metadata（長名稱、模型、角色）；APRS 上傳狀態與 CLI 保持一致，Flow 列表同樣支援點擊 `?` 按鈕呼出 Modal 說明。
   - `node`、`node-snapshot` 事件會同步更新節點暱稱與型號，Flow/Telemetry/封包表都會受益。
 - Web Dashboard 可獨立瀏覽 (`npm run desktop` 後開 `http://localhost:7080`)，但不另提供設定 UI，所有設定仍在 Electron/CLI。
 
