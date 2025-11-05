@@ -1411,6 +1411,34 @@ function formatHexId(num) {
   return `!${num.toString(16).padStart(8, '0')}`;
 }
 
+function formatRelativeAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return '剛剛';
+  }
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) {
+    return '不到 1 分鐘';
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} 分鐘前`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours} 小時前`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 30) {
+    return `${days} 天前`;
+  }
+  const months = Math.floor(days / 30);
+  if (months < 12) {
+    return `${months} 個月前`;
+  }
+  const years = Math.floor(months / 12);
+  return `${years} 年前`;
+}
+
 function formatTimestamp(date) {
   const mm = String(date.getMonth() + 1).padStart(2, '0');
   const dd = String(date.getDate()).padStart(2, '0');
