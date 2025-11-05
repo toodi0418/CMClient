@@ -2119,12 +2119,6 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
 
-    const relayLabelRaw = typeof summary.relay?.label === 'string' ? summary.relay.label.trim() : '';
-    const relayLabelAlt = typeof summary.relayLabel === 'string' ? summary.relayLabel.trim() : '';
-    const relayLabel = relayLabelRaw || relayLabelAlt;
-    if (relayLabel && relayLabel.toLowerCase() === 'self') {
-      return;
-    }
     const record = this.buildTelemetryRecord(summary, {
       meshId: fromMeshId,
       timestampMs
