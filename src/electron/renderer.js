@@ -1832,7 +1832,7 @@ function appendSummaryRow(summary) {
   const relayGuessReason = relayGuessed ? summary.relayGuessReason || RELAY_GUESS_EXPLANATION : '';
   relayCell.innerHTML = '';
   const relayLabelSpan = document.createElement('span');
-  relayLabelSpan.textContent = relayLabel;
+  relayLabelSpan.textContent = relayLabel || (relayGuessed ? '?' : '');
   relayCell.appendChild(relayLabelSpan);
 
   const relayMeshId =

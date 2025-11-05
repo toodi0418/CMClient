@@ -1425,7 +1425,7 @@ function ensureRelayGuessSuffix(label, summary) {
     cell.innerHTML = '';
 
     const labelSpan = document.createElement('span');
-    labelSpan.textContent = label;
+    labelSpan.textContent = label || (isRelayGuessed(summary) ? '?' : '');
     cell.appendChild(labelSpan);
 
     let relayMeshRaw =
