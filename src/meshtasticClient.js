@@ -90,6 +90,21 @@ class MeshtasticClient extends EventEmitter {
     this._loadRelayStatsFromDisk();
   }
 
+  _shouldIgnoreMeshId(value) {
+    if (value == null) return false;
+    let normalized = null;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) return false;
+      normalized = `!${(value >>> 0).toString(16).padStart(8, '0')}`;
+    } else if (typeof value === 'string') {
+      normalized = normalizeMeshId(value);
+      if (!normalized) return false;
+    } else {
+      return false;
+    }
+    return normalized.toLowerCase().startsWith('!abcd');
+  }
+
   _normalizeRelayNode(relayNode, { snr = null, rssi = null } = {}) {
     const raw = Number(relayNode) >>> 0;
     // the firmware sets relay_node to the full node id, but in some cases only
@@ -101,6 +116,9 @@ class MeshtasticClient extends EventEmitter {
     const matches = new Set();
     for (const [num, entry] of this.nodeMap.entries()) {
       const numeric = Number(num) >>> 0;
+      if (this._shouldIgnoreMeshId(numeric)) {
+        continue;
+      }
       if ((numeric & 0xff) === raw && !matches.has(numeric)) {
         matches.add(numeric);
       }
@@ -109,6 +127,9 @@ class MeshtasticClient extends EventEmitter {
         const cleaned = idStr.replace(/[^0-9a-fA-F]/g, '');
         if (cleaned.length === 8) {
           const parsed = parseInt(cleaned, 16) >>> 0;
+          if (this._shouldIgnoreMeshId(parsed)) {
+            continue;
+          }
           if ((parsed & 0xff) === raw && !matches.has(parsed)) {
             matches.add(parsed);
           }
@@ -117,6 +138,9 @@ class MeshtasticClient extends EventEmitter {
     }
     for (const key of this._relayLinkStats.keys()) {
       const candidate = Number(key) >>> 0;
+      if (this._shouldIgnoreMeshId(candidate)) {
+        continue;
+      }
       if ((candidate & 0xff) === raw && !matches.has(candidate)) {
         matches.add(candidate);
       }
@@ -134,6 +158,9 @@ class MeshtasticClient extends EventEmitter {
             entry?.mesh_id_original;
           const normalized = normalizeMeshId(meshCandidate);
           if (!normalized) continue;
+          if (this._shouldIgnoreMeshId(normalized)) {
+            continue;
+          }
           const numeric = parseInt(normalized.slice(1), 16);
           if (!Number.isFinite(numeric)) continue;
           const candidate = numeric >>> 0;
@@ -181,7 +208,11 @@ class MeshtasticClient extends EventEmitter {
     if (!Number.isFinite(numeric) || numeric <= 0) {
       return;
     }
-    if (this._selfNodeId != null && (numeric >>> 0) === (this._selfNodeId >>> 0)) {
+    const normalizedNumeric = numeric >>> 0;
+    if (this._shouldIgnoreMeshId(normalizedNumeric)) {
+      return;
+    }
+    if (this._selfNodeId != null && normalizedNumeric === (this._selfNodeId >>> 0)) {
       return;
     }
     const toNumber = (value) => {
@@ -194,7 +225,7 @@ class MeshtasticClient extends EventEmitter {
     if (snrValue === null && rssiValue === null) {
       return;
     }
-    const key = numeric >>> 0;
+    const key = normalizedNumeric;
     const now = Date.now();
     const alpha = 0.25;
     let stats = this._relayLinkStats.get(key);
@@ -400,6 +431,9 @@ class MeshtasticClient extends EventEmitter {
         if (!value || typeof value !== 'object') continue;
         const numericKey = Number(key);
         if (!Number.isFinite(numericKey) || numericKey <= 0) continue;
+        if (this._shouldIgnoreMeshId(numericKey)) {
+          continue;
+        }
         const entry = {
           snr: Number.isFinite(value.snr) ? Number(value.snr) : null,
           rssi: Number.isFinite(value.rssi) ? Number(value.rssi) : null,
