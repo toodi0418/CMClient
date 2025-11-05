@@ -2118,7 +2118,21 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!fromMeshId) {
       return;
     }
-    if (this.selfMeshId && fromMeshId === this.selfMeshId) {
+
+    const relayMeshId = normalizeMeshId(
+      summary.relay?.meshId ||
+        summary.relay?.meshIdNormalized ||
+        summary.relayMeshId ||
+        summary.relayMeshIdNormalized
+    );
+    const relayLabel = typeof summary.relay?.label === 'string' ? summary.relay.label.trim().toLowerCase() : '';
+
+    const isSelfRelay = Boolean(
+      this.selfMeshId &&
+        ((relayMeshId && relayMeshId === this.selfMeshId) || relayLabel === 'self')
+    );
+
+    if (isSelfRelay) {
       return;
     }
     const record = this.buildTelemetryRecord(summary, {
