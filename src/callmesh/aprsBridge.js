@@ -27,6 +27,7 @@ const APRS_TELEMETRY_INTERVAL_MS = 6 * 60 * 60_000;
 const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
+const TELEMETRY_SAMPLE_TIME_MAX_OFFSET_MS = 7 * 24 * 60 * 60_000; // fallback to receipt time if sample deviates over a week
 
 const TENMAN_FORWARD_WS_ENDPOINT =
   process.env.TENMAN_WS_URL || 'wss://tenmanmap.yakumo.tw/ws';
@@ -2256,9 +2257,19 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     const baseTimestampMs = Number.isFinite(timestampMs) ? Number(timestampMs) : Date.now();
     const telemetry = summary.telemetry;
-    const sampleTimeMs = Number.isFinite(telemetry.timeMs) ? Number(telemetry.timeMs) : null;
+    const rawSampleTimeMs = Number.isFinite(telemetry.timeMs) ? Number(telemetry.timeMs) : null;
+    let sampleTimeMs = rawSampleTimeMs;
+    if (Number.isFinite(sampleTimeMs) && Number.isFinite(baseTimestampMs)) {
+      const offset = Math.abs(sampleTimeMs - baseTimestampMs);
+      if (offset > TELEMETRY_SAMPLE_TIME_MAX_OFFSET_MS) {
+        sampleTimeMs = baseTimestampMs;
+      }
+    }
+    if (!Number.isFinite(sampleTimeMs)) {
+      sampleTimeMs = baseTimestampMs;
+    }
     const recordTimestampIso = new Date(baseTimestampMs).toISOString();
-    const sampleIso = sampleTimeMs != null ? new Date(sampleTimeMs).toISOString() : null;
+    const sampleIso = new Date(sampleTimeMs).toISOString();
     const node = mergeNodeInfo(
       extractTelemetryNode(summary.from),
       this.nodeDatabase.get(meshId),
@@ -2272,8 +2283,8 @@ class CallMeshAprsBridge extends EventEmitter {
       node,
       timestampMs: baseTimestampMs,
       timestamp: recordTimestampIso,
-      sampleTimeMs: sampleTimeMs != null ? sampleTimeMs : baseTimestampMs,
-      sampleTime: sampleIso ?? recordTimestampIso,
+      sampleTimeMs,
+      sampleTime: sampleIso || recordTimestampIso,
       type: summary.type || '',
       detail: summary.detail || '',
       channel: summary.channel ?? null,
