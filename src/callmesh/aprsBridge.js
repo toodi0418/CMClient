@@ -871,6 +871,21 @@ class CallMeshAprsBridge extends EventEmitter {
         return;
       }
 
+      const nodeName = summary?.from?.longName || summary?.from?.shortName || summary?.from?.label || null;
+      const extraPayload = {
+        source: 'TMAG',
+        mesh_id: meshIdNormalized
+      };
+      if (nodeName) {
+        extraPayload.node_name = nodeName;
+      }
+      if (summary?.from?.shortName && summary.from.shortName !== nodeName) {
+        extraPayload.short_name = summary.from.shortName;
+      }
+      if (summary?.from?.longName && summary.from.longName !== nodeName) {
+        extraPayload.long_name = summary.from.longName;
+      }
+
       const payload = {
         device_id: deviceId,
         timestamp,
@@ -879,10 +894,7 @@ class CallMeshAprsBridge extends EventEmitter {
         altitude,
         speed,
         heading,
-        extra: {
-          source: 'TMAG',
-          mesh_id: meshIdNormalized
-        }
+        extra: extraPayload
       };
 
       const message = {
