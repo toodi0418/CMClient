@@ -404,6 +404,33 @@
         </div>
       </div>
     </div>
+    <div id="relay-hint-modal" class="modal hidden">
+      <div class="modal-content relay-hint-modal">
+        <div class="relay-hint-header">
+          <div class="relay-hint-icon">❔</div>
+          <div class="relay-hint-title">
+            <h2>推測的最後轉發節點</h2>
+            <p id="relay-hint-subtitle" class="relay-hint-subtitle">節點資訊可能不完全準確</p>
+          </div>
+        </div>
+        <div class="modal-body relay-hint-body">
+          <p id="relay-hint-reason" class="relay-hint-reason">—</p>
+          <dl class="relay-hint-meta">
+            <div>
+              <dt>節點</dt>
+              <dd id="relay-hint-node">—</dd>
+            </div>
+            <div>
+              <dt>Mesh ID</dt>
+              <dd id="relay-hint-mesh">—</dd>
+            </div>
+          </dl>
+        </div>
+        <div class="modal-actions">
+          <button id="relay-hint-close">了解</button>
+        </div>
+      </div>
+    </div>
     <script src="./renderer.js"></script>
   </body>
 </html>

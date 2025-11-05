@@ -53,6 +53,13 @@
   const nodesOnlineTotalLabel = document.getElementById('nodes-online-total');
   const nodesSearchInput = document.getElementById('nodes-search');
   const nodesStatusLabel = document.getElementById('nodes-status');
+  const relayHintModal = document.getElementById('relay-hint-modal');
+  const relayHintReasonEl = document.getElementById('relay-hint-reason');
+  const relayHintNodeEl = document.getElementById('relay-hint-node');
+  const relayHintMeshEl = document.getElementById('relay-hint-mesh');
+  const relayHintSubtitleEl = document.getElementById('relay-hint-subtitle');
+  const relayHintCloseBtn = document.getElementById('relay-hint-close');
+  const relayHintOkBtn = document.getElementById('relay-hint-ok');
 
   const summaryRows = [];
   const flowRowMap = new Map();
@@ -166,6 +173,26 @@
       safeStorageSet(STORAGE_KEYS.callmeshProvisionOpen, callmeshProvisionDetails.open ? '1' : '0');
     });
   }
+
+  relayHintCloseBtn?.addEventListener('click', () => {
+    closeRelayHintDialog();
+  });
+
+  relayHintOkBtn?.addEventListener('click', () => {
+    closeRelayHintDialog();
+  });
+
+  relayHintModal?.addEventListener('click', (event) => {
+    if (event.target === relayHintModal) {
+      closeRelayHintDialog();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && relayHintModal && !relayHintModal.classList.contains('hidden')) {
+      closeRelayHintDialog();
+    }
+  });
 
   function escapeHtml(input) {
     return String(input)
@@ -1313,22 +1340,35 @@ function getRelayGuessReason(summary) {
   return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
 }
 
-function showRelayHintMessage({ reason, relayLabel, meshId } = {}) {
-  const lines = [];
-  if (reason && reason.trim()) {
-    lines.push(reason.trim());
+  function openRelayHintDialog({ reason, relayLabel, meshId } = {}) {
+    const text = reason && reason.trim() ? reason.trim() : RELAY_GUESS_EXPLANATION;
+    if (!relayHintModal || !relayHintReasonEl) {
+      const fallback = [text, relayLabel ? `節點：${relayLabel}` : null, meshId ? `Mesh ID：${meshId}` : null]
+        .filter(Boolean)
+        .join('\n');
+      window.alert(fallback);
+      return;
+    }
+    relayHintReasonEl.textContent = text;
+    if (relayHintNodeEl) {
+      relayHintNodeEl.textContent = relayLabel && relayLabel.trim() ? relayLabel.trim() : '—';
+    }
+    if (relayHintMeshEl) {
+      relayHintMeshEl.textContent = meshId && meshId.trim() ? meshId.trim() : '—';
+    }
+    if (relayHintSubtitleEl) {
+      relayHintSubtitleEl.textContent = '系統依歷史統計推測可能的最後轉發節點';
+    }
+    relayHintModal.classList.remove('hidden');
+    document.body.classList.add('modal-open');
+    setTimeout(() => relayHintOkBtn?.focus(), 0);
   }
-  if (relayLabel && relayLabel.trim()) {
-    lines.push(`節點：${relayLabel.trim()}`);
+
+  function closeRelayHintDialog() {
+    if (!relayHintModal) return;
+    relayHintModal.classList.add('hidden');
+    document.body.classList.remove('modal-open');
   }
-  if (meshId && meshId.trim()) {
-    lines.push(`Mesh ID：${meshId.trim()}`);
-  }
-  if (!lines.length) {
-    return;
-  }
-  window.alert(lines.join('\n'));
-}
 
 function ensureRelayGuessSuffix(label, summary) {
   if (!isRelayGuessed(summary)) {
@@ -1468,7 +1508,7 @@ function ensureRelayGuessSuffix(label, summary) {
       hintButton.setAttribute('aria-label', '顯示推測原因');
       hintButton.addEventListener('click', (event) => {
         event.stopPropagation();
-        showRelayHintMessage({
+        openRelayHintDialog({
           reason: reason || RELAY_GUESS_EXPLANATION,
           relayLabel: label || normalizedRelayMeshId || '',
           meshId: normalizedRelayMeshId || ''
@@ -3843,11 +3883,11 @@ function ensureRelayGuessSuffix(label, summary) {
             hintBtn.setAttribute('aria-label', '顯示推測原因');
             hintBtn.addEventListener('click', (event) => {
               event.stopPropagation();
-              showRelayHintMessage({
-                reason: entry.relayGuessReason,
-                relayLabel: entry.relayLabel || '',
-                meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
-              });
+            openRelayHintDialog({
+              reason: entry.relayGuessReason,
+              relayLabel: entry.relayLabel || '',
+              meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
+            });
             });
             chipEl.appendChild(hintBtn);
           }

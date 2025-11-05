@@ -28,6 +28,12 @@ const discoverStatus = document.getElementById('discover-status');
 const discoverModal = document.getElementById('discover-modal');
 const discoverModalBody = document.getElementById('discover-modal-body');
 const discoverModalCancel = document.getElementById('discover-modal-cancel');
+const relayHintModal = document.getElementById('relay-hint-modal');
+const relayHintReasonEl = document.getElementById('relay-hint-reason');
+const relayHintNodeEl = document.getElementById('relay-hint-node');
+const relayHintMeshEl = document.getElementById('relay-hint-mesh');
+const relayHintSubtitleEl = document.getElementById('relay-hint-subtitle');
+const relayHintCloseBtn = document.getElementById('relay-hint-close');
 
 const apiKeyInput = document.getElementById('api-key');
 const saveApiKeyBtn = document.getElementById('save-api-key');
@@ -301,6 +307,33 @@ function isRelayGuessed(summary) {
 
 function getRelayGuessReason(summary) {
   return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
+}
+
+function hideRelayHintModal() {
+  if (!relayHintModal) return;
+  relayHintModal.classList.add('hidden');
+  document.body.classList.remove('modal-open');
+}
+
+function showRelayHint({ reason, relayLabel, meshId } = {}) {
+  const fallbackText = reason || RELAY_GUESS_EXPLANATION;
+  if (!relayHintModal || !relayHintReasonEl) {
+    window.alert([fallbackText, relayLabel ? `節點：${relayLabel}` : null, meshId ? `Mesh ID：${meshId}` : null].filter(Boolean).join('\n'));
+    return;
+  }
+  relayHintReasonEl.textContent = fallbackText;
+  if (relayHintSubtitleEl) {
+    relayHintSubtitleEl.textContent = '系統依歷史統計推測可能的最後轉發節點';
+  }
+  if (relayHintNodeEl) {
+    relayHintNodeEl.textContent = relayLabel || '—';
+  }
+  if (relayHintMeshEl) {
+    relayHintMeshEl.textContent = meshId || '—';
+  }
+  relayHintModal.classList.remove('hidden');
+  document.body.classList.add('modal-open');
+  setTimeout(() => relayHintCloseBtn?.focus(), 0);
 }
 
 function ensureRelayGuessSuffix(label, summary) {
@@ -1616,6 +1649,22 @@ discoverModalCancel?.addEventListener('click', () => {
 discoverModal?.addEventListener('click', (event) => {
   if (event.target === discoverModal) {
     hideDiscoverModal();
+  }
+});
+
+relayHintCloseBtn?.addEventListener('click', () => {
+  hideRelayHintModal();
+});
+
+relayHintModal?.addEventListener('click', (event) => {
+  if (event.target === relayHintModal) {
+    hideRelayHintModal();
+  }
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && relayHintModal && !relayHintModal.classList.contains('hidden')) {
+    hideRelayHintModal();
   }
 });
 
