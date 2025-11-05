@@ -2384,9 +2384,6 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!summary) return;
     const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
     const fromMeshId = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
-    if (fromMeshId && this.selfMeshId && fromMeshId === this.selfMeshId) {
-      return;
-    }
     this.addTelemetryMetric('all', timestampMs);
 
     const typeRaw = typeof summary.type === 'string' ? summary.type : '';
