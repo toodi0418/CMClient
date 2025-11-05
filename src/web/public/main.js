@@ -105,6 +105,12 @@
   const telemetryNodeInputDefaultPlaceholder =
     telemetryNodeInput?.getAttribute('placeholder') || '輸入節點 Mesh ID 或搜尋關鍵字';
   const nodeRegistry = new Map();
+
+  function isIgnoredMeshId(meshId) {
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) return false;
+    return normalized.toLowerCase().startsWith('!abcd');
+  }
   let nodeSnapshotLoaded = false;
   const TELEMETRY_TABLE_LIMIT = 200;
   const TELEMETRY_CHART_LIMIT = 200;
@@ -853,6 +859,34 @@
     return { display, tooltip, timestamp };
   }
 
+  function formatNodeCoordinateValue(entry) {
+    if (!entry) return '';
+    const latRaw = entry.latitude;
+    const lonRaw = entry.longitude;
+    if (latRaw == null || lonRaw == null) {
+      return '';
+    }
+    const lat = Number(latRaw);
+    const lon = Number(lonRaw);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return '';
+    }
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+      return '';
+    }
+    const formatComponent = (value) => {
+      const fixed = value.toFixed(5);
+      const trimmed = fixed.replace(/\.?0+$/, '');
+      return trimmed || '0';
+    };
+    const parts = [`${formatComponent(lat)}`, `${formatComponent(lon)}`];
+    const altitude = Number(entry.altitude);
+    if (Number.isFinite(altitude)) {
+      parts.push(`${Math.round(altitude)}m`);
+    }
+    return parts.join(', ');
+  }
+
   function formatNodeDistanceValue(entry) {
     if (
       !selfProvisionCoords ||
@@ -895,12 +929,13 @@
       sanitizeNodeName(entry.label),
       entry.meshId,
       entry.meshIdOriginal,
-      entry.meshIdNormalized,
-      entry.hwModel,
-      entry.hwModelLabel,
-      entry.role,
-      entry.roleLabel
-    ];
+    entry.meshIdNormalized,
+    entry.hwModel,
+    entry.hwModelLabel,
+    entry.role,
+    entry.roleLabel,
+    formatNodeCoordinateValue(entry)
+  ];
     return fields.some((value) => {
       if (!value) return false;
       return String(value).toLowerCase().includes(lowerTerm);
@@ -908,7 +943,9 @@
   }
 
   function getSortedNodeRegistryEntries() {
-    const entries = Array.from(nodeRegistry.values());
+    const entries = Array.from(nodeRegistry.values()).filter(
+      (entry) => !isIgnoredMeshId(entry.meshId) && !isIgnoredMeshId(entry.meshIdOriginal)
+    );
     entries.sort((a, b) => {
       const tsA = getNodeLastSeenTimestamp(a) || 0;
       const tsB = getNodeLastSeenTimestamp(b) || 0;
@@ -1030,6 +1067,7 @@
       const meshLabel = meshIdOriginal || meshId || '—';
       const hwModelDisplay = entry.hwModelLabel || normalizeEnumLabel(entry.hwModel) || '—';
       const roleDisplay = entry.roleLabel || normalizeEnumLabel(entry.role) || '—';
+      const coordinateDisplay = formatNodeCoordinateValue(entry);
       const distanceDisplay = formatNodeDistanceValue(entry);
 
       const { display: lastSeenDisplay, tooltip: lastSeenTooltip, timestamp: lastSeenTimestamp } =
@@ -1048,6 +1086,7 @@
         `<td>${escapeHtml(meshLabel)}</td>` +
         `<td>${escapeHtml(hwModelDisplay)}</td>` +
         `<td>${escapeHtml(roleDisplay)}</td>` +
+        `<td>${escapeHtml(coordinateDisplay || '—')}</td>` +
         `<td>${escapeHtml(distanceDisplay)}</td>` +
         `<td>${lastSeenCell}</td>` +
         '</tr>'
@@ -1068,6 +1107,10 @@
     const candidate = entry.meshId || entry.meshIdNormalized || entry.meshIdOriginal;
     const normalized = normalizeMeshId(candidate);
     if (!normalized) return null;
+    if (isIgnoredMeshId(normalized) || isIgnoredMeshId(entry.meshIdOriginal)) {
+      nodeRegistry.delete(normalized);
+      return null;
+    }
     const existing = nodeRegistry.get(normalized) || {};
     const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
     if (merged) {
@@ -1139,7 +1182,9 @@
       return;
     }
     const totalRecords = Number.isFinite(stats.totalRecords) ? stats.totalRecords : 0;
-    const totalNodes = Number.isFinite(stats.totalNodes) ? stats.totalNodes : nodeRegistry.size;
+    const totalNodes = Number.isFinite(stats.totalNodes)
+      ? stats.totalNodes
+      : getSortedNodeRegistryEntries().length;
     telemetryStatsRecords.textContent = totalRecords.toLocaleString();
     telemetryStatsNodes.textContent = totalNodes.toLocaleString();
     telemetryStatsDisk.textContent = formatBytes(stats.diskBytes);
