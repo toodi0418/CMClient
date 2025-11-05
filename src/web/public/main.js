@@ -1309,15 +1309,32 @@
     return Boolean(summary?.relay?.guessed || summary?.relayGuess);
   }
 
-  function getRelayGuessReason(summary) {
-    return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
-  }
+function getRelayGuessReason(summary) {
+  return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
+}
 
-  function ensureRelayGuessSuffix(label, summary) {
-    if (!isRelayGuessed(summary)) {
-      return label;
-    }
-    const value = label || '';
+function showRelayHintMessage({ reason, relayLabel, meshId } = {}) {
+  const lines = [];
+  if (reason && reason.trim()) {
+    lines.push(reason.trim());
+  }
+  if (relayLabel && relayLabel.trim()) {
+    lines.push(`節點：${relayLabel.trim()}`);
+  }
+  if (meshId && meshId.trim()) {
+    lines.push(`Mesh ID：${meshId.trim()}`);
+  }
+  if (!lines.length) {
+    return;
+  }
+  window.alert(lines.join('\n'));
+}
+
+function ensureRelayGuessSuffix(label, summary) {
+  if (!isRelayGuessed(summary)) {
+    return label;
+  }
+  const value = label || '';
     if (!value) {
       return '?';
     }
@@ -1405,7 +1422,11 @@
   function updateRelayCellDisplay(cell, summary) {
     if (!cell) return;
     const label = formatRelay(summary);
-    cell.textContent = label;
+    cell.innerHTML = '';
+
+    const labelSpan = document.createElement('span');
+    labelSpan.textContent = label;
+    cell.appendChild(labelSpan);
 
     let relayMeshRaw =
       summary?.relay?.meshId ||
@@ -1413,29 +1434,47 @@
       summary?.relayMeshId ||
       summary?.relayMeshIdNormalized ||
       '';
+    let normalizedRelayMeshId = '';
     let relayTitle = '';
     if (typeof relayMeshRaw === 'string' && relayMeshRaw) {
       if (relayMeshRaw.startsWith('0x')) {
-        relayMeshRaw = `!${relayMeshRaw.slice(2)}`;
+        normalizedRelayMeshId = `!${relayMeshRaw.slice(2)}`;
       }
-      if (label && relayMeshRaw && label !== relayMeshRaw) {
-        relayTitle = `${label} (${relayMeshRaw})`;
+      if (!normalizedRelayMeshId) {
+        normalizedRelayMeshId = relayMeshRaw;
+      }
+      const displayMeshId = normalizedRelayMeshId;
+      if (label && displayMeshId && label !== displayMeshId) {
+        relayTitle = `${label} (${displayMeshId})`;
       } else {
-        relayTitle = relayMeshRaw;
+        relayTitle = displayMeshId;
       }
     } else if (label === '直收') {
       relayTitle = '訊息為直收，未經其他節點轉發';
     } else if (label === 'Self') {
       relayTitle = '本站節點轉發';
-    } else if (label && label.includes('?')) {
-      relayTitle = '最後轉發節點未知或標號不完整';
     }
 
-    if (isRelayGuessed(summary)) {
-      const reason = getRelayGuessReason(summary);
-      cell.classList.add('relay-guess');
+    const guessed = isRelayGuessed(summary);
+    const reason = getRelayGuessReason(summary);
+    cell.classList.toggle('relay-guess', guessed);
+    if (guessed) {
       cell.dataset.relayGuess = 'true';
-      relayTitle = relayTitle ? `${relayTitle}\n${reason}` : reason;
+      const hintButton = document.createElement('button');
+      hintButton.type = 'button';
+      hintButton.className = 'relay-hint-btn';
+      hintButton.textContent = '?';
+      hintButton.title = reason || RELAY_GUESS_EXPLANATION;
+      hintButton.setAttribute('aria-label', '顯示推測原因');
+      hintButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        showRelayHintMessage({
+          reason: reason || RELAY_GUESS_EXPLANATION,
+          relayLabel: label || normalizedRelayMeshId || '',
+          meshId: normalizedRelayMeshId || ''
+        });
+      });
+      cell.appendChild(hintButton);
     } else {
       cell.classList.remove('relay-guess');
       cell.removeAttribute('data-relay-guess');
@@ -3591,6 +3630,14 @@
     const satsInView = Number.isFinite(position.satsInView) ? Number(position.satsInView) : null;
     const timestampLabel = summary.timestampLabel || formatFlowTimestamp(timestampMs);
 
+    const relayMeshIdRaw =
+      summary.relay?.meshId ||
+      summary.relay?.meshIdNormalized ||
+      summary.relayMeshId ||
+      summary.relayMeshIdNormalized ||
+      '';
+    const relayMeshIdNormalized = normalizeMeshId(relayMeshIdRaw);
+
     const entry = {
       flowId,
       meshId,
@@ -3619,7 +3666,9 @@
       speedKph,
       satsInView,
       status: 'pending',
-      aprs: null
+      aprs: null,
+      relayMeshId: relayMeshIdRaw,
+      relayMeshIdNormalized
     };
 
     if (!entry.comment && extras.length) {
@@ -3642,6 +3691,14 @@
     entry.relayLabel = formatRelay(summary);
     entry.relayGuess = isRelayGuessed(summary);
     entry.relayGuessReason = entry.relayGuess ? getRelayGuessReason(summary) : '';
+    entry.relayMeshId =
+      summary.relay?.meshId ||
+      summary.relay?.meshIdNormalized ||
+      summary.relayMeshId ||
+      summary.relayMeshIdNormalized ||
+      entry.relayMeshId ||
+      '';
+    entry.relayMeshIdNormalized = normalizeMeshId(entry.relayMeshId) || entry.relayMeshIdNormalized || '';
     const hopInfo = extractHopInfo(summary);
     entry.hopsLabel = hopInfo.hopsLabel || formatHops(summary.hops);
     entry.hopsUsed = hopInfo.usedHops;
@@ -3777,6 +3834,23 @@
         if (chip.label === 'Relay' && entry.relayGuessReason) {
           chipEl.title = entry.relayGuessReason;
           chipEl.classList.add('flow-chip-relay-guess');
+          if (!chipEl.querySelector('.relay-hint-btn')) {
+            const hintBtn = document.createElement('button');
+            hintBtn.type = 'button';
+            hintBtn.className = 'relay-hint-btn relay-hint-btn--chip';
+            hintBtn.textContent = '?';
+            hintBtn.title = entry.relayGuessReason;
+            hintBtn.setAttribute('aria-label', '顯示推測原因');
+            hintBtn.addEventListener('click', (event) => {
+              event.stopPropagation();
+              showRelayHintMessage({
+                reason: entry.relayGuessReason,
+                relayLabel: entry.relayLabel || '',
+                meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
+              });
+            });
+            chipEl.appendChild(hintBtn);
+          }
         }
         meta.appendChild(chipEl);
       }

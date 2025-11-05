@@ -1830,12 +1830,21 @@ function appendSummaryRow(summary) {
   const relayLabel = computeRelayLabel(summary);
   const relayGuessed = isRelayGuessed(summary);
   const relayGuessReason = relayGuessed ? summary.relayGuessReason || RELAY_GUESS_EXPLANATION : '';
-  relayCell.textContent = relayLabel;
+  relayCell.innerHTML = '';
+  const relayLabelSpan = document.createElement('span');
+  relayLabelSpan.textContent = relayLabel;
+  relayCell.appendChild(relayLabelSpan);
 
-  const relayMeshId = summary.relay?.meshId || summary.relay?.meshIdNormalized || '';
+  const relayMeshId =
+    summary.relay?.meshId ||
+    summary.relay?.meshIdNormalized ||
+    summary.relayMeshId ||
+    summary.relayMeshIdNormalized ||
+    '';
   let relayTitle = '';
+  let normalizedRelayId = '';
   if (relayMeshId) {
-    const normalizedRelayId = relayMeshId.startsWith('0x') ? `!${relayMeshId.slice(2)}` : relayMeshId;
+    normalizedRelayId = relayMeshId.startsWith('0x') ? `!${relayMeshId.slice(2)}` : relayMeshId;
     if (relayLabel && relayLabel !== normalizedRelayId) {
       relayTitle = `${relayLabel} (${normalizedRelayId})`;
     } else {
@@ -1850,11 +1859,25 @@ function appendSummaryRow(summary) {
     relayTitle = '最後轉發節點未知或標號不完整';
   }
 
-  if (isRelayGuessed(summary)) {
+  if (relayGuessed) {
     const reason = getRelayGuessReason(summary);
     relayCell.classList.add('relay-guess');
     relayCell.dataset.relayGuess = 'true';
-    relayTitle = relayTitle ? `${relayTitle}\n${reason}` : reason;
+    const hintButton = document.createElement('button');
+    hintButton.type = 'button';
+    hintButton.className = 'relay-hint-btn';
+    hintButton.textContent = '?';
+    hintButton.title = reason || RELAY_GUESS_EXPLANATION;
+    hintButton.setAttribute('aria-label', '顯示推測原因');
+    hintButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      showRelayHint({
+        reason: reason || RELAY_GUESS_EXPLANATION,
+        relayLabel: relayLabel || normalizedRelayId || '',
+        meshId: normalizedRelayId || ''
+      });
+    });
+    relayCell.appendChild(hintButton);
   } else {
     relayCell.classList.remove('relay-guess');
     relayCell.removeAttribute('data-relay-guess');
@@ -2015,6 +2038,14 @@ function registerPacketFlow(summary, { skipPending = false } = {}) {
         : null;
   const sats = Number.isFinite(position.satsInView) ? Number(position.satsInView) : null;
 
+  const relayMeshIdRaw =
+    summary.relay?.meshId ||
+    summary.relay?.meshIdNormalized ||
+    summary.relayMeshId ||
+    summary.relayMeshIdNormalized ||
+    '';
+  const relayMeshIdNormalized = normalizeMeshId(relayMeshIdRaw);
+
   const entry = {
     flowId,
     meshId,
@@ -2043,6 +2074,8 @@ function registerPacketFlow(summary, { skipPending = false } = {}) {
     relayLabel,
     relayGuess: relayGuessed,
     relayGuessReason,
+    relayMeshId: relayMeshIdRaw,
+    relayMeshIdNormalized,
     aprs: null
   };
 
@@ -2220,6 +2253,23 @@ function renderFlowEntries() {
       if (relayChip) {
         relayChip.title = entry.relayGuessReason;
         relayChip.classList.add('chip-relay-guess');
+        if (!relayChip.querySelector('.relay-hint-btn')) {
+          const hintBtn = document.createElement('button');
+          hintBtn.type = 'button';
+          hintBtn.className = 'relay-hint-btn relay-hint-btn--chip';
+          hintBtn.textContent = '?';
+          hintBtn.title = entry.relayGuessReason;
+          hintBtn.setAttribute('aria-label', '顯示推測原因');
+          hintBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            showRelayHint({
+              reason: entry.relayGuessReason,
+              relayLabel: entry.relayLabel || '',
+              meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
+            });
+          });
+          relayChip.appendChild(hintBtn);
+        }
       }
     }
     colRight.appendChild(metaWrap);
