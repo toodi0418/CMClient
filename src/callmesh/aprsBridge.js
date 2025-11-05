@@ -150,157 +150,6 @@ function resolveDeviceRole(value) {
   return resolveEnum(DEVICE_ROLE_ENUM, value);
 }
 
-function formatRelayLabelForSummary(entry) {
-  if (!entry || typeof entry !== 'object') return '';
-  const candidates = [
-    entry.label,
-    entry.longName,
-    entry.shortName,
-    entry.meshId,
-    entry.meshIdNormalized,
-    entry.mesh_id
-  ];
-  for (const candidate of candidates) {
-    if (typeof candidate === 'string' && candidate.trim()) {
-      const trimmed = candidate.trim();
-      if (trimmed.toLowerCase() === 'unknown') {
-        continue;
-      }
-      return trimmed;
-    }
-  }
-  const meshIdRaw =
-    (typeof entry.meshId === 'string' && entry.meshId.trim()) ||
-    (typeof entry.meshIdNormalized === 'string' && entry.meshIdNormalized.trim()) ||
-    (typeof entry.mesh_id === 'string' && entry.mesh_id.trim()) ||
-    '';
-  const normalized = meshIdRaw.startsWith('!') ? meshIdRaw.slice(1) : meshIdRaw;
-  if (normalized && /^0{6}[0-9a-fA-F]{2}$/.test(normalized.toLowerCase())) {
-    return meshIdRaw || '未知';
-  }
-  return meshIdRaw || '未知';
-}
-
-function extractHopInfoFromSummary(summary) {
-  const hopStart = Number(summary?.hops?.start);
-  const hopLimit = Number(summary?.hops?.limit);
-  const label = typeof summary?.hops?.label === 'string' ? summary.hops.label.trim() : '';
-  let used = null;
-  let total = Number.isFinite(hopStart) ? hopStart : null;
-
-  if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
-    used = Math.max(hopStart - hopLimit, 0);
-  } else {
-    const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
-    if (match) {
-      used = Number(match[1]);
-      if (!Number.isFinite(total)) {
-        total = Number(match[2]);
-      }
-    } else if (/^\d+$/.test(label)) {
-      used = 0;
-    }
-  }
-
-  if (!Number.isFinite(total)) {
-    const match = label.match(/\/\s*(\d+)/);
-    if (match) {
-      total = Number(match[1]);
-    }
-  }
-
-  return {
-    usedHops: Number.isFinite(used) ? used : null,
-    totalHops: Number.isFinite(total) ? total : null,
-    hopsLabel: label
-  };
-}
-
-function computeRelayDisplayLabel(summary, selfMeshId) {
-  if (!summary) {
-    return '';
-  }
-  const directLabel =
-    typeof summary.relay?.label === 'string' ? summary.relay.label.trim() : '';
-  const normalizedSelf = normalizeMeshId(selfMeshId);
-  if (!normalizedSelf) {
-    return directLabel || '';
-  }
-  const isSelfMesh = (meshId) => {
-    if (!meshId) return false;
-    const normalized = normalizeMeshId(meshId);
-    return normalized ? normalized === normalizedSelf : false;
-  };
-
-  const fromMeshId =
-    summary.from?.meshId || summary.from?.meshIdNormalized || summary.from?.mesh_id || '';
-  if (fromMeshId && isSelfMesh(fromMeshId)) {
-    return 'Self';
-  }
-
-  let relayMeshIdRaw =
-    summary.relay?.meshId ||
-    summary.relay?.meshIdNormalized ||
-    summary.relayMeshId ||
-    summary.relayMeshIdNormalized ||
-    summary.relay?.mesh_id ||
-    '';
-  if (relayMeshIdRaw && isSelfMesh(relayMeshIdRaw)) {
-    return 'Self';
-  }
-
-  if (directLabel && directLabel.toLowerCase() === 'self') {
-    return 'Self';
-  }
-
-  let relayNormalized = normalizeMeshId(relayMeshIdRaw);
-  if (relayNormalized && /^!0{6}[0-9a-fA-F]{2}$/.test(relayNormalized)) {
-    relayMeshIdRaw = '';
-    relayNormalized = null;
-  }
-
-  const { usedHops, hopsLabel } = extractHopInfoFromSummary(summary);
-  const zeroHop =
-    usedHops === 0 ||
-    hopsLabel === '0/0' ||
-    (typeof hopsLabel === 'string' && hopsLabel.startsWith('0/'));
-
-  if (summary.relay?.label) {
-    if (zeroHop) {
-      return '直收';
-    }
-    return formatRelayLabelForSummary(summary.relay);
-  }
-
-  if (relayMeshIdRaw) {
-    if (zeroHop) {
-      return '直收';
-    }
-    return formatRelayLabelForSummary({
-      label: summary.relay?.label || relayMeshIdRaw,
-      meshId: relayMeshIdRaw
-    });
-  }
-
-  if (zeroHop) {
-    return '直收';
-  }
-
-  if (usedHops != null && usedHops > 0) {
-    return '未知';
-  }
-
-  if (!hopsLabel) {
-    return '直收';
-  }
-
-  if (hopsLabel.includes('?')) {
-    return '未知';
-  }
-
-  return '';
-}
-
 class CallMeshAprsBridge extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -2270,10 +2119,10 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
 
-    const relayDisplayLabel = computeRelayDisplayLabel(summary, this.selfMeshId);
-    const isSelfRelay = relayDisplayLabel === 'Self';
-
-    if (isSelfRelay) {
+    const relayLabelRaw = typeof summary.relay?.label === 'string' ? summary.relay.label.trim() : '';
+    const relayLabelAlt = typeof summary.relayLabel === 'string' ? summary.relayLabel.trim() : '';
+    const relayLabel = relayLabelRaw || relayLabelAlt;
+    if (relayLabel && relayLabel.toLowerCase() === 'self') {
       return;
     }
     const record = this.buildTelemetryRecord(summary, {
