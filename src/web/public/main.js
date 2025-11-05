@@ -507,7 +507,7 @@
     const latest = store[0];
     if (latest) {
       const timeLabel = latest.timestampLabel || '—';
-      const fromLabel = latest.from || 'unknown';
+      const fromLabel = latest.from || '未知節點';
       navItem.meta.textContent = `${timeLabel} · ${fromLabel}`;
     } else {
       navItem.meta.textContent = '尚無訊息';
@@ -712,7 +712,11 @@
     const store = ensureChannelStore(channelId);
 
     const text = formatMessageText(summary);
-    const fromLabel = formatNodeDisplayLabel(summary.from) || 'unknown';
+    const fromLabel =
+      sanitizeNodeName(summary.from?.longName) ||
+      sanitizeNodeName(summary.from?.shortName) ||
+      sanitizeNodeName(summary.from?.label) ||
+      '未知節點';
     const timestampMs = Number.isFinite(Number(summary.timestampMs)) ? Number(summary.timestampMs) : Date.now();
     const timestampLabel = resolveMessageTimestamp(summary, timestampMs);
     const flowIdRaw = summary.flowId || `${channelId}-${timestampMs}-${text}`;

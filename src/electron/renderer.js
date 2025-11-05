@@ -571,7 +571,7 @@ function updateChannelNavMeta(channelId, { unread = false } = {}) {
   const latest = channelMessageStore.get(channelId)?.[0];
   if (latest) {
     const timeLabel = latest.timestampLabel || '—';
-    const fromLabel = latest.from || 'unknown';
+    const fromLabel = latest.from || '未知節點';
     navItem.meta.textContent = `${timeLabel} · ${fromLabel}`;
   } else {
     navItem.meta.textContent = '尚無訊息';
@@ -667,7 +667,11 @@ function recordChannelMessage(summary, { markUnread = true } = {}) {
     : '';
   const text = rawDetail || extraDetail || '（無內容）';
 
-  const fromLabel = formatNodeDisplay(summary.from) || 'unknown';
+  const fromLabel =
+    sanitizeNodeName(summary.from?.longName) ||
+    sanitizeNodeName(summary.from?.shortName) ||
+    sanitizeNodeName(summary.from?.label) ||
+    '未知節點';
   const timestampMs = Number.isFinite(Number(summary.timestampMs)) ? Number(summary.timestampMs) : Date.now();
   const timestampLabel =
     typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
