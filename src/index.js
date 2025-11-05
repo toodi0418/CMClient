@@ -615,15 +615,35 @@ function padEnd(value, width) {
 }
 
 function formatRelayLabel(entry) {
-  if (!entry) return '';
-  const label = entry.label || '';
-  const meshId = entry.meshId || '';
-  if (!meshId) return label;
-  const normalized = meshId.startsWith('!') ? meshId.slice(1) : meshId;
-  if (/^0{6}[0-9a-fA-F]{2}$/.test(normalized)) {
-    return label ? `${label}?` : `${meshId}?`;
+  if (!entry || typeof entry !== 'object') return '';
+  const candidates = [
+    entry.label,
+    entry.longName,
+    entry.shortName,
+    entry.meshId,
+    entry.meshIdNormalized
+  ];
+  let display = '';
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      const trimmed = candidate.trim();
+      if (trimmed.toLowerCase() === 'unknown') {
+        continue;
+      }
+      display = trimmed;
+      break;
+    }
   }
-  return label || meshId;
+  const meshIdRaw =
+    (typeof entry.meshId === 'string' && entry.meshId.trim()) ||
+    (typeof entry.meshIdNormalized === 'string' && entry.meshIdNormalized.trim()) ||
+    '';
+  const meshId = meshIdRaw;
+  const normalized = meshId.startsWith('!') ? meshId.slice(1) : meshId;
+  if (normalized && /^0{6}[0-9a-fA-F]{2}$/.test(normalized.toLowerCase())) {
+    return display || meshId || '未知';
+  }
+  return display || meshId || '未知';
 }
 
 function extractHopInfo(summary) {
@@ -693,32 +713,42 @@ function computeRelayLabel(summary, { selfMeshId } = {}) {
   }
 
   const { usedHops, hopsLabel } = extractHopInfo(summary);
+  const zeroHop =
+    usedHops === 0 ||
+    hopsLabel === '0/0' ||
+    (typeof hopsLabel === 'string' && hopsLabel.startsWith('0/'));
 
   if (summary.relay?.label) {
+    if (zeroHop) {
+      return '直收';
+    }
     return formatRelayLabel(summary.relay);
   }
 
   if (relayMeshIdRaw) {
+    if (zeroHop) {
+      return '直收';
+    }
     return formatRelayLabel({
       label: summary.relay?.label || relayMeshIdRaw,
       meshId: relayMeshIdRaw
     });
   }
 
-  if (usedHops === 0 || hopsLabel === '0/0' || (hopsLabel && hopsLabel.startsWith('0/'))) {
+  if (zeroHop) {
     return '直收';
   }
 
   if (usedHops > 0) {
-    return '未知?';
+    return '未知';
   }
 
   if (!hopsLabel) {
     return '直收';
   }
 
-  if (hopsLabel.includes('?')) {
-    return '未知?';
+  if (typeof hopsLabel === 'string' && hopsLabel.includes('?')) {
+    return '未知';
   }
 
   return '';
