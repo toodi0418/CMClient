@@ -595,6 +595,30 @@
     return stored || '未知節點';
   }
 
+  function formatMessageDistanceMeta(entry) {
+    if (!entry || !entry.fromMeshId) {
+      return '';
+    }
+    const normalized = normalizeMeshId(entry.fromMeshId);
+    if (!normalized) {
+      return '';
+    }
+    const node = nodeRegistry.get(normalized);
+    if (!node) {
+      return '';
+    }
+    const distanceText = formatNodeDistanceValue(node);
+    const lastSeenTs = getNodeLastSeenTimestamp(node);
+    let recencyText = '';
+    if (lastSeenTs != null && Number.isFinite(lastSeenTs)) {
+      recencyText = formatRelativeTime(new Date(lastSeenTs).toISOString());
+    }
+    if (distanceText && recencyText) {
+      return `${distanceText} (${recencyText})`;
+    }
+    return distanceText || recencyText || '';
+  }
+
   function renderChannelMessages(channelId) {
     if (channelId !== selectedChannelId) {
       return;
@@ -624,6 +648,7 @@
       appendMessageMeta(meta, `來自：${resolveStoredMessageFromLabel(entry)}`);
       appendMessageMeta(meta, entry.hops);
       appendMessageMeta(meta, entry.relay);
+      appendMessageMeta(meta, formatMessageDistanceMeta(entry));
       appendMessageMeta(meta, `時間：${entry.timestampLabel}`);
 
       wrapper.append(text, meta);
@@ -1220,6 +1245,9 @@
     refreshSummaryRows();
     renderNodeDatabase();
     renderTelemetryView();
+    if (selectedChannelId != null) {
+      renderChannelMessages(selectedChannelId);
+    }
   }
 
   function handleNodeUpdate(payload) {
@@ -1233,6 +1261,9 @@
     refreshSummaryRows();
     renderNodeDatabase();
     renderTelemetryView();
+    if (selectedChannelId != null) {
+      renderChannelMessages(selectedChannelId);
+    }
   }
 
   function getRegistryNode(meshId) {
@@ -4552,6 +4583,9 @@ function ensureRelayGuessSuffix(label, summary) {
 
     refreshSummarySelfLabels();
     renderNodeDatabase();
+    if (selectedChannelId != null) {
+      renderChannelMessages(selectedChannelId);
+    }
   }
 
   function updateAprsStatus(aprs) {
