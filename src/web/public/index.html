@@ -183,6 +183,7 @@
                   <th>Mesh ID</th>
                   <th>型號</th>
                   <th>角色</th>
+                  <th>座標</th>
                   <th>距離</th>
                   <th>最後出現</th>
                 </tr>
@@ -285,6 +286,35 @@
         </section>
       </section>
     </main>
+
+    <div id="relay-hint-modal" class="relay-hint-modal hidden">
+      <div class="relay-hint-dialog">
+        <div class="relay-hint-header">
+          <div class="relay-hint-icon">❔</div>
+          <div class="relay-hint-title">
+            <h2>推測的最後轉發節點</h2>
+            <p id="relay-hint-subtitle" class="relay-hint-subtitle">依歷史統計推測，僅供參考</p>
+          </div>
+          <button id="relay-hint-close" class="relay-hint-close" type="button" aria-label="關閉">×</button>
+        </div>
+        <div class="relay-hint-content">
+          <p id="relay-hint-reason" class="relay-hint-reason">—</p>
+          <dl class="relay-hint-meta">
+            <div>
+              <dt>節點</dt>
+              <dd id="relay-hint-node">—</dd>
+            </div>
+            <div>
+              <dt>Mesh ID</dt>
+              <dd id="relay-hint-mesh">—</dd>
+            </div>
+          </dl>
+        </div>
+        <div class="relay-hint-actions">
+          <button id="relay-hint-ok" type="button">了解</button>
+        </div>
+      </div>
+    </div>
 
     <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
     <script src="main.js"></script>

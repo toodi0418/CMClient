@@ -28,12 +28,23 @@ const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
 
-const TENMAN_FORWARD_NODE_ID = '!b29f440c';
 const TENMAN_FORWARD_WS_ENDPOINT =
   process.env.TENMAN_WS_URL || 'wss://tenmanmap.yakumo.tw/ws';
 const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
 const TENMAN_FORWARD_QUEUE_LIMIT = 64;
 const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
+const TENMAN_FORWARD_GATEWAY_ID = normalizeMeshId(process.env.TENMAN_GATEWAY_ID || null);
+const TENMAN_FORWARD_API_KEY =
+  process.env.CALLMESH_API_KEY || process.env.TENMAN_API_KEY || null;
+const TENMAN_FORWARD_AUTH_ACTION = 'authenticate';
+const TENMAN_FORWARD_NODE_IDS = new Set(
+  String(process.env.TENMAN_NODE_IDS || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .map((id) => normalizeMeshId(id))
+    .filter(Boolean)
+);
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
@@ -216,7 +227,13 @@ class CallMeshAprsBridge extends EventEmitter {
       queue: [],
       pendingKeys: new Set(),
       sending: false,
-      reconnectTimer: null
+      reconnectTimer: null,
+      authenticated: false,
+      authenticating: false,
+      missingApiKeyWarned: false,
+      skippedNodeIds: new Set(),
+      gatewayId: TENMAN_FORWARD_GATEWAY_ID || null,
+      nodeId: null
     };
 
     this.heartbeatTimer = null;
@@ -412,8 +429,27 @@ class CallMeshAprsBridge extends EventEmitter {
       altitude,
       lastSeenAt: Number.isFinite(timestamp) ? Number(timestamp) : Date.now()
     };
+    if (/^!0{6}[0-9a-f]{2}$/i.test(info.meshIdOriginal || '') || /^!0{6}[0-9a-f]{2}$/i.test(normalized)) {
+      return null;
+    }
     const result = this.nodeDatabase.upsert(normalized, info);
     if (result.changed) {
+      const label = buildNodeLabel(result.node);
+      const rawId = result.node.meshId || result.node.meshIdOriginal || '';
+      const normalizedId = normalizeMeshId(rawId);
+      const looksLikePlaceholder =
+        (label && label.includes('?')) ||
+        (rawId && /^!0{6}[0-9a-f]{2}$/.test(rawId.toLowerCase())) ||
+        (normalizedId && /^!0{6}[0-9a-f]{2}$/.test(normalizedId.toLowerCase()));
+      if (!label || looksLikePlaceholder) {
+        return result.node;
+      }
+      if (label && label.includes('?')) {
+        return result.node;
+      }
+      if (!label) {
+        return result.node;
+      }
       const payload = {
         meshId: normalized,
         shortName: result.node.shortName,
@@ -425,7 +461,7 @@ class CallMeshAprsBridge extends EventEmitter {
         latitude: result.node.latitude,
         longitude: result.node.longitude,
         altitude: result.node.altitude,
-        label: buildNodeLabel(result.node),
+        label,
         lastSeenAt: result.node.lastSeenAt
       };
       this.emit('node', payload);
@@ -765,11 +801,23 @@ class CallMeshAprsBridge extends EventEmitter {
     }
 
     try {
+      const state = this.tenmanForwardState;
       const meshIdNormalized = normalizeMeshId(
         summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
       );
-      if (meshIdNormalized !== TENMAN_FORWARD_NODE_ID) {
+      const useWhitelist = TENMAN_FORWARD_NODE_IDS.size > 0;
+      if (useWhitelist && (!meshIdNormalized || !TENMAN_FORWARD_NODE_IDS.has(meshIdNormalized))) {
+        if (state && meshIdNormalized && !state.skippedNodeIds.has(meshIdNormalized)) {
+          state.skippedNodeIds.add(meshIdNormalized);
+          this.emitLog(
+            'TENMAN',
+            `節點 ${meshIdNormalized} 不在 TENMAN_FORWARD_NODE_IDS 清單中，略過 publish`
+          );
+        }
         return;
+      }
+      if (state && meshIdNormalized) {
+        state.skippedNodeIds.delete(meshIdNormalized);
       }
 
       const position = summary.position;
@@ -802,23 +850,51 @@ class CallMeshAprsBridge extends EventEmitter {
         return;
       }
 
-      const dedupeKey = `${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
-      if (this.tenmanForwardState.lastKey === dedupeKey || this.tenmanForwardState.pendingKeys?.has?.(dedupeKey)) {
+      const apiKey = this.getTenmanApiKey();
+      if (!apiKey) {
+        if (state && !state.missingApiKeyWarned) {
+          state.missingApiKeyWarned = true;
+          this.emitLog('TENMAN', '缺少 CallMesh API Key，請先完成驗證或設定 TENMAN_API_KEY');
+        }
+        return;
+      }
+      if (state) {
+        state.missingApiKeyWarned = false;
+      }
+
+      const deviceId = meshIdNormalized || state.gatewayId || TENMAN_FORWARD_GATEWAY_ID || 'unknown';
+      const dedupeKey = `${deviceId}:${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
+      if (
+        this.tenmanForwardState.lastKey === dedupeKey ||
+        this.tenmanForwardState.pendingKeys?.has?.(dedupeKey)
+      ) {
         return;
       }
 
+      const nodeName = summary?.from?.longName || summary?.from?.shortName || summary?.from?.label || null;
+      const extraPayload = {
+        source: 'TMAG',
+        mesh_id: meshIdNormalized
+      };
+      if (nodeName) {
+        extraPayload.node_name = nodeName;
+      }
+      if (summary?.from?.shortName && summary.from.shortName !== nodeName) {
+        extraPayload.short_name = summary.from.shortName;
+      }
+      if (summary?.from?.longName && summary.from.longName !== nodeName) {
+        extraPayload.long_name = summary.from.longName;
+      }
+
       const payload = {
-        device_id: TENMAN_FORWARD_NODE_ID,
+        device_id: deviceId,
         timestamp,
         latitude,
         longitude,
         altitude,
         speed,
         heading,
-        extra: {
-          source: 'TMAG',
-          mesh_id: meshIdNormalized
-        }
+        extra: extraPayload
       };
 
       const message = {
@@ -869,6 +945,16 @@ class CallMeshAprsBridge extends EventEmitter {
     state.queue.push(entry);
     state.pendingKeys.add(dedupeKey);
 
+    const payload = message?.payload || {};
+    const latLog =
+      typeof payload.latitude === 'number' ? payload.latitude.toFixed(6) : String(payload.latitude ?? '');
+    const lonLog =
+      typeof payload.longitude === 'number' ? payload.longitude.toFixed(6) : String(payload.longitude ?? '');
+    this.emitLog(
+      'TENMAN',
+      `佇列 publish device=${payload.device_id ?? ''} lat=${latLog} lon=${lonLog}`
+    );
+
     this.ensureTenmanWebsocket();
     this.flushTenmanQueue();
   }
@@ -887,6 +973,8 @@ class CallMeshAprsBridge extends EventEmitter {
 
     this.clearTenmanReconnectTimer();
     state.connecting = true;
+    state.authenticated = false;
+    state.authenticating = false;
 
     try {
       const ws = new WebSocket(TENMAN_FORWARD_WS_ENDPOINT);
@@ -894,14 +982,16 @@ class CallMeshAprsBridge extends EventEmitter {
 
       ws.on('open', () => {
         state.connecting = false;
-        this.emitLog('TENMAN', 'WebSocket 已連線');
-        this.flushTenmanQueue();
+        this.emitLog('TENMAN', 'WebSocket 已連線，開始驗證');
+        this.sendTenmanAuth();
       });
 
       ws.on('close', (code, reason) => {
         state.websocket = null;
         state.connecting = false;
         state.sending = false;
+        state.authenticating = false;
+        state.authenticated = false;
         this.emitLog(
           'TENMAN',
           `WebSocket 已關閉 code=${code}${reason ? ` reason=${reason.toString()}` : ''}`
@@ -915,6 +1005,10 @@ class CallMeshAprsBridge extends EventEmitter {
 
       ws.on('unexpected-response', (_req, res) => {
         this.emitLog('TENMAN', `WebSocket unexpected status=${res?.statusCode ?? 'unknown'}`);
+      });
+
+      ws.on('message', (data) => {
+        this.handleTenmanWebsocketMessage(data);
       });
     } catch (err) {
       state.connecting = false;
@@ -932,6 +1026,11 @@ class CallMeshAprsBridge extends EventEmitter {
     const ws = state.websocket;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       this.ensureTenmanWebsocket();
+      return;
+    }
+
+    if (!state.authenticated) {
+      this.sendTenmanAuth();
       return;
     }
 
@@ -985,6 +1084,8 @@ class CallMeshAprsBridge extends EventEmitter {
     state.websocket = null;
     state.connecting = false;
     state.sending = false;
+    state.authenticating = false;
+    state.authenticated = false;
   }
 
   scheduleTenmanReconnect(reason = 'retry') {
@@ -1004,6 +1105,131 @@ class CallMeshAprsBridge extends EventEmitter {
       this.ensureTenmanWebsocket();
     }, TENMAN_FORWARD_RECONNECT_DELAY_MS);
     state.reconnectTimer?.unref?.();
+  }
+
+  getTenmanApiKey() {
+    return TENMAN_FORWARD_API_KEY || this.callmeshState?.apiKey || null;
+  }
+
+  sendTenmanAuth() {
+    const state = this.tenmanForwardState;
+    if (
+      !state ||
+      !state.websocket ||
+      state.websocket.readyState !== WebSocket.OPEN ||
+      state.authenticated ||
+      state.authenticating
+    ) {
+      return;
+    }
+
+    const apiKey = this.getTenmanApiKey();
+    if (!apiKey) {
+      if (!state.missingApiKeyWarned) {
+        state.missingApiKeyWarned = true;
+        this.emitLog('TENMAN', '缺少 CallMesh API Key，無法進行驗證');
+      }
+      return;
+    }
+    state.missingApiKeyWarned = false;
+
+    const authMessage = {
+      action: TENMAN_FORWARD_AUTH_ACTION,
+      api_key: apiKey
+    };
+
+    const serialized = JSON.stringify(authMessage);
+    state.authenticating = true;
+    try {
+      state.websocket.send(serialized, (err) => {
+        if (err) {
+          state.authenticating = false;
+          this.emitLog('TENMAN', `驗證傳送失敗: ${err.message}`);
+          this.scheduleTenmanReconnect('auth-send-error');
+          this.resetTenmanWebsocket();
+        } else {
+          this.emitLog('TENMAN', '已送出驗證請求');
+        }
+      });
+    } catch (err) {
+      state.authenticating = false;
+      this.emitLog('TENMAN', `驗證傳送失敗: ${err.message}`);
+      this.scheduleTenmanReconnect('auth-exception');
+      this.resetTenmanWebsocket();
+    }
+  }
+
+  handleTenmanWebsocketMessage(data) {
+    const state = this.tenmanForwardState;
+    if (!state) return;
+
+    let text;
+    try {
+      text = typeof data === 'string' ? data : data.toString('utf8');
+    } catch (err) {
+      this.emitLog('TENMAN', `無法解析伺服器訊息: ${err.message}`);
+      return;
+    }
+    if (!text) {
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      this.emitLog('TENMAN', `伺服器訊息解析失敗: ${err.message} 原始=${text}`);
+      return;
+    }
+
+    if (parsed?.error) {
+      this.emitLog('TENMAN', `伺服器錯誤: ${text}`);
+      if (parsed.action === TENMAN_FORWARD_AUTH_ACTION || parsed.type === 'auth') {
+        state.authenticating = false;
+        state.authenticated = false;
+        this.scheduleTenmanReconnect('auth-error');
+        this.resetTenmanWebsocket();
+      }
+      return;
+    }
+
+    if (parsed?.action === TENMAN_FORWARD_AUTH_ACTION || parsed?.type === 'auth') {
+      state.authenticating = false;
+      const status = String(parsed?.status ?? parsed?.result ?? parsed?.ok ?? 'ok').toLowerCase();
+      if (status === 'pass' || status === 'ok' || status === 'true') {
+        const gatewayId = normalizeMeshId(
+          parsed?.gateway_id ?? parsed?.gatewayId ?? state.gatewayId ?? TENMAN_FORWARD_GATEWAY_ID
+        );
+        const nodeId = parsed?.node_id ?? parsed?.nodeId ?? state.nodeId ?? null;
+        state.gatewayId = gatewayId || state.gatewayId || null;
+        state.nodeId = nodeId;
+        state.authenticated = true;
+        const infoParts = [];
+        if (gatewayId) infoParts.push(`gateway=${gatewayId}`);
+        if (nodeId) infoParts.push(`node=${nodeId}`);
+        this.emitLog('TENMAN', `驗證通過${infoParts.length ? ` (${infoParts.join(', ')})` : ''}`);
+        this.flushTenmanQueue();
+      } else {
+        state.authenticated = false;
+        this.emitLog('TENMAN', `驗證失敗: ${text}`);
+        this.scheduleTenmanReconnect('auth-failed');
+        this.resetTenmanWebsocket();
+      }
+      return;
+    }
+
+    if (parsed?.type === 'ack') {
+      const action = parsed?.action ?? parsed?.payload?.action;
+      const deviceId = parsed?.payload?.device_id ?? parsed?.device_id ?? '';
+      const gatewayId = parsed?.gateway_id ?? parsed?.payload?.gateway_id ?? state.gatewayId ?? '';
+      this.emitLog(
+        'TENMAN',
+        `收到 ack${action ? ` action=${action}` : ''}${deviceId ? ` device=${deviceId}` : ''}${gatewayId ? ` gateway=${gatewayId}` : ''}`
+      );
+      return;
+    }
+
+    this.emitLog('TENMAN', `伺服器訊息: ${text}`);
   }
 
   clearTenmanReconnectTimer() {
@@ -1892,9 +2118,15 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!fromMeshId) {
       return;
     }
-    if (this.selfMeshId && fromMeshId === this.selfMeshId) {
-      return;
+
+    if (summary.telemetry && typeof summary.telemetry === 'object') {
+      summary.telemetry = {
+        ...summary.telemetry,
+        timeMs: timestampMs,
+        timeSeconds: Math.floor(timestampMs / 1000)
+      };
     }
+
     const record = this.buildTelemetryRecord(summary, {
       meshId: fromMeshId,
       timestampMs
@@ -2032,9 +2264,9 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     const baseTimestampMs = Number.isFinite(timestampMs) ? Number(timestampMs) : Date.now();
     const telemetry = summary.telemetry;
-    const sampleTimeMs = Number.isFinite(telemetry.timeMs) ? Number(telemetry.timeMs) : null;
+    const sampleTimeMs = baseTimestampMs;
     const recordTimestampIso = new Date(baseTimestampMs).toISOString();
-    const sampleIso = sampleTimeMs != null ? new Date(sampleTimeMs).toISOString() : null;
+    const sampleIso = new Date(sampleTimeMs).toISOString();
     const node = mergeNodeInfo(
       extractTelemetryNode(summary.from),
       this.nodeDatabase.get(meshId),
@@ -2048,8 +2280,8 @@ class CallMeshAprsBridge extends EventEmitter {
       node,
       timestampMs: baseTimestampMs,
       timestamp: recordTimestampIso,
-      sampleTimeMs: sampleTimeMs != null ? sampleTimeMs : baseTimestampMs,
-      sampleTime: sampleIso ?? recordTimestampIso,
+      sampleTimeMs,
+      sampleTime: sampleIso || recordTimestampIso,
       type: summary.type || '',
       detail: summary.detail || '',
       channel: summary.channel ?? null,
@@ -2058,8 +2290,8 @@ class CallMeshAprsBridge extends EventEmitter {
       flowId: summary.flowId || null,
       telemetry: {
         kind: telemetry.kind || 'unknown',
-        timeSeconds: Number.isFinite(telemetry.timeSeconds) ? telemetry.timeSeconds : null,
-        timeMs: Number.isFinite(telemetry.timeMs) ? telemetry.timeMs : null,
+        timeSeconds: Number.isFinite(sampleTimeMs) ? Math.floor(sampleTimeMs / 1000) : null,
+        timeMs: sampleTimeMs,
         metrics: cloneTelemetryMetrics(telemetry.metrics)
       }
     };
@@ -2160,9 +2392,6 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!summary) return;
     const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
     const fromMeshId = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
-    if (fromMeshId && this.selfMeshId && fromMeshId === this.selfMeshId) {
-      return;
-    }
     this.addTelemetryMetric('all', timestampMs);
 
     const typeRaw = typeof summary.type === 'string' ? summary.type : '';
@@ -2825,11 +3054,11 @@ function formatTelemetryValue(value) {
 
 function toFiniteNumber(value) {
   if (value == null) return null;
-  const num = Number(value);
-  if (!Number.isFinite(num)) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
     return null;
   }
-  return num;
+  return number;
 }
 
 function roundTo(value, digits = 2) {
@@ -2851,10 +3080,10 @@ function resolveSpeed(position) {
     position.airSpeed,
     position.velHoriz
   ];
-  for (const candidate of candidates) {
-    const value = toFiniteNumber(candidate);
-    if (value != null) {
-      return value;
+  for (const value of candidates) {
+    const numeric = toFiniteNumber(value);
+    if (numeric != null) {
+      return numeric;
     }
   }
   const speedKph = toFiniteNumber(position.speedKph);

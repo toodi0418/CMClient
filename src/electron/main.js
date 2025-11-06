@@ -74,7 +74,11 @@ function sanitizeHopsForPersist(hops) {
 }
 
 function sanitizeMessageSummary(summary) {
-  if (!summary || summary.type !== 'Text') {
+  if (!summary || typeof summary !== 'object') {
+    return null;
+  }
+  const type = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+  if (type !== 'text') {
     return null;
   }
   const channelId = Number(summary.channel);
@@ -599,7 +603,10 @@ async function startWebDashboard() {
     return true;
   }
   try {
-    const server = new WebDashboardServer({ appVersion });
+    const server = new WebDashboardServer({
+      appVersion,
+      relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json')
+    });
     await server.start();
     server.setAppVersion(appVersion);
     webServer = server;
@@ -822,7 +829,8 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     heartbeat: options.heartbeat ?? 0,
     keepAlive: options.keepAlive ?? true,
     keepAliveDelayMs: options.keepAliveDelayMs ?? 15000,
-    idleTimeoutMs: options.idleTimeoutMs ?? 0
+    idleTimeoutMs: options.idleTimeoutMs ?? 0,
+    relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json')
   });
 
   client.on('connected', () => {

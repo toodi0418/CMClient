@@ -5,14 +5,32 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const fsPromises = require('fs/promises');
 const protobuf = require('protobufjs');
 
 const { unishox2_decompress_simple } = require('unishox2.siara.cc');
+const { nodeDatabase } = require('./nodeDatabase');
 
 const MAGIC = 0x94c3;
 const HEADER_SIZE = 4;
 const DEFAULT_MAX_PACKET = 512;
 const BROADCAST_ADDR = 0xffffffff;
+const RELAY_GUESS_EXPLANATION =
+  '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
+
+function normalizeMeshId(meshId) {
+  if (meshId == null) return null;
+  let value = String(meshId).trim();
+  if (!value) return null;
+  if (value.startsWith('!')) {
+    value = value.slice(1);
+  } else if (value.toLowerCase().startsWith('0x')) {
+    value = value.slice(2);
+  }
+  value = value.replace(/[^0-9a-f]/gi, '').toLowerCase();
+  if (!value) return null;
+  return `!${value}`;
+}
 
 function removeSocketListener(socket, eventName, handler) {
   if (!socket || !handler) {
@@ -50,7 +68,16 @@ class MeshtasticClient extends EventEmitter {
     };
 
     this.nodeMap = new Map();
+    this._relayLinkStats = new Map();
+    this._relayStatsPath = options.relayStatsPath ? path.resolve(options.relayStatsPath) : null;
+    this._relayStatsPersistIntervalMs = Number.isFinite(options.relayStatsPersistIntervalMs)
+      ? Math.max(Number(options.relayStatsPersistIntervalMs), 1000)
+      : 30_000;
+    this._relayStatsPersistTimer = null;
+    this._relayStatsPersisting = false;
+    this._relayStatsDirty = false;
     this._decoder = null;
+    this._selfNodeId = null;
     this._socket = null;
     this._heartbeatTimer = null;
     this._connected = false;
@@ -59,31 +86,460 @@ class MeshtasticClient extends EventEmitter {
     this._handleIdleTimeoutBound = null;
     this._currentIdleTimeout = null;
     this._socketClosed = true;
+
+    this._loadRelayStatsFromDisk();
   }
 
-  _normalizeRelayNode(relayNode) {
+  _shouldIgnoreMeshId(value) {
+    if (value == null) return false;
+    let normalized = null;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) return false;
+      normalized = `!${(value >>> 0).toString(16).padStart(8, '0')}`;
+    } else if (typeof value === 'string') {
+      normalized = normalizeMeshId(value);
+      if (!normalized) return false;
+    } else {
+      return false;
+    }
+    return normalized.toLowerCase().startsWith('!abcd');
+  }
+
+  _normalizeRelayNode(relayNode, { snr = null, rssi = null } = {}) {
     const raw = Number(relayNode) >>> 0;
     // the firmware sets relay_node to the full node id, but in some cases only
     // the low byte is populated (e.g. 0x24 for node ending with 0x24).
-    if (raw === 0) return 0;
-    if (raw > 0xff) return raw;
+    if (raw === 0) return { nodeId: 0, guessed: false };
+    if (raw > 0xff) {
+      return { nodeId: raw >>> 0, guessed: false };
+    }
+    const matches = new Set();
     for (const [num, entry] of this.nodeMap.entries()) {
       const numeric = Number(num) >>> 0;
-      if ((numeric & 0xff) === raw) {
-        return numeric;
+      if (this._shouldIgnoreMeshId(numeric)) {
+        continue;
+      }
+      if ((numeric & 0xff) === raw && !matches.has(numeric)) {
+        matches.add(numeric);
       }
       const idStr = typeof entry?.id === 'string' ? entry.id : null;
       if (idStr) {
         const cleaned = idStr.replace(/[^0-9a-fA-F]/g, '');
         if (cleaned.length === 8) {
           const parsed = parseInt(cleaned, 16) >>> 0;
-          if ((parsed & 0xff) === raw) {
-            return parsed;
+          if (this._shouldIgnoreMeshId(parsed)) {
+            continue;
+          }
+          if ((parsed & 0xff) === raw && !matches.has(parsed)) {
+            matches.add(parsed);
           }
         }
       }
     }
-    return raw;
+    for (const key of this._relayLinkStats.keys()) {
+      const candidate = Number(key) >>> 0;
+      if (this._shouldIgnoreMeshId(candidate)) {
+        continue;
+      }
+      if ((candidate & 0xff) === raw && !matches.has(candidate)) {
+        matches.add(candidate);
+      }
+    }
+    try {
+      const dbEntries = typeof nodeDatabase?.list === 'function' ? nodeDatabase.list() : [];
+      if (Array.isArray(dbEntries)) {
+        for (const entry of dbEntries) {
+          const meshCandidate =
+            entry?.meshId ||
+            entry?.meshIdNormalized ||
+            entry?.meshIdOriginal ||
+            entry?.mesh_id ||
+            entry?.mesh_id_normalized ||
+            entry?.mesh_id_original;
+          const normalized = normalizeMeshId(meshCandidate);
+          if (!normalized) continue;
+          if (this._shouldIgnoreMeshId(normalized)) {
+            continue;
+          }
+          const numeric = parseInt(normalized.slice(1), 16);
+          if (!Number.isFinite(numeric)) continue;
+          const candidate = numeric >>> 0;
+          if ((candidate & 0xff) === raw && !matches.has(candidate)) {
+            matches.add(candidate);
+          }
+        }
+      }
+    } catch (err) {
+      if (process.env.DEBUG_RELAY_GUESS) {
+        console.warn('[relay-guess] node database access failed:', err.message);
+      }
+    }
+    if (matches.size === 1) {
+      const [match] = matches;
+      return { nodeId: match >>> 0, guessed: false };
+    }
+    const candidates = Array.from(matches);
+    const guessResult = this._guessRelayCandidate(candidates, { snr, rssi });
+    if (guessResult) {
+      return guessResult;
+    }
+    if (matches.size > 1) {
+      const suffix = raw.toString(16).padStart(2, '0').toUpperCase();
+      const labels = this._describeRelayCandidates(candidates);
+      const parts = [];
+      if (labels.length) {
+        parts.push(`尾碼 0x${suffix} 對應 ${labels.join('、')}`);
+      } else {
+        parts.push(`尾碼 0x${suffix} 對應 ${matches.size} 個節點`);
+      }
+      parts.push('尚無歷史直收樣本可比對 SNR/RSSI');
+      return {
+        nodeId: raw >>> 0,
+        guessed: true,
+        reason: parts.join('；')
+      };
+    }
+    return { nodeId: raw >>> 0, guessed: false };
+  }
+
+  _recordRelayLinkMetrics(nodeId, { snr = null, rssi = null } = {}) {
+    if (nodeId == null) return;
+    const numeric = Number(nodeId);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return;
+    }
+    const normalizedNumeric = numeric >>> 0;
+    if (this._shouldIgnoreMeshId(normalizedNumeric)) {
+      return;
+    }
+    if (this._selfNodeId != null && normalizedNumeric === (this._selfNodeId >>> 0)) {
+      return;
+    }
+    const toNumber = (value) => {
+      if (value === null || value === undefined) return null;
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const snrValue = toNumber(snr);
+    const rssiValue = toNumber(rssi);
+    if (snrValue === null && rssiValue === null) {
+      return;
+    }
+    const key = normalizedNumeric;
+    const now = Date.now();
+    const alpha = 0.25;
+    let stats = this._relayLinkStats.get(key);
+    if (!stats) {
+      stats = {
+        snr: snrValue,
+        rssi: rssiValue,
+        count: 1,
+        updatedAt: now
+      };
+      this._relayLinkStats.set(key, stats);
+      return;
+    }
+    if (snrValue !== null) {
+      stats.snr = stats.snr == null ? snrValue : stats.snr + alpha * (snrValue - stats.snr);
+    }
+    if (rssiValue !== null) {
+      stats.rssi = stats.rssi == null ? rssiValue : stats.rssi + alpha * (rssiValue - stats.rssi);
+    }
+    stats.count = (stats.count || 0) + 1;
+    stats.updatedAt = now;
+    this._scheduleRelayStatsPersist();
+  }
+
+  _guessRelayCandidate(candidates, { snr = null, rssi = null } = {}) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return null;
+    }
+    const uniqueCandidates = Array.from(
+      new Set(
+        candidates
+          .map((value) => {
+            const num = Number(value);
+            return Number.isFinite(num) ? (num >>> 0) : null;
+          })
+          .filter((value) => value != null)
+      )
+    );
+    if (!uniqueCandidates.length) {
+      return null;
+    }
+    const toNumber = (value) => {
+      if (value === null || value === undefined) return null;
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const snrValue = toNumber(snr);
+    const rssiValue = toNumber(rssi);
+    if (snrValue === null && rssiValue === null) {
+      return null;
+    }
+    const now = Date.now();
+    let bestCandidate = null;
+    let bestScore = Infinity;
+    let bestStats = null;
+    for (const candidate of uniqueCandidates) {
+      const stats = this._relayLinkStats.get(candidate >>> 0);
+      if (!stats) continue;
+      let score = 0;
+      let components = 0;
+      if (snrValue !== null && stats.snr != null) {
+        score += Math.abs(snrValue - stats.snr);
+        components += 1;
+      }
+      if (rssiValue !== null && stats.rssi != null) {
+        // scale RSSI diff down so it doesn't dominate SNR
+        score += Math.abs(rssiValue - stats.rssi) * 0.1;
+        components += 1;
+      }
+      if (components === 0) continue;
+      let normalizedScore = score / components;
+      const ageMs = now - (stats.updatedAt || 0);
+      if (Number.isFinite(ageMs) && ageMs > 0) {
+        normalizedScore += Math.min(ageMs / 600000, 5); // +1 per 10 分鐘，最多 +5
+      }
+      const sampleBonus = Math.min(stats.count || 0, 10) * 0.05;
+      normalizedScore -= sampleBonus;
+      if (
+        normalizedScore < bestScore - 0.05 ||
+        (Math.abs(normalizedScore - bestScore) <= 0.05 &&
+          bestStats &&
+          ((stats.count || 0) > (bestStats.count || 0) || (stats.updatedAt || 0) > (bestStats.updatedAt || 0)))
+      ) {
+        bestCandidate = candidate >>> 0;
+        bestScore = normalizedScore;
+        bestStats = stats;
+      }
+    }
+    if (bestCandidate == null) {
+      return null;
+    }
+
+    const infoParts = [];
+    const metricsParts = [];
+    if (snrValue !== null && bestStats?.snr != null) {
+      metricsParts.push(`SNR ${snrValue.toFixed(1)} vs ${bestStats.snr.toFixed(1)}`);
+    }
+    if (rssiValue !== null && bestStats?.rssi != null) {
+      metricsParts.push(`RSSI ${Math.round(rssiValue)} vs ${Math.round(bestStats.rssi)}`);
+    }
+    if (metricsParts.length) {
+      infoParts.push(metricsParts.join('，'));
+    }
+    if (bestStats?.count) {
+      infoParts.push(`樣本 ${Math.max(1, Math.round(bestStats.count))} 筆`);
+    }
+    if (bestStats?.updatedAt) {
+      const ageMs = now - Number(bestStats.updatedAt);
+      if (Number.isFinite(ageMs) && ageMs >= 0) {
+        infoParts.push(`最近更新 ${formatRelativeAge(ageMs)}`);
+      }
+    }
+    if (uniqueCandidates.length > 1) {
+      const labels = this._describeRelayCandidates(uniqueCandidates);
+      if (labels.length) {
+        infoParts.push(`候選節點 ${labels.length} 個：${labels.join('、')}`);
+      } else {
+        infoParts.push(`候選節點 ${uniqueCandidates.length} 個`);
+      }
+    }
+    const reason =
+      `依據歷史直收統計推測 ${formatHexId(bestCandidate)}；${infoParts.join('；') || '韌體僅提供節點尾碼'}`;
+
+    return {
+      nodeId: bestCandidate >>> 0,
+      guessed: true,
+      reason
+    };
+  }
+
+  _describeRelayCandidates(candidates) {
+    if (!Array.isArray(candidates)) {
+      return [];
+    }
+    const labels = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+      const numeric = Number(candidate);
+      if (!Number.isFinite(numeric)) continue;
+      const meshId = formatHexId(numeric >>> 0);
+      if (seen.has(meshId)) continue;
+      seen.add(meshId);
+      const entry = this.nodeMap.get(numeric >>> 0) || {};
+      const meshIdKey = meshId;
+      const dbRecord = nodeDatabase?.get?.(meshIdKey) || {};
+      const name =
+        dbRecord.longName ||
+        dbRecord.shortName ||
+        entry.longName ||
+        entry.shortName ||
+        null;
+      labels.push(name ? `${name} (${meshId})` : meshId);
+    }
+    return labels;
+  }
+
+  _isDirectReception(summary, { relayNodeId, usedHops, hasRelayResult }) {
+    if (!summary || typeof summary !== 'object') {
+      return false;
+    }
+    const relayExists = relayNodeId != null && relayNodeId !== 0;
+    const hopsLabelRaw = typeof summary.hops?.label === 'string' ? summary.hops.label.trim() : '';
+    const zeroHop =
+      usedHops === 0 ||
+      /^0(?:\s*\/|$)/.test(hopsLabelRaw) ||
+      (!relayExists && !hopsLabelRaw);
+    if (!relayExists || zeroHop) {
+      return true;
+    }
+    const fromNormalized = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
+    const relayMeshRaw =
+      summary.relay?.meshId ||
+      summary.relay?.meshIdNormalized ||
+      summary.relayMeshId ||
+      summary.relayMeshIdNormalized ||
+      '';
+    const relayNormalized = normalizeMeshId(relayMeshRaw);
+    if (fromNormalized && relayNormalized && fromNormalized === relayNormalized) {
+      return true;
+    }
+    if (!hasRelayResult && !relayMeshRaw) {
+      return true;
+    }
+    return false;
+  }
+
+  _loadRelayStatsFromDisk() {
+    if (!this._relayStatsPath) {
+      return;
+    }
+    try {
+      const raw = fs.readFileSync(this._relayStatsPath, 'utf8');
+      if (!raw) {
+        return;
+      }
+      const data = JSON.parse(raw);
+      if (!data || typeof data !== 'object') {
+        return;
+      }
+      this._relayLinkStats.clear();
+      const now = Date.now();
+      for (const [key, value] of Object.entries(data)) {
+        if (!value || typeof value !== 'object') continue;
+        const numericKey = Number(key);
+        if (!Number.isFinite(numericKey) || numericKey <= 0) continue;
+        if (this._shouldIgnoreMeshId(numericKey)) {
+          continue;
+        }
+        const entry = {
+          snr: Number.isFinite(value.snr) ? Number(value.snr) : null,
+          rssi: Number.isFinite(value.rssi) ? Number(value.rssi) : null,
+          count: Number.isFinite(value.count) ? Math.max(1, Number(value.count)) : 1,
+          updatedAt: Number.isFinite(value.updatedAt) ? Number(value.updatedAt) : now
+        };
+        this._relayLinkStats.set(numericKey >>> 0, entry);
+      }
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        console.warn(`載入 relay link stats 失敗: ${err.message}`);
+      }
+    }
+  }
+
+  _scheduleRelayStatsPersist() {
+    if (!this._relayStatsPath) {
+      return;
+    }
+    this._relayStatsDirty = true;
+    if (this._relayStatsPersistTimer) {
+      return;
+    }
+    this._relayStatsPersistTimer = setTimeout(() => {
+      this._relayStatsPersistTimer = null;
+      this._persistRelayStats().catch((err) => {
+        console.error(`持久化 relay link stats 失敗: ${err.message}`);
+        this._scheduleRelayStatsPersist();
+      });
+    }, this._relayStatsPersistIntervalMs);
+    this._relayStatsPersistTimer.unref?.();
+  }
+
+  async _persistRelayStats() {
+    if (!this._relayStatsPath || !this._relayStatsDirty || this._relayStatsPersisting) {
+      return;
+    }
+    this._relayStatsPersisting = true;
+    const payload = {};
+    for (const [key, stats] of this._relayLinkStats.entries()) {
+      payload[key] = {
+        snr: Number.isFinite(stats.snr) ? Number(stats.snr) : null,
+        rssi: Number.isFinite(stats.rssi) ? Number(stats.rssi) : null,
+        count: Number.isFinite(stats.count) ? Math.max(1, Math.round(Number(stats.count))) : 1,
+        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : Date.now()
+      };
+    }
+    try {
+      await fsPromises.mkdir(path.dirname(this._relayStatsPath), { recursive: true });
+      if (Object.keys(payload).length === 0) {
+        try {
+          await fsPromises.unlink(this._relayStatsPath);
+        } catch (err) {
+          if (err?.code !== 'ENOENT') {
+            throw err;
+          }
+        }
+      } else {
+        await fsPromises.writeFile(this._relayStatsPath, JSON.stringify(payload, null, 2), 'utf8');
+      }
+      this._relayStatsDirty = false;
+    } catch (err) {
+      this._relayStatsDirty = true;
+      throw err;
+    } finally {
+      this._relayStatsPersisting = false;
+    }
+  }
+
+  _flushRelayStatsPersistSync() {
+    if (!this._relayStatsPath) {
+      return;
+    }
+    if (!this._relayStatsDirty || this._relayStatsPersisting) {
+      return;
+    }
+    if (this._relayStatsPersistTimer) {
+      clearTimeout(this._relayStatsPersistTimer);
+      this._relayStatsPersistTimer = null;
+    }
+    const payload = {};
+    for (const [key, stats] of this._relayLinkStats.entries()) {
+      payload[key] = {
+        snr: Number.isFinite(stats.snr) ? Number(stats.snr) : null,
+        rssi: Number.isFinite(stats.rssi) ? Number(stats.rssi) : null,
+        count: Number.isFinite(stats.count) ? Math.max(1, Math.round(Number(stats.count))) : 1,
+        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : Date.now()
+      };
+    }
+    try {
+      fs.mkdirSync(path.dirname(this._relayStatsPath), { recursive: true });
+      if (Object.keys(payload).length === 0) {
+        try {
+          fs.unlinkSync(this._relayStatsPath);
+        } catch (err) {
+          if (err?.code !== 'ENOENT') {
+            throw err;
+          }
+        }
+      } else {
+        fs.writeFileSync(this._relayStatsPath, JSON.stringify(payload, null, 2), 'utf8');
+      }
+      this._relayStatsDirty = false;
+    } catch (err) {
+      console.error(`同步寫入 relay link stats 失敗: ${err.message}`);
+    }
   }
 
   async start() {
@@ -95,6 +551,7 @@ class MeshtasticClient extends EventEmitter {
 
   stop() {
     this._clearHeartbeat();
+    this._flushRelayStatsPersistSync();
     if (this._socket) {
       if (this._handleIdleTimeoutBound) {
         removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);
@@ -373,6 +830,7 @@ class MeshtasticClient extends EventEmitter {
       raw: num,
       node: nodeInfo
     });
+    this._selfNodeId = num;
     break;
   }
       default:
@@ -412,7 +870,31 @@ class MeshtasticClient extends EventEmitter {
     const timestamp = packet.rxTime ? new Date(packet.rxTime * 1000) : new Date();
     const fromInfo = this._formatNode(packet.from);
     const toInfo = packet.to === BROADCAST_ADDR ? null : this._formatNode(packet.to);
-    const relayInfo = relayNodeId != null ? this._formatNode(this._normalizeRelayNode(relayNodeId)) : null;
+    const linkMetrics = {
+      snr: Number.isFinite(packet.rxSnr) ? Number(packet.rxSnr) : null,
+      rssi: Number.isFinite(packet.rxRssi) ? Number(packet.rxRssi) : null
+    };
+    const hopStart = Number(packet.hopStart);
+    const hopLimit = Number(packet.hopLimit);
+    let usedHops = null;
+    if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
+      usedHops = Math.max(hopStart - hopLimit, 0);
+    } else if (Number.isFinite(hopStart) && !Number.isFinite(hopLimit)) {
+      usedHops = 0;
+    }
+
+    let relayResult = null;
+    if (relayNodeId != null) {
+      relayResult = this._normalizeRelayNode(relayNodeId, linkMetrics);
+    }
+    const relayInfo =
+      relayNodeId != null && relayResult ? this._formatNode(relayResult.nodeId) : null;
+    if (relayInfo && relayResult) {
+      relayInfo.guessed = Boolean(relayResult.guessed);
+      if (relayResult.reason) {
+        relayInfo.reason = relayResult.reason;
+      }
+    }
     const nextHopInfo = nextHopId != null ? this._formatNode(nextHopId) : null;
 
     if (relayInfo && relayInfo.meshId) {
@@ -443,12 +925,26 @@ class MeshtasticClient extends EventEmitter {
       from: fromInfo,
       to: toInfo,
       relay: relayInfo,
+      relayGuess: Boolean(relayResult?.guessed),
+      relayGuessReason: relayResult?.guessed
+        ? relayResult.reason || RELAY_GUESS_EXPLANATION
+        : undefined,
       nextHop: nextHopInfo,
       position: decodeInfo?.position || null,
       telemetry: decodeInfo?.telemetry || null,
       rawHex,
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
+
+    const isDirect = this._isDirectReception(summary, {
+      relayNodeId,
+      usedHops,
+      hasRelayResult: Boolean(relayResult)
+    });
+
+    if (isDirect && packet.from != null) {
+      this._recordRelayLinkMetrics(packet.from, linkMetrics);
+    }
 
     return summary;
   }
@@ -947,6 +1443,34 @@ function friendlyPortLabel(portName, portId) {
 
 function formatHexId(num) {
   return `!${num.toString(16).padStart(8, '0')}`;
+}
+
+function formatRelativeAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return '剛剛';
+  }
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) {
+    return '不到 1 分鐘';
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} 分鐘前`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours} 小時前`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 30) {
+    return `${days} 天前`;
+  }
+  const months = Math.floor(days / 30);
+  if (months < 12) {
+    return `${months} 個月前`;
+  }
+  const years = Math.floor(months / 12);
+  return `${years} 年前`;
 }
 
 function formatTimestamp(date) {

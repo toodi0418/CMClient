@@ -3,6 +3,8 @@
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const { URL } = require('url');
+const fsPromises = fs.promises;
 
 const DEFAULT_PORT = Number(process.env.TMAG_WEB_PORT) || 7080;
 const DEFAULT_HOST = process.env.TMAG_WEB_HOST || '0.0.0.0';
@@ -14,6 +16,7 @@ const APRS_HISTORY_MAX = 5000;
 const APRS_RECORD_HISTORY_MAX = 5000;
 const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
 const MESSAGE_MAX_PER_CHANNEL = 200;
+const MESSAGE_PERSIST_INTERVAL_MS = 2000;
 const CHANNEL_CONFIG = [
   { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
   { id: 1, code: 'CH1', name: 'Mesh TW', note: '跨節點廣播與共通交換' },
@@ -95,6 +98,10 @@ class WebDashboardServer {
     this.appVersion = typeof options.appVersion === 'string' && options.appVersion.trim()
       ? options.appVersion.trim()
       : FALLBACK_VERSION;
+    this.relayStatsPath =
+      typeof options.relayStatsPath === 'string' && options.relayStatsPath.trim()
+        ? options.relayStatsPath.trim()
+        : null;
 
     this.server = null;
     this.clients = new Set();
@@ -133,6 +140,12 @@ class WebDashboardServer {
     this.nodeRegistry = new Map();
     this.channelConfig = CHANNEL_CONFIG;
     this.messageStore = new Map();
+    this.messageLogPath =
+      typeof options.messageLogPath === 'string' && options.messageLogPath.trim()
+        ? options.messageLogPath.trim()
+        : null;
+    this._messageDirty = false;
+    this._messagePersistTimer = null;
     this._ensureConfiguredChannels();
   }
 
@@ -141,9 +154,23 @@ class WebDashboardServer {
       return;
     }
 
+    await this._loadMessageLog();
+
     this.server = http.createServer((req, res) => {
-      if (req.url === '/api/events') {
+      const parsedUrl = (() => {
+        try {
+          return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+        } catch {
+          return { pathname: req.url };
+        }
+      })();
+      const pathname = parsedUrl.pathname || req.url;
+      if (pathname === '/api/events') {
         this._handleEventStream(req, res);
+        return;
+      }
+      if (pathname === '/debug') {
+        this._handleDebugRequest(req, res);
         return;
       }
       this._serveStatic(req, res);
@@ -175,6 +202,7 @@ class WebDashboardServer {
 
   async stop() {
     this._stopPing();
+    this._flushMessagePersistSync();
 
     for (const client of this.clients) {
       try {
@@ -381,13 +409,76 @@ class WebDashboardServer {
     if (store.length > MESSAGE_MAX_PER_CHANNEL) {
       store.length = MESSAGE_MAX_PER_CHANNEL;
     }
+    const cloned = this._cloneMessageEntry(sanitized);
     this._broadcast({
       type: 'message-append',
       payload: {
         channelId,
-        entry: this._cloneMessageEntry(sanitized)
+        entry: cloned
       }
     });
+    this._scheduleMessagePersist();
+  }
+
+  _handleDebugRequest(req, res) {
+    if (req.method && req.method.toUpperCase() !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Method Not Allowed', allowed: ['GET'] }));
+      return;
+    }
+    this._readRelayStats()
+      .then(({ stats, message }) => {
+        const payload = {
+          relayStatsPath: this.relayStatsPath || null,
+          relayLinkStats: stats,
+          message: message || undefined,
+          generatedAt: new Date().toISOString()
+        };
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store, max-age=0'
+        });
+        res.end(JSON.stringify(payload, null, 2));
+      })
+      .catch((err) => {
+        res.writeHead(500, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store, max-age=0'
+        });
+        res.end(
+          JSON.stringify(
+            {
+              error: 'Failed to load relayLinkStats',
+              message: err.message,
+              relayStatsPath: this.relayStatsPath || null
+            },
+            null,
+            2
+          )
+        );
+      });
+  }
+
+  async _readRelayStats() {
+    if (!this.relayStatsPath) {
+      return { stats: null, message: 'relayStatsPath not configured' };
+    }
+    try {
+      const raw = await fsPromises.readFile(this.relayStatsPath, 'utf8');
+      if (!raw || !raw.trim()) {
+        return { stats: {}, message: null };
+      }
+      try {
+        return { stats: JSON.parse(raw), message: null };
+      } catch (parseErr) {
+        throw new Error(`Invalid relay stats JSON: ${parseErr.message}`);
+      }
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return { stats: {}, message: null };
+      }
+      throw err;
+    }
   }
 
   seedMessageSnapshot(snapshot = {}) {
@@ -818,6 +909,119 @@ class WebDashboardServer {
       }
     }
     return { channels };
+  }
+
+  async _loadMessageLog() {
+    if (!this.messageLogPath) {
+      return;
+    }
+    this.messageStore.clear();
+    try {
+      const content = await fsPromises.readFile(this.messageLogPath, 'utf8');
+      if (!content) {
+        this._ensureConfiguredChannels();
+        return;
+      }
+      const lines = content.split(/\n+/).filter((line) => line.trim().length > 0);
+      for (const line of lines) {
+        let parsed;
+        try {
+          parsed = JSON.parse(line);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`跳過無法解析的訊息紀錄: ${err.message}`);
+          continue;
+        }
+        const entry = this._cloneMessageEntry(parsed);
+        if (!entry) {
+          continue;
+        }
+        const channelId = entry.channel;
+        const store = this._getChannelStore(channelId);
+        const duplicateIndex = store.findIndex((item) => item.flowId === entry.flowId);
+        if (duplicateIndex !== -1) {
+          store.splice(duplicateIndex, 1);
+        }
+        store.push(entry);
+        if (store.length > MESSAGE_MAX_PER_CHANNEL) {
+          store.splice(0, store.length - MESSAGE_MAX_PER_CHANNEL);
+        }
+      }
+      this._ensureConfiguredChannels();
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        // eslint-disable-next-line no-console
+        console.warn(`載入訊息紀錄失敗: ${err.message}`);
+      }
+    }
+  }
+
+  _scheduleMessagePersist() {
+    if (!this.messageLogPath) {
+      return;
+    }
+    this._messageDirty = true;
+    if (this._messagePersistTimer) {
+      return;
+    }
+    this._messagePersistTimer = setTimeout(() => {
+      this._messagePersistTimer = null;
+      this._persistMessageLog().catch((err) => {
+        console.error(`寫入訊息紀錄失敗: ${err.message}`);
+        this._scheduleMessagePersist();
+      });
+    }, MESSAGE_PERSIST_INTERVAL_MS);
+    this._messagePersistTimer.unref?.();
+  }
+
+  async _persistMessageLog() {
+    if (!this.messageLogPath || !this._messageDirty) {
+      return;
+    }
+    this._messageDirty = false;
+    const lines = [];
+    const sortedChannels = Array.from(this.messageStore.entries()).sort((a, b) => a[0] - b[0]);
+    for (const [, list] of sortedChannels) {
+      const entries = Array.isArray(list) ? list : [];
+      for (const entry of entries) {
+        lines.push(JSON.stringify(entry));
+      }
+    }
+    try {
+      await fsPromises.mkdir(path.dirname(this.messageLogPath), { recursive: true });
+      await fsPromises.writeFile(this.messageLogPath, lines.join('\n'), 'utf8');
+    } catch (err) {
+      this._messageDirty = true;
+      throw err;
+    }
+  }
+
+  _flushMessagePersistSync() {
+    if (!this.messageLogPath) {
+      return;
+    }
+    if (this._messagePersistTimer) {
+      clearTimeout(this._messagePersistTimer);
+      this._messagePersistTimer = null;
+    }
+    if (!this._messageDirty) {
+      return;
+    }
+    const lines = [];
+    const sortedChannels = Array.from(this.messageStore.entries()).sort((a, b) => a[0] - b[0]);
+    for (const [, list] of sortedChannels) {
+      const entries = Array.isArray(list) ? list : [];
+      for (const entry of entries) {
+        lines.push(JSON.stringify(entry));
+      }
+    }
+    try {
+      fs.mkdirSync(path.dirname(this.messageLogPath), { recursive: true });
+      fs.writeFileSync(this.messageLogPath, lines.join('\n'), 'utf8');
+      this._messageDirty = false;
+    } catch (err) {
+      console.error(`同步寫入訊息紀錄失敗: ${err.message}`);
+    }
   }
 
   _broadcastMetrics() {

@@ -12,6 +12,10 @@ body {
   box-sizing: border-box;
 }
 
+body.modal-open {
+  overflow: hidden;
+}
+
 header {
   margin-bottom: 20px;
 }
@@ -128,6 +132,41 @@ main {
   background: rgba(59, 130, 246, 0.4);
   border-color: rgba(59, 130, 246, 0.8);
   color: #0f172a;
+}
+
+.relay-hint-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-left: 6px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  background: rgba(30, 64, 175, 0.15);
+  color: #dbeafe;
+  font-size: 0.75rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+
+.relay-hint-btn:hover {
+  background: rgba(59, 130, 246, 0.3);
+  border-color: rgba(59, 130, 246, 0.6);
+}
+
+.relay-hint-btn:active {
+  background: rgba(37, 99, 235, 0.4);
+  transform: scale(0.94);
+}
+
+.relay-hint-btn--chip {
+  width: 20px;
+  height: 20px;
+  margin-left: 8px;
+  font-size: 0.7rem;
 }
 
 .page {
@@ -765,6 +804,36 @@ tbody tr:hover {
   font-weight: 700;
 }
 
+.relay-hint-btn {
+  margin-left: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: #e0f2fe;
+  font-size: 0.75rem;
+  line-height: 1;
+  cursor: help;
+  padding: 0;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.relay-hint-btn:hover,
+.relay-hint-btn:focus-visible {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: rgba(59, 130, 246, 0.5);
+  color: #f8fafc;
+  outline: none;
+}
+
+.flow-item-meta .relay-hint-btn {
+  margin-left: 4px;
+}
+
 .flow-item-comment {
   color: #e2e8f0;
   font-size: 0.9rem;
@@ -1197,6 +1266,136 @@ tbody tr:hover {
   display: block;
   border-radius: 8px;
   background: rgba(13, 18, 33, 0.85);
+}
+
+.relay-hint-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(7, 10, 20, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.relay-hint-modal.hidden {
+  display: none;
+}
+
+.relay-hint-dialog {
+  width: min(440px, 90vw);
+  background: linear-gradient(135deg, rgba(30, 41, 59, 0.96), rgba(15, 23, 42, 0.96));
+  border-radius: 16px;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  padding: 24px;
+  box-shadow: 0 20px 55px rgba(8, 47, 73, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.relay-hint-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.relay-hint-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.6), rgba(14, 165, 233, 0.6));
+  color: #0b1120;
+  font-size: 1.4rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 14px 28px rgba(14, 165, 233, 0.35);
+}
+
+.relay-hint-title h2 {
+  margin: 0;
+  font-size: 1.3rem;
+  color: #f8fafc;
+}
+
+.relay-hint-subtitle {
+  margin: 4px 0 0;
+  color: rgba(191, 219, 254, 0.7);
+}
+
+.relay-hint-close {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: rgba(226, 232, 240, 0.65);
+  font-size: 1.4rem;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.relay-hint-close:hover {
+  color: #f8fafc;
+}
+
+.relay-hint-content {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.relay-hint-reason {
+  margin: 0;
+  font-size: 1rem;
+  line-height: 1.6;
+  color: #e0f2fe;
+}
+
+.relay-hint-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.relay-hint-meta div {
+  background: rgba(30, 41, 59, 0.6);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.relay-hint-meta dt {
+  margin: 0 0 6px;
+  font-size: 0.75rem;
+  color: rgba(191, 219, 254, 0.6);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.relay-hint-meta dd {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #f8fafc;
+  font-family: 'JetBrains Mono', monospace;
+  word-break: break-all;
+}
+
+.relay-hint-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+#relay-hint-ok {
+  padding: 8px 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(96, 165, 250, 0.6);
+  background: rgba(37, 99, 235, 0.35);
+  color: #dbeafe;
+  font-weight: 600;
+}
+
+#relay-hint-ok:hover {
+  background: rgba(59, 130, 246, 0.45);
 }
 
 .telemetry-table-wrapper {

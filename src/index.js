@@ -13,6 +13,62 @@ const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge')
 const { WebDashboardServer } = require('./web/server');
 const pkg = require('../package.json');
 
+const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
+
+function getMessageLogPath() {
+  return path.join(getArtifactsDir(), MESSAGE_LOG_FILENAME);
+}
+
+function tryPublishWebMessage(webServer, summary) {
+  if (!webServer || !summary || typeof summary !== 'object') {
+    return;
+  }
+  const type = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+  if (type !== 'text') {
+    return;
+  }
+  const channelId = Number(summary.channel);
+  if (!Number.isFinite(channelId) || channelId < 0) {
+    return;
+  }
+  const sanitizeStringArray = (arr) =>
+    Array.isArray(arr)
+      ? arr
+          .map((line) => (typeof line === 'string' ? line.trim() : ''))
+          .filter(Boolean)
+      : [];
+  const detail = typeof summary.detail === 'string' ? summary.detail : '';
+  const extraLines = sanitizeStringArray(summary.extraLines);
+  const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
+  const timestampLabel =
+    typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
+      ? summary.timestampLabel.trim()
+      : new Date(timestampMs).toISOString();
+  const flowId =
+    typeof summary.flowId === 'string' && summary.flowId.trim()
+      ? summary.flowId.trim()
+      : `${channelId}-${timestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+  const entry = {
+    type: 'Text',
+    channel: channelId,
+    detail,
+    extraLines,
+    from: summary.from ? { ...summary.from } : null,
+    relay: summary.relay ? { ...summary.relay } : null,
+    relayMeshId: summary.relay?.meshId ?? summary.relayMeshId ?? null,
+    relayMeshIdNormalized: summary.relay?.meshIdNormalized ?? summary.relayMeshIdNormalized ?? null,
+    hops: summary.hops ? { ...summary.hops } : null,
+    timestampMs,
+    timestampLabel,
+    flowId
+  };
+  try {
+    webServer.publishMessage(entry);
+  } catch (err) {
+    console.warn(`推播文字訊息失敗：${err.message}`);
+  }
+}
+
 function toWebCallmeshState(state) {
   if (!state || typeof state !== 'object') {
     return null;
@@ -293,10 +349,14 @@ async function startMonitor(argv) {
     console.error('CallMesh Heartbeat 失敗：', err);
   });
 
+  const relayStatsPath = path.join(getArtifactsDir(), 'relay-link-stats.json');
+
   if (webUiEnabled && !webServer) {
     try {
       webServer = new WebDashboardServer({
-        appVersion: pkg.version || '0.0.0'
+        appVersion: pkg.version || '0.0.0',
+        relayStatsPath,
+        messageLogPath: getMessageLogPath()
       });
       await webServer.start();
       webServer.setAppVersion(pkg.version || '0.0.0');
@@ -337,7 +397,8 @@ async function startMonitor(argv) {
     heartbeat: HEARTBEAT_INTERVAL_SECONDS,
     keepAlive: true,
     keepAliveDelayMs: 15_000,
-    idleTimeoutMs: 90_000
+    idleTimeoutMs: 90_000,
+    relayStatsPath
   };
 
   const RECONNECT_DELAY_MS = 30_000;
@@ -457,6 +518,7 @@ async function startMonitor(argv) {
           if (!summary) return;
           bridge.handleMeshtasticSummary(summary);
           webServer?.publishSummary(summary);
+          tryPublishWebMessage(webServer, summary);
           if (!headerPrinted) {
             console.log('Date               | Nodes                      | Relay        | Ch |   SNR | RSSI | Type         | Hops   | Details');
             console.log('-------------------+---------------------------+--------------+----+-------+------+--------------+--------+------------------------------');
@@ -491,6 +553,7 @@ async function startMonitor(argv) {
           if (!summary) return;
           bridge.handleMeshtasticSummary(summary);
           webServer?.publishSummary(summary);
+          tryPublishWebMessage(webServer, summary);
         });
         client.on('fromRadio', ({ message }) => {
           const object = client.toObject(message, {
@@ -552,15 +615,35 @@ function padEnd(value, width) {
 }
 
 function formatRelayLabel(entry) {
-  if (!entry) return '';
-  const label = entry.label || '';
-  const meshId = entry.meshId || '';
-  if (!meshId) return label;
-  const normalized = meshId.startsWith('!') ? meshId.slice(1) : meshId;
-  if (/^0{6}[0-9a-fA-F]{2}$/.test(normalized)) {
-    return label ? `${label}?` : `${meshId}?`;
+  if (!entry || typeof entry !== 'object') return '';
+  const candidates = [
+    entry.label,
+    entry.longName,
+    entry.shortName,
+    entry.meshId,
+    entry.meshIdNormalized
+  ];
+  let display = '';
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      const trimmed = candidate.trim();
+      if (trimmed.toLowerCase() === 'unknown') {
+        continue;
+      }
+      display = trimmed;
+      break;
+    }
   }
-  return label || meshId;
+  const meshIdRaw =
+    (typeof entry.meshId === 'string' && entry.meshId.trim()) ||
+    (typeof entry.meshIdNormalized === 'string' && entry.meshIdNormalized.trim()) ||
+    '';
+  const meshId = meshIdRaw;
+  const normalized = meshId.startsWith('!') ? meshId.slice(1) : meshId;
+  if (normalized && /^0{6}[0-9a-fA-F]{2}$/.test(normalized.toLowerCase())) {
+    return display || meshId || '未知';
+  }
+  return display || meshId || '未知';
 }
 
 function extractHopInfo(summary) {
@@ -630,32 +713,42 @@ function computeRelayLabel(summary, { selfMeshId } = {}) {
   }
 
   const { usedHops, hopsLabel } = extractHopInfo(summary);
+  const zeroHop =
+    usedHops === 0 ||
+    hopsLabel === '0/0' ||
+    (typeof hopsLabel === 'string' && hopsLabel.startsWith('0/'));
 
   if (summary.relay?.label) {
+    if (zeroHop) {
+      return '直收';
+    }
     return formatRelayLabel(summary.relay);
   }
 
   if (relayMeshIdRaw) {
+    if (zeroHop) {
+      return '直收';
+    }
     return formatRelayLabel({
       label: summary.relay?.label || relayMeshIdRaw,
       meshId: relayMeshIdRaw
     });
   }
 
-  if (usedHops === 0 || hopsLabel === '0/0' || (hopsLabel && hopsLabel.startsWith('0/'))) {
+  if (zeroHop) {
     return '直收';
   }
 
   if (usedHops > 0) {
-    return '未知?';
+    return '未知';
   }
 
   if (!hopsLabel) {
     return '直收';
   }
 
-  if (hopsLabel.includes('?')) {
-    return '未知?';
+  if (typeof hopsLabel === 'string' && hopsLabel.includes('?')) {
+    return '未知';
   }
 
   return '';

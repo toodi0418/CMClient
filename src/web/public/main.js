@@ -53,6 +53,13 @@
   const nodesOnlineTotalLabel = document.getElementById('nodes-online-total');
   const nodesSearchInput = document.getElementById('nodes-search');
   const nodesStatusLabel = document.getElementById('nodes-status');
+  const relayHintModal = document.getElementById('relay-hint-modal');
+  const relayHintReasonEl = document.getElementById('relay-hint-reason');
+  const relayHintNodeEl = document.getElementById('relay-hint-node');
+  const relayHintMeshEl = document.getElementById('relay-hint-mesh');
+  const relayHintSubtitleEl = document.getElementById('relay-hint-subtitle');
+  const relayHintCloseBtn = document.getElementById('relay-hint-close');
+  const relayHintOkBtn = document.getElementById('relay-hint-ok');
 
   const summaryRows = [];
   const flowRowMap = new Map();
@@ -67,6 +74,8 @@
   let flowFilterState = 'all';
   let flowSearchTerm = '';
   const FLOW_MAX_ENTRIES = 1000;
+  const RELAY_GUESS_EXPLANATION =
+    '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
 
   let currentSelfMeshId = null;
   let selfProvisionCoords = null;
@@ -96,6 +105,13 @@
   const telemetryNodeInputDefaultPlaceholder =
     telemetryNodeInput?.getAttribute('placeholder') || '輸入節點 Mesh ID 或搜尋關鍵字';
   const nodeRegistry = new Map();
+  const MESH_ID_PATTERN = /^![0-9a-f]{8}$/i;
+
+  function isIgnoredMeshId(meshId) {
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) return false;
+    return normalized.toLowerCase().startsWith('!abcd');
+  }
   let nodeSnapshotLoaded = false;
   const TELEMETRY_TABLE_LIMIT = 200;
   const TELEMETRY_CHART_LIMIT = 200;
@@ -164,6 +180,26 @@
       safeStorageSet(STORAGE_KEYS.callmeshProvisionOpen, callmeshProvisionDetails.open ? '1' : '0');
     });
   }
+
+  relayHintCloseBtn?.addEventListener('click', () => {
+    closeRelayHintDialog();
+  });
+
+  relayHintOkBtn?.addEventListener('click', () => {
+    closeRelayHintDialog();
+  });
+
+  relayHintModal?.addEventListener('click', (event) => {
+    if (event.target === relayHintModal) {
+      closeRelayHintDialog();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && relayHintModal && !relayHintModal.classList.contains('hidden')) {
+      closeRelayHintDialog();
+    }
+  });
 
   function escapeHtml(input) {
     return String(input)
@@ -472,7 +508,7 @@
     const latest = store[0];
     if (latest) {
       const timeLabel = latest.timestampLabel || '—';
-      const fromLabel = latest.from || 'unknown';
+      const fromLabel = resolveStoredMessageFromLabel(latest);
       navItem.meta.textContent = `${timeLabel} · ${fromLabel}`;
     } else {
       navItem.meta.textContent = '尚無訊息';
@@ -482,6 +518,81 @@
     } else {
       navItem.button.classList.remove('channel-nav-btn--unread');
     }
+  }
+
+  function resolveMessageSource(summary) {
+    const fallback = { label: '未知節點', meshId: null };
+    if (!summary || typeof summary !== 'object') {
+      return fallback;
+    }
+    const node = summary.from || {};
+    const directName =
+      sanitizeNodeName(node.longName) ||
+      sanitizeNodeName(node.shortName) ||
+      sanitizeNodeName(node.label);
+    const meshIdRaw =
+      node.meshIdNormalized ||
+      node.meshId ||
+      node.meshIdOriginal ||
+      summary.fromMeshIdNormalized ||
+      summary.fromMeshId ||
+      summary.fromMeshIdOriginal ||
+      null;
+    const normalized = normalizeMeshId(meshIdRaw);
+    if (normalized) {
+      fallback.meshId = normalized;
+    }
+    if (directName) {
+      return {
+        label: directName,
+        meshId: normalized || null
+      };
+    }
+    if (normalized) {
+      const registryNode = nodeRegistry.get(normalized);
+      if (registryNode) {
+        const registryName =
+          sanitizeNodeName(registryNode.longName) ||
+          sanitizeNodeName(registryNode.shortName) ||
+          sanitizeNodeName(registryNode.label);
+        if (registryName) {
+          return {
+            label: registryName,
+            meshId: normalized
+          };
+        }
+      }
+      return {
+        label: normalized,
+        meshId: normalized
+      };
+    }
+    return fallback;
+  }
+
+  function resolveStoredMessageFromLabel(entry) {
+    if (!entry || typeof entry !== 'object') {
+      return '未知節點';
+    }
+    const stored = sanitizeNodeName(entry.from);
+    if (stored && !MESH_ID_PATTERN.test(stored)) {
+      return stored;
+    }
+    const normalized = entry.fromMeshId || normalizeMeshId(stored);
+    if (normalized) {
+      const registryNode = nodeRegistry.get(normalized);
+      if (registryNode) {
+        const registryName =
+          sanitizeNodeName(registryNode.longName) ||
+          sanitizeNodeName(registryNode.shortName) ||
+          sanitizeNodeName(registryNode.label);
+        if (registryName) {
+          return registryName;
+        }
+      }
+      return normalized;
+    }
+    return stored || '未知節點';
   }
 
   function renderChannelMessages(channelId) {
@@ -510,7 +621,7 @@
 
       const meta = document.createElement('div');
       meta.className = 'channel-message-meta';
-      appendMessageMeta(meta, `來自：${entry.from}`);
+      appendMessageMeta(meta, `來自：${resolveStoredMessageFromLabel(entry)}`);
       appendMessageMeta(meta, entry.hops);
       appendMessageMeta(meta, entry.relay);
       appendMessageMeta(meta, `時間：${entry.timestampLabel}`);
@@ -614,6 +725,12 @@
     channelNavButtons.forEach((_, channelId) => updateChannelNavMeta(channelId, { unread: false }));
   }
 
+  function isTextSummary(summary) {
+    if (!summary || typeof summary !== 'object') return false;
+    const type = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+    return type === 'text';
+  }
+
   function formatMessageText(summary) {
     const detail = typeof summary.detail === 'string' ? summary.detail.trim() : '';
     const extra = Array.isArray(summary.extraLines)
@@ -634,7 +751,7 @@
 
   function buildMessageRelayLabel(summary) {
     let relayLabel = formatRelay({ ...summary });
-    if (!relayLabel || relayLabel === '未知?' || relayLabel === '?') {
+    if (!relayLabel || relayLabel === '未知' || relayLabel === '?') {
       relayLabel = formatNodeDisplayLabel(summary.relay);
     }
     if (!relayLabel || relayLabel === 'unknown') {
@@ -660,7 +777,7 @@
   }
 
   function recordChannelMessage(summary, { markUnread = true, deferRender = false } = {}) {
-    if (!summary || summary.type !== 'Text') {
+    if (!isTextSummary(summary)) {
       return;
     }
     const channelId = Number(summary.channel);
@@ -671,7 +788,7 @@
     const store = ensureChannelStore(channelId);
 
     const text = formatMessageText(summary);
-    const fromLabel = formatNodeDisplayLabel(summary.from) || 'unknown';
+    const { label: fromLabel, meshId: fromMeshId } = resolveMessageSource(summary);
     const timestampMs = Number.isFinite(Number(summary.timestampMs)) ? Number(summary.timestampMs) : Date.now();
     const timestampLabel = resolveMessageTimestamp(summary, timestampMs);
     const flowIdRaw = summary.flowId || `${channelId}-${timestampMs}-${text}`;
@@ -690,6 +807,7 @@
       timestampLabel,
       text,
       from: fromLabel,
+      fromMeshId: fromMeshId || null,
       hops: hopSummary,
       relay: relaySummary
     });
@@ -739,6 +857,13 @@
             detail: entry.detail,
             extraLines: Array.isArray(entry.extraLines) ? entry.extraLines : [],
             from: entry.from,
+            fromMeshId:
+              entry.from?.meshId ||
+              entry.from?.meshIdNormalized ||
+              entry.from?.meshIdOriginal ||
+              entry.fromMeshId ||
+              entry.fromMeshIdNormalized ||
+              null,
             relay: entry.relay,
             relayMeshId: entry.relayMeshId,
             relayMeshIdNormalized: entry.relayMeshIdNormalized,
@@ -747,6 +872,7 @@
             timestampLabel: entry.timestampLabel,
             flowId: entry.flowId
           };
+          hydrateSummaryNodes(hydrated);
           recordChannelMessage(hydrated, { markUnread: false, deferRender: true });
         }
       });
@@ -818,6 +944,34 @@
     return { display, tooltip, timestamp };
   }
 
+  function formatNodeCoordinateValue(entry) {
+    if (!entry) return '';
+    const latRaw = entry.latitude;
+    const lonRaw = entry.longitude;
+    if (latRaw == null || lonRaw == null) {
+      return '';
+    }
+    const lat = Number(latRaw);
+    const lon = Number(lonRaw);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return '';
+    }
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+      return '';
+    }
+    const formatComponent = (value) => {
+      const fixed = value.toFixed(5);
+      const trimmed = fixed.replace(/\.?0+$/, '');
+      return trimmed || '0';
+    };
+    const parts = [`${formatComponent(lat)}`, `${formatComponent(lon)}`];
+    const altitude = Number(entry.altitude);
+    if (Number.isFinite(altitude)) {
+      parts.push(`${Math.round(altitude)}m`);
+    }
+    return parts.join(', ');
+  }
+
   function formatNodeDistanceValue(entry) {
     if (
       !selfProvisionCoords ||
@@ -860,12 +1014,13 @@
       sanitizeNodeName(entry.label),
       entry.meshId,
       entry.meshIdOriginal,
-      entry.meshIdNormalized,
-      entry.hwModel,
-      entry.hwModelLabel,
-      entry.role,
-      entry.roleLabel
-    ];
+    entry.meshIdNormalized,
+    entry.hwModel,
+    entry.hwModelLabel,
+    entry.role,
+    entry.roleLabel,
+    formatNodeCoordinateValue(entry)
+  ];
     return fields.some((value) => {
       if (!value) return false;
       return String(value).toLowerCase().includes(lowerTerm);
@@ -873,7 +1028,9 @@
   }
 
   function getSortedNodeRegistryEntries() {
-    const entries = Array.from(nodeRegistry.values());
+    const entries = Array.from(nodeRegistry.values()).filter(
+      (entry) => !isIgnoredMeshId(entry.meshId) && !isIgnoredMeshId(entry.meshIdOriginal)
+    );
     entries.sort((a, b) => {
       const tsA = getNodeLastSeenTimestamp(a) || 0;
       const tsB = getNodeLastSeenTimestamp(b) || 0;
@@ -995,6 +1152,7 @@
       const meshLabel = meshIdOriginal || meshId || '—';
       const hwModelDisplay = entry.hwModelLabel || normalizeEnumLabel(entry.hwModel) || '—';
       const roleDisplay = entry.roleLabel || normalizeEnumLabel(entry.role) || '—';
+      const coordinateDisplay = formatNodeCoordinateValue(entry);
       const distanceDisplay = formatNodeDistanceValue(entry);
 
       const { display: lastSeenDisplay, tooltip: lastSeenTooltip, timestamp: lastSeenTimestamp } =
@@ -1013,6 +1171,7 @@
         `<td>${escapeHtml(meshLabel)}</td>` +
         `<td>${escapeHtml(hwModelDisplay)}</td>` +
         `<td>${escapeHtml(roleDisplay)}</td>` +
+        `<td>${escapeHtml(coordinateDisplay || '—')}</td>` +
         `<td>${escapeHtml(distanceDisplay)}</td>` +
         `<td>${lastSeenCell}</td>` +
         '</tr>'
@@ -1033,6 +1192,10 @@
     const candidate = entry.meshId || entry.meshIdNormalized || entry.meshIdOriginal;
     const normalized = normalizeMeshId(candidate);
     if (!normalized) return null;
+    if (isIgnoredMeshId(normalized) || isIgnoredMeshId(entry.meshIdOriginal)) {
+      nodeRegistry.delete(normalized);
+      return null;
+    }
     const existing = nodeRegistry.get(normalized) || {};
     const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
     if (merged) {
@@ -1104,7 +1267,9 @@
       return;
     }
     const totalRecords = Number.isFinite(stats.totalRecords) ? stats.totalRecords : 0;
-    const totalNodes = Number.isFinite(stats.totalNodes) ? stats.totalNodes : nodeRegistry.size;
+    const totalNodes = Number.isFinite(stats.totalNodes)
+      ? stats.totalNodes
+      : getSortedNodeRegistryEntries().length;
     telemetryStatsRecords.textContent = totalRecords.toLocaleString();
     telemetryStatsNodes.textContent = totalNodes.toLocaleString();
     telemetryStatsDisk.textContent = formatBytes(stats.diskBytes);
@@ -1193,7 +1358,7 @@
 
   telemetryNodeInput?.addEventListener('input', (event) => {
     handleTelemetryNodeInputChange(event);
-    renderTelemetryDropdown();
+    renderTelemetryDropdown({ force: true });
   });
 
   telemetryNodeInput?.addEventListener('change', (event) => {
@@ -1297,79 +1462,201 @@
     renderTelemetryView();
   });
 
+  function isRelayGuessed(summary) {
+    return Boolean(summary?.relay?.guessed || summary?.relayGuess);
+  }
+
+function getRelayGuessReason(summary) {
+  return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
+}
+
+  function openRelayHintDialog({ reason, relayLabel, meshId } = {}) {
+    const text = reason && reason.trim() ? reason.trim() : RELAY_GUESS_EXPLANATION;
+    if (!relayHintModal || !relayHintReasonEl) {
+      const fallback = [text, relayLabel ? `節點：${relayLabel}` : null, meshId ? `Mesh ID：${meshId}` : null]
+        .filter(Boolean)
+        .join('\n');
+      window.alert(fallback);
+      return;
+    }
+    relayHintReasonEl.textContent = text;
+    if (relayHintNodeEl) {
+      relayHintNodeEl.textContent = relayLabel && relayLabel.trim() ? relayLabel.trim() : '—';
+    }
+    if (relayHintMeshEl) {
+      relayHintMeshEl.textContent = meshId && meshId.trim() ? meshId.trim() : '—';
+    }
+    if (relayHintSubtitleEl) {
+      relayHintSubtitleEl.textContent = '系統依歷史統計推測可能的最後轉發節點';
+    }
+    relayHintModal.classList.remove('hidden');
+    document.body.classList.add('modal-open');
+    setTimeout(() => relayHintOkBtn?.focus(), 0);
+  }
+
+  function closeRelayHintDialog() {
+    if (!relayHintModal) return;
+    relayHintModal.classList.add('hidden');
+    document.body.classList.remove('modal-open');
+  }
+
+function ensureRelayGuessSuffix(label, summary) {
+  if (!isRelayGuessed(summary)) {
+    return label;
+  }
+  const value = (label || '').trim();
+  if (!value) {
+    return '未知';
+  }
+  return value;
+}
+
   function formatRelay(summary) {
     if (!summary) return '直收';
     const fromMeshId = summary.from?.meshId || summary.from?.meshIdNormalized || '';
-    const relayMeshRaw =
+    const fromNormalized = normalizeMeshId(fromMeshId);
+    if (fromMeshId && isSelfMesh(fromMeshId, summary)) {
+      return ensureRelayGuessSuffix('Self', summary);
+    }
+
+    let relayMeshIdRaw =
       summary.relay?.meshId ||
       summary.relay?.meshIdNormalized ||
       summary.relayMeshId ||
       summary.relayMeshIdNormalized ||
       '';
-    const relayNormalized = normalizeMeshId(relayMeshRaw);
-    const fromNormalized = normalizeMeshId(fromMeshId);
-    const rawRelayCanonical = relayMeshRaw.startsWith('!') ? relayMeshRaw.slice(1) : relayMeshRaw;
-
-    if (fromMeshId && isSelfMesh(fromMeshId, summary)) {
-      return 'Self';
-    }
-
-    if (relayMeshRaw && isSelfMesh(relayMeshRaw, summary)) {
-      return 'Self';
-    }
-
-    const relayNode = relayMeshRaw ? hydrateSummaryNode(summary.relay, relayMeshRaw) : null;
+    const relayNode = relayMeshIdRaw ? hydrateSummaryNode(summary.relay, relayMeshIdRaw) : null;
     if (relayNode) {
       summary.relay = relayNode;
+      relayMeshIdRaw =
+        relayNode.meshId || relayNode.meshIdOriginal || relayNode.meshIdNormalized || relayMeshIdRaw;
+    }
+    if (relayMeshIdRaw && isSelfMesh(relayMeshIdRaw, summary)) {
+      return ensureRelayGuessSuffix('Self', summary);
+    }
+    let relayNormalized = normalizeMeshId(relayMeshIdRaw);
+    if (relayNormalized && /^!0{6}[0-9a-fA-F]{2}$/.test(relayNormalized)) {
+      relayMeshIdRaw = '';
+      relayNormalized = null;
     }
 
-    let relayMeshDisplay = relayNode?.meshId || relayMeshRaw;
-    let relayNormWork = relayNode?.meshIdNormalized || relayNormalized;
-    if (relayMeshRaw && /^0{6}[0-9a-fA-F]{2}$/.test(rawRelayCanonical.toLowerCase())) {
-      relayMeshDisplay = '';
-      relayNormWork = null;
-    }
-
-    if (fromNormalized && relayNormWork && fromNormalized === relayNormWork) {
-      return '直收';
+    if (fromNormalized && relayNormalized && fromNormalized === relayNormalized) {
+      return ensureRelayGuessSuffix('直收', summary);
     }
 
     const hopInfo = extractHopInfo(summary);
-    const usedHops = Number.isFinite(hopInfo.usedHops) ? hopInfo.usedHops : null;
-    const hopsLabel = hopInfo.hopsLabel || '';
-    const zeroHop = usedHops === 0 || /^0(?:\s*\/|$)/.test(hopsLabel);
+    const normalizedHopsLabel = hopInfo.hopsLabel || '';
+    const zeroHop = hopInfo.usedHops === 0 || /^0(?:\s*\/|$)/.test(normalizedHopsLabel);
 
-    if (summary.relay) {
+    if (summary.relay?.label) {
       if (zeroHop) {
-        return '直收';
+        return ensureRelayGuessSuffix('直收', summary);
       }
-      return formatRelayLabel(summary.relay);
+      return ensureRelayGuessSuffix(formatRelayLabel(summary.relay), summary);
     }
 
-    if (relayMeshDisplay) {
+    if (relayMeshIdRaw) {
       if (zeroHop) {
-        return '直收';
+        return ensureRelayGuessSuffix('直收', summary);
       }
-      return formatRelayLabel({ label: summary.relay?.label || relayMeshDisplay, meshId: relayMeshDisplay });
+      return ensureRelayGuessSuffix(
+        formatRelayLabel({ label: summary.relay?.label || relayMeshIdRaw, meshId: relayMeshIdRaw }),
+        summary
+      );
     }
 
     if (zeroHop) {
-      return '直收';
+      return ensureRelayGuessSuffix('直收', summary);
     }
 
-    if (usedHops != null && usedHops > 0) {
-      return '未知?';
+    if (hopInfo.usedHops != null && hopInfo.usedHops > 0) {
+      return ensureRelayGuessSuffix('未知', summary);
     }
 
-    if (!hopsLabel) {
-      return '直收';
+    if (!normalizedHopsLabel) {
+      return ensureRelayGuessSuffix('直收', summary);
     }
 
-    if (hopsLabel.includes('?')) {
-      return '未知?';
+    if (normalizedHopsLabel.includes('?')) {
+      return ensureRelayGuessSuffix('未知', summary);
     }
 
-    return '';
+    return ensureRelayGuessSuffix('', summary);
+  }
+
+  function updateRelayCellDisplay(cell, summary) {
+    if (!cell) return;
+    const label = formatRelay(summary);
+    let relayGuessed = isRelayGuessed(summary);
+    if (label === '直收' || label === 'Self') {
+      relayGuessed = false;
+    }
+    const relayGuessReason = relayGuessed ? getRelayGuessReason(summary) : '';
+    cell.innerHTML = '';
+
+    const labelSpan = document.createElement('span');
+    const relayDisplay = label || (relayGuessed ? '未知' : '—');
+    labelSpan.textContent = relayDisplay;
+    cell.appendChild(labelSpan);
+
+    let relayMeshRaw =
+      summary?.relay?.meshId ||
+      summary?.relay?.meshIdNormalized ||
+      summary?.relayMeshId ||
+      summary?.relayMeshIdNormalized ||
+      '';
+    let normalizedRelayMeshId = '';
+    let relayTitle = '';
+    if (typeof relayMeshRaw === 'string' && relayMeshRaw) {
+      if (relayMeshRaw.startsWith('0x')) {
+        normalizedRelayMeshId = `!${relayMeshRaw.slice(2)}`;
+      }
+      if (!normalizedRelayMeshId) {
+        normalizedRelayMeshId = relayMeshRaw;
+      }
+      const displayMeshId = normalizedRelayMeshId;
+      if (label && displayMeshId && label !== displayMeshId) {
+        relayTitle = `${label} (${displayMeshId})`;
+      } else {
+        relayTitle = displayMeshId;
+      }
+    } else if (label === '直收') {
+      relayTitle = '訊息為直收，未經其他節點轉發';
+    } else if (label === 'Self') {
+      relayTitle = '本站節點轉發';
+    } else if (relayGuessed) {
+      relayTitle = '最後轉發節點未知或標號不完整';
+    }
+
+    const reason = relayGuessReason || RELAY_GUESS_EXPLANATION;
+    cell.classList.toggle('relay-guess', relayGuessed);
+    if (relayGuessed) {
+      cell.dataset.relayGuess = 'true';
+      const hintButton = document.createElement('button');
+      hintButton.type = 'button';
+      hintButton.className = 'relay-hint-btn';
+      hintButton.textContent = '?';
+      hintButton.title = reason;
+      hintButton.setAttribute('aria-label', '顯示推測原因');
+      hintButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        openRelayHintDialog({
+          reason,
+          relayLabel: label || normalizedRelayMeshId || '',
+          meshId: normalizedRelayMeshId || ''
+        });
+      });
+      cell.appendChild(hintButton);
+    } else {
+      cell.classList.remove('relay-guess');
+      cell.removeAttribute('data-relay-guess');
+    }
+
+    if (relayTitle) {
+      cell.title = relayTitle;
+    } else {
+      cell.removeAttribute('title');
+    }
   }
 
   function formatRelayLabel(relay) {
@@ -1389,7 +1676,7 @@
     }
     if (stripped && /^0{6}[0-9a-fA-F]{2}$/.test(String(stripped).toLowerCase())) {
       const fallback = display || meshId || '';
-      return fallback ? (fallback.includes('?') ? fallback : `${fallback}?`) : '?';
+      return fallback || '未知';
     }
     if (display) {
       return display;
@@ -1896,7 +2183,7 @@
     telemetryDropdownInteracting = false;
   }
 
-  function renderTelemetryDropdown() {
+  function renderTelemetryDropdown({ force = false } = {}) {
     if (!telemetryNodeDropdown || !telemetryNodeInput || telemetryNodeInput.disabled) {
       hideTelemetryDropdown();
       return;
@@ -1907,23 +2194,60 @@
       hideTelemetryDropdown();
       return;
     }
-    const fragment = document.createDocumentFragment();
-    let activeOption = null;
-    for (const candidate of candidates) {
-      const option = document.createElement('div');
-      option.className = 'telemetry-node-option';
-      option.dataset.meshId = candidate.meshId || '';
-      const displayText = candidate.display || candidate.meshId || '未知節點';
-      option.textContent = displayText;
-      option.title = displayText;
-      if (candidate.meshId === telemetrySelectedMeshId) {
-        option.classList.add('active');
-        activeOption = option;
-      }
-      fragment.appendChild(option);
+    if (telemetryDropdownVisible && !force) {
+      return;
     }
-    telemetryNodeDropdown.innerHTML = '';
-    telemetryNodeDropdown.appendChild(fragment);
+    const existingOptions = telemetryNodeDropdown.children;
+    let needsRebuild = existingOptions.length !== candidates.length;
+    if (!needsRebuild) {
+      for (let i = 0; i < candidates.length; i += 1) {
+        const candidate = candidates[i];
+        const option = existingOptions[i];
+        if (!option) {
+          needsRebuild = true;
+          break;
+        }
+        const displayText = candidate.display || candidate.meshId || '未知節點';
+        if (option.dataset.meshId !== (candidate.meshId || '') || option.textContent !== displayText) {
+          needsRebuild = true;
+          break;
+        }
+      }
+    }
+    let activeOption = null;
+    if (needsRebuild) {
+      const fragment = document.createDocumentFragment();
+      for (const candidate of candidates) {
+        const option = document.createElement('div');
+        option.className = 'telemetry-node-option';
+        option.dataset.meshId = candidate.meshId || '';
+        const displayText = candidate.display || candidate.meshId || '未知節點';
+        option.textContent = displayText;
+        option.title = displayText;
+        if (candidate.meshId === telemetrySelectedMeshId) {
+          option.classList.add('active');
+          activeOption = option;
+        }
+        fragment.appendChild(option);
+      }
+      telemetryNodeDropdown.innerHTML = '';
+      telemetryNodeDropdown.appendChild(fragment);
+    } else {
+      for (let i = 0; i < candidates.length; i += 1) {
+        const candidate = candidates[i];
+        const option = existingOptions[i];
+        const displayText = candidate.display || candidate.meshId || '未知節點';
+        option.textContent = displayText;
+        option.title = displayText;
+        option.dataset.meshId = candidate.meshId || '';
+        if (candidate.meshId === telemetrySelectedMeshId) {
+          option.classList.add('active');
+          activeOption = option;
+        } else {
+          option.classList.remove('active');
+        }
+      }
+    }
     showTelemetryDropdown();
     if (activeOption) {
       activeOption.scrollIntoView({ block: 'nearest' });
@@ -1946,7 +2270,7 @@
     if (hideDropdown) {
       hideTelemetryDropdown();
     } else {
-      renderTelemetryDropdown();
+      renderTelemetryDropdown({ force: true });
     }
   }
 
@@ -1954,7 +2278,7 @@
     if (!telemetryNodeInput || telemetryNodeInput.disabled) {
       return;
     }
-    renderTelemetryDropdown();
+    renderTelemetryDropdown({ force: true });
     const candidates = getTelemetryNavigationCandidates();
     if (!candidates.length) {
       return;
@@ -2001,7 +2325,7 @@
     if (!telemetryNodeInput || telemetryNodeInput.disabled || document.activeElement !== telemetryNodeInput) {
       return;
     }
-    renderTelemetryDropdown();
+    renderTelemetryDropdown({ force: true });
     const candidates = getTelemetryNavigationCandidates();
     if (!candidates.length) {
       return;
@@ -2227,7 +2551,7 @@
 
     if (searchActive) {
       updateTelemetryNodeInputDisplay();
-      renderTelemetryDropdown();
+      renderTelemetryDropdown({ force: true });
       return;
     }
 
@@ -2260,7 +2584,9 @@
     telemetrySearchRaw = '';
     telemetrySearchTerm = '';
     updateTelemetryNodeInputDisplay();
-    renderTelemetryDropdown();
+    if (!telemetryDropdownVisible) {
+      renderTelemetryDropdown();
+    }
   }
 
   function getTelemetryRecordsForSelection() {
@@ -2858,7 +3184,9 @@
       telemetrySelectedMeshId = firstKey || null;
       telemetryLastExplicitMeshId = telemetrySelectedMeshId;
       updateTelemetryNodeInputDisplay();
-      renderTelemetryDropdown();
+      if (!telemetryDropdownVisible) {
+        renderTelemetryDropdown();
+      }
     }
     const baseRecords = getTelemetryRecordsForSelection();
     const filteredRecords = applyTelemetryFilters(baseRecords);
@@ -2915,7 +3243,9 @@
       telemetrySelectedMeshId = previousSelection;
       telemetryLastExplicitMeshId = previousSelection;
       updateTelemetryNodeInputDisplay();
-      renderTelemetryDropdown();
+      if (!telemetryDropdownVisible) {
+        renderTelemetryDropdown();
+      }
     }
     renderTelemetryView();
     updateTelemetryUpdatedAtLabel();
@@ -2948,7 +3278,9 @@
       telemetryLastExplicitMeshId = meshId;
     }
     updateTelemetryNodeInputDisplay();
-    renderTelemetryDropdown();
+    if (!telemetryDropdownVisible) {
+      renderTelemetryDropdown();
+    }
     if (telemetrySelectedMeshId === meshId) {
       renderTelemetryView();
     }
@@ -3282,6 +3614,7 @@
       <td>${formatNumber(summary.rssi, 0)}</td>
       <td class="info-cell">${formatDetail(summary)}</td>
     `;
+    updateRelayCellDisplay(tr.cells[2], summary);
     return tr;
   }
 
@@ -3365,7 +3698,7 @@
         continue;
       }
       cells[1].textContent = formatSource(summary);
-      cells[2].textContent = formatRelay(summary);
+      updateRelayCellDisplay(cells[2], summary);
     }
   }
 
@@ -3457,12 +3790,25 @@
       ? summary.extraLines.filter((line) => typeof line === 'string' && line.trim())
       : [];
     const relayLabel = formatRelay(summary);
+    let relayGuessed = isRelayGuessed(summary);
+    if (relayLabel === '直收' || relayLabel === 'Self') {
+      relayGuessed = false;
+    }
+    const relayGuessReason = relayGuessed ? getRelayGuessReason(summary) : '';
     const hopInfo = extractHopInfo(summary);
     const position = summary.position || {};
     const altitude = resolveAltitudeMeters(position);
     const speedKph = computeSpeedKph(position);
     const satsInView = Number.isFinite(position.satsInView) ? Number(position.satsInView) : null;
     const timestampLabel = summary.timestampLabel || formatFlowTimestamp(timestampMs);
+
+    const relayMeshIdRaw =
+      summary.relay?.meshId ||
+      summary.relay?.meshIdNormalized ||
+      summary.relayMeshId ||
+      summary.relayMeshIdNormalized ||
+      '';
+    const relayMeshIdNormalized = normalizeMeshId(relayMeshIdRaw);
 
     const entry = {
       flowId,
@@ -3476,6 +3822,8 @@
       pathLabel: formatFlowPath(summary),
       channel: summary.channel ?? '',
       relayLabel,
+      relayGuess: relayGuessed,
+      relayGuessReason,
       hopsLabel: hopInfo.hopsLabel || formatHops(summary.hops),
       hopsUsed: hopInfo.usedHops,
       hopsTotal: hopInfo.totalHops,
@@ -3490,7 +3838,9 @@
       speedKph,
       satsInView,
       status: 'pending',
-      aprs: null
+      aprs: null,
+      relayMeshId: relayMeshIdRaw,
+      relayMeshIdNormalized
     };
 
     if (!entry.comment && extras.length) {
@@ -3510,7 +3860,22 @@
     entry.toLabel = summary.to ? formatFlowNode(summary.to) : null;
     entry.pathLabel = formatFlowPath(summary);
     entry.channel = summary.channel ?? entry.channel;
-    entry.relayLabel = formatRelay(summary);
+    const relayLabel = formatRelay(summary);
+    let relayGuessed = isRelayGuessed(summary);
+    if (relayLabel === '直收' || relayLabel === 'Self') {
+      relayGuessed = false;
+    }
+    entry.relayLabel = relayLabel;
+    entry.relayGuess = relayGuessed;
+    entry.relayGuessReason = relayGuessed ? getRelayGuessReason(summary) : '';
+    entry.relayMeshId =
+      summary.relay?.meshId ||
+      summary.relay?.meshIdNormalized ||
+      summary.relayMeshId ||
+      summary.relayMeshIdNormalized ||
+      entry.relayMeshId ||
+      '';
+    entry.relayMeshIdNormalized = normalizeMeshId(entry.relayMeshId) || entry.relayMeshIdNormalized || '';
     const hopInfo = extractHopInfo(summary);
     entry.hopsLabel = hopInfo.hopsLabel || formatHops(summary.hops);
     entry.hopsUsed = hopInfo.usedHops;
@@ -3643,6 +4008,27 @@
         const strong = document.createElement('strong');
         strong.textContent = chip.label;
         chipEl.append(strong, document.createTextNode(` ${chip.value}`));
+        if (chip.label === 'Relay' && entry.relayGuessReason) {
+          chipEl.title = entry.relayGuessReason;
+          chipEl.classList.add('flow-chip-relay-guess');
+          if (!chipEl.querySelector('.relay-hint-btn')) {
+            const hintBtn = document.createElement('button');
+            hintBtn.type = 'button';
+            hintBtn.className = 'relay-hint-btn relay-hint-btn--chip';
+            hintBtn.textContent = '?';
+            hintBtn.title = entry.relayGuessReason;
+            hintBtn.setAttribute('aria-label', '顯示推測原因');
+            hintBtn.addEventListener('click', (event) => {
+              event.stopPropagation();
+            openRelayHintDialog({
+              reason: entry.relayGuessReason,
+              relayLabel: entry.relayLabel || '',
+              meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
+            });
+            });
+            chipEl.appendChild(hintBtn);
+          }
+        }
         meta.appendChild(chipEl);
       }
       item.appendChild(meta);
@@ -4216,7 +4602,7 @@
       }
       const relayCell = row.cells?.[2];
       if (relayCell) {
-        relayCell.textContent = formatRelay(summary);
+        updateRelayCellDisplay(relayCell, summary);
       }
       const sourceCell = row.cells?.[1];
       if (sourceCell) {

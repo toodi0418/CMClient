@@ -16,6 +16,7 @@ TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合�
 - **APRS Uplink**：依 Mapping 決定呼號、符號與註解，上傳位置/狀態/遙測資料到 APRS-IS，具備 Beacon、Status、Telemetry 定時器與互斥上傳控制。
 - **遙測統計**：計算近 10 分鐘的封包數量、上傳比率、類型分佈（Position / Message / Control）。
 - **跨平台部署**：可自行打包 macOS / Windows / Linux x64 CLI 或 Desktop 版；CLI 同時支援自動重連。
+- **穩定時間戳**：Telemetry 紀錄寫入時會使用收包當下的時間戳，避免裝置 RTC 漂移造成前端區間掛零。
 
 ---
 
@@ -204,7 +205,18 @@ GUI 提供：
 
 ---
 
-## 6. 打包指令
+## 6. 維護工具
+
+- **遙測時間校正**：若早期資料受裝置時間影響，可在專案根目錄執行  
+  ```bash
+  node scripts/fix-telemetry-timestamps.js ~/.config/callmesh/telemetry-records.jsonl
+  ```  
+  腳本會將每筆紀錄的 `timestampMs`／`sampleTimeMs`／`telemetry.timeMs` 對齊收包時刻，並保留 `.bak` 備份。
+- **打包工具**：`scripts/pack-cli.sh`、`scripts/pack-desktop.sh` 可快速產出 CLI / GUI 可攜版（需安裝 `pkg`、`electron-packager`）。
+
+---
+
+## 7. 打包指令
 
 | 目標 | 指令 | 輸出位置 |
 | ---- | ---- | -------- |
@@ -231,7 +243,7 @@ npx pkg src/index.js \
 
 ---
 
-## 7. 專案結構概覽
+## 8. 專案結構概覽
 
 ```
 CMClient/
@@ -250,7 +262,7 @@ CMClient/
 
 ---
 
-## 8. 開發與測試
+## 9. 開發與測試
 
 1. 更動程式後可直接執行 `npm start`（CLI summary 模式）。
 2. 若要觀察 APRS 上行內容，可同時開啟 Electron GUI 的「Mapping 封包追蹤」頁面，或在 CLI 監看 log。
@@ -258,7 +270,7 @@ CMClient/
 
 ---
 
-## 9. 常見問題
+## 10. 常見問題
 
 - **為何 GitHub Repo 只有原始碼沒有 `dist/`？**  
   build 產物會破百 MB，已排除在 git 外。先 `npm install` 後再執行 `npm run build:*` 可在本機重新產出。
@@ -271,6 +283,6 @@ CMClient/
 
 ---
 
-## 10. 授權
+## 11. 授權
 
 此專案依原作者設定的授權條款釋出；若需商用或替代授權，請聯絡 maintainer。
