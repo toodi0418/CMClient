@@ -5,7 +5,13 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing tag to build (e.g. v0.2.17)'
+        required: true
 
+permissions:
+  contents: write
 
 env:
   NODE_VERSION: 20
@@ -20,11 +26,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Create release if needed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           gh release view "$TAG_NAME" >/dev/null 2>&1 && exit 0
           gh release create "$TAG_NAME" --verify-tag --generate-notes
@@ -39,6 +46,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -91,7 +99,7 @@ jobs:
       - name: Upload macOS assets to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           gh release upload "$TAG_NAME" \
             "dist/TMAG_Monitor-macOS-x64-v${{ steps.mac_version.outputs.version }}.zip" \
@@ -108,6 +116,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -175,7 +184,7 @@ jobs:
       - name: Upload Linux assets to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           gh release upload "$TAG_NAME" \
             "dist/TMAG_Monitor-linux-x64-v${{ steps.linux_version.outputs.version }}.zip" \
@@ -193,6 +202,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ github.event.inputs.release_tag != '' && format('refs/tags/{0}', github.event.inputs.release_tag) || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
