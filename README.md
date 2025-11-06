@@ -17,6 +17,8 @@ TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合�
 - **遙測統計**：計算近 10 分鐘的封包數量、上傳比率、類型分佈（Position / Message / Control）。
 - **跨平台部署**：可自行打包 macOS / Windows / Linux x64 CLI 或 Desktop 版；CLI 同時支援自動重連。
 - **穩定時間戳**：Telemetry 紀錄寫入時會使用收包當下的時間戳，避免裝置 RTC 漂移造成前端區間掛零。
+- **節點資料庫共用**：內建 `nodeDatabase` 集中維護節點長短名、模型、座標等資訊，CLI / Electron / Web 透過 `node`、`node-snapshot` 事件共享同一份資料，節點清單支援座標搜尋與距離顯示。
+- **訊息與 Relay 體驗**：GUI/Web 會持久化 CH0~CH3 文字訊息（含節點暱稱、最後轉發資訊），同時提供 Relay 推測提示 UI，能追蹤候選節點與推測理由。
 
 ---
 
