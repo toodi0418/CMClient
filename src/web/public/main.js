@@ -45,6 +45,7 @@
   const telemetryStatsRecords = document.getElementById('telemetry-stats-records');
   const telemetryStatsNodes = document.getElementById('telemetry-stats-nodes');
   const telemetryStatsDisk = document.getElementById('telemetry-stats-disk');
+  const telemetryDownloadBtn = document.getElementById('telemetry-download-btn');
   const nodesTableWrapper = document.getElementById('nodes-table-wrapper');
   const nodesTableBody = document.getElementById('nodes-table-body');
   const nodesEmptyState = document.getElementById('nodes-empty-state');
@@ -208,6 +209,24 @@
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
+  }
+
+  function escapeCsvValue(value) {
+    if (value === null || value === undefined) return '';
+    const str = String(value);
+    if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  }
+
+  function formatNumericForCsv(value, digits = null) {
+    if (!Number.isFinite(value)) return '';
+    if (digits == null) {
+      return String(value);
+    }
+    const fixed = value.toFixed(digits);
+    return fixed.replace(/0+$/, '').replace(/\.$/, '') || '0';
   }
 
   function setCounter(element, value) {
@@ -1491,6 +1510,10 @@
   telemetryChartMetricSelect?.addEventListener('change', (event) => {
     telemetryChartMetric = event.target.value || null;
     renderTelemetryView();
+  });
+
+  telemetryDownloadBtn?.addEventListener('click', () => {
+    downloadTelemetryCsv();
   });
 
   function isRelayGuessed(summary) {
@@ -3224,6 +3247,10 @@ function ensureRelayGuessSuffix(label, summary) {
     const searchFilteredRecords = filterTelemetryBySearch(filteredRecords);
     const hasData = searchFilteredRecords.length > 0;
     const hasBase = baseRecords.length > 0;
+    if (telemetryDownloadBtn) {
+      telemetryDownloadBtn.disabled = !hasData;
+      telemetryDownloadBtn.title = hasData ? '' : '目前沒有可匯出的遙測資料';
+    }
     telemetryEmptyState.classList.toggle('hidden', hasData);
     if (telemetryTableWrapper) {
       telemetryTableWrapper.classList.toggle('hidden', !hasData);
@@ -3246,6 +3273,115 @@ function ensureRelayGuessSuffix(label, summary) {
     }
     renderTelemetryCharts(searchFilteredRecords);
     renderTelemetryTable(searchFilteredRecords);
+  }
+
+  function downloadTelemetryCsv() {
+    const baseRecords = getTelemetryRecordsForSelection();
+    const filteredRecords = applyTelemetryFilters(baseRecords);
+    const exportRecords = filterTelemetryBySearch(filteredRecords);
+    if (!exportRecords.length) {
+      appendLog({ tag: 'telemetry', message: '目前沒有可匯出的遙測資料' });
+      return;
+    }
+
+    const metricKeysInUse = Object.keys(TELEMETRY_METRIC_DEFINITIONS).filter((key) =>
+      exportRecords.some((record) => record?.telemetry?.metrics?.[key] != null)
+    );
+    const knownMetricKeySet = new Set(metricKeysInUse);
+    const extraMetricKeySet = new Set();
+    for (const record of exportRecords) {
+      const flat = flattenTelemetryMetrics(record.telemetry?.metrics || {});
+      for (const [key] of flat) {
+        if (!key) continue;
+        if (knownMetricKeySet.has(key)) continue;
+        extraMetricKeySet.add(key);
+      }
+    }
+    const extraMetricKeys = Array.from(extraMetricKeySet).sort((a, b) => a.localeCompare(b));
+
+    const header = [
+      '時間 (ISO)',
+      'Unix 秒',
+      'MeshID',
+      '節點',
+      'Channel',
+      'SNR',
+      'RSSI',
+      '詳細',
+      ...metricKeysInUse.map((key) => {
+        const def = TELEMETRY_METRIC_DEFINITIONS[key] || {};
+        const baseLabel = def.label || key;
+        return def.unit ? `${baseLabel} (${def.unit})` : baseLabel;
+      }),
+      ...extraMetricKeys
+    ];
+
+    const rows = exportRecords.map((record) => {
+      const timeMs = Number(record.sampleTimeMs);
+      const isoTime = Number.isFinite(timeMs) ? new Date(timeMs).toISOString() : '';
+      const unixSeconds = Number.isFinite(timeMs) ? Math.floor(timeMs / 1000) : '';
+      const meshId = record.meshId || record.node?.meshId || '';
+      const nodeLabel = record.node
+        ? formatTelemetryNodeLabel(meshId, record.node)
+        : meshId || '未知節點';
+      const channelValue = Number.isFinite(record.channel) ? record.channel : '';
+      const snrValue = formatNumericForCsv(record.snr, 2);
+      const rssiValue = formatNumericForCsv(record.rssi, 0);
+      const detailValue = record.detail || '';
+      const row = [
+        escapeCsvValue(isoTime),
+        escapeCsvValue(unixSeconds),
+        escapeCsvValue(meshId),
+        escapeCsvValue(nodeLabel),
+        escapeCsvValue(channelValue),
+        escapeCsvValue(snrValue),
+        escapeCsvValue(rssiValue),
+        escapeCsvValue(detailValue)
+      ];
+
+      for (const key of metricKeysInUse) {
+        const raw = record.telemetry?.metrics?.[key];
+        const formatted = raw == null ? '' : formatTelemetryValue(key, raw);
+        row.push(escapeCsvValue(formatted));
+      }
+
+      const flatMetrics = new Map(flattenTelemetryMetrics(record.telemetry?.metrics || {}));
+      for (const key of extraMetricKeys) {
+        let value = flatMetrics.has(key) ? flatMetrics.get(key) : '';
+        if (typeof value === 'number') {
+          value = trimTrailingZeros(value.toFixed(2));
+        } else if (typeof value === 'boolean') {
+          value = value ? 'true' : 'false';
+        }
+        row.push(escapeCsvValue(value));
+      }
+
+      return row.join(',');
+    });
+
+    const csvContent = [header.map(escapeCsvValue).join(','), ...rows].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const meshIdLabel =
+      normalizeMeshId(telemetrySelectedMeshId) || telemetrySelectedMeshId || 'telemetry';
+    const safeMeshId = meshIdLabel ? meshIdLabel.replace(/[^0-9a-zA-Z_-]+/g, '') : 'telemetry';
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `telemetry-${safeMeshId || 'export'}-${timestamp}.csv`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const logLabel =
+      telemetryNodeDisplayByMesh.get(telemetrySelectedMeshId || '') ||
+      normalizeMeshId(telemetrySelectedMeshId) ||
+      telemetrySelectedMeshId ||
+      '未選擇節點';
+    appendLog({
+      tag: 'telemetry',
+      message: `已匯出 ${rows.length} 筆遙測資料 (${logLabel})`
+    });
   }
 
   function applyTelemetrySnapshot(snapshot) {

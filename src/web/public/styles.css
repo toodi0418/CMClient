@@ -1184,6 +1184,33 @@ tbody tr:hover {
   font-size: 0.9rem;
 }
 
+.telemetry-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.telemetry-download-btn {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  background: rgba(37, 99, 235, 0.22);
+  color: #bfdbfe;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
+}
+
+.telemetry-download-btn:hover {
+  background: rgba(37, 99, 235, 0.35);
+  border-color: rgba(96, 165, 250, 0.6);
+}
+
+.telemetry-download-btn:active {
+  transform: translateY(1px);
+}
+
 .telemetry-stat {
   display: flex;
   flex-direction: column;

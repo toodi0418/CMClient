@@ -114,6 +114,7 @@ const telemetryRangeStartInput = document.getElementById('telemetry-range-start'
 const telemetryRangeEndInput = document.getElementById('telemetry-range-end');
 const telemetryChartModeSelect = document.getElementById('telemetry-chart-mode');
 const telemetryChartMetricSelect = document.getElementById('telemetry-chart-metric');
+const telemetryDownloadBtn = document.getElementById('telemetry-download-btn');
 const telemetryClearBtn = document.getElementById('telemetry-clear-btn');
 const telemetryStatsRecords = document.getElementById('telemetry-stats-records');
 const telemetryStatsNodes = document.getElementById('telemetry-stats-nodes');
@@ -1616,6 +1617,10 @@ downloadLogBtn?.addEventListener('click', () => {
   appendLog('APP', '日誌已下載');
 });
 
+telemetryDownloadBtn?.addEventListener('click', () => {
+  downloadTelemetryCsv();
+});
+
 telemetryClearBtn?.addEventListener('click', async () => {
   if (!window.meshtastic.clearTelemetry) {
     appendLog('APP', '目前無法清空遙測資料：功能未初始化');
@@ -2607,6 +2612,115 @@ function escapeCsvValue(value) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
+}
+
+function downloadTelemetryCsv() {
+  const baseRecords = getTelemetryRecordsForSelection();
+  const filteredRecords = applyTelemetryFilters(baseRecords);
+  const exportRecords = filterTelemetryBySearch(filteredRecords);
+  if (!exportRecords.length) {
+    appendLog('TELEMETRY', '目前沒有可匯出的遙測資料');
+    return;
+  }
+
+  const metricKeysInUse = Object.keys(TELEMETRY_METRIC_DEFINITIONS).filter((key) =>
+    exportRecords.some((record) => record?.telemetry?.metrics?.[key] != null)
+  );
+  const knownMetricKeySet = new Set(metricKeysInUse);
+  const extraMetricKeySet = new Set();
+  for (const record of exportRecords) {
+    const flat = flattenTelemetryMetrics(record.telemetry?.metrics || {});
+    for (const [key] of flat) {
+      if (!key) continue;
+      if (knownMetricKeySet.has(key)) continue;
+      extraMetricKeySet.add(key);
+    }
+  }
+  const extraMetricKeys = Array.from(extraMetricKeySet).sort((a, b) => a.localeCompare(b));
+
+  const header = [
+    '時間 (ISO)',
+    'Unix 秒',
+    'MeshID',
+    '節點',
+    'Channel',
+    'SNR',
+    'RSSI',
+    '詳細',
+    ...metricKeysInUse.map((key) => {
+      const def = TELEMETRY_METRIC_DEFINITIONS[key] || {};
+      const baseLabel = def.label || key;
+      return def.unit ? `${baseLabel} (${def.unit})` : baseLabel;
+    }),
+    ...extraMetricKeys
+  ];
+
+  const rows = exportRecords.map((record) => {
+    const timeMs = Number(record.sampleTimeMs);
+    const isoTime = Number.isFinite(timeMs) ? new Date(timeMs).toISOString() : '';
+    const unixSeconds = Number.isFinite(timeMs) ? Math.floor(timeMs / 1000) : '';
+    const node = record.node || {};
+    const nodeLabel =
+      node.label ||
+      node.longName ||
+      node.shortName ||
+      record.meshId ||
+      node.meshId ||
+      '';
+    const channelValue = Number.isFinite(record.channel) ? record.channel : '';
+    const snrValue = formatNumericForCsv(record.snr, 2);
+    const rssiValue = formatNumericForCsv(record.rssi, 0);
+    const detailValue = record.detail || '';
+    const row = [
+      escapeCsvValue(isoTime),
+      escapeCsvValue(unixSeconds),
+      escapeCsvValue(record.meshId || node.meshId || ''),
+      escapeCsvValue(nodeLabel),
+      escapeCsvValue(channelValue),
+      escapeCsvValue(snrValue),
+      escapeCsvValue(rssiValue),
+      escapeCsvValue(detailValue)
+    ];
+
+    for (const key of metricKeysInUse) {
+      const raw = record.telemetry?.metrics?.[key];
+      const formatted = raw == null ? '' : formatTelemetryValue(key, raw);
+      row.push(escapeCsvValue(formatted));
+    }
+
+    const flatMetrics = new Map(flattenTelemetryMetrics(record.telemetry?.metrics || {}));
+    for (const key of extraMetricKeys) {
+      let value = flatMetrics.has(key) ? flatMetrics.get(key) : '';
+      if (typeof value === 'number') {
+        value = trimTrailingZeros(value.toFixed(2));
+      } else if (typeof value === 'boolean') {
+        value = value ? 'true' : 'false';
+      }
+      row.push(escapeCsvValue(value));
+    }
+
+    return row.join(',');
+  });
+
+  const csvContent = [header.map(escapeCsvValue).join(','), ...rows].join('\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const meshIdLabel = normalizeMeshId(telemetrySelectedMeshId) || telemetrySelectedMeshId || 'telemetry';
+  const safeMeshId = meshIdLabel ? meshIdLabel.replace(/[^0-9a-zA-Z_-]+/g, '') : 'telemetry';
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `telemetry-${safeMeshId || 'export'}-${timestamp}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const logLabel =
+    telemetryNodeDisplayByMesh.get(telemetrySelectedMeshId || '') ||
+    normalizeMeshId(telemetrySelectedMeshId) ||
+    telemetrySelectedMeshId ||
+    '未選擇節點';
+  appendLog('TELEMETRY', `已匯出 ${rows.length} 筆遙測資料 (${logLabel})`);
 }
 
 function downloadFlowCsv() {
