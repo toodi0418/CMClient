@@ -18,6 +18,7 @@
 - **訊息來源名稱對齊節點資料庫**：儲存的文字訊息會帶入節點 Mesh ID，重新載入時會回查節點資料庫補齊長短名，避免僅顯示 Mesh ID。
 - **最後轉發推測升級**：`meshtasticClient` 會比對 `relay-link-stats.json` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
 - **Relay 提示 UI**：CLI/Electron/Web 均以圓形 `?` 按鈕提示推測結果；桌面與 Web 啟用半透明 Modal 顯示推測原因、候選節點與 Mesh ID。
+- **TENMANMAP 轉發管線**：`CallMeshAprsBridge` 支援以 WebSocket 將指定節點位置上傳至 TENMANMAP 服務，具備驗證、白名單、佇列與自動重連機制。
 - **遙測時間戳統一**：所有 Telemetry 紀錄寫入時都會以收包當下的時間 (`timestampMs`) 為準，同步更新 `sampleTime*` 與 `telemetry.time*` 欄位，避免裝置 RTC 漂移造成前端區間掛零。
 - **CLI 旗標**：預設關閉 Web UI；若需啟動可加上 `--web-ui`。Electron 亦可透過設定頁切換，或以 `TMAG_WEB_DASHBOARD` 強制指定。
 
@@ -115,6 +116,10 @@ CMClient/
     - 事件透過 `bridge.emit('telemetry')` 推播給 Electron / Web Dashboard，類型分為 `append` 與 `reset`；
     - 預設每節點僅保留 500 筆最新紀錄（避免佔用過多記憶體），但 JSONL 會完整累積，以便跨重啟保留歷史；
     - 同步回傳 `stats`（筆數、節點數、JSONL 檔案大小），前端可直接顯示。
+  - TENMANMAP 位置轉發：
+    - 以 `TENMAN_WS_URL`、`TENMAN_GATEWAY_ID`、`TENMAN_NODE_IDS`、`TENMAN_API_KEY` 控制 WebSocket 端點、驗證與節點白名單；
+    - 佇列上限 `TENMAN_FORWARD_QUEUE_LIMIT`（預設 64），溢出會捨棄最舊 publish；
+    - 失敗自動延遲 5 秒重試，驗證成功後才會推送位置，缺少 Key 會在 Log 標示。
 
 ### 3.3 節點資料庫 (`src/nodeDatabase.js`)
 - 採用 `Map` 快取 Mesh 節點資訊，索引鍵為正規化後的 `meshId`（`!xxxxxxxx`）。
