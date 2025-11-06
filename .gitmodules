@@ -1,0 +1,7 @@
+[submodule "meshtastic"]
+	path = meshtastic
+	url = https://github.com/meshtastic/meshtastic.git
+[submodule "meshtastic-device"]
+	path = meshtastic-device
+	url = https://github.com/meshtastic/meshtastic-device.git
+
