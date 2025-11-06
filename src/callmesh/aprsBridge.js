@@ -2244,6 +2244,23 @@ class CallMeshAprsBridge extends EventEmitter {
       this.nodeDatabase.get(meshId),
       { meshId }
     );
+    const relayFields = prepareTelemetryRelayFields(cloned);
+    cloned.relay = relayFields.relay;
+    cloned.relayLabel = relayFields.relayLabel;
+    cloned.relayMeshId = relayFields.relayMeshId;
+    cloned.relayMeshIdNormalized = relayFields.relayMeshIdNormalized;
+    cloned.relayGuessed = relayFields.relayGuessed;
+    cloned.relayGuessReason = relayFields.relayGuessReason;
+    const hopFields = prepareTelemetryHopsFields({
+      hops: cloned.hops,
+      hopsLabel: cloned.hopsLabel,
+      hopsStart: cloned.hops?.start ?? cloned.hopsStart,
+      hopsLimit: cloned.hops?.limit ?? cloned.hopsLimit
+    });
+    cloned.hops = hopFields.hops;
+    cloned.hopsLabel = hopFields.hopsLabel;
+    cloned.hopsUsed = hopFields.hopsUsed;
+    cloned.hopsTotal = hopFields.hopsTotal;
     return cloned;
   }
 
@@ -2273,6 +2290,15 @@ class CallMeshAprsBridge extends EventEmitter {
       { meshId }
     );
     const recordId = `${meshId}-${baseTimestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+    const relayFields = prepareTelemetryRelayFields({
+      relay: summary.relay,
+      relayMeshId: summary.relayMeshId,
+      relayMeshIdNormalized: summary.relayMeshIdNormalized,
+      relayLabel: summary.relay?.label,
+      relayGuess: summary.relayGuess,
+      relayGuessReason: summary.relayGuessReason
+    });
+    const hopFields = prepareTelemetryHopsFields(summary.hops);
 
     return {
       id: recordId,
@@ -2288,6 +2314,16 @@ class CallMeshAprsBridge extends EventEmitter {
       snr: Number.isFinite(summary.snr) ? summary.snr : null,
       rssi: Number.isFinite(summary.rssi) ? summary.rssi : null,
       flowId: summary.flowId || null,
+      relay: relayFields.relay,
+      relayLabel: relayFields.relayLabel,
+      relayMeshId: relayFields.relayMeshId,
+      relayMeshIdNormalized: relayFields.relayMeshIdNormalized,
+      relayGuessed: relayFields.relayGuessed,
+      relayGuessReason: relayFields.relayGuessReason,
+      hops: hopFields.hops,
+      hopsLabel: hopFields.hopsLabel,
+      hopsUsed: hopFields.hopsUsed,
+      hopsTotal: hopFields.hopsTotal,
       telemetry: {
         kind: telemetry.kind || 'unknown',
         timeSeconds: Number.isFinite(sampleTimeMs) ? Math.floor(sampleTimeMs / 1000) : null,
@@ -2647,6 +2683,182 @@ function mergeNodeInfo(...sources) {
   return result;
 }
 
+function prepareTelemetryRelayFields(source) {
+  const relaySource = source?.relay && typeof source.relay === 'object' ? source.relay : null;
+  const baseRelay = extractTelemetryNode(relaySource);
+  const meshCandidates = [
+    source?.relayMeshId,
+    source?.relayMeshIdNormalized,
+    relaySource?.meshId,
+    relaySource?.meshIdNormalized,
+    baseRelay?.meshId,
+    baseRelay?.meshIdNormalized
+  ].filter(Boolean);
+  let meshIdNormalized = null;
+  let meshIdRaw = null;
+  for (const candidate of meshCandidates) {
+    const normalized = normalizeMeshId(candidate);
+    if (!normalized) continue;
+    if (!meshIdNormalized) {
+      meshIdNormalized = normalized;
+    }
+    if (!meshIdRaw) {
+      const candidateStr = String(candidate);
+      meshIdRaw =
+        candidateStr.startsWith('!') || candidateStr.toLowerCase().startsWith('0x')
+          ? normalized
+          : candidateStr;
+    }
+  }
+  if (!meshIdRaw && meshIdNormalized) {
+    meshIdRaw = meshIdNormalized;
+  }
+  const labelCandidates = [
+    typeof source?.relayLabel === 'string' ? source.relayLabel.trim() : '',
+    typeof relaySource?.label === 'string' ? relaySource.label.trim() : '',
+    baseRelay?.label ?? ''
+  ];
+  const relayLabel = labelCandidates.find((value) => value) || '';
+  const guessedFlag =
+    source?.relayGuessed ??
+    source?.relayGuess ??
+    relaySource?.guessed ??
+    false;
+  const relayReason =
+    source?.relayGuessReason ??
+    relaySource?.reason ??
+    relaySource?.guessReason ??
+    null;
+
+  let relay = null;
+  if (baseRelay || meshIdRaw || meshIdNormalized || relayLabel) {
+    relay = mergeNodeInfo(baseRelay, {
+      meshId: meshIdRaw || meshIdNormalized || null,
+      meshIdNormalized: meshIdNormalized || null,
+      label: relayLabel || null
+    });
+    if (relay) {
+      if (!relay.label) {
+        relay.label = buildNodeLabel(relay);
+      }
+      relay.guessed = Boolean(guessedFlag);
+      if (relayReason) {
+        relay.guessReason = relayReason;
+      } else {
+        delete relay.guessReason;
+      }
+    } else if (relayLabel || meshIdRaw || meshIdNormalized) {
+      relay = {
+        label: relayLabel || null,
+        meshId: meshIdRaw || meshIdNormalized || null,
+        meshIdNormalized: meshIdNormalized || null,
+        guessed: Boolean(guessedFlag)
+      };
+      if (relayReason) {
+        relay.guessReason = relayReason;
+      }
+    }
+  }
+
+  return {
+    relay: relay || null,
+    relayLabel: (relay && relay.label) || relayLabel || null,
+    relayMeshId: (relay && relay.meshId) || meshIdRaw || meshIdNormalized || null,
+    relayMeshIdNormalized: (relay && relay.meshIdNormalized) || meshIdNormalized || null,
+    relayGuessed: Boolean(guessedFlag) && Boolean(relayLabel || meshIdRaw || meshIdNormalized),
+    relayGuessReason: relayReason || (relay && relay.guessReason) || null
+  };
+}
+
+function deriveHopUsage({ start, limit, label }) {
+  let used = null;
+  let total = Number.isFinite(start) ? start : null;
+
+  if (Number.isFinite(start) && Number.isFinite(limit)) {
+    used = Math.max(start - limit, 0);
+  } else if (label) {
+    const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
+    if (match) {
+      used = Number(match[1]);
+      if (!Number.isFinite(total)) {
+        total = Number(match[2]);
+      }
+    } else if (/^\d+$/.test(label)) {
+      used = 0;
+      if (!Number.isFinite(total)) {
+        total = Number(label);
+      }
+    }
+    if (!Number.isFinite(total)) {
+      const totalMatch = label.match(/\/\s*(\d+)/);
+      if (totalMatch) {
+        total = Number(totalMatch[1]);
+      }
+    }
+  }
+
+  return {
+    used: Number.isFinite(used) ? used : null,
+    total: Number.isFinite(total) ? total : null
+  };
+}
+
+function prepareTelemetryHopsFields(source) {
+  const hopSource = source && typeof source === 'object'
+    ? source.hops && typeof source.hops === 'object'
+      ? source.hops
+      : source
+    : null;
+  const startRaw = Number(hopSource?.start);
+  const startCandidate = Number.isFinite(startRaw)
+    ? startRaw
+    : Number.isFinite(Number(source?.hopsStart))
+      ? Number(source.hopsStart)
+      : null;
+  const limitRaw = Number(hopSource?.limit);
+  const limitCandidate = Number.isFinite(limitRaw)
+    ? limitRaw
+    : Number.isFinite(Number(source?.hopsLimit))
+      ? Number(source.hopsLimit)
+      : null;
+  const labelCandidateRaw =
+    (typeof hopSource?.label === 'string' && hopSource.label.trim()) ||
+    (typeof source?.hopsLabel === 'string' && source.hopsLabel.trim()) ||
+    '';
+  const labelCandidate = labelCandidateRaw || null;
+  const { used, total } = deriveHopUsage({
+    start: startCandidate,
+    limit: limitCandidate,
+    label: labelCandidate || ''
+  });
+
+  if (
+    startCandidate == null &&
+    limitCandidate == null &&
+    !labelCandidate &&
+    used == null &&
+    total == null
+  ) {
+    return {
+      hops: null,
+      hopsLabel: null,
+      hopsUsed: null,
+      hopsTotal: null
+    };
+  }
+
+  return {
+    hops: {
+      start: Number.isFinite(startCandidate) ? startCandidate : null,
+      limit: Number.isFinite(limitCandidate) ? limitCandidate : null,
+      label: labelCandidate
+    },
+    hopsLabel: labelCandidate,
+    hopsUsed: used,
+    hopsTotal: total
+  };
+}
+
 function deepCloneTelemetryValue(value) {
   if (value == null) {
     return value;
@@ -2678,6 +2890,8 @@ function cloneTelemetryRecord(record) {
   return {
     ...record,
     node: record.node ? { ...record.node } : null,
+    relay: record.relay ? { ...record.relay } : null,
+    hops: record.hops ? { ...record.hops } : null,
     telemetry: record.telemetry
       ? {
           ...record.telemetry,

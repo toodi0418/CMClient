@@ -2668,10 +2668,32 @@ function ensureRelayGuessSuffix(label, summary) {
     const node = record.node || {};
     haystack.push(node.label, node.longName, node.shortName, node.hwModelLabel, node.roleLabel);
     haystack.push(record.meshId, node.meshId, node.meshIdOriginal, node.meshIdNormalized);
+    const relay = record.relay || {};
+    haystack.push(
+      record.relayLabel,
+      record.relayMeshId,
+      record.relayMeshIdNormalized,
+      relay.label,
+      relay.longName,
+      relay.shortName
+    );
+    if (record.relayGuessReason) {
+      haystack.push(record.relayGuessReason);
+    }
     if (record.detail) haystack.push(record.detail);
     if (record.channel != null) haystack.push(`ch ${record.channel}`);
     if (Number.isFinite(record.snr)) haystack.push(`snr ${record.snr}`);
     if (Number.isFinite(record.rssi)) haystack.push(`rssi ${record.rssi}`);
+    if (record.hopsLabel) {
+      haystack.push(record.hopsLabel);
+    }
+    if (Number.isFinite(record.hopsUsed)) {
+      haystack.push(`hops ${record.hopsUsed}`);
+    }
+    if (Number.isFinite(record.hopsTotal)) {
+      haystack.push(`hops ${record.hopsUsed}/${record.hopsTotal}`);
+      haystack.push(String(record.hopsTotal));
+    }
     const summary = formatTelemetrySummary(record);
     if (summary && summary !== '—') {
       haystack.push(summary);
@@ -3073,6 +3095,43 @@ function ensureRelayGuessSuffix(label, summary) {
     return '—';
   }
 
+  function buildTelemetryRelayDescriptor(record) {
+    if (!record) return null;
+    const relay = record.relay || {};
+    const label =
+      (typeof record.relayLabel === 'string' && record.relayLabel.trim()) ||
+      (typeof relay.label === 'string' && relay.label.trim()) ||
+      (typeof relay.longName === 'string' && relay.longName.trim()) ||
+      (typeof relay.shortName === 'string' && relay.shortName.trim()) ||
+      (typeof record.relayMeshId === 'string' && record.relayMeshId.trim()) ||
+      (typeof record.relayMeshIdNormalized === 'string' && record.relayMeshIdNormalized.trim()) ||
+      '';
+    if (!label) {
+      return null;
+    }
+    const guessed = Boolean(record.relayGuessed || relay.guessed);
+    return guessed ? `${label} (?)` : label;
+  }
+
+  function buildTelemetryHopsDescriptor(record) {
+    if (!record) return null;
+    if (Number.isFinite(record.hopsUsed) && Number.isFinite(record.hopsTotal)) {
+      return `${record.hopsUsed}/${record.hopsTotal}`;
+    }
+    if (Number.isFinite(record.hopsUsed)) {
+      return String(record.hopsUsed);
+    }
+    if (typeof record.hopsLabel === 'string' && record.hopsLabel.trim()) {
+      return record.hopsLabel.trim();
+    }
+    const hops = record.hops || {};
+    if (Number.isFinite(hops.start) && Number.isFinite(hops.limit)) {
+      const used = Math.max(hops.start - hops.limit, 0);
+      return `${used}/${hops.start}`;
+    }
+    return null;
+  }
+
   function formatTelemetryExtra(record) {
     const extras = [];
     if (record.channel != null) {
@@ -3083,6 +3142,14 @@ function ensureRelayGuessSuffix(label, summary) {
     }
     if (Number.isFinite(record.rssi)) {
       extras.push(`RSSI ${trimTrailingZeros(record.rssi.toFixed(0))}`);
+    }
+    const relayDescriptor = buildTelemetryRelayDescriptor(record);
+    if (relayDescriptor) {
+      extras.push(`Relay ${relayDescriptor}`);
+    }
+    const hopsDescriptor = buildTelemetryHopsDescriptor(record);
+    if (hopsDescriptor) {
+      extras.push(`Hops ${hopsDescriptor}`);
     }
     const metrics = record.telemetry?.metrics || {};
     const knownKeys = new Set(Object.keys(TELEMETRY_METRIC_DEFINITIONS));
@@ -3308,6 +3375,13 @@ function ensureRelayGuessSuffix(label, summary) {
       'SNR',
       'RSSI',
       '詳細',
+      '最後轉發',
+      '最後轉發 MeshID',
+      '最後轉發為推測',
+      '最後轉發說明',
+      '跳數',
+      'Hop Start',
+      'Hop Limit',
       ...metricKeysInUse.map((key) => {
         const def = TELEMETRY_METRIC_DEFINITIONS[key] || {};
         const baseLabel = def.label || key;
@@ -3328,6 +3402,22 @@ function ensureRelayGuessSuffix(label, summary) {
       const snrValue = formatNumericForCsv(record.snr, 2);
       const rssiValue = formatNumericForCsv(record.rssi, 0);
       const detailValue = record.detail || '';
+      const relayDescriptor = buildTelemetryRelayDescriptor(record) || '';
+      const relayMeshValue =
+        record.relayMeshId ||
+        record.relayMeshIdNormalized ||
+        record.relay?.meshId ||
+        record.relay?.meshIdNormalized ||
+        '';
+      const relayGuessFlag = record.relayGuessed ? 'true' : '';
+      const relayReason = record.relayGuessReason || '';
+      const hopsDescriptor =
+        buildTelemetryHopsDescriptor(record) ||
+        (record.hopsLabel || '');
+      const hopStart =
+        Number.isFinite(record.hops?.start) ? record.hops.start : '';
+      const hopLimit =
+        Number.isFinite(record.hops?.limit) ? record.hops.limit : '';
       const row = [
         escapeCsvValue(isoTime),
         escapeCsvValue(unixSeconds),
@@ -3336,7 +3426,14 @@ function ensureRelayGuessSuffix(label, summary) {
         escapeCsvValue(channelValue),
         escapeCsvValue(snrValue),
         escapeCsvValue(rssiValue),
-        escapeCsvValue(detailValue)
+        escapeCsvValue(detailValue),
+        escapeCsvValue(relayDescriptor),
+        escapeCsvValue(relayMeshValue),
+        escapeCsvValue(relayGuessFlag),
+        escapeCsvValue(relayReason),
+        escapeCsvValue(hopsDescriptor),
+        escapeCsvValue(hopStart),
+        escapeCsvValue(hopLimit)
       ];
 
       for (const key of metricKeysInUse) {
