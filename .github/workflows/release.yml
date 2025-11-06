@@ -1,0 +1,240 @@
+name: Build & Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  NODE_VERSION: 20
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create release if needed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 && exit 0
+          gh release create "$TAG_NAME" --verify-tag --generate-notes
+
+  build-macos:
+    name: Build macOS Assets
+    needs: create-release
+    runs-on: macos-13
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build macOS CLI
+        run: npm run build:mac-cli
+
+      - name: Build macOS GUI
+        run: |
+          npx electron-packager . "TMAG Monitor" \
+            --platform=darwin \
+            --arch=x64 \
+            --out dist \
+            --overwrite \
+            --prune=true
+
+      - name: Determine version
+        id: mac_version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package macOS GUI
+        run: |
+          app_path="dist/TMAG Monitor-darwin-x64/TMAG Monitor.app"
+          if [ ! -d "$app_path" ]; then
+            echo "App bundle not found: $app_path" >&2
+            exit 1
+          fi
+          output_zip="dist/TMAG_Monitor-macOS-x64-v${{ steps.mac_version.outputs.version }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$output_zip"
+
+      - name: Package macOS CLI
+        run: |
+          cli_path="dist/cli/tmag-cli"
+          if [ ! -f "$cli_path" ]; then
+            echo "CLI executable not found: $cli_path" >&2
+            exit 1
+          fi
+          mkdir -p dist/artifacts
+          cp "$cli_path" "dist/artifacts/tmag-cli-macos-x64"
+          (cd dist/artifacts && zip -9 "tmag-cli-macos-x64-v${{ steps.mac_version.outputs.version }}.zip" "tmag-cli-macos-x64")
+
+      - name: Upload macOS assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG_NAME" \
+            "dist/TMAG_Monitor-macOS-x64-v${{ steps.mac_version.outputs.version }}.zip" \
+            "dist/artifacts/tmag-cli-macos-x64-v${{ steps.mac_version.outputs.version }}.zip" \
+            --clobber
+
+  build-linux:
+    name: Build Linux Assets
+    needs: create-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Linux GUI
+        run: |
+          npx electron-packager . "TMAG Monitor" \
+            --platform=linux \
+            --arch=x64 \
+            --out dist \
+            --overwrite \
+            --prune=true
+
+      - name: Build Linux CLI (x64)
+        run: |
+          mkdir -p dist/cli
+          npx pkg src/index.js \
+            --config package.json \
+            --targets node18-linux-x64 \
+            --compress Brotli \
+            --public \
+            --output dist/cli/tmag-cli-linux-x64
+
+      - name: Build Linux CLI (arm64)
+        run: |
+          mkdir -p dist/cli
+          npx pkg src/index.js \
+            --config package.json \
+            --targets node18-linux-arm64 \
+            --compress Brotli \
+            --public \
+            --output dist/cli/tmag-cli-linux-arm64
+
+      - name: Determine version
+        id: linux_version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package Linux assets
+        run: |
+          set -e
+          version="${{ steps.linux_version.outputs.version }}"
+          gui_dir="TMAG Monitor-linux-x64"
+          if [ ! -d "dist/$gui_dir" ]; then
+            echo "Linux GUI directory not found: dist/$gui_dir" >&2
+            exit 1
+          fi
+          (cd dist && zip -9 -r "TMAG_Monitor-linux-x64-v${version}.zip" "$gui_dir")
+          for target in linux-x64 linux-arm64; do
+            cli_path="dist/cli/tmag-cli-${target}"
+            if [ ! -f "$cli_path" ]; then
+              echo "CLI binary missing: $cli_path" >&2
+              exit 1
+            fi
+            (cd dist/cli && zip -9 "tmag-cli-${target}-v${version}.zip" "tmag-cli-${target}")
+          done
+
+      - name: Upload Linux assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG_NAME" \
+            "dist/TMAG_Monitor-linux-x64-v${{ steps.linux_version.outputs.version }}.zip" \
+            "dist/cli/tmag-cli-linux-x64-v${{ steps.linux_version.outputs.version }}.zip" \
+            "dist/cli/tmag-cli-linux-arm64-v${{ steps.linux_version.outputs.version }}.zip" \
+            --clobber
+
+  build-windows:
+    name: Build Windows Assets
+    needs: create-release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        shell: powershell
+
+      - name: Build Windows GUI
+        run: npm run build:win
+        shell: powershell
+
+      - name: Build Windows CLI
+        run: |
+          if (-not (Test-Path dist\cli)) { New-Item -ItemType Directory -Path dist\cli | Out-Null }
+          npx pkg src/index.js `
+            --config package.json `
+            --targets node18-win-x64 `
+            --compress Brotli `
+            --public `
+            --output dist/cli/tmag-cli-win-x64.exe
+        shell: powershell
+
+      - name: Determine version
+        id: win_version
+        shell: powershell
+        run: |
+          $packageJson = Get-Content package.json -Raw | ConvertFrom-Json
+          $version = $packageJson.version
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Package Windows assets
+        shell: powershell
+        run: |
+          $version = "${{ steps.win_version.outputs.version }}"
+          $guiZip = "dist/TMAG_Monitor-v${version}-win32-x64.zip"
+          if (-not (Test-Path $guiZip)) { throw "Windows GUI zip not found: $guiZip" }
+          $cliPath = "dist/cli/tmag-cli-win-x64.exe"
+          if (-not (Test-Path $cliPath)) { throw "Windows CLI exe not found: $cliPath" }
+          Compress-Archive -Path $cliPath -DestinationPath ("dist/cli/tmag-cli-win-x64-v" + $version + ".zip") -Force
+
+      - name: Upload Windows assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release upload "$env:TAG_NAME" `
+            "dist/TMAG_Monitor-v${{ steps.win_version.outputs.version }}-win32-x64.zip" `
+            "dist/cli/tmag-cli-win-x64-v${{ steps.win_version.outputs.version }}.zip" `
+            --clobber
+        shell: powershell
+
