@@ -18,6 +18,7 @@
 - **訊息來源名稱對齊節點資料庫**：儲存的文字訊息會帶入節點 Mesh ID，重新載入時會回查節點資料庫補齊長短名，避免僅顯示 Mesh ID。
 - **最後轉發推測升級**：`meshtasticClient` 會比對 `relay-link-stats.json` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
 - **Relay 提示 UI**：CLI/Electron/Web 均以圓形 `?` 按鈕提示推測結果；桌面與 Web 啟用半透明 Modal 顯示推測原因、候選節點與 Mesh ID。
+- **遙測時間戳統一**：所有 Telemetry 紀錄寫入時都會以收包當下的時間 (`timestampMs`) 為準，同步更新 `sampleTime*` 與 `telemetry.time*` 欄位，避免裝置 RTC 漂移造成前端區間掛零。
 - **CLI 旗標**：預設關閉 Web UI；若需啟動可加上 `--web-ui`。Electron 亦可透過設定頁切換，或以 `TMAG_WEB_DASHBOARD` 強制指定。
 
 ## 1. 專案定位與核心價值
@@ -188,11 +189,12 @@ CMClient/
 - Telemetry 事件會透過 IPC/SSE 推播至 Electron Renderer 與 Web Dashboard：
   - `telemetry:type=append`：即時新增單筆並附上節點資訊；
   - `telemetry:type=reset`：資料被清除時，通知前端刷新。
-- 自家節點的遙測僅在「最後轉發」仍為 Self 時才忽略；若由其他節點轉發（非 Self），即使來源是自家節點也會寫入資料庫。
+- 所有遙測封包（包含自家節點）都會寫入資料庫，並以 **收到封包當下的時間** 標記 `timestampMs` / `sampleTimeMs` / `telemetry.timeMs`，避免裝置 RTC 漂移導致前端找不到資料。
 - 目前支援的量測包含 `batteryLevel`、`voltage`、`channelUtilization`、`airUtilTx`、`temperature`、`relativeHumidity`、`barometricPressure` 等（其餘欄位會以 `metrics.*` 原樣保留）。
 - 事件 payload 會附帶統計資訊：`totalRecords`、`totalNodes`、`diskBytes`。GUI 與 Web 直接顯示，不需自行計算。
 - Telemetry 記錄內的節點欄位會與節點資料庫合併，確保長名稱及模型資訊一致。
 - GUI 端節點輸入框同時充當搜尋欄位：輸入任意關鍵字時會保留原先節點選擇並使用文字篩選 Chart/Table；選取 datalist 項目則會直接切換節點並重置搜尋。
+- 若需校正舊檔（早期使用裝置回報時間的紀錄），可執行 `node scripts/fix-telemetry-timestamps.js <path/to/telemetry-records.jsonl>` 將所有 `sampleTime*` / `telemetry.time*` 欄位同步到相對應的 `timestampMs`，原檔會留下 `.bak` 備份。
 
 ### 3.9 節點資料庫（Node Database）
 - 透過 `src/nodeDatabase.js` 單例集中管理節點資訊，Electron / Web / CLI 共用。
@@ -355,6 +357,7 @@ npx pkg src/index.js --targets node18-linux-x64
       - 遙測節點輸入框在「選取節點」與「純搜尋」兩種使用方式下渲染結果是否一致
 9. **遙測資料**
   - 若需清空歷史記錄，請使用 GUI/Web 的「清空遙測數據」或手動刪除 `callmesh/telemetry-records.jsonl`；
+  - 若需保留舊檔但將舊資料的時間戳對齊收包時間，可在專案根目錄執行 `node scripts/fix-telemetry-timestamps.js ~/.config/callmesh/telemetry-records.jsonl`（會產生 `.bak` 備份後再覆寫原檔）；
   - 調整每節點快取上限可修改 `CallMeshAprsBridge` 建構子參數 `telemetryMaxEntriesPerNode`；
   - 若要顯示額外統計欄位，請從 Bridge `getTelemetryStats()` 擴充，並同步更新 Electron/Web 的顯示邏輯。
 
@@ -368,7 +371,7 @@ npx pkg src/index.js --targets node18-linux-x64
 | APRS 已上傳但未變色 | 檢查 Flow 是否有 `flowId`、`aprs-uplink` 是否回報。同時確認 `flowAprsCallsigns` 是否被清空。 |
 | Web Dashboard port 被占用 | 調整 `TMAG_WEB_PORT`，或先停用其它應用；若需完全關閉 Web Dashboard，可設 `TMAG_WEB_DASHBOARD=0`。 |
 | CallMesh Key 被鎖 | 使用設定頁「重置本地資料」或刪除 `~/<userData>/callmesh/` 目錄，再重新輸入 Key。 |
-| 遙測圖表沒有資料 | 確認選擇的時間區間內有紀錄；若僅存在歷史資料，請切換至符合的日/週/月/年或自訂時間。 |
+| 遙測圖表沒有資料 | 確認選擇的時間區間內有紀錄；若僅存在歷史資料，請切換至符合的日/週/月/年或自訂時間，或使用 `scripts/fix-telemetry-timestamps.js` 將舊紀錄對齊收包時間。 |
 | Telemetry JSONL 長期成長 | 可定期歸檔或壓縮 `telemetry-records.jsonl`，必要時調整 `telemetryMaxEntriesPerNode` 限制。 |
 | Chart.js 未載入 | 確保 `node_modules/chart.js/dist/chart.umd.js` 存在；若 `desktop` 包裝成可攜版，記得把整個 `node_modules/chart.js` 併入發佈資產。 |
 | 節點名稱仍顯示 MeshID | 確認 `node` / `node-snapshot` 事件是否正常送達；若 API Key 尚未驗證或節點尚未回報 `nodeInfo`，會暫時只顯示 MeshID。 |
