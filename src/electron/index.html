@@ -239,23 +239,23 @@
               </select>
               <button type="button" id="serial-refresh-btn">重新整理</button>
             </div>
-            <small class="callmesh-hint">若列表為空，可確認裝置是否已連線，或手動輸入路徑。</small>
+            <small class="callmesh-hint">若列表為空，請確認裝置已連線後再按重新整理。</small>
             <small id="serial-status" class="discover-status"></small>
           </div>
-          <div class="fieldset">
-            <label for="settings-host">Meshtastic 目標</label>
+          <div class="fieldset" id="settings-host-fieldset">
+            <label for="settings-host" id="settings-host-label">Meshtastic 目標</label>
             <div class="host-row">
               <input
                 id="settings-host"
                 name="settingsHost"
                 type="text"
-                placeholder="輸入節點 IP 或 serial:///裝置路徑"
+                placeholder="輸入節點 IP"
                 required
               />
               <button type="button" id="discover-btn">自動搜尋</button>
             </div>
-            <small class="callmesh-hint">
-              TCP 模式輸入 IP（例如 192.168.1.50）；Serial 模式可從上方清單選擇或輸入路徑（例如 serial:///dev/ttyUSB0）。
+            <small class="callmesh-hint" id="settings-host-hint">
+              TCP 模式輸入 IP（例如 192.168.1.50）；Serial 模式請從上方清單選擇裝置，系統會自動套用。
             </small>
             <small id="discover-status" class="discover-status"></small>
           </div>
@@ -283,6 +283,13 @@
               <span>啟用 Web UI</span>
             </label>
             <small class="callmesh-hint">預設關閉，啟用後會啟動內建 Web Dashboard</small>
+          </div>
+          <div class="fieldset tenman-privacy">
+            <label class="toggle-row">
+              <input id="tenman-share-enabled" type="checkbox" checked />
+              <span class="muted-text">允許與 TenManMap 及合作夥伴分享資料</span>
+            </label>
+            <small class="callmesh-hint muted-hint">不建議停用，僅在特殊需求時取消。</small>
           </div>
           <button type="button" id="reset-data-btn" class="danger-btn">重置所有資料</button>
         </section>
@@ -408,7 +415,7 @@
         </div>
         <div id="overlay-step-host" class="overlay-step hidden">
           <h2>設定 Meshtastic 連線</h2>
-          <p>請輸入節點 IP，或使用 <code>serial:///</code> 路徑連線至裝置（Serial 模式不支援自動搜尋）。</p>
+          <p>請輸入節點 IP，或在 Serial 模式下從清單選擇裝置（Serial 模式不支援自動搜尋）。</p>
           <div class="overlay-input-group">
             <label for="overlay-connection-mode">連線模式</label>
             <select id="overlay-connection-mode">
@@ -426,8 +433,8 @@
             </div>
             <div id="overlay-serial-status" class="overlay-status"></div>
           </div>
-          <div class="overlay-input-group add-gap">
-            <input id="overlay-host" type="text" placeholder="例如：192.168.1.50 或 serial:///dev/ttyUSB0" />
+          <div class="overlay-input-group add-gap" id="overlay-host-group">
+            <input id="overlay-host" type="text" placeholder="例如：192.168.1.50" />
             <div class="overlay-host-actions">
               <button id="overlay-apply-host">儲存連線設定</button>
               <button id="overlay-discover-host">自動搜尋</button>

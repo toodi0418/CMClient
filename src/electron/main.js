@@ -320,6 +320,13 @@ function normalizeClientPreferences(raw) {
         normalized.serialPath = trimmedPath;
       }
     }
+    if (Object.prototype.hasOwnProperty.call(raw, 'shareWithTenmanMap')) {
+      if (raw.shareWithTenmanMap === null) {
+        normalized.shareWithTenmanMap = null;
+      } else {
+        normalized.shareWithTenmanMap = Boolean(raw.shareWithTenmanMap);
+      }
+    }
   }
   return normalized;
 }
@@ -396,6 +403,17 @@ async function updateClientPreferences(updates = {}) {
       existing.serialPath = pathValue;
     } else if (!pathValue) {
       delete existing.serialPath;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'shareWithTenmanMap')) {
+    const rawValue = updates.shareWithTenmanMap;
+    if (rawValue === null) {
+      delete existing.shareWithTenmanMap;
+      bridge?.setTenmanShareEnabled?.(null);
+    } else {
+      const desired = Boolean(rawValue);
+      existing.shareWithTenmanMap = desired;
+      bridge?.setTenmanShareEnabled?.(desired);
     }
   }
   return writeClientPreferences(existing);
@@ -551,6 +569,15 @@ function setupBridgeListeners() {
 async function initialiseBridge() {
   callmeshRestoreAllowed = shouldIncludeEnvApiKey();
 
+  const preferences = await getCachedClientPreferences().catch(() => ({}));
+  const storedSharePreference = (() => {
+    if (!preferences || typeof preferences !== 'object') return null;
+    if (!Object.prototype.hasOwnProperty.call(preferences, 'shareWithTenmanMap')) return null;
+    const value = preferences.shareWithTenmanMap;
+    if (value === null) return null;
+    return Boolean(value);
+  })();
+
   let restoredKey = '';
   if (callmeshRestoreAllowed) {
     const persisted = await loadPersistedApiKey();
@@ -562,14 +589,20 @@ async function initialiseBridge() {
   const envKey = callmeshRestoreAllowed ? (process.env.CALLMESH_API_KEY || '') : '';
   const initialKey = envKey || restoredKey || '';
 
-  bridge = new CallMeshAprsBridge({
+  const bridgeOptions = {
     storageDir: getCallMeshDataDir(),
     appVersion,
     apiKey: initialKey,
     verified: Boolean(initialKey),
     heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
     agentProduct: 'callmesh-client'
-  });
+  };
+
+  if (storedSharePreference !== null) {
+    bridgeOptions.shareWithTenmanMap = storedSharePreference;
+  }
+
+  bridge = new CallMeshAprsBridge(bridgeOptions);
 
   setupBridgeListeners();
   await bridge.init({ allowRestore: callmeshRestoreAllowed });

@@ -5,7 +5,7 @@ TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合�
 - **CLI**：適合在 macOS / Linux / Windows（或 Raspberry Pi）上以無頭模式執行，能透過 Meshtastic **TCP 或 Serial** 連線將封包轉換成 APRS uplink 並回報 CallMesh。
 - **Electron 桌面版**：提供即時儀表板、封包/節點追蹤、APRS 狀態檢視等 GUI 功能，並支援 TCP / Serial 模式與裝置清單選取。
 
-> ✅ 只要準備 CallMesh API Key 與 Meshtastic TCP Access（預設埠 4403），就能在任何支援 Node.js 的平台啟動整個 Gateway。
+> ✅ 只要準備 CallMesh API Key 與 Meshtastic 連線（TCP 或 Serial），就能在任何支援 Node.js 的平台啟動整個 Gateway。
 
 ---
 
@@ -25,7 +25,7 @@ TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合�
 ## 2. 環境需求
 
 - Node.js 18 以上（建議使用 LTS 版本）
-- Meshtastic 裝置或 Gateway，且啟用 TCP API（預設 `tcp://<裝置 IP>:4403`）
+- Meshtastic 裝置或 Gateway（TCP API 或 Serial 連線）
 - CallMesh 平台有效的 API Key（環境變數 `CALLMESH_API_KEY`）
 - （若使用 APRS）穩定的網際網路連線
 - （若使用 Serial）系統需對裝置節點具有讀寫權限，例如將使用者加入 `dialout` 或 `uucp` 群組
@@ -77,14 +77,21 @@ export TENMAN_DISABLE=1   # 設為 1 / true / yes / on 時停用 TenManMap 推�
 
 ---
 
-### TenManMap 推播設定與隱私提醒
+### TenManMap 推播與隱私聲明
 
-驗證成功後，TMAG 會沿用 CallMesh 的授權資訊，將 Meshtastic 摘要資料同步到 TenManMap 及其合作夥伴，內容涵蓋與節點狀態及現場觀測相關的資訊。系統不提供任意調整終端、API Key 或白名單的能力；唯一的控制項是是否整體停用。
+驗證成功後，TMAG 會沿用 CallMesh 的授權資訊，將 Meshtastic 摘要資料同步至 TenManMap 及其合作夥伴。以下為資料使用的概述：
 
-- 預設：TenManMap 推播 **開啟**。
-- 如需暫停推播，請在啟動前設定 `TENMAN_DISABLE=1`（支援 `true` / `yes` / `on`），或在 CLI 加上 `--no-share-with-tenmanmap`。
+- 同步範圍：與節點狀態與現地觀測相關的摘要資訊（例如位置、遙測與訊息之摘要欄位）。
+- 使用目的：服務提供與維運、效能與可靠度監測、資安維護、統計分析、研究，以及依據商業策略所需之用途。
+- 分享對象：TenManMap 與其合作夥伴；依法令要求時，可能提供予主管機關或其他有權單位。
+- 保留期間：為達成前述目的所需之期間，或依法律／合約要求延長。
+- 你的選擇：預設同步為開啟；如需停用，請在啟動前設定環境變數 `TENMAN_DISABLE=1`（支援 `true` / `yes` / `on`），於 CLI 加上 `--no-share-with-tenmanmap`，或於桌面版設定頁底部調整分享開關。
+- 資料安全：我們採取合理的技術與管理措施降低風險，但無法保證絕對安全。
+- 跨區處理：資料可能在不同法域之間處理與儲存，適用當地法規。
+- 權利行使：若你欲查詢、請求刪除或停止同步，請依你的部署流程聯絡維運窗口。
+- 條款更新：本段內容可能依實際作業調整，更新後恕不另行通知。
 
-若您的部署場域對位置資訊有額外規範，請務必在啟動前評估是否需要停用 TenManMap。更多資料格式細節仍可參考 `new-api.md`。
+若你的環境對資料揭露有額外規範，請在啟動前評估是否需要停用同步。更多結構與欄位示意請參考 `new-api.md`。
 
 ---
 
@@ -187,6 +194,7 @@ Options:
   -f, --format      輸出格式：summary 顯示表格，json 顯示完整資料
                                [choices: "summary", "json"] [default: "summary"]
   -p, --pretty      搭配 --format json 時使用縮排輸出  [boolean] [default: true]
+      --no-share-with-tenmanmap  停用 TenManMap 分享         [boolean] [default: false]
 ```
 
 常用選項：

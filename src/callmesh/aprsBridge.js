@@ -906,6 +906,28 @@ class CallMeshAprsBridge extends EventEmitter {
     return TENMAN_FORWARD_DEFAULT_ENABLED;
   }
 
+  setTenmanShareEnabled(enabled) {
+    const override = typeof enabled === 'boolean' ? enabled : null;
+    if (this.tenmanForwardOverride === override) {
+      return this.isTenmanForwardEnabled();
+    }
+    this.tenmanForwardOverride = override;
+    if (!this.isTenmanForwardEnabled()) {
+      this.tenmanForwardState.queue = [];
+      this.tenmanForwardState.pendingKeys?.clear?.();
+      this.tenmanForwardState.lastKey = null;
+      this.tenmanForwardState.disabledLogged = false;
+      this.emitLog('TENMAN', 'TenManMap 轉發已停用');
+      this.resetTenmanWebsocket();
+      return false;
+    }
+    this.tenmanForwardState.disabledLogged = false;
+    this.emitLog('TENMAN', 'TenManMap 轉發已啟用');
+    this.ensureTenmanWebsocket();
+    this.flushTenmanQueue();
+    return true;
+  }
+
   enqueueTenmanPublish(message, dedupeKey) {
     if (!message || !dedupeKey) {
       return;
