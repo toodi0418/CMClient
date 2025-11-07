@@ -1336,11 +1336,6 @@ class MeshtasticClient extends EventEmitter {
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
 
-    summary.from = this._scrubPlaceholderNode(summary.from);
-    summary.to = this._scrubPlaceholderNode(summary.to);
-    summary.relay = this._scrubPlaceholderNode(summary.relay);
-    summary.nextHop = this._scrubPlaceholderNode(summary.nextHop);
-
     const fromMeshCandidate =
       summary.from?.meshId ??
       summary.from?.meshIdNormalized ??
@@ -1752,43 +1747,6 @@ class MeshtasticClient extends EventEmitter {
       }
     }
     return true;
-  }
-
-  _scrubPlaceholderNode(node) {
-    if (!node || typeof node !== 'object') {
-      return node;
-    }
-    const meshIdCandidate =
-      node.meshId ?? node.meshIdNormalized ?? node.meshIdOriginal ?? null;
-    let normalized = null;
-    if (meshIdCandidate != null) {
-      if (typeof meshIdCandidate === 'string') {
-        normalized = normalizeMeshId(meshIdCandidate);
-      } else if (Number.isFinite(meshIdCandidate)) {
-        normalized = formatHexId(Number(meshIdCandidate) >>> 0);
-      }
-    } else if (Number.isFinite(node.raw)) {
-      normalized = formatHexId(Number(node.raw) >>> 0);
-    }
-    if (!normalized || !this._shouldIgnoreMeshId(normalized)) {
-      return node;
-    }
-    const scrubbed = {
-      ...node,
-      meshId: null,
-      meshIdNormalized: null,
-      meshIdOriginal: null
-    };
-    const fallbackLabel = scrubbed.longName || scrubbed.shortName || null;
-    if (fallbackLabel) {
-      scrubbed.label = fallbackLabel;
-    } else if (scrubbed.label) {
-      const cleaned = scrubbed.label.replace(/\s*\(!abcd[0-9a-f]*\)$/i, '').trim();
-      scrubbed.label = cleaned || 'unknown';
-    } else {
-      scrubbed.label = 'unknown';
-    }
-    return scrubbed;
   }
 
   _sendWantConfig() {
