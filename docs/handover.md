@@ -271,7 +271,14 @@ node src/index.js discover           # 掃描 Meshtastic 裝置
 
 # 啟動內建 Web Dashboard（預設關閉）
 node src/index.js --host 192.168.1.50 --port 4403 --web-ui
+
+# Serial 連線（以 /dev/ttyUSB0 為例，預設 115200 bps）
+node src/index.js --connection serial --serial-path /dev/ttyUSB0 --serial-baud 115200
+# 或可直接透過 host 指定 serial:// 路徑（同樣採 115200 bps，若需其他速率再帶 --serial-baud）
+node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 ```
+
+- Electron 設定頁的「連線模式」可切換 TCP/Serial，Serial 模式可從清單選擇偵測到的裝置或手動輸入 `serial:///` 路徑。
 
 ### 6.4 遙測與節點資料
 
@@ -290,9 +297,118 @@ node src/index.js --host 192.168.1.50 --port 4403 --web-ui
 
 ---
 
-## 7. Build / Release 流程
+## 7. 專案架構與模組細節
 
-### 7.1 GitHub Actions
+以下整理專案組成、資料流與模組責任，提供維護時的快速索引。
+
+### 7.1 整體資料流
+
+```
+Meshtastic（TCP / Serial）
+        │
+        ▼
+MeshtasticClient（封包解碼、節點快取、relay 估算）
+        │ summary / myInfo / fromRadio
+        ▼
+CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
+        │                               │
+        │                               └─► APRS-IS 上傳（含 TENMANMAP 佇列）
+        │
+        ├─► CLI 輸出（表格 / JSON）
+        ├─► Electron 主行程（IPC）──► Renderer UI（設定、監控、訊息、遙測）
+        └─► WebDashboardServer（SSE）─► 瀏覽器端 Dashboard
+```
+
+- 所有通路（CLI / Electron / Web）都透過 `CallMeshAprsBridge` 共享狀態，確保資料一致。
+- `MeshtasticClient` 支援 TCP 與 Serial；Serial 採 `serialport` 套件，預設鮑率 115200，可由 CLI flag 或 GUI 設定覆寫。
+- Relay 尾碼補全：若韌體僅回傳 `relay_node` 尾碼（常見情況），會藉由 routing 封包、節點資料庫與歷史 RSSI/SNR 建立尾碼對應表，必要時標示為 `relayGuess`。
+
+### 7.2 主要檔案與職責
+
+| 檔案 / 資料夾 | 職責與重點 |
+| ------------ | ---------- |
+| `src/index.js` | CLI 入口；處理命令列參數（連線方式、API Key、Web UI 等），負責初始化 `MeshtasticClient` 與 `CallMeshAprsBridge`，並管理重連、訊號處理（SIGINT）。 |
+| `src/meshtasticClient.js` | Meshtastic 客戶端，負責：連線（TCP/Serial）、封包解析（protobuf）、節點快取、重複封包過濾、relay 猜測與尾碼映射、心跳與 keep-alive、summary 事件發出。 |
+| `src/callmesh/client.js` | CallMesh API 包裝：驗證、心跳、mapping、provision、TENMANMAP 追蹤等；對服務降級與認證失敗提供統一錯誤處理。 |
+| `src/callmesh/aprsBridge.js` | 負責整合 Meshtastic summary 與 CallMesh／APRS 流程，包含：Mapping／Provision 資料同步、APRS/TENMANMAP 上傳節流、telemetry append/reset、節點資料庫維護、flow tracking。 |
+| `src/nodeDatabase.js` | Mesh 節點資料庫單例：提供增刪查改、持久化 (`node-database.json`)、查詢距離／角色／硬體等功能。 |
+| `src/web/server.js` | 簡易 Express + SSE 伺服器：對外提供儀表板頁面 (`src/web/public`) 與即時事件。 |
+| `src/electron/main.js` | Electron 主行程：建立視窗、IPC handler（連線、偏好、節點、遙測、Web Dashboard 控制）、啟動 `WebDashboardServer`，並串接訊息持久化。 |
+| `src/electron/renderer.js` | Renderer 腳本：UI 互動、Auto reconnect、Serial 裝置列表、偏好儲存、節點/遙測/訊息渲染、Log 管理。檔案較大，擴充時請留意共用 helper。 |
+| `scripts/` | `run-electron.js`、`build-*.js`、`fix-telemetry-timestamps.js` 等開發/維運腳本。 |
+| `meshtastic/` | 韌體參考資料（config、board 定義等），主要作為測試與範例。 |
+
+### 7.3 重要事件與資料結構
+
+- `MeshtasticClient` 事件：
+  - `connected` / `disconnected`：連線狀態。
+  - `summary`：封包摘要（時間、節點、relay、SNR/RSSI、hop、detail）。
+  - `fromRadio`：原始 `FromRadio` protobuf。
+  - `myInfo`：本機節點資訊。
+- `CallMeshAprsBridge` 事件：
+  - `state`：API 驗證、心跳狀態（含 degraded）。
+  - `node`、`telemetry`：節點／遙測更新。
+  - `aprs-uplink`：APRS 上傳回報。
+  - `log`：橋接層內部 log，Electron/Web 會呈現於 Log 頁。
+- Electron IPC：
+  - `meshtastic:connect`／`disconnect`、`discover`、`list-serial`。
+  - `callmesh:save-key`／`reset`、`nodes:get-snapshot`、`telemetry:get-snapshot`、`web:set-enabled` 等。
+- SSE Topic（WebDashboardServer）：
+  - `status`、`summary`、`node`、`telemetry`、`aprs`、`log`。
+
+### 7.4 連線模式與偏好
+
+- 連線模式儲存在 localStorage 與 `client-preferences.json`，欄位包括 `host`、`connectionMode`、`serialPath`、`webDashboardEnabled`。
+- Serial 模式：
+  - 預設鮑率 115200；可自 CLI `--serial-baud` 或 Electron 設定覆寫。
+  - Electron 會列舉 Serial 裝置 (`SerialPort.list()`)，選擇後自動帶入 `serial:///` 路徑。
+  - `MeshtasticClient` 會將 routing 封包中的完整節點 ID 與 `relay_node` 尾碼對照，避免 Summary 一律顯示本機。
+- TCP 模式：
+  - `host` 預設 127.0.0.1、port 4403；可於 CLI / GUI 設定。
+  - Keep-alive、idle timeout 依 CLI / UI 預設（15 秒心跳、90 秒 idle）。
+
+### 7.5 Relay 尾碼推測
+
+- 韌體常回傳尾碼（`relay_node=0xfc`），需要補全：
+  1. `routing` 封包中的 `route` / `routeBack` 會先記錄完整 meshId → 尾碼對應。
+  2. `nodeDatabase` 及歷史 relays (`_relayLinkStats`) 會視情況補足候選。
+  3. 若仍無法唯一判定，summary 會標示 `relayGuess=true`，在 CLI / GUI 顯示推測說明。
+- 若尾碼只對應到本機，會直接視為「直收」並清空 `summary.relay`。
+
+### 7.6 資料持久化
+
+- `CALLMESH_ARTIFACTS_DIR`（預設 `~/.config/callmesh/`）：
+  - `monitor.json`：CallMesh API 驗證結果、心跳時間。
+  - `node-database.json`：節點快照。
+  - `telemetry-records.jsonl`：遙測資料。
+  - `relay-link-stats.json`：relay 猜測歷史（SNR/RSSI）。
+  - `message-log.jsonl`：桌面版訊息紀錄。
+- WebDashboard Snapshots：啟動時會以 `seed*` 方法注入節點、遙測、訊息快照；重新整理頁面也會取得最新資料。
+
+### 7.7 建議維運檢查表
+
+1. **連線流程**
+   - 驗證 API Key 成功（橋接層 log 顯示 `verify success`）。
+   - Meshtastic 連線後有 `summary` log，SNR/RSSI 等資訊如期更新。
+   - Serial → TCP 切換時，偏好資料與 UI placeholder 是否更新。
+2. **Relay 顯示**
+   - Serial 模式不應一直顯示本機 ID；若出現 `relayGuess`，應有合理原因。
+   - 封包 `hops=0` 要顯示「直收」。
+3. **節點資料庫**
+   - 節點清單搜尋與線上統計（1 小時內）是否準確。
+   - 距離計算需有 Provision 座標，若為 (0,0) 應被忽略。
+4. **遙測／APRS**
+   - Telemetry append/reset 是否同步至 GUI/Web。
+   - APRS 上傳需觀察 `aprs-uplink` log 與 flow 狀態，確認速率與節流。
+5. **Logs / 儀表板**
+   - Electron Log 頁是否能依 Tag / 關鍵字篩選。
+   - Web Dashboard SSE 是否收到 `status`、`summary` 等事件（可透過瀏覽器 DevTools 檢視）。
+
+---
+
+## 8. Build / Release 流程
+
+### 8.1 GitHub Actions
 
 分支 `main`/`dev` push 或 PR → 自動觸發：
 
@@ -311,7 +427,7 @@ node src/index.js --host 192.168.1.50 --port 4403 --web-ui
 3. 若需手動觸發（例如補傳舊 tag），可在 Actions → **Build & Publish Release** 使用 `Run workflow`，輸入 `release_tag`（例如 `v0.2.18`）；必要時可使用 `gh workflow run "Build & Publish Release" --ref main -f release_tag=v0.2.18`。
 4. 若要額外附檔或修改說明，再使用 `gh release edit` 或 GitHub UI 調整即可。
 
-### 7.2 本地打包
+### 8.2 本地打包
 
 僅作備援（仍以 Actions 產物為主）：
 
@@ -326,7 +442,7 @@ npx pkg src/index.js --targets node18-linux-x64
 
 ---
 
-## 8. 開發注意事項與 QA
+## 9. 開發注意事項與 QA
 
 1. **API Key 流程**
    - 首次啟動需在設定頁輸入 Key；驗證成功才會解鎖 UI 與 CLI。

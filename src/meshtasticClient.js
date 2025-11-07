@@ -2,6 +2,7 @@
 
 const { EventEmitter } = require('events');
 const net = require('net');
+const { SerialPort } = require('serialport');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -55,6 +56,7 @@ class MeshtasticClient extends EventEmitter {
   constructor(options = {}) {
     super();
     this.options = {
+      transport: 'tcp',
       host: '127.0.0.1',
       port: 4403,
       maxLength: DEFAULT_MAX_PACKET,
@@ -64,9 +66,22 @@ class MeshtasticClient extends EventEmitter {
       keepAliveDelayMs: 15000,
       idleTimeoutMs: 0,
       protoDir: path.resolve(__dirname, '..', 'proto'),
+      serialPath: null,
+      serialBaudRate: 115200,
+      serialOpenOptions: {},
       ...options
     };
 
+    if (typeof this.options.transport === 'string') {
+      const mode = this.options.transport.toLowerCase();
+      this.options.transport = mode === 'serial' ? 'serial' : 'tcp';
+    } else if (this.options.serialPath) {
+      this.options.transport = 'serial';
+    } else {
+      this.options.transport = 'tcp';
+    }
+
+    this._transportType = this.options.transport;
     this.nodeMap = new Map();
     this._relayLinkStats = new Map();
     this._relayStatsPath = options.relayStatsPath ? path.resolve(options.relayStatsPath) : null;
@@ -78,7 +93,10 @@ class MeshtasticClient extends EventEmitter {
     this._relayStatsDirty = false;
     this._decoder = null;
     this._selfNodeId = null;
+    this._selfNodeNormalized = null;
+    this._relayTailCandidates = new Map();
     this._socket = null;
+    this._serialPort = null;
     this._heartbeatTimer = null;
     this._connected = false;
     this._seenPacketKeys = new Map();
@@ -86,6 +104,7 @@ class MeshtasticClient extends EventEmitter {
     this._handleIdleTimeoutBound = null;
     this._currentIdleTimeout = null;
     this._socketClosed = true;
+    this._serialConnectTimer = null;
 
     this._loadRelayStatsFromDisk();
   }
@@ -114,9 +133,34 @@ class MeshtasticClient extends EventEmitter {
       return { nodeId: raw >>> 0, guessed: false };
     }
     const matches = new Set();
+    const selfNumeric =
+      typeof this._selfNodeId === 'number'
+        ? this._selfNodeId >>> 0
+        : null;
+    let selfNormalized = this._selfNodeNormalized || null;
+    if (!selfNormalized && selfNumeric != null) {
+      selfNormalized = formatHexId(selfNumeric);
+    }
+    const tailCandidates = this._relayTailCandidates.get(raw);
+    if (tailCandidates && tailCandidates.size) {
+      for (const candidate of tailCandidates) {
+        if (!Number.isFinite(candidate)) continue;
+        const numericCandidate = candidate >>> 0;
+        if (selfNumeric != null && numericCandidate === selfNumeric) {
+          continue;
+        }
+        if (this._shouldIgnoreMeshId(numericCandidate)) {
+          continue;
+        }
+        matches.add(numericCandidate);
+      }
+    }
     for (const [num, entry] of this.nodeMap.entries()) {
       const numeric = Number(num) >>> 0;
       if (this._shouldIgnoreMeshId(numeric)) {
+        continue;
+      }
+      if (selfNumeric != null && numeric === selfNumeric) {
         continue;
       }
       if ((numeric & 0xff) === raw && !matches.has(numeric)) {
@@ -130,6 +174,9 @@ class MeshtasticClient extends EventEmitter {
           if (this._shouldIgnoreMeshId(parsed)) {
             continue;
           }
+          if (selfNumeric != null && parsed === selfNumeric) {
+            continue;
+          }
           if ((parsed & 0xff) === raw && !matches.has(parsed)) {
             matches.add(parsed);
           }
@@ -139,6 +186,9 @@ class MeshtasticClient extends EventEmitter {
     for (const key of this._relayLinkStats.keys()) {
       const candidate = Number(key) >>> 0;
       if (this._shouldIgnoreMeshId(candidate)) {
+        continue;
+      }
+      if (selfNumeric != null && candidate === selfNumeric) {
         continue;
       }
       if ((candidate & 0xff) === raw && !matches.has(candidate)) {
@@ -161,9 +211,15 @@ class MeshtasticClient extends EventEmitter {
           if (this._shouldIgnoreMeshId(normalized)) {
             continue;
           }
+          if (selfNormalized && normalized === selfNormalized) {
+            continue;
+          }
           const numeric = parseInt(normalized.slice(1), 16);
           if (!Number.isFinite(numeric)) continue;
           const candidate = numeric >>> 0;
+          if (selfNumeric != null && candidate === selfNumeric) {
+            continue;
+          }
           if ((candidate & 0xff) === raw && !matches.has(candidate)) {
             matches.add(candidate);
           }
@@ -176,11 +232,18 @@ class MeshtasticClient extends EventEmitter {
     }
     if (matches.size === 1) {
       const [match] = matches;
+      if (selfNumeric != null && (match >>> 0) === selfNumeric) {
+        return null;
+      }
+      this._recordRelayTailCandidate(match >>> 0);
       return { nodeId: match >>> 0, guessed: false };
     }
     const candidates = Array.from(matches);
     const guessResult = this._guessRelayCandidate(candidates, { snr, rssi });
     if (guessResult) {
+      if (guessResult.nodeId != null) {
+        this._recordRelayTailCandidate(guessResult.nodeId);
+      }
       return guessResult;
     }
     if (matches.size > 1) {
@@ -199,7 +262,12 @@ class MeshtasticClient extends EventEmitter {
         reason: parts.join('；')
       };
     }
-    return { nodeId: raw >>> 0, guessed: false };
+    const fallbackNodeId = raw >>> 0;
+    if (selfNumeric != null && fallbackNodeId === selfNumeric) {
+      return null;
+    }
+    this._recordRelayTailCandidate(fallbackNodeId);
+    return { nodeId: fallbackNodeId, guessed: false };
   }
 
   _recordRelayLinkMetrics(nodeId, { snr = null, rssi = null } = {}) {
@@ -248,6 +316,32 @@ class MeshtasticClient extends EventEmitter {
     stats.count = (stats.count || 0) + 1;
     stats.updatedAt = now;
     this._scheduleRelayStatsPersist();
+  }
+
+  _recordRelayTailCandidate(nodeId) {
+    if (nodeId == null) return;
+    const numeric = Number(nodeId);
+    if (!Number.isFinite(numeric) || numeric <= 0) return;
+    const normalized = numeric >>> 0;
+    if (this._selfNodeId != null && normalized === (this._selfNodeId >>> 0)) {
+      return;
+    }
+    if (this._shouldIgnoreMeshId(normalized)) {
+      return;
+    }
+    const tail = normalized & 0xff;
+    if (!this._relayTailCandidates.has(tail)) {
+      this._relayTailCandidates.set(tail, new Set());
+    }
+    const bucket = this._relayTailCandidates.get(tail);
+    bucket.add(normalized);
+    if (bucket.size > 8) {
+      // keep candidate set reasonably small by removing oldest inserted value
+      const firstValue = bucket.values().next().value;
+      if (firstValue !== undefined) {
+        bucket.delete(firstValue);
+      }
+    }
   }
 
   _guessRelayCandidate(candidates, { snr = null, rssi = null } = {}) {
@@ -403,6 +497,20 @@ class MeshtasticClient extends EventEmitter {
       summary.relayMeshIdNormalized ||
       '';
     const relayNormalized = normalizeMeshId(relayMeshRaw);
+    if (relayNormalized) {
+      const selfNode = this._selfNodeId;
+      if (selfNode != null) {
+        let selfNormalized = null;
+        if (typeof selfNode === 'string') {
+          selfNormalized = normalizeMeshId(selfNode);
+        } else if (Number.isFinite(selfNode)) {
+          selfNormalized = normalizeMeshId(formatHexId((selfNode >>> 0)));
+        }
+        if (selfNormalized && relayNormalized === selfNormalized) {
+          return true;
+        }
+      }
+    }
     if (fromNormalized && relayNormalized && fromNormalized === relayNormalized) {
       return true;
     }
@@ -549,10 +657,60 @@ class MeshtasticClient extends EventEmitter {
     this._connect();
   }
 
+  _connect() {
+    if (this.options.transport === 'serial') {
+      this._transportType = 'serial';
+    } else if (this.options.transport === 'tcp') {
+      this._transportType = 'tcp';
+    } else if (this.options.serialPath) {
+      this._transportType = 'serial';
+    } else {
+      this._transportType = 'tcp';
+    }
+    this.options.transport = this._transportType;
+
+    this._decoder = new MeshtasticStreamDecoder({
+      maxPacketLength: this.options.maxLength,
+      onPacket: (payload) => this._handlePayload(payload),
+      onError: (err) => this.emit('error', err)
+    });
+
+    if (this._transportType === 'serial') {
+      this._connectSerial();
+    } else {
+      this._connectTcp();
+    }
+  }
+
   stop() {
     this._clearHeartbeat();
     this._flushRelayStatsPersistSync();
-    if (this._socket) {
+    if (this._serialConnectTimer) {
+      clearTimeout(this._serialConnectTimer);
+      this._serialConnectTimer = null;
+    }
+    const shouldNotifyDisconnect = !this._socketClosed;
+    if (this._transportType === 'serial') {
+      const port = this._serialPort;
+      this._serialPort = null;
+      if (port) {
+        try {
+          port.removeAllListeners();
+        } catch {
+          // ignore removal errors
+        }
+        try {
+          const shouldClose = typeof port.isOpen === 'boolean' ? port.isOpen : true;
+          if (shouldClose && typeof port.close === 'function') {
+            port.close(() => {
+              // ignore close callback errors during shutdown
+            });
+          }
+        } catch {
+          // ignore close errors during shutdown
+        }
+      }
+    } else if (this._socket) {
       if (this._handleIdleTimeoutBound) {
         removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);
       }
@@ -561,14 +719,17 @@ class MeshtasticClient extends EventEmitter {
       } catch {
         // ignore errors disabling keepalive during shutdown
       }
-      this._socket.destroy();
       this._socket.removeAllListeners();
+      this._socket.destroy();
       this._socket = null;
     }
-    this._socketClosed = true;
+    if (shouldNotifyDisconnect) {
+      this._handleConnectionClosed();
+    } else {
+      this._connected = false;
+      this._connectionStartedAt = null;
+    }
     this._currentIdleTimeout = null;
-    this._connected = false;
-    this._connectionStartedAt = null;
     this._seenPacketKeys.clear();
     this._packetKeyQueue.length = 0;
   }
@@ -628,13 +789,7 @@ class MeshtasticClient extends EventEmitter {
     };
   }
 
-  _connect() {
-    this._decoder = new MeshtasticStreamDecoder({
-      maxPacketLength: this.options.maxLength,
-      onPacket: (payload) => this._handlePayload(payload),
-      onError: (err) => this.emit('error', err)
-    });
-
+  _connectTcp() {
     const connectionOptions = {
       host: this.options.host,
       port: this.options.port,
@@ -681,11 +836,101 @@ class MeshtasticClient extends EventEmitter {
     });
 
     this._socket.on('end', () => {
-      this._handleSocketClosed();
+      this._handleConnectionClosed();
     });
 
     this._socket.on('close', () => {
-      this._handleSocketClosed();
+      this._handleConnectionClosed();
+    });
+  }
+
+  _connectSerial() {
+    const pathInput =
+      typeof this.options.serialPath === 'string' ? this.options.serialPath.trim() : '';
+    if (!pathInput) {
+      process.nextTick(() =>
+        this.emit('error', new Error('serialPath 未設定，無法建立 Serial 連線'))
+      );
+      return;
+    }
+    const baudCandidate = Number(this.options.serialBaudRate);
+    const baudRate = Number.isFinite(baudCandidate) && baudCandidate > 0 ? baudCandidate : 115200;
+    const openOverrides =
+      this.options.serialOpenOptions && typeof this.options.serialOpenOptions === 'object'
+        ? { ...this.options.serialOpenOptions }
+        : {};
+    const openOptions = {
+      autoOpen: false,
+      ...openOverrides,
+      path: pathInput,
+      baudRate
+    };
+
+    let port;
+    try {
+      port = new SerialPort(openOptions);
+    } catch (err) {
+      this._socketClosed = true;
+      process.nextTick(() => this.emit('error', err));
+      return;
+    }
+
+    this._serialPort = port;
+    this._socketClosed = false;
+
+    const connectTimeoutMs = this.options.connectTimeout ?? 15000;
+    const shouldApplyTimeout = Number.isFinite(connectTimeoutMs) && connectTimeoutMs > 0;
+    if (shouldApplyTimeout) {
+      this._serialConnectTimer = setTimeout(() => {
+        this._serialConnectTimer = null;
+        const timeoutError = new Error(`serial connect timeout after ${connectTimeoutMs}ms`);
+        timeoutError.code = 'MESHTASTIC_SERIAL_TIMEOUT';
+        this.emit('error', timeoutError);
+        try {
+          port.close();
+        } catch {
+          // ignore close error during timeout
+        }
+        this._handleConnectionClosed();
+      }, connectTimeoutMs);
+      this._serialConnectTimer.unref?.();
+    }
+
+    const clearSerialTimer = () => {
+      if (this._serialConnectTimer) {
+        clearTimeout(this._serialConnectTimer);
+        this._serialConnectTimer = null;
+      }
+    };
+
+    port.on('data', (chunk) => this._decoder.push(chunk));
+
+    port.on('error', (err) => {
+      this.emit('error', err);
+    });
+
+    port.on('close', () => {
+      clearSerialTimer();
+      this._handleConnectionClosed();
+    });
+
+    port.once('open', () => {
+      clearSerialTimer();
+      this._connected = true;
+      this._connectionStartedAt = Date.now();
+      this.emit('connected');
+      if (this.options.handshake) {
+        this._sendWantConfig();
+      }
+      this._setupHeartbeat();
+    });
+
+    port.open((err) => {
+      if (err) {
+        clearSerialTimer();
+        this.emit('error', err);
+        this._handleConnectionClosed();
+      }
     });
   }
 
@@ -753,23 +998,84 @@ class MeshtasticClient extends EventEmitter {
       this._socket.destroy(timeoutError);
     } else {
       this.emit('error', timeoutError);
-      this._handleSocketClosed();
+      this._handleConnectionClosed();
     }
   }
 
-  _handleSocketClosed() {
+  _handleConnectionClosed() {
     if (this._socketClosed) {
       return;
     }
     this._socketClosed = true;
     this._connected = false;
     this._connectionStartedAt = null;
-    if (this._socket && this._handleIdleTimeoutBound) {
-      removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);
+    if (this._serialConnectTimer) {
+      clearTimeout(this._serialConnectTimer);
+      this._serialConnectTimer = null;
     }
+    if (this._socket) {
+      if (this._handleIdleTimeoutBound) {
+        removeSocketListener(this._socket, 'timeout', this._handleIdleTimeoutBound);
+      }
+      this._socket.removeAllListeners();
+      this._socket = null;
+    }
+    if (this._serialPort) {
+      try {
+        this._serialPort.removeAllListeners();
+      } catch {
+        // ignore listener cleanup errors
+      }
+      this._serialPort = null;
+    }
+    this._selfNodeId = null;
+    this._selfNodeNormalized = null;
     this._currentIdleTimeout = null;
     this._clearHeartbeat();
     this.emit('disconnected');
+  }
+
+  _writeFrame(frame, callback) {
+    if (!this._connected) {
+      if (callback) {
+        callback(new Error('connection not established'));
+      }
+      return;
+    }
+
+    if (this._transportType === 'serial') {
+      if (!this._serialPort) {
+        if (callback) {
+          callback(new Error('serial port not ready'));
+        }
+        return;
+      }
+      this._serialPort.write(frame, (err) => {
+        if (err) {
+          callback?.(err);
+          return;
+        }
+        if (typeof this._serialPort.drain === 'function') {
+          this._serialPort.drain((drainErr) => {
+            callback?.(drainErr || null);
+          });
+        } else {
+          callback?.(null);
+        }
+      });
+      return;
+    }
+
+    if (this._socket) {
+      this._socket.write(frame, (err) => {
+        callback?.(err || null);
+      });
+      return;
+    }
+
+    if (callback) {
+      callback(new Error('connection channel not available'));
+    }
   }
 
   _handlePayload(payload) {
@@ -831,6 +1137,12 @@ class MeshtasticClient extends EventEmitter {
       node: nodeInfo
     });
     this._selfNodeId = num;
+    const normalizedSelf =
+      normalizeMeshId(
+        nodeInfo?.meshId ||
+          (typeof info?.myNodeId === 'string' ? info.myNodeId : null)
+      ) || formatHexId(num);
+    this._selfNodeNormalized = normalizedSelf;
     break;
   }
       default:
@@ -883,19 +1195,107 @@ class MeshtasticClient extends EventEmitter {
       usedHops = 0;
     }
 
-    let relayResult = null;
-    if (relayNodeId != null) {
-      relayResult = this._normalizeRelayNode(relayNodeId, linkMetrics);
+    const resolveRelayCandidate = (rawId) => {
+      if (rawId == null) {
+        return null;
+      }
+      const normalized = this._normalizeRelayNode(rawId, linkMetrics);
+      if (!normalized) {
+        return null;
+      }
+      const info = this._formatNode(normalized.nodeId);
+      const annotated = info ? { ...info } : null;
+      if (annotated) {
+        annotated.guessed = Boolean(normalized.guessed);
+        if (normalized.reason) {
+          annotated.reason = normalized.reason;
+        }
+      }
+      return {
+        nodeId: normalized.nodeId >>> 0,
+        guessed: Boolean(normalized.guessed),
+        reason: normalized.reason || null,
+        info: annotated
+      };
+    };
+
+    const relayCandidate = resolveRelayCandidate(relayNodeId);
+    let relayResult = relayCandidate
+      ? {
+          nodeId: relayCandidate.nodeId,
+          guessed: relayCandidate.guessed,
+          reason: relayCandidate.reason
+        }
+      : null;
+    let relayInfo = relayCandidate?.info ? { ...relayCandidate.info } : null;
+
+    const nextHopCandidate = resolveRelayCandidate(nextHopId);
+    let nextHopInfo = nextHopCandidate?.info ? { ...nextHopCandidate.info } : null;
+    if (!nextHopInfo && nextHopId != null) {
+      nextHopInfo = this._formatNode(nextHopId);
     }
-    const relayInfo =
-      relayNodeId != null && relayResult ? this._formatNode(relayResult.nodeId) : null;
-    if (relayInfo && relayResult) {
-      relayInfo.guessed = Boolean(relayResult.guessed);
-      if (relayResult.reason) {
-        relayInfo.reason = relayResult.reason;
+
+    const selfNumeric = this._selfNodeId != null ? this._selfNodeId >>> 0 : null;
+    const relayMatchesSelf =
+      selfNumeric != null && relayResult && (relayResult.nodeId >>> 0) === selfNumeric;
+    const relayMissing = !relayResult;
+    const rawNextHopExists = nextHopId != null && nextHopId !== 0;
+    const hopCount = Number.isFinite(usedHops) ? usedHops : null;
+    const indicatesRelay =
+      (hopCount != null && hopCount > 0) ||
+      (relayNodeId != null && relayNodeId !== 0) ||
+      rawNextHopExists;
+
+    const fallbackNextHop = (() => {
+      if (nextHopCandidate) {
+        return {
+          nodeId: nextHopCandidate.nodeId >>> 0,
+          guessed: Boolean(nextHopCandidate.guessed),
+          reason: nextHopCandidate.reason || null,
+          info: nextHopCandidate.info ? { ...nextHopCandidate.info } : null
+        };
+      }
+      if (!rawNextHopExists) {
+        return null;
+      }
+      const numeric = Number(nextHopId);
+      if (!Number.isFinite(numeric) || numeric === 0) {
+        return null;
+      }
+      const info = this._formatNode(numeric);
+      return {
+        nodeId: numeric >>> 0,
+        guessed: true,
+        reason: null,
+        info: info ? { ...info, guessed: true } : null
+      };
+    })();
+
+    const nextHopMatchesSelf =
+      selfNumeric != null &&
+      fallbackNextHop &&
+      (fallbackNextHop.nodeId >>> 0) === selfNumeric;
+
+    if ((relayMissing || relayMatchesSelf) && fallbackNextHop && !nextHopMatchesSelf && indicatesRelay) {
+      const fallbackReason =
+        fallbackNextHop.reason ||
+        (relayMatchesSelf
+          ? '韌體回報最後轉發為本機，改用 nextHop 反推上一跳節點。'
+          : '韌體未提供最後轉發，改用 nextHop 反推上一跳節點。');
+      relayResult = {
+        nodeId: fallbackNextHop.nodeId >>> 0,
+        guessed: Boolean(fallbackNextHop.guessed),
+        reason: fallbackReason
+      };
+      const info = fallbackNextHop.info ? { ...fallbackNextHop.info } : this._formatNode(fallbackNextHop.nodeId);
+      relayInfo = info || null;
+      if (relayInfo) {
+        relayInfo.guessed = Boolean(relayResult.guessed);
+        if (fallbackReason && !relayInfo.reason) {
+          relayInfo.reason = fallbackReason;
+        }
       }
     }
-    const nextHopInfo = nextHopId != null ? this._formatNode(nextHopId) : null;
 
     if (relayInfo && relayInfo.meshId) {
       // relay info exposed via summary.relay for UI display
@@ -936,14 +1336,22 @@ class MeshtasticClient extends EventEmitter {
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
 
+    const directRelayNodeId =
+      relayResult && Number.isFinite(relayResult.nodeId) ? relayResult.nodeId : relayNodeId;
+
     const isDirect = this._isDirectReception(summary, {
-      relayNodeId,
+      relayNodeId: directRelayNodeId,
       usedHops,
       hasRelayResult: Boolean(relayResult)
     });
 
     if (isDirect && packet.from != null) {
       this._recordRelayLinkMetrics(packet.from, linkMetrics);
+      summary.relay = null;
+      summary.relayGuess = false;
+      if (summary.relayGuessReason !== undefined) {
+        delete summary.relayGuessReason;
+      }
     }
 
     return summary;
@@ -1039,6 +1447,31 @@ class MeshtasticClient extends EventEmitter {
         case 'ROUTING_APP': {
           const message = this.types.routing.decode(payload);
           const routing = this.types.routing.toObject(message, TO_OBJECT_OPTIONS);
+          const recordRouteNodes = (list) => {
+            if (!Array.isArray(list)) return;
+            for (const value of list) {
+              if (Number.isFinite(value)) {
+                this._recordRelayTailCandidate(value);
+              } else if (
+                value &&
+                typeof value === 'object' &&
+                Number.isFinite(value.nodeNum)
+              ) {
+                this._recordRelayTailCandidate(value.nodeNum);
+              }
+            }
+          };
+          if (routing.routeRequest) {
+            recordRouteNodes(routing.routeRequest.route);
+          }
+          if (routing.routeReply) {
+            recordRouteNodes(routing.routeReply.route);
+            recordRouteNodes(routing.routeReply.routeBack);
+            recordRouteNodes(routing.routeReply.routeForward);
+          }
+          if (routing.routeDelete) {
+            recordRouteNodes(routing.routeDelete.route);
+          }
           if (routing.routeRequest) {
             const path = (routing.routeRequest.route || []).map((n) =>
               this._formatNode(n).label
@@ -1307,23 +1740,23 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _sendWantConfig() {
-    if (!this._socket || !this._connected) return;
+    if (!this._connected) return;
     const nonce = crypto.randomBytes(2).readUInt16BE(0);
     const message = this.toRadioType.create({ wantConfigId: nonce });
     const encoded = this.toRadioType.encode(message).finish();
     const framed = framePacket(encoded);
-    this._socket.write(framed, (err) => {
+    this._writeFrame(framed, (err) => {
       if (err) {
         this.emit('error', new Error(`want_config 傳送失敗: ${err.message}`));
-      } else {
-        this.emit('handshake', { nonce });
+        return;
       }
+      this.emit('handshake', { nonce });
     });
   }
 
   _setupHeartbeat() {
     this._clearHeartbeat();
-    if (this.options.heartbeat > 0 && this._socket) {
+    if (this.options.heartbeat > 0 && this._connected) {
       const intervalMs = this.options.heartbeat * 1000;
       this._heartbeatTimer = setInterval(() => this._sendHeartbeat(), intervalMs);
       this._heartbeatTimer.unref?.();
@@ -1338,11 +1771,11 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _sendHeartbeat() {
-    if (!this._socket || !this._connected) return;
+    if (!this._connected) return;
     const message = this.toRadioType.create({ heartbeat: {} });
     const encoded = this.toRadioType.encode(message).finish();
     const framed = framePacket(encoded);
-    this._socket.write(framed, (err) => {
+    this._writeFrame(framed, (err) => {
       if (err) {
         this.emit('error', new Error(`heartbeat 傳送失敗: ${err.message}`));
       }
