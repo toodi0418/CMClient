@@ -167,6 +167,10 @@ async function main() {
             default: 115200,
             describe: 'Serial 連線時的鮑率'
           })
+          .option('no-share-with-tenmanmap', {
+            type: 'boolean',
+            describe: '停用 TenManMap 分享（預設為啟用）'
+          })
           .option('max-length', {
             alias: 'm',
             type: 'number',
@@ -227,15 +231,22 @@ async function startMonitor(argv) {
   const HEARTBEAT_INTERVAL_MS = 60_000;
   const HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_MS / 1000;
   const artifactsDir = getArtifactsDir();
+  const shareWithTenmanMapOverride =
+    argv.noShareWithTenmanmap ? false : null;
 
-  const bridge = new CallMeshAprsBridge({
+  const bridgeOptions = {
     storageDir: artifactsDir,
     appVersion: pkg.version || '0.0.0',
     apiKey: previouslyVerified ? apiKey : '',
     verified: previouslyVerified,
     heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
     agentProduct: 'callmesh-client-cli'
-  });
+  };
+  if (shareWithTenmanMapOverride !== null) {
+    bridgeOptions.shareWithTenmanMap = shareWithTenmanMapOverride;
+  }
+
+  const bridge = new CallMeshAprsBridge(bridgeOptions);
 
   const verificationRecord = { ...(previousVerification || {}) };
   verificationRecord.apiKey = apiKey;

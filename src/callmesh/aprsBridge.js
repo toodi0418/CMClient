@@ -28,23 +28,15 @@ const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
 
-const TENMAN_FORWARD_WS_ENDPOINT =
-  process.env.TENMAN_WS_URL || 'wss://tenmanmap.yakumo.tw/ws';
+const TENMAN_FORWARD_WS_ENDPOINT = 'wss://tenmanmap.yakumo.tw/ws';
+const TENMAN_FORWARD_DEFAULT_ENABLED =
+  !['1', 'true', 'yes', 'on'].includes(
+    String(process.env.TENMAN_DISABLE || '').trim().toLowerCase()
+  );
 const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
 const TENMAN_FORWARD_QUEUE_LIMIT = 64;
 const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
-const TENMAN_FORWARD_GATEWAY_ID = normalizeMeshId(process.env.TENMAN_GATEWAY_ID || null);
-const TENMAN_FORWARD_API_KEY =
-  process.env.CALLMESH_API_KEY || process.env.TENMAN_API_KEY || null;
 const TENMAN_FORWARD_AUTH_ACTION = 'authenticate';
-const TENMAN_FORWARD_NODE_IDS = new Set(
-  String(process.env.TENMAN_NODE_IDS || '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean)
-    .map((id) => normalizeMeshId(id))
-    .filter(Boolean)
-);
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
@@ -220,6 +212,8 @@ class CallMeshAprsBridge extends EventEmitter {
       ? Math.max(10, Math.floor(telemetryMaxEntriesPerNode))
       : 500;
 
+    this.tenmanForwardOverride =
+      typeof options.shareWithTenmanMap === 'boolean' ? options.shareWithTenmanMap : null;
     this.tenmanForwardState = {
       lastKey: null,
       websocket: null,
@@ -231,9 +225,9 @@ class CallMeshAprsBridge extends EventEmitter {
       authenticated: false,
       authenticating: false,
       missingApiKeyWarned: false,
-      skippedNodeIds: new Set(),
-      gatewayId: TENMAN_FORWARD_GATEWAY_ID || null,
-      nodeId: null
+      gatewayId: null,
+      nodeId: null,
+      disabledLogged: false
     };
 
     this.heartbeatTimer = null;
@@ -802,23 +796,20 @@ class CallMeshAprsBridge extends EventEmitter {
 
     try {
       const state = this.tenmanForwardState;
-      const meshIdNormalized = normalizeMeshId(
-        summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
-      );
-      const useWhitelist = TENMAN_FORWARD_NODE_IDS.size > 0;
-      if (useWhitelist && (!meshIdNormalized || !TENMAN_FORWARD_NODE_IDS.has(meshIdNormalized))) {
-        if (state && meshIdNormalized && !state.skippedNodeIds.has(meshIdNormalized)) {
-          state.skippedNodeIds.add(meshIdNormalized);
-          this.emitLog(
-            'TENMAN',
-            `節點 ${meshIdNormalized} 不在 TENMAN_FORWARD_NODE_IDS 清單中，略過 publish`
-          );
+      if (!this.isTenmanForwardEnabled()) {
+        if (state && !state.disabledLogged) {
+          state.disabledLogged = true;
+          this.emitLog('TENMAN', 'TenManMap 轉發已停用');
         }
         return;
       }
-      if (state && meshIdNormalized) {
-        state.skippedNodeIds.delete(meshIdNormalized);
+      if (state) {
+        state.disabledLogged = false;
       }
+
+      const meshIdNormalized = normalizeMeshId(
+        summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
+      );
 
       const position = summary.position;
       if (!position) {
@@ -854,7 +845,7 @@ class CallMeshAprsBridge extends EventEmitter {
       if (!apiKey) {
         if (state && !state.missingApiKeyWarned) {
           state.missingApiKeyWarned = true;
-          this.emitLog('TENMAN', '缺少 CallMesh API Key，請先完成驗證或設定 TENMAN_API_KEY');
+          this.emitLog('TENMAN', '缺少 CallMesh API Key，請先完成驗證');
         }
         return;
       }
@@ -862,7 +853,7 @@ class CallMeshAprsBridge extends EventEmitter {
         state.missingApiKeyWarned = false;
       }
 
-      const deviceId = meshIdNormalized || state.gatewayId || TENMAN_FORWARD_GATEWAY_ID || 'unknown';
+      const deviceId = meshIdNormalized || state.gatewayId || 'unknown';
       const dedupeKey = `${deviceId}:${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
       if (
         this.tenmanForwardState.lastKey === dedupeKey ||
@@ -908,8 +899,18 @@ class CallMeshAprsBridge extends EventEmitter {
     }
   }
 
+  isTenmanForwardEnabled() {
+    if (typeof this.tenmanForwardOverride === 'boolean') {
+      return this.tenmanForwardOverride;
+    }
+    return TENMAN_FORWARD_DEFAULT_ENABLED;
+  }
+
   enqueueTenmanPublish(message, dedupeKey) {
     if (!message || !dedupeKey) {
+      return;
+    }
+    if (!this.isTenmanForwardEnabled()) {
       return;
     }
     const state = this.tenmanForwardState;
@@ -960,6 +961,9 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   ensureTenmanWebsocket() {
+    if (!this.isTenmanForwardEnabled()) {
+      return;
+    }
     const state = this.tenmanForwardState;
     if (!state || !Array.isArray(state.queue)) {
       return;
@@ -1018,6 +1022,9 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   flushTenmanQueue() {
+    if (!this.isTenmanForwardEnabled()) {
+      return;
+    }
     const state = this.tenmanForwardState;
     if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
       return;
@@ -1089,6 +1096,9 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   scheduleTenmanReconnect(reason = 'retry') {
+    if (!this.isTenmanForwardEnabled()) {
+      return;
+    }
     const state = this.tenmanForwardState;
     if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
       return;
@@ -1108,7 +1118,7 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   getTenmanApiKey() {
-    return TENMAN_FORWARD_API_KEY || this.callmeshState?.apiKey || null;
+    return this.callmeshState?.apiKey || null;
   }
 
   sendTenmanAuth() {
@@ -1198,7 +1208,7 @@ class CallMeshAprsBridge extends EventEmitter {
       const status = String(parsed?.status ?? parsed?.result ?? parsed?.ok ?? 'ok').toLowerCase();
       if (status === 'pass' || status === 'ok' || status === 'true') {
         const gatewayId = normalizeMeshId(
-          parsed?.gateway_id ?? parsed?.gatewayId ?? state.gatewayId ?? TENMAN_FORWARD_GATEWAY_ID
+          parsed?.gateway_id ?? parsed?.gatewayId ?? state.gatewayId ?? null
         );
         const nodeId = parsed?.node_id ?? parsed?.nodeId ?? state.nodeId ?? null;
         state.gatewayId = gatewayId || state.gatewayId || null;

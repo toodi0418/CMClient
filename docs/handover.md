@@ -20,7 +20,7 @@
 - **訊息來源名稱對齊節點資料庫**：儲存的文字訊息會帶入節點 Mesh ID，重新載入時會回查節點資料庫補齊長短名，避免僅顯示 Mesh ID。
 - **最後轉發推測升級**：`meshtasticClient` 會比對 `relay-link-stats.json` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
 - **Relay 提示 UI**：CLI/Electron/Web 均以圓形 `?` 按鈕提示推測結果；桌面與 Web 啟用半透明 Modal 顯示推測原因、候選節點與 Mesh ID。
-- **TENMANMAP 轉發管線**：`CallMeshAprsBridge` 支援以 WebSocket 將指定節點位置上傳至 TENMANMAP 服務，具備驗證、白名單、佇列與自動重連機制。
+- **TENMANMAP 轉發管線**：`CallMeshAprsBridge` 會以 WebSocket 將位置封包上傳至 TENMANMAP 服務，預設全數節點皆轉發，可透過環境變數 `TENMAN_DISABLE=1` 或 CLI 旗標 `--no-share-with-tenmanmap` 全域停用；佇列、驗證與自動重連機制維持啟用。
 - **訊息距離顯示**：訊息分頁會根據節點資料庫座標與最後更新時間，顯示距離（km／m）與位置更新時間差（例如 `22.9 km (3 分鐘前)`）。
 - **遙測時間戳統一**：所有 Telemetry 紀錄寫入時都會以收包當下的時間 (`timestampMs`) 為準，同步更新 `sampleTime*` 與 `telemetry.time*` 欄位，避免裝置 RTC 漂移造成前端區間掛零。
 - **CLI 旗標**：預設關閉 Web UI；若需啟動可加上 `--web-ui`。Electron 亦可透過設定頁切換，或以 `TMAG_WEB_DASHBOARD` 強制指定。
