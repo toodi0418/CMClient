@@ -1336,16 +1336,10 @@ class MeshtasticClient extends EventEmitter {
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
 
-    if (
-      this._summaryContainsIgnoredMesh(summary, {
-        fromRaw: packet.from,
-        toRaw: packet.to,
-        relayRaw: relayNodeId,
-        nextHopRaw: nextHopId
-      })
-    ) {
-      return null;
-    }
+    summary.from = this._scrubPlaceholderNode(summary.from);
+    summary.to = this._scrubPlaceholderNode(summary.to);
+    summary.relay = this._scrubPlaceholderNode(summary.relay);
+    summary.nextHop = this._scrubPlaceholderNode(summary.nextHop);
 
     const fromMeshCandidate =
       summary.from?.meshId ??
@@ -1760,39 +1754,41 @@ class MeshtasticClient extends EventEmitter {
     return true;
   }
 
-  _summaryContainsIgnoredMesh(summary, { fromRaw = null, toRaw = null, relayRaw = null, nextHopRaw = null } = {}) {
-    const checks = [
-      [summary?.from, fromRaw],
-      [summary?.to, toRaw],
-      [summary?.relay, relayRaw],
-      [summary?.nextHop, nextHopRaw]
-    ];
-    for (const [node, fallback] of checks) {
-      if (this._nodeContainsIgnoredMesh(node, fallback)) {
-        return true;
+  _scrubPlaceholderNode(node) {
+    if (!node || typeof node !== 'object') {
+      return node;
+    }
+    const meshIdCandidate =
+      node.meshId ?? node.meshIdNormalized ?? node.meshIdOriginal ?? null;
+    let normalized = null;
+    if (meshIdCandidate != null) {
+      if (typeof meshIdCandidate === 'string') {
+        normalized = normalizeMeshId(meshIdCandidate);
+      } else if (Number.isFinite(meshIdCandidate)) {
+        normalized = formatHexId(Number(meshIdCandidate) >>> 0);
       }
+    } else if (Number.isFinite(node.raw)) {
+      normalized = formatHexId(Number(node.raw) >>> 0);
     }
-    return false;
-  }
-
-  _nodeContainsIgnoredMesh(node, fallback) {
-    const candidates = [];
-    if (node && typeof node === 'object') {
-      if (node.meshId !== undefined) candidates.push(node.meshId);
-      if (node.meshIdNormalized !== undefined) candidates.push(node.meshIdNormalized);
-      if (node.meshIdOriginal !== undefined) candidates.push(node.meshIdOriginal);
-      if (Number.isFinite(node.raw)) candidates.push(node.raw);
+    if (!normalized || !this._shouldIgnoreMeshId(normalized)) {
+      return node;
     }
-    if (fallback != null) {
-      candidates.push(fallback);
+    const scrubbed = {
+      ...node,
+      meshId: null,
+      meshIdNormalized: null,
+      meshIdOriginal: null
+    };
+    const fallbackLabel = scrubbed.longName || scrubbed.shortName || null;
+    if (fallbackLabel) {
+      scrubbed.label = fallbackLabel;
+    } else if (scrubbed.label) {
+      const cleaned = scrubbed.label.replace(/\s*\(!abcd[0-9a-f]*\)$/i, '').trim();
+      scrubbed.label = cleaned || 'unknown';
+    } else {
+      scrubbed.label = 'unknown';
     }
-    for (const candidate of candidates) {
-      if (candidate == null) continue;
-      if (this._shouldIgnoreMeshId(candidate)) {
-        return true;
-      }
-    }
-    return false;
+    return scrubbed;
   }
 
   _sendWantConfig() {
