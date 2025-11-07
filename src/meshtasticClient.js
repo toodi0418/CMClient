@@ -1276,6 +1276,16 @@ class MeshtasticClient extends EventEmitter {
       fallbackNextHop &&
       (fallbackNextHop.nodeId >>> 0) === selfNumeric;
 
+    const fromMeshCandidate =
+      fromInfo?.meshId ??
+      fromInfo?.meshIdNormalized ??
+      fromInfo?.meshIdOriginal ??
+      packet.from ??
+      null;
+    if (this._shouldIgnoreMeshId(fromMeshCandidate)) {
+      return null;
+    }
+
     if ((relayMissing || relayMatchesSelf) && fallbackNextHop && !nextHopMatchesSelf && indicatesRelay) {
       const fallbackReason =
         fallbackNextHop.reason ||
