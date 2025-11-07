@@ -1286,6 +1286,16 @@ class MeshtasticClient extends EventEmitter {
       return null;
     }
 
+    const toMeshCandidate =
+      toInfo?.meshId ??
+      toInfo?.meshIdNormalized ??
+      toInfo?.meshIdOriginal ??
+      (packet.to !== BROADCAST_ADDR ? packet.to : null) ??
+      null;
+    if (this._shouldIgnoreMeshId(toMeshCandidate)) {
+      return null;
+    }
+
     if ((relayMissing || relayMatchesSelf) && fallbackNextHop && !nextHopMatchesSelf && indicatesRelay) {
       const fallbackReason =
         fallbackNextHop.reason ||
