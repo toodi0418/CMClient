@@ -28,23 +28,15 @@ const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
 
-const TENMAN_FORWARD_WS_ENDPOINT =
-  process.env.TENMAN_WS_URL || 'wss://tenmanmap.yakumo.tw/ws';
+const TENMAN_FORWARD_WS_ENDPOINT = 'wss://tenmanmap.yakumo.tw/ws';
+const TENMAN_FORWARD_DEFAULT_ENABLED =
+  !['1', 'true', 'yes', 'on'].includes(
+    String(process.env.TENMAN_DISABLE || '').trim().toLowerCase()
+  );
 const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
 const TENMAN_FORWARD_QUEUE_LIMIT = 64;
 const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
-const TENMAN_FORWARD_GATEWAY_ID = normalizeMeshId(process.env.TENMAN_GATEWAY_ID || null);
-const TENMAN_FORWARD_API_KEY =
-  process.env.CALLMESH_API_KEY || process.env.TENMAN_API_KEY || null;
 const TENMAN_FORWARD_AUTH_ACTION = 'authenticate';
-const TENMAN_FORWARD_NODE_IDS = new Set(
-  String(process.env.TENMAN_NODE_IDS || '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean)
-    .map((id) => normalizeMeshId(id))
-    .filter(Boolean)
-);
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
@@ -220,6 +212,8 @@ class CallMeshAprsBridge extends EventEmitter {
       ? Math.max(10, Math.floor(telemetryMaxEntriesPerNode))
       : 500;
 
+    this.tenmanForwardOverride =
+      typeof options.shareWithTenmanMap === 'boolean' ? options.shareWithTenmanMap : null;
     this.tenmanForwardState = {
       lastKey: null,
       websocket: null,
@@ -231,9 +225,9 @@ class CallMeshAprsBridge extends EventEmitter {
       authenticated: false,
       authenticating: false,
       missingApiKeyWarned: false,
-      skippedNodeIds: new Set(),
-      gatewayId: TENMAN_FORWARD_GATEWAY_ID || null,
-      nodeId: null
+      gatewayId: null,
+      nodeId: null,
+      disabledLogged: false
     };
 
     this.heartbeatTimer = null;
@@ -802,23 +796,20 @@ class CallMeshAprsBridge extends EventEmitter {
 
     try {
       const state = this.tenmanForwardState;
-      const meshIdNormalized = normalizeMeshId(
-        summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
-      );
-      const useWhitelist = TENMAN_FORWARD_NODE_IDS.size > 0;
-      if (useWhitelist && (!meshIdNormalized || !TENMAN_FORWARD_NODE_IDS.has(meshIdNormalized))) {
-        if (state && meshIdNormalized && !state.skippedNodeIds.has(meshIdNormalized)) {
-          state.skippedNodeIds.add(meshIdNormalized);
-          this.emitLog(
-            'TENMAN',
-            `節點 ${meshIdNormalized} 不在 TENMAN_FORWARD_NODE_IDS 清單中，略過 publish`
-          );
+      if (!this.isTenmanForwardEnabled()) {
+        if (state && !state.disabledLogged) {
+          state.disabledLogged = true;
+          this.emitLog('TENMAN', 'TenManMap 轉發已停用');
         }
         return;
       }
-      if (state && meshIdNormalized) {
-        state.skippedNodeIds.delete(meshIdNormalized);
+      if (state) {
+        state.disabledLogged = false;
       }
+
+      const meshIdNormalized = normalizeMeshId(
+        summary?.from?.meshIdNormalized ?? summary?.from?.meshId ?? summary?.from?.mesh_id
+      );
 
       const position = summary.position;
       if (!position) {
@@ -854,7 +845,7 @@ class CallMeshAprsBridge extends EventEmitter {
       if (!apiKey) {
         if (state && !state.missingApiKeyWarned) {
           state.missingApiKeyWarned = true;
-          this.emitLog('TENMAN', '缺少 CallMesh API Key，請先完成驗證或設定 TENMAN_API_KEY');
+          this.emitLog('TENMAN', '缺少 CallMesh API Key，請先完成驗證');
         }
         return;
       }
@@ -862,7 +853,7 @@ class CallMeshAprsBridge extends EventEmitter {
         state.missingApiKeyWarned = false;
       }
 
-      const deviceId = meshIdNormalized || state.gatewayId || TENMAN_FORWARD_GATEWAY_ID || 'unknown';
+      const deviceId = meshIdNormalized || state.gatewayId || 'unknown';
       const dedupeKey = `${deviceId}:${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
       if (
         this.tenmanForwardState.lastKey === dedupeKey ||
@@ -908,8 +899,40 @@ class CallMeshAprsBridge extends EventEmitter {
     }
   }
 
+  isTenmanForwardEnabled() {
+    if (typeof this.tenmanForwardOverride === 'boolean') {
+      return this.tenmanForwardOverride;
+    }
+    return TENMAN_FORWARD_DEFAULT_ENABLED;
+  }
+
+  setTenmanShareEnabled(enabled) {
+    const override = typeof enabled === 'boolean' ? enabled : null;
+    if (this.tenmanForwardOverride === override) {
+      return this.isTenmanForwardEnabled();
+    }
+    this.tenmanForwardOverride = override;
+    if (!this.isTenmanForwardEnabled()) {
+      this.tenmanForwardState.queue = [];
+      this.tenmanForwardState.pendingKeys?.clear?.();
+      this.tenmanForwardState.lastKey = null;
+      this.tenmanForwardState.disabledLogged = false;
+      this.emitLog('TENMAN', 'TenManMap 轉發已停用');
+      this.resetTenmanWebsocket();
+      return false;
+    }
+    this.tenmanForwardState.disabledLogged = false;
+    this.emitLog('TENMAN', 'TenManMap 轉發已啟用');
+    this.ensureTenmanWebsocket();
+    this.flushTenmanQueue();
+    return true;
+  }
+
   enqueueTenmanPublish(message, dedupeKey) {
     if (!message || !dedupeKey) {
+      return;
+    }
+    if (!this.isTenmanForwardEnabled()) {
       return;
     }
     const state = this.tenmanForwardState;
@@ -960,6 +983,9 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   ensureTenmanWebsocket() {
+    if (!this.isTenmanForwardEnabled()) {
+      return;
+    }
     const state = this.tenmanForwardState;
     if (!state || !Array.isArray(state.queue)) {
       return;
@@ -1018,6 +1044,9 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   flushTenmanQueue() {
+    if (!this.isTenmanForwardEnabled()) {
+      return;
+    }
     const state = this.tenmanForwardState;
     if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
       return;
@@ -1089,6 +1118,9 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   scheduleTenmanReconnect(reason = 'retry') {
+    if (!this.isTenmanForwardEnabled()) {
+      return;
+    }
     const state = this.tenmanForwardState;
     if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
       return;
@@ -1108,7 +1140,7 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   getTenmanApiKey() {
-    return TENMAN_FORWARD_API_KEY || this.callmeshState?.apiKey || null;
+    return this.callmeshState?.apiKey || null;
   }
 
   sendTenmanAuth() {
@@ -1198,7 +1230,7 @@ class CallMeshAprsBridge extends EventEmitter {
       const status = String(parsed?.status ?? parsed?.result ?? parsed?.ok ?? 'ok').toLowerCase();
       if (status === 'pass' || status === 'ok' || status === 'true') {
         const gatewayId = normalizeMeshId(
-          parsed?.gateway_id ?? parsed?.gatewayId ?? state.gatewayId ?? TENMAN_FORWARD_GATEWAY_ID
+          parsed?.gateway_id ?? parsed?.gatewayId ?? state.gatewayId ?? null
         );
         const nodeId = parsed?.node_id ?? parsed?.nodeId ?? state.nodeId ?? null;
         state.gatewayId = gatewayId || state.gatewayId || null;
@@ -2244,6 +2276,23 @@ class CallMeshAprsBridge extends EventEmitter {
       this.nodeDatabase.get(meshId),
       { meshId }
     );
+    const relayFields = prepareTelemetryRelayFields(cloned);
+    cloned.relay = relayFields.relay;
+    cloned.relayLabel = relayFields.relayLabel;
+    cloned.relayMeshId = relayFields.relayMeshId;
+    cloned.relayMeshIdNormalized = relayFields.relayMeshIdNormalized;
+    cloned.relayGuessed = relayFields.relayGuessed;
+    cloned.relayGuessReason = relayFields.relayGuessReason;
+    const hopFields = prepareTelemetryHopsFields({
+      hops: cloned.hops,
+      hopsLabel: cloned.hopsLabel,
+      hopsStart: cloned.hops?.start ?? cloned.hopsStart,
+      hopsLimit: cloned.hops?.limit ?? cloned.hopsLimit
+    });
+    cloned.hops = hopFields.hops;
+    cloned.hopsLabel = hopFields.hopsLabel;
+    cloned.hopsUsed = hopFields.hopsUsed;
+    cloned.hopsTotal = hopFields.hopsTotal;
     return cloned;
   }
 
@@ -2273,6 +2322,15 @@ class CallMeshAprsBridge extends EventEmitter {
       { meshId }
     );
     const recordId = `${meshId}-${baseTimestampMs}-${Math.random().toString(16).slice(2, 10)}`;
+    const relayFields = prepareTelemetryRelayFields({
+      relay: summary.relay,
+      relayMeshId: summary.relayMeshId,
+      relayMeshIdNormalized: summary.relayMeshIdNormalized,
+      relayLabel: summary.relay?.label,
+      relayGuess: summary.relayGuess,
+      relayGuessReason: summary.relayGuessReason
+    });
+    const hopFields = prepareTelemetryHopsFields(summary.hops);
 
     return {
       id: recordId,
@@ -2288,6 +2346,16 @@ class CallMeshAprsBridge extends EventEmitter {
       snr: Number.isFinite(summary.snr) ? summary.snr : null,
       rssi: Number.isFinite(summary.rssi) ? summary.rssi : null,
       flowId: summary.flowId || null,
+      relay: relayFields.relay,
+      relayLabel: relayFields.relayLabel,
+      relayMeshId: relayFields.relayMeshId,
+      relayMeshIdNormalized: relayFields.relayMeshIdNormalized,
+      relayGuessed: relayFields.relayGuessed,
+      relayGuessReason: relayFields.relayGuessReason,
+      hops: hopFields.hops,
+      hopsLabel: hopFields.hopsLabel,
+      hopsUsed: hopFields.hopsUsed,
+      hopsTotal: hopFields.hopsTotal,
       telemetry: {
         kind: telemetry.kind || 'unknown',
         timeSeconds: Number.isFinite(sampleTimeMs) ? Math.floor(sampleTimeMs / 1000) : null,
@@ -2647,6 +2715,182 @@ function mergeNodeInfo(...sources) {
   return result;
 }
 
+function prepareTelemetryRelayFields(source) {
+  const relaySource = source?.relay && typeof source.relay === 'object' ? source.relay : null;
+  const baseRelay = extractTelemetryNode(relaySource);
+  const meshCandidates = [
+    source?.relayMeshId,
+    source?.relayMeshIdNormalized,
+    relaySource?.meshId,
+    relaySource?.meshIdNormalized,
+    baseRelay?.meshId,
+    baseRelay?.meshIdNormalized
+  ].filter(Boolean);
+  let meshIdNormalized = null;
+  let meshIdRaw = null;
+  for (const candidate of meshCandidates) {
+    const normalized = normalizeMeshId(candidate);
+    if (!normalized) continue;
+    if (!meshIdNormalized) {
+      meshIdNormalized = normalized;
+    }
+    if (!meshIdRaw) {
+      const candidateStr = String(candidate);
+      meshIdRaw =
+        candidateStr.startsWith('!') || candidateStr.toLowerCase().startsWith('0x')
+          ? normalized
+          : candidateStr;
+    }
+  }
+  if (!meshIdRaw && meshIdNormalized) {
+    meshIdRaw = meshIdNormalized;
+  }
+  const labelCandidates = [
+    typeof source?.relayLabel === 'string' ? source.relayLabel.trim() : '',
+    typeof relaySource?.label === 'string' ? relaySource.label.trim() : '',
+    baseRelay?.label ?? ''
+  ];
+  const relayLabel = labelCandidates.find((value) => value) || '';
+  const guessedFlag =
+    source?.relayGuessed ??
+    source?.relayGuess ??
+    relaySource?.guessed ??
+    false;
+  const relayReason =
+    source?.relayGuessReason ??
+    relaySource?.reason ??
+    relaySource?.guessReason ??
+    null;
+
+  let relay = null;
+  if (baseRelay || meshIdRaw || meshIdNormalized || relayLabel) {
+    relay = mergeNodeInfo(baseRelay, {
+      meshId: meshIdRaw || meshIdNormalized || null,
+      meshIdNormalized: meshIdNormalized || null,
+      label: relayLabel || null
+    });
+    if (relay) {
+      if (!relay.label) {
+        relay.label = buildNodeLabel(relay);
+      }
+      relay.guessed = Boolean(guessedFlag);
+      if (relayReason) {
+        relay.guessReason = relayReason;
+      } else {
+        delete relay.guessReason;
+      }
+    } else if (relayLabel || meshIdRaw || meshIdNormalized) {
+      relay = {
+        label: relayLabel || null,
+        meshId: meshIdRaw || meshIdNormalized || null,
+        meshIdNormalized: meshIdNormalized || null,
+        guessed: Boolean(guessedFlag)
+      };
+      if (relayReason) {
+        relay.guessReason = relayReason;
+      }
+    }
+  }
+
+  return {
+    relay: relay || null,
+    relayLabel: (relay && relay.label) || relayLabel || null,
+    relayMeshId: (relay && relay.meshId) || meshIdRaw || meshIdNormalized || null,
+    relayMeshIdNormalized: (relay && relay.meshIdNormalized) || meshIdNormalized || null,
+    relayGuessed: Boolean(guessedFlag) && Boolean(relayLabel || meshIdRaw || meshIdNormalized),
+    relayGuessReason: relayReason || (relay && relay.guessReason) || null
+  };
+}
+
+function deriveHopUsage({ start, limit, label }) {
+  let used = null;
+  let total = Number.isFinite(start) ? start : null;
+
+  if (Number.isFinite(start) && Number.isFinite(limit)) {
+    used = Math.max(start - limit, 0);
+  } else if (label) {
+    const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
+    if (match) {
+      used = Number(match[1]);
+      if (!Number.isFinite(total)) {
+        total = Number(match[2]);
+      }
+    } else if (/^\d+$/.test(label)) {
+      used = 0;
+      if (!Number.isFinite(total)) {
+        total = Number(label);
+      }
+    }
+    if (!Number.isFinite(total)) {
+      const totalMatch = label.match(/\/\s*(\d+)/);
+      if (totalMatch) {
+        total = Number(totalMatch[1]);
+      }
+    }
+  }
+
+  return {
+    used: Number.isFinite(used) ? used : null,
+    total: Number.isFinite(total) ? total : null
+  };
+}
+
+function prepareTelemetryHopsFields(source) {
+  const hopSource = source && typeof source === 'object'
+    ? source.hops && typeof source.hops === 'object'
+      ? source.hops
+      : source
+    : null;
+  const startRaw = Number(hopSource?.start);
+  const startCandidate = Number.isFinite(startRaw)
+    ? startRaw
+    : Number.isFinite(Number(source?.hopsStart))
+      ? Number(source.hopsStart)
+      : null;
+  const limitRaw = Number(hopSource?.limit);
+  const limitCandidate = Number.isFinite(limitRaw)
+    ? limitRaw
+    : Number.isFinite(Number(source?.hopsLimit))
+      ? Number(source.hopsLimit)
+      : null;
+  const labelCandidateRaw =
+    (typeof hopSource?.label === 'string' && hopSource.label.trim()) ||
+    (typeof source?.hopsLabel === 'string' && source.hopsLabel.trim()) ||
+    '';
+  const labelCandidate = labelCandidateRaw || null;
+  const { used, total } = deriveHopUsage({
+    start: startCandidate,
+    limit: limitCandidate,
+    label: labelCandidate || ''
+  });
+
+  if (
+    startCandidate == null &&
+    limitCandidate == null &&
+    !labelCandidate &&
+    used == null &&
+    total == null
+  ) {
+    return {
+      hops: null,
+      hopsLabel: null,
+      hopsUsed: null,
+      hopsTotal: null
+    };
+  }
+
+  return {
+    hops: {
+      start: Number.isFinite(startCandidate) ? startCandidate : null,
+      limit: Number.isFinite(limitCandidate) ? limitCandidate : null,
+      label: labelCandidate
+    },
+    hopsLabel: labelCandidate,
+    hopsUsed: used,
+    hopsTotal: total
+  };
+}
+
 function deepCloneTelemetryValue(value) {
   if (value == null) {
     return value;
@@ -2678,6 +2922,8 @@ function cloneTelemetryRecord(record) {
   return {
     ...record,
     node: record.node ? { ...record.node } : null,
+    relay: record.relay ? { ...record.relay } : null,
+    hops: record.hops ? { ...record.hops } : null,
     telemetry: record.telemetry
       ? {
           ...record.telemetry,

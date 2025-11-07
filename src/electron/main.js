@@ -36,6 +36,7 @@ const MeshtasticClient = require('../meshtasticClient');
 const { discoverMeshtasticDevices } = require('../discovery');
 const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
 const { WebDashboardServer } = require('../web/server');
+const { SerialPort } = require('serialport');
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
@@ -307,6 +308,25 @@ function normalizeClientPreferences(raw) {
     if (Object.prototype.hasOwnProperty.call(raw, 'webDashboardEnabled')) {
       normalized.webDashboardEnabled = Boolean(raw.webDashboardEnabled);
     }
+    if (typeof raw.connectionMode === 'string') {
+      const mode = raw.connectionMode.trim().toLowerCase();
+      if (mode === 'serial' || mode === 'tcp') {
+        normalized.connectionMode = mode;
+      }
+    }
+    if (typeof raw.serialPath === 'string') {
+      const trimmedPath = raw.serialPath.trim();
+      if (trimmedPath) {
+        normalized.serialPath = trimmedPath;
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(raw, 'shareWithTenmanMap')) {
+      if (raw.shareWithTenmanMap === null) {
+        normalized.shareWithTenmanMap = null;
+      } else {
+        normalized.shareWithTenmanMap = Boolean(raw.shareWithTenmanMap);
+      }
+    }
   }
   return normalized;
 }
@@ -322,6 +342,9 @@ async function getCachedClientPreferences() {
 
 async function writeClientPreferences(preferences) {
   const normalized = normalizeClientPreferences(preferences);
+  if (normalized.connectionMode !== 'serial') {
+    delete normalized.serialPath;
+  }
   const filePath = getClientPreferencesPath();
   if (!Object.keys(normalized).length) {
     await fs.rm(filePath, { force: true });
@@ -358,6 +381,40 @@ async function updateClientPreferences(updates = {}) {
   }
   if (Object.prototype.hasOwnProperty.call(updates, 'webDashboardEnabled')) {
     existing.webDashboardEnabled = Boolean(updates.webDashboardEnabled);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'connectionMode')) {
+    const modeValue =
+      typeof updates.connectionMode === 'string'
+        ? updates.connectionMode.trim().toLowerCase()
+        : '';
+    if (modeValue === 'serial' || modeValue === 'tcp') {
+      existing.connectionMode = modeValue;
+    } else {
+      delete existing.connectionMode;
+    }
+    if (modeValue !== 'serial') {
+      delete existing.serialPath;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'serialPath')) {
+    const pathValue =
+      typeof updates.serialPath === 'string' ? updates.serialPath.trim() : '';
+    if (pathValue && (existing.connectionMode === 'serial')) {
+      existing.serialPath = pathValue;
+    } else if (!pathValue) {
+      delete existing.serialPath;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'shareWithTenmanMap')) {
+    const rawValue = updates.shareWithTenmanMap;
+    if (rawValue === null) {
+      delete existing.shareWithTenmanMap;
+      bridge?.setTenmanShareEnabled?.(null);
+    } else {
+      const desired = Boolean(rawValue);
+      existing.shareWithTenmanMap = desired;
+      bridge?.setTenmanShareEnabled?.(desired);
+    }
   }
   return writeClientPreferences(existing);
 }
@@ -512,6 +569,15 @@ function setupBridgeListeners() {
 async function initialiseBridge() {
   callmeshRestoreAllowed = shouldIncludeEnvApiKey();
 
+  const preferences = await getCachedClientPreferences().catch(() => ({}));
+  const storedSharePreference = (() => {
+    if (!preferences || typeof preferences !== 'object') return null;
+    if (!Object.prototype.hasOwnProperty.call(preferences, 'shareWithTenmanMap')) return null;
+    const value = preferences.shareWithTenmanMap;
+    if (value === null) return null;
+    return Boolean(value);
+  })();
+
   let restoredKey = '';
   if (callmeshRestoreAllowed) {
     const persisted = await loadPersistedApiKey();
@@ -523,14 +589,20 @@ async function initialiseBridge() {
   const envKey = callmeshRestoreAllowed ? (process.env.CALLMESH_API_KEY || '') : '';
   const initialKey = envKey || restoredKey || '';
 
-  bridge = new CallMeshAprsBridge({
+  const bridgeOptions = {
     storageDir: getCallMeshDataDir(),
     appVersion,
     apiKey: initialKey,
     verified: Boolean(initialKey),
     heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
     agentProduct: 'callmesh-client'
-  });
+  };
+
+  if (storedSharePreference !== null) {
+    bridgeOptions.shareWithTenmanMap = storedSharePreference;
+  }
+
+  bridge = new CallMeshAprsBridge(bridgeOptions);
 
   setupBridgeListeners();
   await bridge.init({ allowRestore: callmeshRestoreAllowed });
@@ -821,17 +893,121 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   lastMeshtasticStatus = connectingPayload;
   webServer?.publishStatus(connectingPayload);
 
-  client = new MeshtasticClient({
-    host: options.host,
-    port: options.port,
+  const parseSerialHost = (value) => {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed.toLowerCase().startsWith('serial:')) return null;
+    let remainder = trimmed.slice(trimmed.indexOf(':') + 1);
+    if (remainder.startsWith('//')) {
+      remainder = remainder.slice(2);
+    }
+    let query = '';
+    const queryIndex = remainder.indexOf('?');
+    if (queryIndex >= 0) {
+      query = remainder.slice(queryIndex + 1);
+      remainder = remainder.slice(0, queryIndex);
+    }
+    let baudRate = null;
+    const atIndex = remainder.lastIndexOf('@');
+    if (atIndex > 0) {
+      const candidate = remainder.slice(atIndex + 1).trim();
+      if (/^\d+$/.test(candidate)) {
+        baudRate = Number(candidate);
+        remainder = remainder.slice(0, atIndex);
+      }
+    }
+    if (query) {
+      const params = new URLSearchParams(query);
+      for (const key of ['baud', 'baudrate']) {
+        if (params.has(key)) {
+          const valueNum = Number(params.get(key));
+          if (Number.isFinite(valueNum) && valueNum > 0) {
+            baudRate = valueNum;
+            break;
+          }
+        }
+      }
+    }
+    const path = remainder.trim();
+    if (!path) {
+      return null;
+    }
+    return {
+      path,
+      baudRate: Number.isFinite(baudRate) && baudRate > 0 ? baudRate : null
+    };
+  };
+
+  const determineTransport = () => {
+    if (typeof options.transport === 'string') {
+      const mode = options.transport.trim().toLowerCase();
+      if (mode === 'serial') return 'serial';
+      if (mode === 'tcp') return 'tcp';
+    }
+    if (options.serialPath) return 'serial';
+    if (options.host && parseSerialHost(options.host)) return 'serial';
+    return 'tcp';
+  };
+
+  const transport = determineTransport();
+  const relayStatsPath = path.join(getCallMeshDataDir(), 'relay-link-stats.json');
+  const clientOptions = {
+    transport,
     maxLength: options.maxLength ?? 512,
     handshake: options.handshake ?? true,
     heartbeat: options.heartbeat ?? 0,
-    keepAlive: options.keepAlive ?? true,
-    keepAliveDelayMs: options.keepAliveDelayMs ?? 15000,
-    idleTimeoutMs: options.idleTimeoutMs ?? 0,
-    relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json')
-  });
+    relayStatsPath
+  };
+
+  if (Number.isFinite(options.connectTimeoutMs) && options.connectTimeoutMs > 0) {
+    clientOptions.connectTimeout = options.connectTimeoutMs;
+  } else if (Number.isFinite(options.connectTimeout) && options.connectTimeout > 0) {
+    clientOptions.connectTimeout = options.connectTimeout;
+  }
+
+  if (transport === 'serial') {
+    const serialSpec = parseSerialHost(options.host);
+    let serialPath = typeof options.serialPath === 'string' ? options.serialPath.trim() : '';
+    if (!serialPath && serialSpec?.path) {
+      serialPath = serialSpec.path;
+    }
+    clientOptions.serialPath = serialPath;
+    const baudCandidates = [
+      options.serialBaudRate,
+      options.serialBaud,
+      serialSpec?.baudRate
+    ]
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (baudCandidates.length) {
+      clientOptions.serialBaudRate = baudCandidates[0];
+    }
+    if (options.serialOpenOptions && typeof options.serialOpenOptions === 'object') {
+      clientOptions.serialOpenOptions = { ...options.serialOpenOptions };
+    }
+    clientOptions.keepAlive = false;
+    clientOptions.idleTimeoutMs = Number.isFinite(options.idleTimeoutMs)
+      ? options.idleTimeoutMs
+      : 0;
+  } else {
+    clientOptions.host =
+      typeof options.host === 'string' && options.host.trim() ? options.host.trim() : '127.0.0.1';
+    clientOptions.port = Number.isFinite(options.port) ? options.port : 4403;
+    clientOptions.keepAlive = options.keepAlive ?? true;
+    clientOptions.keepAliveDelayMs = options.keepAliveDelayMs ?? 15000;
+    clientOptions.idleTimeoutMs = options.idleTimeoutMs ?? 0;
+  }
+
+  if (transport === 'serial' && !clientOptions.serialPath) {
+    const message = 'Serial 連線需要指定裝置路徑';
+    const payload = { status: 'error', message };
+    mainWindow?.webContents.send('meshtastic:status', payload);
+    lastMeshtasticStatus = payload;
+    webServer?.publishStatus(payload);
+    throw new Error(message);
+  }
+
+  client = new MeshtasticClient(clientOptions);
 
   client.on('connected', () => {
     const payload = { status: 'connected' };
@@ -939,6 +1115,28 @@ ipcMain.handle('meshtastic:disconnect', async () => {
 ipcMain.handle('meshtastic:discover', async (_event, options) => {
   const devices = await discoverMeshtasticDevices(options);
   return devices;
+});
+
+ipcMain.handle('meshtastic:list-serial', async () => {
+  try {
+    const ports = await SerialPort.list();
+    if (!Array.isArray(ports)) {
+      return [];
+    }
+    return ports.map((port) => ({
+      path: port.path || '',
+      manufacturer: port.manufacturer || null,
+      friendlyName: port.friendlyName || null,
+      productId: port.productId || null,
+      vendorId: port.vendorId || null,
+      serialNumber: port.serialNumber || null,
+      locationId: port.locationId || null,
+      pnpId: port.pnpId || null
+    }));
+  } catch (err) {
+    console.error('列出 Serial 裝置失敗:', err);
+    throw err;
+  }
 });
 
 ipcMain.handle('messages:get-snapshot', async () => {

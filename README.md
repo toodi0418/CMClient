@@ -2,19 +2,21 @@
 
 TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合了 CallMesh 平台驗證、Mapping 同步、APRS uplink 與遙測統計。專案同時提供：
 
-- **CLI**：適合在 macOS / Linux / Windows（或 Raspberry Pi）上以無頭模式執行，固定將 Meshtastic TCP 流轉換成 APRS 封包並回報至 CallMesh。
-- **Electron 桌面版**：提供即時儀表板、封包/節點追蹤、APR S 狀態檢視等 GUI 功能。
+- **CLI**：適合在 macOS / Linux / Windows（或 Raspberry Pi）上以無頭模式執行，能透過 Meshtastic **TCP 或 Serial** 連線將封包轉換成 APRS uplink 並回報 CallMesh。
+- **Electron 桌面版**：提供即時儀表板、封包/節點追蹤、APRS 狀態檢視等 GUI 功能，並支援 TCP / Serial 模式與裝置清單選取。
 
-> ✅ 只要準備 CallMesh API Key 與 Meshtastic TCP Access（預設埠 4403），就能在任何支援 Node.js 的平台啟動整個 Gateway。
+> ✅ 只要準備 CallMesh API Key 與 Meshtastic 連線（TCP 或 Serial），就能在任何支援 Node.js 的平台啟動整個 Gateway。
 
 ---
 
 ## 1. 主要功能
 
-- **Meshtastic 監控**：解析 TCP Stream 內的 protobuf 封包，摘要顯示節點、SNR/RSSI、Hops、座標等資訊。
+- **Meshtastic 監控**：解析 Meshtastic TCP / Serial 流中的 protobuf 封包，摘要顯示節點、SNR/RSSI、Hops、座標等資訊。
 - **CallMesh 整合**：透過 Heartbeat/Mapping/Provision API 取得節點配置與 APRS 參數，並在 Key 驗證失敗時鎖定系統。
 - **APRS Uplink**：依 Mapping 決定呼號、符號與註解，上傳位置/狀態/遙測資料到 APRS-IS，具備 Beacon、Status、Telemetry 定時器與互斥上傳控制。
+- **TenManMap 轉發**：驗證成功後，會將 Meshtastic 摘要同步到 TenManMap 及其合作夥伴，佇列與重試機制常駐執行。
 - **遙測統計**：計算近 10 分鐘的封包數量、上傳比率、類型分佈（Position / Message / Control）。
+- **彈性連線模式**：CLI 與 GUI 皆支援 `tcp://` 與 `serial://` 目標，可自動判讀 `serial:///dev/ttyUSB0` 類型字串並套用鮑率。
 - **跨平台部署**：可自行打包 macOS / Windows / Linux x64 CLI 或 Desktop 版；CLI 同時支援自動重連。
 - **穩定時間戳**：Telemetry 紀錄寫入時會使用收包當下的時間戳，避免裝置 RTC 漂移造成前端區間掛零。
 - **節點資料庫共用**：內建 `nodeDatabase` 集中維護節點長短名、模型、座標等資訊，CLI / Electron / Web 透過 `node`、`node-snapshot` 事件共享同一份資料，節點清單支援座標搜尋與距離顯示。
@@ -26,9 +28,10 @@ TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合�
 ## 2. 環境需求
 
 - Node.js 18 以上（建議使用 LTS 版本）
-- Meshtastic 裝置或 Gateway，且啟用 TCP API（預設 `tcp://<裝置 IP>:4403`）
+- Meshtastic 裝置或 Gateway（TCP API 或 Serial 連線）
 - CallMesh 平台有效的 API Key（環境變數 `CALLMESH_API_KEY`）
 - （若使用 APRS）穩定的網際網路連線
+- （若使用 Serial）系統需對裝置節點具有讀寫權限，例如將使用者加入 `dialout` 或 `uucp` 群組
 
 ---
 
@@ -70,7 +73,28 @@ export CALLMESH_API_KEY="你的 CallMesh API Key"
 # 可選：變更快取與驗證檔案位置
 export CALLMESH_VERIFICATION_FILE=~/.config/callmesh/monitor.json
 export CALLMESH_ARTIFACTS_DIR=~/.config/callmesh/
+
+# TenManMap 開關（預設啟用）
+export TENMAN_DISABLE=1   # 設為 1 / true / yes / on 時停用 TenManMap 推播
 ```
+
+---
+
+### TenManMap 推播與隱私聲明
+
+驗證成功後，TMAG 會沿用 CallMesh 的授權資訊，將 Meshtastic 摘要資料同步至 TenManMap 及其合作夥伴。以下為資料使用的概述：
+
+- 同步範圍：與節點狀態與現地觀測相關的摘要資訊（例如位置、遙測與訊息之摘要欄位）。
+- 使用目的：服務提供與維運、效能與可靠度監測、資安維護、統計分析、研究，以及依據商業策略所需之用途。
+- 分享對象：TenManMap 與其合作夥伴；依法令要求時，可能提供予主管機關或其他有權單位。
+- 保留期間：為達成前述目的所需之期間，或依法律／合約要求延長。
+- 你的選擇：預設同步為開啟；如需停用，請在啟動前設定環境變數 `TENMAN_DISABLE=1`（支援 `true` / `yes` / `on`），於 CLI 加上 `--no-share-with-tenmanmap`，或於桌面版設定頁底部調整分享開關。
+- 資料安全：我們採取合理的技術與管理措施降低風險，但無法保證絕對安全。
+- 跨區處理：資料可能在不同法域之間處理與儲存，適用當地法規。
+- 權利行使：若你欲查詢、請求刪除或停止同步，請依你的部署流程聯絡維運窗口。
+- 條款更新：本段內容可能依實際作業調整，更新後恕不另行通知。
+
+若你的環境對資料揭露有額外規範，請在啟動前評估是否需要停用同步。更多結構與欄位示意請參考 `new-api.md`。
 
 ---
 
@@ -131,10 +155,18 @@ npx pkg src/index.js \
 
 ## 4. CLI 快速上手
 
-CLI 預設會驗證 CallMesh API Key、啟動 heartbeat 與 Mapping 同步，再連線 Meshtastic TCP 並自動轉發到 APRS。
+CLI 預設會驗證 CallMesh API Key、啟動 heartbeat 與 Mapping 同步，再連線 Meshtastic 目標（TCP / Serial）並自動轉發到 APRS。
 
 ```bash
 node src/index.js --host 172.16.8.91 --port 4403
+```
+
+若裝置透過 USB / Serial 連線，也可以：
+
+```bash
+node src/index.js --connection serial --serial-path /dev/ttyUSB0 --serial-baud 115200
+# 或直接使用 host=serial:/// 路徑（鮑率可搭配查詢字串或 @ 參數覆寫）
+node src/index.js --host serial:///dev/ttyUSB0
 ```
 
 使用 `pkg` 打包後的 CLI 執行檔也支援完整的指令列參數，可透過 `--help` 查看：
@@ -153,6 +185,10 @@ Options:
                                                                         [string]
   -H, --host        Meshtastic TCP 伺服器主機位置[string] [default: "127.0.0.1"]
   -P, --port        Meshtastic TCP 伺服器埠號           [number] [default: 4403]
+  -C, --connection  Meshtastic 連線方式（未指定時會依 host 判斷）
+                                                     [choices: "tcp", "serial"]
+      --serial-path Serial 連線時的裝置路徑（例如 /dev/ttyUSB0）        [string]
+      --serial-baud Serial 連線時的鮑率             [number] [default: 115200]
   -m, --max-length  允許的最大封包大小 (位元組)          [number] [default: 512]
   -r, --show-raw    在摘要輸出時同時列印 payload 十六進位
                                                       [boolean] [default: false]
@@ -161,18 +197,23 @@ Options:
   -f, --format      輸出格式：summary 顯示表格，json 顯示完整資料
                                [choices: "summary", "json"] [default: "summary"]
   -p, --pretty      搭配 --format json 時使用縮排輸出  [boolean] [default: true]
+      --no-share-with-tenmanmap  停用 TenManMap 分享         [boolean] [default: false]
 ```
 
 常用選項：
 
 | 參數 | 預設 | 說明 |
 | ---- | ---- | ---- |
-| `--host, -H` | `127.0.0.1` | Meshtastic TCP 伺服器 |
-| `--port, -P` | `4403` | TCP 連接埠 |
-| `--format, -f` | `summary` | `summary` 表格、`json` 輸出完整 protobuf 內容 |
-| `--show-raw, -r` | `false` | 在 summary 下同時顯示十六進位 payload |
-| `--web-ui` | `false` | 啟用內建 Web Dashboard（HTTP + SSE 伺服器） |
-| `--discover` | - | 搜尋區網內 `_meshtastic._tcp` 裝置 |
+| `--connection, -C` | 自動偵測 | 指定 `tcp` 或 `serial`；未設定時會依 `--host` 內容判斷。 |
+| `--host, -H` | `127.0.0.1` | Meshtastic 目標，可填入 IP（如 `192.168.1.50`）或 `serial:///dev/ttyUSB0`。 |
+| `--port, -P` | `4403` | TCP 模式使用的連接埠。 |
+| `--serial-path` | - | Serial 模式的裝置路徑（若 `--host` 已使用 `serial://` 可省略）。 |
+| `--serial-baud` | `115200` | Serial 模式鮑率。 |
+| `--format, -f` | `summary` | `summary` 表格、`json` 輸出完整 protobuf 內容。 |
+| `--show-raw, -r` | `false` | 在 summary 下同時顯示十六進位 payload。 |
+| `--web-ui` | `false` | 啟用內建 Web Dashboard（HTTP + SSE 伺服器）。 |
+| `--no-share-with-tenmanmap` | `false` | 停用 TenManMap 分享。 |
+| `--discover` | - | 搜尋區網內 `_meshtastic._tcp` 裝置。 |
 
 CLI 具備自動重連：若 TCP 連線中斷會每 30 秒重試一次，直到 `Ctrl+C` 終止。
 
@@ -199,10 +240,10 @@ npm run desktop
 
 GUI 提供：
 
-- 連線狀態、APR S 伺服器與登錄顯示
+- 連線狀態、APRS 伺服器與登錄顯示
 - 封包列表與 Mapping 封包追蹤（含「已上傳／待上傳」狀態）
 - CallMesh Log、APRS Log 與遙測統計圖表
-- 設定頁：輸入 CallMesh API Key、調整 APRS Beacon 間隔、掃描 Meshtastic 裝置
+- 設定頁：輸入 CallMesh API Key、調整 APRS Beacon 間隔、掃描 Meshtastic 裝置，並可切換 TCP / Serial 模式與選擇 Serial 裝置
 
 首次啟動需輸入並驗證 CallMesh API Key，通過後即可連線 Meshtastic。
 
@@ -281,7 +322,7 @@ CMClient/
 - **Meshtastic 斷線會自動重連嗎？**  
   CLI 會自動重連；Electron 版由 GUI 控制，可手動重試或啟用背景重連。
 
-- **APR S 不停重連怎麼辦？**  
+- **APRS 不停重連怎麼辦？**  
   通常是同一呼號在不同實例上登入或 comment 更新後頻繁重連；目前我們只在呼號/SSID 變更時才 teardown APRS，若仍被踢請確認無其他裝置使用相同呼號。
 
 ---

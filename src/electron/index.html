@@ -158,6 +158,9 @@
               </div>
             </div>
             <div class="telemetry-actions">
+              <button type="button" id="telemetry-download-btn" class="telemetry-download-btn">
+                下載 CSV
+              </button>
               <button type="button" id="telemetry-clear-btn" class="danger-btn slim">
                 清空遙測數據
               </button>
@@ -222,17 +225,38 @@
         <section class="settings-panel">
           <h2>連線與 CallMesh 設定</h2>
           <div class="fieldset">
-            <label for="settings-host">Meshtastic Host</label>
+            <label for="connection-mode">連線模式</label>
+            <select id="connection-mode">
+              <option value="tcp">TCP（網路）</option>
+              <option value="serial">Serial（USB）</option>
+            </select>
+          </div>
+          <div class="fieldset hidden" id="serial-settings-block">
+            <label for="serial-device-select">Serial 裝置</label>
+            <div class="host-row">
+              <select id="serial-device-select">
+                <option value="">請選擇 Serial 裝置</option>
+              </select>
+              <button type="button" id="serial-refresh-btn">重新整理</button>
+            </div>
+            <small class="callmesh-hint">若列表為空，請確認裝置已連線後再按重新整理。</small>
+            <small id="serial-status" class="discover-status"></small>
+          </div>
+          <div class="fieldset" id="settings-host-fieldset">
+            <label for="settings-host" id="settings-host-label">Meshtastic 目標</label>
             <div class="host-row">
               <input
                 id="settings-host"
                 name="settingsHost"
                 type="text"
-                placeholder="請輸入 Meshtastic 節點 IP"
+                placeholder="輸入節點 IP"
                 required
               />
               <button type="button" id="discover-btn">自動搜尋</button>
             </div>
+            <small class="callmesh-hint" id="settings-host-hint">
+              TCP 模式輸入 IP（例如 192.168.1.50）；Serial 模式請從上方清單選擇裝置，系統會自動套用。
+            </small>
             <small id="discover-status" class="discover-status"></small>
           </div>
           <div class="fieldset callmesh-group">
@@ -259,6 +283,13 @@
               <span>啟用 Web UI</span>
             </label>
             <small class="callmesh-hint">預設關閉，啟用後會啟動內建 Web Dashboard</small>
+          </div>
+          <div class="fieldset tenman-privacy">
+            <label class="toggle-row">
+              <input id="tenman-share-enabled" type="checkbox" checked />
+              <span class="muted-text">允許與 TenManMap 及合作夥伴分享資料</span>
+            </label>
+            <small class="callmesh-hint muted-hint">不建議停用，僅在特殊需求時取消。</small>
           </div>
           <button type="button" id="reset-data-btn" class="danger-btn">重置所有資料</button>
         </section>
@@ -383,12 +414,29 @@
           <button id="overlay-retry">重新驗證</button>
         </div>
         <div id="overlay-step-host" class="overlay-step hidden">
-          <h2>設定 Meshtastic 節點</h2>
-          <p>請輸入節點 IP 或按下「自動搜尋」來尋找區網內的設備。</p>
-          <div class="overlay-input-group add-gap">
+          <h2>設定 Meshtastic 連線</h2>
+          <p>請輸入節點 IP，或在 Serial 模式下從清單選擇裝置（Serial 模式不支援自動搜尋）。</p>
+          <div class="overlay-input-group">
+            <label for="overlay-connection-mode">連線模式</label>
+            <select id="overlay-connection-mode">
+              <option value="tcp">TCP（網路）</option>
+              <option value="serial">Serial（USB）</option>
+            </select>
+          </div>
+          <div class="overlay-input-group add-gap hidden" id="overlay-serial-block">
+            <label for="overlay-serial-select">Serial 裝置</label>
+            <div class="overlay-host-actions">
+              <select id="overlay-serial-select">
+                <option value="">請選擇 Serial 裝置</option>
+              </select>
+              <button id="overlay-serial-refresh">重新整理</button>
+            </div>
+            <div id="overlay-serial-status" class="overlay-status"></div>
+          </div>
+          <div class="overlay-input-group add-gap" id="overlay-host-group">
             <input id="overlay-host" type="text" placeholder="例如：192.168.1.50" />
             <div class="overlay-host-actions">
-              <button id="overlay-apply-host">儲存節點 IP</button>
+              <button id="overlay-apply-host">儲存連線設定</button>
               <button id="overlay-discover-host">自動搜尋</button>
             </div>
           </div>

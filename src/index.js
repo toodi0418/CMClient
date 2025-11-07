@@ -153,6 +153,24 @@ async function main() {
             default: 4403,
             describe: 'Meshtastic TCP 伺服器埠號'
           })
+          .option('connection', {
+            alias: 'C',
+            choices: ['tcp', 'serial'],
+            describe: 'Meshtastic 連線方式（未指定時會依 host 判斷）'
+          })
+          .option('serial-path', {
+            type: 'string',
+            describe: 'Serial 連線時的裝置路徑（例如 /dev/ttyUSB0）'
+          })
+          .option('serial-baud', {
+            type: 'number',
+            default: 115200,
+            describe: 'Serial 連線時的鮑率'
+          })
+          .option('no-share-with-tenmanmap', {
+            type: 'boolean',
+            describe: '停用 TenManMap 分享（預設為啟用）'
+          })
           .option('max-length', {
             alias: 'm',
             type: 'number',
@@ -213,15 +231,22 @@ async function startMonitor(argv) {
   const HEARTBEAT_INTERVAL_MS = 60_000;
   const HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_MS / 1000;
   const artifactsDir = getArtifactsDir();
+  const shareWithTenmanMapOverride =
+    argv.noShareWithTenmanmap ? false : null;
 
-  const bridge = new CallMeshAprsBridge({
+  const bridgeOptions = {
     storageDir: artifactsDir,
     appVersion: pkg.version || '0.0.0',
     apiKey: previouslyVerified ? apiKey : '',
     verified: previouslyVerified,
     heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
     agentProduct: 'callmesh-client-cli'
-  });
+  };
+  if (shareWithTenmanMapOverride !== null) {
+    bridgeOptions.shareWithTenmanMap = shareWithTenmanMapOverride;
+  }
+
+  const bridge = new CallMeshAprsBridge(bridgeOptions);
 
   const verificationRecord = { ...(previousVerification || {}) };
   verificationRecord.apiKey = apiKey;
@@ -389,17 +414,129 @@ async function startMonitor(argv) {
     }
   }
 
+  const DEFAULT_SERIAL_BAUD = 115_200;
+
+  const parseSerialEndpoint = (input) => {
+    if (!input || typeof input !== 'string') return null;
+    const trimmed = input.trim();
+    if (!trimmed.toLowerCase().startsWith('serial:')) {
+      return null;
+    }
+    let remainder = trimmed.slice(trimmed.indexOf(':') + 1);
+    if (remainder.startsWith('//')) {
+      remainder = remainder.slice(2);
+    }
+    let query = '';
+    const queryIndex = remainder.indexOf('?');
+    if (queryIndex >= 0) {
+      query = remainder.slice(queryIndex + 1);
+      remainder = remainder.slice(0, queryIndex);
+    }
+    let baudRate = null;
+    const atIndex = remainder.lastIndexOf('@');
+    if (atIndex > 0) {
+      const candidate = remainder.slice(atIndex + 1).trim();
+      if (/^\d+$/.test(candidate)) {
+        baudRate = Number(candidate);
+        remainder = remainder.slice(0, atIndex);
+      }
+    }
+    if (query) {
+      const params = new URLSearchParams(query);
+      for (const key of ['baud', 'baudrate']) {
+        if (params.has(key)) {
+          const value = Number(params.get(key));
+          if (Number.isFinite(value) && value > 0) {
+            baudRate = value;
+            break;
+          }
+        }
+      }
+    }
+    const path = remainder.trim();
+    if (!path) {
+      return null;
+    }
+    return {
+      path,
+      baudRate: Number.isFinite(baudRate) && baudRate > 0 ? baudRate : null
+    };
+  };
+
+  const hostInput = typeof argv.host === 'string' ? argv.host.trim() : '';
+  const normalizedConnectionArg =
+    typeof argv.connection === 'string' ? argv.connection.trim().toLowerCase() : '';
+  const serialSpec = parseSerialEndpoint(hostInput);
+  let transport = 'tcp';
+  if (normalizedConnectionArg === 'serial') {
+    transport = 'serial';
+  } else if (normalizedConnectionArg === 'tcp') {
+    transport = 'tcp';
+  } else if (
+    (serialSpec && serialSpec.path) ||
+    (typeof argv.serialPath === 'string' && argv.serialPath.trim())
+  ) {
+    transport = 'serial';
+  }
+
+  let serialPath = typeof argv.serialPath === 'string' ? argv.serialPath.trim() : '';
+  if (!serialPath && serialSpec?.path) {
+    serialPath = serialSpec.path;
+  }
+  let serialBaudRate = DEFAULT_SERIAL_BAUD;
+  if (serialSpec?.baudRate) {
+    serialBaudRate = serialSpec.baudRate;
+  }
+  const baudArg = Number(argv.serialBaud);
+  if (Number.isFinite(baudArg) && baudArg > 0) {
+    serialBaudRate = baudArg;
+  }
+
+  if (transport === 'serial' && !serialPath) {
+    console.error(
+      'Serial 連線時必須指定裝置路徑，可使用 --serial-path 或 host=serial://<device>'
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (transport === 'tcp' && serialSpec && normalizedConnectionArg === 'tcp') {
+    console.error(
+      'host 使用 serial:// 前綴時需搭配 --connection serial，或請改用一般 TCP 主機位址。'
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const tcpHost = hostInput || '127.0.0.1';
+  const tcpPort = Number.isFinite(argv.port) ? argv.port : 4403;
+  const connectionSummary =
+    transport === 'serial'
+      ? `Serial ${serialPath} @ ${serialBaudRate}`
+      : `TCP ${tcpHost}:${tcpPort}`;
+
   const connectionOptions = {
-    host: argv.host,
-    port: argv.port,
+    transport,
     maxLength: argv.maxLength,
     handshake: true,
     heartbeat: HEARTBEAT_INTERVAL_SECONDS,
-    keepAlive: true,
-    keepAliveDelayMs: 15_000,
-    idleTimeoutMs: 90_000,
     relayStatsPath
   };
+  if (transport === 'serial') {
+    Object.assign(connectionOptions, {
+      serialPath,
+      serialBaudRate,
+      keepAlive: false,
+      idleTimeoutMs: 0
+    });
+  } else {
+    Object.assign(connectionOptions, {
+      host: tcpHost,
+      port: tcpPort,
+      keepAlive: true,
+      keepAliveDelayMs: 15_000,
+      idleTimeoutMs: 90_000
+    });
+  }
 
   const RECONNECT_DELAY_MS = 30_000;
   let reconnectTimer = null;
@@ -494,7 +631,10 @@ async function startMonitor(argv) {
       };
 
       client.on('connected', () => {
-        logWithTag('MESHTASTIC', `已連線至 ${argv.host}:${argv.port} (嘗試第 ${attempt} 次)，開始接收封包`);
+        logWithTag(
+          'MESHTASTIC',
+          `已連線至 ${connectionSummary} (嘗試第 ${attempt} 次)，開始接收封包`
+        );
         webServer?.publishStatus({ status: 'connected' });
       });
 
@@ -585,7 +725,9 @@ async function startMonitor(argv) {
   while (!stopRequested) {
     attempt += 1;
     const startLabel = formatTimestampLabel(new Date());
-    console.log(`[${startLabel}] [MESHTASTIC] 開始連線流程 (第 ${attempt} 次嘗試)`);
+    console.log(
+      `[${startLabel}] [MESHTASTIC] 開始連線流程 (第 ${attempt} 次嘗試，目標=${connectionSummary})`
+    );
     await runClientOnce(attempt);
     if (stopRequested) {
       break;

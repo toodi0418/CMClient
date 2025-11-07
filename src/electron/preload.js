@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('meshtastic', {
   connect: (options) => ipcRenderer.invoke('meshtastic:connect', options),
   disconnect: () => ipcRenderer.invoke('meshtastic:disconnect'),
   discover: (options) => ipcRenderer.invoke('meshtastic:discover', options),
+  listSerialPorts: () => ipcRenderer.invoke('meshtastic:list-serial'),
   saveCallmeshKey: (key) => ipcRenderer.invoke('callmesh:save-key', key),
   getCallMeshStatus: () => ipcRenderer.invoke('callmesh:get-status'),
   onSummary: (callback) => {

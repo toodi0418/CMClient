@@ -22,6 +22,9 @@ const currentNodeDisplay = document.getElementById('current-node-display');
 const currentNodeText = document.getElementById('current-node-text');
 const openSettingsBtn = document.getElementById('open-settings-btn');
 
+const settingsHostFieldset = document.getElementById('settings-host-fieldset');
+const settingsHostLabel = document.getElementById('settings-host-label');
+const settingsHostHint = document.getElementById('settings-host-hint');
 const settingsHostInput = document.getElementById('settings-host');
 const discoverBtn = document.getElementById('discover-btn');
 const discoverStatus = document.getElementById('discover-status');
@@ -48,6 +51,22 @@ const overlayHostInput = document.getElementById('overlay-host');
 const overlayApplyHostBtn = document.getElementById('overlay-apply-host');
 const overlayDiscoverHostBtn = document.getElementById('overlay-discover-host');
 const overlayHostStatus = document.getElementById('overlay-host-status');
+const connectionModeSelect = document.getElementById('connection-mode');
+const serialSettingsBlock = document.getElementById('serial-settings-block');
+const serialDeviceSelect = document.getElementById('serial-device-select');
+const serialRefreshBtn = document.getElementById('serial-refresh-btn');
+const serialStatusLabel = document.getElementById('serial-status');
+const overlayConnectionModeSelect = document.getElementById('overlay-connection-mode');
+const overlaySerialBlock = document.getElementById('overlay-serial-block');
+const overlaySerialSelect = document.getElementById('overlay-serial-select');
+const overlaySerialRefreshBtn = document.getElementById('overlay-serial-refresh');
+const overlaySerialStatus = document.getElementById('overlay-serial-status');
+const HOST_LABEL_TCP_TEXT = settingsHostLabel?.textContent ?? 'Meshtastic 目標';
+const HOST_LABEL_SERIAL_TEXT = 'Serial 裝置';
+const HOST_HINT_TCP_TEXT =
+  'TCP 模式輸入 IP（例如 192.168.1.50）；Serial 模式請從上方清單選擇裝置，系統會自動套用。';
+const HOST_HINT_SERIAL_TEXT =
+  '請從上方清單選擇 Serial 裝置，系統會自動套用連線路徑。';
 
 const counterPackets10Min = document.getElementById('counter-packages-10min');
 const counterAprsUploaded = document.getElementById('counter-aprs-uploaded');
@@ -64,10 +83,14 @@ const DEFAULT_APRS_BEACON_MINUTES = 10;
 const SOCKET_HEARTBEAT_SECONDS = 30;
 const SOCKET_IDLE_TIMEOUT_MS = 60 * 1000;
 const SOCKET_KEEPALIVE_DELAY_MS = 15 * 1000;
-const HOST_GUIDANCE_MESSAGE = '尚未設定節點 IP，請手動輸入或按「自動搜尋」。';
+const DEFAULT_SERIAL_BAUD = 115200;
+const HOST_GUIDANCE_MESSAGE =
+  '尚未設定節點 IP 或 Serial 裝置，請輸入 IP 或從 Serial 清單選擇裝置。';
+const SERIAL_DISCOVER_HINT = 'Serial 模式不支援自動搜尋，請從清單選擇裝置。';
 const METERS_PER_FOOT = 0.3048;
 const LOG_DOWNLOAD_PREFIX = 'tmag-log';
 const NODE_ONLINE_WINDOW_MS = 60 * 60 * 1000;
+const CONNECTION_APPLY_DEBOUNCE_MS = 600;
 
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
@@ -114,6 +137,7 @@ const telemetryRangeStartInput = document.getElementById('telemetry-range-start'
 const telemetryRangeEndInput = document.getElementById('telemetry-range-end');
 const telemetryChartModeSelect = document.getElementById('telemetry-chart-mode');
 const telemetryChartMetricSelect = document.getElementById('telemetry-chart-metric');
+const telemetryDownloadBtn = document.getElementById('telemetry-download-btn');
 const telemetryClearBtn = document.getElementById('telemetry-clear-btn');
 const telemetryStatsRecords = document.getElementById('telemetry-stats-records');
 const telemetryStatsNodes = document.getElementById('telemetry-stats-nodes');
@@ -121,6 +145,7 @@ const telemetryStatsDisk = document.getElementById('telemetry-stats-disk');
 const aprsServerInput = document.getElementById('aprs-server');
 const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
 const webUiEnabledCheckbox = document.getElementById('web-ui-enabled');
+const tenmanShareCheckbox = document.getElementById('tenman-share-enabled');
 const resetDataBtn = document.getElementById('reset-data-btn');
 const copyLogBtn = document.getElementById('copy-log-btn');
 const downloadLogBtn = document.getElementById('download-log-btn');
@@ -158,6 +183,11 @@ let allowReconnectLoop = true;
 let hostPreferenceRevision = 0;
 let lastConnectedHost = null;
 let lastConnectedHostRevision = -1;
+let connectionMode = 'tcp';
+let serialPathPreference = '';
+let lastTcpHostInput = '';
+let serialListLoading = false;
+let suppressHostSync = false;
 let nodeDistanceReference = null;
 let nodesSearchTerm = '';
 let telemetrySearchTerm = '';
@@ -173,6 +203,10 @@ const selfNodeState = {
   normalizedMeshId: null,
   raw: null
 };
+let connectionApplyTimer = null;
+let connectionApplyInFlight = false;
+let connectionApplyQueued = false;
+let connectionApplyQueuedReason = 'settings-change';
 const LOG_MAX_ENTRIES = 2000;
 const logEntries = [];
 let logFilterTag = 'all';
@@ -628,6 +662,7 @@ function renderChannelMessages(channelId) {
     appendMeta(meta, `來自：${resolveStoredMessageFromLabel(entry)}`);
     appendMeta(meta, entry.hops);
     appendMeta(meta, entry.relay);
+    appendMeta(meta, formatMessageDistanceMeta(entry));
     appendMeta(meta, `時間：${entry.timestampLabel}`);
 
     wrapper.append(text, meta);
@@ -724,6 +759,26 @@ function resolveStoredMessageFromLabel(entry) {
     return normalized;
   }
   return stored || '未知節點';
+}
+
+function formatMessageDistanceMeta(entry) {
+  if (!entry || !entry.fromMeshId) {
+    return '';
+  }
+  const node = getRegistryNode(entry.fromMeshId);
+  if (!node) {
+    return '';
+  }
+  const distanceText = formatNodeDistanceValue(node);
+  const lastSeenTs = getNodeLastSeenTimestamp(node);
+  let recencyText = '';
+  if (lastSeenTs != null && Number.isFinite(lastSeenTs)) {
+    recencyText = formatRelativeTime(new Date(lastSeenTs).toISOString());
+  }
+  if (distanceText && recencyText) {
+    return `${distanceText} (${recencyText})`;
+  }
+  return distanceText || recencyText || '';
 }
 
 function recordChannelMessage(summary, { markUnread = true } = {}) {
@@ -1088,6 +1143,25 @@ function loadPreferences() {
   try {
     const saved = JSON.parse(localStorage.getItem('meshtastic:preferences') || '{}');
     const savedHost = typeof saved.host === 'string' ? saved.host.trim() : '';
+    const hostSerialSpec = parseSerialTarget(savedHost);
+    const savedTcpHost = typeof saved.tcpHost === 'string' ? saved.tcpHost.trim() : '';
+    if (savedTcpHost) {
+      lastTcpHostInput = savedTcpHost;
+    } else if (savedHost && !hostSerialSpec) {
+      lastTcpHostInput = savedHost;
+    }
+    let savedMode =
+      typeof saved.connectionMode === 'string' ? saved.connectionMode.trim().toLowerCase() : '';
+    if (savedMode !== 'serial' && savedMode !== 'tcp') {
+      savedMode = hostSerialSpec ? 'serial' : 'tcp';
+    }
+    let savedSerialPath =
+      typeof saved.serialPath === 'string' ? saved.serialPath.trim() : '';
+    if (!savedSerialPath && hostSerialSpec?.path) {
+      savedSerialPath = hostSerialSpec.path;
+    }
+    connectionMode = savedMode === 'serial' ? 'serial' : 'tcp';
+    serialPathPreference = savedSerialPath || '';
     if (settingsHostInput) {
       settingsHostInput.value = savedHost;
     }
@@ -1118,6 +1192,22 @@ function loadPreferences() {
     if (webUiEnabledCheckbox) {
       webUiEnabledCheckbox.checked = Boolean(saved.webDashboardEnabled);
     }
+    if (tenmanShareCheckbox) {
+      tenmanShareCheckbox.checked = saved.shareWithTenmanMap === false ? false : true;
+    }
+    setConnectionMode(connectionMode, { persist: false });
+    if (serialPathPreference) {
+      applySerialSelection(serialPathPreference, { updateHost: false });
+    }
+    if (connectionMode === 'serial' && !getHostValue() && serialPathPreference) {
+      const serialHost = buildSerialHost(serialPathPreference);
+      suppressHostSync = true;
+      settingsHostInput.value = serialHost;
+      if (overlayHostInput) {
+        overlayHostInput.value = serialHost;
+      }
+      suppressHostSync = false;
+    }
   } catch (err) {
     console.warn('無法載入偏好設定:', err);
     if (settingsHostInput) settingsHostInput.value = '';
@@ -1129,8 +1219,34 @@ function loadPreferences() {
 }
 
 function savePreferences({ persist = true } = {}) {
+  const rawHost = settingsHostInput.value.trim();
+  const effectiveHost = getEffectiveHost({ overrideHost: rawHost });
+  if (effectiveHost !== rawHost) {
+    suppressHostSync = true;
+    settingsHostInput.value = effectiveHost;
+    if (overlayHostInput && overlayHostInput.value !== effectiveHost) {
+      overlayHostInput.value = effectiveHost;
+    }
+    suppressHostSync = false;
+  }
+  let serialPath = '';
+  if (connectionMode === 'serial') {
+    serialPath =
+      serialDeviceSelect?.value ||
+      serialPathPreference ||
+      extractSerialPathFromHost(effectiveHost);
+    if (serialPath) {
+      serialPathPreference = serialPath;
+    }
+  } else {
+    serialPathPreference = '';
+  }
+  if (!parseSerialTarget(effectiveHost) && effectiveHost) {
+    rememberTcpHost(effectiveHost);
+  }
   const data = {
-    host: settingsHostInput.value.trim(),
+    host: effectiveHost,
+    tcpHost: lastTcpHostInput,
     apiKey: apiKeyInput.value.trim(),
     platformStatus: platformStatus.textContent,
     callmeshVerified: callmeshHasServerKey,
@@ -1138,18 +1254,30 @@ function savePreferences({ persist = true } = {}) {
     lastVerifiedKey,
     aprsServer: aprsServerInput ? aprsServerInput.value.trim() || DEFAULT_APRS_SERVER : DEFAULT_APRS_SERVER,
     aprsBeaconMinutes: getAprsBeaconMinutes(),
-    webDashboardEnabled: webUiEnabledCheckbox ? Boolean(webUiEnabledCheckbox.checked) : false
+    webDashboardEnabled: webUiEnabledCheckbox ? Boolean(webUiEnabledCheckbox.checked) : false,
+    connectionMode,
+    serialPath,
+    shareWithTenmanMap: tenmanShareCheckbox ? Boolean(tenmanShareCheckbox.checked) : true
   };
   localStorage.setItem('meshtastic:preferences', JSON.stringify(data));
   if (persist) {
-    const hostPayload = data.host || null;
-    window.meshtastic.updateClientPreferences?.({ host: hostPayload }).then((result) => {
-      if (result && result.success === false && result.error) {
-        console.warn('persist client preferences failed:', result.error);
-      }
-    }).catch((err) => {
-      console.warn('persist client preferences error:', err);
-    });
+    const payload = {
+      host: data.host || null,
+      connectionMode: data.connectionMode,
+      serialPath: data.serialPath,
+      webDashboardEnabled: data.webDashboardEnabled,
+      shareWithTenmanMap: data.shareWithTenmanMap
+    };
+    window.meshtastic
+      .updateClientPreferences?.(payload)
+      .then((result) => {
+        if (result && result.success === false && result.error) {
+          console.warn('persist client preferences failed:', result.error);
+        }
+      })
+      .catch((err) => {
+        console.warn('persist client preferences error:', err);
+      });
   }
   return data;
 }
@@ -1164,18 +1292,44 @@ async function hydratePreferencesFromMain() {
       return;
     }
     let shouldPersist = false;
+    const tcpHostPref =
+      typeof preferences.tcpHost === 'string' ? preferences.tcpHost.trim() : '';
+    if (tcpHostPref) {
+      lastTcpHostInput = tcpHostPref;
+    }
     const host = typeof preferences.host === 'string' ? preferences.host.trim() : '';
     if (host && getHostValue() !== host) {
       settingsHostInput.value = host;
       if (overlayHostInput) {
         overlayHostInput.value = host;
       }
+      rememberTcpHost(host);
+      shouldPersist = true;
+    }
+    const desiredMode =
+      preferences.connectionMode === 'serial' ? 'serial' : preferences.connectionMode === 'tcp' ? 'tcp' : null;
+    if (desiredMode && desiredMode !== connectionMode) {
+      setConnectionMode(desiredMode, { persist: false });
+      shouldPersist = true;
+    }
+    const desiredSerialPath =
+      typeof preferences.serialPath === 'string' ? preferences.serialPath.trim() : extractSerialPathFromHost(host);
+    if (desiredSerialPath && desiredSerialPath !== serialPathPreference) {
+      serialPathPreference = desiredSerialPath;
+      applySerialSelection(desiredSerialPath, { updateHost: false });
       shouldPersist = true;
     }
     if (webUiEnabledCheckbox && Object.prototype.hasOwnProperty.call(preferences, 'webDashboardEnabled')) {
       const desired = Boolean(preferences.webDashboardEnabled);
       if (webUiEnabledCheckbox.checked !== desired) {
         webUiEnabledCheckbox.checked = desired;
+        shouldPersist = true;
+      }
+    }
+    if (tenmanShareCheckbox && Object.prototype.hasOwnProperty.call(preferences, 'shareWithTenmanMap')) {
+      const desiredShare = preferences.shareWithTenmanMap === false ? false : true;
+      if (tenmanShareCheckbox.checked !== desiredShare) {
+        tenmanShareCheckbox.checked = desiredShare;
         shouldPersist = true;
       }
     }
@@ -1191,6 +1345,442 @@ function getHostValue() {
   return (settingsHostInput.value || '').trim();
 }
 
+function parseSerialTarget(input) {
+  if (!input || typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  if (!trimmed.toLowerCase().startsWith('serial:')) {
+    return null;
+  }
+  let remainder = trimmed.slice(trimmed.indexOf(':') + 1);
+  if (remainder.startsWith('//')) {
+    remainder = remainder.slice(2);
+  }
+  let query = '';
+  const queryIndex = remainder.indexOf('?');
+  if (queryIndex >= 0) {
+    query = remainder.slice(queryIndex + 1);
+    remainder = remainder.slice(0, queryIndex);
+  }
+  let baudRate = null;
+  const atIndex = remainder.lastIndexOf('@');
+  if (atIndex > 0) {
+    const candidate = remainder.slice(atIndex + 1).trim();
+    if (/^\d+$/.test(candidate)) {
+      baudRate = Number(candidate);
+      remainder = remainder.slice(0, atIndex);
+    }
+  }
+  if (query) {
+    try {
+      const params = new URLSearchParams(query);
+      for (const key of ['baud', 'baudrate']) {
+        if (params.has(key)) {
+          const parsed = Number(params.get(key));
+          if (Number.isFinite(parsed) && parsed > 0) {
+            baudRate = parsed;
+            break;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('解析 Serial 參數失敗:', err);
+    }
+  }
+  const path = remainder.trim();
+  if (!path) {
+    return null;
+  }
+  return {
+    path,
+    baudRate: Number.isFinite(baudRate) && baudRate > 0 ? baudRate : null
+  };
+}
+
+function rememberTcpHost(value) {
+  if (!value) return;
+  const parsed = parseSerialTarget(value);
+  if (!parsed) {
+    lastTcpHostInput = value;
+  }
+}
+
+function buildSerialHost(path) {
+  if (!path || typeof path !== 'string') {
+    return '';
+  }
+  const trimmed = path.trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (trimmed.toLowerCase().startsWith('serial:')) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('/')) {
+    return `serial://${trimmed}`;
+  }
+  return `serial://${trimmed}`;
+}
+
+function extractSerialPathFromHost(host) {
+  const spec = parseSerialTarget(host);
+  return spec?.path ?? '';
+}
+
+function setSerialStatus(message, variant = 'info', source = 'settings') {
+  const target =
+    source === 'overlay' ? overlaySerialStatus : serialStatusLabel;
+  if (!target) return;
+  if (!message) {
+    target.textContent = '';
+    delete target.dataset.variant;
+    return;
+  }
+  target.textContent = message;
+  target.dataset.variant = variant;
+}
+
+function populateSerialSelect(selectEl, ports, selectedPath) {
+  if (!selectEl) return;
+  const currentValue = selectEl.value;
+  selectEl.innerHTML = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = '請選擇 Serial 裝置';
+  selectEl.appendChild(placeholder);
+  for (const port of ports) {
+    if (!port || typeof port.path !== 'string') continue;
+    const option = document.createElement('option');
+    option.value = port.path;
+    const labelParts = [port.path];
+    if (port.friendlyName) {
+      labelParts.push(port.friendlyName);
+    } else if (port.manufacturer) {
+      labelParts.push(port.manufacturer);
+    }
+    option.textContent = labelParts.join(' — ');
+    selectEl.appendChild(option);
+  }
+  const desired = selectedPath || currentValue;
+  if (desired && Array.from(selectEl.options).some((opt) => opt.value === desired)) {
+    selectEl.value = desired;
+  } else {
+    selectEl.value = '';
+  }
+}
+
+async function refreshSerialDeviceList({ source = 'settings', quiet = false } = {}) {
+  if (!window.meshtastic?.listSerialPorts) {
+    if (!quiet) {
+      setSerialStatus('目前環境無法列出 Serial 裝置，請確認驅動或改用 TCP 模式。', 'warn', source);
+    }
+    return [];
+  }
+  if (serialListLoading) {
+    return [];
+  }
+  serialListLoading = true;
+  if (!quiet) {
+    setSerialStatus('正在列出 Serial 裝置…', 'info', source);
+  }
+  try {
+    const ports = await window.meshtastic.listSerialPorts();
+    const normalized = Array.isArray(ports)
+      ? ports.filter((item) => item && typeof item.path === 'string')
+      : [];
+    populateSerialSelect(serialDeviceSelect, normalized, serialPathPreference);
+    populateSerialSelect(overlaySerialSelect, normalized, serialPathPreference);
+    if (!normalized.length) {
+      if (!quiet) {
+        setSerialStatus('找不到 Serial 裝置，請確認裝置已連線並重新整理。', 'warn', source);
+      }
+    } else if (!quiet) {
+      setSerialStatus(`找到 ${normalized.length} 個 Serial 裝置`, 'success', source);
+    }
+    return normalized;
+  } catch (err) {
+    console.error('列出 Serial 裝置失敗:', err);
+    if (!quiet) {
+      setSerialStatus(`列出失敗：${err.message}`, 'error', source);
+    }
+    return [];
+  } finally {
+    serialListLoading = false;
+  }
+}
+
+function applySerialSelection(path, { source = 'settings', updateHost = true } = {}) {
+  const normalized = typeof path === 'string' ? path.trim() : '';
+  if (updateHost && connectionMode === 'serial') {
+    rememberTcpHost(getHostValue());
+  }
+  serialPathPreference = normalized;
+  if (serialDeviceSelect && serialDeviceSelect.value !== normalized) {
+    serialDeviceSelect.value = normalized;
+  }
+  if (overlaySerialSelect && overlaySerialSelect.value !== normalized) {
+    overlaySerialSelect.value = normalized;
+  }
+  if (updateHost && connectionMode === 'serial' && normalized) {
+    const serialHost = buildSerialHost(normalized);
+    if (getHostValue() !== serialHost) {
+      suppressHostSync = true;
+      settingsHostInput.value = serialHost;
+      suppressHostSync = false;
+      if (overlayHostInput && overlayHostInput.value !== serialHost) {
+        suppressHostSync = true;
+        overlayHostInput.value = serialHost;
+        suppressHostSync = false;
+      }
+      markHostPreferenceUpdated();
+      savePreferences();
+      updateConnectAvailability();
+    }
+  }
+}
+
+function updateConnectionModeUI(mode) {
+  const isSerial = mode === 'serial';
+  if (serialSettingsBlock) {
+    serialSettingsBlock.classList.toggle('hidden', !isSerial);
+  }
+  if (overlaySerialBlock) {
+    overlaySerialBlock.classList.toggle('hidden', !isSerial);
+  }
+  if (settingsHostFieldset) {
+    settingsHostFieldset.classList.toggle('hidden', isSerial);
+  }
+  if (discoverBtn) {
+    discoverBtn.disabled = isSerial;
+    discoverBtn.classList.toggle('hidden', isSerial);
+  }
+  if (overlayDiscoverHostBtn) {
+    overlayDiscoverHostBtn.classList.toggle('hidden', isSerial);
+    overlayDiscoverHostBtn.disabled = isSerial;
+  }
+  if (settingsHostLabel) {
+    settingsHostLabel.textContent = isSerial ? HOST_LABEL_SERIAL_TEXT : HOST_LABEL_TCP_TEXT;
+    settingsHostLabel.classList.toggle('hidden', isSerial);
+  }
+  if (settingsHostHint) {
+    settingsHostHint.textContent = isSerial ? HOST_HINT_SERIAL_TEXT : HOST_HINT_TCP_TEXT;
+    settingsHostHint.classList.toggle('hidden', isSerial);
+  }
+  if (!isSerial && settingsHostInput) {
+    const currentHost = getHostValue();
+    if (parseSerialTarget(currentHost)) {
+      const restoredHost = lastTcpHostInput || '';
+      suppressHostSync = true;
+      settingsHostInput.value = restoredHost;
+      if (overlayHostInput) {
+        overlayHostInput.value = restoredHost;
+      }
+      suppressHostSync = false;
+      if (restoredHost) {
+        rememberTcpHost(restoredHost);
+      }
+    }
+  }
+  const tcpPlaceholder = '輸入 Meshtastic 節點 IP，例如 192.168.1.50';
+  const serialPlaceholder = 'Serial 裝置將由系統自動套用';
+  if (settingsHostInput) {
+    settingsHostInput.placeholder = isSerial ? serialPlaceholder : tcpPlaceholder;
+    settingsHostInput.classList.toggle('hidden', isSerial);
+  }
+  if (discoverStatus) {
+    if (isSerial) {
+      discoverStatus.classList.add('hidden');
+      setDiscoverStatus('', 'info');
+    } else {
+      discoverStatus.classList.remove('hidden');
+    }
+  }
+  const overlayTcpPlaceholder = '例如：192.168.1.50';
+  const overlaySerialPlaceholder = 'Serial 裝置將自動填入';
+  if (overlayHostInput) {
+    overlayHostInput.placeholder = isSerial ? overlaySerialPlaceholder : overlayTcpPlaceholder;
+    overlayHostInput.classList.toggle('hidden', isSerial);
+    if (isSerial) {
+      overlayHostInput.blur();
+    }
+  }
+  if (!isSerial) {
+    if (getHostValue()) {
+      ensureHostGuidance();
+    } else {
+      ensureHostGuidance({ force: true });
+    }
+  }
+  if (isSerial) {
+    if (!serialStatusLabel?.textContent) {
+      setSerialStatus(SERIAL_DISCOVER_HINT, 'info', 'settings');
+    }
+    if (isOverlayHostStepVisible()) {
+      if (!overlayHostStatus?.textContent) {
+        setOverlayHostStatus(SERIAL_DISCOVER_HINT, 'info');
+      }
+    }
+    refreshSerialDeviceList({
+      source: 'settings',
+      quiet: Boolean(serialPathPreference)
+    });
+  } else {
+    if (discoverStatus?.textContent === SERIAL_DISCOVER_HINT) {
+      setDiscoverStatus('', 'info');
+    }
+    setSerialStatus('', 'info', 'settings');
+    setSerialStatus('', 'info', 'overlay');
+  }
+}
+
+function setConnectionMode(mode, { source = 'settings', persist = true } = {}) {
+  const previousMode = connectionMode;
+  const normalized = mode === 'serial' ? 'serial' : 'tcp';
+  if (previousMode !== 'serial' && normalized === 'serial') {
+    rememberTcpHost(getHostValue());
+  }
+  if (connectionMode !== normalized) {
+    connectionMode = normalized;
+  }
+  if (connectionModeSelect && connectionModeSelect.value !== normalized) {
+    connectionModeSelect.value = normalized;
+  }
+  if (overlayConnectionModeSelect && overlayConnectionModeSelect.value !== normalized) {
+    overlayConnectionModeSelect.value = normalized;
+  }
+  updateConnectionModeUI(normalized);
+  if (persist) {
+    savePreferences();
+    scheduleConnectionApply({ reason: 'mode-change', immediate: true });
+  } else {
+    updateConnectAvailability();
+  }
+}
+
+function getEffectiveHost({ overrideHost } = {}) {
+  const mode = connectionMode;
+  const rawHost = typeof overrideHost === 'string' ? overrideHost.trim() : getHostValue();
+  if (mode === 'serial') {
+    const parsed = parseSerialTarget(rawHost);
+    if (parsed?.path) {
+      if (parsed.path !== serialPathPreference) {
+        serialPathPreference = parsed.path;
+        applySerialSelection(parsed.path, { updateHost: false });
+      }
+      return rawHost;
+    }
+    if (serialDeviceSelect?.value) {
+      return buildSerialHost(serialDeviceSelect.value);
+    }
+    if (serialPathPreference) {
+      return buildSerialHost(serialPathPreference);
+    }
+  }
+  return rawHost;
+}
+
+function resolveConnectionTarget(rawInput) {
+  const value = typeof rawInput === 'string' ? rawInput.trim() : '';
+  const serialSpec = parseSerialTarget(value);
+  if (serialSpec) {
+    const baud = serialSpec.baudRate || DEFAULT_SERIAL_BAUD;
+    return {
+      transport: 'serial',
+      serialPath: serialSpec.path,
+      serialBaudRate: baud,
+      host: '',
+      label: `Serial ${serialSpec.path} @ ${baud}`,
+      raw: value,
+      valid: Boolean(serialSpec.path)
+    };
+  }
+  if (value && value.toLowerCase().startsWith('serial:')) {
+    return {
+      transport: 'serial',
+      serialPath: '',
+      serialBaudRate: null,
+      host: '',
+      label: value,
+      raw: value,
+      valid: false
+    };
+  }
+  return {
+    transport: 'tcp',
+    serialPath: '',
+    serialBaudRate: null,
+    host: value,
+    label: value ? `TCP ${value}:4403` : '',
+    raw: value,
+    valid: Boolean(value)
+  };
+}
+
+function clearConnectionApplyTimer() {
+  if (connectionApplyTimer) {
+    clearTimeout(connectionApplyTimer);
+    connectionApplyTimer = null;
+  }
+}
+
+function scheduleConnectionApply({ reason = 'settings-change', immediate = false } = {}) {
+  if (immediate) {
+    clearConnectionApplyTimer();
+    void applyConnectionChanges(reason);
+    return;
+  }
+  clearConnectionApplyTimer();
+  connectionApplyTimer = setTimeout(() => {
+    connectionApplyTimer = null;
+    void applyConnectionChanges(reason);
+  }, CONNECTION_APPLY_DEBOUNCE_MS);
+}
+
+async function applyConnectionChanges(reason = 'settings-change') {
+  if (connectionApplyInFlight) {
+    connectionApplyQueued = true;
+    connectionApplyQueuedReason = reason;
+    return;
+  }
+  connectionApplyInFlight = true;
+  try {
+    const effectiveHost = getEffectiveHost();
+    const target = resolveConnectionTarget(effectiveHost);
+    if (!target.valid) {
+      return;
+    }
+    if (!hasApiKey()) {
+      return;
+    }
+    if (manualDisconnect) {
+      appendLog('CONNECT', `connection change recorded (${reason}); manual disconnect active`);
+      return;
+    }
+
+    allowReconnectLoop = true;
+    resumeAutoReconnect({ reason, silent: true });
+
+    if (isConnecting || isConnected) {
+      await performDisconnect({ silent: true, preserveManual: false });
+    }
+
+    const success = await connectNow({ context: 'settings' });
+    if (!success && !manualDisconnect) {
+      startReconnectLoop();
+    }
+  } catch (err) {
+    console.error('apply connection change failed:', err);
+    appendLog('CONNECT', `連線設定更新失敗 (${reason}): ${err.message || err}`);
+  } finally {
+    connectionApplyInFlight = false;
+    if (connectionApplyQueued) {
+      connectionApplyQueued = false;
+      const queuedReason = connectionApplyQueuedReason;
+      connectionApplyQueuedReason = 'settings-change';
+      scheduleConnectionApply({ reason: queuedReason, immediate: true });
+    }
+  }
+}
+
 function markHostPreferenceUpdated() {
   hostPreferenceRevision += 1;
 }
@@ -1199,7 +1789,7 @@ function getReconnectHost() {
   if (lastConnectedHost && lastConnectedHostRevision === hostPreferenceRevision) {
     return lastConnectedHost;
   }
-  const currentHost = getHostValue();
+  const currentHost = getEffectiveHost();
   if (currentHost) {
     return currentHost;
   }
@@ -1447,23 +2037,76 @@ flowSearchInput?.addEventListener('input', () => {
 
 
 settingsHostInput.addEventListener('input', () => {
+  if (suppressHostSync) {
+    return;
+  }
   markHostPreferenceUpdated();
   const trimmedHost = settingsHostInput.value.trim();
   if (overlayHostInput && overlayHostInput.value !== trimmedHost) {
     overlayHostInput.value = trimmedHost;
   }
+  const serialSpec = parseSerialTarget(trimmedHost);
+  if (serialSpec && connectionMode !== 'serial') {
+    serialPathPreference = serialSpec.path;
+    applySerialSelection(serialSpec.path, { updateHost: false });
+    setConnectionMode('serial', { persist: false });
+  } else if (!serialSpec && connectionMode === 'serial' && trimmedHost && !trimmedHost.toLowerCase().startsWith('serial:')) {
+    setConnectionMode('tcp', { persist: false });
+  } else if (serialSpec) {
+    serialPathPreference = serialSpec.path;
+    applySerialSelection(serialSpec.path, { updateHost: false });
+  }
+  if (!serialSpec && trimmedHost) {
+    rememberTcpHost(trimmedHost);
+  }
   if (!trimmedHost) {
+    if (connectionMode !== 'serial') {
+      lastTcpHostInput = '';
+    }
     lastConnectedHost = null;
     lastConnectedHostRevision = -1;
   }
   resumeAutoReconnect({ reason: 'host-updated', silent: true });
   savePreferences();
+  scheduleConnectionApply({ reason: 'host-change' });
   updateConnectAvailability();
   if (trimmedHost) {
     ensureHostGuidance();
   } else {
     ensureHostGuidance({ force: true });
   }
+});
+
+connectionModeSelect?.addEventListener('change', (event) => {
+  const mode = event.target.value === 'serial' ? 'serial' : 'tcp';
+  setConnectionMode(mode, { persist: true });
+  if (mode === 'serial' && serialDeviceSelect?.value) {
+    applySerialSelection(serialDeviceSelect.value, { source: 'settings' });
+  } else if (mode !== 'serial') {
+    updateConnectAvailability();
+  }
+});
+
+serialDeviceSelect?.addEventListener('change', () => {
+  const value = (serialDeviceSelect.value || '').trim();
+  if (!value) {
+    serialPathPreference = '';
+    setSerialStatus('請選擇 Serial 裝置。', 'info', 'settings');
+    savePreferences();
+    updateConnectAvailability();
+    return;
+  }
+  if (connectionMode !== 'serial') {
+    setConnectionMode('serial', { persist: true });
+  }
+  applySerialSelection(value, { source: 'settings' });
+  setSerialStatus(`已選擇 ${value}`, 'success', 'settings');
+  updateConnectAvailability();
+  scheduleConnectionApply({ reason: 'serial-device', immediate: true });
+});
+
+serialRefreshBtn?.addEventListener('click', () => {
+  refreshSerialDeviceList({ source: 'settings' });
 });
 
 aprsServerInput?.addEventListener('input', () => {
@@ -1506,6 +2149,11 @@ webUiEnabledCheckbox?.addEventListener('change', async () => {
   } finally {
     checkbox.disabled = false;
   }
+});
+
+tenmanShareCheckbox?.addEventListener('change', () => {
+  savePreferences();
+  appendLog('TENMAN', tenmanShareCheckbox.checked ? '已啟用與 TenManMap 分享' : '已停用與 TenManMap 分享');
 });
 
 resetDataBtn?.addEventListener('click', async () => {
@@ -1595,6 +2243,10 @@ downloadLogBtn?.addEventListener('click', () => {
   appendLog('APP', '日誌已下載');
 });
 
+telemetryDownloadBtn?.addEventListener('click', () => {
+  downloadTelemetryCsv();
+});
+
 telemetryClearBtn?.addEventListener('click', async () => {
   if (!window.meshtastic.clearTelemetry) {
     appendLog('APP', '目前無法清空遙測資料：功能未初始化');
@@ -1639,8 +2291,8 @@ form.addEventListener('submit', async (event) => {
   }
 
   if (!hasHost()) {
-    setDiscoverStatus('請先設定 Host', 'error');
-    updateStatus('error', 'Host 未設定');
+      setDiscoverStatus('請先設定連線目標', 'error');
+      updateStatus('error', '連線目標未設定');
     updateConnectAvailability();
     appendLog('CONNECT', 'blocked: missing host');
     allowReconnectLoop = true;
@@ -1690,12 +2342,52 @@ overlayHostInput?.addEventListener('keydown', (event) => {
   }
 });
 
+overlayConnectionModeSelect?.addEventListener('change', (event) => {
+  const mode = event.target.value === 'serial' ? 'serial' : 'tcp';
+  setConnectionMode(mode, { persist: true });
+  if (mode === 'serial') {
+    refreshSerialDeviceList({ source: 'overlay' });
+  } else {
+    setOverlayHostStatus('已切換為 TCP 模式，請輸入節點 IP。', 'info');
+  }
+});
+
+overlaySerialSelect?.addEventListener('change', () => {
+  const value = (overlaySerialSelect.value || '').trim();
+  if (!value) {
+    setOverlayHostStatus('請選擇 Serial 裝置。', 'info');
+    serialPathPreference = '';
+    savePreferences();
+    updateConnectAvailability();
+    return;
+  }
+  if (connectionMode !== 'serial') {
+    setConnectionMode('serial', { persist: true });
+  }
+  applySerialSelection(value, { source: 'overlay' });
+  setOverlayHostStatus(`已選擇 ${value}`, 'success');
+  updateConnectAvailability();
+  scheduleConnectionApply({ reason: 'overlay-serial', immediate: true });
+});
+
+overlaySerialRefreshBtn?.addEventListener('click', () => {
+  refreshSerialDeviceList({ source: 'overlay' });
+});
+
 overlayDiscoverHostBtn?.addEventListener('click', () => {
   setOverlayHostStatus('正在搜尋區網內的裝置...', 'info');
   discoverBtn?.click();
 });
 
 discoverBtn.addEventListener('click', async () => {
+  if (connectionMode === 'serial') {
+    setDiscoverStatus(SERIAL_DISCOVER_HINT, 'warn');
+    if (isOverlayHostStepVisible()) {
+      setOverlayHostStatus(SERIAL_DISCOVER_HINT, 'warn');
+    }
+    appendLog('DISCOVER', 'skipped (serial mode)');
+    return;
+  }
   setDiscoveringState(true);
   setDiscoverStatus('正在搜尋區網內的裝置...', 'info');
   if (isOverlayHostStepVisible()) {
@@ -2588,6 +3280,145 @@ function escapeCsvValue(value) {
   return str;
 }
 
+function downloadTelemetryCsv() {
+  const baseRecords = getTelemetryRecordsForSelection();
+  const filteredRecords = applyTelemetryFilters(baseRecords);
+  const exportRecords = filterTelemetryBySearch(filteredRecords);
+  if (!exportRecords.length) {
+    appendLog('TELEMETRY', '目前沒有可匯出的遙測資料');
+    return;
+  }
+
+  const metricKeysInUse = Object.keys(TELEMETRY_METRIC_DEFINITIONS).filter((key) =>
+    exportRecords.some((record) => record?.telemetry?.metrics?.[key] != null)
+  );
+  const knownMetricKeySet = new Set(metricKeysInUse);
+  const extraMetricKeySet = new Set();
+  for (const record of exportRecords) {
+    const flat = flattenTelemetryMetrics(record.telemetry?.metrics || {});
+    for (const [key] of flat) {
+      if (!key) continue;
+      if (knownMetricKeySet.has(key)) continue;
+      extraMetricKeySet.add(key);
+    }
+  }
+  const extraMetricKeys = Array.from(extraMetricKeySet).sort((a, b) => a.localeCompare(b));
+
+  const header = [
+    '時間 (ISO)',
+    'Unix 秒',
+    'MeshID',
+    '節點',
+    'Channel',
+    'SNR',
+    'RSSI',
+    '詳細',
+    '最後轉發',
+    '最後轉發 MeshID',
+    '最後轉發為推測',
+    '最後轉發說明',
+    '跳數',
+    'Hop Start',
+    'Hop Limit',
+    ...metricKeysInUse.map((key) => {
+      const def = TELEMETRY_METRIC_DEFINITIONS[key] || {};
+      const baseLabel = def.label || key;
+      return def.unit ? `${baseLabel} (${def.unit})` : baseLabel;
+    }),
+    ...extraMetricKeys
+  ];
+
+  const rows = exportRecords.map((record) => {
+    const timeMs = Number(record.sampleTimeMs);
+    const isoTime = Number.isFinite(timeMs) ? new Date(timeMs).toISOString() : '';
+    const unixSeconds = Number.isFinite(timeMs) ? Math.floor(timeMs / 1000) : '';
+    const node = record.node || {};
+    const nodeLabel =
+      node.label ||
+      node.longName ||
+      node.shortName ||
+      record.meshId ||
+      node.meshId ||
+      '';
+    const channelValue = Number.isFinite(record.channel) ? record.channel : '';
+    const snrValue = formatNumericForCsv(record.snr, 2);
+    const rssiValue = formatNumericForCsv(record.rssi, 0);
+    const detailValue = record.detail || '';
+    const relayDescriptor = buildTelemetryRelayDescriptor(record) || '';
+    const relayMeshValue =
+      record.relayMeshId ||
+      record.relayMeshIdNormalized ||
+      record.relay?.meshId ||
+      record.relay?.meshIdNormalized ||
+      '';
+    const relayGuessFlag = record.relayGuessed ? 'true' : '';
+    const relayReason = record.relayGuessReason || '';
+    const hopsDescriptor =
+      buildTelemetryHopsDescriptor(record) ||
+      (record.hopsLabel || '');
+    const hopStart =
+      Number.isFinite(record.hops?.start) ? record.hops.start : '';
+    const hopLimit =
+      Number.isFinite(record.hops?.limit) ? record.hops.limit : '';
+    const row = [
+      escapeCsvValue(isoTime),
+      escapeCsvValue(unixSeconds),
+      escapeCsvValue(record.meshId || node.meshId || ''),
+      escapeCsvValue(nodeLabel),
+      escapeCsvValue(channelValue),
+      escapeCsvValue(snrValue),
+      escapeCsvValue(rssiValue),
+      escapeCsvValue(detailValue),
+      escapeCsvValue(relayDescriptor),
+      escapeCsvValue(relayMeshValue),
+      escapeCsvValue(relayGuessFlag),
+      escapeCsvValue(relayReason),
+      escapeCsvValue(hopsDescriptor),
+      escapeCsvValue(hopStart),
+      escapeCsvValue(hopLimit)
+    ];
+
+    for (const key of metricKeysInUse) {
+      const raw = record.telemetry?.metrics?.[key];
+      const formatted = raw == null ? '' : formatTelemetryValue(key, raw);
+      row.push(escapeCsvValue(formatted));
+    }
+
+    const flatMetrics = new Map(flattenTelemetryMetrics(record.telemetry?.metrics || {}));
+    for (const key of extraMetricKeys) {
+      let value = flatMetrics.has(key) ? flatMetrics.get(key) : '';
+      if (typeof value === 'number') {
+        value = trimTrailingZeros(value.toFixed(2));
+      } else if (typeof value === 'boolean') {
+        value = value ? 'true' : 'false';
+      }
+      row.push(escapeCsvValue(value));
+    }
+
+    return row.join(',');
+  });
+
+  const csvContent = [header.map(escapeCsvValue).join(','), ...rows].join('\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const meshIdLabel = normalizeMeshId(telemetrySelectedMeshId) || telemetrySelectedMeshId || 'telemetry';
+  const safeMeshId = meshIdLabel ? meshIdLabel.replace(/[^0-9a-zA-Z_-]+/g, '') : 'telemetry';
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `telemetry-${safeMeshId || 'export'}-${timestamp}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const logLabel =
+    telemetryNodeDisplayByMesh.get(telemetrySelectedMeshId || '') ||
+    normalizeMeshId(telemetrySelectedMeshId) ||
+    telemetrySelectedMeshId ||
+    '未選擇節點';
+  appendLog('TELEMETRY', `已匯出 ${rows.length} 筆遙測資料 (${logLabel})`);
+}
+
 function downloadFlowCsv() {
   const exportEntries = getFilteredFlowEntries();
   if (!exportEntries.length) {
@@ -2835,6 +3666,7 @@ function applyDiscoveredDevice(device) {
   }
   const overlayActive = isOverlayHostStepVisible();
   settingsHostInput.value = address;
+  rememberTcpHost(address);
   markHostPreferenceUpdated();
   if (overlayActive || initialSetupAutoConnectPending) {
     initialSetupAutoConnectPending = true;
@@ -2851,6 +3683,7 @@ function applyDiscoveredDevice(device) {
   ensureHostGuidance();
   hideDiscoverModal();
   appendLog('DISCOVER', `selected ${device.name || address}`);
+  scheduleConnectionApply({ reason: 'discovered-host', immediate: true });
   maybeTriggerInitialSetupAutoConnect('host-discovered');
 }
 
@@ -2885,6 +3718,10 @@ function setNodeDatabaseStatus(message, variant = 'info') {
 
 function ensureHostGuidance({ force = false } = {}) {
   if (!discoverStatus) return;
+  if (connectionMode === 'serial') {
+    hostGuidanceActive = false;
+    return;
+  }
   if (hasHost()) {
     if (hostGuidanceActive) {
       setDiscoverStatus('', 'info');
@@ -2912,15 +3749,33 @@ function applyOverlayHost() {
   if (!overlayHostInput) return;
   const value = overlayHostInput.value.trim();
   if (!value) {
-    setOverlayHostStatus('請輸入節點 IP', 'error');
-    overlayHostInput.focus();
+    if (connectionMode === 'serial') {
+      setOverlayHostStatus('請先從清單選擇 Serial 裝置。', 'error');
+      overlaySerialSelect?.focus();
+    } else {
+      setOverlayHostStatus('請輸入節點 IP。', 'error');
+      overlayHostInput.focus();
+    }
     return;
   }
   const previous = getHostValue();
   const overlayActive = isOverlayHostStepVisible();
+  const serialSpec = parseSerialTarget(value);
+  suppressHostSync = true;
   settingsHostInput.value = value;
   if (overlayHostInput) {
     overlayHostInput.value = value;
+  }
+  suppressHostSync = false;
+  if (!serialSpec) {
+    rememberTcpHost(value);
+  }
+  if (serialSpec) {
+    serialPathPreference = serialSpec.path;
+    applySerialSelection(serialSpec.path, { updateHost: false });
+    setConnectionMode('serial', { persist: false });
+  } else if (connectionMode === 'serial' && !value.toLowerCase().startsWith('serial:')) {
+    setConnectionMode('tcp', { persist: false });
   }
   markHostPreferenceUpdated();
   if (overlayActive || initialSetupAutoConnectPending) {
@@ -2930,8 +3785,9 @@ function applyOverlayHost() {
   resumeAutoReconnect({ reason: 'host-updated', silent: true });
   updateConnectAvailability();
   ensureHostGuidance();
+  scheduleConnectionApply({ reason: 'overlay-host', immediate: true });
   if (overlayActive) {
-    setOverlayHostStatus('節點 IP 已儲存', 'success');
+    setOverlayHostStatus('連線設定已儲存', 'success');
   }
   if (previous !== value) {
     appendLog('CONNECT', 'host updated value=' + value);
@@ -3734,6 +4590,7 @@ function applyNodeRegistrySnapshot(list) {
   refreshTelemetrySelectors(telemetrySelectedMeshId);
   renderNodeDatabase();
   renderTelemetryView();
+  renderChannelMessages(selectedChannelId);
 }
 
 function handleNodeEvent(payload) {
@@ -3751,6 +4608,7 @@ function handleNodeEvent(payload) {
   refreshSummarySelfLabels();
   refreshFlowEntryLabels();
   renderFlowEntries();
+  renderChannelMessages(selectedChannelId);
 }
 
 function updateTelemetryNodesWithRegistry(normalizedMeshId, registryInfo) {
@@ -4220,10 +5078,32 @@ function matchesTelemetrySearch(record, term) {
   const node = record.node || {};
   haystack.push(node.label, node.longName, node.shortName, node.hwModelLabel, node.roleLabel);
   haystack.push(record.meshId, node.meshId, node.meshIdOriginal, node.meshIdNormalized);
+  const relay = record.relay || {};
+  haystack.push(
+    record.relayLabel,
+    record.relayMeshId,
+    record.relayMeshIdNormalized,
+    relay.label,
+    relay.longName,
+    relay.shortName
+  );
+  if (record.relayGuessReason) {
+    haystack.push(record.relayGuessReason);
+  }
   if (record.detail) haystack.push(record.detail);
   if (record.channel != null) haystack.push(`ch ${record.channel}`);
   if (Number.isFinite(record.snr)) haystack.push(`snr ${record.snr}`);
   if (Number.isFinite(record.rssi)) haystack.push(`rssi ${record.rssi}`);
+  if (record.hopsLabel) {
+    haystack.push(record.hopsLabel);
+  }
+  if (Number.isFinite(record.hopsUsed)) {
+    haystack.push(`hops ${record.hopsUsed}`);
+  }
+  if (Number.isFinite(record.hopsTotal)) {
+    haystack.push(`hops ${record.hopsUsed}/${record.hopsTotal}`);
+    haystack.push(String(record.hopsTotal));
+  }
   const summary = formatTelemetrySummary(record);
   if (summary && summary !== '—') {
     haystack.push(summary);
@@ -4699,6 +5579,43 @@ function formatTelemetrySummary(record) {
   return '—';
 }
 
+function buildTelemetryRelayDescriptor(record) {
+  if (!record) return null;
+  const relay = record.relay || {};
+  const label =
+    (typeof record.relayLabel === 'string' && record.relayLabel.trim()) ||
+    (typeof relay.label === 'string' && relay.label.trim()) ||
+    (typeof relay.longName === 'string' && relay.longName.trim()) ||
+    (typeof relay.shortName === 'string' && relay.shortName.trim()) ||
+    (typeof record.relayMeshId === 'string' && record.relayMeshId.trim()) ||
+    (typeof record.relayMeshIdNormalized === 'string' && record.relayMeshIdNormalized.trim()) ||
+    '';
+  if (!label) {
+    return null;
+  }
+  const guessed = Boolean(record.relayGuessed || relay.guessed);
+  return guessed ? `${label} (?)` : label;
+}
+
+function buildTelemetryHopsDescriptor(record) {
+  if (!record) return null;
+  if (Number.isFinite(record.hopsUsed) && Number.isFinite(record.hopsTotal)) {
+    return `${record.hopsUsed}/${record.hopsTotal}`;
+  }
+  if (Number.isFinite(record.hopsUsed)) {
+    return String(record.hopsUsed);
+  }
+  if (typeof record.hopsLabel === 'string' && record.hopsLabel.trim()) {
+    return record.hopsLabel.trim();
+  }
+  const hops = record.hops || {};
+  if (Number.isFinite(hops.start) && Number.isFinite(hops.limit)) {
+    const used = Math.max(hops.start - hops.limit, 0);
+    return `${used}/${hops.start}`;
+  }
+  return null;
+}
+
 function formatTelemetryExtra(record) {
   const extras = [];
   if (record.channel != null) {
@@ -4709,6 +5626,14 @@ function formatTelemetryExtra(record) {
   }
   if (Number.isFinite(record.rssi)) {
     extras.push(`RSSI ${trimTrailingZeros(record.rssi.toFixed(0))}`);
+  }
+  const relayDescriptor = buildTelemetryRelayDescriptor(record);
+  if (relayDescriptor) {
+    extras.push(`Relay ${relayDescriptor}`);
+  }
+  const hopsDescriptor = buildTelemetryHopsDescriptor(record);
+  if (hopsDescriptor) {
+    extras.push(`Hops ${hopsDescriptor}`);
   }
   const metrics = record.telemetry?.metrics || {};
   const knownKeys = new Set(Object.keys(TELEMETRY_METRIC_DEFINITIONS));
@@ -4998,7 +5923,7 @@ function hasApiKey() {
 }
 
 function hasHost() {
-  return getHostValue().length > 0;
+  return Boolean(getEffectiveHost());
 }
 
 function updateConnectAvailability() {
@@ -5028,12 +5953,24 @@ function setOverlayStep(step) {
     overlayStepHost.classList.toggle('hidden', !useHost);
   }
   if (useHost) {
+    if (overlayConnectionModeSelect) {
+      overlayConnectionModeSelect.value = connectionMode;
+    }
+    if (overlaySerialSelect) {
+      overlaySerialSelect.value = serialPathPreference || '';
+    }
     if (overlayHostInput) {
       overlayHostInput.value = getHostValue();
-      setTimeout(() => overlayHostInput?.focus(), 50);
+      if (connectionMode !== 'serial') {
+        setTimeout(() => overlayHostInput?.focus(), 50);
+      }
     }
     setOverlayStatus('', 'info');
-    setOverlayHostStatus('請輸入節點 IP 或使用自動搜尋。', 'info');
+    const overlayMessage =
+      connectionMode === 'serial'
+        ? '請從清單選擇 Serial 裝置。'
+        : '請輸入節點 IP 或使用自動搜尋。';
+    setOverlayHostStatus(overlayMessage, 'info');
   } else {
     if (overlayKeyInput) {
       overlayKeyInput.value = apiKeyInput.value.trim();
@@ -5397,14 +6334,24 @@ async function connectNow({ context = 'manual', overrideHost } = {}) {
     return false;
   }
 
-  const hostSource = overrideHost != null ? overrideHost : getHostValue();
-  const host = typeof hostSource === 'string' ? hostSource.trim() : '';
-  if (!host) {
+  const hostSource = typeof overrideHost === 'string' ? overrideHost : null;
+  const effectiveHost = getEffectiveHost({ overrideHost: hostSource });
+  const target = resolveConnectionTarget(effectiveHost);
+  if (!target.valid) {
     if (context === 'manual') {
-      setDiscoverStatus('請先設定 Host', 'error');
-      updateStatus('error', 'Host 未設定');
-      ensureHostGuidance();
-    } else {
+      if (connectionMode === 'serial') {
+        setDiscoverStatus('請先選擇 Serial 裝置', 'error');
+        setSerialStatus('請先選擇 Serial 裝置。', 'error', 'settings');
+        if (isOverlayHostStepVisible()) {
+          setOverlayHostStatus('請先從清單選擇 Serial 裝置。', 'error');
+        }
+        updateStatus('error', 'Serial 裝置未選擇');
+      } else {
+        setDiscoverStatus('請先設定連線目標', 'error');
+        updateStatus('error', '連線目標未設定');
+        ensureHostGuidance();
+      }
+    } else if (context !== 'manual') {
       ensureHostGuidance({ force: true });
     }
     updateConnectAvailability();
@@ -5423,20 +6370,35 @@ async function connectNow({ context = 'manual', overrideHost } = {}) {
   setConnectingState(true);
   const statusMessage = context === 'reconnect' ? '重新連線中...' : '連線中...';
   updateStatus('connecting', statusMessage);
-  appendLog('CONNECT', `attempt context=${context} host=${host}`);
+  appendLog(
+    'CONNECT',
+    `attempt context=${context} target=${target.label || target.raw || '(未設定)'}`
+  );
 
   try {
-    await window.meshtastic.connect({
-      host,
-      port: 4403,
+    const connectPayload = {
+      transport: target.transport,
       handshake: true,
-      heartbeat: SOCKET_HEARTBEAT_SECONDS,
-      keepAlive: true,
-      keepAliveDelayMs: SOCKET_KEEPALIVE_DELAY_MS,
-      idleTimeoutMs: SOCKET_IDLE_TIMEOUT_MS
-    });
-    appendLog('CONNECT', `success context=${context}`);
-    lastConnectedHost = host;
+      heartbeat: SOCKET_HEARTBEAT_SECONDS
+    };
+    if (target.transport === 'serial') {
+      connectPayload.serialPath = target.serialPath;
+      if (Number.isFinite(target.serialBaudRate) && target.serialBaudRate > 0) {
+        connectPayload.serialBaudRate = target.serialBaudRate;
+      }
+      connectPayload.keepAlive = false;
+      connectPayload.idleTimeoutMs = 0;
+    } else {
+      connectPayload.host = target.host;
+      connectPayload.port = 4403;
+      connectPayload.keepAlive = true;
+      connectPayload.keepAliveDelayMs = SOCKET_KEEPALIVE_DELAY_MS;
+      connectPayload.idleTimeoutMs = SOCKET_IDLE_TIMEOUT_MS;
+    }
+
+    await window.meshtastic.connect(connectPayload);
+    appendLog('CONNECT', `success context=${context} target=${target.label || target.raw}`);
+    lastConnectedHost = target.raw;
     lastConnectedHostRevision = hostPreferenceRevision;
     return true;
   } catch (err) {
@@ -5448,7 +6410,10 @@ async function connectNow({ context = 'manual', overrideHost } = {}) {
     } else if (context === 'reconnect') {
       updateStatus('error', '連線中斷，正在重試');
     }
-    appendLog('CONNECT', `failure context=${context} error=${err.message}`);
+    appendLog(
+      'CONNECT',
+      `failure context=${context} target=${target.label || target.raw} error=${err.message}`
+    );
     return false;
   } finally {
     setConnectingState(false);
@@ -5703,6 +6668,7 @@ function clearSelfNodeDisplay() {
 
 function updateProvisionInfo(provision, mappingSyncedAt) {
   setNodeDistanceReferenceFromProvision(provision);
+  renderChannelMessages(selectedChannelId);
   if (!infoCallsign) return;
   if (!provision) {
     infoCallsign.textContent = '—';

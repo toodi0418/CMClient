@@ -429,7 +429,6 @@ class WebDashboardServer {
     this._readRelayStats()
       .then(({ stats, message }) => {
         const payload = {
-          relayStatsPath: this.relayStatsPath || null,
           relayLinkStats: stats,
           message: message || undefined,
           generatedAt: new Date().toISOString()
@@ -449,8 +448,7 @@ class WebDashboardServer {
           JSON.stringify(
             {
               error: 'Failed to load relayLinkStats',
-              message: err.message,
-              relayStatsPath: this.relayStatsPath || null
+              message: err.message
             },
             null,
             2

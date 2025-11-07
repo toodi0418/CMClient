@@ -86,6 +86,7 @@ header {
   flex: 1;
   min-height: 0;
   gap: 16px;
+  overflow-y: auto;
 }
 
 .subtitle {
@@ -444,6 +445,21 @@ header {
   height: 18px;
 }
 
+.tenman-privacy {
+  margin-top: 8px;
+  opacity: 0.75;
+}
+
+.tenman-privacy .muted-text {
+  font-size: 0.8rem;
+  color: rgba(226, 232, 240, 0.68);
+}
+
+.tenman-privacy .muted-hint {
+  font-size: 0.7rem;
+  color: rgba(148, 163, 184, 0.55);
+}
+
 .callmesh-group {
   min-width: 280px;
 }
@@ -569,15 +585,34 @@ header {
   border-radius: 12px;
   border: 1px solid rgba(37, 99, 235, 0.25);
   background: rgba(15, 23, 42, 0.6);
-  max-width: 520px;
-  display: flex;
-  flex-direction: column;
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-auto-rows: max-content;
   gap: 24px;
+  align-content: start;
+  box-sizing: border-box;
 }
 
 .settings-panel h2 {
   margin: 0;
   font-size: 1.25rem;
+  grid-column: 1 / -1;
+}
+
+.settings-panel #reset-data-btn {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+#serial-settings-block {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 900px) {
+  .settings-panel {
+    grid-template-columns: 1fr;
+  }
 }
 
 
@@ -923,6 +958,26 @@ header {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.telemetry-download-btn {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  background: rgba(37, 99, 235, 0.25);
+  color: #bfdbfe;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
+}
+
+.telemetry-download-btn:hover {
+  background: rgba(37, 99, 235, 0.4);
+  border-color: rgba(59, 130, 246, 0.65);
+}
+
+.telemetry-download-btn:active {
+  transform: translateY(1px);
 }
 
 .telemetry-stats {
