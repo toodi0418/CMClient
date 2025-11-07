@@ -37,6 +37,9 @@ const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
 const TENMAN_FORWARD_QUEUE_LIMIT = 64;
 const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
 const TENMAN_FORWARD_AUTH_ACTION = 'authenticate';
+const TENMAN_FORWARD_SUPPRESS_ACK = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.TENMAN_SUPPRESS_ACK ?? 'true').trim().toLowerCase()
+);
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
@@ -226,8 +229,10 @@ class CallMeshAprsBridge extends EventEmitter {
       authenticating: false,
       missingApiKeyWarned: false,
       gatewayId: null,
+      gatewayMeshId: null,
       nodeId: null,
-      disabledLogged: false
+      disabledLogged: false,
+      suppressAck: TENMAN_FORWARD_SUPPRESS_ACK
     };
 
     this.heartbeatTimer = null;
@@ -853,7 +858,12 @@ class CallMeshAprsBridge extends EventEmitter {
         state.missingApiKeyWarned = false;
       }
 
-      const deviceId = meshIdNormalized || state.gatewayId || 'unknown';
+      const deviceId =
+        meshIdNormalized ||
+        state.gatewayMeshId ||
+        state.gatewayId ||
+        state.nodeId ||
+        'unknown';
       const dedupeKey = `${deviceId}:${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
       if (
         this.tenmanForwardState.lastKey === dedupeKey ||
@@ -864,11 +874,10 @@ class CallMeshAprsBridge extends EventEmitter {
 
       const nodeName = summary?.from?.longName || summary?.from?.shortName || summary?.from?.label || null;
       const extraPayload = {
-        source: 'TMAG',
-        mesh_id: meshIdNormalized
+        source: 'TMAG'
       };
-      if (nodeName) {
-        extraPayload.node_name = nodeName;
+      if (meshIdNormalized) {
+        extraPayload.mesh_id = meshIdNormalized;
       }
       if (summary?.from?.shortName && summary.from.shortName !== nodeName) {
         extraPayload.short_name = summary.from.shortName;
@@ -884,9 +893,14 @@ class CallMeshAprsBridge extends EventEmitter {
         longitude,
         altitude,
         speed,
-        heading,
-        extra: extraPayload
+        heading
       };
+      if (nodeName) {
+        payload.node_name = nodeName;
+      }
+      if (Object.keys(extraPayload).length > 0) {
+        payload.extra = extraPayload;
+      }
 
       const message = {
         action: 'publish',
@@ -1169,6 +1183,9 @@ class CallMeshAprsBridge extends EventEmitter {
       action: TENMAN_FORWARD_AUTH_ACTION,
       api_key: apiKey
     };
+    if (state.suppressAck) {
+      authMessage.suppress_ack = true;
+    }
 
     const serialized = JSON.stringify(authMessage);
     state.authenticating = true;
@@ -1229,15 +1246,26 @@ class CallMeshAprsBridge extends EventEmitter {
       state.authenticating = false;
       const status = String(parsed?.status ?? parsed?.result ?? parsed?.ok ?? 'ok').toLowerCase();
       if (status === 'pass' || status === 'ok' || status === 'true') {
-        const gatewayId = normalizeMeshId(
-          parsed?.gateway_id ?? parsed?.gatewayId ?? state.gatewayId ?? null
-        );
-        const nodeId = parsed?.node_id ?? parsed?.nodeId ?? state.nodeId ?? null;
-        state.gatewayId = gatewayId || state.gatewayId || null;
+        const gatewayIdRawCandidate = parsed?.gateway_id ?? parsed?.gatewayId ?? null;
+        const gatewayIdRaw =
+          gatewayIdRawCandidate != null && String(gatewayIdRawCandidate).trim()
+            ? String(gatewayIdRawCandidate).trim()
+            : null;
+        const gatewayMeshId = normalizeMeshId(gatewayIdRaw);
+        const nodeIdCandidate = parsed?.node_id ?? parsed?.nodeId ?? null;
+        const nodeId =
+          nodeIdCandidate != null && String(nodeIdCandidate).trim()
+            ? String(nodeIdCandidate).trim()
+            : null;
+        state.gatewayId = gatewayIdRaw;
+        state.gatewayMeshId = gatewayMeshId ?? null;
         state.nodeId = nodeId;
         state.authenticated = true;
         const infoParts = [];
-        if (gatewayId) infoParts.push(`gateway=${gatewayId}`);
+        if (gatewayIdRaw) infoParts.push(`gateway=${gatewayIdRaw}`);
+        if (gatewayMeshId && gatewayMeshId !== gatewayIdRaw) {
+          infoParts.push(`mesh=${gatewayMeshId}`);
+        }
         if (nodeId) infoParts.push(`node=${nodeId}`);
         this.emitLog('TENMAN', `驗證通過${infoParts.length ? ` (${infoParts.join(', ')})` : ''}`);
         this.flushTenmanQueue();
@@ -1253,7 +1281,12 @@ class CallMeshAprsBridge extends EventEmitter {
     if (parsed?.type === 'ack') {
       const action = parsed?.action ?? parsed?.payload?.action;
       const deviceId = parsed?.payload?.device_id ?? parsed?.device_id ?? '';
-      const gatewayId = parsed?.gateway_id ?? parsed?.payload?.gateway_id ?? state.gatewayId ?? '';
+      const gatewayId =
+        parsed?.gateway_id ??
+        parsed?.payload?.gateway_id ??
+        state.gatewayId ??
+        state.gatewayMeshId ??
+        '';
       this.emitLog(
         'TENMAN',
         `收到 ack${action ? ` action=${action}` : ''}${deviceId ? ` device=${deviceId}` : ''}${gatewayId ? ` gateway=${gatewayId}` : ''}`
