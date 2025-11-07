@@ -1336,16 +1336,6 @@ class MeshtasticClient extends EventEmitter {
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
 
-    const fromMeshCandidate =
-      summary.from?.meshId ??
-      summary.from?.meshIdNormalized ??
-      summary.from?.meshIdOriginal ??
-      packet.from ??
-      null;
-    if (this._shouldIgnoreMeshId(fromMeshCandidate)) {
-      return null;
-    }
-
     const directRelayNodeId =
       relayResult && Number.isFinite(relayResult.nodeId) ? relayResult.nodeId : relayNodeId;
 
