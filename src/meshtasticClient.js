@@ -18,28 +18,7 @@ const DEFAULT_MAX_PACKET = 512;
 const BROADCAST_ADDR = 0xffffffff;
 const RELAY_GUESS_EXPLANATION =
   '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
-const DEFAULT_OUTBOUND_HOP_LIMIT = (() => {
-  const candidates = [
-    process.env.MESHTASTIC_OUTBOUND_HOP_LIMIT,
-    process.env.MESHTASTIC_HOP_LIMIT
-  ].filter((value) => typeof value === 'string' && value.trim() !== '');
-  for (const candidate of candidates) {
-    const parsed = Number(candidate);
-    if (Number.isFinite(parsed)) {
-      return Math.max(0, Math.floor(parsed));
-    }
-  }
-  return 3;
-})();
-
-function normalizeHopValue(value) {
-  if (value == null) return null;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-  return Math.max(0, Math.floor(parsed));
-}
+const FORCED_OUTBOUND_HOP_LIMIT = 6;
 
 function normalizeMeshId(meshId) {
   if (meshId == null) return null;
@@ -124,10 +103,6 @@ class MeshtasticClient extends EventEmitter {
     this._seenPacketKeys = new Map();
     this._packetKeyQueue = [];
     this._nextPacketId = Math.floor(Math.random() * 0xffffffff);
-    this._outboundHopStartOverride = normalizeHopValue(options.defaultHopStart);
-    this._outboundHopLimitOverride = normalizeHopValue(options.defaultHopLimit);
-    this._observedHopStart = null;
-    this._observedHopLimit = null;
     this._handleIdleTimeoutBound = null;
     this._currentIdleTimeout = null;
     this._socketClosed = true;
@@ -1189,7 +1164,6 @@ class MeshtasticClient extends EventEmitter {
     if (!packet || packet.payloadVariant !== 'decoded') {
       return null;
     }
-    this._registerObservedHopValues(packet);
     if (this._connectionStartedAt && packet.rxTime) {
       const packetTime = packet.rxTime * 1000;
       if (packetTime <= this._connectionStartedAt) {
@@ -1790,36 +1764,8 @@ class MeshtasticClient extends EventEmitter {
     return true;
   }
 
-  _registerObservedHopValues(packet) {
-    if (!packet || typeof packet !== 'object') {
-      return;
-    }
-    const start = normalizeHopValue(packet.hopStart);
-    if (start != null && start > 0) {
-      this._observedHopStart =
-        this._observedHopStart != null ? Math.max(this._observedHopStart, start) : start;
-    }
-    const limit = normalizeHopValue(packet.hopLimit);
-    if ((this._observedHopStart == null || this._observedHopStart <= 0) && limit != null && limit > 0) {
-      this._observedHopLimit =
-        this._observedHopLimit != null ? Math.max(this._observedHopLimit, limit) : limit;
-    }
-  }
-
   _resolveOutboundHopStart() {
-    if (this._outboundHopStartOverride != null) {
-      return this._outboundHopStartOverride;
-    }
-    if (this._outboundHopLimitOverride != null) {
-      return this._outboundHopLimitOverride;
-    }
-    if (this._observedHopStart != null && this._observedHopStart > 0) {
-      return this._observedHopStart;
-    }
-    if (this._observedHopLimit != null && this._observedHopLimit > 0) {
-      return this._observedHopLimit;
-    }
-    return DEFAULT_OUTBOUND_HOP_LIMIT;
+    return FORCED_OUTBOUND_HOP_LIMIT;
   }
 
   sendTextMessage({ text, channel = 0, destination = BROADCAST_ADDR, wantAck = false } = {}) {
