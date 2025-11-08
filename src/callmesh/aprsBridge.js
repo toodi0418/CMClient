@@ -1262,12 +1262,22 @@ class CallMeshAprsBridge extends EventEmitter {
       typeof payload.scope === 'string' ? payload.scope.trim().toLowerCase() : 'broadcast';
     const scope = scopeRaw || 'broadcast';
     const wantAck = Boolean(payload.want_ack);
+    let replyToNormalized = null;
 
     let destination = MESHTASTIC_BROADCAST_ADDR;
     let meshDestinationLabel = 'broadcast';
     if (scope === 'broadcast') {
       destination = MESHTASTIC_BROADCAST_ADDR;
       meshDestinationLabel = 'broadcast';
+      const replyToCandidate =
+        payload.reply_to ??
+        payload.destination ??
+        payload.mesh_destination ??
+        payload.meshId ??
+        payload.mesh_id ??
+        payload.to ??
+        null;
+      replyToNormalized = normalizeMeshId(replyToCandidate);
     } else if (scope === 'directed') {
       const destinationRaw =
         payload.destination ??
@@ -1339,13 +1349,16 @@ class CallMeshAprsBridge extends EventEmitter {
         scope,
         queued_at: queuedAt,
         encoding: 'utf-8',
-        bytes: textBytes
+        bytes: textBytes,
+        reply_to: replyToNormalized ?? undefined
       });
       const destinationLog =
         scope === 'directed' ? `destination=${meshDestinationLabel}` : 'broadcast';
+      const replyLog =
+        scope === 'broadcast' && replyToNormalized ? ` reply_to=${replyToNormalized}` : '';
       this.emitLog(
         'TENMAN',
-        `已接受 TenManMap 訊息 scope=${scope} channel=${channel} ${destinationLog} bytes=${textBytes}`
+        `已接受 TenManMap 訊息 scope=${scope} channel=${channel} ${destinationLog}${replyLog} bytes=${textBytes}`
       );
     } catch (err) {
       this.emitLog('TENMAN', `TenManMap 訊息轉送失敗: ${err.message}`);

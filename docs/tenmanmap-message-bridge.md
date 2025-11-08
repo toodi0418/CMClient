@@ -125,7 +125,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
     "text": "ALL OK",
     "encoding": "utf-8",                           // 預設 utf-8
     "scope": "broadcast",                          // broadcast / directed
-    "destination": "!efef9876",                    // scope=directed 時必填；broadcast 可省略
+    "destination": "!efef9876",                    // broadcast=群組回覆時可填寫對象；scope=directed 時必填
     "want_ack": false                              // 選填；預設 false
   }
 }
@@ -140,8 +140,9 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
   "status": "accepted",
   "client_message_id": "tenman-20250208-00001",
   "flow_id": "1739017468890-5f5e4d3c",
-  "scope": "directed",
-  "mesh_destination": "!efef9876",                 // broadcast 時回傳 "broadcast"
+  "scope": "broadcast",
+  "mesh_destination": "broadcast",
+  "reply_to": "!efef9876",                         // broadcast + destination 時帶回對象
   "channel": 0,
   "queued_at": "2025-02-08T15:05:05+08:00"
 }
@@ -154,6 +155,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
   - `failed`：傳送失敗，會附帶 `error_code`。
 - 傳送時固定套用 hop limit = 6，確保訊息可跨節點中繼。
 - `scope=directed` 時必須提供 `destination`（`!` 開頭 Mesh ID），橋接層會自動轉為點對點傳送。
+- 若仍以 `broadcast` 廣播但希望標示「回覆對象」，可在 `destination` 帶入 Mesh ID；bridge 會保留廣播行為，並在 ACK 加入 `reply_to`。
 
 ### 4.3 可能錯誤碼
 
