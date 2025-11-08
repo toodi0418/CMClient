@@ -40,6 +40,9 @@ const TENMAN_FORWARD_AUTH_ACTION = 'authenticate';
 const TENMAN_FORWARD_SUPPRESS_ACK = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.TENMAN_SUPPRESS_ACK ?? 'true').trim().toLowerCase()
 );
+const TENMAN_FORWARD_VERBOSE_LOG = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.TENMAN_VERBOSE_LOG ?? 'false').trim().toLowerCase()
+);
 const TENMAN_INBOUND_MIN_INTERVAL_MS = 5000;
 const MESHTASTIC_BROADCAST_ADDR = 0xffffffff;
 
@@ -1374,7 +1377,9 @@ class CallMeshAprsBridge extends EventEmitter {
       if (dropped?.key) {
         state.pendingKeys.delete(dropped.key);
       }
-      this.emitLog('TENMAN', '佇列已滿，將移除最舊的 publish 訊息');
+      if (TENMAN_FORWARD_VERBOSE_LOG) {
+        this.emitLog('TENMAN', '佇列已滿，將移除最舊的 publish 訊息');
+      }
     }
 
     const entry = {
@@ -1389,10 +1394,12 @@ class CallMeshAprsBridge extends EventEmitter {
     if (message?.action === 'message.publish') {
       const previewSource = typeof payload.text === 'string' ? payload.text : '';
       const preview = previewSource.replace(/\s+/g, ' ').slice(0, 64);
-      this.emitLog(
-        'TENMAN',
-        `佇列 message.publish channel=${payload.channel ?? ''} text=${preview || '[空白]'}`
-      );
+      if (TENMAN_FORWARD_VERBOSE_LOG) {
+        this.emitLog(
+          'TENMAN',
+          `佇列 message.publish channel=${payload.channel ?? ''} text=${preview || '[空白]'}`
+        );
+      }
     } else {
       const latLog =
         typeof payload.latitude === 'number'
@@ -1402,10 +1409,12 @@ class CallMeshAprsBridge extends EventEmitter {
         typeof payload.longitude === 'number'
           ? payload.longitude.toFixed(6)
           : String(payload.longitude ?? '');
-      this.emitLog(
-        'TENMAN',
-        `佇列 publish device=${payload.device_id ?? ''} lat=${latLog} lon=${lonLog}`
-      );
+      if (TENMAN_FORWARD_VERBOSE_LOG) {
+        this.emitLog(
+          'TENMAN',
+          `佇列 publish device=${payload.device_id ?? ''} lat=${latLog} lon=${lonLog}`
+        );
+      }
     }
 
     this.ensureTenmanWebsocket();
