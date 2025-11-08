@@ -699,10 +699,6 @@ async function startMonitor(argv) {
     handleSummary(summary);
   });
 
-  bridge.on('auto-summary', (summary) => {
-    handleSummary(summary, { synthetic: true });
-  });
-
   if (argv.format !== 'summary') {
     client.on('fromRadio', ({ message }) => {
       const object = client.toObject(message, {

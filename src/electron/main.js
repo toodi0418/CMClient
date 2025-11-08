@@ -1049,10 +1049,6 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     processSummary(summary);
   });
 
-  bridge?.on('auto-summary', (summary) => {
-    processSummary(summary, { synthetic: true });
-  });
-
   client.on('fromRadio', ({ message }) => {
     if (!message) return;
     try {
