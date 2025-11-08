@@ -124,8 +124,8 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
     "channel": 0,
     "text": "ALL OK",
     "encoding": "utf-8",                           // 預設 utf-8
-    "scope": "broadcast",                          // 目前僅支援 broadcast
-    "destination": "!efef9876",                    // 選填，scope=directed 時必填
+    "scope": "broadcast",                          // broadcast / directed
+    "destination": "!efef9876",                    // scope=directed 時必填；broadcast 可省略
     "want_ack": false                              // 選填；預設 false
   }
 }
@@ -140,7 +140,8 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
   "status": "accepted",
   "client_message_id": "tenman-20250208-00001",
   "flow_id": "1739017468890-5f5e4d3c",
-  "mesh_destination": "broadcast",                 // 或實際 meshId
+  "scope": "directed",
+  "mesh_destination": "!efef9876",                 // broadcast 時回傳 "broadcast"
   "channel": 0,
   "queued_at": "2025-02-08T15:05:05+08:00"
 }
@@ -152,6 +153,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
   - `delivered`：成功交給 Meshtastic stack（需後續韌體確認）；
   - `failed`：傳送失敗，會附帶 `error_code`。
 - 傳送時固定套用 hop limit = 6，確保訊息可跨節點中繼。
+- `scope=directed` 時必須提供 `destination`（`!` 開頭 Mesh ID），橋接層會自動轉為點對點傳送。
 
 ### 4.3 可能錯誤碼
 
@@ -164,6 +166,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
 | `ROUTING_UNAVAILABLE` | 指定 Mesh ID 不在 CallMesh 節點列表中或處於離線 | 確認節點是否在線／提供備援流程                  |
 | `RATE_LIMITED`     | TenManMap 短時間內送出過多訊息                         | 稍待 5 秒再重試（預設每 5 秒允許 1 則）          |
 | `INTERNAL_ERROR`   | 其他未捕捉錯誤                                         | 參考 `TENMAN` log，並回報 CallMesh 團隊         |
+| `INVALID_DESTINATION` | `scope=directed` 缺少或填錯 `destination` Mesh ID | 填入 `!` 開頭的 8 位十六進位 Mesh ID             |
 
 ### 4.4 節流與排程
 

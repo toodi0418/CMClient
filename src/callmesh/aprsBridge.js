@@ -1258,13 +1258,41 @@ class CallMeshAprsBridge extends EventEmitter {
 
     const channelValue = Number(payload.channel);
     const channel = Number.isFinite(channelValue) ? Math.max(0, Math.floor(channelValue)) : 0;
-    const scope = typeof payload.scope === 'string' ? payload.scope.trim().toLowerCase() : 'broadcast';
-    if (scope && scope !== 'broadcast') {
+    const scopeRaw =
+      typeof payload.scope === 'string' ? payload.scope.trim().toLowerCase() : 'broadcast';
+    const scope = scopeRaw || 'broadcast';
+    const wantAck = Boolean(payload.want_ack);
+
+    let destination = MESHTASTIC_BROADCAST_ADDR;
+    let meshDestinationLabel = 'broadcast';
+    if (scope === 'broadcast') {
+      destination = MESHTASTIC_BROADCAST_ADDR;
+      meshDestinationLabel = 'broadcast';
+    } else if (scope === 'directed') {
+      const destinationRaw =
+        payload.destination ??
+        payload.mesh_destination ??
+        payload.meshId ??
+        payload.mesh_id ??
+        payload.to ??
+        null;
+      const normalizedDestination = normalizeMeshId(destinationRaw);
+      if (!normalizedDestination) {
+        respondError('INVALID_DESTINATION', 'directed 範圍需提供有效的 destination mesh id');
+        return;
+      }
+      const destinationNumeric = meshIdToUint32(normalizedDestination);
+      if (!Number.isFinite(destinationNumeric)) {
+        respondError('INVALID_DESTINATION', 'destination mesh id 無法轉換為數值');
+        return;
+      }
+      destination = destinationNumeric >>> 0;
+      meshDestinationLabel = normalizedDestination;
+    } else if (scope) {
       respondError('UNSUPPORTED_SCOPE', `scope=${scope} 尚未支援`);
       return;
     }
 
-    const wantAck = Boolean(payload.want_ack);
     const maxPayloadLength =
       Number.isFinite(client?.constantsEnum?.values?.DATA_PAYLOAD_LEN)
         ? Number(client.constantsEnum.values.DATA_PAYLOAD_LEN)
@@ -1292,7 +1320,7 @@ class CallMeshAprsBridge extends EventEmitter {
       await client.sendTextMessage({
         text,
         channel,
-        destination: MESHTASTIC_BROADCAST_ADDR,
+        destination,
         wantAck
       });
       inboundState.lastAcceptedAt = Date.now();
@@ -1305,14 +1333,20 @@ class CallMeshAprsBridge extends EventEmitter {
         status: 'accepted',
         client_message_id: clientMessageId ?? undefined,
         flow_id: flowId,
-        mesh_destination: 'broadcast',
+        mesh_destination: meshDestinationLabel,
         channel,
         want_ack: wantAck,
+        scope,
         queued_at: queuedAt,
         encoding: 'utf-8',
         bytes: textBytes
       });
-      this.emitLog('TENMAN', `已接受 TenManMap 訊息 channel=${channel} bytes=${textBytes}`);
+      const destinationLog =
+        scope === 'directed' ? `destination=${meshDestinationLabel}` : 'broadcast';
+      this.emitLog(
+        'TENMAN',
+        `已接受 TenManMap 訊息 scope=${scope} channel=${channel} ${destinationLog} bytes=${textBytes}`
+      );
     } catch (err) {
       this.emitLog('TENMAN', `TenManMap 訊息轉送失敗: ${err.message}`);
       respondError('INTERNAL_ERROR', err.message || '傳送 Meshtastic 訊息失敗');
@@ -3032,6 +3066,23 @@ function normalizeMeshId(meshId) {
   value = value.replace(/[^0-9a-f]/gi, '').toLowerCase();
   if (!value) return null;
   return `!${value}`;
+}
+
+function meshIdToUint32(meshId) {
+  const normalized = normalizeMeshId(meshId);
+  if (!normalized) {
+    return null;
+  }
+  const hex = normalized.slice(1);
+  if (!hex) {
+    return null;
+  }
+  const padded = hex.length > 8 ? hex.slice(-8) : hex.padStart(8, '0');
+  const parsed = Number.parseInt(padded, 16);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return parsed >>> 0;
 }
 
 function extractTelemetryNode(node) {
