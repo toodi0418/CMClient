@@ -44,6 +44,7 @@ const MESSAGE_MAX_PER_CHANNEL = 200;
 
 const messageStore = new Map();
 let messageWritePromise = Promise.resolve();
+let bridgeSummaryListener = null;
 
 function getMessageLogPath() {
   return path.join(getCallMeshDataDir(), MESSAGE_LOG_FILENAME);
@@ -110,7 +111,10 @@ function sanitizeMessageSummary(summary) {
         : new Date(timestampMs).toISOString(),
     flowId: flowIdRaw,
     meshPacketId: Number.isFinite(summary.meshPacketId) ? Number(summary.meshPacketId) : null,
-    replyId: Number.isFinite(summary.replyId) ? Number(summary.replyId) : null
+    replyId: Number.isFinite(summary.replyId) ? Number(summary.replyId) : null,
+    replyTo: typeof summary.replyTo === 'string' ? summary.replyTo : null,
+    scope: typeof summary.scope === 'string' ? summary.scope : null,
+    synthetic: Boolean(summary.synthetic)
   };
 }
 
@@ -665,6 +669,10 @@ async function initialiseApp() {
 }
 
 function cleanupMeshtasticClient() {
+  if (bridgeSummaryListener && bridge && typeof bridge.removeListener === 'function') {
+    bridge.removeListener('summary', bridgeSummaryListener);
+    bridgeSummaryListener = null;
+  }
   if (client) {
     bridge?.detachMeshtasticClient(client);
     client.stop();
@@ -1031,7 +1039,9 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     if (!summary) return;
     let messageEntry = null;
     try {
-      bridge?.handleMeshtasticSummary(summary);
+      if (!synthetic) {
+        bridge?.handleMeshtasticSummary(summary);
+      }
     } catch (err) {
       console.error('處理 APRS Summary 時發生錯誤:', err);
     }
@@ -1046,6 +1056,16 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
       webServer?.publishMessage(messageEntry);
     }
   };
+
+  if (bridge && typeof bridge.on === 'function') {
+    if (bridgeSummaryListener && typeof bridge.removeListener === 'function') {
+      bridge.removeListener('summary', bridgeSummaryListener);
+    }
+    bridgeSummaryListener = (summary) => {
+      processSummary(summary, { synthetic: true });
+    };
+    bridge.on('summary', bridgeSummaryListener);
+  }
 
   client.on('summary', (summary) => {
     processSummary(summary);

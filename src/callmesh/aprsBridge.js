@@ -1164,6 +1164,119 @@ class CallMeshAprsBridge extends EventEmitter {
     return Object.keys(payload).length > 0 ? payload : null;
   }
 
+  buildSummaryNodeForMesh(meshId, { fallbackLabel = null } = {}) {
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) {
+      if (!fallbackLabel) {
+        return null;
+      }
+      return {
+        label: fallbackLabel,
+        meshId: null,
+        meshIdNormalized: null,
+        meshIdOriginal: null,
+        shortName: null,
+        longName: null,
+        raw: null
+      };
+    }
+    const registry = this.nodeDatabase?.get(normalized) || null;
+    const shortName = registry?.shortName ?? null;
+    const longName = registry?.longName ?? null;
+    const name = longName || shortName || null;
+    const label = name ? `${name} (${normalized})` : normalized;
+    const raw = meshIdToUint32(normalized);
+    const node = {
+      label,
+      meshId: normalized,
+      meshIdNormalized: normalized,
+      meshIdOriginal: registry?.meshIdOriginal ?? null,
+      shortName,
+      longName,
+      hwModel: registry?.hwModel ?? null,
+      role: registry?.role ?? null,
+      raw: Number.isFinite(raw) ? raw >>> 0 : null
+    };
+    if (registry?.hwModelLabel) {
+      node.hwModelLabel = registry.hwModelLabel;
+    }
+    if (registry?.roleLabel) {
+      node.roleLabel = registry.roleLabel;
+    }
+    if (registry?.lastSeenAt) {
+      node.lastSeenAt = registry.lastSeenAt;
+    }
+    return node;
+  }
+
+  emitTenmanSyntheticSummary({
+    text,
+    channel,
+    flowId,
+    meshPacketId,
+    scope,
+    replyTo,
+    replyId,
+    meshDestination
+  }) {
+    const timestampMs = Date.now();
+    const timestamp = new Date(timestampMs);
+    const fromNode =
+      this.buildSummaryNodeForMesh(this.selfMeshId, { fallbackLabel: '本機節點' }) ||
+      {
+        label: '本機節點',
+        meshId: this.selfMeshId || null,
+        meshIdNormalized: this.selfMeshId || null,
+        meshIdOriginal: this.selfMeshId || null,
+        shortName: null,
+        longName: null,
+        raw: meshIdToUint32(this.selfMeshId)
+      };
+    let toNode = null;
+    if (scope === 'directed' && meshDestination && meshDestination !== 'broadcast') {
+      toNode =
+        this.buildSummaryNodeForMesh(meshDestination) ||
+        {
+          label: meshDestination,
+          meshId: meshDestination,
+          meshIdNormalized: meshDestination,
+          meshIdOriginal: meshDestination,
+          shortName: null,
+          longName: null,
+          raw: meshIdToUint32(meshDestination)
+        };
+    }
+    const safeText = typeof text === 'string' ? text : text != null ? String(text) : '';
+    const buffer = Buffer.from(safeText, 'utf8');
+    const summary = {
+      type: 'Text',
+      detail: safeText,
+      channel,
+      timestamp: timestamp.toISOString(),
+      timestampLabel: formatTimestampLabel(timestamp),
+      timestampMs,
+      from: fromNode,
+      to: toNode,
+      relay: null,
+      hops: null,
+      snr: null,
+      rssi: null,
+      meshPacketId: Number.isFinite(meshPacketId) ? meshPacketId >>> 0 : null,
+      replyId: Number.isFinite(replyId) ? replyId >>> 0 : null,
+      replyTo: replyTo || null,
+      flowId,
+      scope,
+      synthetic: true,
+      rawHex: buffer.length > 0 ? buffer.toString('hex') : null,
+      rawLength: buffer.length,
+      extraLines: []
+    };
+    if (scope === 'broadcast' && replyTo) {
+      summary.extraLines.push(`回覆對象: ${replyTo}`);
+    }
+    this.emit('summary', summary);
+  }
+
   sendTenmanControlMessage(message) {
     const state = this.tenmanForwardState;
     if (!state || !state.websocket || state.websocket.readyState !== WebSocket.OPEN) {
@@ -1383,6 +1496,16 @@ class CallMeshAprsBridge extends EventEmitter {
         'TENMAN',
         `已接受 TenManMap 訊息 scope=${scope} channel=${channel} ${destinationLog}${replyLog}${replyIdLog}${packetIdLabel} bytes=${textBytes}`
       );
+      this.emitTenmanSyntheticSummary({
+        text,
+        channel,
+        flowId,
+        meshPacketId: Number.isFinite(packetId) ? Number(packetId) >>> 0 : null,
+        scope,
+        replyTo: replyToNormalized ?? null,
+        replyId: replyIdNumeric ?? null,
+        meshDestination: scope === 'directed' ? meshDestinationLabel : null
+      });
     } catch (err) {
       this.emitLog('TENMAN', `TenManMap 訊息轉送失敗: ${err.message}`);
       respondError('INTERNAL_ERROR', err.message || '傳送 Meshtastic 訊息失敗');

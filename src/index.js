@@ -14,6 +14,7 @@ const { WebDashboardServer } = require('./web/server');
 const pkg = require('../package.json');
 
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
+let bridgeSummaryListener = null;
 
 function getMessageLogPath() {
   return path.join(getArtifactsDir(), MESSAGE_LOG_FILENAME);
@@ -60,7 +61,12 @@ function tryPublishWebMessage(webServer, summary) {
     hops: summary.hops ? { ...summary.hops } : null,
     timestampMs,
     timestampLabel,
-    flowId
+    flowId,
+    meshPacketId: Number.isFinite(summary.meshPacketId) ? Number(summary.meshPacketId) : null,
+    replyId: Number.isFinite(summary.replyId) ? Number(summary.replyId) : null,
+    replyTo: typeof summary.replyTo === 'string' ? summary.replyTo : null,
+    scope: typeof summary.scope === 'string' ? summary.scope : null,
+    synthetic: Boolean(summary.synthetic)
   };
   try {
     webServer.publishMessage(entry);
@@ -619,6 +625,10 @@ async function startMonitor(argv) {
       const cleanup = () => {
         if (settled) return;
         settled = true;
+        if (bridgeSummaryListener && typeof bridge.removeListener === 'function') {
+          bridge.removeListener('summary', bridgeSummaryListener);
+          bridgeSummaryListener = null;
+        }
         bridge.detachMeshtasticClient(client);
         client.removeAllListeners();
         try {
@@ -657,7 +667,9 @@ async function startMonitor(argv) {
 
   const handleSummary = (summary, { synthetic = false } = {}) => {
     if (!summary) return;
-    bridge.handleMeshtasticSummary(summary);
+    if (!synthetic) {
+      bridge.handleMeshtasticSummary(summary);
+    }
     webServer?.publishSummary(summary);
     tryPublishWebMessage(webServer, summary);
 
@@ -694,6 +706,17 @@ async function startMonitor(argv) {
       }
     }
   };
+
+      if (bridgeSummaryListener && typeof bridge.removeListener === 'function') {
+        bridge.removeListener('summary', bridgeSummaryListener);
+        bridgeSummaryListener = null;
+      }
+      if (typeof bridge.on === 'function') {
+        bridgeSummaryListener = (summary) => {
+          handleSummary(summary, { synthetic: true });
+        };
+        bridge.on('summary', bridgeSummaryListener);
+      }
 
   client.on('summary', (summary) => {
     handleSummary(summary);
