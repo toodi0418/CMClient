@@ -96,7 +96,10 @@ TenManMap 可繼續沿用既有處理流程。
     "rssi": -87,
     "snr": 9.75,
     "raw_hex": "515448204f4b",
-    "raw_length": 6
+    "raw_length": 6,
+    "mesh_packet_id": 305419896,                  // 新增：原始 mesh packet id，可用於 reply_id
+    "reply_id": 123456789,                        // 若原封包為 Meshtastic 回覆，會填入原始 reply_id
+    "reply_to": "!efef9876"                       // 若為群組回覆（broadcast + destination），會提供回覆目標
   }
 }
 ```
@@ -126,6 +129,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
     "encoding": "utf-8",                           // 預設 utf-8
     "scope": "broadcast",                          // broadcast / directed
     "destination": "!efef9876",                    // broadcast=群組回覆時可填寫對象；scope=directed 時必填
+    "reply_id": 305419896,                         // 選填；若要讓 Meshtastic 原生 UI 顯示回覆指標，請帶入原訊息的 mesh_packet_id
     "want_ack": false                              // 選填；預設 false
   }
 }
@@ -143,6 +147,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
   "scope": "broadcast",
   "mesh_destination": "broadcast",
   "reply_to": "!efef9876",                         // broadcast + destination 時帶回對象
+  "mesh_packet_id": 412345678,                    // 新送出的封包 ID，可供後續回覆使用
   "channel": 0,
   "queued_at": "2025-02-08T15:05:05+08:00"
 }
@@ -156,6 +161,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
 - 傳送時固定套用 hop limit = 6，確保訊息可跨節點中繼。
 - `scope=directed` 時必須提供 `destination`（`!` 開頭 Mesh ID），橋接層會自動轉為點對點傳送。
 - 若仍以 `broadcast` 廣播但希望標示「回覆對象」，可在 `destination` 帶入 Mesh ID；bridge 會保留廣播行為，並在 ACK 加入 `reply_to`。
+- Meshtastic 官方 App 需要 `reply_id` 才會顯示回覆指標。請將原訊息 `message.publish.payload.mesh_packet_id` 回填為 `reply_id`（橋接層也會在 ACK 的 `reply_id` / `mesh_packet_id` 提供）。
 
 ### 4.3 可能錯誤碼
 

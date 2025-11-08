@@ -1012,6 +1012,12 @@ class CallMeshAprsBridge extends EventEmitter {
       if (receivedAt) {
         payload.received_at = receivedAt;
       }
+      if (Number.isFinite(summary.meshPacketId)) {
+        payload.mesh_packet_id = Number(summary.meshPacketId) >>> 0;
+      }
+      if (Number.isFinite(summary.replyId)) {
+        payload.reply_id = Number(summary.replyId) >>> 0;
+      }
 
       const fromDescriptor = this.buildTenmanNodeDescriptor(summary.from);
       if (fromDescriptor) {
@@ -1263,6 +1269,16 @@ class CallMeshAprsBridge extends EventEmitter {
     const scope = scopeRaw || 'broadcast';
     const wantAck = Boolean(payload.want_ack);
     let replyToNormalized = null;
+    let replyIdNumeric = null;
+    const replyIdCandidateRaw = payload.reply_id ?? payload.replyId ?? null;
+    if (replyIdCandidateRaw != null) {
+      const parsed = Number(replyIdCandidateRaw);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        respondError('INVALID_PAYLOAD', 'reply_id 必須為非負整數');
+        return;
+      }
+      replyIdNumeric = parsed >>> 0;
+    }
 
     let destination = MESHTASTIC_BROADCAST_ADDR;
     let meshDestinationLabel = 'broadcast';
@@ -1327,11 +1343,12 @@ class CallMeshAprsBridge extends EventEmitter {
     }
 
     try {
-      await client.sendTextMessage({
+      const packetId = await client.sendTextMessage({
         text,
         channel,
         destination,
-        wantAck
+        wantAck,
+        replyId: replyIdNumeric
       });
       inboundState.lastAcceptedAt = Date.now();
       const flowId = `tenman-${inboundState.lastAcceptedAt}-${Math.random().toString(16).slice(2, 10)}`;
@@ -1350,15 +1367,21 @@ class CallMeshAprsBridge extends EventEmitter {
         queued_at: queuedAt,
         encoding: 'utf-8',
         bytes: textBytes,
-        reply_to: replyToNormalized ?? undefined
+        mesh_packet_id: Number.isFinite(packetId) ? Number(packetId) >>> 0 : undefined,
+        reply_to: replyToNormalized ?? undefined,
+        reply_id: replyIdNumeric ?? undefined
       });
       const destinationLog =
         scope === 'directed' ? `destination=${meshDestinationLabel}` : 'broadcast';
       const replyLog =
         scope === 'broadcast' && replyToNormalized ? ` reply_to=${replyToNormalized}` : '';
+      const replyIdLog =
+        replyIdNumeric != null ? ` reply_id=${replyIdNumeric}` : '';
+      const packetIdLabel =
+        Number.isFinite(packetId) ? ` packet_id=${Number(packetId) >>> 0}` : '';
       this.emitLog(
         'TENMAN',
-        `已接受 TenManMap 訊息 scope=${scope} channel=${channel} ${destinationLog}${replyLog} bytes=${textBytes}`
+        `已接受 TenManMap 訊息 scope=${scope} channel=${channel} ${destinationLog}${replyLog}${replyIdLog}${packetIdLabel} bytes=${textBytes}`
       );
     } catch (err) {
       this.emitLog('TENMAN', `TenManMap 訊息轉送失敗: ${err.message}`);

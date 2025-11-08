@@ -1332,6 +1332,13 @@ class MeshtasticClient extends EventEmitter {
     const rawHex =
       Buffer.isBuffer(payload) && payload.length > 0 ? payload.toString('hex') : null;
 
+    const meshPacketId = Number.isFinite(packet.id) ? packet.id >>> 0 : null;
+    const decoded = packet.decoded || {};
+    const replyId = Number.isFinite(decoded.replyId) ? decoded.replyId >>> 0 : null;
+    const requestId = Number.isFinite(decoded.requestId) ? decoded.requestId >>> 0 : null;
+    const emoji = Number.isFinite(decoded.emoji) ? decoded.emoji >>> 0 : null;
+    const bitfield = Number.isFinite(decoded.bitfield) ? decoded.bitfield >>> 0 : null;
+
     const summary = {
       timestamp: timestamp.toISOString(),
       timestampLabel: formatTimestamp(timestamp),
@@ -1357,6 +1364,11 @@ class MeshtasticClient extends EventEmitter {
       nextHop: nextHopInfo,
       position: decodeInfo?.position || null,
       telemetry: decodeInfo?.telemetry || null,
+      meshPacketId,
+      replyId,
+      requestId,
+      emoji,
+      bitfield,
       rawHex,
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
@@ -1768,7 +1780,13 @@ class MeshtasticClient extends EventEmitter {
     return FORCED_OUTBOUND_HOP_LIMIT;
   }
 
-  sendTextMessage({ text, channel = 0, destination = BROADCAST_ADDR, wantAck = false } = {}) {
+  sendTextMessage({
+    text,
+    channel = 0,
+    destination = BROADCAST_ADDR,
+    wantAck = false,
+    replyId = null
+  } = {}) {
     if (!this._connected) {
       return Promise.reject(new Error('Meshtastic 尚未連線'));
     }
@@ -1817,6 +1835,14 @@ class MeshtasticClient extends EventEmitter {
       meshPacketPayload.hopLimit = hopStart >>> 0;
       meshPacketPayload.hopStart = hopStart >>> 0;
     }
+    const replyIdValue = replyId != null ? Number(replyId) : null;
+    const replyIdNumeric = Number.isFinite(replyIdValue) ? replyIdValue >>> 0 : null;
+    if (replyIdNumeric != null) {
+      if (!meshPacketPayload.decoded) {
+        meshPacketPayload.decoded = {};
+      }
+      meshPacketPayload.decoded.replyId = replyIdNumeric;
+    }
     const message = this.toRadioType.create({
       packet: meshPacketPayload
     });
@@ -1827,7 +1853,7 @@ class MeshtasticClient extends EventEmitter {
         if (err) {
           reject(err);
         } else {
-          resolve(true);
+          resolve(meshPacketPayload.id >>> 0);
         }
       });
     });

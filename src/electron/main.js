@@ -108,7 +108,9 @@ function sanitizeMessageSummary(summary) {
       typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
         ? summary.timestampLabel.trim()
         : new Date(timestampMs).toISOString(),
-    flowId: flowIdRaw
+    flowId: flowIdRaw,
+    meshPacketId: Number.isFinite(summary.meshPacketId) ? Number(summary.meshPacketId) : null,
+    replyId: Number.isFinite(summary.replyId) ? Number(summary.replyId) : null
   };
 }
 
