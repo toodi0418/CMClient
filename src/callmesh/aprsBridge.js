@@ -45,7 +45,7 @@ const AUTO_REPLY_CHANNEL = 2;
 const AUTO_REPLY_TRIGGER = '@cm';
 const AUTO_REPLY_RESPONSE = 'OK';
 const AUTO_REPLY_HISTORY_LIMIT = 256;
-const AUTO_REPLY_DELAY_MS = 3_000;
+const AUTO_REPLY_DIRECT_DELAY_MS = 4_000;
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
@@ -860,6 +860,7 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!this._registerAutoReplyKey(historyKey)) {
       return;
     }
+    const delayMs = this._isDirectSummary(summary) ? AUTO_REPLY_DIRECT_DELAY_MS : 0;
     const dispatch = () =>
       this._sendAutoReplyNow({
         text: this.autoReplyConfig.response,
@@ -867,8 +868,8 @@ class CallMeshAprsBridge extends EventEmitter {
       }).catch(() => {
         // error already logged inside _sendAutoReplyNow
       });
-    if (AUTO_REPLY_DELAY_MS > 0) {
-      setTimeout(dispatch, AUTO_REPLY_DELAY_MS);
+    if (delayMs > 0) {
+      setTimeout(dispatch, delayMs);
     } else {
       dispatch();
     }
@@ -915,6 +916,31 @@ class CallMeshAprsBridge extends EventEmitter {
       }
     }
     return null;
+  }
+
+  _isDirectSummary(summary) {
+    if (!summary || typeof summary !== 'object') {
+      return false;
+    }
+    const relayCandidate =
+      summary.relay?.meshId ??
+      summary.relay?.meshIdNormalized ??
+      summary.relay?.meshIdOriginal ??
+      summary.relayMeshId ??
+      summary.relayMeshIdNormalized ??
+      null;
+    if (relayCandidate) {
+      return false;
+    }
+    const hopsLabelRaw = typeof summary.hops?.label === 'string' ? summary.hops.label.trim() : '';
+    if (hopsLabelRaw) {
+      const usedPart = hopsLabelRaw.split('/')[0].trim();
+      const usedValue = Number(usedPart);
+      if (Number.isFinite(usedValue) && usedValue > 0) {
+        return false;
+      }
+    }
+    return true;
   }
 
   async _sendAutoReplyNow({ text, channel }) {
