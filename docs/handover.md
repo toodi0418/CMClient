@@ -28,6 +28,7 @@
 - **Serial 自動重連對齊**：Serial 連線現在使用與 TCP 相同的自動重連、閒置檢測與錯誤回復流程；中斷時會進入同一套 `startReconnectLoop()` 機制。
 - **TenManMap 分享偏好持久化**：CLI (`--no-share-with-tenmanmap`)、環境變數 (`TENMAN_DISABLE=1`) 與 GUI 勾選會寫入偏好檔並呼叫 `setTenmanShareEnabled()`，即時控制資料是否同步至 TenManMap 與其合作夥伴。
 - **TenManMap 訊息互通**：TenManMap WebSocket 現可接收 Meshtastic 文字封包（`message.publish`），並支援透過 `send_message` 命令回傳廣播文字；套用 5 秒節流與長度檢查，詳細規格見 `docs/tenmanmap-message-bridge.md`。
+- **TenManMap 回覆與自發訊息同步**：TenManMap 下行訊息可攜帶 `destination` / `reply_id`；橋接層會在廣播時保留 `reply_to`、在 Meshtastic 封包寫入 `reply_id`，並回報新的 `mesh_packet_id`。CLI / Electron / Web 會發出合成 summary 以顯示自身送出的訊息（含回覆箭頭資訊），iOS/Android App 亦可藉由 `reply_id` 顯示回覆符號。
 
 ## 1. 專案定位與核心價值
 
@@ -412,6 +413,29 @@ CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
 5. **Logs / 儀表板**
    - Electron Log 頁是否能依 Tag / 關鍵字篩選。
    - Web Dashboard SSE 是否收到 `status`、`summary` 等事件（可透過瀏覽器 DevTools 檢視）。
+
+### 7.8 TenManMap 訊息互通與回覆機制
+
+- **上行（Meshtastic → TenManMap）**
+  - `forwardTenmanMessage()` 會將 Meshtastic 文字封包轉為 `message.publish`，payload 包含 `mesh_packet_id`（韌體 Packet ID）、`reply_id`、`reply_to`、`relay`、`hops`、`raw_hex` / `raw_length` 等欄位，TenManMap 可憑此還原來源節點與回覆目標。
+  - CLI / Electron / Web 端收到封包時，同步保留 `meshPacketId`、`replyId`，後續在訊息列表、CSV 或 API 匯出都能查詢。
+
+- **下行（TenManMap → Meshtastic）**
+  - `send_message` 支援 `scope="broadcast"` 與 `scope="directed"`：
+    - `broadcast`：保持廣播行為，可加上 `destination` 或 `reply_to` 指出群組回覆對象。
+    - `directed`：轉為點對點封包，**必須**帶入 `destination` Mesh ID。
+  - `reply_id`（選填）會寫入 `MeshPacket.decoded.replyId`，Meshtastic 官方 App 因而顯示回覆箭頭；成功送出後的 ACK 會附帶 `mesh_packet_id`、`reply_to`、`reply_id` 等欄位供 TenManMap 回填。
+  - 橋接層針對 TenManMap 指令套用 5 秒節流（`TENMAN_INBOUND_MIN_INTERVAL_MS`），文字長度遵循韌體 `DATA_PAYLOAD_LEN` 上限（預設 233 Bytes）。
+
+- **自發訊息同步**
+  - 成功送出 TenManMap 指令後，`emitTenmanSyntheticSummary()` 會產生合成 `summary`（標記 `synthetic=true`、保留 `reply_to` / `reply_id`），透過 `bridge.emit('summary')` 推送。
+  - CLI (`src/index.js`) 與 Electron (`src/electron/main.js`) 會訂閱並持久化該 summary，因此本機廣播的訊息也會出現在訊息列表與 `message-log.jsonl` 中；Web Dashboard 同樣會收到這筆快照。
+
+- **TenManMap 端整合建議**
+  - 接收 `message.publish` 後保存 `mesh_packet_id` 與 `reply_to`，作為「回覆」按鈕的目標與 ID。
+  - 群組回覆：`scope="broadcast"`、`destination="<Mesh ID>"`、`reply_id=<原訊息 mesh_packet_id>` → 所有節點可見，並保留回覆箭頭。
+  - 私訊回覆：`scope="directed"`、`destination="<Mesh ID>"`，可選擇是否帶 `reply_id`。
+  - 若需暫停分享，可使用 `TENMAN_DISABLE=1` 或 `CallMeshAprsBridge.setTenmanShareEnabled(false)` 停用整個 TenManMap 管線。
 
 ---
 
