@@ -45,8 +45,14 @@ const AUTO_REPLY_CHANNEL = 2;
 const AUTO_REPLY_TRIGGER = '@cm';
 const AUTO_REPLY_RESPONSE = 'OK';
 const AUTO_REPLY_HISTORY_LIMIT = 256;
+const AUTO_REPLY_DELAY_MS = 3_000;
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
+
+function formatTimestampLabel(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
 
 function extractEnumBlock(source, enumName) {
   const enumIndex = source.indexOf(`enum ${enumName}`);
@@ -909,6 +915,9 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   async _sendAutoReply({ text, channel }) {
+    if (AUTO_REPLY_DELAY_MS > 0) {
+      await new Promise((resolve) => setTimeout(resolve, AUTO_REPLY_DELAY_MS));
+    }
     const client = this._getWritableMeshtasticClient();
     if (!client) {
       this.emitLog('AUTO', '沒有可用的 Meshtastic 客戶端可傳送自動回覆');
@@ -922,6 +931,55 @@ class CallMeshAprsBridge extends EventEmitter {
         wantAck: false
       });
       this.emitLog('AUTO', `已自動回覆「${text}」於 CH${channel}`);
+      const timestampMs = Date.now();
+      const timestamp = new Date(timestampMs);
+      const baseNode = this.selfMeshId
+        ? {
+            meshId: this.selfMeshId,
+            meshIdNormalized: this.selfMeshId,
+            meshIdOriginal: this.selfMeshId
+          }
+        : null;
+      const registryNode =
+        this.selfMeshId && this.nodeDatabase ? this.nodeDatabase.get(this.selfMeshId) : null;
+      const mergedNode = mergeNodeInfo(baseNode, registryNode);
+      if (mergedNode) {
+        mergedNode.label = mergedNode.label || buildNodeLabel(mergedNode) || this.selfMeshId || 'Self';
+      }
+      const fromEntry = mergedNode
+        ? {
+            meshId: mergedNode.meshId ?? this.selfMeshId ?? null,
+            meshIdNormalized: mergedNode.meshIdNormalized ?? this.selfMeshId ?? null,
+            meshIdOriginal: mergedNode.meshIdOriginal ?? mergedNode.meshId ?? this.selfMeshId ?? null,
+            shortName: mergedNode.shortName ?? null,
+            longName: mergedNode.longName ?? null,
+            label: mergedNode.label ?? buildNodeLabel(mergedNode) ?? this.selfMeshId ?? 'Self'
+          }
+        : {
+            meshId: this.selfMeshId ?? null,
+            meshIdNormalized: this.selfMeshId ?? null,
+            meshIdOriginal: this.selfMeshId ?? null,
+            shortName: null,
+            longName: null,
+            label: this.selfMeshId ?? 'Self'
+          };
+      const autoSummary = {
+        flowId: `auto-${timestampMs}-${Math.random().toString(16).slice(2, 10)}`,
+        type: 'Text',
+        detail: text,
+        channel,
+        timestamp: timestamp.toISOString(),
+        timestampMs,
+        timestampLabel: formatTimestampLabel(timestamp),
+        from: fromEntry,
+        extraLines: [],
+        relay: null,
+        rawHex: Buffer.from(text, 'utf8').toString('hex'),
+        rawLength: Buffer.byteLength(text, 'utf8'),
+        synthetic: true,
+        autoReply: true
+      };
+      this.emit('auto-summary', autoSummary);
     } catch (err) {
       this.emitLog('AUTO', `自動回覆傳送失敗: ${err.message}`);
       throw err;

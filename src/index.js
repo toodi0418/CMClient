@@ -655,56 +655,63 @@ async function startMonitor(argv) {
         webServer?.publishStatus({ status: 'error', message: err.message });
       });
 
-      if (argv.format === 'summary') {
-        client.on('summary', (summary) => {
-          if (!summary) return;
-          bridge.handleMeshtasticSummary(summary);
-          webServer?.publishSummary(summary);
-          tryPublishWebMessage(webServer, summary);
-          if (!headerPrinted) {
-            console.log('Date               | Nodes                      | Relay        | Ch |   SNR | RSSI | Type         | Hops   | Details');
-            console.log('-------------------+---------------------------+--------------+----+-------+------+--------------+--------+------------------------------');
-            headerPrinted = true;
-          }
+  const handleSummary = (summary, { synthetic = false } = {}) => {
+    if (!summary) return;
+    bridge.handleMeshtasticSummary(summary);
+    webServer?.publishSummary(summary);
+    tryPublishWebMessage(webServer, summary);
 
-          const nodesLabel = formatNodes(summary);
-          const relayLabel = computeRelayLabel(summary, { selfMeshId });
-          const relayCol = padEnd(relayLabel, 12);
-          const channelCol = padValue(summary.channel ?? '', 2);
-          const snrCol = formatSignal(summary.snr, 2, 6, summary, { selfMeshId });
-          const rssiCol = formatSignal(summary.rssi, 0, 5, summary, { selfMeshId });
-          const typeCol = String(summary.type || '').padEnd(12);
-          const hopsCol = (summary.hops?.label || '').padEnd(7);
-          const detail = summary.detail || '';
+    if (argv.format !== 'summary') {
+      return;
+    }
 
-          const line = `${summary.timestampLabel.padEnd(19)} | ${nodesLabel.padEnd(27)} | ${relayCol} | ${channelCol} | ${snrCol} | ${rssiCol} | ${typeCol} | ${hopsCol} | ${detail}`;
-          console.log(line.trimEnd());
+    if (!headerPrinted) {
+      console.log('Date               | Nodes                      | Relay        | Ch |   SNR | RSSI | Type         | Hops   | Details');
+      console.log('-------------------+---------------------------+--------------+----+-------+------+--------------+--------+------------------------------');
+      headerPrinted = true;
+    }
 
-          if (argv['show-raw'] && summary.rawHex) {
-            console.log(`  raw: ${summary.rawHex}`);
-          }
+    const nodesLabel = formatNodes(summary);
+    const relayLabel = computeRelayLabel(summary, { selfMeshId });
+    const relayCol = padEnd(relayLabel, 12);
+    const channelCol = padValue(summary.channel ?? '', 2);
+    const snrCol = formatSignal(summary.snr, 2, 6, summary, { selfMeshId });
+    const rssiCol = formatSignal(summary.rssi, 0, 5, summary, { selfMeshId });
+    const typeCol = String(summary.type || '').padEnd(12);
+    const hopsCol = (summary.hops?.label || '').padEnd(7);
+    const detail = summary.detail || '';
 
-          if (Array.isArray(summary.extraLines)) {
-            for (const extra of summary.extraLines) {
-              console.log(`  ${extra}`);
-            }
-          }
-        });
-      } else {
-        client.on('summary', (summary) => {
-          if (!summary) return;
-          bridge.handleMeshtasticSummary(summary);
-          webServer?.publishSummary(summary);
-          tryPublishWebMessage(webServer, summary);
-        });
-        client.on('fromRadio', ({ message }) => {
-          const object = client.toObject(message, {
-            bytes: String
-          });
-          const spacing = argv.pretty ? 2 : 0;
-          console.log(JSON.stringify(object, null, spacing));
-        });
+    const line = `${(summary.timestampLabel ?? '').padEnd(19)} | ${nodesLabel.padEnd(27)} | ${relayCol} | ${channelCol} | ${snrCol} | ${rssiCol} | ${typeCol} | ${hopsCol} | ${detail}`;
+    console.log(line.trimEnd());
+
+    if (argv['show-raw'] && summary.rawHex) {
+      console.log(`  raw: ${summary.rawHex}`);
+    }
+
+    if (Array.isArray(summary.extraLines)) {
+      for (const extra of summary.extraLines) {
+        console.log(`  ${extra}`);
       }
+    }
+  };
+
+  client.on('summary', (summary) => {
+    handleSummary(summary);
+  });
+
+  bridge.on('auto-summary', (summary) => {
+    handleSummary(summary, { synthetic: true });
+  });
+
+  if (argv.format !== 'summary') {
+    client.on('fromRadio', ({ message }) => {
+      const object = client.toObject(message, {
+        bytes: String
+      });
+      const spacing = argv.pretty ? 2 : 0;
+      console.log(JSON.stringify(object, null, spacing));
+    });
+  }
 
       client.on('myInfo', (info) => {
         bridge.handleMeshtasticMyInfo(info);

@@ -1025,7 +1025,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     webServer?.publishStatus(payload);
   });
 
-  client.on('summary', (summary) => {
+  const processSummary = (summary, { synthetic = false } = {}) => {
     if (!summary) return;
     let messageEntry = null;
     try {
@@ -1036,13 +1036,21 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     try {
       messageEntry = persistMessageSummary(summary);
     } catch (err) {
-      console.error('寫入訊息摘要失敗:', err);
+      console.error('寫入訊息紀錄失敗:', err);
     }
     mainWindow?.webContents.send('meshtastic:summary', summary);
     webServer?.publishSummary(summary);
     if (messageEntry) {
       webServer?.publishMessage(messageEntry);
     }
+  };
+
+  client.on('summary', (summary) => {
+    processSummary(summary);
+  });
+
+  bridge?.on('auto-summary', (summary) => {
+    processSummary(summary, { synthetic: true });
   });
 
   client.on('fromRadio', ({ message }) => {
