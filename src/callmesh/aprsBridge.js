@@ -860,14 +860,17 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!this._registerAutoReplyKey(historyKey)) {
       return;
     }
-    const maybePromise = this._sendAutoReply({
-      text: this.autoReplyConfig.response,
-      channel: configuredChannel
-    });
-    if (maybePromise && typeof maybePromise.catch === 'function') {
-      maybePromise.catch(() => {
-        // error already logged inside _sendAutoReply
+    const dispatch = () =>
+      this._sendAutoReplyNow({
+        text: this.autoReplyConfig.response,
+        channel: configuredChannel
+      }).catch(() => {
+        // error already logged inside _sendAutoReplyNow
       });
+    if (AUTO_REPLY_DELAY_MS > 0) {
+      setTimeout(dispatch, AUTO_REPLY_DELAY_MS);
+    } else {
+      dispatch();
     }
   }
 
@@ -914,10 +917,7 @@ class CallMeshAprsBridge extends EventEmitter {
     return null;
   }
 
-  async _sendAutoReply({ text, channel }) {
-    if (AUTO_REPLY_DELAY_MS > 0) {
-      await new Promise((resolve) => setTimeout(resolve, AUTO_REPLY_DELAY_MS));
-    }
+  async _sendAutoReplyNow({ text, channel }) {
     const client = this._getWritableMeshtasticClient();
     if (!client) {
       this.emitLog('AUTO', '沒有可用的 Meshtastic 客戶端可傳送自動回覆');
