@@ -151,6 +151,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
   - `accepted`：已排入送出佇列；
   - `delivered`：成功交給 Meshtastic stack（需後續韌體確認）；
   - `failed`：傳送失敗，會附帶 `error_code`。
+- 傳送時會套用 Mesh 網路預設 hop limit（自動從近期封包推估，若無資料則預設為 3），確保訊息可在網路上續跳。
 
 ### 4.3 可能錯誤碼
 
