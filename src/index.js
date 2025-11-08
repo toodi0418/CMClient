@@ -611,6 +611,7 @@ async function startMonitor(argv) {
     selfMeshId = null;
     const client = new MeshtasticClient(connectionOptions);
     currentClient = client;
+    bridge.attachMeshtasticClient(client);
     webServer?.publishStatus({ status: 'connecting' });
 
     return new Promise((resolve) => {
@@ -618,6 +619,7 @@ async function startMonitor(argv) {
       const cleanup = () => {
         if (settled) return;
         settled = true;
+        bridge.detachMeshtasticClient(client);
         client.removeAllListeners();
         try {
           client.stop();

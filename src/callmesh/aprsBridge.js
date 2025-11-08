@@ -40,6 +40,11 @@ const TENMAN_FORWARD_AUTH_ACTION = 'authenticate';
 const TENMAN_FORWARD_SUPPRESS_ACK = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.TENMAN_SUPPRESS_ACK ?? 'true').trim().toLowerCase()
 );
+const MESHTASTIC_BROADCAST_ADDR = 0xffffffff;
+const AUTO_REPLY_CHANNEL = 2;
+const AUTO_REPLY_TRIGGER = '@cm';
+const AUTO_REPLY_RESPONSE = 'OK';
+const AUTO_REPLY_HISTORY_LIMIT = 256;
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
@@ -234,6 +239,15 @@ class CallMeshAprsBridge extends EventEmitter {
       disabledLogged: false,
       suppressAck: TENMAN_FORWARD_SUPPRESS_ACK
     };
+
+    this.meshtasticClients = new Set();
+    this.autoReplyConfig = {
+      trigger: AUTO_REPLY_TRIGGER.toLowerCase(),
+      response: AUTO_REPLY_RESPONSE,
+      channel: AUTO_REPLY_CHANNEL
+    };
+    this.autoReplyHistory = new Set();
+    this.autoReplyHistoryQueue = [];
 
     this.heartbeatTimer = null;
     this.heartbeatRunning = false;
@@ -792,6 +806,126 @@ class CallMeshAprsBridge extends EventEmitter {
       this.handleAprsSummary(summary);
     }
     this.forwardTenmanPosition(summary);
+    this.handleAutoReplies(summary);
+  }
+
+  attachMeshtasticClient(client) {
+    if (!client || typeof client !== 'object') {
+      return;
+    }
+    this.meshtasticClients.add(client);
+  }
+
+  detachMeshtasticClient(client) {
+    if (!client) {
+      return;
+    }
+    this.meshtasticClients.delete(client);
+  }
+
+  handleAutoReplies(summary) {
+    if (!summary) return;
+    const configuredChannel = this.autoReplyConfig.channel;
+    const channelId = Number(summary.channel);
+    if (!Number.isFinite(channelId) || channelId !== configuredChannel) {
+      return;
+    }
+    const typeLabel = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+    if (typeLabel !== 'text') {
+      return;
+    }
+    const detailRaw = typeof summary.detail === 'string' ? summary.detail.trim() : '';
+    if (!detailRaw) {
+      return;
+    }
+    if (detailRaw.toLowerCase() !== this.autoReplyConfig.trigger) {
+      return;
+    }
+    const fromMesh = normalizeMeshId(
+      summary.from?.meshId ??
+        summary.from?.meshIdNormalized ??
+        summary.from?.meshIdOriginal ??
+        null
+    );
+    if (fromMesh && this.selfMeshId && fromMesh === this.selfMeshId) {
+      return;
+    }
+    const historyKey = this._buildAutoReplyKey(summary, detailRaw, fromMesh);
+    if (!this._registerAutoReplyKey(historyKey)) {
+      return;
+    }
+    const maybePromise = this._sendAutoReply({
+      text: this.autoReplyConfig.response,
+      channel: configuredChannel
+    });
+    if (maybePromise && typeof maybePromise.catch === 'function') {
+      maybePromise.catch(() => {
+        // error already logged inside _sendAutoReply
+      });
+    }
+  }
+
+  _buildAutoReplyKey(summary, detail, fromMesh) {
+    const flowId =
+      typeof summary.flowId === 'string' && summary.flowId.trim() ? summary.flowId.trim() : null;
+    if (flowId) {
+      return `flow:${flowId}`;
+    }
+    const timestamp =
+      Number.isFinite(summary?.timestampMs) && summary.timestampMs > 0
+        ? Number(summary.timestampMs)
+        : summary?.timestamp
+          ? Date.parse(summary.timestamp) || Date.now()
+          : Date.now();
+    return `${fromMesh || 'unknown'}|${detail}|${timestamp}`;
+  }
+
+  _registerAutoReplyKey(key) {
+    if (!key) return false;
+    if (this.autoReplyHistory.has(key)) {
+      return false;
+    }
+    this.autoReplyHistory.add(key);
+    this.autoReplyHistoryQueue.push(key);
+    while (this.autoReplyHistoryQueue.length > AUTO_REPLY_HISTORY_LIMIT) {
+      const oldest = this.autoReplyHistoryQueue.shift();
+      if (oldest) {
+        this.autoReplyHistory.delete(oldest);
+      }
+    }
+    return true;
+  }
+
+  _getWritableMeshtasticClient() {
+    if (!this.meshtasticClients || this.meshtasticClients.size === 0) {
+      return null;
+    }
+    for (const client of this.meshtasticClients) {
+      if (client && typeof client.sendTextMessage === 'function') {
+        return client;
+      }
+    }
+    return null;
+  }
+
+  async _sendAutoReply({ text, channel }) {
+    const client = this._getWritableMeshtasticClient();
+    if (!client) {
+      this.emitLog('AUTO', '沒有可用的 Meshtastic 客戶端可傳送自動回覆');
+      return;
+    }
+    try {
+      await client.sendTextMessage({
+        text,
+        channel,
+        destination: MESHTASTIC_BROADCAST_ADDR,
+        wantAck: false
+      });
+      this.emitLog('AUTO', `已自動回覆「${text}」於 CH${channel}`);
+    } catch (err) {
+      this.emitLog('AUTO', `自動回覆傳送失敗: ${err.message}`);
+      throw err;
+    }
   }
 
   async forwardTenmanPosition(summary) {
@@ -1453,6 +1587,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.stopHeartbeatLoop();
     this.teardownAprsConnection();
     this.flushNodeDatabasePersistSync();
+    this.meshtasticClients.clear();
   }
 
   // Internal helpers

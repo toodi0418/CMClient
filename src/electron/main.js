@@ -664,6 +664,7 @@ async function initialiseApp() {
 
 function cleanupMeshtasticClient() {
   if (client) {
+    bridge?.detachMeshtasticClient(client);
     client.stop();
     client.removeAllListeners();
     client = null;
@@ -1008,6 +1009,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   }
 
   client = new MeshtasticClient(clientOptions);
+  bridge?.attachMeshtasticClient(client);
 
   client.on('connected', () => {
     const payload = { status: 'connected' };

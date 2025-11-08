@@ -101,6 +101,7 @@ class MeshtasticClient extends EventEmitter {
     this._connected = false;
     this._seenPacketKeys = new Map();
     this._packetKeyQueue = [];
+    this._nextPacketId = Math.floor(Math.random() * 0xffffffff);
     this._handleIdleTimeoutBound = null;
     this._currentIdleTimeout = null;
     this._socketClosed = true;
@@ -773,6 +774,9 @@ class MeshtasticClient extends EventEmitter {
     this.fromRadioType = root.lookupType('meshtastic.FromRadio');
     this.toRadioType = root.lookupType('meshtastic.ToRadio');
     this.portEnum = root.lookupEnum('meshtastic.PortNum');
+    this.meshPacketType = root.lookupType('meshtastic.MeshPacket');
+    this.dataType = root.lookupType('meshtastic.Data');
+    this.constantsEnum = root.lookupEnum('meshtastic.Constants');
     this.types = {
       position: root.lookupType('meshtastic.Position'),
       routing: root.lookupType('meshtastic.Routing'),
@@ -1757,6 +1761,74 @@ class MeshtasticClient extends EventEmitter {
       }
     }
     return true;
+  }
+
+  sendTextMessage({ text, channel = 0, destination = BROADCAST_ADDR, wantAck = false } = {}) {
+    if (!this._connected) {
+      return Promise.reject(new Error('Meshtastic 尚未連線'));
+    }
+    if (!this.toRadioType || !this.meshPacketType || !this.dataType || !this.portEnum) {
+      return Promise.reject(new Error('Meshtastic protobuf 尚未載入完成'));
+    }
+    const rawText =
+      typeof text === 'string'
+        ? text
+        : text !== undefined && text !== null
+          ? String(text)
+          : '';
+    if (!rawText) {
+      return Promise.reject(new Error('文字內容不可為空'));
+    }
+    const numericChannel = Number.isFinite(Number(channel)) ? Number(channel) : 0;
+    const targetChannel = Math.max(0, Math.floor(numericChannel));
+    const broadcastAddr = Number.isFinite(destination) ? destination >>> 0 : BROADCAST_ADDR;
+    const payloadBuffer = Buffer.from(rawText, 'utf8');
+    const limitValue =
+      this.constantsEnum?.values?.DATA_PAYLOAD_LEN && Number.isFinite(this.constantsEnum.values.DATA_PAYLOAD_LEN)
+        ? Number(this.constantsEnum.values.DATA_PAYLOAD_LEN)
+        : 233;
+    const maxPayloadLength = Math.max(1, limitValue);
+    let trimmedPayload = payloadBuffer;
+    if (payloadBuffer.length > maxPayloadLength) {
+      trimmedPayload = payloadBuffer.slice(0, maxPayloadLength);
+    }
+    const portValue = this.portEnum?.values?.TEXT_MESSAGE_APP;
+    if (!Number.isFinite(portValue)) {
+      return Promise.reject(new Error('無法取得 TEXT_MESSAGE_APP portnum'));
+    }
+    const packetId = this._generatePacketId();
+    const meshPacketPayload = {
+      to: broadcastAddr,
+      channel: targetChannel >>> 0,
+      decoded: {
+        portnum: portValue,
+        payload: trimmedPayload
+      },
+      wantAck: Boolean(wantAck),
+      id: packetId >>> 0
+    };
+    const message = this.toRadioType.create({
+      packet: meshPacketPayload
+    });
+    const encoded = this.toRadioType.encode(message).finish();
+    const framed = framePacket(encoded);
+    return new Promise((resolve, reject) => {
+      this._writeFrame(framed, (err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(true);
+        }
+      });
+    });
+  }
+
+  _generatePacketId() {
+    this._nextPacketId = (this._nextPacketId + 1) >>> 0;
+    if (this._nextPacketId === 0) {
+      this._nextPacketId = 1;
+    }
+    return this._nextPacketId;
   }
 
   _sendWantConfig() {
