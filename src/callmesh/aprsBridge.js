@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs/promises');
 const fsSync = require('fs');
 const EventEmitter = require('events');
+const crypto = require('crypto');
 const readline = require('readline');
 const { CallMeshClient, buildAgentString } = require('./client');
 const { APRSClient } = require('../aprs/client');
@@ -44,6 +45,7 @@ const TENMAN_FORWARD_VERBOSE_LOG = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.TENMAN_VERBOSE_LOG ?? 'false').trim().toLowerCase()
 );
 const TENMAN_INBOUND_MIN_INTERVAL_MS = 5000;
+const TENMAN_FORWARD_NODE_UPDATE_BUCKET_MS = 30_000;
 const MESHTASTIC_BROADCAST_ADDR = 0xffffffff;
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
@@ -242,7 +244,13 @@ class CallMeshAprsBridge extends EventEmitter {
       gatewayMeshId: null,
       nodeId: null,
       disabledLogged: false,
-      suppressAck: TENMAN_FORWARD_SUPPRESS_ACK
+      suppressAck: TENMAN_FORWARD_SUPPRESS_ACK,
+      nodeSync: {
+        signatures: new Map(),
+        pendingSnapshot: true,
+        pendingSnapshotReason: 'init',
+        lastSnapshotAt: 0
+      }
     };
     this.tenmanInboundState = {
       lastAcceptedAt: 0
@@ -299,6 +307,8 @@ class CallMeshAprsBridge extends EventEmitter {
     const cleared = this.nodeDatabase.clear();
     this.scheduleNodeDatabasePersist();
     this.emitLog('NODE-DB', `cleared node database count=${cleared}`);
+    this.resetTenmanNodeSyncSignatures();
+    this.requestTenmanNodeSnapshot('cleared');
     return {
       cleared,
       nodes: this.nodeDatabase.list()
@@ -323,6 +333,8 @@ class CallMeshAprsBridge extends EventEmitter {
           ? payload
           : [];
       const restored = this.nodeDatabase.replace(entries);
+      this.resetTenmanNodeSyncSignatures();
+      this.requestTenmanNodeSnapshot('restore');
       if (restored.length) {
         this.emitLog('NODE-DB', `restored ${restored.length} nodes from disk`);
       }
@@ -448,6 +460,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     const result = this.nodeDatabase.upsert(normalized, info);
     if (result.changed) {
+      this.forwardTenmanNodeUpdate(result.node);
       const label = buildNodeLabel(result.node);
       const rawId = result.node.meshId || result.node.meshIdOriginal || '';
       const normalizedId = normalizeMeshId(rawId);
@@ -619,6 +632,8 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsLastTelemetryDataAt = 0;
     this.nodeDatabase.clear();
     this.scheduleNodeDatabasePersist();
+    this.resetTenmanNodeSyncSignatures();
+    this.requestTenmanNodeSnapshot('artifacts-cleared');
     await this.clearTelemetryStore({ silent: false });
     this.emitLog('CALLMESH', 'cleared local mapping/provision cache');
     this.updateAprsProvision(null);
@@ -914,20 +929,6 @@ class CallMeshAprsBridge extends EventEmitter {
         return;
       }
 
-      const nodeName = summary?.from?.longName || summary?.from?.shortName || summary?.from?.label || null;
-      const extraPayload = {
-        source: 'TMAG'
-      };
-      if (meshIdNormalized) {
-        extraPayload.mesh_id = meshIdNormalized;
-      }
-      if (summary?.from?.shortName && summary.from.shortName !== nodeName) {
-        extraPayload.short_name = summary.from.shortName;
-      }
-      if (summary?.from?.longName && summary.from.longName !== nodeName) {
-        extraPayload.long_name = summary.from.longName;
-      }
-
       const payload = {
         device_id: deviceId,
         timestamp,
@@ -935,13 +936,17 @@ class CallMeshAprsBridge extends EventEmitter {
         longitude,
         altitude,
         speed,
-        heading
+        heading,
+        source: 'TMAG'
       };
-      if (nodeName) {
-        payload.node_name = nodeName;
+      if (meshIdNormalized) {
+        payload.mesh_id = meshIdNormalized;
       }
-      if (Object.keys(extraPayload).length > 0) {
-        payload.extra = extraPayload;
+      if (summary?.from?.shortName) {
+        payload.short_name = summary.from.shortName;
+      }
+      if (summary?.from?.longName) {
+        payload.long_name = summary.from.longName;
       }
 
       const message = {
@@ -1062,6 +1067,253 @@ class CallMeshAprsBridge extends EventEmitter {
       this.enqueueTenmanPublish(message, dedupeKey);
     } catch (err) {
       this.emitLog('TENMAN', `文字訊息轉發失敗: ${err.message}`);
+    }
+  }
+
+  forwardTenmanNodeSnapshot({ reason = null } = {}) {
+    try {
+      if (!this.isTenmanForwardEnabled()) {
+        return false;
+      }
+      const syncState = this.getTenmanNodeSyncState();
+      if (!syncState) {
+        return false;
+      }
+      const rawNodes =
+        typeof this.nodeDatabase?.list === 'function' ? this.nodeDatabase.list() : [];
+      const nodes = Array.isArray(rawNodes) ? rawNodes : [];
+      const nodePayloads = [];
+      const signatures = new Map();
+      for (const node of nodes) {
+        const payload = this.buildTenmanNodePayload(node);
+        if (!payload) continue;
+        nodePayloads.push(payload);
+        const signature = this.computeTenmanNodeSignature(node);
+        if (signature) {
+          signatures.set(payload.mesh_id, signature);
+        }
+      }
+      const now = new Date();
+      const generatedAt =
+        formatTimestampWithOffset(now, TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES) ?? toIsoString(now);
+      const message = {
+        action: 'node.snapshot',
+        payload: {
+          version: 1,
+          source: 'TMAG',
+          generated_at: generatedAt,
+          total: nodePayloads.length,
+          nodes: nodePayloads
+        }
+      };
+      if (reason) {
+        message.payload.reason = reason;
+      }
+      const queued = this.enqueueTenmanPublish(
+        message,
+        `node:snapshot:${generatedAt ?? now.getTime()}`
+      );
+      if (queued) {
+        syncState.signatures = signatures;
+      }
+      return queued;
+    } catch (err) {
+      this.emitLog('TENMAN', `節點快照同步失敗: ${err.message}`);
+      return false;
+    }
+  }
+
+  forwardTenmanNodeUpdate(node, { reason = null } = {}) {
+    if (!node) {
+      return;
+    }
+    try {
+      if (!this.isTenmanForwardEnabled()) {
+        return;
+      }
+      const payload = this.buildTenmanNodePayload(node);
+      if (!payload) {
+        return;
+      }
+      const signature = this.computeTenmanNodeSignature(node);
+      if (!signature) {
+        return;
+      }
+      const syncState = this.getTenmanNodeSyncState();
+      const previousSignature = syncState.signatures.get(payload.mesh_id);
+      if (previousSignature === signature) {
+        return;
+      }
+      payload.version = 1;
+      payload.source = 'TMAG';
+      const syncedAt =
+        formatTimestampWithOffset(new Date(), TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES) ??
+        toIsoString(Date.now());
+      if (syncedAt) {
+        payload.synced_at = syncedAt;
+      }
+      if (reason) {
+        payload.reason = reason;
+      }
+      const queued = this.enqueueTenmanPublish(
+        {
+          action: 'node.update',
+          payload
+        },
+        `node:update:${payload.mesh_id}:${signature}`
+      );
+      if (queued) {
+        syncState.signatures.set(payload.mesh_id, signature);
+      }
+    } catch (err) {
+      this.emitLog('TENMAN', `節點資料同步失敗: ${err.message}`);
+    }
+  }
+
+  buildTenmanNodePayload(node) {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+    const meshId =
+      normalizeMeshId(node.meshId ?? node.meshIdNormalized ?? node.meshIdOriginal ?? null) || null;
+    if (!meshId) {
+      return null;
+    }
+    const payload = {
+      mesh_id: meshId
+    };
+    const shortName =
+      typeof node.shortName === 'string' && node.shortName.trim()
+        ? node.shortName.trim()
+        : null;
+    if (shortName) {
+      payload.short_name = shortName;
+    }
+    const longName =
+      typeof node.longName === 'string' && node.longName.trim()
+        ? node.longName.trim()
+        : null;
+    if (longName) {
+      payload.long_name = longName;
+    }
+    const lastSeenIso = toIsoString(node.lastSeenAt ?? node.last_seen_at ?? null);
+    if (lastSeenIso) {
+      payload.last_seen_at = lastSeenIso;
+    }
+    const latitude = toFiniteNumber(node.latitude);
+    const longitude = toFiniteNumber(node.longitude);
+    const altitude = toFiniteNumber(node.altitude);
+    if (latitude != null) {
+      payload.latitude = roundTo(latitude, 6);
+    }
+    if (longitude != null) {
+      payload.longitude = roundTo(longitude, 6);
+    }
+    if (altitude != null) {
+      payload.altitude = roundTo(altitude, 2);
+    }
+    return payload;
+  }
+
+  computeTenmanNodeSignature(node) {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+    const meshId =
+      normalizeMeshId(node.meshId ?? node.meshIdNormalized ?? node.meshIdOriginal ?? null) || null;
+    if (!meshId) {
+      return null;
+    }
+    const lastSeenCandidate = node.lastSeenAt ?? node.last_seen_at ?? null;
+    let lastSeenMs = null;
+    if (Number.isFinite(lastSeenCandidate)) {
+      lastSeenMs = Number(lastSeenCandidate);
+    } else if (typeof lastSeenCandidate === 'string' && lastSeenCandidate.trim()) {
+      const parsed = Date.parse(lastSeenCandidate.trim());
+      if (!Number.isNaN(parsed)) {
+        lastSeenMs = parsed;
+      }
+    }
+    const bucket =
+      lastSeenMs != null
+        ? Math.floor(lastSeenMs / TENMAN_FORWARD_NODE_UPDATE_BUCKET_MS)
+        : null;
+    const latitude = toFiniteNumber(node.latitude);
+    const longitude = toFiniteNumber(node.longitude);
+    const altitude = toFiniteNumber(node.altitude);
+    const shortName =
+      typeof node.shortName === 'string' && node.shortName.trim()
+        ? node.shortName.trim()
+        : null;
+    const longName =
+      typeof node.longName === 'string' && node.longName.trim()
+        ? node.longName.trim()
+        : null;
+    const signaturePayload = {
+      meshId,
+      shortName,
+      longName,
+      latitude: latitude != null ? roundTo(latitude, 6) : null,
+      longitude: longitude != null ? roundTo(longitude, 6) : null,
+      altitude: altitude != null ? roundTo(altitude, 2) : null,
+      lastSeenBucket: bucket
+    };
+    try {
+      return crypto.createHash('sha1').update(stableStringify(signaturePayload)).digest('hex');
+    } catch {
+      return null;
+    }
+  }
+
+  getTenmanNodeSyncState() {
+    const state = this.tenmanForwardState;
+    if (!state) {
+      return null;
+    }
+    if (!state.nodeSync) {
+      state.nodeSync = {
+        signatures: new Map(),
+        pendingSnapshot: false,
+        pendingSnapshotReason: null,
+        lastSnapshotAt: 0
+      };
+    }
+    if (!(state.nodeSync.signatures instanceof Map)) {
+      state.nodeSync.signatures = new Map();
+    }
+    return state.nodeSync;
+  }
+
+  resetTenmanNodeSyncSignatures() {
+    const syncState = this.getTenmanNodeSyncState();
+    if (syncState?.signatures instanceof Map) {
+      syncState.signatures.clear();
+    }
+  }
+
+  requestTenmanNodeSnapshot(reason = null) {
+    const syncState = this.getTenmanNodeSyncState();
+    if (!syncState) {
+      return;
+    }
+    syncState.pendingSnapshot = true;
+    if (reason) {
+      syncState.pendingSnapshotReason = reason;
+    }
+    this.queueTenmanNodeSnapshot();
+  }
+
+  queueTenmanNodeSnapshot() {
+    const syncState = this.getTenmanNodeSyncState();
+    if (!syncState?.pendingSnapshot) {
+      return;
+    }
+    const reason = syncState.pendingSnapshotReason || null;
+    const queued = this.forwardTenmanNodeSnapshot({ reason });
+    if (queued) {
+      syncState.pendingSnapshot = false;
+      syncState.pendingSnapshotReason = null;
+      syncState.lastSnapshotAt = Date.now();
     }
   }
 
@@ -1536,6 +1788,8 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     this.tenmanForwardState.disabledLogged = false;
     this.emitLog('TENMAN', 'TenManMap 轉發已啟用');
+    this.resetTenmanNodeSyncSignatures();
+    this.requestTenmanNodeSnapshot('share-enabled');
     this.ensureTenmanWebsocket();
     this.flushTenmanQueue();
     return true;
@@ -1543,14 +1797,14 @@ class CallMeshAprsBridge extends EventEmitter {
 
   enqueueTenmanPublish(message, dedupeKey) {
     if (!message || !dedupeKey) {
-      return;
+      return false;
     }
     if (!this.isTenmanForwardEnabled()) {
-      return;
+      return false;
     }
     const state = this.tenmanForwardState;
     if (!state) {
-      return;
+      return false;
     }
 
     if (!state.pendingKeys) {
@@ -1558,7 +1812,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
 
     if (state.lastKey === dedupeKey || state.pendingKeys.has(dedupeKey)) {
-      return;
+      return false;
     }
 
     if (!Array.isArray(state.queue)) {
@@ -1583,26 +1837,35 @@ class CallMeshAprsBridge extends EventEmitter {
     state.queue.push(entry);
     state.pendingKeys.add(dedupeKey);
 
-    const payload = message?.payload || {};
-    if (message?.action === 'message.publish') {
-      const previewSource = typeof payload.text === 'string' ? payload.text : '';
-      const preview = previewSource.replace(/\s+/g, ' ').slice(0, 64);
-      if (TENMAN_FORWARD_VERBOSE_LOG) {
+    if (TENMAN_FORWARD_VERBOSE_LOG) {
+      const payload = message?.payload || {};
+      if (message?.action === 'message.publish') {
+        const previewSource = typeof payload.text === 'string' ? payload.text : '';
+        const preview = previewSource.replace(/\s+/g, ' ').slice(0, 64);
         this.emitLog(
           'TENMAN',
           `佇列 message.publish channel=${payload.channel ?? ''} text=${preview || '[空白]'}`
         );
-      }
-    } else {
-      const latLog =
-        typeof payload.latitude === 'number'
-          ? payload.latitude.toFixed(6)
-          : String(payload.latitude ?? '');
-      const lonLog =
-        typeof payload.longitude === 'number'
-          ? payload.longitude.toFixed(6)
-          : String(payload.longitude ?? '');
-      if (TENMAN_FORWARD_VERBOSE_LOG) {
+      } else if (message?.action === 'node.update') {
+        this.emitLog(
+          'TENMAN',
+          `佇列 node.update mesh=${payload.mesh_id ?? ''} last_seen=${payload.last_seen_at ?? 'N/A'}`
+        );
+      } else if (message?.action === 'node.snapshot') {
+        const total = Number.isFinite(payload.total) ? payload.total : payload.nodes?.length ?? 0;
+        this.emitLog(
+          'TENMAN',
+          `佇列 node.snapshot total=${total} generated_at=${payload.generated_at ?? 'N/A'}`
+        );
+      } else {
+        const latLog =
+          typeof payload.latitude === 'number'
+            ? payload.latitude.toFixed(6)
+            : String(payload.latitude ?? '');
+        const lonLog =
+          typeof payload.longitude === 'number'
+            ? payload.longitude.toFixed(6)
+            : String(payload.longitude ?? '');
         this.emitLog(
           'TENMAN',
           `佇列 publish device=${payload.device_id ?? ''} lat=${latLog} lon=${lonLog}`
@@ -1612,6 +1875,7 @@ class CallMeshAprsBridge extends EventEmitter {
 
     this.ensureTenmanWebsocket();
     this.flushTenmanQueue();
+    return true;
   }
 
   ensureTenmanWebsocket() {
@@ -1709,7 +1973,7 @@ class CallMeshAprsBridge extends EventEmitter {
       ws.send(entry.serialized, (err) => {
         state.sending = false;
         if (err) {
-          this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+          this.emitLog('TENMAN', `TenManMap 傳送失敗: ${err.message}`);
           this.scheduleTenmanReconnect('send-error');
           this.resetTenmanWebsocket();
           return;
@@ -1722,7 +1986,7 @@ class CallMeshAprsBridge extends EventEmitter {
       });
     } catch (err) {
       state.sending = false;
-      this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+      this.emitLog('TENMAN', `TenManMap 傳送失敗: ${err.message}`);
       this.scheduleTenmanReconnect('exception');
       this.resetTenmanWebsocket();
     }
@@ -1886,6 +2150,8 @@ class CallMeshAprsBridge extends EventEmitter {
         }
         if (nodeId) infoParts.push(`node=${nodeId}`);
         this.emitLog('TENMAN', `驗證通過${infoParts.length ? ` (${infoParts.join(', ')})` : ''}`);
+        this.resetTenmanNodeSyncSignatures();
+        this.requestTenmanNodeSnapshot('auth');
         this.flushTenmanQueue();
       } else {
         state.authenticated = false;
@@ -1905,10 +2171,12 @@ class CallMeshAprsBridge extends EventEmitter {
         state.gatewayId ??
         state.gatewayMeshId ??
         '';
-      this.emitLog(
-        'TENMAN',
-        `收到 ack${action ? ` action=${action}` : ''}${deviceId ? ` device=${deviceId}` : ''}${gatewayId ? ` gateway=${gatewayId}` : ''}`
-      );
+      if (TENMAN_FORWARD_VERBOSE_LOG) {
+        this.emitLog(
+          'TENMAN',
+          `收到 ack${action ? ` action=${action}` : ''}${deviceId ? ` device=${deviceId}` : ''}${gatewayId ? ` gateway=${gatewayId}` : ''}`
+        );
+      }
       return;
     }
 

@@ -42,12 +42,10 @@ TenManMap 目前透過 WebSocket 取得位置封包。本文件說明 `CMClient`
     "altitude": 23.4,
     "speed": 12.5,
     "heading": 270,
-    "node_name": "台北中繼-01",
-    "extra": {
-      "source": "TMAG",
-      "mesh_id": "!abcd1234",
-      "short_name": "TPE1"
-    }
+    "source": "TMAG",
+    "mesh_id": "!abcd1234",
+    "short_name": "TPE1",
+    "long_name": "台北中繼-01"
   }
 }
 ```
@@ -56,14 +54,99 @@ TenManMap 可繼續沿用既有處理流程。
 
 ---
 
-## 3. 上行：Meshtastic → TenManMap 文字訊息
+## 3. 節點資料庫同步（Node Database Sync）
 
-### 3.1 觸發來源
+TenManMap 需要掌握 Mesh 節點的暱稱、硬體資訊與最後出現時間才能補足地圖與訊息來源。`CallMeshAprsBridge`
+會以 `node.snapshot` 與 `node.update` 兩種事件將節點資料庫同步至 TenManMap，並具備排程、去重與節流機制。
+
+### 3.1 節點快照（`node.snapshot`）
+
+- **觸發情境**：
+  - TenManMap 分享開啟或重新開啟；
+  - WebSocket 完成驗證（重新連線後會再次送出全量）；
+  - 啟動時成功還原節點資料庫、或手動清除／重建節點快取；
+  - 呼叫 `clearArtifacts()`（重置 CallMesh 快取）。
+- 每則快照包含當下全部節點，TenManMap 可視為「覆寫」既有節點資料。
+- 佇列仍受 64 筆上限限制，超量時最舊快照會被捨棄並記錄於 `TENMAN` log。
+
+```json
+{
+  "action": "node.snapshot",
+  "payload": {
+    "version": 1,
+    "source": "TMAG",
+    "reason": "auth",                         // 選填：auth / share-enabled / restore / cleared / artifacts-cleared
+    "generated_at": "2025-02-08T15:05:30+08:00",
+    "total": 2,
+    "nodes": [
+      {
+        "mesh_id": "!abcd1234",
+        "short_name": "NODE1",
+        "long_name": "中和測試節點",
+        "last_seen_at": "2025-02-08T07:05:12Z",
+        "latitude": 25.033964,
+        "longitude": 121.564468,
+        "altitude": 23.4
+      },
+      {
+        "mesh_id": "!efef9876",
+        "last_seen_at": "2025-02-08T07:04:01Z"
+      }
+    ]
+  }
+}
+```
+
+> **欄位重點**
+>
+> - `version` / `source`：目前固定 `version=1`、`source="TMAG"`。
+> - `generated_at`：快照產生時間（UTC+8）。
+> - `total`：節點筆數。
+> - `nodes[*]`：包含 `mesh_id`、可用的 `short_name` / `long_name`、`last_seen_at` 與座標（可用時提供）。
+
+### 3.2 節點增量（`node.update`）
+
+- `node.update` 在節點資料變動時送出，例如：
+  - 呼號 / 暱稱、硬體型號、角色變更；
+  - 新增了有效座標；
+  - `last_seen_at` 更新（僅保留 30 秒一桶的最後出現時間，避免淹沒佇列）。
+- 每則更新都帶有 `synced_at`，代表橋接層送出的時間；`reason` 可能出現在特殊情境（與快照相同）。
+- 節點屬性與 `node.snapshot` 相同，範例如下：
+
+```json
+{
+  "action": "node.update",
+  "payload": {
+    "version": 1,
+    "source": "TMAG",
+    "mesh_id": "!abcd1234",
+    "short_name": "NODE1",
+    "long_name": "中和測試節點",
+    "last_seen_at": "2025-02-08T07:06:00Z",
+    "latitude": 25.033964,
+    "longitude": 121.564468,
+    "altitude": 23.4,
+    "synced_at": "2025-02-08T15:06:02+08:00"
+  }
+}
+```
+
+> **節流策略**
+>
+> - 同一節點僅在**資訊實際變更**或 `last_seen_at` 跨越 30 秒桶時才會送出新更新。
+> - 若 TenManMap 在 `synced_at` 前尚未收到對應快照，可直接套用 `node.update` 的內容；收到新的 `node.snapshot`
+>   時建議重新載入整體節點表，避免殘留舊資料。
+
+---
+
+## 4. 上行：Meshtastic → TenManMap 文字訊息
+
+### 4.1 觸發來源
 
 - `MeshtasticClient.summary` 中 `type = "Text"`（含壓縮文字）或 `detail` 為文字內容的封包。
 - 預設涵蓋 CH0~CH3 的廣播訊息；未來若加入點對點或特殊 Port，將在 `payload.scope` 標示。
 
-### 3.2 WebSocket 負載
+### 4.2 WebSocket 負載
 
 ```json
 {
@@ -104,7 +187,7 @@ TenManMap 可繼續沿用既有處理流程。
 }
 ```
 
-### 3.3 拓展注意
+### 4.3 拓展注意
 
 - `scope` 目前僅會傳 `broadcast`，但預留點對點（`directed`）與群組（`group`）。
 - `text` 為 UTF-8，若後續需要傳遞純位元資料，可追加 `encoding: "base64"` 與 `raw_base64` 欄位。
@@ -113,11 +196,11 @@ TenManMap 可繼續沿用既有處理流程。
 
 ---
 
-## 4. 下行：TenManMap → Meshtastic 指令
+## 5. 下行：TenManMap → Meshtastic 指令
 
 TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge` 轉交 Meshtastic。
 
-### 4.1 指令格式
+### 5.1 指令格式
 
 ```json
 {
@@ -135,7 +218,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
 }
 ```
 
-### 4.2 成功回應
+### 5.2 成功回應
 
 ```json
 {
@@ -163,7 +246,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
 - 若仍以 `broadcast` 廣播但希望標示「回覆對象」，可在 `destination` 帶入 Mesh ID；bridge 會保留廣播行為，並在 ACK 加入 `reply_to`。
 - Meshtastic 官方 App 需要 `reply_id` 才會顯示回覆指標。請將原訊息 `message.publish.payload.mesh_packet_id` 回填為 `reply_id`（橋接層也會在 ACK 的 `reply_id` / `mesh_packet_id` 提供）。
 
-### 4.3 可能錯誤碼
+### 5.3 可能錯誤碼
 
 | `error_code`       | 說明                                                   | 常見修正                                         |
 | ------------------ | ------------------------------------------------------ | ------------------------------------------------ |
@@ -176,7 +259,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
 | `INTERNAL_ERROR`   | 其他未捕捉錯誤                                         | 參考 `TENMAN` log，並回報 CallMesh 團隊         |
 | `INVALID_DESTINATION` | `scope=directed` 缺少或填錯 `destination` Mesh ID | 填入 `!` 開頭的 8 位十六進位 Mesh ID             |
 
-### 4.4 節流與排程
+### 5.4 節流與排程
 
 - 佇列採 FIFO，單次傳送完成後才會處理下一筆。
 - 為避免刷屏，預設對 TenManMap 下行訊息套用 **5 秒 1 則** 的節流；後續可調。
@@ -184,7 +267,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
 
 ---
 
-## 5. 啟用與控管
+## 6. 啟用與控管
 
 - CLI / Electron 可透過偏好設定取消 TenManMap 分享：`--no-share-with-tenmanmap`、環境變數 `TENMAN_DISABLE=1` 或 GUI 勾選。
 - 下行功能僅在分享開啟時啟用；若使用者手動停用分享，伺服器會收到 `{"type":"error","action":"send_message","status":"disabled"}`。
@@ -192,7 +275,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
 
 ---
 
-## 6. 驗證步驟建議
+## 7. 驗證步驟建議
 
 1. 使用測試 API Key 連線並驗證成功。
 2. 從 Meshtastic 傳送文本，確認收到 `message.publish` JSON，內容包含 `message_id`。
@@ -205,7 +288,7 @@ TenManMap 可透過同一 WebSocket 送出文字訊息，由 `CallMeshAprsBridge
 
 ---
 
-## 7. 後續延伸
+## 8. 後續延伸
 
 - 若 TenManMap 需要影像或檔案類型，可擴充 `encoding` 與 `payload.kind`。
 - 佇列與節流參數可視實際流量調整。
