@@ -18,6 +18,7 @@ const DEFAULT_MAX_PACKET = 512;
 const BROADCAST_ADDR = 0xffffffff;
 const RELAY_GUESS_EXPLANATION =
   '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
+const FORCED_OUTBOUND_HOP_LIMIT = 6;
 
 function normalizeMeshId(meshId) {
   if (meshId == null) return null;
@@ -69,6 +70,8 @@ class MeshtasticClient extends EventEmitter {
       serialPath: null,
       serialBaudRate: 115200,
       serialOpenOptions: {},
+      initialBacklogSuppressWindowMs: 15_000,
+      initialBacklogSkewAllowanceMs: 5_000,
       ...options
     };
 
@@ -101,12 +104,28 @@ class MeshtasticClient extends EventEmitter {
     this._connected = false;
     this._seenPacketKeys = new Map();
     this._packetKeyQueue = [];
+    this._nextPacketId = Math.floor(Math.random() * 0xffffffff);
     this._handleIdleTimeoutBound = null;
     this._currentIdleTimeout = null;
     this._socketClosed = true;
     this._serialConnectTimer = null;
+    this._initialBacklogFilterActive = false;
+    this._initialBacklogFilterDeadline = null;
 
     this._loadRelayStatsFromDisk();
+  }
+
+  _resetInitialBacklogFilter() {
+    const windowMs = Number.isFinite(this.options.initialBacklogSuppressWindowMs)
+      ? Math.max(0, Number(this.options.initialBacklogSuppressWindowMs))
+      : 0;
+    if (windowMs > 0) {
+      this._initialBacklogFilterActive = true;
+      this._initialBacklogFilterDeadline = Date.now() + windowMs;
+    } else {
+      this._initialBacklogFilterActive = false;
+      this._initialBacklogFilterDeadline = null;
+    }
   }
 
   _shouldIgnoreMeshId(value) {
@@ -773,6 +792,9 @@ class MeshtasticClient extends EventEmitter {
     this.fromRadioType = root.lookupType('meshtastic.FromRadio');
     this.toRadioType = root.lookupType('meshtastic.ToRadio');
     this.portEnum = root.lookupEnum('meshtastic.PortNum');
+    this.meshPacketType = root.lookupType('meshtastic.MeshPacket');
+    this.dataType = root.lookupType('meshtastic.Data');
+    this.constantsEnum = root.lookupEnum('meshtastic.Constants');
     this.types = {
       position: root.lookupType('meshtastic.Position'),
       routing: root.lookupType('meshtastic.Routing'),
@@ -815,6 +837,7 @@ class MeshtasticClient extends EventEmitter {
           this._socket.setTimeout(0);
           this._applySocketOptions();
         }
+        this._resetInitialBacklogFilter();
         this.emit('connected');
         if (this.options.handshake) {
           this._sendWantConfig();
@@ -918,6 +941,7 @@ class MeshtasticClient extends EventEmitter {
       clearSerialTimer();
       this._connected = true;
       this._connectionStartedAt = Date.now();
+      this._resetInitialBacklogFilter();
       this.emit('connected');
       if (this.options.handshake) {
         this._sendWantConfig();
@@ -1031,6 +1055,8 @@ class MeshtasticClient extends EventEmitter {
     this._selfNodeId = null;
     this._selfNodeNormalized = null;
     this._currentIdleTimeout = null;
+    this._initialBacklogFilterActive = false;
+    this._initialBacklogFilterDeadline = null;
     this._clearHeartbeat();
     this.emit('disconnected');
   }
@@ -1159,10 +1185,29 @@ class MeshtasticClient extends EventEmitter {
     if (!packet || packet.payloadVariant !== 'decoded') {
       return null;
     }
-    if (this._connectionStartedAt && packet.rxTime) {
-      const packetTime = packet.rxTime * 1000;
-      if (packetTime <= this._connectionStartedAt) {
-        return null;
+    const packetRxTimeSeconds = Number.isFinite(packet.rxTime) ? Number(packet.rxTime) : null;
+    if (this._initialBacklogFilterActive) {
+      const now = Date.now();
+      if (this._initialBacklogFilterDeadline && now >= this._initialBacklogFilterDeadline) {
+        this._initialBacklogFilterActive = false;
+      }
+    }
+    if (this._initialBacklogFilterActive) {
+      let disableFilter = false;
+      if (this._connectionStartedAt && packetRxTimeSeconds && packetRxTimeSeconds > 0) {
+        const packetTimeMs = packetRxTimeSeconds * 1000;
+        const skewAllowanceMs = Number.isFinite(this.options.initialBacklogSkewAllowanceMs)
+          ? Math.max(0, Number(this.options.initialBacklogSkewAllowanceMs))
+          : 0;
+        if (packetTimeMs + skewAllowanceMs < this._connectionStartedAt) {
+          return null;
+        }
+        disableFilter = true;
+      } else {
+        disableFilter = true;
+      }
+      if (disableFilter) {
+        this._initialBacklogFilterActive = false;
       }
     }
 
@@ -1179,7 +1224,10 @@ class MeshtasticClient extends EventEmitter {
       return null;
     }
 
-    const timestamp = packet.rxTime ? new Date(packet.rxTime * 1000) : new Date();
+    const timestamp =
+      packetRxTimeSeconds && packetRxTimeSeconds > 0
+        ? new Date(packetRxTimeSeconds * 1000)
+        : new Date();
     const fromInfo = this._formatNode(packet.from);
     const toInfo = packet.to === BROADCAST_ADDR ? null : this._formatNode(packet.to);
     const linkMetrics = {
@@ -1276,6 +1324,26 @@ class MeshtasticClient extends EventEmitter {
       fallbackNextHop &&
       (fallbackNextHop.nodeId >>> 0) === selfNumeric;
 
+    const fromMeshCandidate =
+      fromInfo?.meshId ??
+      fromInfo?.meshIdNormalized ??
+      fromInfo?.meshIdOriginal ??
+      packet.from ??
+      null;
+    if (this._shouldIgnoreMeshId(fromMeshCandidate)) {
+      return null;
+    }
+
+    const toMeshCandidate =
+      toInfo?.meshId ??
+      toInfo?.meshIdNormalized ??
+      toInfo?.meshIdOriginal ??
+      (packet.to !== BROADCAST_ADDR ? packet.to : null) ??
+      null;
+    if (this._shouldIgnoreMeshId(toMeshCandidate)) {
+      return null;
+    }
+
     if ((relayMissing || relayMatchesSelf) && fallbackNextHop && !nextHopMatchesSelf && indicatesRelay) {
       const fallbackReason =
         fallbackNextHop.reason ||
@@ -1307,6 +1375,13 @@ class MeshtasticClient extends EventEmitter {
     const rawHex =
       Buffer.isBuffer(payload) && payload.length > 0 ? payload.toString('hex') : null;
 
+    const meshPacketId = Number.isFinite(packet.id) ? packet.id >>> 0 : null;
+    const decoded = packet.decoded || {};
+    const replyId = Number.isFinite(decoded.replyId) ? decoded.replyId >>> 0 : null;
+    const requestId = Number.isFinite(decoded.requestId) ? decoded.requestId >>> 0 : null;
+    const emoji = Number.isFinite(decoded.emoji) ? decoded.emoji >>> 0 : null;
+    const bitfield = Number.isFinite(decoded.bitfield) ? decoded.bitfield >>> 0 : null;
+
     const summary = {
       timestamp: timestamp.toISOString(),
       timestampLabel: formatTimestamp(timestamp),
@@ -1332,6 +1407,11 @@ class MeshtasticClient extends EventEmitter {
       nextHop: nextHopInfo,
       position: decodeInfo?.position || null,
       telemetry: decodeInfo?.telemetry || null,
+      meshPacketId,
+      replyId,
+      requestId,
+      emoji,
+      bitfield,
       rawHex,
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
@@ -1737,6 +1817,97 @@ class MeshtasticClient extends EventEmitter {
       }
     }
     return true;
+  }
+
+  _resolveOutboundHopStart() {
+    return FORCED_OUTBOUND_HOP_LIMIT;
+  }
+
+  sendTextMessage({
+    text,
+    channel = 0,
+    destination = BROADCAST_ADDR,
+    wantAck = false,
+    replyId = null
+  } = {}) {
+    if (!this._connected) {
+      return Promise.reject(new Error('Meshtastic 尚未連線'));
+    }
+    if (!this.toRadioType || !this.meshPacketType || !this.dataType || !this.portEnum) {
+      return Promise.reject(new Error('Meshtastic protobuf 尚未載入完成'));
+    }
+    const rawText =
+      typeof text === 'string'
+        ? text
+        : text !== undefined && text !== null
+          ? String(text)
+          : '';
+    if (!rawText) {
+      return Promise.reject(new Error('文字內容不可為空'));
+    }
+    const numericChannel = Number.isFinite(Number(channel)) ? Number(channel) : 0;
+    const targetChannel = Math.max(0, Math.floor(numericChannel));
+    const broadcastAddr = Number.isFinite(destination) ? destination >>> 0 : BROADCAST_ADDR;
+    const payloadBuffer = Buffer.from(rawText, 'utf8');
+    const limitValue =
+      this.constantsEnum?.values?.DATA_PAYLOAD_LEN && Number.isFinite(this.constantsEnum.values.DATA_PAYLOAD_LEN)
+        ? Number(this.constantsEnum.values.DATA_PAYLOAD_LEN)
+        : 233;
+    const maxPayloadLength = Math.max(1, limitValue);
+    let trimmedPayload = payloadBuffer;
+    if (payloadBuffer.length > maxPayloadLength) {
+      trimmedPayload = payloadBuffer.slice(0, maxPayloadLength);
+    }
+    const portValue = this.portEnum?.values?.TEXT_MESSAGE_APP;
+    if (!Number.isFinite(portValue)) {
+      return Promise.reject(new Error('無法取得 TEXT_MESSAGE_APP portnum'));
+    }
+    const packetId = this._generatePacketId();
+    const meshPacketPayload = {
+      to: broadcastAddr,
+      channel: targetChannel >>> 0,
+      decoded: {
+        portnum: portValue,
+        payload: trimmedPayload
+      },
+      wantAck: Boolean(wantAck),
+      id: packetId >>> 0
+    };
+    const hopStart = this._resolveOutboundHopStart();
+    if (hopStart != null) {
+      meshPacketPayload.hopLimit = hopStart >>> 0;
+      meshPacketPayload.hopStart = hopStart >>> 0;
+    }
+    const replyIdValue = replyId != null ? Number(replyId) : null;
+    const replyIdNumeric = Number.isFinite(replyIdValue) ? replyIdValue >>> 0 : null;
+    if (replyIdNumeric != null) {
+      if (!meshPacketPayload.decoded) {
+        meshPacketPayload.decoded = {};
+      }
+      meshPacketPayload.decoded.replyId = replyIdNumeric;
+    }
+    const message = this.toRadioType.create({
+      packet: meshPacketPayload
+    });
+    const encoded = this.toRadioType.encode(message).finish();
+    const framed = framePacket(encoded);
+    return new Promise((resolve, reject) => {
+      this._writeFrame(framed, (err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(meshPacketPayload.id >>> 0);
+        }
+      });
+    });
+  }
+
+  _generatePacketId() {
+    this._nextPacketId = (this._nextPacketId + 1) >>> 0;
+    if (this._nextPacketId === 0) {
+      this._nextPacketId = 1;
+    }
+    return this._nextPacketId;
   }
 
   _sendWantConfig() {

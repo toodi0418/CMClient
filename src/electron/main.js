@@ -44,6 +44,7 @@ const MESSAGE_MAX_PER_CHANNEL = 200;
 
 const messageStore = new Map();
 let messageWritePromise = Promise.resolve();
+let bridgeSummaryListener = null;
 
 function getMessageLogPath() {
   return path.join(getCallMeshDataDir(), MESSAGE_LOG_FILENAME);
@@ -108,7 +109,12 @@ function sanitizeMessageSummary(summary) {
       typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
         ? summary.timestampLabel.trim()
         : new Date(timestampMs).toISOString(),
-    flowId: flowIdRaw
+    flowId: flowIdRaw,
+    meshPacketId: Number.isFinite(summary.meshPacketId) ? Number(summary.meshPacketId) : null,
+    replyId: Number.isFinite(summary.replyId) ? Number(summary.replyId) : null,
+    replyTo: typeof summary.replyTo === 'string' ? summary.replyTo : null,
+    scope: typeof summary.scope === 'string' ? summary.scope : null,
+    synthetic: Boolean(summary.synthetic)
   };
 }
 
@@ -663,7 +669,12 @@ async function initialiseApp() {
 }
 
 function cleanupMeshtasticClient() {
+  if (bridgeSummaryListener && bridge && typeof bridge.removeListener === 'function') {
+    bridge.removeListener('summary', bridgeSummaryListener);
+    bridgeSummaryListener = null;
+  }
   if (client) {
+    bridge?.detachMeshtasticClient(client);
     client.stop();
     client.removeAllListeners();
     client = null;
@@ -1008,6 +1019,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   }
 
   client = new MeshtasticClient(clientOptions);
+  bridge?.attachMeshtasticClient(client);
 
   client.on('connected', () => {
     const payload = { status: 'connected' };
@@ -1023,24 +1035,40 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     webServer?.publishStatus(payload);
   });
 
-  client.on('summary', (summary) => {
+  const processSummary = (summary, { synthetic = false } = {}) => {
     if (!summary) return;
     let messageEntry = null;
     try {
-      bridge?.handleMeshtasticSummary(summary);
+      if (!synthetic) {
+        bridge?.handleMeshtasticSummary(summary);
+      }
     } catch (err) {
       console.error('處理 APRS Summary 時發生錯誤:', err);
     }
     try {
       messageEntry = persistMessageSummary(summary);
     } catch (err) {
-      console.error('寫入訊息摘要失敗:', err);
+      console.error('寫入訊息紀錄失敗:', err);
     }
     mainWindow?.webContents.send('meshtastic:summary', summary);
     webServer?.publishSummary(summary);
     if (messageEntry) {
       webServer?.publishMessage(messageEntry);
     }
+  };
+
+  if (bridge && typeof bridge.on === 'function') {
+    if (bridgeSummaryListener && typeof bridge.removeListener === 'function') {
+      bridge.removeListener('summary', bridgeSummaryListener);
+    }
+    bridgeSummaryListener = (summary) => {
+      processSummary(summary, { synthetic: true });
+    };
+    bridge.on('summary', bridgeSummaryListener);
+  }
+
+  client.on('summary', (summary) => {
+    processSummary(summary);
   });
 
   client.on('fromRadio', ({ message }) => {

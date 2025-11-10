@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs/promises');
 const fsSync = require('fs');
 const EventEmitter = require('events');
+const crypto = require('crypto');
 const readline = require('readline');
 const { CallMeshClient, buildAgentString } = require('./client');
 const { APRSClient } = require('../aprs/client');
@@ -37,8 +38,22 @@ const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
 const TENMAN_FORWARD_QUEUE_LIMIT = 64;
 const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
 const TENMAN_FORWARD_AUTH_ACTION = 'authenticate';
+const TENMAN_FORWARD_SUPPRESS_ACK = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.TENMAN_SUPPRESS_ACK ?? 'true').trim().toLowerCase()
+);
+const TENMAN_FORWARD_VERBOSE_LOG = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.TENMAN_VERBOSE_LOG ?? 'false').trim().toLowerCase()
+);
+const TENMAN_INBOUND_MIN_INTERVAL_MS = 5000;
+const TENMAN_FORWARD_NODE_UPDATE_BUCKET_MS = 30_000;
+const MESHTASTIC_BROADCAST_ADDR = 0xffffffff;
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
+
+function formatTimestampLabel(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
 
 function extractEnumBlock(source, enumName) {
   const enumIndex = source.indexOf(`enum ${enumName}`);
@@ -226,9 +241,22 @@ class CallMeshAprsBridge extends EventEmitter {
       authenticating: false,
       missingApiKeyWarned: false,
       gatewayId: null,
+      gatewayMeshId: null,
       nodeId: null,
-      disabledLogged: false
+      disabledLogged: false,
+      suppressAck: TENMAN_FORWARD_SUPPRESS_ACK,
+      nodeSync: {
+        signatures: new Map(),
+        pendingSnapshot: true,
+        pendingSnapshotReason: 'init',
+        lastSnapshotAt: 0
+      }
     };
+    this.tenmanInboundState = {
+      lastAcceptedAt: 0
+    };
+
+    this.meshtasticClients = new Set();
 
     this.heartbeatTimer = null;
     this.heartbeatRunning = false;
@@ -279,6 +307,8 @@ class CallMeshAprsBridge extends EventEmitter {
     const cleared = this.nodeDatabase.clear();
     this.scheduleNodeDatabasePersist();
     this.emitLog('NODE-DB', `cleared node database count=${cleared}`);
+    this.resetTenmanNodeSyncSignatures();
+    this.requestTenmanNodeSnapshot('cleared');
     return {
       cleared,
       nodes: this.nodeDatabase.list()
@@ -303,6 +333,8 @@ class CallMeshAprsBridge extends EventEmitter {
           ? payload
           : [];
       const restored = this.nodeDatabase.replace(entries);
+      this.resetTenmanNodeSyncSignatures();
+      this.requestTenmanNodeSnapshot('restore');
       if (restored.length) {
         this.emitLog('NODE-DB', `restored ${restored.length} nodes from disk`);
       }
@@ -428,6 +460,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     const result = this.nodeDatabase.upsert(normalized, info);
     if (result.changed) {
+      this.forwardTenmanNodeUpdate(result.node);
       const label = buildNodeLabel(result.node);
       const rawId = result.node.meshId || result.node.meshIdOriginal || '';
       const normalizedId = normalizeMeshId(rawId);
@@ -599,6 +632,8 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsLastTelemetryDataAt = 0;
     this.nodeDatabase.clear();
     this.scheduleNodeDatabasePersist();
+    this.resetTenmanNodeSyncSignatures();
+    this.requestTenmanNodeSnapshot('artifacts-cleared');
     await this.clearTelemetryStore({ silent: false });
     this.emitLog('CALLMESH', 'cleared local mapping/provision cache');
     this.updateAprsProvision(null);
@@ -787,6 +822,33 @@ class CallMeshAprsBridge extends EventEmitter {
       this.handleAprsSummary(summary);
     }
     this.forwardTenmanPosition(summary);
+    this.forwardTenmanMessage(summary);
+  }
+
+  attachMeshtasticClient(client) {
+    if (!client || typeof client !== 'object') {
+      return;
+    }
+    this.meshtasticClients.add(client);
+  }
+
+  detachMeshtasticClient(client) {
+    if (!client) {
+      return;
+    }
+    this.meshtasticClients.delete(client);
+  }
+
+  _getWritableMeshtasticClient() {
+    if (!this.meshtasticClients || this.meshtasticClients.size === 0) {
+      return null;
+    }
+    for (const client of this.meshtasticClients) {
+      if (client && typeof client.sendTextMessage === 'function') {
+        return client;
+      }
+    }
+    return null;
   }
 
   async forwardTenmanPosition(summary) {
@@ -853,7 +915,12 @@ class CallMeshAprsBridge extends EventEmitter {
         state.missingApiKeyWarned = false;
       }
 
-      const deviceId = meshIdNormalized || state.gatewayId || 'unknown';
+      const deviceId =
+        meshIdNormalized ||
+        state.gatewayMeshId ||
+        state.gatewayId ||
+        state.nodeId ||
+        'unknown';
       const dedupeKey = `${deviceId}:${timestamp}:${latitude.toFixed(6)}:${longitude.toFixed(6)}`;
       if (
         this.tenmanForwardState.lastKey === dedupeKey ||
@@ -862,13 +929,13 @@ class CallMeshAprsBridge extends EventEmitter {
         return;
       }
 
-      const nodeName = summary?.from?.longName || summary?.from?.shortName || summary?.from?.label || null;
+      const nodeName =
+        summary?.from?.longName || summary?.from?.shortName || summary?.from?.label || null;
       const extraPayload = {
-        source: 'TMAG',
-        mesh_id: meshIdNormalized
+        source: 'TMAG'
       };
-      if (nodeName) {
-        extraPayload.node_name = nodeName;
+      if (meshIdNormalized) {
+        extraPayload.mesh_id = meshIdNormalized;
       }
       if (summary?.from?.shortName && summary.from.shortName !== nodeName) {
         extraPayload.short_name = summary.from.shortName;
@@ -884,9 +951,14 @@ class CallMeshAprsBridge extends EventEmitter {
         longitude,
         altitude,
         speed,
-        heading,
-        extra: extraPayload
+        heading
       };
+      if (nodeName) {
+        payload.node_name = nodeName;
+      }
+      if (Object.keys(extraPayload).length > 0) {
+        payload.extra = extraPayload;
+      }
 
       const message = {
         action: 'publish',
@@ -896,6 +968,867 @@ class CallMeshAprsBridge extends EventEmitter {
       this.enqueueTenmanPublish(message, dedupeKey);
     } catch (err) {
       this.emitLog('TENMAN', `位置回報處理失敗: ${err.message}`);
+    }
+  }
+
+  forwardTenmanMessage(summary) {
+    if (!summary) {
+      return;
+    }
+
+    try {
+      const state = this.tenmanForwardState;
+      if (!this.isTenmanForwardEnabled()) {
+        if (state && !state.disabledLogged) {
+          state.disabledLogged = true;
+          this.emitLog('TENMAN', 'TenManMap 轉發已停用');
+        }
+        return;
+      }
+      if (state) {
+        state.disabledLogged = false;
+      }
+
+      const typeLabel = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+      if (!typeLabel || !typeLabel.includes('text')) {
+        return;
+      }
+      const text =
+        typeof summary.detail === 'string'
+          ? summary.detail
+          : summary.detail != null
+            ? String(summary.detail)
+            : '';
+      if (!text) {
+        return;
+      }
+
+      const messageId =
+        typeof summary.flowId === 'string' && summary.flowId.trim()
+          ? summary.flowId.trim()
+          : `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      const timestampSource =
+        summary.timestamp ??
+        (Number.isFinite(summary.timestampMs) ? new Date(Number(summary.timestampMs)).toISOString() : null) ??
+        new Date().toISOString();
+      const receivedAt = formatTimestampWithOffset(
+        timestampSource,
+        TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES
+      );
+      const channel = Number.isFinite(Number(summary.channel)) ? Number(summary.channel) : 0;
+      const scope = summary?.to ? 'directed' : 'broadcast';
+
+      const payload = {
+        message_id: messageId,
+        channel,
+        text,
+        encoding: 'utf-8',
+        scope
+      };
+      if (receivedAt) {
+        payload.received_at = receivedAt;
+      }
+      if (Number.isFinite(summary.meshPacketId)) {
+        payload.mesh_packet_id = Number(summary.meshPacketId) >>> 0;
+      }
+      if (Number.isFinite(summary.replyId)) {
+        payload.reply_id = Number(summary.replyId) >>> 0;
+      }
+
+      const fromDescriptor = this.buildTenmanNodeDescriptor(summary.from);
+      if (fromDescriptor) {
+        payload.from = fromDescriptor;
+      }
+      const toDescriptor = this.buildTenmanNodeDescriptor(summary.to);
+      if (toDescriptor) {
+        payload.to = toDescriptor;
+      }
+      const relayDescriptor = this.buildTenmanRelayDescriptor(summary);
+      if (relayDescriptor) {
+        payload.relay = relayDescriptor;
+      }
+      const hopsDescriptor = this.buildTenmanHopsDescriptor(summary?.hops);
+      if (hopsDescriptor) {
+        payload.hops = hopsDescriptor;
+      }
+      if (Number.isFinite(summary.rssi)) {
+        payload.rssi = Number(summary.rssi);
+      }
+      if (Number.isFinite(summary.snr)) {
+        payload.snr = Number(summary.snr);
+      }
+      if (Array.isArray(summary.extraLines) && summary.extraLines.length > 0) {
+        payload.extra_lines = summary.extraLines;
+      }
+      if (summary.rawHex) {
+        payload.raw_hex = summary.rawHex;
+      }
+      const rawLength = Number.isFinite(summary.rawLength)
+        ? Number(summary.rawLength)
+        : Buffer.byteLength(text, 'utf8');
+      if (Number.isFinite(rawLength) && rawLength >= 0) {
+        payload.raw_length = rawLength;
+      }
+
+      const dedupeKey = `msg:${messageId}`;
+      const message = {
+        action: 'message.publish',
+        payload
+      };
+      this.enqueueTenmanPublish(message, dedupeKey);
+    } catch (err) {
+      this.emitLog('TENMAN', `文字訊息轉發失敗: ${err.message}`);
+    }
+  }
+
+  forwardTenmanNodeSnapshot({ reason = null } = {}) {
+    try {
+      if (!this.isTenmanForwardEnabled()) {
+        return false;
+      }
+      const syncState = this.getTenmanNodeSyncState();
+      if (!syncState) {
+        return false;
+      }
+      const rawNodes =
+        typeof this.nodeDatabase?.list === 'function' ? this.nodeDatabase.list() : [];
+      const nodes = Array.isArray(rawNodes) ? rawNodes : [];
+      const nodePayloads = [];
+      const signatures = new Map();
+      for (const node of nodes) {
+        const payload = this.buildTenmanNodePayload(node);
+        if (!payload) continue;
+        nodePayloads.push(payload);
+        const signature = this.computeTenmanNodeSignature(node);
+        if (signature) {
+          signatures.set(payload.mesh_id, signature);
+        }
+      }
+      const now = new Date();
+      const generatedAt =
+        formatTimestampWithOffset(now, TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES) ?? toIsoString(now);
+      const message = {
+        action: 'node.snapshot',
+        payload: {
+          version: 1,
+          source: 'TMAG',
+          generated_at: generatedAt,
+          total: nodePayloads.length,
+          nodes: nodePayloads
+        }
+      };
+      if (reason) {
+        message.payload.reason = reason;
+      }
+      const queued = this.enqueueTenmanPublish(
+        message,
+        `node:snapshot:${generatedAt ?? now.getTime()}`
+      );
+      if (queued) {
+        syncState.signatures = signatures;
+      }
+      return queued;
+    } catch (err) {
+      this.emitLog('TENMAN', `節點快照同步失敗: ${err.message}`);
+      return false;
+    }
+  }
+
+  forwardTenmanNodeUpdate(node, { reason = null } = {}) {
+    if (!node) {
+      return;
+    }
+    try {
+      if (!this.isTenmanForwardEnabled()) {
+        return;
+      }
+      const payload = this.buildTenmanNodePayload(node);
+      if (!payload) {
+        return;
+      }
+      const signature = this.computeTenmanNodeSignature(node);
+      if (!signature) {
+        return;
+      }
+      const syncState = this.getTenmanNodeSyncState();
+      const previousSignature = syncState.signatures.get(payload.mesh_id);
+      if (previousSignature === signature) {
+        return;
+      }
+      payload.version = 1;
+      payload.source = 'TMAG';
+      const syncedAt =
+        formatTimestampWithOffset(new Date(), TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES) ??
+        toIsoString(Date.now());
+      if (syncedAt) {
+        payload.synced_at = syncedAt;
+      }
+      if (reason) {
+        payload.reason = reason;
+      }
+      const queued = this.enqueueTenmanPublish(
+        {
+          action: 'node.update',
+          payload
+        },
+        `node:update:${payload.mesh_id}:${signature}`
+      );
+      if (queued) {
+        syncState.signatures.set(payload.mesh_id, signature);
+      }
+    } catch (err) {
+      this.emitLog('TENMAN', `節點資料同步失敗: ${err.message}`);
+    }
+  }
+
+  buildTenmanNodePayload(node) {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+    const meshId =
+      normalizeMeshId(node.meshId ?? node.meshIdNormalized ?? node.meshIdOriginal ?? null) || null;
+    if (!meshId) {
+      return null;
+    }
+    const payload = {
+      mesh_id: meshId
+    };
+    const original =
+      typeof node.meshIdOriginal === 'string' && node.meshIdOriginal.trim()
+        ? node.meshIdOriginal.trim()
+        : null;
+    if (original && original !== meshId) {
+      payload.mesh_id_original = original;
+    }
+    const shortName =
+      typeof node.shortName === 'string' && node.shortName.trim()
+        ? node.shortName.trim()
+        : null;
+    if (shortName) {
+      payload.short_name = shortName;
+    }
+    const longName =
+      typeof node.longName === 'string' && node.longName.trim()
+        ? node.longName.trim()
+        : null;
+    const hwModel =
+      node.hwModel != null && String(node.hwModel).trim() ? String(node.hwModel).trim() : null;
+    const hwModelLabel =
+      node.hwModelLabel != null && String(node.hwModelLabel).trim()
+        ? String(node.hwModelLabel).trim()
+        : null;
+    const role =
+      node.role != null && String(node.role).trim() ? String(node.role).trim() : null;
+    const roleLabel =
+      node.roleLabel != null && String(node.roleLabel).trim()
+        ? String(node.roleLabel).trim()
+        : null;
+    if (longName) {
+      payload.long_name = longName;
+    }
+    if (hwModel) {
+      payload.hw_model = hwModel;
+    }
+    if (hwModelLabel) {
+      payload.hw_model_label = hwModelLabel;
+    }
+    if (role) {
+      payload.role = role;
+    }
+    if (roleLabel) {
+      payload.role_label = roleLabel;
+    }
+    const lastSeenIso = toIsoString(node.lastSeenAt ?? node.last_seen_at ?? null);
+    if (lastSeenIso) {
+      payload.last_seen_at = lastSeenIso;
+    }
+    const latitude = toFiniteNumber(node.latitude);
+    const longitude = toFiniteNumber(node.longitude);
+    const altitude = toFiniteNumber(node.altitude);
+    if (latitude != null) {
+      payload.latitude = roundTo(latitude, 6);
+    }
+    if (longitude != null) {
+      payload.longitude = roundTo(longitude, 6);
+    }
+    if (altitude != null) {
+      payload.altitude = roundTo(altitude, 2);
+    }
+    const labelCandidate = buildNodeLabel(node);
+    const label = typeof labelCandidate === 'string' ? labelCandidate.trim() : '';
+    if (label) {
+      payload.label = label;
+    }
+    return payload;
+  }
+
+  computeTenmanNodeSignature(node) {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+    const meshId =
+      normalizeMeshId(node.meshId ?? node.meshIdNormalized ?? node.meshIdOriginal ?? null) || null;
+    if (!meshId) {
+      return null;
+    }
+    const original =
+      typeof node.meshIdOriginal === 'string' && node.meshIdOriginal.trim()
+        ? node.meshIdOriginal.trim()
+        : null;
+    const lastSeenCandidate = node.lastSeenAt ?? node.last_seen_at ?? null;
+    let lastSeenMs = null;
+    if (Number.isFinite(lastSeenCandidate)) {
+      lastSeenMs = Number(lastSeenCandidate);
+    } else if (typeof lastSeenCandidate === 'string' && lastSeenCandidate.trim()) {
+      const parsed = Date.parse(lastSeenCandidate.trim());
+      if (!Number.isNaN(parsed)) {
+        lastSeenMs = parsed;
+      }
+    }
+    const bucket =
+      lastSeenMs != null
+        ? Math.floor(lastSeenMs / TENMAN_FORWARD_NODE_UPDATE_BUCKET_MS)
+        : null;
+    const latitude = toFiniteNumber(node.latitude);
+    const longitude = toFiniteNumber(node.longitude);
+    const altitude = toFiniteNumber(node.altitude);
+    const shortName =
+      typeof node.shortName === 'string' && node.shortName.trim()
+        ? node.shortName.trim()
+        : null;
+    const longName =
+      typeof node.longName === 'string' && node.longName.trim()
+        ? node.longName.trim()
+        : null;
+    const hwModel =
+      node.hwModel != null && String(node.hwModel).trim() ? String(node.hwModel).trim() : null;
+    const hwModelLabel =
+      node.hwModelLabel != null && String(node.hwModelLabel).trim()
+        ? String(node.hwModelLabel).trim()
+        : null;
+    const role =
+      node.role != null && String(node.role).trim() ? String(node.role).trim() : null;
+    const roleLabel =
+      node.roleLabel != null && String(node.roleLabel).trim()
+        ? String(node.roleLabel).trim()
+        : null;
+    const signaturePayload = {
+      meshId,
+      meshIdOriginal: original,
+      shortName,
+      longName,
+      hwModel,
+      hwModelLabel,
+      role,
+      roleLabel,
+      latitude: latitude != null ? roundTo(latitude, 6) : null,
+      longitude: longitude != null ? roundTo(longitude, 6) : null,
+      altitude: altitude != null ? roundTo(altitude, 2) : null,
+      lastSeenBucket: bucket
+    };
+    try {
+      return crypto.createHash('sha1').update(stableStringify(signaturePayload)).digest('hex');
+    } catch {
+      return null;
+    }
+  }
+
+  getTenmanNodeSyncState() {
+    const state = this.tenmanForwardState;
+    if (!state) {
+      return null;
+    }
+    if (!state.nodeSync) {
+      state.nodeSync = {
+        signatures: new Map(),
+        pendingSnapshot: false,
+        pendingSnapshotReason: null,
+        lastSnapshotAt: 0
+      };
+    }
+    if (!(state.nodeSync.signatures instanceof Map)) {
+      state.nodeSync.signatures = new Map();
+    }
+    return state.nodeSync;
+  }
+
+  resetTenmanNodeSyncSignatures() {
+    const syncState = this.getTenmanNodeSyncState();
+    if (syncState?.signatures instanceof Map) {
+      syncState.signatures.clear();
+    }
+  }
+
+  requestTenmanNodeSnapshot(reason = null) {
+    const syncState = this.getTenmanNodeSyncState();
+    if (!syncState) {
+      return;
+    }
+    syncState.pendingSnapshot = true;
+    if (reason) {
+      syncState.pendingSnapshotReason = reason;
+    }
+    this.queueTenmanNodeSnapshot();
+  }
+
+  queueTenmanNodeSnapshot() {
+    const syncState = this.getTenmanNodeSyncState();
+    if (!syncState?.pendingSnapshot) {
+      return;
+    }
+    const reason = syncState.pendingSnapshotReason || null;
+    const queued = this.forwardTenmanNodeSnapshot({ reason });
+    if (queued) {
+      syncState.pendingSnapshot = false;
+      syncState.pendingSnapshotReason = null;
+      syncState.lastSnapshotAt = Date.now();
+    }
+  }
+
+  buildTenmanNodeDescriptor(node) {
+    if (!node || typeof node !== 'object') {
+      return null;
+    }
+    const meshIdCandidate =
+      node.meshId ?? node.meshIdNormalized ?? node.mesh_id ?? node.meshIdOriginal ?? null;
+    const meshIdNormalized = normalizeMeshId(meshIdCandidate);
+    const descriptor = {};
+    if (meshIdNormalized) {
+      descriptor.mesh_id = meshIdNormalized;
+    }
+    const meshIdOriginal =
+      node.meshIdOriginal && typeof node.meshIdOriginal === 'string'
+        ? node.meshIdOriginal
+        : meshIdCandidate && meshIdCandidate !== meshIdNormalized
+          ? meshIdCandidate
+          : null;
+    if (meshIdOriginal && meshIdOriginal !== meshIdNormalized) {
+      descriptor.mesh_id_original = meshIdOriginal;
+    }
+
+    const registry =
+      meshIdNormalized && this.nodeDatabase
+        ? this.nodeDatabase.get(meshIdNormalized)
+        : null;
+    const shortName =
+      node.shortName ??
+      node.short_name ??
+      registry?.shortName ??
+      null;
+    if (shortName) {
+      descriptor.short_name = shortName;
+    }
+    const longName =
+      node.longName ??
+      node.long_name ??
+      registry?.longName ??
+      null;
+    if (longName) {
+      descriptor.long_name = longName;
+    }
+    const lastSeenCandidate =
+      node.lastSeenAt ??
+      node.last_seen_at ??
+      registry?.lastSeenAt ??
+      null;
+    const lastSeenIso = toIsoString(lastSeenCandidate);
+    if (lastSeenIso) {
+      descriptor.last_seen_at = lastSeenIso;
+    }
+    if (Number.isFinite(node.raw)) {
+      descriptor.raw = Number(node.raw);
+    }
+    return Object.keys(descriptor).length > 0 ? descriptor : null;
+  }
+
+  buildTenmanRelayDescriptor(summary) {
+    const relay = summary?.relay;
+    const descriptor = relay ? this.buildTenmanNodeDescriptor(relay) : null;
+    const payload = descriptor ? { ...descriptor } : {};
+    const guessed =
+      relay?.guessed ??
+      summary?.relayGuess ??
+      null;
+    if (guessed != null) {
+      payload.guessed = Boolean(guessed);
+    }
+    const reason = relay?.reason ?? summary?.relayGuessReason ?? null;
+    if (reason) {
+      payload.reason = String(reason);
+    }
+    return Object.keys(payload).length > 0 ? payload : null;
+  }
+
+  buildTenmanHopsDescriptor(hops) {
+    if (!hops || typeof hops !== 'object') {
+      return null;
+    }
+    const payload = {};
+    const start = Number.isFinite(hops.start) ? Number(hops.start) : null;
+    const limit = Number.isFinite(hops.limit) ? Number(hops.limit) : null;
+    if (start != null) {
+      payload.start = start;
+    }
+    if (limit != null) {
+      payload.limit = limit;
+    }
+    if (start != null && limit != null) {
+      payload.used = Math.max(start - limit, 0);
+    } else if (start != null && limit == null) {
+      payload.used = 0;
+    }
+    const label = typeof hops.label === 'string' ? hops.label.trim() : '';
+    if (label) {
+      payload.label = label;
+    }
+    return Object.keys(payload).length > 0 ? payload : null;
+  }
+
+  buildSummaryNodeForMesh(meshId, { fallbackLabel = null } = {}) {
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) {
+      if (!fallbackLabel) {
+        return null;
+      }
+      return {
+        label: fallbackLabel,
+        meshId: null,
+        meshIdNormalized: null,
+        meshIdOriginal: null,
+        shortName: null,
+        longName: null,
+        raw: null
+      };
+    }
+    const registry = this.nodeDatabase?.get(normalized) || null;
+    const shortName = registry?.shortName ?? null;
+    const longName = registry?.longName ?? null;
+    const name = longName || shortName || null;
+    const label = name ? `${name} (${normalized})` : normalized;
+    const raw = meshIdToUint32(normalized);
+    const node = {
+      label,
+      meshId: normalized,
+      meshIdNormalized: normalized,
+      meshIdOriginal: registry?.meshIdOriginal ?? null,
+      shortName,
+      longName,
+      hwModel: registry?.hwModel ?? null,
+      role: registry?.role ?? null,
+      raw: Number.isFinite(raw) ? raw >>> 0 : null
+    };
+    if (registry?.hwModelLabel) {
+      node.hwModelLabel = registry.hwModelLabel;
+    }
+    if (registry?.roleLabel) {
+      node.roleLabel = registry.roleLabel;
+    }
+    if (registry?.lastSeenAt) {
+      node.lastSeenAt = registry.lastSeenAt;
+    }
+    return node;
+  }
+
+  emitTenmanSyntheticSummary({
+    text,
+    channel,
+    flowId,
+    meshPacketId,
+    scope,
+    replyTo,
+    replyId,
+    meshDestination
+  }) {
+    const timestampMs = Date.now();
+    const timestamp = new Date(timestampMs);
+    const fromNode =
+      this.buildSummaryNodeForMesh(this.selfMeshId, { fallbackLabel: '本機節點' }) ||
+      {
+        label: '本機節點',
+        meshId: this.selfMeshId || null,
+        meshIdNormalized: this.selfMeshId || null,
+        meshIdOriginal: this.selfMeshId || null,
+        shortName: null,
+        longName: null,
+        raw: meshIdToUint32(this.selfMeshId)
+      };
+    let toNode = null;
+    if (scope === 'directed' && meshDestination && meshDestination !== 'broadcast') {
+      toNode =
+        this.buildSummaryNodeForMesh(meshDestination) ||
+        {
+          label: meshDestination,
+          meshId: meshDestination,
+          meshIdNormalized: meshDestination,
+          meshIdOriginal: meshDestination,
+          shortName: null,
+          longName: null,
+          raw: meshIdToUint32(meshDestination)
+        };
+    }
+    const safeText = typeof text === 'string' ? text : text != null ? String(text) : '';
+    const buffer = Buffer.from(safeText, 'utf8');
+    const summary = {
+      type: 'Text',
+      detail: safeText,
+      channel,
+      timestamp: timestamp.toISOString(),
+      timestampLabel: formatTimestampLabel(timestamp),
+      timestampMs,
+      from: fromNode,
+      to: toNode,
+      relay: null,
+      hops: null,
+      snr: null,
+      rssi: null,
+      meshPacketId: Number.isFinite(meshPacketId) ? meshPacketId >>> 0 : null,
+      replyId: Number.isFinite(replyId) ? replyId >>> 0 : null,
+      replyTo: replyTo || null,
+      flowId,
+      scope,
+      synthetic: true,
+      rawHex: buffer.length > 0 ? buffer.toString('hex') : null,
+      rawLength: buffer.length,
+      extraLines: []
+    };
+    if (scope === 'broadcast' && replyTo) {
+      summary.extraLines.push(`回覆對象: ${replyTo}`);
+    }
+    this.emit('summary', summary);
+  }
+
+  sendTenmanControlMessage(message) {
+    const state = this.tenmanForwardState;
+    if (!state || !state.websocket || state.websocket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      const serialized = JSON.stringify(message);
+      state.websocket.send(serialized);
+      return true;
+    } catch (err) {
+      this.emitLog('TENMAN', `控制訊息傳送失敗: ${err.message}`);
+      return false;
+    }
+  }
+
+  sendTenmanAck(action, details = {}) {
+    const message = {
+      type: 'ack',
+      action,
+      status: details.status ?? 'ok'
+    };
+    for (const [key, value] of Object.entries(details)) {
+      if (value !== undefined) {
+        message[key] = value;
+      }
+    }
+    return this.sendTenmanControlMessage(message);
+  }
+
+  sendTenmanError(action, errorCode, errorMessage, extra = {}) {
+    const payload = {
+      type: 'error',
+      action,
+      status: 'error',
+      error_code: errorCode,
+      message: errorMessage
+    };
+    for (const [key, value] of Object.entries(extra || {})) {
+      if (value !== undefined) {
+        payload[key] = value;
+      }
+    }
+    return this.sendTenmanControlMessage(payload);
+  }
+
+  async handleTenmanSendMessageCommand(message) {
+    const payload = message?.payload || {};
+    const clientMessageIdRaw =
+      typeof payload.client_message_id === 'string' ? payload.client_message_id.trim() : '';
+    const clientMessageId = clientMessageIdRaw || null;
+    const respondError = (code, msg, extra = {}) =>
+      this.sendTenmanError('send_message', code, msg, {
+        ...extra,
+        client_message_id: clientMessageId ?? undefined
+      });
+
+    if (!this.isTenmanForwardEnabled()) {
+      respondError('DISABLED', 'TenManMap 分享已停用');
+      return;
+    }
+    if (!this.callmeshState?.apiKey || !this.callmeshState?.verified) {
+      respondError('UNAUTHORIZED', 'CallMesh API Key 尚未驗證');
+      return;
+    }
+
+    const client = this._getWritableMeshtasticClient();
+    if (!client) {
+      respondError('ROUTING_UNAVAILABLE', '沒有可用的 Meshtastic 客戶端');
+      return;
+    }
+
+    const encodingRaw =
+      typeof payload.encoding === 'string' ? payload.encoding.trim().toLowerCase() : 'utf-8';
+    let text;
+    if (!encodingRaw || encodingRaw === 'utf-8' || encodingRaw === 'utf8' || encodingRaw === 'text') {
+      text =
+        typeof payload.text === 'string'
+          ? payload.text
+          : payload.text != null
+            ? String(payload.text)
+            : '';
+    } else if (encodingRaw === 'base64') {
+      try {
+        text = Buffer.from(String(payload.text ?? ''), 'base64').toString('utf8');
+      } catch (err) {
+        respondError('INVALID_PAYLOAD', `Base64 內容解碼失敗: ${err.message}`);
+        return;
+      }
+    } else {
+      respondError('INVALID_PAYLOAD', `不支援的 encoding：${encodingRaw}`);
+      return;
+    }
+
+    if (!text) {
+      respondError('INVALID_PAYLOAD', '文字內容不可為空');
+      return;
+    }
+
+    const channelValue = Number(payload.channel);
+    const channel = Number.isFinite(channelValue) ? Math.max(0, Math.floor(channelValue)) : 0;
+    const scopeRaw =
+      typeof payload.scope === 'string' ? payload.scope.trim().toLowerCase() : 'broadcast';
+    const scope = scopeRaw || 'broadcast';
+    const wantAck = Boolean(payload.want_ack);
+    let replyToNormalized = null;
+    let replyIdNumeric = null;
+    const replyIdCandidateRaw = payload.reply_id ?? payload.replyId ?? null;
+    if (replyIdCandidateRaw != null) {
+      const parsed = Number(replyIdCandidateRaw);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        respondError('INVALID_PAYLOAD', 'reply_id 必須為非負整數');
+        return;
+      }
+      replyIdNumeric = parsed >>> 0;
+    }
+
+    let destination = MESHTASTIC_BROADCAST_ADDR;
+    let meshDestinationLabel = 'broadcast';
+    if (scope === 'broadcast') {
+      destination = MESHTASTIC_BROADCAST_ADDR;
+      meshDestinationLabel = 'broadcast';
+      const replyToCandidate =
+        payload.reply_to ??
+        payload.destination ??
+        payload.mesh_destination ??
+        payload.meshId ??
+        payload.mesh_id ??
+        payload.to ??
+        null;
+      replyToNormalized = normalizeMeshId(replyToCandidate);
+    } else if (scope === 'directed') {
+      const destinationRaw =
+        payload.destination ??
+        payload.mesh_destination ??
+        payload.meshId ??
+        payload.mesh_id ??
+        payload.to ??
+        null;
+      const normalizedDestination = normalizeMeshId(destinationRaw);
+      if (!normalizedDestination) {
+        respondError('INVALID_DESTINATION', 'directed 範圍需提供有效的 destination mesh id');
+        return;
+      }
+      const destinationNumeric = meshIdToUint32(normalizedDestination);
+      if (!Number.isFinite(destinationNumeric)) {
+        respondError('INVALID_DESTINATION', 'destination mesh id 無法轉換為數值');
+        return;
+      }
+      destination = destinationNumeric >>> 0;
+      meshDestinationLabel = normalizedDestination;
+    } else if (scope) {
+      respondError('UNSUPPORTED_SCOPE', `scope=${scope} 尚未支援`);
+      return;
+    }
+
+    const maxPayloadLength =
+      Number.isFinite(client?.constantsEnum?.values?.DATA_PAYLOAD_LEN)
+        ? Number(client.constantsEnum.values.DATA_PAYLOAD_LEN)
+        : 233;
+    const textBytes = Buffer.byteLength(text, 'utf8');
+    if (textBytes > maxPayloadLength) {
+      respondError('MESSAGE_TOO_LONG', `文字長度 ${textBytes} bytes 超過上限 ${maxPayloadLength}`, {
+        max_bytes: maxPayloadLength,
+        actual_bytes: textBytes
+      });
+      return;
+    }
+
+    const inboundState = this.tenmanInboundState || (this.tenmanInboundState = { lastAcceptedAt: 0 });
+    const now = Date.now();
+    if (now - inboundState.lastAcceptedAt < TENMAN_INBOUND_MIN_INTERVAL_MS) {
+      const retryAfterMs = TENMAN_INBOUND_MIN_INTERVAL_MS - (now - inboundState.lastAcceptedAt);
+      respondError('RATE_LIMITED', 'TenManMap 訊息傳送過於頻繁', {
+        retry_after_ms: Math.max(0, retryAfterMs)
+      });
+      return;
+    }
+
+    try {
+      const packetId = await client.sendTextMessage({
+        text,
+        channel,
+        destination,
+        wantAck,
+        replyId: replyIdNumeric
+      });
+      inboundState.lastAcceptedAt = Date.now();
+      const flowId = `tenman-${inboundState.lastAcceptedAt}-${Math.random().toString(16).slice(2, 10)}`;
+      const queuedAt = formatTimestampWithOffset(
+        inboundState.lastAcceptedAt,
+        TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES
+      );
+      this.sendTenmanAck('send_message', {
+        status: 'accepted',
+        client_message_id: clientMessageId ?? undefined,
+        flow_id: flowId,
+        mesh_destination: meshDestinationLabel,
+        channel,
+        want_ack: wantAck,
+        scope,
+        queued_at: queuedAt,
+        encoding: 'utf-8',
+        bytes: textBytes,
+        mesh_packet_id: Number.isFinite(packetId) ? Number(packetId) >>> 0 : undefined,
+        reply_to: replyToNormalized ?? undefined,
+        reply_id: replyIdNumeric ?? undefined
+      });
+      const destinationLog =
+        scope === 'directed' ? `destination=${meshDestinationLabel}` : 'broadcast';
+      const replyLog =
+        scope === 'broadcast' && replyToNormalized ? ` reply_to=${replyToNormalized}` : '';
+      const replyIdLog =
+        replyIdNumeric != null ? ` reply_id=${replyIdNumeric}` : '';
+      const packetIdLabel =
+        Number.isFinite(packetId) ? ` packet_id=${Number(packetId) >>> 0}` : '';
+      this.emitLog(
+        'TENMAN',
+        `已接受 TenManMap 訊息 scope=${scope} channel=${channel} ${destinationLog}${replyLog}${replyIdLog}${packetIdLabel} bytes=${textBytes}`
+      );
+      this.emitTenmanSyntheticSummary({
+        text,
+        channel,
+        flowId,
+        meshPacketId: Number.isFinite(packetId) ? Number(packetId) >>> 0 : null,
+        scope,
+        replyTo: replyToNormalized ?? null,
+        replyId: replyIdNumeric ?? null,
+        meshDestination: scope === 'directed' ? meshDestinationLabel : null
+      });
+    } catch (err) {
+      this.emitLog('TENMAN', `TenManMap 訊息轉送失敗: ${err.message}`);
+      respondError('INTERNAL_ERROR', err.message || '傳送 Meshtastic 訊息失敗');
     }
   }
 
@@ -923,6 +1856,8 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     this.tenmanForwardState.disabledLogged = false;
     this.emitLog('TENMAN', 'TenManMap 轉發已啟用');
+    this.resetTenmanNodeSyncSignatures();
+    this.requestTenmanNodeSnapshot('share-enabled');
     this.ensureTenmanWebsocket();
     this.flushTenmanQueue();
     return true;
@@ -930,14 +1865,14 @@ class CallMeshAprsBridge extends EventEmitter {
 
   enqueueTenmanPublish(message, dedupeKey) {
     if (!message || !dedupeKey) {
-      return;
+      return false;
     }
     if (!this.isTenmanForwardEnabled()) {
-      return;
+      return false;
     }
     const state = this.tenmanForwardState;
     if (!state) {
-      return;
+      return false;
     }
 
     if (!state.pendingKeys) {
@@ -945,7 +1880,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
 
     if (state.lastKey === dedupeKey || state.pendingKeys.has(dedupeKey)) {
-      return;
+      return false;
     }
 
     if (!Array.isArray(state.queue)) {
@@ -957,7 +1892,9 @@ class CallMeshAprsBridge extends EventEmitter {
       if (dropped?.key) {
         state.pendingKeys.delete(dropped.key);
       }
-      this.emitLog('TENMAN', '佇列已滿，將移除最舊的 publish 訊息');
+      if (TENMAN_FORWARD_VERBOSE_LOG) {
+        this.emitLog('TENMAN', '佇列已滿，將移除最舊的 publish 訊息');
+      }
     }
 
     const entry = {
@@ -968,18 +1905,45 @@ class CallMeshAprsBridge extends EventEmitter {
     state.queue.push(entry);
     state.pendingKeys.add(dedupeKey);
 
-    const payload = message?.payload || {};
-    const latLog =
-      typeof payload.latitude === 'number' ? payload.latitude.toFixed(6) : String(payload.latitude ?? '');
-    const lonLog =
-      typeof payload.longitude === 'number' ? payload.longitude.toFixed(6) : String(payload.longitude ?? '');
-    this.emitLog(
-      'TENMAN',
-      `佇列 publish device=${payload.device_id ?? ''} lat=${latLog} lon=${lonLog}`
-    );
+    if (TENMAN_FORWARD_VERBOSE_LOG) {
+      const payload = message?.payload || {};
+      if (message?.action === 'message.publish') {
+        const previewSource = typeof payload.text === 'string' ? payload.text : '';
+        const preview = previewSource.replace(/\s+/g, ' ').slice(0, 64);
+        this.emitLog(
+          'TENMAN',
+          `佇列 message.publish channel=${payload.channel ?? ''} text=${preview || '[空白]'}`
+        );
+      } else if (message?.action === 'node.update') {
+        this.emitLog(
+          'TENMAN',
+          `佇列 node.update mesh=${payload.mesh_id ?? ''} last_seen=${payload.last_seen_at ?? 'N/A'}`
+        );
+      } else if (message?.action === 'node.snapshot') {
+        const total = Number.isFinite(payload.total) ? payload.total : payload.nodes?.length ?? 0;
+        this.emitLog(
+          'TENMAN',
+          `佇列 node.snapshot total=${total} generated_at=${payload.generated_at ?? 'N/A'}`
+        );
+      } else {
+        const latLog =
+          typeof payload.latitude === 'number'
+            ? payload.latitude.toFixed(6)
+            : String(payload.latitude ?? '');
+        const lonLog =
+          typeof payload.longitude === 'number'
+            ? payload.longitude.toFixed(6)
+            : String(payload.longitude ?? '');
+        this.emitLog(
+          'TENMAN',
+          `佇列 publish device=${payload.device_id ?? ''} lat=${latLog} lon=${lonLog}`
+        );
+      }
+    }
 
     this.ensureTenmanWebsocket();
     this.flushTenmanQueue();
+    return true;
   }
 
   ensureTenmanWebsocket() {
@@ -1077,7 +2041,7 @@ class CallMeshAprsBridge extends EventEmitter {
       ws.send(entry.serialized, (err) => {
         state.sending = false;
         if (err) {
-          this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+          this.emitLog('TENMAN', `TenManMap 傳送失敗: ${err.message}`);
           this.scheduleTenmanReconnect('send-error');
           this.resetTenmanWebsocket();
           return;
@@ -1090,7 +2054,7 @@ class CallMeshAprsBridge extends EventEmitter {
       });
     } catch (err) {
       state.sending = false;
-      this.emitLog('TENMAN', `位置回報失敗: ${err.message}`);
+      this.emitLog('TENMAN', `TenManMap 傳送失敗: ${err.message}`);
       this.scheduleTenmanReconnect('exception');
       this.resetTenmanWebsocket();
     }
@@ -1169,6 +2133,9 @@ class CallMeshAprsBridge extends EventEmitter {
       action: TENMAN_FORWARD_AUTH_ACTION,
       api_key: apiKey
     };
+    if (state.suppressAck) {
+      authMessage.suppress_ack = true;
+    }
 
     const serialized = JSON.stringify(authMessage);
     state.authenticating = true;
@@ -1229,17 +2196,30 @@ class CallMeshAprsBridge extends EventEmitter {
       state.authenticating = false;
       const status = String(parsed?.status ?? parsed?.result ?? parsed?.ok ?? 'ok').toLowerCase();
       if (status === 'pass' || status === 'ok' || status === 'true') {
-        const gatewayId = normalizeMeshId(
-          parsed?.gateway_id ?? parsed?.gatewayId ?? state.gatewayId ?? null
-        );
-        const nodeId = parsed?.node_id ?? parsed?.nodeId ?? state.nodeId ?? null;
-        state.gatewayId = gatewayId || state.gatewayId || null;
+        const gatewayIdRawCandidate = parsed?.gateway_id ?? parsed?.gatewayId ?? null;
+        const gatewayIdRaw =
+          gatewayIdRawCandidate != null && String(gatewayIdRawCandidate).trim()
+            ? String(gatewayIdRawCandidate).trim()
+            : null;
+        const gatewayMeshId = normalizeMeshId(gatewayIdRaw);
+        const nodeIdCandidate = parsed?.node_id ?? parsed?.nodeId ?? null;
+        const nodeId =
+          nodeIdCandidate != null && String(nodeIdCandidate).trim()
+            ? String(nodeIdCandidate).trim()
+            : null;
+        state.gatewayId = gatewayIdRaw;
+        state.gatewayMeshId = gatewayMeshId ?? null;
         state.nodeId = nodeId;
         state.authenticated = true;
         const infoParts = [];
-        if (gatewayId) infoParts.push(`gateway=${gatewayId}`);
+        if (gatewayIdRaw) infoParts.push(`gateway=${gatewayIdRaw}`);
+        if (gatewayMeshId && gatewayMeshId !== gatewayIdRaw) {
+          infoParts.push(`mesh=${gatewayMeshId}`);
+        }
         if (nodeId) infoParts.push(`node=${nodeId}`);
         this.emitLog('TENMAN', `驗證通過${infoParts.length ? ` (${infoParts.join(', ')})` : ''}`);
+        this.resetTenmanNodeSyncSignatures();
+        this.requestTenmanNodeSnapshot('auth');
         this.flushTenmanQueue();
       } else {
         state.authenticated = false;
@@ -1253,11 +2233,28 @@ class CallMeshAprsBridge extends EventEmitter {
     if (parsed?.type === 'ack') {
       const action = parsed?.action ?? parsed?.payload?.action;
       const deviceId = parsed?.payload?.device_id ?? parsed?.device_id ?? '';
-      const gatewayId = parsed?.gateway_id ?? parsed?.payload?.gateway_id ?? state.gatewayId ?? '';
-      this.emitLog(
-        'TENMAN',
-        `收到 ack${action ? ` action=${action}` : ''}${deviceId ? ` device=${deviceId}` : ''}${gatewayId ? ` gateway=${gatewayId}` : ''}`
-      );
+      const gatewayId =
+        parsed?.gateway_id ??
+        parsed?.payload?.gateway_id ??
+        state.gatewayId ??
+        state.gatewayMeshId ??
+        '';
+      if (TENMAN_FORWARD_VERBOSE_LOG) {
+        this.emitLog(
+          'TENMAN',
+          `收到 ack${action ? ` action=${action}` : ''}${deviceId ? ` device=${deviceId}` : ''}${gatewayId ? ` gateway=${gatewayId}` : ''}`
+        );
+      }
+      return;
+    }
+
+    if (parsed?.action === 'send_message') {
+      const maybePromise = this.handleTenmanSendMessageCommand(parsed);
+      if (maybePromise && typeof maybePromise.catch === 'function') {
+        maybePromise.catch((err) => {
+          this.emitLog('TENMAN', `處理 send_message 指令失敗: ${err.message}`);
+        });
+      }
       return;
     }
 
@@ -1420,6 +2417,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.stopHeartbeatLoop();
     this.teardownAprsConnection();
     this.flushNodeDatabasePersistSync();
+    this.meshtasticClients.clear();
   }
 
   // Internal helpers
@@ -2565,6 +3563,23 @@ function normalizeMeshId(meshId) {
   return `!${value}`;
 }
 
+function meshIdToUint32(meshId) {
+  const normalized = normalizeMeshId(meshId);
+  if (!normalized) {
+    return null;
+  }
+  const hex = normalized.slice(1);
+  if (!hex) {
+    return null;
+  }
+  const padded = hex.length > 8 ? hex.slice(-8) : hex.padStart(8, '0');
+  const parsed = Number.parseInt(padded, 16);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return parsed >>> 0;
+}
+
 function extractTelemetryNode(node) {
   if (!node || typeof node !== 'object') {
     return null;
@@ -3353,6 +4368,30 @@ function resolveHeading(position) {
   }
   const normalized = raw % 360;
   return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function toIsoString(value) {
+  if (value == null) {
+    return null;
+  }
+  let date;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      return null;
+    }
+    date = value;
+  } else if (typeof value === 'number' && Number.isFinite(value)) {
+    date = new Date(value);
+  } else if (typeof value === 'string' && value.trim()) {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+    date = parsed;
+  } else {
+    return null;
+  }
+  return date.toISOString();
 }
 
 function formatTimestampWithOffset(source, offsetMinutes) {
