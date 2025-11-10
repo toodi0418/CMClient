@@ -929,6 +929,21 @@ class CallMeshAprsBridge extends EventEmitter {
         return;
       }
 
+      const nodeName =
+        summary?.from?.longName || summary?.from?.shortName || summary?.from?.label || null;
+      const extraPayload = {
+        source: 'TMAG'
+      };
+      if (meshIdNormalized) {
+        extraPayload.mesh_id = meshIdNormalized;
+      }
+      if (summary?.from?.shortName && summary.from.shortName !== nodeName) {
+        extraPayload.short_name = summary.from.shortName;
+      }
+      if (summary?.from?.longName && summary.from.longName !== nodeName) {
+        extraPayload.long_name = summary.from.longName;
+      }
+
       const payload = {
         device_id: deviceId,
         timestamp,
@@ -936,17 +951,13 @@ class CallMeshAprsBridge extends EventEmitter {
         longitude,
         altitude,
         speed,
-        heading,
-        source: 'TMAG'
+        heading
       };
-      if (meshIdNormalized) {
-        payload.mesh_id = meshIdNormalized;
+      if (nodeName) {
+        payload.node_name = nodeName;
       }
-      if (summary?.from?.shortName) {
-        payload.short_name = summary.from.shortName;
-      }
-      if (summary?.from?.longName) {
-        payload.long_name = summary.from.longName;
+      if (Object.keys(extraPayload).length > 0) {
+        payload.extra = extraPayload;
       }
 
       const message = {
@@ -1182,6 +1193,13 @@ class CallMeshAprsBridge extends EventEmitter {
     const payload = {
       mesh_id: meshId
     };
+    const original =
+      typeof node.meshIdOriginal === 'string' && node.meshIdOriginal.trim()
+        ? node.meshIdOriginal.trim()
+        : null;
+    if (original && original !== meshId) {
+      payload.mesh_id_original = original;
+    }
     const shortName =
       typeof node.shortName === 'string' && node.shortName.trim()
         ? node.shortName.trim()
@@ -1193,8 +1211,43 @@ class CallMeshAprsBridge extends EventEmitter {
       typeof node.longName === 'string' && node.longName.trim()
         ? node.longName.trim()
         : null;
+    const hwModel =
+      node.hwModel != null && String(node.hwModel).trim() ? String(node.hwModel).trim() : null;
+    const hwModelLabel =
+      node.hwModelLabel != null && String(node.hwModelLabel).trim()
+        ? String(node.hwModelLabel).trim()
+        : null;
+    const role = node.role != null && String(node.role).trim() ? String(node.role).trim() : null;
+    const roleLabel =
+      node.roleLabel != null && String(node.roleLabel).trim()
+        ? String(node.roleLabel).trim()
+        : null;
     if (longName) {
       payload.long_name = longName;
+    }
+    const hwModel =
+      node.hwModel != null && String(node.hwModel).trim() ? String(node.hwModel).trim() : null;
+    if (hwModel) {
+      payload.hw_model = hwModel;
+    }
+    const hwModelLabel =
+      node.hwModelLabel != null && String(node.hwModelLabel).trim()
+        ? String(node.hwModelLabel).trim()
+        : null;
+    if (hwModelLabel) {
+      payload.hw_model_label = hwModelLabel;
+    }
+    const role =
+      node.role != null && String(node.role).trim() ? String(node.role).trim() : null;
+    if (role) {
+      payload.role = role;
+    }
+    const roleLabel =
+      node.roleLabel != null && String(node.roleLabel).trim()
+        ? String(node.roleLabel).trim()
+        : null;
+    if (roleLabel) {
+      payload.role_label = roleLabel;
     }
     const lastSeenIso = toIsoString(node.lastSeenAt ?? node.last_seen_at ?? null);
     if (lastSeenIso) {
@@ -1212,6 +1265,11 @@ class CallMeshAprsBridge extends EventEmitter {
     if (altitude != null) {
       payload.altitude = roundTo(altitude, 2);
     }
+    const labelCandidate = buildNodeLabel(node);
+    const label = typeof labelCandidate === 'string' ? labelCandidate.trim() : '';
+    if (label) {
+      payload.label = label;
+    }
     return payload;
   }
 
@@ -1224,6 +1282,10 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!meshId) {
       return null;
     }
+    const original =
+      typeof node.meshIdOriginal === 'string' && node.meshIdOriginal.trim()
+        ? node.meshIdOriginal.trim()
+        : null;
     const lastSeenCandidate = node.lastSeenAt ?? node.last_seen_at ?? null;
     let lastSeenMs = null;
     if (Number.isFinite(lastSeenCandidate)) {
@@ -1251,8 +1313,13 @@ class CallMeshAprsBridge extends EventEmitter {
         : null;
     const signaturePayload = {
       meshId,
+      meshIdOriginal: original,
       shortName,
       longName,
+      hwModel,
+      hwModelLabel,
+      role,
+      roleLabel,
       latitude: latitude != null ? roundTo(latitude, 6) : null,
       longitude: longitude != null ? roundTo(longitude, 6) : null,
       altitude: altitude != null ? roundTo(altitude, 2) : null,

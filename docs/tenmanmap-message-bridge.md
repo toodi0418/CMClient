@@ -42,10 +42,12 @@ TenManMap 目前透過 WebSocket 取得位置封包。本文件說明 `CMClient`
     "altitude": 23.4,
     "speed": 12.5,
     "heading": 270,
-    "source": "TMAG",
-    "mesh_id": "!abcd1234",
-    "short_name": "TPE1",
-    "long_name": "台北中繼-01"
+    "node_name": "台北中繼-01",
+    "extra": {
+      "source": "TMAG",
+      "mesh_id": "!abcd1234",
+      "short_name": "TPE1"
+    }
   }
 }
 ```
@@ -81,8 +83,14 @@ TenManMap 需要掌握 Mesh 節點的暱稱、硬體資訊與最後出現時間�
     "nodes": [
       {
         "mesh_id": "!abcd1234",
+        "mesh_id_original": "!ABCD1234",
         "short_name": "NODE1",
         "long_name": "中和測試節點",
+        "label": "中和測試節點 (!abcd1234)",
+        "hw_model": "TBEAM",
+        "hw_model_label": "TBEAM",
+        "role": "CLIENT",
+        "role_label": "Client",
         "last_seen_at": "2025-02-08T07:05:12Z",
         "latitude": 25.033964,
         "longitude": 121.564468,
@@ -90,6 +98,7 @@ TenManMap 需要掌握 Mesh 節點的暱稱、硬體資訊與最後出現時間�
       },
       {
         "mesh_id": "!efef9876",
+        "label": "!efef9876",
         "last_seen_at": "2025-02-08T07:04:01Z"
       }
     ]
@@ -99,10 +108,10 @@ TenManMap 需要掌握 Mesh 節點的暱稱、硬體資訊與最後出現時間�
 
 > **欄位重點**
 >
-> - `version` / `source`：目前固定 `version=1`、`source="TMAG"`。
+> - `version` / `source`：供 TenManMap 區分格式版本，現階段固定 `version=1`、`source="TMAG"`。
 > - `generated_at`：快照產生時間（UTC+8）。
-> - `total`：節點筆數。
-> - `nodes[*]`：包含 `mesh_id`、可用的 `short_name` / `long_name`、`last_seen_at` 與座標（可用時提供）。
+> - `total`：`nodes` 陣列筆數，方便伺服器做比對。
+> - `nodes[*]`：與 `node.update` 相同的欄位集合；若節點缺乏座標會省略 `latitude` / `longitude` / `altitude`。
 
 ### 3.2 節點增量（`node.update`）
 
@@ -120,8 +129,14 @@ TenManMap 需要掌握 Mesh 節點的暱稱、硬體資訊與最後出現時間�
     "version": 1,
     "source": "TMAG",
     "mesh_id": "!abcd1234",
+    "mesh_id_original": "!ABCD1234",
     "short_name": "NODE1",
     "long_name": "中和測試節點",
+    "label": "中和測試節點 (!abcd1234)",
+    "hw_model": "TBEAM",
+    "hw_model_label": "TBEAM",
+    "role": "CLIENT",
+    "role_label": "Client",
     "last_seen_at": "2025-02-08T07:06:00Z",
     "latitude": 25.033964,
     "longitude": 121.564468,
