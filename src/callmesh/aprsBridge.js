@@ -2086,11 +2086,18 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     const state = this.tenmanForwardState;
-    if (!state || !Array.isArray(state.queue) || state.queue.length === 0) {
+    if (!state) {
       return;
+    }
+    if (!Array.isArray(state.queue)) {
+      state.queue = [];
     }
     if (state.reconnectTimer) {
       return;
+    }
+    const shouldLogQueueState = state.queue.length === 0;
+    if (shouldLogQueueState && TENMAN_FORWARD_VERBOSE_LOG) {
+      this.emitLog('TENMAN', '佇列為空，但仍將排程 TenManMap 重新連線');
     }
     this.emitLog(
       'TENMAN',
@@ -2098,7 +2105,13 @@ class CallMeshAprsBridge extends EventEmitter {
     );
     state.reconnectTimer = setTimeout(() => {
       state.reconnectTimer = null;
+      if (!this.isTenmanForwardEnabled()) {
+        return;
+      }
       this.ensureTenmanWebsocket();
+      if (state.queue.length > 0) {
+        this.flushTenmanQueue();
+      }
     }, TENMAN_FORWARD_RECONNECT_DELAY_MS);
     state.reconnectTimer?.unref?.();
   }
