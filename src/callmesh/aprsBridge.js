@@ -1300,6 +1300,18 @@ class CallMeshAprsBridge extends EventEmitter {
       typeof node.longName === 'string' && node.longName.trim()
         ? node.longName.trim()
         : null;
+    const hwModel =
+      node.hwModel != null && String(node.hwModel).trim() ? String(node.hwModel).trim() : null;
+    const hwModelLabel =
+      node.hwModelLabel != null && String(node.hwModelLabel).trim()
+        ? String(node.hwModelLabel).trim()
+        : null;
+    const role =
+      node.role != null && String(node.role).trim() ? String(node.role).trim() : null;
+    const roleLabel =
+      node.roleLabel != null && String(node.roleLabel).trim()
+        ? String(node.roleLabel).trim()
+        : null;
     const signaturePayload = {
       meshId,
       meshIdOriginal: original,
