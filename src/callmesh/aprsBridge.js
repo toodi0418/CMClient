@@ -1995,6 +1995,8 @@ class CallMeshAprsBridge extends EventEmitter {
 
       ws.on('unexpected-response', (_req, res) => {
         this.emitLog('TENMAN', `WebSocket unexpected status=${res?.statusCode ?? 'unknown'}`);
+        this.scheduleTenmanReconnect('unexpected-response');
+        this.resetTenmanWebsocket();
       });
 
       ws.on('message', (data) => {
