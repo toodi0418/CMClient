@@ -1226,27 +1226,15 @@ class CallMeshAprsBridge extends EventEmitter {
     if (longName) {
       payload.long_name = longName;
     }
-    const hwModel =
-      node.hwModel != null && String(node.hwModel).trim() ? String(node.hwModel).trim() : null;
     if (hwModel) {
       payload.hw_model = hwModel;
     }
-    const hwModelLabel =
-      node.hwModelLabel != null && String(node.hwModelLabel).trim()
-        ? String(node.hwModelLabel).trim()
-        : null;
     if (hwModelLabel) {
       payload.hw_model_label = hwModelLabel;
     }
-    const role =
-      node.role != null && String(node.role).trim() ? String(node.role).trim() : null;
     if (role) {
       payload.role = role;
     }
-    const roleLabel =
-      node.roleLabel != null && String(node.roleLabel).trim()
-        ? String(node.roleLabel).trim()
-        : null;
     if (roleLabel) {
       payload.role_label = roleLabel;
     }
