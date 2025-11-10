@@ -2042,6 +2042,8 @@ class CallMeshAprsBridge extends EventEmitter {
         state.sending = false;
         if (err) {
           this.emitLog('TENMAN', `TenManMap 傳送失敗: ${err.message}`);
+          state.queue.shift();
+          state.pendingKeys?.delete(entry.key);
           this.scheduleTenmanReconnect('send-error');
           this.resetTenmanWebsocket();
           return;
@@ -2055,6 +2057,8 @@ class CallMeshAprsBridge extends EventEmitter {
     } catch (err) {
       state.sending = false;
       this.emitLog('TENMAN', `TenManMap 傳送失敗: ${err.message}`);
+      state.queue.shift();
+      state.pendingKeys?.delete(entry.key);
       this.scheduleTenmanReconnect('exception');
       this.resetTenmanWebsocket();
     }
