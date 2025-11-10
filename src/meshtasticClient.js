@@ -70,6 +70,8 @@ class MeshtasticClient extends EventEmitter {
       serialPath: null,
       serialBaudRate: 115200,
       serialOpenOptions: {},
+      initialBacklogSuppressWindowMs: 15_000,
+      initialBacklogSkewAllowanceMs: 5_000,
       ...options
     };
 
@@ -107,8 +109,23 @@ class MeshtasticClient extends EventEmitter {
     this._currentIdleTimeout = null;
     this._socketClosed = true;
     this._serialConnectTimer = null;
+    this._initialBacklogFilterActive = false;
+    this._initialBacklogFilterDeadline = null;
 
     this._loadRelayStatsFromDisk();
+  }
+
+  _resetInitialBacklogFilter() {
+    const windowMs = Number.isFinite(this.options.initialBacklogSuppressWindowMs)
+      ? Math.max(0, Number(this.options.initialBacklogSuppressWindowMs))
+      : 0;
+    if (windowMs > 0) {
+      this._initialBacklogFilterActive = true;
+      this._initialBacklogFilterDeadline = Date.now() + windowMs;
+    } else {
+      this._initialBacklogFilterActive = false;
+      this._initialBacklogFilterDeadline = null;
+    }
   }
 
   _shouldIgnoreMeshId(value) {
@@ -820,6 +837,7 @@ class MeshtasticClient extends EventEmitter {
           this._socket.setTimeout(0);
           this._applySocketOptions();
         }
+        this._resetInitialBacklogFilter();
         this.emit('connected');
         if (this.options.handshake) {
           this._sendWantConfig();
@@ -923,6 +941,7 @@ class MeshtasticClient extends EventEmitter {
       clearSerialTimer();
       this._connected = true;
       this._connectionStartedAt = Date.now();
+      this._resetInitialBacklogFilter();
       this.emit('connected');
       if (this.options.handshake) {
         this._sendWantConfig();
@@ -1036,6 +1055,8 @@ class MeshtasticClient extends EventEmitter {
     this._selfNodeId = null;
     this._selfNodeNormalized = null;
     this._currentIdleTimeout = null;
+    this._initialBacklogFilterActive = false;
+    this._initialBacklogFilterDeadline = null;
     this._clearHeartbeat();
     this.emit('disconnected');
   }
@@ -1164,10 +1185,29 @@ class MeshtasticClient extends EventEmitter {
     if (!packet || packet.payloadVariant !== 'decoded') {
       return null;
     }
-    if (this._connectionStartedAt && packet.rxTime) {
-      const packetTime = packet.rxTime * 1000;
-      if (packetTime <= this._connectionStartedAt) {
-        return null;
+    const packetRxTimeSeconds = Number.isFinite(packet.rxTime) ? Number(packet.rxTime) : null;
+    if (this._initialBacklogFilterActive) {
+      const now = Date.now();
+      if (this._initialBacklogFilterDeadline && now >= this._initialBacklogFilterDeadline) {
+        this._initialBacklogFilterActive = false;
+      }
+    }
+    if (this._initialBacklogFilterActive) {
+      let disableFilter = false;
+      if (this._connectionStartedAt && packetRxTimeSeconds && packetRxTimeSeconds > 0) {
+        const packetTimeMs = packetRxTimeSeconds * 1000;
+        const skewAllowanceMs = Number.isFinite(this.options.initialBacklogSkewAllowanceMs)
+          ? Math.max(0, Number(this.options.initialBacklogSkewAllowanceMs))
+          : 0;
+        if (packetTimeMs + skewAllowanceMs < this._connectionStartedAt) {
+          return null;
+        }
+        disableFilter = true;
+      } else {
+        disableFilter = true;
+      }
+      if (disableFilter) {
+        this._initialBacklogFilterActive = false;
       }
     }
 
@@ -1184,7 +1224,10 @@ class MeshtasticClient extends EventEmitter {
       return null;
     }
 
-    const timestamp = packet.rxTime ? new Date(packet.rxTime * 1000) : new Date();
+    const timestamp =
+      packetRxTimeSeconds && packetRxTimeSeconds > 0
+        ? new Date(packetRxTimeSeconds * 1000)
+        : new Date();
     const fromInfo = this._formatNode(packet.from);
     const toInfo = packet.to === BROADCAST_ADDR ? null : this._formatNode(packet.to);
     const linkMetrics = {
