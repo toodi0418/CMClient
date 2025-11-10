@@ -15,7 +15,7 @@ TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合�
 - **CallMesh 整合**：透過 Heartbeat/Mapping/Provision API 取得節點配置與 APRS 參數，並在 Key 驗證失敗時鎖定系統。
 - **APRS Uplink**：依 Mapping 決定呼號、符號與註解，上傳位置/狀態/遙測資料到 APRS-IS，具備 Beacon、Status、Telemetry 定時器與互斥上傳控制。
 - **TenManMap 轉發**：驗證成功後，會將 Meshtastic 摘要同步到 TenManMap 及其合作夥伴，佇列與重試機制常駐執行。
-- **@cm 自動回覆機器人**：在 CH2 `Signal Test` 頻道輸入 `@cm ...` 會觸發機器人，由最近（含本機）節點自動回覆測試訊息。
+- **@cm 自動回覆機器人**：在 CH2 `Signal Test` 頻道輸入 `@cm ...` 會觸發機器人，由最近（含本機）節點自動回覆測試訊息；需保持 TenManMap 分享為啟用狀態，停用分享時該機器人無法運作。
 - **遙測統計**：計算近 10 分鐘的封包數量、上傳比率、類型分佈（Position / Message / Control）。
 - **彈性連線模式**：CLI 與 GUI 皆支援 `tcp://` 與 `serial://` 目標，可自動判讀 `serial:///dev/ttyUSB0` 類型字串並套用鮑率。
 - **跨平台部署**：可自行打包 macOS / Windows / Linux x64 CLI 或 Desktop 版；CLI 同時支援自動重連。
