@@ -1217,7 +1217,8 @@ class CallMeshAprsBridge extends EventEmitter {
       node.hwModelLabel != null && String(node.hwModelLabel).trim()
         ? String(node.hwModelLabel).trim()
         : null;
-    const role = node.role != null && String(node.role).trim() ? String(node.role).trim() : null;
+    const role =
+      node.role != null && String(node.role).trim() ? String(node.role).trim() : null;
     const roleLabel =
       node.roleLabel != null && String(node.roleLabel).trim()
         ? String(node.roleLabel).trim()
