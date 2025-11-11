@@ -2061,7 +2061,7 @@ function ensureRelayGuessSuffix(label, summary) {
   }
 
   function setTelemetryRangeMode(mode, { skipRender = false } = {}) {
-    const allowed = new Set(['day', 'week', 'month', 'year', 'custom']);
+    const allowed = new Set(['hour1', 'hour3', 'hour6', 'hour12', 'day', 'week', 'month', 'year', 'custom']);
     if (!allowed.has(mode)) {
       mode = 'day';
     }
@@ -2097,6 +2097,26 @@ function ensureRelayGuessSuffix(label, summary) {
 
   function getTelemetryRangeWindow(now = Date.now()) {
     switch (telemetryRangeMode) {
+      case 'hour1':
+        return {
+          startMs: now - 1 * 60 * 60 * 1000,
+          endMs: now
+        };
+      case 'hour3':
+        return {
+          startMs: now - 3 * 60 * 60 * 1000,
+          endMs: now
+        };
+      case 'hour6':
+        return {
+          startMs: now - 6 * 60 * 60 * 1000,
+          endMs: now
+        };
+      case 'hour12':
+        return {
+          startMs: now - 12 * 60 * 60 * 1000,
+          endMs: now
+        };
       case 'day':
         return {
           startMs: now - 24 * 60 * 60 * 1000,
