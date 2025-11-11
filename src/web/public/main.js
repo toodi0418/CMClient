@@ -85,6 +85,7 @@
   const MAX_LOG_ENTRIES = 200;
   const telemetryStore = new Map();
   const telemetryRecordIds = new Set();
+  const telemetryRecordOrder = [];
   const telemetryCharts = new Map();
   let telemetrySelectedMeshId = null;
   const telemetryNodeLookup = new Map();
@@ -117,6 +118,7 @@
   const TELEMETRY_TABLE_LIMIT = 200;
   const TELEMETRY_CHART_LIMIT = 200;
   const TELEMETRY_MAX_LOCAL_RECORDS = 500;
+  const TELEMETRY_MAX_TOTAL_RECORDS = 4000;
   const TELEMETRY_METRIC_DEFINITIONS = {
     batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
     voltage: { label: '電壓', unit: 'V', decimals: 2, chart: true },
@@ -1830,6 +1832,55 @@ function ensureRelayGuessSuffix(label, summary) {
     return mergeNodeMetadata(base, registry);
   }
 
+  function trackTelemetryRecord(meshId, recordId) {
+    if (!recordId) {
+      return;
+    }
+    telemetryRecordOrder.push({ meshId, recordId });
+  }
+
+  function removeTelemetryOrderEntry(meshId, recordId) {
+    if (!recordId || telemetryRecordOrder.length === 0) {
+      return;
+    }
+    for (let i = telemetryRecordOrder.length - 1; i >= 0; i -= 1) {
+      const entry = telemetryRecordOrder[i];
+      if (entry.recordId === recordId && (meshId == null || entry.meshId === meshId)) {
+        telemetryRecordOrder.splice(i, 1);
+        break;
+      }
+    }
+  }
+
+  function enforceTelemetryGlobalLimit() {
+    if (!Number.isFinite(TELEMETRY_MAX_TOTAL_RECORDS) || TELEMETRY_MAX_TOTAL_RECORDS <= 0) {
+      return;
+    }
+    while (telemetryRecordOrder.length > TELEMETRY_MAX_TOTAL_RECORDS) {
+      const oldest = telemetryRecordOrder.shift();
+      if (!oldest) {
+        break;
+      }
+      const bucket = telemetryStore.get(oldest.meshId);
+      if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+        telemetryRecordIds.delete(oldest.recordId);
+        continue;
+      }
+      const index = bucket.records.findIndex((item) => item?.id === oldest.recordId);
+      if (index === -1) {
+        telemetryRecordIds.delete(oldest.recordId);
+        continue;
+      }
+      const [removed] = bucket.records.splice(index, 1);
+      if (removed?.id) {
+        telemetryRecordIds.delete(removed.id);
+      }
+      if (!bucket.records.length) {
+        telemetryStore.delete(oldest.meshId);
+      }
+    }
+  }
+
   function formatTelemetryNodeLabel(meshId, node) {
     const normalized =
       (node?.meshIdNormalized && String(node.meshIdNormalized).trim()) ||
@@ -1930,14 +1981,18 @@ function ensureRelayGuessSuffix(label, summary) {
       const removed = bucket.records.shift();
       if (removed?.id) {
         telemetryRecordIds.delete(removed.id);
+        removeTelemetryOrderEntry(key, removed.id);
       }
     }
+    trackTelemetryRecord(key, record.id);
+    enforceTelemetryGlobalLimit();
     return record;
   }
 
   function clearTelemetryDataLocal({ silent = false } = {}) {
     telemetryStore.clear();
     telemetryRecordIds.clear();
+    telemetryRecordOrder.length = 0;
     telemetrySelectedMeshId = null;
     telemetryNodeLookup.clear();
     telemetryNodeDisplayByMesh.clear();

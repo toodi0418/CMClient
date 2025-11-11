@@ -243,6 +243,7 @@ const aprsCompletedQueue = [];
 const TELEMETRY_TABLE_LIMIT = 200;
 const TELEMETRY_CHART_LIMIT = 200;
 const TELEMETRY_MAX_LOCAL_RECORDS = 500;
+const TELEMETRY_MAX_TOTAL_RECORDS = 4000;
 const TELEMETRY_METRIC_DEFINITIONS = {
   batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
   voltage: { label: '電壓', unit: 'V', decimals: 2, chart: true },
@@ -260,6 +261,7 @@ const TELEMETRY_METRIC_DEFINITIONS = {
 
 const telemetryStore = new Map();
 const telemetryRecordIds = new Set();
+const telemetryRecordOrder = [];
 let telemetrySelectedMeshId = null;
 let telemetryUpdatedAt = null;
 let telemetryRangeMode = 'day';
@@ -4747,9 +4749,59 @@ function sanitizeTelemetryRecord(record, meshId) {
   };
 }
 
+function trackTelemetryRecord(meshKey, recordId) {
+  if (!recordId) {
+    return;
+  }
+  telemetryRecordOrder.push({ meshId: meshKey, recordId });
+}
+
+function removeTelemetryOrderEntry(meshKey, recordId) {
+  if (!recordId || telemetryRecordOrder.length === 0) {
+    return;
+  }
+  for (let i = telemetryRecordOrder.length - 1; i >= 0; i -= 1) {
+    const entry = telemetryRecordOrder[i];
+    if (entry.recordId === recordId && (meshKey == null || entry.meshId === meshKey)) {
+      telemetryRecordOrder.splice(i, 1);
+      break;
+    }
+  }
+}
+
+function enforceTelemetryGlobalLimit() {
+  if (!Number.isFinite(TELEMETRY_MAX_TOTAL_RECORDS) || TELEMETRY_MAX_TOTAL_RECORDS <= 0) {
+    return;
+  }
+  while (telemetryRecordOrder.length > TELEMETRY_MAX_TOTAL_RECORDS) {
+    const oldest = telemetryRecordOrder.shift();
+    if (!oldest) {
+      break;
+    }
+    const bucket = telemetryStore.get(oldest.meshId);
+    if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+      telemetryRecordIds.delete(oldest.recordId);
+      continue;
+    }
+    const index = bucket.records.findIndex((item) => item?.id === oldest.recordId);
+    if (index === -1) {
+      telemetryRecordIds.delete(oldest.recordId);
+      continue;
+    }
+    const [removed] = bucket.records.splice(index, 1);
+    if (removed?.id) {
+      telemetryRecordIds.delete(removed.id);
+    }
+    if (!bucket.records.length) {
+      telemetryStore.delete(oldest.meshId);
+    }
+  }
+}
+
 function clearTelemetryDataLocal({ silent = false } = {}) {
   telemetryStore.clear();
   telemetryRecordIds.clear();
+  telemetryRecordOrder.length = 0;
   telemetryNodeLookup.clear();
   telemetryNodeDisplayByMesh.clear();
   telemetryNodeOptions = [];
@@ -4796,12 +4848,15 @@ function applyTelemetrySnapshot(snapshot) {
     if (!sanitizedRecords.length) {
       continue;
     }
+    const meshKey = resolveTelemetryMeshKey(meshId);
     sanitizedRecords.sort((a, b) => a.sampleTimeMs - b.sampleTimeMs);
     if (sanitizedRecords.length > TELEMETRY_MAX_LOCAL_RECORDS) {
       sanitizedRecords.splice(0, sanitizedRecords.length - TELEMETRY_MAX_LOCAL_RECORDS);
     }
-    sanitizedRecords.forEach((item) => telemetryRecordIds.add(item.id));
-    const meshKey = resolveTelemetryMeshKey(meshId);
+    sanitizedRecords.forEach((item) => {
+      telemetryRecordIds.add(item.id);
+      trackTelemetryRecord(meshKey, item.id);
+    });
     telemetryStore.set(meshKey, {
       meshId: meshKey,
       rawMeshId: meshId,
@@ -4809,6 +4864,7 @@ function applyTelemetrySnapshot(snapshot) {
       records: sanitizedRecords
     });
   }
+  enforceTelemetryGlobalLimit();
   telemetryUpdatedAt = snapshot.updatedAt ?? Date.now();
   telemetrySelectedMeshId = previousSelection;
   refreshTelemetrySelectors(previousSelection);
@@ -4867,9 +4923,18 @@ function appendTelemetryRecord(meshId, rawRecord, rawNode, updatedAt) {
   bucket.records.push(sanitizedRecord);
   telemetryRecordIds.add(sanitizedRecord.id);
   if (bucket.records.length > TELEMETRY_MAX_LOCAL_RECORDS) {
-    const removed = bucket.records.splice(0, bucket.records.length - TELEMETRY_MAX_LOCAL_RECORDS);
-    removed.forEach((item) => telemetryRecordIds.delete(item.id));
+    const excess = bucket.records.length - TELEMETRY_MAX_LOCAL_RECORDS;
+    const removed = bucket.records.splice(0, excess);
+    removed.forEach((item) => {
+      if (!item) {
+        return;
+      }
+      telemetryRecordIds.delete(item.id);
+      removeTelemetryOrderEntry(targetMeshKey, item.id);
+    });
   }
+  trackTelemetryRecord(targetMeshKey, sanitizedRecord.id);
+  enforceTelemetryGlobalLimit();
   telemetryUpdatedAt = Number.isFinite(updatedAt) ? Number(updatedAt) : Date.now();
   const previousSelection = telemetrySelectedMeshId;
   const preferredMesh = previousSelection || targetMeshKey;

@@ -15,6 +15,7 @@ const MAX_LOG_ENTRIES = 200;
 const APRS_HISTORY_MAX = 5000;
 const APRS_RECORD_HISTORY_MAX = 5000;
 const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
+const DEFAULT_TELEMETRY_MAX_TOTAL_RECORDS = 4000;
 const MESSAGE_MAX_PER_CHANNEL = 200;
 const MESSAGE_PERSIST_INTERVAL_MS = 2000;
 const CHANNEL_CONFIG = [
@@ -129,8 +130,13 @@ class WebDashboardServer {
       Number.isFinite(options.telemetryMaxPerNode) && options.telemetryMaxPerNode > 0
         ? Math.floor(options.telemetryMaxPerNode)
         : DEFAULT_TELEMETRY_MAX_PER_NODE;
+    this.telemetryMaxTotalRecords =
+      Number.isFinite(options.telemetryMaxTotalRecords) && options.telemetryMaxTotalRecords > 0
+        ? Math.floor(options.telemetryMaxTotalRecords)
+        : DEFAULT_TELEMETRY_MAX_TOTAL_RECORDS;
     this.telemetryStore = new Map();
     this.telemetryRecordIds = new Set();
+    this.telemetryRecordOrder = [];
     this.telemetryUpdatedAt = null;
     this.telemetryStats = {
       totalRecords: 0,
@@ -282,6 +288,7 @@ class WebDashboardServer {
     if (payload.type === 'reset') {
       this.telemetryStore.clear();
       this.telemetryRecordIds.clear();
+      this.telemetryRecordOrder = [];
       this.telemetryUpdatedAt =
         Number.isFinite(payload.updatedAt) && payload.updatedAt > 0
           ? Number(payload.updatedAt)
@@ -326,6 +333,7 @@ class WebDashboardServer {
   seedTelemetrySnapshot(snapshot = {}) {
     this.telemetryStore.clear();
     this.telemetryRecordIds.clear();
+    this.telemetryRecordOrder = [];
 
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
     for (const node of nodes) {
@@ -678,6 +686,18 @@ class WebDashboardServer {
     if (mergedNode) {
       record.node = mergeNodeInfo(record.node ? sanitizeTelemetryNode(record.node) : {}, mergedNode);
     }
+    const sampleMs = Number.isFinite(record.sampleTimeMs)
+      ? Number(record.sampleTimeMs)
+      : Number.isFinite(record.timestampMs)
+        ? Number(record.timestampMs)
+        : Date.now();
+    record.sampleTimeMs = Number.isFinite(sampleMs) ? sampleMs : Date.now();
+    if (!Number.isFinite(record.timestampMs)) {
+      record.timestampMs = record.sampleTimeMs;
+    }
+    if (!record.id) {
+      record.id = `${key}-${record.sampleTimeMs}-${Math.random().toString(16).slice(2, 10)}`;
+    }
     if (record.id) {
       this.telemetryRecordIds.add(record.id);
     }
@@ -688,7 +708,62 @@ class WebDashboardServer {
       for (const item of removed) {
         if (item?.id) {
           this.telemetryRecordIds.delete(item.id);
+          this._removeTelemetryOrderEntry(key, item.id);
         }
+      }
+    }
+    if (record.id) {
+      this._trackTelemetryRecord(key, record.id);
+    }
+    this._enforceTelemetryGlobalLimit();
+  }
+
+  _trackTelemetryRecord(meshKey, recordId) {
+    if (!recordId) {
+      return;
+    }
+    this.telemetryRecordOrder.push({ meshId: meshKey, recordId });
+  }
+
+  _removeTelemetryOrderEntry(meshKey, recordId) {
+    if (!recordId || this.telemetryRecordOrder.length === 0) {
+      return;
+    }
+    for (let i = this.telemetryRecordOrder.length - 1; i >= 0; i -= 1) {
+      const entry = this.telemetryRecordOrder[i];
+      if (entry.recordId === recordId && (meshKey == null || entry.meshId === meshKey)) {
+        this.telemetryRecordOrder.splice(i, 1);
+        break;
+      }
+    }
+  }
+
+  _enforceTelemetryGlobalLimit() {
+    const maxTotal = this.telemetryMaxTotalRecords;
+    if (!Number.isFinite(maxTotal) || maxTotal <= 0) {
+      return;
+    }
+    while (this.telemetryRecordOrder.length > maxTotal) {
+      const oldest = this.telemetryRecordOrder.shift();
+      if (!oldest) {
+        break;
+      }
+      const bucket = this.telemetryStore.get(oldest.meshId);
+      if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+        this.telemetryRecordIds.delete(oldest.recordId);
+        continue;
+      }
+      const index = bucket.records.findIndex((item) => item?.id === oldest.recordId);
+      if (index === -1) {
+        this.telemetryRecordIds.delete(oldest.recordId);
+        continue;
+      }
+      const [removed] = bucket.records.splice(index, 1);
+      if (removed?.id) {
+        this.telemetryRecordIds.delete(removed.id);
+      }
+      if (!bucket.records.length) {
+        this.telemetryStore.delete(oldest.meshId);
       }
     }
   }
