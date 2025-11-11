@@ -1323,6 +1323,67 @@ ipcMain.handle('telemetry:get-snapshot', async (_event, options = {}) => {
   }
 });
 
+ipcMain.handle('telemetry:get-available', async () => {
+  const fallback = {
+    updatedAt: Date.now(),
+    nodes: [],
+    stats: {
+      totalRecords: 0,
+      totalNodes: 0,
+      diskBytes: 0
+    }
+  };
+  if (!bridge) {
+    return fallback;
+  }
+  try {
+    return bridge.getTelemetryNodesSummary();
+  } catch (err) {
+    console.error('取得遙測節點清單失敗:', err);
+    return fallback;
+  }
+});
+
+ipcMain.handle('telemetry:fetch-range', async (_event, options = {}) => {
+  const meshId = options?.meshId || options?.mesh_id || null;
+  const fallback = {
+    meshId,
+    rawMeshId: meshId,
+    meshIdNormalized: meshId,
+    node: null,
+    records: [],
+    totalRecords: 0,
+    filteredCount: 0,
+    latestSampleMs: null,
+    earliestSampleMs: null,
+    availableMetrics: [],
+    range: {
+      startMs: options?.startMs ?? options?.start ?? null,
+      endMs: options?.endMs ?? options?.end ?? null
+    },
+    requestedLimit: options?.limit ?? null,
+    updatedAt: Date.now(),
+    stats: {
+      totalRecords: 0,
+      totalNodes: 0,
+      diskBytes: 0
+    },
+    error: bridge ? null : 'bridge not initialised'
+  };
+  if (!bridge) {
+    return fallback;
+  }
+  try {
+    return bridge.getTelemetryRecordsForRange(options);
+  } catch (err) {
+    console.error('取得遙測範圍資料失敗:', err);
+    return {
+      ...fallback,
+      error: err.message || 'unknown error'
+    };
+  }
+});
+
 ipcMain.handle('telemetry:clear', async () => {
   if (!bridge) {
     return { success: false, error: 'bridge not initialised' };

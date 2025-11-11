@@ -277,6 +277,10 @@ const telemetryNodeDisplayByMesh = new Map();
 let telemetryNodeOptions = [];
 let telemetryDropdownVisible = false;
 let telemetryDropdownInteracting = false;
+let telemetryLoading = false;
+let telemetryLoadingMeshId = null;
+let telemetryFetchToken = 0;
+let telemetrySummaryUpdatedAt = null;
 const nodeRegistry = new Map();
 
 function isIgnoredMeshId(meshId) {
@@ -1990,6 +1994,7 @@ function handleTelemetryRangeInputChange() {
   updateTelemetryRangeInputs();
   refreshTelemetrySelectors(telemetrySelectedMeshId);
   renderTelemetryView();
+  void loadTelemetryRecordsForSelection(telemetrySelectedMeshId, { force: true });
 }
 
 telemetryRangeStartInput?.addEventListener('change', handleTelemetryRangeInputChange);
@@ -4381,6 +4386,7 @@ function applyTelemetryNodeSelection(meshId, { preserveSearch = false, hideDropd
   } else {
     renderTelemetryDropdown();
   }
+  void loadTelemetryRecordsForSelection(meshId);
 }
 
 function handleTelemetryNodeNavigationKey(event) {
@@ -4888,6 +4894,259 @@ function applyTelemetrySnapshot(snapshot) {
   updateTelemetryStats(snapshot?.stats);
 }
 
+async function refreshTelemetryAvailability() {
+  if (!window.meshtastic.getTelemetryAvailableNodes) {
+    return;
+  }
+  try {
+    const summary = await window.meshtastic.getTelemetryAvailableNodes();
+    applyTelemetryAvailability(summary);
+  } catch (err) {
+    console.warn('取得遙測節點清單失敗:', err);
+  }
+}
+
+function applyTelemetryAvailability(summary) {
+  const nodes = Array.isArray(summary?.nodes) ? summary.nodes : [];
+  telemetrySummaryUpdatedAt =
+    Number.isFinite(summary?.updatedAt) && summary.updatedAt > 0
+      ? Number(summary.updatedAt)
+      : Date.now();
+
+  const seenKeys = new Set();
+  for (const entry of nodes) {
+    if (!entry) continue;
+    const meshCandidate = entry.meshId || entry.meshIdNormalized || entry.rawMeshId;
+    if (!meshCandidate) {
+      continue;
+    }
+    const meshKey = resolveTelemetryMeshKey(meshCandidate);
+    const nodeInfo = sanitizeTelemetryNode(entry.node);
+    let bucket = telemetryStore.get(meshKey);
+    if (!bucket) {
+      bucket = {
+        meshId: meshKey,
+        rawMeshId: entry.rawMeshId || meshCandidate,
+        node: nodeInfo,
+        records: [],
+        recordIdSet: new Set(),
+        loadedRange: null,
+        totalRecords: 0,
+        metrics: new Set(),
+        latestSampleMs: null,
+        earliestSampleMs: null
+      };
+      telemetryStore.set(meshKey, bucket);
+    } else {
+      if (!Array.isArray(bucket.records)) {
+        bucket.records = [];
+      }
+      if (!bucket.recordIdSet) {
+        bucket.recordIdSet = new Set();
+      }
+      if (entry.rawMeshId && !bucket.rawMeshId) {
+        bucket.rawMeshId = entry.rawMeshId;
+      }
+      if (nodeInfo) {
+        bucket.node = mergeNodeMetadata(bucket.node, nodeInfo);
+      }
+    }
+
+    bucket.totalRecords = Number.isFinite(entry.totalRecords)
+      ? Number(entry.totalRecords)
+      : Array.isArray(bucket.records)
+        ? bucket.records.length
+        : 0;
+    if (!bucket.metrics) {
+      bucket.metrics = new Set();
+    }
+    if (Array.isArray(entry.availableMetrics)) {
+      for (const metricKey of entry.availableMetrics) {
+        bucket.metrics.add(metricKey);
+      }
+    }
+    const latest = Number.isFinite(entry.latestSampleMs) ? Number(entry.latestSampleMs) : null;
+    if (latest != null) {
+      bucket.latestSampleMs =
+        bucket.latestSampleMs == null ? latest : Math.max(bucket.latestSampleMs, latest);
+    }
+    const earliest = Number.isFinite(entry.earliestSampleMs) ? Number(entry.earliestSampleMs) : null;
+    if (earliest != null) {
+      bucket.earliestSampleMs =
+        bucket.earliestSampleMs == null ? earliest : Math.min(bucket.earliestSampleMs, earliest);
+    }
+    seenKeys.add(meshKey);
+  }
+
+  updateTelemetryStats(summary?.stats);
+  if (!telemetrySelectedMeshId && !telemetryLastExplicitMeshId && nodes.length) {
+    telemetrySelectedMeshId = resolveTelemetryMeshKey(
+      nodes[0].meshId || nodes[0].meshIdNormalized || nodes[0].rawMeshId
+    );
+    telemetryLastExplicitMeshId = telemetrySelectedMeshId;
+  }
+  refreshTelemetrySelectors(telemetrySelectedMeshId);
+  updateTelemetryUpdatedAtLabel();
+}
+
+async function loadTelemetryRecordsForSelection(meshId = telemetrySelectedMeshId, { force = false } = {}) {
+  if (!meshId || !window.meshtastic.fetchTelemetryRange) {
+    return;
+  }
+  const meshKey = resolveTelemetryMeshKey(meshId);
+  const bucket = telemetryStore.get(meshKey);
+  const { startMs, endMs } = getTelemetryRangeWindow();
+  const effectiveStart = startMs != null ? Math.floor(startMs) : null;
+  const effectiveEnd = endMs != null ? Math.floor(endMs) : null;
+  const fetchKey = `${meshKey}:${effectiveStart ?? ''}:${effectiveEnd ?? ''}`;
+
+  if (
+    !force &&
+    bucket &&
+    bucket.loadedRange &&
+    bucket.loadedRange.startMs === effectiveStart &&
+    bucket.loadedRange.endMs === effectiveEnd &&
+    Array.isArray(bucket.records) &&
+    bucket.records.length
+  ) {
+    telemetrySelectedMeshId = meshKey;
+    telemetryLastExplicitMeshId = meshKey;
+    telemetryLoading = false;
+    telemetryLoadingMeshId = null;
+    renderTelemetryView();
+    return;
+  }
+
+  const currentToken = ++telemetryFetchToken;
+  telemetryLoading = true;
+  telemetryLoadingMeshId = meshKey;
+  renderTelemetryView();
+
+  try {
+    const payload = await window.meshtastic.fetchTelemetryRange({
+      meshId,
+      startMs: effectiveStart,
+      endMs: effectiveEnd,
+      limit: TELEMETRY_MAX_LOCAL_RECORDS
+    });
+    if (currentToken !== telemetryFetchToken) {
+      return;
+    }
+    if (payload?.error) {
+      throw new Error(payload.error);
+    }
+    const sanitizedNode = sanitizeTelemetryNode(payload?.node);
+    let targetBucket = telemetryStore.get(meshKey);
+    if (!targetBucket) {
+      targetBucket = {
+        meshId: meshKey,
+        rawMeshId: payload?.rawMeshId || meshId,
+        node: sanitizedNode,
+        records: [],
+        recordIdSet: new Set(),
+        loadedRange: null,
+        totalRecords: 0,
+        metrics: new Set(),
+        latestSampleMs: null,
+        earliestSampleMs: null
+      };
+      telemetryStore.set(meshKey, targetBucket);
+    } else {
+      if (!Array.isArray(targetBucket.records)) {
+        targetBucket.records = [];
+      }
+      if (!targetBucket.recordIdSet) {
+        targetBucket.recordIdSet = new Set();
+      }
+      if (payload?.rawMeshId && !targetBucket.rawMeshId) {
+        targetBucket.rawMeshId = payload.rawMeshId;
+      }
+      if (sanitizedNode) {
+        targetBucket.node = mergeNodeMetadata(targetBucket.node, sanitizedNode);
+      }
+    }
+
+    if (Array.isArray(targetBucket.records)) {
+      for (const existing of targetBucket.records) {
+        if (existing?.id) {
+          telemetryRecordIds.delete(existing.id);
+          targetBucket.recordIdSet?.delete(existing.id);
+          removeTelemetryOrderEntry(meshKey, existing.id);
+        }
+      }
+    }
+
+    const fetchedRecords = Array.isArray(payload?.records) ? payload.records : [];
+    const sanitizedRecords = fetchedRecords
+      .map((raw) => sanitizeTelemetryRecord(raw, meshKey))
+      .filter(Boolean);
+    sanitizedRecords.sort((a, b) => a.sampleTimeMs - b.sampleTimeMs);
+    if (sanitizedRecords.length > TELEMETRY_MAX_LOCAL_RECORDS) {
+      sanitizedRecords.splice(0, sanitizedRecords.length - TELEMETRY_MAX_LOCAL_RECORDS);
+    }
+    targetBucket.records = sanitizedRecords;
+    targetBucket.recordIdSet = new Set();
+    for (const record of sanitizedRecords) {
+      if (record?.id) {
+        targetBucket.recordIdSet.add(record.id);
+        telemetryRecordIds.add(record.id);
+        trackTelemetryRecord(meshKey, record.id);
+      }
+    }
+    enforceTelemetryGlobalLimit();
+
+    targetBucket.loadedRange = {
+      startMs: effectiveStart,
+      endMs: effectiveEnd
+    };
+    if (!targetBucket.metrics) {
+      targetBucket.metrics = new Set();
+    }
+    if (Array.isArray(payload?.availableMetrics)) {
+      for (const metricKey of payload.availableMetrics) {
+        targetBucket.metrics.add(metricKey);
+      }
+    }
+    targetBucket.totalRecords = Number.isFinite(payload?.totalRecords)
+      ? Number(payload.totalRecords)
+      : sanitizedRecords.length;
+    targetBucket.latestSampleMs = Number.isFinite(payload?.latestSampleMs)
+      ? Number(payload.latestSampleMs)
+      : (sanitizedRecords.length
+          ? sanitizedRecords[sanitizedRecords.length - 1].sampleTimeMs
+          : targetBucket.latestSampleMs ?? null);
+    targetBucket.earliestSampleMs = Number.isFinite(payload?.earliestSampleMs)
+      ? Number(payload.earliestSampleMs)
+      : (sanitizedRecords.length ? sanitizedRecords[0].sampleTimeMs : targetBucket.earliestSampleMs ?? null);
+
+    telemetrySelectedMeshId = meshKey;
+    telemetryLastExplicitMeshId = meshKey;
+    telemetryLoading = false;
+    telemetryLoadingMeshId = null;
+    telemetryUpdatedAt =
+      Number.isFinite(payload?.updatedAt) && payload.updatedAt > 0
+        ? Number(payload.updatedAt)
+        : Date.now();
+    updateTelemetryStats(payload?.stats);
+    refreshTelemetrySelectors(meshKey);
+    updateTelemetryNodeInputDisplay();
+    renderTelemetryView();
+    updateTelemetryUpdatedAtLabel();
+  } catch (err) {
+    if (currentToken !== telemetryFetchToken) {
+      return;
+    }
+    telemetryLoading = false;
+    telemetryLoadingMeshId = null;
+    console.error('載入遙測資料失敗:', err);
+    if (telemetryEmptyState) {
+      telemetryEmptyState.classList.remove('hidden');
+      telemetryEmptyState.textContent = `載入遙測資料失敗：${err.message}`;
+    }
+    renderTelemetryView();
+  }
+}
+
 function handleTelemetryEvent(payload) {
   if (!payload || typeof payload !== 'object') {
     return;
@@ -4934,41 +5193,90 @@ function appendTelemetryRecord(meshId, rawRecord, rawNode, updatedAt, maxTotalRe
       meshId: targetMeshKey,
       rawMeshId,
       node: nodeInfo,
-      records: []
+      records: [],
+      recordIdSet: new Set(),
+      loadedRange: null,
+      totalRecords: 0,
+      metrics: new Set(),
+      latestSampleMs: null,
+      earliestSampleMs: null
     };
     telemetryStore.set(targetMeshKey, bucket);
   } else if (nodeInfo) {
-    bucket.node = {
-      ...bucket.node,
-      ...nodeInfo
-    };
+    bucket.node = mergeNodeMetadata(bucket.node, nodeInfo);
   }
-  bucket.records.push(sanitizedRecord);
-  telemetryRecordIds.add(sanitizedRecord.id);
-  if (bucket.records.length > TELEMETRY_MAX_LOCAL_RECORDS) {
-    const excess = bucket.records.length - TELEMETRY_MAX_LOCAL_RECORDS;
-    const removed = bucket.records.splice(0, excess);
-    removed.forEach((item) => {
-      if (!item) {
-        return;
-      }
-      telemetryRecordIds.delete(item.id);
-      removeTelemetryOrderEntry(targetMeshKey, item.id);
-    });
+
+  if (!Array.isArray(bucket.records)) {
+    bucket.records = [];
   }
-  trackTelemetryRecord(targetMeshKey, sanitizedRecord.id);
-  enforceTelemetryGlobalLimit();
+  if (!bucket.recordIdSet) {
+    bucket.recordIdSet = new Set();
+  }
+  if (!(bucket.metrics instanceof Set)) {
+    bucket.metrics = new Set(bucket.metrics || []);
+  }
+
+  const metrics = sanitizedRecord.telemetry?.metrics;
+  if (metrics && typeof metrics === 'object') {
+    for (const key of Object.keys(metrics)) {
+      bucket.metrics.add(key);
+    }
+  }
+
+  const currentTotal = Number.isFinite(bucket.totalRecords)
+    ? Number(bucket.totalRecords)
+    : bucket.records.length;
+  bucket.totalRecords = currentTotal + 1;
+
+  const sampleTime = Number(sanitizedRecord.sampleTimeMs);
+  if (Number.isFinite(sampleTime)) {
+    bucket.latestSampleMs =
+      bucket.latestSampleMs == null ? sampleTime : Math.max(bucket.latestSampleMs, sampleTime);
+    bucket.earliestSampleMs =
+      bucket.earliestSampleMs == null ? sampleTime : Math.min(bucket.earliestSampleMs, sampleTime);
+  }
+
+  const loadedRange = bucket.loadedRange || null;
+  let shouldStore = false;
+  if (loadedRange) {
+    const startLimit = Number.isFinite(loadedRange.startMs) ? Number(loadedRange.startMs) : null;
+    const endLimit = Number.isFinite(loadedRange.endMs) ? Number(loadedRange.endMs) : null;
+    const withinStart = startLimit == null || !Number.isFinite(sampleTime) || sampleTime >= startLimit;
+    const withinEnd = endLimit == null || !Number.isFinite(sampleTime) || sampleTime <= endLimit;
+    shouldStore = withinStart && withinEnd;
+  } else if (telemetrySelectedMeshId === targetMeshKey) {
+    const { startMs, endMs } = getTelemetryRangeWindow();
+    const withinStart = startMs == null || !Number.isFinite(sampleTime) || sampleTime >= startMs;
+    const withinEnd = endMs == null || !Number.isFinite(sampleTime) || sampleTime <= endMs;
+    shouldStore = withinStart && withinEnd;
+  }
+
+  if (shouldStore) {
+    bucket.records.push(sanitizedRecord);
+    telemetryRecordIds.add(sanitizedRecord.id);
+    bucket.recordIdSet.add(sanitizedRecord.id);
+    if (bucket.records.length > TELEMETRY_MAX_LOCAL_RECORDS) {
+      const excess = bucket.records.length - TELEMETRY_MAX_LOCAL_RECORDS;
+      const removed = bucket.records.splice(0, excess);
+      removed.forEach((item) => {
+        if (!item) {
+          return;
+        }
+        telemetryRecordIds.delete(item.id);
+        bucket.recordIdSet.delete(item.id);
+        removeTelemetryOrderEntry(targetMeshKey, item.id);
+      });
+    }
+    trackTelemetryRecord(targetMeshKey, sanitizedRecord.id);
+    enforceTelemetryGlobalLimit();
+  }
+
   telemetryUpdatedAt = Number.isFinite(updatedAt) ? Number(updatedAt) : Date.now();
-  const previousSelection = telemetrySelectedMeshId;
-  const preferredMesh = previousSelection || targetMeshKey;
+  const preferredMesh = telemetrySelectedMeshId || targetMeshKey;
   refreshTelemetrySelectors(preferredMesh);
-  if (!telemetrySearchRaw && !telemetrySelectedMeshId && preferredMesh) {
-    telemetrySelectedMeshId = preferredMesh;
-    telemetryLastExplicitMeshId = preferredMesh;
-    updateTelemetryNodeInputDisplay();
-    renderTelemetryDropdown();
+  if (telemetrySelectedMeshId === targetMeshKey && shouldStore) {
+    renderTelemetryView();
   }
-  renderTelemetryView();
   updateTelemetryUpdatedAtLabel();
 }
 
@@ -4983,37 +5291,59 @@ function refreshTelemetrySelectors(preferredMeshId = null) {
 
   const nodes = Array.from(telemetryStore.values())
     .map((bucket) => {
-      if (!Array.isArray(bucket.records) || !bucket.records.length) {
-        return null;
-      }
-      const metricKeys = new Set();
-      let latestTime = null;
-      for (const record of bucket.records) {
-        const time = Number(record.sampleTimeMs);
-        if (!Number.isFinite(time)) {
-          continue;
-        }
-        if (startMs != null && time < startMs) {
-          continue;
-        }
-        if (endMs != null && time > endMs) {
-          continue;
-        }
-        const metrics = record.telemetry?.metrics;
-        if (metrics && typeof metrics === 'object') {
-          for (const key of Object.keys(metrics)) {
-            metricKeys.add(key);
-          }
-        }
-        if (latestTime == null || time > latestTime) {
-          latestTime = time;
-        }
-      }
-      if (!metricKeys.size) {
+      if (!bucket) {
         return null;
       }
       const meshKey = bucket.meshId || resolveTelemetryMeshKey(bucket.rawMeshId);
-      const rawMeshId = bucket.rawMeshId || meshKey || 'unknown';
+      if (!meshKey) {
+        return null;
+      }
+      const rawMeshId = bucket.rawMeshId || meshKey;
+      const metricKeys = new Set();
+      if (bucket.metrics instanceof Set) {
+        for (const key of bucket.metrics) {
+          metricKeys.add(key);
+        }
+      } else if (Array.isArray(bucket.metrics)) {
+        for (const key of bucket.metrics) {
+          metricKeys.add(key);
+        }
+      }
+
+      let latestTime = Number.isFinite(bucket.latestSampleMs) ? Number(bucket.latestSampleMs) : null;
+      let earliestTime = Number.isFinite(bucket.earliestSampleMs) ? Number(bucket.earliestSampleMs) : null;
+
+      if (Array.isArray(bucket.records)) {
+        for (const record of bucket.records) {
+          const time = Number(record.sampleTimeMs);
+          if (Number.isFinite(time)) {
+            if (latestTime == null || time > latestTime) {
+              latestTime = time;
+            }
+            if (earliestTime == null || time < earliestTime) {
+              earliestTime = time;
+            }
+          }
+          const metrics = record.telemetry?.metrics;
+          if (metrics && typeof metrics === 'object') {
+            for (const key of Object.keys(metrics)) {
+              metricKeys.add(key);
+            }
+          }
+        }
+      }
+
+      if (!metricKeys.size) {
+        return null;
+      }
+
+      if (startMs != null && latestTime != null && latestTime < startMs) {
+        return null;
+      }
+      if (endMs != null && earliestTime != null && earliestTime > endMs) {
+        return null;
+      }
+
       const nodeInfo = bucket.node || {};
       const displayNode = {
         ...nodeInfo,
@@ -5023,12 +5353,19 @@ function refreshTelemetrySelectors(preferredMeshId = null) {
         label: nodeInfo.label || nodeInfo.longName || rawMeshId
       };
       const label = formatNodeDisplay(displayNode);
+      const totalRecords = Number.isFinite(bucket.totalRecords)
+        ? Number(bucket.totalRecords)
+        : Array.isArray(bucket.records)
+          ? bucket.records.length
+          : 0;
+
       return {
         meshId: meshKey,
         rawMeshId,
         label,
         count: metricKeys.size,
-        latestMs: Number.isFinite(latestTime) ? latestTime : null
+        latestMs: Number.isFinite(latestTime) ? latestTime : null,
+        totalRecords
       };
     })
     .filter(Boolean);
@@ -5225,6 +5562,16 @@ function renderTelemetryView() {
     renderTelemetryDropdown();
   }
   const baseRecords = getTelemetryRecordsForSelection();
+  if (
+    telemetryLoading &&
+    (!Array.isArray(baseRecords) || baseRecords.length === 0)
+  ) {
+    telemetryEmptyState.classList.remove('hidden');
+    telemetryEmptyState.textContent = '正在載入遙測資料...';
+    telemetryChartsContainer?.classList.add('hidden');
+    telemetryTableWrapper?.classList.add('hidden');
+    return;
+  }
   const filteredRecords = applyTelemetryFilters(baseRecords);
   const searchFilteredRecords = filterTelemetryBySearch(filteredRecords);
   const hasData = searchFilteredRecords.length > 0;
@@ -5868,6 +6215,7 @@ function setTelemetryRangeMode(mode, { skipRender = false } = {}) {
   if (!skipRender) {
     renderTelemetryView();
   }
+  void loadTelemetryRecordsForSelection(telemetrySelectedMeshId, { force: true });
 }
 
 function setTelemetryChartMode(mode, { skipRender = false } = {}) {
@@ -5970,14 +6318,20 @@ function applyTelemetryFilters(records) {
 }
 
 async function initializeTelemetry() {
-  if (!window.meshtastic.getTelemetrySnapshot) {
+  if (!window.meshtastic.getTelemetryAvailableNodes) {
     return;
   }
   try {
-    const snapshot = await window.meshtastic.getTelemetrySnapshot({
-      limitPerNode: TELEMETRY_MAX_LOCAL_RECORDS
-    });
-    applyTelemetrySnapshot(snapshot);
+    await refreshTelemetryAvailability();
+    const initialMeshId =
+      telemetrySelectedMeshId ||
+      telemetryLastExplicitMeshId ||
+      getFirstTelemetryMeshId();
+    if (initialMeshId) {
+      await loadTelemetryRecordsForSelection(initialMeshId, { force: true });
+    } else {
+      renderTelemetryView();
+    }
   } catch (err) {
     console.warn('載入遙測資料失敗:', err);
   }

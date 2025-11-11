@@ -175,6 +175,10 @@ class WebDashboardServer {
         this._handleEventStream(req, res);
         return;
       }
+      if (pathname === '/api/telemetry') {
+        this._handleTelemetryRequest(req, res);
+        return;
+      }
       if (pathname === '/debug') {
         this._handleDebugRequest(req, res);
         return;
@@ -650,6 +654,113 @@ class WebDashboardServer {
     });
   }
 
+  _handleTelemetryRequest(req, res) {
+    if (!req.method || req.method.toUpperCase() !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Method Not Allowed', allowed: ['GET'] }));
+      return;
+    }
+    let url;
+    try {
+      url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Invalid URL' }));
+      return;
+    }
+    const meshIdParam = url.searchParams.get('meshId') || url.searchParams.get('mesh_id');
+    if (!meshIdParam) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'meshId is required' }));
+      return;
+    }
+    const { bucket, key } = this._findTelemetryBucket(meshIdParam);
+    if (!bucket) {
+      res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Telemetry not found for provided meshId' }));
+      return;
+    }
+    const startRaw = url.searchParams.get('startMs') ?? url.searchParams.get('start');
+    const endRaw = url.searchParams.get('endMs') ?? url.searchParams.get('end');
+    const limitRaw = url.searchParams.get('limit');
+    const startMs = Number.isFinite(Number(startRaw)) ? Number(startRaw) : null;
+    const endMs = Number.isFinite(Number(endRaw)) ? Number(endRaw) : null;
+    if (startMs != null && endMs != null && startMs > endMs) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'startMs must be less than or equal to endMs' }));
+      return;
+    }
+    const limit =
+      Number.isFinite(Number(limitRaw)) && Number(limitRaw) > 0 ? Math.floor(Number(limitRaw)) : null;
+
+    const records = Array.isArray(bucket.records) ? bucket.records : [];
+    const filtered = records.filter((record) => {
+      const sample = Number(record?.sampleTimeMs);
+      if (!Number.isFinite(sample)) {
+        return false;
+      }
+      if (startMs != null && sample < startMs) {
+        return false;
+      }
+      if (endMs != null && sample > endMs) {
+        return false;
+      }
+      return true;
+    });
+
+    const sorted = filtered.slice().sort((a, b) => a.sampleTimeMs - b.sampleTimeMs);
+    const limited =
+      limit && sorted.length > limit ? sorted.slice(sorted.length - limit) : sorted;
+    const clonedRecords = limited.map((record) => cloneJson(record));
+
+    let filteredLatestMs = null;
+    let filteredEarliestMs = null;
+    const metricsSet = new Set();
+    for (const record of clonedRecords) {
+      const sample = Number(record?.sampleTimeMs);
+      if (Number.isFinite(sample)) {
+        if (filteredLatestMs == null || sample > filteredLatestMs) {
+          filteredLatestMs = sample;
+        }
+        if (filteredEarliestMs == null || sample < filteredEarliestMs) {
+          filteredEarliestMs = sample;
+        }
+      }
+      const metrics = record?.telemetry?.metrics;
+      if (metrics && typeof metrics === 'object') {
+        for (const metricKey of Object.keys(metrics)) {
+          metricsSet.add(metricKey);
+        }
+      }
+    }
+
+    const response = {
+      meshId: bucket.meshId,
+      rawMeshId: bucket.rawMeshId || bucket.meshId,
+      meshIdNormalized: normalizeMeshId(bucket.meshId),
+      node: bucket.node ? cloneJson(bucket.node) : null,
+      records: clonedRecords,
+      totalRecords: records.length,
+      filteredCount: clonedRecords.length,
+      latestSampleMs: filteredLatestMs != null ? filteredLatestMs : null,
+      earliestSampleMs: filteredEarliestMs != null ? filteredEarliestMs : null,
+      availableMetrics: Array.from(metricsSet),
+      range: {
+        startMs: startMs != null ? startMs : null,
+        endMs: endMs != null ? endMs : null
+      },
+      requestedLimit: limit,
+      updatedAt: this.telemetryUpdatedAt,
+      sourceKey: key
+    };
+
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store, max-age=0'
+    });
+    res.end(JSON.stringify(response));
+  }
+
   _appendTelemetryRecord(meshId, node, record) {
     if (!meshId || !record) {
       return;
@@ -674,15 +785,20 @@ class WebDashboardServer {
       record.node ? sanitizeTelemetryNode(record.node) : null,
       registryNode
     );
+    const rawMeshId = record.rawMeshId || record.meshId || meshId;
     if (!bucket) {
       bucket = {
         meshId: key,
+        rawMeshId: rawMeshId || meshId,
         node: mergedNode,
         records: []
       };
       this.telemetryStore.set(key, bucket);
     } else if (mergedNode) {
       bucket.node = mergedNode;
+    }
+    if (rawMeshId && !bucket.rawMeshId) {
+      bucket.rawMeshId = rawMeshId;
     }
     if (mergedNode) {
       record.node = mergeNodeInfo(record.node ? sanitizeTelemetryNode(record.node) : {}, mergedNode);
@@ -717,6 +833,28 @@ class WebDashboardServer {
       this._trackTelemetryRecord(key, record.id);
     }
     this._enforceTelemetryGlobalLimit();
+  }
+
+  _findTelemetryBucket(meshId) {
+    if (!meshId) {
+      return { bucket: null, key: null };
+    }
+    if (this.telemetryStore.has(meshId)) {
+      return { bucket: this.telemetryStore.get(meshId), key: meshId };
+    }
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) {
+      return { bucket: null, key: null };
+    }
+    for (const [key, bucket] of this.telemetryStore.entries()) {
+      if (!bucket) continue;
+      const keyNormalized = normalizeMeshId(key);
+      const rawNormalized = normalizeMeshId(bucket.rawMeshId);
+      if (keyNormalized === normalized || rawNormalized === normalized) {
+        return { bucket, key };
+      }
+    }
+    return { bucket: null, key: null };
   }
 
   _trackTelemetryRecord(meshKey, recordId) {
@@ -772,20 +910,38 @@ class WebDashboardServer {
   _buildTelemetrySnapshot(limitPerNode = this.telemetryMaxPerNode) {
     const nodes = [];
     for (const bucket of this.telemetryStore.values()) {
-      if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+      if (!bucket) {
         continue;
       }
-      const records = bucket.records;
-      const limit =
-        Number.isFinite(limitPerNode) && limitPerNode > 0
-          ? Math.floor(limitPerNode)
-          : records.length;
-      const start = records.length > limit ? records.length - limit : 0;
-      const slice = records.slice(start).map((record) => cloneJson(record));
+      const records = Array.isArray(bucket.records) ? bucket.records : [];
+      let latestSampleMs = null;
+      let earliestSampleMs = null;
+      const metricsSet = new Set();
+      for (const record of records) {
+        const sample = Number(record?.sampleTimeMs);
+        if (Number.isFinite(sample)) {
+          if (latestSampleMs == null || sample > latestSampleMs) {
+            latestSampleMs = sample;
+          }
+          if (earliestSampleMs == null || sample < earliestSampleMs) {
+            earliestSampleMs = sample;
+          }
+        }
+        const metrics = record?.telemetry?.metrics;
+        if (metrics && typeof metrics === 'object') {
+          for (const key of Object.keys(metrics)) {
+            metricsSet.add(key);
+          }
+        }
+      }
       nodes.push({
         meshId: bucket.meshId,
+        rawMeshId: bucket.rawMeshId || bucket.meshId,
         node: bucket.node ? cloneJson(bucket.node) : null,
-        records: slice
+        totalRecords: records.length,
+        latestSampleMs,
+        earliestSampleMs,
+        metrics: Array.from(metricsSet)
       });
     }
     nodes.sort((a, b) => {
