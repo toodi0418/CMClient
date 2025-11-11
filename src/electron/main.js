@@ -50,6 +50,19 @@ function getMessageLogPath() {
   return path.join(getCallMeshDataDir(), MESSAGE_LOG_FILENAME);
 }
 
+function resolveTelemetryMaxTotalRecords() {
+  const raw = process.env.TMAG_WEB_TELEMETRY_MAX_TOTAL;
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(`TMAG_WEB_TELEMETRY_MAX_TOTAL 必須為正整數，已忽略：${raw}`);
+    return undefined;
+  }
+  return Math.floor(value);
+}
+
 function sanitizeMessageNodeForPersist(node) {
   if (!node || typeof node !== 'object') {
     return null;
@@ -686,10 +699,16 @@ async function startWebDashboard() {
     return true;
   }
   try {
-    const server = new WebDashboardServer({
+    const options = {
       appVersion,
-      relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json')
-    });
+      relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json'),
+      messageLogPath: getMessageLogPath()
+    };
+    const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
+    if (telemetryMaxTotalOverride) {
+      options.telemetryMaxTotalRecords = telemetryMaxTotalOverride;
+    }
+    const server = new WebDashboardServer(options);
     await server.start();
     server.setAppVersion(appVersion);
     webServer = server;

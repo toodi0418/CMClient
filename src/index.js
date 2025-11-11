@@ -75,6 +75,19 @@ function tryPublishWebMessage(webServer, summary) {
   }
 }
 
+function resolveTelemetryMaxTotalRecords() {
+  const raw = process.env.TMAG_WEB_TELEMETRY_MAX_TOTAL;
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(`TMAG_WEB_TELEMETRY_MAX_TOTAL 必須為正整數，已忽略：${raw}`);
+    return undefined;
+  }
+  return Math.floor(value);
+}
+
 function toWebCallmeshState(state) {
   if (!state || typeof state !== 'object') {
     return null;
@@ -384,11 +397,16 @@ async function startMonitor(argv) {
 
   if (webUiEnabled && !webServer) {
     try {
-      webServer = new WebDashboardServer({
+      const webDashboardOptions = {
         appVersion: pkg.version || '0.0.0',
         relayStatsPath,
         messageLogPath: getMessageLogPath()
-      });
+      };
+      const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
+      if (telemetryMaxTotalOverride) {
+        webDashboardOptions.telemetryMaxTotalRecords = telemetryMaxTotalOverride;
+      }
+      webServer = new WebDashboardServer(webDashboardOptions);
       await webServer.start();
       webServer.setAppVersion(pkg.version || '0.0.0');
       webServer.publishStatus({ status: 'disconnected' });

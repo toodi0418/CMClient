@@ -15,7 +15,7 @@ const MAX_LOG_ENTRIES = 200;
 const APRS_HISTORY_MAX = 5000;
 const APRS_RECORD_HISTORY_MAX = 5000;
 const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
-const DEFAULT_TELEMETRY_MAX_TOTAL_RECORDS = 4000;
+const DEFAULT_TELEMETRY_MAX_TOTAL_RECORDS = 20000;
 const MESSAGE_MAX_PER_CHANNEL = 200;
 const MESSAGE_PERSIST_INTERVAL_MS = 2000;
 const CHANNEL_CONFIG = [
@@ -296,7 +296,7 @@ class WebDashboardServer {
       const stats = this._computeTelemetryStats();
       this._broadcast({
         type: 'telemetry-reset',
-        payload: { updatedAt: this.telemetryUpdatedAt, stats }
+        payload: { updatedAt: this.telemetryUpdatedAt, stats, maxTotalRecords: this.telemetryMaxTotalRecords }
       });
       return;
     }
@@ -325,7 +325,8 @@ class WebDashboardServer {
         node: nodeInfo,
         record,
         updatedAt: this.telemetryUpdatedAt,
-        stats
+        stats,
+        maxTotalRecords: this.telemetryMaxTotalRecords
       }
     });
   }
@@ -798,7 +799,8 @@ class WebDashboardServer {
     return {
       updatedAt: this.telemetryUpdatedAt,
       nodes,
-      stats
+      stats,
+      maxTotalRecords: this.telemetryMaxTotalRecords
     };
   }
 

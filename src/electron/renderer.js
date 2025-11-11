@@ -243,7 +243,7 @@ const aprsCompletedQueue = [];
 const TELEMETRY_TABLE_LIMIT = 200;
 const TELEMETRY_CHART_LIMIT = 200;
 const TELEMETRY_MAX_LOCAL_RECORDS = 500;
-const TELEMETRY_MAX_TOTAL_RECORDS = 4000;
+let telemetryMaxTotalRecords = 20000;
 const TELEMETRY_METRIC_DEFINITIONS = {
   batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
   voltage: { label: '電壓', unit: 'V', decimals: 2, chart: true },
@@ -4769,11 +4769,19 @@ function removeTelemetryOrderEntry(meshKey, recordId) {
   }
 }
 
-function enforceTelemetryGlobalLimit() {
-  if (!Number.isFinite(TELEMETRY_MAX_TOTAL_RECORDS) || TELEMETRY_MAX_TOTAL_RECORDS <= 0) {
+function updateTelemetryMaxTotalRecords(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
     return;
   }
-  while (telemetryRecordOrder.length > TELEMETRY_MAX_TOTAL_RECORDS) {
+  telemetryMaxTotalRecords = Math.floor(numeric);
+}
+
+function enforceTelemetryGlobalLimit() {
+  if (!Number.isFinite(telemetryMaxTotalRecords) || telemetryMaxTotalRecords <= 0) {
+    return;
+  }
+  while (telemetryRecordOrder.length > telemetryMaxTotalRecords) {
     const oldest = telemetryRecordOrder.shift();
     if (!oldest) {
       break;
@@ -4825,6 +4833,9 @@ function clearTelemetryDataLocal({ silent = false } = {}) {
 function applyTelemetrySnapshot(snapshot) {
   const previousSelection = telemetrySelectedMeshId;
   clearTelemetryDataLocal({ silent: true });
+  if (Number.isFinite(snapshot?.maxTotalRecords) && snapshot.maxTotalRecords > 0) {
+    updateTelemetryMaxTotalRecords(snapshot.maxTotalRecords);
+  }
   if (!snapshot || !Array.isArray(snapshot.nodes)) {
     telemetrySelectedMeshId = null;
     telemetryUpdatedAt = snapshot?.updatedAt ?? telemetryUpdatedAt ?? null;
@@ -4883,18 +4894,30 @@ function handleTelemetryEvent(payload) {
   }
   if (payload.type === 'reset') {
     telemetryUpdatedAt = Number.isFinite(payload.updatedAt) ? Number(payload.updatedAt) : Date.now();
+    if (Number.isFinite(payload.maxTotalRecords) && payload.maxTotalRecords > 0) {
+      updateTelemetryMaxTotalRecords(payload.maxTotalRecords);
+    }
     clearTelemetryDataLocal({ silent: true });
     updateTelemetryUpdatedAtLabel();
     updateTelemetryStats(payload.stats);
     return;
   }
   if (payload.type === 'append') {
-    appendTelemetryRecord(payload.meshId, payload.record, payload.node, payload.updatedAt);
+    appendTelemetryRecord(
+      payload.meshId,
+      payload.record,
+      payload.node,
+      payload.updatedAt,
+      payload.maxTotalRecords
+    );
     updateTelemetryStats(payload.stats);
   }
 }
 
-function appendTelemetryRecord(meshId, rawRecord, rawNode, updatedAt) {
+function appendTelemetryRecord(meshId, rawRecord, rawNode, updatedAt, maxTotalRecords) {
+  if (Number.isFinite(maxTotalRecords) && maxTotalRecords > 0) {
+    updateTelemetryMaxTotalRecords(maxTotalRecords);
+  }
   const sanitizedRecord = sanitizeTelemetryRecord(rawRecord, meshId);
   if (!sanitizedRecord) {
     return;
