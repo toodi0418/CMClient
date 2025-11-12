@@ -400,7 +400,8 @@ async function startMonitor(argv) {
       const webDashboardOptions = {
         appVersion: pkg.version || '0.0.0',
         relayStatsPath,
-        messageLogPath: getMessageLogPath()
+        messageLogPath: getMessageLogPath(),
+        telemetryProvider: bridge
       };
       const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
       if (telemetryMaxTotalOverride) {

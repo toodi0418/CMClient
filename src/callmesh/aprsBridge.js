@@ -3554,33 +3554,10 @@ class CallMeshAprsBridge extends EventEmitter {
     };
   }
 
-  getTelemetryRecordsForRange(options = {}) {
+  async getTelemetryRecordsForRange(options = {}) {
     const meshId = options?.meshId || options?.mesh_id || null;
     if (!meshId) {
       throw new Error('meshId is required');
-    }
-
-    const { bucket, key } = this.findTelemetryBucket(meshId);
-    if (!bucket) {
-      return {
-        meshId: meshId,
-        rawMeshId: meshId,
-        meshIdNormalized: normalizeMeshId(meshId),
-        node: null,
-        records: [],
-        totalRecords: 0,
-        filteredCount: 0,
-        latestSampleMs: null,
-        earliestSampleMs: null,
-        availableMetrics: [],
-        range: {
-          startMs: null,
-          endMs: null
-        },
-        requestedLimit: null,
-        updatedAt: this.telemetryUpdatedAt,
-        stats: this.getTelemetryStats()
-      };
     }
 
     const startRaw = options?.startMs ?? options?.start ?? null;
@@ -3595,31 +3572,78 @@ class CallMeshAprsBridge extends EventEmitter {
     const limit =
       Number.isFinite(Number(limitRaw)) && Number(limitRaw) > 0 ? Math.floor(Number(limitRaw)) : null;
 
-    const records = Array.isArray(bucket.records) ? bucket.records : [];
-    const filtered = records.filter((record) => {
-      const sample = Number(record?.sampleTimeMs);
-      if (!Number.isFinite(sample)) {
-        return false;
-      }
-      if (startMs != null && sample < startMs) {
-        return false;
-      }
-      if (endMs != null && sample > endMs) {
-        return false;
-      }
-      return true;
+    const { bucket, key } = this.findTelemetryBucket(meshId);
+    const bucketRecords = Array.isArray(bucket?.records) ? bucket.records : [];
+    const normalizedMeshId = normalizeMeshId(meshId);
+
+    const diskResult = await this._readTelemetryRecordsFromDisk({
+      meshId,
+      normalizedMeshId,
+      startMs,
+      endMs,
+      limit: limit == null ? null : limit + bucketRecords.length
     });
 
-    const sorted = filtered.slice().sort((a, b) => a.sampleTimeMs - b.sampleTimeMs);
-    const limited =
-      limit && sorted.length > limit ? sorted.slice(sorted.length - limit) : sorted;
-    const clonedRecords = limited.map((record) => cloneTelemetryRecord(record));
+    const aggregated = [];
+    const seenIds = new Set();
+    const metricsSet = new Set();
+
+    const considerRecord = (candidate) => {
+      if (!candidate) {
+        return;
+      }
+      const sample = Number(candidate?.sampleTimeMs ?? candidate?.timestampMs);
+      if (startMs != null && Number.isFinite(sample) && sample < startMs) {
+        return;
+      }
+      if (endMs != null && Number.isFinite(sample) && sample > endMs) {
+        return;
+      }
+      const cloned = cloneTelemetryRecord(candidate);
+      const recordId = typeof cloned?.id === 'string' && cloned.id.trim() ? cloned.id.trim() : null;
+      if (recordId && seenIds.has(recordId)) {
+        return;
+      }
+      if (recordId) {
+        seenIds.add(recordId);
+      }
+      if (cloned?.telemetry?.metrics && typeof cloned.telemetry.metrics === 'object') {
+        for (const metricKey of Object.keys(cloned.telemetry.metrics)) {
+          metricsSet.add(metricKey);
+        }
+      }
+      aggregated.push(cloned);
+    };
+
+    for (const record of diskResult.records) {
+      considerRecord(record);
+    }
+    for (const record of bucketRecords) {
+      considerRecord(record);
+    }
+
+    aggregated.sort((a, b) => {
+      const aSample = Number(a?.sampleTimeMs ?? a?.timestampMs ?? 0);
+      const bSample = Number(b?.sampleTimeMs ?? b?.timestampMs ?? 0);
+      if (!Number.isFinite(aSample) && !Number.isFinite(bSample)) {
+        return 0;
+      }
+      if (!Number.isFinite(aSample)) {
+        return -1;
+      }
+      if (!Number.isFinite(bSample)) {
+        return 1;
+      }
+      return aSample - bSample;
+    });
+
+    const limitedRecords =
+      limit && aggregated.length > limit ? aggregated.slice(aggregated.length - limit) : aggregated;
 
     let filteredLatestMs = null;
     let filteredEarliestMs = null;
-    const metricsSet = new Set();
-    for (const record of clonedRecords) {
-      const sample = Number(record?.sampleTimeMs);
+    for (const record of limitedRecords) {
+      const sample = Number(record?.sampleTimeMs ?? record?.timestampMs);
       if (Number.isFinite(sample)) {
         if (filteredLatestMs == null || sample > filteredLatestMs) {
           filteredLatestMs = sample;
@@ -3628,22 +3652,54 @@ class CallMeshAprsBridge extends EventEmitter {
           filteredEarliestMs = sample;
         }
       }
-      const metrics = record?.telemetry?.metrics;
-      if (metrics && typeof metrics === 'object') {
-        for (const metricKey of Object.keys(metrics)) {
-          metricsSet.add(metricKey);
+    }
+
+    const bucketNode = bucket?.node ? { ...bucket.node } : null;
+    let resolvedNode = bucketNode;
+    if (!resolvedNode) {
+      for (let i = limitedRecords.length - 1; i >= 0; i -= 1) {
+        const candidateNode = limitedRecords[i]?.node;
+        if (candidateNode) {
+          resolvedNode = { ...candidateNode };
+          break;
         }
       }
     }
 
+    const totalFromDisk = diskResult.totalMatching;
+    let totalRecords = totalFromDisk;
+    if (bucketRecords.length) {
+      for (const record of bucketRecords) {
+        const recordId = typeof record?.id === 'string' && record.id.trim() ? record.id.trim() : null;
+        if (!recordId || !diskResult.recordIdSet.has(recordId)) {
+          const sample = Number(record?.sampleTimeMs ?? record?.timestampMs);
+          if (
+            Number.isFinite(sample) &&
+            (startMs == null || sample >= startMs) &&
+            (endMs == null || sample <= endMs)
+          ) {
+            totalRecords += 1;
+          }
+        }
+      }
+    }
+
+    const effectiveMeshKey = key || meshId;
+    const rawMeshId =
+      bucket?.rawMeshId ||
+      bucket?.meshIdOriginal ||
+      bucket?.meshId ||
+      limitedRecords.find((record) => typeof record?.meshId === 'string')?.meshId ||
+      meshId;
+
     return {
-      meshId: key,
-      rawMeshId: bucket.meshIdOriginal || bucket.meshId || key,
-      meshIdNormalized: normalizeMeshId(key),
-      node: bucket.node ? { ...bucket.node } : null,
-      records: clonedRecords,
-      totalRecords: records.length,
-      filteredCount: clonedRecords.length,
+      meshId: effectiveMeshKey,
+      rawMeshId,
+      meshIdNormalized: normalizeMeshId(effectiveMeshKey),
+      node: resolvedNode || null,
+      records: limitedRecords,
+      totalRecords,
+      filteredCount: limitedRecords.length,
       latestSampleMs: filteredLatestMs,
       earliestSampleMs: filteredEarliestMs,
       availableMetrics: Array.from(metricsSet),
@@ -3654,6 +3710,102 @@ class CallMeshAprsBridge extends EventEmitter {
       requestedLimit: limit,
       updatedAt: this.telemetryUpdatedAt,
       stats: this.getTelemetryStats()
+    };
+  }
+
+  async _readTelemetryRecordsFromDisk({ meshId, normalizedMeshId, startMs, endMs, limit = null }) {
+    const filePath = this.getTelemetryStorePath();
+    let stream;
+    try {
+      await fs.access(filePath, fsSync.constants.F_OK);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return {
+          records: [],
+          totalMatching: 0,
+          recordIdSet: new Set()
+        };
+      }
+      throw err;
+    }
+
+    stream = fsSync.createReadStream(filePath, { encoding: 'utf8' });
+    const rl = readline.createInterface({
+      input: stream,
+      crlfDelay: Infinity
+    });
+
+    const results = [];
+    const recordIdSet = new Set();
+    let totalMatching = 0;
+
+    const matchesMeshId = (candidate) => {
+      if (!candidate) {
+        return false;
+      }
+      if (candidate === meshId) {
+        return true;
+      }
+      const normalizedCandidate = normalizeMeshId(candidate);
+      if (normalizedCandidate && normalizedMeshId) {
+        return normalizedCandidate === normalizedMeshId;
+      }
+      return false;
+    };
+
+    try {
+      for await (const line of rl) {
+        if (!line || !line.trim()) {
+          continue;
+        }
+        let parsed = null;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const candidateMeshId =
+          parsed?.meshId ||
+          parsed?.rawMeshId ||
+          parsed?.mesh_id ||
+          parsed?.node?.meshId ||
+          parsed?.node?.mesh_id;
+        if (!matchesMeshId(candidateMeshId)) {
+          const normalizedCandidate = parsed?.meshIdNormalized || parsed?.mesh_id_normalized;
+          if (!matchesMeshId(normalizedCandidate)) {
+            continue;
+          }
+        }
+        const sample = Number(parsed?.sampleTimeMs ?? parsed?.timestampMs);
+        if (startMs != null && Number.isFinite(sample) && sample < startMs) {
+          continue;
+        }
+        if (endMs != null && Number.isFinite(sample) && sample > endMs) {
+          continue;
+        }
+        totalMatching += 1;
+        const recordId =
+          typeof parsed?.id === 'string' && parsed.id.trim() ? parsed.id.trim() : null;
+        if (recordId) {
+          recordIdSet.add(recordId);
+        }
+        results.push(parsed);
+        if (limit && results.length > limit) {
+          const removed = results.shift();
+          if (removed?.id) {
+            recordIdSet.delete(removed.id);
+          }
+        }
+      }
+    } finally {
+      rl.close();
+      stream.destroy();
+    }
+
+    return {
+      records: results,
+      totalMatching,
+      recordIdSet
     };
   }
 

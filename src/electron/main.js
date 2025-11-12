@@ -702,7 +702,8 @@ async function startWebDashboard() {
     const options = {
       appVersion,
       relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json'),
-      messageLogPath: getMessageLogPath()
+      messageLogPath: getMessageLogPath(),
+      telemetryProvider: bridge
     };
     const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
     if (telemetryMaxTotalOverride) {
@@ -1374,7 +1375,7 @@ ipcMain.handle('telemetry:fetch-range', async (_event, options = {}) => {
     return fallback;
   }
   try {
-    return bridge.getTelemetryRecordsForRange(options);
+    return await bridge.getTelemetryRecordsForRange(options);
   } catch (err) {
     console.error('取得遙測範圍資料失敗:', err);
     return {
