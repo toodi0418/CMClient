@@ -2052,6 +2052,12 @@ function ensureRelayGuessSuffix(label, summary) {
         removeTelemetryOrderEntry(key, removed.id);
       }
     }
+    bucket.loadedCount = bucket.records.length;
+    if (Number.isFinite(bucket.totalRecords)) {
+      bucket.partial = bucket.totalRecords > bucket.loadedCount;
+    } else {
+      bucket.partial = false;
+    }
     if (record.id) {
       trackTelemetryRecord(key, record.id);
     }
@@ -2480,6 +2486,37 @@ function ensureRelayGuessSuffix(label, summary) {
     loadTelemetryRecordsForSelection(meshId);
   }
 
+  async function requestTelemetryRange({ meshId, startMs = null, endMs = null, limit = null, signal } = {}) {
+    if (!meshId) {
+      throw new Error('meshId is required');
+    }
+    const params = new URLSearchParams();
+    params.set('meshId', meshId);
+    if (Number.isFinite(Number(startMs))) {
+      params.set('startMs', String(Math.floor(Number(startMs))));
+    }
+    if (Number.isFinite(Number(endMs))) {
+      params.set('endMs', String(Math.floor(Number(endMs))));
+    }
+    if (limit != null && Number.isFinite(Number(limit)) && Number(limit) > 0) {
+      params.set('limit', String(Math.floor(Number(limit))));
+    }
+    const response = await fetch(`/api/telemetry?${params.toString()}`, {
+      signal,
+      headers: {
+        Accept: 'application/json'
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('Invalid telemetry response');
+    }
+    return payload;
+  }
+
   async function loadTelemetryRecordsForSelection(
     meshId = telemetrySelectedMeshId,
     { force = false } = {}
@@ -2518,24 +2555,14 @@ function ensureRelayGuessSuffix(label, summary) {
     renderTelemetryView();
 
     try {
-      const params = new URLSearchParams();
-      params.set('meshId', meshId);
-      if (startMs != null) {
-        params.set('startMs', String(Math.floor(startMs)));
-      }
-      if (endMs != null) {
-        params.set('endMs', String(Math.floor(endMs)));
-      }
-      const response = await fetch(`/api/telemetry?${params.toString()}`, {
-        signal: telemetryFetchController.signal,
-        headers: {
-          Accept: 'application/json'
-        }
+      const viewLimit = TELEMETRY_MAX_LOCAL_RECORDS;
+      const payload = await requestTelemetryRange({
+        meshId,
+        startMs,
+        endMs,
+        limit: viewLimit,
+        signal: telemetryFetchController.signal
       });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      const payload = await response.json();
       if (telemetryFetchController.signal.aborted) {
         return;
       }
@@ -2553,6 +2580,7 @@ function ensureRelayGuessSuffix(label, summary) {
           records: [],
           recordIdSet: new Set(),
           loadedRange: null,
+          loadedCount: 0,
           totalRecords: Number.isFinite(payload.totalRecords) ? Number(payload.totalRecords) : 0,
           metrics: new Set(Array.isArray(payload.availableMetrics) ? payload.availableMetrics : []),
           latestSampleMs: Number.isFinite(payload.latestSampleMs)
@@ -2560,7 +2588,8 @@ function ensureRelayGuessSuffix(label, summary) {
             : null,
           earliestSampleMs: Number.isFinite(payload.earliestSampleMs)
             ? Number(payload.earliestSampleMs)
-            : null
+            : null,
+          partial: false
         };
         telemetryStore.set(bucketKey, bucket);
       } else {
@@ -2602,7 +2631,11 @@ function ensureRelayGuessSuffix(label, summary) {
       }
 
       const fetchedRecords = Array.isArray(payload.records) ? payload.records : [];
-      bucket.records = fetchedRecords.map((item) => cloneTelemetry(item));
+      const limitedRecords =
+        viewLimit && fetchedRecords.length > viewLimit
+          ? fetchedRecords.slice(fetchedRecords.length - viewLimit)
+          : fetchedRecords;
+      bucket.records = limitedRecords.map((item) => cloneTelemetry(item));
       bucket.recordIdSet = new Set();
       for (const rec of bucket.records) {
         if (rec?.id) {
@@ -2612,8 +2645,34 @@ function ensureRelayGuessSuffix(label, summary) {
       }
       bucket.loadedRange = {
         startMs: startMs != null ? startMs : null,
-        endMs: endMs != null ? endMs : null
+        endMs: endMs != null ? endMs : null,
+        limit: viewLimit
       };
+      const totalRecords = Number.isFinite(payload.totalRecords)
+        ? Number(payload.totalRecords)
+        : fetchedRecords.length;
+      bucket.totalRecords = totalRecords;
+      const loadedCount = Math.min(
+        Number.isFinite(payload.filteredCount) ? Number(payload.filteredCount) : bucket.records.length,
+        bucket.records.length
+      );
+      bucket.loadedCount = loadedCount;
+      bucket.partial =
+        Number.isFinite(bucket.totalRecords) &&
+        Number.isFinite(loadedCount) &&
+        loadedCount < bucket.totalRecords;
+      if (!Number.isFinite(bucket.latestSampleMs) || bucket.latestSampleMs == null) {
+        const latestFromRecords = bucket.records.length
+          ? bucket.records[bucket.records.length - 1].sampleTimeMs
+          : null;
+        bucket.latestSampleMs = Number.isFinite(latestFromRecords) ? Number(latestFromRecords) : bucket.latestSampleMs;
+      }
+      if (!Number.isFinite(bucket.earliestSampleMs) || bucket.earliestSampleMs == null) {
+        const earliestFromRecords = bucket.records.length ? bucket.records[0].sampleTimeMs : null;
+        if (Number.isFinite(earliestFromRecords)) {
+          bucket.earliestSampleMs = Number(earliestFromRecords);
+        }
+      }
 
       telemetrySelectedMeshId = bucketKey;
       telemetryLastExplicitMeshId = bucketKey;
@@ -3623,7 +3682,19 @@ function ensureRelayGuessSuffix(label, summary) {
     const hasBase = baseRecords.length > 0;
     if (telemetryDownloadBtn) {
       telemetryDownloadBtn.disabled = !hasData;
-      telemetryDownloadBtn.title = hasData ? '' : '目前沒有可匯出的遙測資料';
+      if (!hasData) {
+        telemetryDownloadBtn.title = '目前沒有可匯出的遙測資料';
+      } else {
+        const bucket = telemetrySelectedMeshId ? telemetryStore.get(telemetrySelectedMeshId) : null;
+        if (bucket && bucket.partial && Number.isFinite(bucket.totalRecords)) {
+          const loadedCount = Number.isFinite(bucket.loadedCount)
+            ? bucket.loadedCount
+            : bucket.records.length;
+          telemetryDownloadBtn.title = `目前僅載入 ${loadedCount} / ${bucket.totalRecords} 筆，匯出會下載完整區間資料。`;
+        } else {
+          telemetryDownloadBtn.title = '';
+        }
+      }
     }
     telemetryEmptyState.classList.toggle('hidden', hasData);
     if (telemetryTableWrapper) {
@@ -3649,21 +3720,68 @@ function ensureRelayGuessSuffix(label, summary) {
     renderTelemetryTable(searchFilteredRecords);
   }
 
-  function downloadTelemetryCsv() {
-    const baseRecords = getTelemetryRecordsForSelection();
-    const filteredRecords = applyTelemetryFilters(baseRecords);
-    const exportRecords = filterTelemetryBySearch(filteredRecords);
-    if (!exportRecords.length) {
+  async function downloadTelemetryCsv() {
+    const meshId = telemetrySelectedMeshId || telemetryLastExplicitMeshId;
+    if (!meshId) {
+      appendLog({ tag: 'telemetry', message: '尚未選擇節點，無法匯出遙測資料' });
+      return;
+    }
+    if (telemetryLoading && telemetryLoadingMeshId === meshId) {
+      appendLog({ tag: 'telemetry', message: '資料載入中，請稍候再試匯出' });
+      return;
+    }
+
+    const button = telemetryDownloadBtn || null;
+    const originalLabel = button ? button.textContent : null;
+    if (button) {
+      button.disabled = true;
+      button.textContent = '匯出中…';
+      button.title = '資料匯出中';
+    }
+
+    const { startMs, endMs } = getTelemetryRangeWindow();
+    let payload;
+    try {
+      payload = await requestTelemetryRange({
+        meshId,
+        startMs,
+        endMs,
+        limit: null
+      });
+    } catch (err) {
+      appendLog({
+        tag: 'telemetry',
+        message: `匯出遙測資料失敗：${err.message || err}`
+      });
+      if (button) {
+        button.disabled = false;
+        button.textContent = originalLabel || '下載 CSV';
+      }
+      renderTelemetryView();
+      return;
+    }
+
+    const exportRecordsRaw = Array.isArray(payload.records) ? payload.records : [];
+    const exportRecords = exportRecordsRaw.map((record) => cloneTelemetry(record));
+    const filteredByRange = applyTelemetryFilters(exportRecords);
+    const filteredBySearch = filterTelemetryBySearch(filteredByRange);
+
+    if (!filteredBySearch.length) {
       appendLog({ tag: 'telemetry', message: '目前沒有可匯出的遙測資料' });
+      if (button) {
+        button.disabled = false;
+        button.textContent = originalLabel || '下載 CSV';
+      }
+      renderTelemetryView();
       return;
     }
 
     const metricKeysInUse = Object.keys(TELEMETRY_METRIC_DEFINITIONS).filter((key) =>
-      exportRecords.some((record) => record?.telemetry?.metrics?.[key] != null)
+      filteredBySearch.some((record) => record?.telemetry?.metrics?.[key] != null)
     );
     const knownMetricKeySet = new Set(metricKeysInUse);
     const extraMetricKeySet = new Set();
-    for (const record of exportRecords) {
+    for (const record of filteredBySearch) {
       const flat = flattenTelemetryMetrics(record.telemetry?.metrics || {});
       for (const [key] of flat) {
         if (!key) continue;
@@ -3697,14 +3815,14 @@ function ensureRelayGuessSuffix(label, summary) {
       ...extraMetricKeys
     ];
 
-    const rows = exportRecords.map((record) => {
+    const rows = filteredBySearch.map((record) => {
       const timeMs = Number(record.sampleTimeMs);
       const isoTime = Number.isFinite(timeMs) ? new Date(timeMs).toISOString() : '';
       const unixSeconds = Number.isFinite(timeMs) ? Math.floor(timeMs / 1000) : '';
-      const meshId = record.meshId || record.node?.meshId || '';
+      const meshIdValue = record.meshId || record.node?.meshId || '';
       const nodeLabel = record.node
-        ? formatTelemetryNodeLabel(meshId, record.node)
-        : meshId || '未知節點';
+        ? formatTelemetryNodeLabel(meshIdValue, record.node)
+        : meshIdValue || '未知節點';
       const channelValue = Number.isFinite(record.channel) ? record.channel : '';
       const snrValue = formatNumericForCsv(record.snr, 2);
       const rssiValue = formatNumericForCsv(record.rssi, 0);
@@ -3728,7 +3846,7 @@ function ensureRelayGuessSuffix(label, summary) {
       const row = [
         escapeCsvValue(isoTime),
         escapeCsvValue(unixSeconds),
-        escapeCsvValue(meshId),
+        escapeCsvValue(meshIdValue),
         escapeCsvValue(nodeLabel),
         escapeCsvValue(channelValue),
         escapeCsvValue(snrValue),
@@ -3768,7 +3886,7 @@ function ensureRelayGuessSuffix(label, summary) {
     const url = URL.createObjectURL(blob);
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const meshIdLabel =
-      normalizeMeshId(telemetrySelectedMeshId) || telemetrySelectedMeshId || 'telemetry';
+      normalizeMeshId(meshId) || meshId || 'telemetry';
     const safeMeshId = meshIdLabel ? meshIdLabel.replace(/[^0-9a-zA-Z_-]+/g, '') : 'telemetry';
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -3778,14 +3896,20 @@ function ensureRelayGuessSuffix(label, summary) {
     document.body.removeChild(anchor);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     const logLabel =
-      telemetryNodeDisplayByMesh.get(telemetrySelectedMeshId || '') ||
-      normalizeMeshId(telemetrySelectedMeshId) ||
-      telemetrySelectedMeshId ||
+      telemetryNodeDisplayByMesh.get(meshId || '') ||
+      normalizeMeshId(meshId) ||
+      meshId ||
       '未選擇節點';
     appendLog({
       tag: 'telemetry',
       message: `已匯出 ${rows.length} 筆遙測資料 (${logLabel})`
     });
+
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalLabel || '下載 CSV';
+    }
+    renderTelemetryView();
   }
 
   function applyTelemetrySnapshot(snapshot) {
@@ -3817,12 +3941,15 @@ function ensureRelayGuessSuffix(label, summary) {
         records: [],
         recordIdSet: new Set(),
         loadedRange: null,
+        loadedCount: 0,
         totalRecords: Number.isFinite(node?.totalRecords) ? Number(node.totalRecords) : 0,
         metrics: new Set(Array.isArray(node?.metrics) ? node.metrics : []),
         latestSampleMs: Number.isFinite(node?.latestSampleMs) ? Number(node.latestSampleMs) : null,
         earliestSampleMs: Number.isFinite(node?.earliestSampleMs)
           ? Number(node.earliestSampleMs)
-          : null
+          : null,
+        partial:
+          Number.isFinite(node?.totalRecords) && Number(node.totalRecords) > TELEMETRY_MAX_LOCAL_RECORDS
       };
       telemetryStore.set(meshKey, bucket);
       if (sanitizedNode && sanitizedNode.meshIdNormalized) {
