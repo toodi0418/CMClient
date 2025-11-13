@@ -99,6 +99,7 @@
   let telemetryDropdownInteracting = false;
   let nodesSearchTerm = '';
   let nodesStatusResetTimer = null;
+  const TELEMETRY_RANGE_OPTIONS = ['hour1', 'hour3', 'hour6', 'hour12', 'day', 'week', 'month', 'year', 'custom'];
   let telemetryRangeMode = 'day';
   let telemetryCustomRange = { startMs: null, endMs: null };
   let telemetryChartMode = 'all';
@@ -157,8 +158,13 @@
   const METERS_PER_FOOT = 0.3048;
   const NODE_ONLINE_WINDOW_MS = 60 * 60 * 1000;
   const STORAGE_KEYS = {
-    callmeshProvisionOpen: 'tmag:web:callmeshProvision:open'
+    callmeshProvisionOpen: 'tmag:web:callmeshProvision:open',
+    telemetryRangeMode: 'tmag:web:telemetry:range-mode'
   };
+
+  function isValidTelemetryRangeMode(mode) {
+    return typeof mode === 'string' && TELEMETRY_RANGE_OPTIONS.includes(mode);
+  }
 
   function safeStorageGet(key) {
     try {
@@ -166,6 +172,11 @@
     } catch {
       return null;
     }
+  }
+
+  const storedTelemetryRangeMode = safeStorageGet(STORAGE_KEYS.telemetryRangeMode);
+  if (isValidTelemetryRangeMode(storedTelemetryRangeMode)) {
+    telemetryRangeMode = storedTelemetryRangeMode;
   }
 
   function safeStorageSet(key, value) {
@@ -1479,7 +1490,7 @@
 
   telemetryRangeSelect?.addEventListener('change', (event) => {
     const mode = event.target.value;
-    setTelemetryRangeMode(mode);
+    setTelemetryRangeMode(mode, { persist: true });
   });
 
   function handleTelemetryRangeInputChange() {
@@ -1504,6 +1515,7 @@
     updateTelemetryRangeInputs();
     refreshTelemetrySelectors();
     loadTelemetryRecordsForSelection(telemetrySelectedMeshId, { force: true });
+    safeStorageSet(STORAGE_KEYS.telemetryRangeMode, 'custom');
   }
 
   telemetryRangeStartInput?.addEventListener('change', handleTelemetryRangeInputChange);
@@ -2213,9 +2225,8 @@ function ensureRelayGuessSuffix(label, summary) {
     }
   }
 
-  function setTelemetryRangeMode(mode, { skipRender = false } = {}) {
-    const allowed = new Set(['hour1', 'hour3', 'hour6', 'hour12', 'day', 'week', 'month', 'year', 'custom']);
-    if (!allowed.has(mode)) {
+  function setTelemetryRangeMode(mode, { skipRender = false, persist = false } = {}) {
+    if (!isValidTelemetryRangeMode(mode)) {
       mode = 'day';
     }
     telemetryRangeMode = mode;
@@ -2232,6 +2243,9 @@ function ensureRelayGuessSuffix(label, summary) {
     refreshTelemetrySelectors();
     if (!skipRender) {
       loadTelemetryRecordsForSelection(telemetrySelectedMeshId, { force: true });
+    }
+    if (persist) {
+      safeStorageSet(STORAGE_KEYS.telemetryRangeMode, telemetryRangeMode);
     }
   }
 
@@ -5349,6 +5363,7 @@ function ensureRelayGuessSuffix(label, summary) {
     };
   }
 
+  setTelemetryRangeMode(telemetryRangeMode, { skipRender: true });
   renderNodeDatabase();
   connectStream();
 })();
