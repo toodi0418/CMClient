@@ -5237,18 +5237,39 @@ function appendTelemetryRecord(meshId, rawRecord, rawNode, updatedAt, maxTotalRe
   }
 
   const loadedRange = bucket.loadedRange || null;
+  const currentWindow = getTelemetryRangeWindow();
+  const currentStart = Number.isFinite(currentWindow.startMs) ? Number(currentWindow.startMs) : null;
+  const currentEnd = Number.isFinite(currentWindow.endMs) ? Number(currentWindow.endMs) : null;
+  const relativeRangeActive = isRelativeTelemetryRange();
+
   let shouldStore = false;
   if (loadedRange) {
-    const startLimit = Number.isFinite(loadedRange.startMs) ? Number(loadedRange.startMs) : null;
-    const endLimit = Number.isFinite(loadedRange.endMs) ? Number(loadedRange.endMs) : null;
+    let startLimit = Number.isFinite(loadedRange.startMs) ? Number(loadedRange.startMs) : null;
+    let endLimit = Number.isFinite(loadedRange.endMs) ? Number(loadedRange.endMs) : null;
+    if (relativeRangeActive) {
+      startLimit = currentStart ?? startLimit;
+      endLimit = currentEnd ?? endLimit;
+    }
     const withinStart = startLimit == null || !Number.isFinite(sampleTime) || sampleTime >= startLimit;
     const withinEnd = endLimit == null || !Number.isFinite(sampleTime) || sampleTime <= endLimit;
     shouldStore = withinStart && withinEnd;
+    if (relativeRangeActive) {
+      bucket.loadedRange = {
+        startMs: Number.isFinite(startLimit) ? startLimit : null,
+        endMs: Number.isFinite(endLimit) ? endLimit : null
+      };
+    }
   } else if (telemetrySelectedMeshId === targetMeshKey) {
-    const { startMs, endMs } = getTelemetryRangeWindow();
-    const withinStart = startMs == null || !Number.isFinite(sampleTime) || sampleTime >= startMs;
-    const withinEnd = endMs == null || !Number.isFinite(sampleTime) || sampleTime <= endMs;
+    const withinStart =
+      currentStart == null || !Number.isFinite(sampleTime) || sampleTime >= currentStart;
+    const withinEnd = currentEnd == null || !Number.isFinite(sampleTime) || sampleTime <= currentEnd;
     shouldStore = withinStart && withinEnd;
+    if (shouldStore && relativeRangeActive) {
+      bucket.loadedRange = {
+        startMs: Number.isFinite(currentStart) ? currentStart : null,
+        endMs: Number.isFinite(currentEnd) ? currentEnd : null
+      };
+    }
   }
 
   if (shouldStore) {
@@ -6295,6 +6316,25 @@ function getTelemetryRangeWindow(now = Date.now()) {
     default:
       return { startMs: null, endMs: null };
   }
+}
+
+const TELEMETRY_RANGE_DURATIONS = {
+  hour1: 1 * 60 * 60 * 1000,
+  hour3: 3 * 60 * 60 * 1000,
+  hour6: 6 * 60 * 60 * 1000,
+  hour12: 12 * 60 * 60 * 1000,
+  day: 24 * 60 * 60 * 1000,
+  week: 7 * 24 * 60 * 60 * 1000,
+  month: 30 * 24 * 60 * 60 * 1000,
+  year: 365 * 24 * 60 * 60 * 1000
+};
+
+function getTelemetryRangeDuration(mode = telemetryRangeMode) {
+  return TELEMETRY_RANGE_DURATIONS[mode] ?? null;
+}
+
+function isRelativeTelemetryRange(mode = telemetryRangeMode) {
+  return mode !== 'custom' && getTelemetryRangeDuration(mode) != null;
 }
 
 function applyTelemetryFilters(records) {

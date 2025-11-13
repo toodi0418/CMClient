@@ -2012,24 +2012,39 @@ function ensureRelayGuessSuffix(label, summary) {
       ? bucket.totalRecords + 1
       : (Array.isArray(bucket.records) ? bucket.records.length : 0) + 1;
 
+    const currentWindow = getTelemetryRangeWindow();
+    const currentStart = Number.isFinite(currentWindow.startMs) ? Number(currentWindow.startMs) : null;
+    const currentEnd = Number.isFinite(currentWindow.endMs) ? Number(currentWindow.endMs) : null;
+    const relativeRangeActive = isRelativeTelemetryRange();
+
+    if (!bucket.loadedRange && relativeRangeActive) {
+      bucket.loadedRange = {
+        startMs: currentStart,
+        endMs: currentEnd
+      };
+    }
+
     const hasLoadedRange =
       bucket.loadedRange && typeof bucket.loadedRange === 'object' && Array.isArray(bucket.records);
     if (!hasLoadedRange) {
       return record;
     }
-    const { startMs: loadedStart, endMs: loadedEnd } = bucket.loadedRange;
-    if (
-      Number.isFinite(sampleTime) &&
-      loadedStart != null &&
-      sampleTime < loadedStart
-    ) {
+
+    let startLimit = Number.isFinite(bucket.loadedRange.startMs) ? Number(bucket.loadedRange.startMs) : null;
+    let endLimit = Number.isFinite(bucket.loadedRange.endMs) ? Number(bucket.loadedRange.endMs) : null;
+    if (relativeRangeActive) {
+      startLimit = currentStart ?? startLimit;
+      endLimit = currentEnd ?? endLimit;
+      bucket.loadedRange = {
+        startMs: Number.isFinite(startLimit) ? startLimit : null,
+        endMs: Number.isFinite(endLimit) ? endLimit : null
+      };
+    }
+
+    if (Number.isFinite(sampleTime) && startLimit != null && sampleTime < startLimit) {
       return record;
     }
-    if (
-      Number.isFinite(sampleTime) &&
-      loadedEnd != null &&
-      sampleTime > loadedEnd
-    ) {
+    if (Number.isFinite(sampleTime) && endLimit != null && sampleTime > endLimit) {
       return record;
     }
     if (record.id && bucket.recordIdSet && bucket.recordIdSet.has(record.id)) {
@@ -2291,6 +2306,25 @@ function ensureRelayGuessSuffix(label, summary) {
       default:
         return { startMs: null, endMs: null };
     }
+  }
+
+  const TELEMETRY_RANGE_DURATIONS = {
+    hour1: 1 * 60 * 60 * 1000,
+    hour3: 3 * 60 * 60 * 1000,
+    hour6: 6 * 60 * 60 * 1000,
+    hour12: 12 * 60 * 60 * 1000,
+    day: 24 * 60 * 60 * 1000,
+    week: 7 * 24 * 60 * 60 * 1000,
+    month: 30 * 24 * 60 * 60 * 1000,
+    year: 365 * 24 * 60 * 60 * 1000
+  };
+
+  function getTelemetryRangeDuration(mode = telemetryRangeMode) {
+    return TELEMETRY_RANGE_DURATIONS[mode] ?? null;
+  }
+
+  function isRelativeTelemetryRange(mode = telemetryRangeMode) {
+    return mode !== 'custom' && getTelemetryRangeDuration(mode) != null;
   }
 
   function applyTelemetryFilters(records) {
