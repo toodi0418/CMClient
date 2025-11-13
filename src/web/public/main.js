@@ -3720,7 +3720,7 @@ function ensureRelayGuessSuffix(label, summary) {
     renderTelemetryTable(searchFilteredRecords);
   }
 
-  async function downloadTelemetryCsv() {
+  function downloadTelemetryCsv() {
     const meshId = telemetrySelectedMeshId || telemetryLastExplicitMeshId;
     if (!meshId) {
       appendLog({ tag: 'telemetry', message: '尚未選擇節點，無法匯出遙測資料' });
@@ -3731,170 +3731,43 @@ function ensureRelayGuessSuffix(label, summary) {
       return;
     }
 
+    const bucket = telemetryStore.get(meshId);
+    const hasKnownRecords =
+      (bucket && Number.isFinite(bucket.totalRecords) && bucket.totalRecords > 0) ||
+      (bucket && Array.isArray(bucket.records) && bucket.records.length > 0);
+    if (!hasKnownRecords) {
+      appendLog({ tag: 'telemetry', message: '目前沒有可匯出的遙測資料' });
+      return;
+    }
+
     const button = telemetryDownloadBtn || null;
-    const originalLabel = button ? button.textContent : null;
     if (button) {
       button.disabled = true;
-      button.textContent = '匯出中…';
+      button.textContent = '準備中…';
       button.title = '資料匯出中';
     }
 
     const { startMs, endMs } = getTelemetryRangeWindow();
-    let payload;
-    try {
-      payload = await requestTelemetryRange({
-        meshId,
-        startMs,
-        endMs,
-        limit: null
-      });
-    } catch (err) {
-      appendLog({
-        tag: 'telemetry',
-        message: `匯出遙測資料失敗：${err.message || err}`
-      });
-      if (button) {
-        button.disabled = false;
-        button.textContent = originalLabel || '下載 CSV';
-      }
-      renderTelemetryView();
-      return;
+    const params = new URLSearchParams();
+    params.set('meshId', meshId);
+    if (startMs != null) {
+      params.set('startMs', String(Math.floor(startMs)));
+    }
+    if (endMs != null) {
+      params.set('endMs', String(Math.floor(endMs)));
+    }
+    if (telemetrySearchTerm) {
+      params.set('search', telemetrySearchRaw || telemetrySearchTerm);
     }
 
-    const exportRecordsRaw = Array.isArray(payload.records) ? payload.records : [];
-    const exportRecords = exportRecordsRaw.map((record) => cloneTelemetry(record));
-    const filteredByRange = applyTelemetryFilters(exportRecords);
-    const filteredBySearch = filterTelemetryBySearch(filteredByRange);
-
-    if (!filteredBySearch.length) {
-      appendLog({ tag: 'telemetry', message: '目前沒有可匯出的遙測資料' });
-      if (button) {
-        button.disabled = false;
-        button.textContent = originalLabel || '下載 CSV';
-      }
-      renderTelemetryView();
-      return;
-    }
-
-    const metricKeysInUse = Object.keys(TELEMETRY_METRIC_DEFINITIONS).filter((key) =>
-      filteredBySearch.some((record) => record?.telemetry?.metrics?.[key] != null)
-    );
-    const knownMetricKeySet = new Set(metricKeysInUse);
-    const extraMetricKeySet = new Set();
-    for (const record of filteredBySearch) {
-      const flat = flattenTelemetryMetrics(record.telemetry?.metrics || {});
-      for (const [key] of flat) {
-        if (!key) continue;
-        if (knownMetricKeySet.has(key)) continue;
-        extraMetricKeySet.add(key);
-      }
-    }
-    const extraMetricKeys = Array.from(extraMetricKeySet).sort((a, b) => a.localeCompare(b));
-
-    const header = [
-      '時間 (ISO)',
-      'Unix 秒',
-      'MeshID',
-      '節點',
-      'Channel',
-      'SNR',
-      'RSSI',
-      '詳細',
-      '最後轉發',
-      '最後轉發 MeshID',
-      '最後轉發為推測',
-      '最後轉發說明',
-      '跳數',
-      'Hop Start',
-      'Hop Limit',
-      ...metricKeysInUse.map((key) => {
-        const def = TELEMETRY_METRIC_DEFINITIONS[key] || {};
-        const baseLabel = def.label || key;
-        return def.unit ? `${baseLabel} (${def.unit})` : baseLabel;
-      }),
-      ...extraMetricKeys
-    ];
-
-    const rows = filteredBySearch.map((record) => {
-      const timeMs = Number(record.sampleTimeMs);
-      const isoTime = Number.isFinite(timeMs) ? new Date(timeMs).toISOString() : '';
-      const unixSeconds = Number.isFinite(timeMs) ? Math.floor(timeMs / 1000) : '';
-      const meshIdValue = record.meshId || record.node?.meshId || '';
-      const nodeLabel = record.node
-        ? formatTelemetryNodeLabel(meshIdValue, record.node)
-        : meshIdValue || '未知節點';
-      const channelValue = Number.isFinite(record.channel) ? record.channel : '';
-      const snrValue = formatNumericForCsv(record.snr, 2);
-      const rssiValue = formatNumericForCsv(record.rssi, 0);
-      const detailValue = record.detail || '';
-      const relayDescriptor = buildTelemetryRelayDescriptor(record) || '';
-      const relayMeshValue =
-        record.relayMeshId ||
-        record.relayMeshIdNormalized ||
-        record.relay?.meshId ||
-        record.relay?.meshIdNormalized ||
-        '';
-      const relayGuessFlag = record.relayGuessed ? 'true' : '';
-      const relayReason = record.relayGuessReason || '';
-      const hopsDescriptor =
-        buildTelemetryHopsDescriptor(record) ||
-        (record.hopsLabel || '');
-      const hopStart =
-        Number.isFinite(record.hops?.start) ? record.hops.start : '';
-      const hopLimit =
-        Number.isFinite(record.hops?.limit) ? record.hops.limit : '';
-      const row = [
-        escapeCsvValue(isoTime),
-        escapeCsvValue(unixSeconds),
-        escapeCsvValue(meshIdValue),
-        escapeCsvValue(nodeLabel),
-        escapeCsvValue(channelValue),
-        escapeCsvValue(snrValue),
-        escapeCsvValue(rssiValue),
-        escapeCsvValue(detailValue),
-        escapeCsvValue(relayDescriptor),
-        escapeCsvValue(relayMeshValue),
-        escapeCsvValue(relayGuessFlag),
-        escapeCsvValue(relayReason),
-        escapeCsvValue(hopsDescriptor),
-        escapeCsvValue(hopStart),
-        escapeCsvValue(hopLimit)
-      ];
-
-      for (const key of metricKeysInUse) {
-        const raw = record.telemetry?.metrics?.[key];
-        const formatted = raw == null ? '' : formatTelemetryValue(key, raw);
-        row.push(escapeCsvValue(formatted));
-      }
-
-      const flatMetrics = new Map(flattenTelemetryMetrics(record.telemetry?.metrics || {}));
-      for (const key of extraMetricKeys) {
-        let value = flatMetrics.has(key) ? flatMetrics.get(key) : '';
-        if (typeof value === 'number') {
-          value = trimTrailingZeros(value.toFixed(2));
-        } else if (typeof value === 'boolean') {
-          value = value ? 'true' : 'false';
-        }
-        row.push(escapeCsvValue(value));
-      }
-
-      return row.join(',');
-    });
-
-    const csvContent = [header.map(escapeCsvValue).join(','), ...rows].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const meshIdLabel =
-      normalizeMeshId(meshId) || meshId || 'telemetry';
-    const safeMeshId = meshIdLabel ? meshIdLabel.replace(/[^0-9a-zA-Z_-]+/g, '') : 'telemetry';
+    const url = `/api/telemetry/export.csv?${params.toString()}`;
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `telemetry-${safeMeshId || 'export'}-${timestamp}.csv`;
+    anchor.download = '';
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+
     const logLabel =
       telemetryNodeDisplayByMesh.get(meshId || '') ||
       normalizeMeshId(meshId) ||
@@ -3902,14 +3775,18 @@ function ensureRelayGuessSuffix(label, summary) {
       '未選擇節點';
     appendLog({
       tag: 'telemetry',
-      message: `已匯出 ${rows.length} 筆遙測資料 (${logLabel})`
+      message: `已開始匯出遙測資料 (${logLabel})`
     });
 
     if (button) {
-      button.disabled = false;
-      button.textContent = originalLabel || '下載 CSV';
+      setTimeout(() => {
+        button.disabled = false;
+        button.textContent = '下載 CSV';
+        button.title = bucket && bucket.partial && Number.isFinite(bucket.totalRecords)
+          ? `目前僅載入 ${bucket.loadedCount ?? bucket.records.length} / ${bucket.totalRecords} 筆，匯出會下載完整區間資料。`
+          : '';
+      }, 1500);
     }
-    renderTelemetryView();
   }
 
   function applyTelemetrySnapshot(snapshot) {

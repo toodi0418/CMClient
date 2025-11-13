@@ -3714,17 +3714,50 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   async _readTelemetryRecordsFromDisk({ meshId, normalizedMeshId, startMs, endMs, limit = null }) {
+    const results = [];
+    const recordIdSet = new Set();
+    let totalMatching = 0;
+    for await (const parsed of this._iterateTelemetryRecordsFromDisk({
+      meshId,
+      normalizedMeshId,
+      startMs,
+      endMs
+    })) {
+      totalMatching += 1;
+      const recordId =
+        typeof parsed?.id === 'string' && parsed.id.trim() ? parsed.id.trim() : null;
+      if (recordId) {
+        recordIdSet.add(recordId);
+      }
+      results.push(parsed);
+      if (limit && results.length > limit) {
+        const removed = results.shift();
+        if (removed?.id) {
+          recordIdSet.delete(removed.id);
+        }
+      }
+    }
+
+    return {
+      records: results,
+      totalMatching,
+      recordIdSet
+    };
+  }
+
+  async *_iterateTelemetryRecordsFromDisk({
+    meshId,
+    normalizedMeshId,
+    startMs,
+    endMs
+  }) {
     const filePath = this.getTelemetryStorePath();
     let stream;
     try {
       await fs.access(filePath, fsSync.constants.F_OK);
     } catch (err) {
       if (err && err.code === 'ENOENT') {
-        return {
-          records: [],
-          totalMatching: 0,
-          recordIdSet: new Set()
-        };
+        return;
       }
       throw err;
     }
@@ -3734,10 +3767,6 @@ class CallMeshAprsBridge extends EventEmitter {
       input: stream,
       crlfDelay: Infinity
     });
-
-    const results = [];
-    const recordIdSet = new Set();
-    let totalMatching = 0;
 
     const matchesMeshId = (candidate) => {
       if (!candidate) {
@@ -3783,30 +3812,68 @@ class CallMeshAprsBridge extends EventEmitter {
         if (endMs != null && Number.isFinite(sample) && sample > endMs) {
           continue;
         }
-        totalMatching += 1;
-        const recordId =
-          typeof parsed?.id === 'string' && parsed.id.trim() ? parsed.id.trim() : null;
-        if (recordId) {
-          recordIdSet.add(recordId);
-        }
-        results.push(parsed);
-        if (limit && results.length > limit) {
-          const removed = results.shift();
-          if (removed?.id) {
-            recordIdSet.delete(removed.id);
-          }
-        }
+        yield parsed;
       }
     } finally {
       rl.close();
       stream.destroy();
     }
+  }
 
-    return {
-      records: results,
-      totalMatching,
-      recordIdSet
-    };
+  async *streamTelemetryRecords(options = {}) {
+    const meshId = options?.meshId || options?.mesh_id || null;
+    if (!meshId) {
+      throw new Error('meshId is required');
+    }
+
+    const startRaw = options?.startMs ?? options?.start ?? null;
+    const endRaw = options?.endMs ?? options?.end ?? null;
+
+    const startMs = Number.isFinite(Number(startRaw)) ? Number(startRaw) : null;
+    const endMs = Number.isFinite(Number(endRaw)) ? Number(endRaw) : null;
+    if (startMs != null && endMs != null && startMs > endMs) {
+      throw new Error('startMs must be less than or equal to endMs');
+    }
+
+    const normalizedMeshId = normalizeMeshId(meshId);
+    const seenIds = new Set();
+
+    for await (const parsed of this._iterateTelemetryRecordsFromDisk({
+      meshId,
+      normalizedMeshId,
+      startMs,
+      endMs
+    })) {
+      const cloned = cloneTelemetryRecord(parsed);
+      const recordId =
+        typeof cloned?.id === 'string' && cloned.id.trim() ? cloned.id.trim() : null;
+      if (recordId) {
+        seenIds.add(recordId);
+      }
+      yield cloned;
+    }
+
+    const { bucket } = this.findTelemetryBucket(meshId);
+    const bucketRecords = Array.isArray(bucket?.records) ? bucket.records : [];
+    if (!bucketRecords.length) {
+      return;
+    }
+    for (const record of bucketRecords) {
+      if (!record) continue;
+      const recordId =
+        typeof record?.id === 'string' && record.id.trim() ? record.id.trim() : null;
+      if (recordId && seenIds.has(recordId)) {
+        continue;
+      }
+      const sample = Number(record?.sampleTimeMs ?? record?.timestampMs);
+      if (startMs != null && Number.isFinite(sample) && sample < startMs) {
+        continue;
+      }
+      if (endMs != null && Number.isFinite(sample) && sample > endMs) {
+        continue;
+      }
+      yield cloneTelemetryRecord(record);
+    }
   }
 
   recordTelemetryPacket(summary) {
