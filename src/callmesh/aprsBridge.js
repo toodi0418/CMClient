@@ -814,7 +814,7 @@ class CallMeshAprsBridge extends EventEmitter {
 
   handleMeshtasticSummary(summary) {
     if (!summary) return;
-    const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
+    const timestampMs = Date.now();
     this.captureSummaryNodeInfo(summary, timestampMs);
     this.ensureSummaryFlowMetadata(summary);
     this.recordTelemetryPacket(summary);
@@ -3923,18 +3923,11 @@ class CallMeshAprsBridge extends EventEmitter {
   ensureSummaryFlowMetadata(summary) {
     if (!summary) return;
     const now = Date.now();
-    let timestampMs = Number.isFinite(Number(summary.timestampMs)) ? Number(summary.timestampMs) : NaN;
-    if (Number.isNaN(timestampMs)) {
-      if (typeof summary.timestamp === 'string') {
-        const parsed = Date.parse(summary.timestamp);
-        timestampMs = Number.isFinite(parsed) ? parsed : now;
-      } else if (Number.isFinite(summary.timestamp)) {
-        timestampMs = Number(summary.timestamp);
-      } else {
-        timestampMs = now;
-      }
-    }
+    const timestampMs = now;
     summary.timestampMs = timestampMs;
+    const timestampDate = new Date(timestampMs);
+    summary.timestamp = timestampDate.toISOString();
+    summary.timestampLabel = formatTimestampLabel(timestampDate);
     if (!summary.flowId) {
       summary.flowId = `${timestampMs}-${Math.random().toString(16).slice(2, 10)}`;
     }
