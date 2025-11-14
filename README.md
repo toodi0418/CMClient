@@ -283,6 +283,56 @@ npx pkg src/index.js \
 ```
 或針對 64 位元 Pi OS 使用 `--targets node18-linux-arm64`。
 
+### Docker 佈署
+
+GitHub Actions 會自動執行 **Build & Publish Docker Image** workflow，並把映像推送到 GitHub Container Registry（GHCR）。預設路徑為 `ghcr.io/<OWNER>/<REPO>:<tag>`，實際名稱等於 GitHub 倉庫的 `owner/repo`，例如 `ghcr.io/toodi0418/cmclient:latest`。常見流程如下：
+
+1. **取得映像**
+   - 從 GHCR 下載：  
+     ```bash
+     docker pull ghcr.io/<OWNER>/<REPO>:latest
+     ```
+   - 或在原始碼目錄自行建置：  
+     ```bash
+     docker build -t callmesh-client .
+     ```
+   - 若已透過 `docker save callmesh-client:latest -o callmesh-client.tar` 匯出，可在其他主機使用 `docker load -i callmesh-client.tar` 匯入。
+
+2. **準備環境與 compose**
+   - 根目錄已有 `.env` 範本，填入 `CALLMESH_API_KEY`、`MESHTASTIC_HOST`、`TMAG_WEB_PORT` 等參數。
+   - `docker-compose.yml` 會：
+     - 以 `.env` 中的參數建置/啟動 `callmesh-client`；
+     - 將 `/data/callmesh` 透過 volume `callmesh-data` 持久化 CallMesh 驗證、歷史遙測與訊息記錄；
+     - 預設開啟 Web Dashboard（7080 埠），如需停用可把 `TMAG_WEB_DASHBOARD` 設為 `0`。
+
+3. **啟動**
+   ```bash
+   docker compose up -d --build
+   ```
+   - 變更設定後重新載入：`docker compose up -d`。
+   - 查看日誌：`docker compose logs -f`.
+   - 需改用 Serial 裝置時，可在 `docker-compose.yml` 新增：
+     ```yaml
+     devices:
+       - /dev/ttyUSB0:/dev/ttyUSB0
+     command:
+       - npm
+       - start
+       - --
+       - --connection
+       - serial
+       - --serial-path
+       - /dev/ttyUSB0
+       - --serial-baud
+       - "115200"
+     ```
+
+4. **群暉 NAS 提示**
+   - 在 DSM「Container Manager」建立專案時，直接匯入 repo 內的 `docker-compose.yml`，並把 `.env` 一併上傳。
+   - 若想把資料存進共享資料夾，可將 compose 內的 volume 改為 `./data:/data/callmesh`，確保資料夾具有讀寫權限。
+   - Serial 連線需要在 Container Manager → 編輯容器 → 裝置中勾選 `/dev/ttyUSB*`，同時於 compose 增加 `devices`。
+   - 開放 Web Dashboard 時，務必在 DSM 防火牆放行 `TMAG_WEB_PORT`（預設 7080）。
+
 ---
 
 ## 8. 專案結構概覽
