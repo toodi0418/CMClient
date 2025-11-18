@@ -431,20 +431,7 @@ async function startMonitor(argv) {
       } catch (err) {
         console.warn(`初始化 Web 節點快照失敗：${err.message}`);
       }
-      if (typeof bridge.getTelemetrySnapshot === 'function') {
-        setTimeout(() => {
-          (async () => {
-            try {
-              const telemetrySnapshot = await bridge.getTelemetrySnapshot({
-                limitPerNode: webServer.telemetryMaxPerNode
-              });
-              webServer.seedTelemetrySnapshot(telemetrySnapshot);
-            } catch (err) {
-              console.warn(`初始化 Web Telemetry 失敗：${err.message}`);
-            }
-          })();
-        }, 0).unref?.();
-      }
+      // 避免同步讀取大量遙測資料阻塞事件迴圈，啟動時不再主動載入 Telemetry。
     } catch (err) {
       console.warn(`啟動 Web Dashboard 失敗：${err.message}`);
       webServer = null;
