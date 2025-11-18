@@ -432,14 +432,18 @@ async function startMonitor(argv) {
         console.warn(`初始化 Web 節點快照失敗：${err.message}`);
       }
       if (typeof bridge.getTelemetrySnapshot === 'function') {
-        try {
-          const telemetrySnapshot = await bridge.getTelemetrySnapshot({
-            limitPerNode: webServer.telemetryMaxPerNode
-          });
-          webServer.seedTelemetrySnapshot(telemetrySnapshot);
-        } catch (err) {
-          console.warn(`初始化 Web Telemetry 失敗：${err.message}`);
-        }
+        setTimeout(() => {
+          (async () => {
+            try {
+              const telemetrySnapshot = await bridge.getTelemetrySnapshot({
+                limitPerNode: webServer.telemetryMaxPerNode
+              });
+              webServer.seedTelemetrySnapshot(telemetrySnapshot);
+            } catch (err) {
+              console.warn(`初始化 Web Telemetry 失敗：${err.message}`);
+            }
+          })();
+        }, 0).unref?.();
       }
     } catch (err) {
       console.warn(`啟動 Web Dashboard 失敗：${err.message}`);
