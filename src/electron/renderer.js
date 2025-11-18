@@ -456,7 +456,11 @@ function computeRelayLabel(summary) {
     return ensureRelayGuessSuffix('直收', summary);
   }
 
-  const { usedHops, hopsLabel } = extractHopInfo(summary);
+  const hopInfo = extractHopInfo(summary);
+  if (summary.relayInvalid || hopInfo.limitOnly) {
+    return '無效';
+  }
+  const { usedHops, hopsLabel } = hopInfo;
   const normalizedHopsLabel = hopsLabel || '';
   const zeroHop = usedHops === 0 || /^0(?:\s*\/|$)/.test(normalizedHopsLabel);
 
@@ -497,37 +501,57 @@ function computeRelayLabel(summary) {
 }
 
 function extractHopInfo(summary) {
-  const hopStart = Number(summary.hops?.start);
-  const hopLimit = Number(summary.hops?.limit);
-  const label = typeof summary.hops?.label === 'string' ? summary.hops.label.trim() : '';
+  const hops = summary?.hops || {};
+  const label = typeof hops.label === 'string' ? hops.label.trim() : '';
+  const hopStartProvided = hops.start !== undefined && hops.start !== null;
+  const hopLimitProvided = hops.limit !== undefined && hops.limit !== null;
+  const toFiniteOrNull = (value) => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  };
+  const hopStart = hopStartProvided ? toFiniteOrNull(hops.start) : null;
+  const hopLimit = hopLimitProvided ? toFiniteOrNull(hops.limit) : null;
+  const limitOnly =
+    Boolean(hops.limitOnly) ||
+    (!hopStartProvided && hopLimitProvided && label && !label.includes('/') && !label.includes('?'));
+
   let used = null;
-  let total = Number.isFinite(hopStart) ? hopStart : null;
+  let total = hopStart != null ? hopStart : null;
 
-  if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
-    used = Math.max(hopStart - hopLimit, 0);
-  } else {
-    const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
-    if (match) {
-      used = Number(match[1]);
-      if (!Number.isFinite(total)) {
-        total = Number(match[2]);
-      }
-    } else if (/^\d+$/.test(label)) {
+  if (!limitOnly) {
+    if (hopStart != null && hopLimit != null) {
+      used = Math.max(hopStart - hopLimit, 0);
+    } else if (hopStart != null && hopLimit == null) {
       used = 0;
+    } else {
+      const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
+      if (match) {
+        used = Number(match[1]);
+        if (!Number.isFinite(total)) {
+          total = Number(match[2]);
+        }
+      } else if (/^\d+$/.test(label) && hopStart === 0) {
+        used = 0;
+        total = Number.isFinite(total) ? total : 0;
+      }
     }
-  }
 
-  if (!Number.isFinite(total)) {
-    const match = label.match(/\/\s*(\d+)/);
-    if (match) {
-      total = Number(match[1]);
+    if (!Number.isFinite(total)) {
+      const match = label.match(/\/\s*(\d+)/);
+      if (match) {
+        total = Number(match[1]);
+      }
     }
+  } else {
+    used = null;
+    total = null;
   }
 
   return {
     usedHops: Number.isFinite(used) ? used : null,
     totalHops: Number.isFinite(total) ? total : null,
-    hopsLabel: label
+    hopsLabel: label,
+    limitOnly
   };
 }
 
@@ -816,7 +840,9 @@ function recordChannelMessage(summary, { markUnread = true } = {}) {
 
   const hopStats = extractHopInfo(summary);
   let hopSummary;
-  if (hopStats.usedHops === 0) {
+  if (hopStats.limitOnly) {
+    hopSummary = '跳數：無效';
+  } else if (hopStats.usedHops === 0) {
     hopSummary = '跳數：0 (直收)';
   } else if (hopStats.usedHops != null && hopStats.totalHops != null) {
     hopSummary = `跳數：${hopStats.usedHops}/${hopStats.totalHops}`;
@@ -2736,7 +2762,9 @@ function appendSummaryRow(summary) {
   row.querySelector('.snr').textContent = formatNumber(summary.snr, 2);
   row.querySelector('.rssi').textContent = formatNumber(summary.rssi, 0);
   renderTypeCell(row.querySelector('.type'), summary);
-  row.querySelector('.hops').textContent = hopInfo.hopsLabel || summary.hops?.label || '';
+  row.querySelector('.hops').textContent = hopInfo.limitOnly
+    ? '無效'
+    : hopInfo.hopsLabel || summary.hops?.label || '';
   row.querySelector('.detail-main').textContent = summary.detail || '';
 
   const fromMeshNormalized = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized);
@@ -2870,7 +2898,7 @@ function registerPacketFlow(summary, { skipPending = false } = {}) {
   const mappingCallsign = formatMappingCallsign(mapping);
   const mappingComment = extractMappingComment(mapping) || '';
   const hopInfo = extractHopInfo(summary);
-  const hopsLabel = hopInfo.hopsLabel || summary.hops?.label || null;
+  const hopsLabel = hopInfo.limitOnly ? '無效' : hopInfo.hopsLabel || summary.hops?.label || null;
   const position = summary.position || {};
   const latitude = Number.isFinite(position.latitude) ? Number(position.latitude) : null;
   const longitude = Number.isFinite(position.longitude) ? Number(position.longitude) : null;

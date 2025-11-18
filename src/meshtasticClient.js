@@ -530,8 +530,11 @@ class MeshtasticClient extends EventEmitter {
     return labels;
   }
 
-  _isDirectReception(summary, { relayNodeId, usedHops, hasRelayResult }) {
+  _isDirectReception(summary, { relayNodeId, usedHops, hasRelayResult, hopLimitOnly = false }) {
     if (!summary || typeof summary !== 'object') {
+      return false;
+    }
+    if (hopLimitOnly) {
       return false;
     }
     const relayExists = relayNodeId != null && relayNodeId !== 0;
@@ -1370,12 +1373,21 @@ class MeshtasticClient extends EventEmitter {
       snr: Number.isFinite(packet.rxSnr) ? Number(packet.rxSnr) : null,
       rssi: Number.isFinite(packet.rxRssi) ? Number(packet.rxRssi) : null
     };
-    const hopStart = Number(packet.hopStart);
-    const hopLimit = Number(packet.hopLimit);
+    const toFiniteOrNull = (value) => {
+      if (value === null || value === undefined) {
+        return null;
+      }
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+
+    const hopStartValue = toFiniteOrNull(packet.hopStart);
+    const hopLimitValue = toFiniteOrNull(packet.hopLimit);
+    const hopLimitOnly = hopLimitValue != null && hopStartValue == null;
     let usedHops = null;
-    if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
-      usedHops = Math.max(hopStart - hopLimit, 0);
-    } else if (Number.isFinite(hopStart) && !Number.isFinite(hopLimit)) {
+    if (hopStartValue != null && hopLimitValue != null) {
+      usedHops = Math.max(hopStartValue - hopLimitValue, 0);
+    } else if (hopStartValue != null && hopLimitValue == null) {
       usedHops = 0;
     }
 
@@ -1525,9 +1537,10 @@ class MeshtasticClient extends EventEmitter {
       snr: packet.rxSnr ?? null,
       rssi: packet.rxRssi ?? null,
       hops: {
-        limit: packet.hopLimit ?? null,
-        start: packet.hopStart ?? null,
-        label: formatHops(packet.hopLimit, packet.hopStart)
+        limit: hopLimitValue,
+        start: hopStartValue,
+        label: formatHops(hopLimitValue, hopStartValue),
+        limitOnly: hopLimitOnly
       },
       type: decodeInfo?.type || friendlyPortLabel(portInfo.name, portInfo.id),
       detail: decodeInfo?.details || '',
@@ -1551,6 +1564,7 @@ class MeshtasticClient extends EventEmitter {
       rawHex,
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
+    summary.relayInvalid = hopLimitOnly;
 
     const directRelayNodeId =
       relayResult && Number.isFinite(relayResult.nodeId) ? relayResult.nodeId : relayNodeId;
@@ -1558,7 +1572,8 @@ class MeshtasticClient extends EventEmitter {
     const isDirect = this._isDirectReception(summary, {
       relayNodeId: directRelayNodeId,
       usedHops,
-      hasRelayResult: Boolean(relayResult)
+      hasRelayResult: Boolean(relayResult),
+      hopLimitOnly
     });
 
     if (isDirect && packet.from != null) {

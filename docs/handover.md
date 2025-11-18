@@ -86,6 +86,91 @@ CMClient/
 └── package-lock.json
 ```
 
+### 2.1 核心模組職責
+
+| 模組 / 類別 | 來源 | 主要責任 | 對外介面 / 關鍵輸出 |
+| ----------- | ---- | -------- | -------------------- |
+| `src/index.js` | CLI 入口 | 解析參數、啟動畫面、建立 `CallMeshAprsBridge`、選擇 TCP/Serial 連線、啟動 Web Dashboard（選用） | CLI 標準輸出、`WebDashboardServer`、IPC |
+| `MeshtasticClient` | `src/meshtasticClient.js` | 維持 Meshtastic TCP 連線、解碼 Protobuf、產生 `summary`/`fromRadio` 事件、推測 relay 節點 | 事件：`summary`、`connected`、`disconnected`、`myInfo` |
+| `CallMeshAprsBridge` | `src/callmesh/aprsBridge.js` | 驗證 CallMesh API Key、同步 Mapping/Provision、管理 APRS uplink、保存遙測/訊息/節點資料、發出 Web/Electron 用事件 | 事件：`state`、`summary`、`telemetry`、`node`、`aprs-uplink`；方法：`verifyApiKey()`、`getTelemetrySnapshot()` |
+| `callmesh/client.js` | CallMesh API 包裝 | 心跳、mapping/provision 下載、TenManMap 設定同步 | Promise API、錯誤碼轉換 |
+| `aprs/client.js` | APRS-IS 客戶端 | 登入、維持連線、上傳位置與 Telemetry、斷線自動重試 | 事件：`connected`、`line`、`error` |
+| `WebDashboardServer` | `src/web/server.js` | 提供 HTTP + SSE、維護快取（status / summary / nodes / telemetry / logs）、寫入訊息紀錄 | `/api/events` SSE、`/api/telemetry` CSV 匯出、`telemetry-snapshot` 等事件 |
+| Electron 主行程 | `src/electron/main.js` | 打包 CLI 能力到桌面 UI、IPC to Renderer、啟動 Web Dashboard、寫入 local storage | IPC channel `tmag:*`、Electron BrowserWindow |
+| Electron Renderer | `src/electron/renderer.js` | 桌面 UI、設定面板、遙測圖表、Mapping Flow、訊息瀏覽 | IPC、Chart.js、LocalStorage |
+| Node 資料庫 | `src/nodeDatabase.js` | 統一節點快照：Mesh ID、長/短名、角色、最後出現時間、座標 | 方法：`get()`、`list()`、`replace()` |
+| 遙測資料庫 | `src/storage/telemetryDatabase.js` | SQLite 正規化儲存遙測紀錄、按需查詢最新筆數 | `insertRecord()`、`fetchRecentSnapshot()`、`getRecordCount()` |
+| 共用儲存層 | `src/storage/callmeshDataStore.js` | `kv_store`、節點資料、訊息、relay 統計的 SQLite 儲存庫 | `setKv()`、`saveMessageLog()`、`replaceNodes()` |
+
+### 2.2 資料儲存層一覽
+
+- **`telemetry-records.sqlite`** (`telemetry_records.sqlite`)
+  - `telemetry_records`：每筆遙測的主檔；欄位包含 `id`、`mesh_id(_normalized)`、`timestamp_ms`、`sample_time_ms`、`type`、`detail`、`channel`、`snr`、`rssi`、`relay_*`、`hops_*`、`telemetry_kind`、`telemetry_time_ms`、`node_*` 等。
+  - `telemetry_metrics`：以 `(record_id, metric_key)` 為主鍵，存放每個量測值；支援 `number_value` / `text_value` / `json_value` 三種型態。
+  - 讀寫策略：啟動時不預先載入；`fetchRecentSnapshot()` 會依節點抓取最新 `N` 筆並合併記憶體快取。
+- **`callmesh-data.sqlite`**
+  - `kv_store`：儲存 API 驗證狀態、mapping/provision 快取。
+  - `nodes`：節點快照（Mesh ID、長/短名、型號、角色、座標、最後出現時間）。
+  - `message_log`：訊息主體（`flow_id`、`channel`、`timestamp_ms`、`detail`、`scope`、`mesh_packet_id`、`relay_mesh_id`、`hops_*`、`snr`、`rssi`、`raw_hex/raw_length`）。
+  - `message_nodes`：訊息來源與最後轉發節點的快照（`role` = from / relay）。
+  - `message_extra_lines`：訊息附註行（reply 提示、TenManMap 推測原因等）。
+  - `relay_stats`：歷史 SNR/RSSI，同步給 `MeshtasticClient` 作尾碼對應推測。
+- **Artifacts**（預設 `~/.config/callmesh/` 或 Electron UserData）
+  - `monitor.json`：CallMesh 驗證紀錄（API Key、verified / degraded、最後心跳）。
+  - `telemetry-records.jsonl.migrated`：舊版遙測備份。
+  - `message-log.jsonl.migrated`：舊版訊息備份。
+
+### 2.3 啟動流程（CLI / Electron 共用）
+
+1. 解析 CLI 參數 → 決定 TCP / Serial 與連線參數、Web Dashboard 是否啟用。
+2. 建立 `CallMeshAprsBridge`，載入 artifacts（mapping / provision / node DB / message log）。
+3. 呼叫 `bridge.verifyApiKey()`：必要時進行 CallMesh 驗證並寫入 `monitor.json`。
+4. 啟動 Heartbeat loop、設定 APRS / TenManMap 管線。
+5. （選用）啟動 `WebDashboardServer`：
+   - 立即回應 HTTP / SSE；
+   - 透過 `seedNodeSnapshot()`、`seedTelemetrySnapshot()`、`applyMessageSnapshot()` 注入初始快取；
+   - 送出 `status: disconnected` 事件。
+6. 準備 `MeshtasticClient` 連線物件，進入 `runClientOnce()` 流程：
+   - 嘗試連線 → `connected` → `want_config`；
+   - 任何封包會透過 `summary` 事件進入 Bridge，再由 Bridge 廣播至 CLI / Electron / Web。
+7. 任一流程失敗 → 依情況重試（CallMesh degraded、APR S 重連、Meshtastic 30 秒後重試）。
+
+### 2.4 事件與通訊通道
+
+- **Meshtastic → Bridge**
+  - `summary`：標準化封包資訊（來源/轉發/頻道/Telemetry/FlowId）
+  - `fromRadio`：原始 Protobuf 轉 JSON（供除錯）
+  - `myInfo` / `nodeInfo`：節點資訊 → `nodeDatabase` / `node` 事件
+- **Bridge → 前端 / CLI**
+  - `summary`（含 `synthetic=true` 自發訊息）
+  - `telemetry` (`append/reset`)
+  - `node` / `node-snapshot`
+  - `state`（CallMesh 驗證狀態、degraded 與 heartbeat 追蹤）
+  - `aprs-uplink`、`log`
+- **Web Dashboard SSE (`/api/events`)**
+  - `app-info`、`status`、`metrics`
+  - `summary` / `summary-batch`
+  - `message-snapshot` / `message-append`
+  - `telemetry-snapshot` / `telemetry-append` / `telemetry-reset`
+  - `node-snapshot` / `node`
+  - `aprs`、`log-batch`
+- **TenManMap WebSocket**
+  - 上行：`message.publish`（位置 / 文字）→ 5 秒節流、含 `relay` / `hops` 等欄位。
+  - 下行：`send_message`（broadcast / directed）、`reply_id`、`destination`。
+  - 合成事件：`emitTenmanSyntheticSummary()` 將本地傳送的訊息以 `synthetic=true` 推回 UI。
+- **APR S-IS**
+  - 位置報文：`<callsign> ...`，含 `Callsign-SSID`、座標、Hpos/Hdop 等欄位。
+  - Telemetry 報文：以序號 (`SEQ`) + 量測值上傳。
+
+### 2.5 外部整合與依賴
+
+- **CallMesh API**：`/heartbeat`、`/mapping`、`/provision`、TenMan 分享開關。
+- **APR S-IS**：預設 `asia.aprs2.net:14580`，需傳送正確 passcode。
+- **TenManMap**：`wss://tenmanmap.yakumo.tw/ws`，透過 CallMesh API Key 驗證。
+- **Meshtastic 裝置**：TCP (`host:port`) 或 Serial (`serial://ttyUSB0?baud=115200`)。
+- **Bonjour/mDNS 掃描**：`node src/discovery.js` 可查找區網內 Meshtastic 節點。
+- **可選依賴**：Chart.js、Electron、pkg（打包 CLI）。
+
 ---
 
 ## 3. 模組詳解

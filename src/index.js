@@ -835,37 +835,57 @@ function formatRelayLabel(entry) {
 }
 
 function extractHopInfo(summary) {
-  const hopStart = Number(summary.hops?.start);
-  const hopLimit = Number(summary.hops?.limit);
-  const label = typeof summary.hops?.label === 'string' ? summary.hops.label.trim() : '';
+  const hops = summary?.hops || {};
+  const label = typeof hops.label === 'string' ? hops.label.trim() : '';
+  const hopStartProvided = hops.start !== undefined && hops.start !== null;
+  const hopLimitProvided = hops.limit !== undefined && hops.limit !== null;
+  const toFiniteOrNull = (value) => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  };
+  const hopStart = hopStartProvided ? toFiniteOrNull(hops.start) : null;
+  const hopLimit = hopLimitProvided ? toFiniteOrNull(hops.limit) : null;
+  const limitOnly =
+    Boolean(hops.limitOnly) ||
+    (!hopStartProvided && hopLimitProvided && label && !label.includes('/') && !label.includes('?'));
+
   let used = null;
-  let total = Number.isFinite(hopStart) ? hopStart : null;
+  let total = hopStart != null ? hopStart : null;
 
-  if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
-    used = Math.max(hopStart - hopLimit, 0);
-  } else {
-    const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
-    if (match) {
-      used = Number(match[1]);
-      if (!Number.isFinite(total)) {
-        total = Number(match[2]);
-      }
-    } else if (/^\d+$/.test(label)) {
+  if (!limitOnly) {
+    if (hopStart != null && hopLimit != null) {
+      used = Math.max(hopStart - hopLimit, 0);
+    } else if (hopStart != null && hopLimit == null) {
       used = 0;
+    } else {
+      const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
+      if (match) {
+        used = Number(match[1]);
+        if (!Number.isFinite(total)) {
+          total = Number(match[2]);
+        }
+      } else if (/^\d+$/.test(label) && hopStart === 0) {
+        used = 0;
+        total = Number.isFinite(total) ? total : 0;
+      }
     }
-  }
 
-  if (!Number.isFinite(total)) {
-    const match = label.match(/\/\s*(\d+)/);
-    if (match) {
-      total = Number(match[1]);
+    if (!Number.isFinite(total)) {
+      const match = label.match(/\/\s*(\d+)/);
+      if (match) {
+        total = Number(match[1]);
+      }
     }
+  } else {
+    used = null;
+    total = null;
   }
 
   return {
     usedHops: Number.isFinite(used) ? used : null,
     totalHops: Number.isFinite(total) ? total : null,
-    hopsLabel: label
+    hopsLabel: label,
+    limitOnly
   };
 }
 
@@ -900,7 +920,11 @@ function computeRelayLabel(summary, { selfMeshId } = {}) {
     return '直收';
   }
 
-  const { usedHops, hopsLabel } = extractHopInfo(summary);
+  const hopInfo = extractHopInfo(summary);
+  if (summary.relayInvalid || hopInfo.limitOnly) {
+    return '無效';
+  }
+  const { usedHops, hopsLabel } = hopInfo;
   const zeroHop =
     usedHops === 0 ||
     hopsLabel === '0/0' ||
