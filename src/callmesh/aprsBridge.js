@@ -2496,7 +2496,9 @@ class CallMeshAprsBridge extends EventEmitter {
     const candidates = [];
     if (summary.from) candidates.push(summary.from);
     if (summary.to) candidates.push(summary.to);
-    if (summary.relay) candidates.push(summary.relay);
+    if (summary.relay && !summary.relayInvalid) {
+      candidates.push(summary.relay);
+    }
     if (summary.nextHop) candidates.push(summary.nextHop);
     for (const node of candidates) {
       if (!node || typeof node !== 'object') continue;
