@@ -554,16 +554,14 @@ function sendNodeInfo(payload) {
 }
 
 async function syncWebTelemetrySnapshot() {
-  if (!bridge || !webServer || typeof bridge.getTelemetrySnapshot !== 'function') {
+  if (!bridge || !webServer || typeof bridge.getTelemetrySummary !== 'function') {
     return;
   }
   try {
-    const snapshot = await bridge.getTelemetrySnapshot({
-      limitPerNode: webServer.telemetryMaxPerNode
-    });
-    webServer.seedTelemetrySnapshot(snapshot);
+    const summary = bridge.getTelemetrySummary();
+    webServer.seedTelemetrySummary(summary);
   } catch (err) {
-    console.warn('同步 Web Telemetry Snapshot 失敗:', err);
+    console.warn('同步 Web Telemetry 摘要失敗:', err);
   }
 }
 
@@ -1351,19 +1349,44 @@ ipcMain.handle('telemetry:get-snapshot', async (_event, options = {}) => {
   if (!bridge) {
     return {
       updatedAt: Date.now(),
-      nodes: []
+      nodes: [],
+      summary: [],
+      stats: {
+        totalRecords: 0,
+        totalNodes: 0,
+        diskBytes: 0
+      }
     };
   }
   try {
-    const limit = Number.isFinite(options?.limitPerNode) ? options.limitPerNode : undefined;
-    return bridge.getTelemetrySnapshot({
-      limitPerNode: limit
-    });
+    const summary = bridge.getTelemetrySummary();
+    const updatedAt =
+      Number.isFinite(summary?.updatedAt) && summary.updatedAt > 0
+        ? Number(summary.updatedAt)
+        : bridge.telemetryUpdatedAt;
+    const nodes = Array.isArray(summary?.nodes) ? summary.nodes : [];
+    const stats =
+      summary?.stats && typeof summary.stats === 'object'
+        ? summary.stats
+        : bridge.getTelemetryStats();
+    return {
+      updatedAt,
+      nodes,
+      summary: nodes,
+      stats
+    };
   } catch (err) {
     console.error('取得遙測快照失敗:', err);
     return {
       updatedAt: Date.now(),
-      nodes: []
+      nodes: [],
+      summary: [],
+      stats: {
+        totalRecords: 0,
+        totalNodes: 0,
+        diskBytes: 0
+      },
+      error: err.message
     };
   }
 });
@@ -1372,6 +1395,7 @@ ipcMain.handle('telemetry:get-available', async () => {
   const fallback = {
     updatedAt: Date.now(),
     nodes: [],
+    summary: [],
     stats: {
       totalRecords: 0,
       totalNodes: 0,
@@ -1382,7 +1406,22 @@ ipcMain.handle('telemetry:get-available', async () => {
     return fallback;
   }
   try {
-    return bridge.getTelemetryNodesSummary();
+    const summary = bridge.getTelemetrySummary();
+    const updatedAt =
+      Number.isFinite(summary?.updatedAt) && summary.updatedAt > 0
+        ? Number(summary.updatedAt)
+        : bridge.telemetryUpdatedAt;
+    const nodes = Array.isArray(summary?.nodes) ? summary.nodes : [];
+    const stats =
+      summary?.stats && typeof summary.stats === 'object'
+        ? summary.stats
+        : bridge.getTelemetryStats();
+    return {
+      updatedAt,
+      nodes,
+      summary: nodes,
+      stats
+    };
   } catch (err) {
     console.error('取得遙測節點清單失敗:', err);
     return fallback;
@@ -1419,7 +1458,18 @@ ipcMain.handle('telemetry:fetch-range', async (_event, options = {}) => {
     return fallback;
   }
   try {
-    return await bridge.getTelemetryRecordsForRange(options);
+    const limit = Number.isFinite(options?.limit) ? Number(options.limit) : undefined;
+    const startMs = Number.isFinite(options?.startMs ?? options?.start)
+      ? Number(options?.startMs ?? options?.start)
+      : null;
+    const endMs = Number.isFinite(options?.endMs ?? options?.end)
+      ? Number(options?.endMs ?? options?.end)
+      : null;
+    return bridge.getTelemetryRecordsForMesh(meshId, {
+      limit,
+      startMs,
+      endMs
+    });
   } catch (err) {
     console.error('取得遙測範圍資料失敗:', err);
     return {

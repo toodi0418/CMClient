@@ -242,7 +242,7 @@ const aprsCompletedFlowIds = new Set();
 const aprsCompletedQueue = [];
 const TELEMETRY_TABLE_LIMIT = 200;
 const TELEMETRY_CHART_LIMIT = 200;
-const TELEMETRY_MAX_LOCAL_RECORDS = 500;
+const TELEMETRY_MAX_LOCAL_RECORDS = Number.POSITIVE_INFINITY;
 let telemetryMaxTotalRecords = 20000;
 const TELEMETRY_METRIC_DEFINITIONS = {
   batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
@@ -5054,8 +5054,7 @@ async function loadTelemetryRecordsForSelection(meshId = telemetrySelectedMeshId
     const payload = await window.meshtastic.fetchTelemetryRange({
       meshId,
       startMs: effectiveStart,
-      endMs: effectiveEnd,
-      limit: TELEMETRY_MAX_LOCAL_RECORDS
+      endMs: effectiveEnd
     });
     if (currentToken !== telemetryFetchToken) {
       return;
@@ -5109,9 +5108,6 @@ async function loadTelemetryRecordsForSelection(meshId = telemetrySelectedMeshId
       .map((raw) => sanitizeTelemetryRecord(raw, meshKey))
       .filter(Boolean);
     sanitizedRecords.sort((a, b) => a.sampleTimeMs - b.sampleTimeMs);
-    if (sanitizedRecords.length > TELEMETRY_MAX_LOCAL_RECORDS) {
-      sanitizedRecords.splice(0, sanitizedRecords.length - TELEMETRY_MAX_LOCAL_RECORDS);
-    }
     targetBucket.records = sanitizedRecords;
     targetBucket.recordIdSet = new Set();
     for (const record of sanitizedRecords) {
@@ -5125,7 +5121,8 @@ async function loadTelemetryRecordsForSelection(meshId = telemetrySelectedMeshId
 
     targetBucket.loadedRange = {
       startMs: effectiveStart,
-      endMs: effectiveEnd
+      endMs: effectiveEnd,
+      limit: null
     };
     if (!targetBucket.metrics) {
       targetBucket.metrics = new Set();

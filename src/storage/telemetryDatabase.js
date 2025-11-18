@@ -162,6 +162,14 @@ const SELECT_RECORDS_FOR_MESH_SQL = `
   ORDER BY timestamp_ms DESC
   LIMIT @limit
 `;
+const MESH_RECORD_COUNT_SQL = `
+  SELECT
+    mesh_id,
+    COUNT(*) AS count,
+    MAX(timestamp_ms) AS latest_timestamp_ms
+  FROM telemetry_records
+  GROUP BY mesh_id
+`;
 const FETCH_RECENT_SNAPSHOT_SQL = `
   SELECT *
   FROM (
@@ -631,6 +639,83 @@ class TelemetryDatabase {
         });
       }
     }
+    if (!rows.length) {
+      return [];
+    }
+    const metricsMap = this._fetchMetricsForRecords(rows.map((row) => row.id));
+    return rows.map((row) => this._composeRecord(row, metricsMap.get(row.id) || []));
+  }
+
+  listMeshRecordCounts({ meshIds = null } = {}) {
+    if (!this.db) {
+      throw new Error('TelemetryDatabase 尚未初始化');
+    }
+    let rows = [];
+    if (Array.isArray(meshIds) && meshIds.length) {
+      const sanitized = meshIds.map((id) => sanitizeText(id)).filter(Boolean);
+      if (!sanitized.length) {
+        return [];
+      }
+      const placeholders = sanitized.map((_, index) => `@mesh${index}`).join(', ');
+      const sql = `
+        SELECT
+          mesh_id,
+          COUNT(*) AS count,
+          MAX(timestamp_ms) AS latest_timestamp_ms
+        FROM telemetry_records
+        WHERE mesh_id IN (${placeholders})
+        GROUP BY mesh_id
+      `;
+      const stmt = this.db.prepare(sql);
+      const params = {};
+      sanitized.forEach((value, index) => {
+        params[`mesh${index}`] = value;
+      });
+      rows = stmt.all(params);
+    } else {
+      rows = this.db.prepare(MESH_RECORD_COUNT_SQL).all();
+    }
+    return rows.map((row) => ({
+      meshId: sanitizeText(row?.mesh_id),
+      count: Number(row?.count || 0),
+      latestTimestampMs: toTimestampMs(row?.latest_timestamp_ms, null)
+    }));
+  }
+
+  fetchRecordsForMesh({ meshId, limit = null, startMs = null, endMs = null } = {}) {
+    if (!this.db) {
+      throw new Error('TelemetryDatabase 尚未初始化');
+    }
+    const normalizedMeshId = sanitizeText(meshId);
+    if (!normalizedMeshId) {
+      return [];
+    }
+    const effectiveLimit =
+      Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : null;
+    const conditions = ['mesh_id = @meshId'];
+    const params = {
+      meshId: normalizedMeshId
+    };
+    if (Number.isFinite(Number(startMs))) {
+      params.startMs = Math.floor(Number(startMs));
+      conditions.push('timestamp_ms >= @startMs');
+    }
+    if (Number.isFinite(Number(endMs))) {
+      params.endMs = Math.floor(Number(endMs));
+      conditions.push('timestamp_ms <= @endMs');
+    }
+    let limitClause = '';
+    if (effectiveLimit != null) {
+      params.limit = effectiveLimit;
+      limitClause = ' LIMIT @limit';
+    }
+    const sql = `
+      SELECT *
+      FROM telemetry_records
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY timestamp_ms DESC${limitClause}
+    `;
+    const rows = this.db.prepare(sql).all(params);
     if (!rows.length) {
       return [];
     }

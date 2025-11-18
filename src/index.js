@@ -432,14 +432,12 @@ async function startMonitor(argv) {
         console.warn(`初始化 Web 節點快照失敗：${err.message}`);
       }
       // 避免同步讀取大量遙測資料阻塞事件迴圈，啟動時改以背景程序載入 Telemetry 快照。
-      setTimeout(async () => {
+      setTimeout(() => {
         try {
-          const snapshot = await bridge.getTelemetrySnapshot({
-            limitPerNode: webServer.telemetryMaxPerNode
-          });
-          webServer.seedTelemetrySnapshot(snapshot);
+          const summary = bridge.getTelemetrySummary();
+          webServer.seedTelemetrySummary(summary);
         } catch (err) {
-          console.warn(`初始化 Web 遙測快照失敗：${err.message}`);
+          console.warn(`初始化 Web 遙測摘要失敗：${err.message}`);
         }
       }, 0);
     } catch (err) {
