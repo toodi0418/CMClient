@@ -895,7 +895,21 @@ class CallMeshAprsBridge extends EventEmitter {
     this.telemetryStore.clear();
     this.telemetryRecordIds.clear();
 
+    let expectedCount = null;
+    try {
+      expectedCount = this.telemetryDb.getRecordCount();
+    } catch (err) {
+      this.emitLog('CALLMESH', `inspect telemetry database failed: ${err.message}`);
+    }
+    if (expectedCount && expectedCount > 0) {
+      this.emitLog(
+        'CALLMESH',
+        `正在載入遙測快取（約 ${expectedCount} 筆），請稍候……`
+      );
+    }
+
     let loadedCount = 0;
+    const startedAt = Date.now();
     try {
       this.telemetryDb.iterateAll((record) => {
         const normalized = this.normalizeTelemetryRecordFromDisk(record);
@@ -915,7 +929,11 @@ class CallMeshAprsBridge extends EventEmitter {
     }
 
     if (loadedCount > 0) {
-      this.emitLog('CALLMESH', `restored telemetry history count=${loadedCount}`);
+      const durationMs = Date.now() - startedAt;
+      this.emitLog(
+        'CALLMESH',
+        `restored telemetry history count=${loadedCount} duration=${durationMs}ms`
+      );
     }
   }
 
