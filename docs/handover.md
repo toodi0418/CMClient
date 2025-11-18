@@ -199,7 +199,7 @@ CMClient/
 - Web Dashboard 可獨立瀏覽 (`npm run desktop` 後開 `http://localhost:7080`)，但不另提供設定 UI，所有設定仍在 Electron/CLI。
 
 ### 3.8 遙測資料庫（Telemetry Archive）
-- 遙測摘要（`summary.telemetry`）會由 `CallMeshAprsBridge` 寫入 `storageDir/telemetry-records.sqlite`，改採 **SQLite** 持久化；更新後首次啟動會自動匯入舊版 `telemetry-records.jsonl` 並將原檔改名為 `.migrated` 備份。
+- 遙測摘要（`summary.telemetry`）會由 `CallMeshAprsBridge` 寫入 `storageDir/telemetry-records.sqlite`，改採 **SQLite** 持久化；更新後首次啟動會自動匯入舊版 `telemetry-records.jsonl` 並將原檔改名為 `.migrated` 備份。2025-11 之後的版本改為以 `telemetry_records` / `telemetry_metrics` 正規化資料表存放各欄位與量測值（不再保存整筆 JSON），升級時會自動遷移舊版 SQLite。
 - 新資料會同步保留在記憶體的節點快取中，每個節點最多保存 **500** 筆最新紀錄，超出時會淘汰最舊資料；刪除資料或按下「重置所有資料」時會同步清空 SQLite 內容。
 - Telemetry 事件會透過 IPC/SSE 推播至 Electron Renderer 與 Web Dashboard：
   - `telemetry:type=append`：即時新增單筆並附上節點資訊；
