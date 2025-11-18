@@ -154,6 +154,25 @@ const CLEAR_METRICS_SQL = 'DELETE FROM telemetry_metrics';
 const CLEAR_RECORDS_SQL = 'DELETE FROM telemetry_records';
 const COUNT_RECORDS_SQL = 'SELECT COUNT(*) AS count FROM telemetry_records';
 const COUNT_DISTINCT_MESH_SQL = 'SELECT COUNT(DISTINCT mesh_id) AS nodes FROM telemetry_records';
+const LIST_MESH_IDS_SQL = 'SELECT DISTINCT mesh_id FROM telemetry_records';
+const SELECT_RECORDS_FOR_MESH_SQL = `
+  SELECT *
+  FROM telemetry_records
+  WHERE mesh_id = @meshId
+  ORDER BY timestamp_ms DESC
+  LIMIT @limit
+`;
+const FETCH_RECENT_SNAPSHOT_SQL = `
+  SELECT *
+  FROM (
+    SELECT
+      tr.*,
+      ROW_NUMBER() OVER (PARTITION BY mesh_id ORDER BY timestamp_ms DESC) AS rn
+    FROM telemetry_records tr
+  )
+  WHERE rn <= @limit
+  ORDER BY mesh_id ASC, timestamp_ms DESC
+`;
 
 function ensureDirectory(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -254,6 +273,17 @@ function sanitizeText(value) {
   return str.length ? str : null;
 }
 
+function chunkArray(items, chunkSize) {
+  if (!Array.isArray(items) || chunkSize <= 0) {
+    return [];
+  }
+  const result = [];
+  for (let i = 0; i < items.length; i += chunkSize) {
+    result.push(items.slice(i, i + chunkSize));
+  }
+  return result;
+}
+
 class TelemetryDatabase {
   constructor(filePath, options = {}) {
     if (!filePath) {
@@ -263,6 +293,7 @@ class TelemetryDatabase {
     this.options = options;
     this.db = null;
     this.statements = Object.create(null);
+    this.supportsWindowFunctions = false;
   }
 
   init() {
@@ -291,6 +322,17 @@ class TelemetryDatabase {
     this.statements.clearRecords = this.db.prepare(CLEAR_RECORDS_SQL);
     this.statements.countRecords = this.db.prepare(COUNT_RECORDS_SQL);
     this.statements.countDistinctMesh = this.db.prepare(COUNT_DISTINCT_MESH_SQL);
+    this.statements.listMeshIds = this.db.prepare(LIST_MESH_IDS_SQL);
+    this.statements.selectRecordsForMesh = this.db.prepare(SELECT_RECORDS_FOR_MESH_SQL);
+    try {
+      this.statements.fetchRecentSnapshot = this.db.prepare(FETCH_RECENT_SNAPSHOT_SQL);
+      this.supportsWindowFunctions = true;
+    } catch (err) {
+      this.supportsWindowFunctions = false;
+      this.statements.fetchRecentSnapshot = null;
+      // eslint-disable-next-line no-console
+      console.warn(`TelemetryDatabase: window functions unavailable, falling back to per-mesh queries (${err.message})`);
+    }
   }
 
   _applyMigrations() {
@@ -524,6 +566,78 @@ class TelemetryDatabase {
     }
   }
 
+  fetchRecentSnapshot({ limitPerNode = 500, meshIds = null } = {}) {
+    if (!this.db) {
+      throw new Error('TelemetryDatabase 尚未初始化');
+    }
+    const limit =
+      Number.isFinite(limitPerNode) && limitPerNode > 0 ? Math.floor(limitPerNode) : 500;
+    let rows = [];
+    if (Array.isArray(meshIds) && meshIds.length) {
+      const sanitizedIds = meshIds.map((id) => sanitizeText(id)).filter(Boolean);
+      if (!sanitizedIds.length) {
+        return [];
+      }
+      if (this.supportsWindowFunctions && this.statements.fetchRecentSnapshot) {
+        const placeholders = sanitizedIds.map((_, index) => `@mesh${index}`).join(', ');
+        const sql = `
+          SELECT *
+          FROM (
+            SELECT
+              tr.*,
+              ROW_NUMBER() OVER (PARTITION BY mesh_id ORDER BY timestamp_ms DESC) AS rn
+            FROM telemetry_records tr
+            WHERE mesh_id IN (${placeholders})
+          )
+          WHERE rn <= @limit
+          ORDER BY mesh_id ASC, timestamp_ms DESC
+        `;
+        const stmt = this.db.prepare(sql);
+        const params = { limit };
+        sanitizedIds.forEach((id, index) => {
+          params[`mesh${index}`] = id;
+        });
+        rows = stmt.all(params);
+      } else {
+        const stmt = this.statements.selectRecordsForMesh;
+        for (const meshId of sanitizedIds) {
+          const part = stmt.all({ meshId, limit });
+          rows.push(...part);
+        }
+        rows.sort((a, b) => {
+          if (a.mesh_id === b.mesh_id) {
+            return b.timestamp_ms - a.timestamp_ms;
+          }
+          return a.mesh_id.localeCompare(b.mesh_id);
+        });
+      }
+    } else {
+      if (this.supportsWindowFunctions && this.statements.fetchRecentSnapshot) {
+        rows = this.statements.fetchRecentSnapshot.all({ limit });
+      } else {
+        const meshList = this.statements.listMeshIds.all();
+        const stmt = this.statements.selectRecordsForMesh;
+        for (const row of meshList) {
+          const meshId = sanitizeText(row?.mesh_id);
+          if (!meshId) continue;
+          const part = stmt.all({ meshId, limit });
+          rows.push(...part);
+        }
+        rows.sort((a, b) => {
+          if (a.mesh_id === b.mesh_id) {
+            return b.timestamp_ms - a.timestamp_ms;
+          }
+          return a.mesh_id.localeCompare(b.mesh_id);
+        });
+      }
+    }
+    if (!rows.length) {
+      return [];
+    }
+    const metricsMap = this._fetchMetricsForRecords(rows.map((row) => row.id));
+    return rows.map((row) => this._composeRecord(row, metricsMap.get(row.id) || []));
+  }
+
   _serializeRecord(record) {
     if (!record || typeof record !== 'object') {
       return null;
@@ -743,6 +857,36 @@ class TelemetryDatabase {
       node,
       createdAt: Number.isFinite(row.created_at) ? row.created_at : null
     };
+  }
+
+  _fetchMetricsForRecords(recordIds) {
+    const metricsMap = new Map();
+    if (!Array.isArray(recordIds) || recordIds.length === 0) {
+      return metricsMap;
+    }
+    const chunks = chunkArray(recordIds, 400);
+    for (const chunk of chunks) {
+      if (!chunk.length) continue;
+      const placeholders = chunk.map((_, index) => `@id${index}`).join(', ');
+      const sql = `
+        SELECT record_id, metric_key, number_value, text_value, json_value
+        FROM telemetry_metrics
+        WHERE record_id IN (${placeholders})
+      `;
+      const stmt = this.db.prepare(sql);
+      const params = {};
+      chunk.forEach((id, index) => {
+        params[`id${index}`] = id;
+      });
+      const rows = stmt.all(params);
+      for (const row of rows) {
+        if (!row || !row.record_id || !row.metric_key) continue;
+        const list = metricsMap.get(row.record_id) || [];
+        list.push(row);
+        metricsMap.set(row.record_id, list);
+      }
+    }
+    return metricsMap;
   }
 }
 

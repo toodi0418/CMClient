@@ -889,51 +889,11 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   async loadTelemetryStore() {
-    if (!this.telemetryDb) {
-      return;
-    }
     this.telemetryStore.clear();
     this.telemetryRecordIds.clear();
-
-    let expectedCount = null;
-    try {
-      expectedCount = this.telemetryDb.getRecordCount();
-    } catch (err) {
-      this.emitLog('CALLMESH', `inspect telemetry database failed: ${err.message}`);
-    }
-    if (expectedCount && expectedCount > 0) {
-      this.emitLog(
-        'CALLMESH',
-        `正在載入遙測快取（約 ${expectedCount} 筆），請稍候……`
-      );
-    }
-
-    let loadedCount = 0;
-    const startedAt = Date.now();
-    try {
-      this.telemetryDb.iterateAll((record) => {
-        const normalized = this.normalizeTelemetryRecordFromDisk(record);
-        if (!normalized) {
-          return;
-        }
-        this.addTelemetryRecord(normalized.meshId, normalized, {
-          node: normalized.node || null,
-          persist: false,
-          emitEvent: false
-        });
-        loadedCount += 1;
-      });
-    } catch (err) {
-      this.emitLog('CALLMESH', `restore telemetry history failed: ${err.message}`);
-      return;
-    }
-
-    if (loadedCount > 0) {
-      const durationMs = Date.now() - startedAt;
-      this.emitLog(
-        'CALLMESH',
-        `restored telemetry history count=${loadedCount} duration=${durationMs}ms`
-      );
+    this.telemetryUpdatedAt = Date.now();
+    if (this.telemetryDb) {
+      this.emitLog('CALLMESH', '遙測快取將於查詢時由資料庫動態載入');
     }
   }
 
@@ -3704,17 +3664,85 @@ class CallMeshAprsBridge extends EventEmitter {
       Number.isFinite(limitPerNode) && limitPerNode > 0
         ? Math.floor(limitPerNode)
         : this.telemetryMaxEntriesPerNode;
-    const nodes = [];
+
+    const bucketMap = new Map();
+
+    const ensureBucket = (meshId, nodeCandidate = null) => {
+      if (!meshId) {
+        return null;
+      }
+      let bucket = bucketMap.get(meshId);
+      if (!bucket) {
+        bucket = {
+          meshId,
+          node: null,
+          records: [],
+          recordIds: new Set()
+        };
+        bucketMap.set(meshId, bucket);
+      }
+      if (nodeCandidate) {
+        bucket.node = mergeNodeInfo(bucket.node, nodeCandidate, { meshId });
+      }
+      return bucket;
+    };
+
+    const appendRecord = (record, { meshIdOverride = null, nodeCandidate = null } = {}) => {
+      if (!record) {
+        return;
+      }
+      const meshId = meshIdOverride || record.meshId || record.mesh_id;
+      if (!meshId) {
+        return;
+      }
+      const bucket = ensureBucket(meshId, nodeCandidate || record.node);
+      if (!bucket) {
+        return;
+      }
+      if (record.id && bucket.recordIds.has(record.id)) {
+        return;
+      }
+      bucket.records.push(cloneTelemetryRecord(record));
+      if (record.id) {
+        bucket.recordIds.add(record.id);
+      }
+    };
+
+    if (this.telemetryDb) {
+      try {
+        const snapshotRows = this.telemetryDb.fetchRecentSnapshot({ limitPerNode: limit });
+        for (const row of snapshotRows) {
+          appendRecord(row);
+        }
+      } catch (err) {
+        this.emitLog('CALLMESH', `fetch telemetry snapshot failed: ${err.message}`);
+      }
+    }
+
     for (const [meshId, bucket] of this.telemetryStore.entries()) {
-      const records = bucket.records || [];
-      const start = limit > 0 && records.length > limit ? records.length - limit : 0;
-      const slice = records.slice(start).map((record) => cloneTelemetryRecord(record));
+      const records = Array.isArray(bucket.records) ? bucket.records : [];
+      for (const record of records) {
+        appendRecord(record, {
+          meshIdOverride: meshId,
+          nodeCandidate: bucket.node || null
+        });
+      }
+    }
+
+    const nodes = [];
+    for (const [meshId, bucket] of bucketMap.entries()) {
+      const sortedRecords = bucket.records.sort((a, b) => a.timestampMs - b.timestampMs);
+      const limited =
+        limit > 0 && sortedRecords.length > limit
+          ? sortedRecords.slice(sortedRecords.length - limit)
+          : sortedRecords;
       nodes.push({
         meshId,
         node: bucket.node ? { ...bucket.node } : null,
-        records: slice
+        records: limited.map((record) => cloneTelemetryRecord(record))
       });
     }
+
     nodes.sort((a, b) => {
       const labelA = (a.node?.label || a.meshId || '').toLowerCase();
       const labelB = (b.node?.label || b.meshId || '').toLowerCase();
@@ -3722,23 +3750,54 @@ class CallMeshAprsBridge extends EventEmitter {
       if (labelA > labelB) return 1;
       return 0;
     });
+
     return {
       updatedAt: this.telemetryUpdatedAt,
       nodes,
-      stats: this.getTelemetryStats({ cachedNodes: nodes })
+      stats: this.getTelemetryStats()
     };
   }
 
   getTelemetryStats({ cachedNodes = null } = {}) {
-    let totalRecords = 0;
-    const source = cachedNodes;
-    if (Array.isArray(source)) {
-      totalRecords = source.reduce((acc, item) => acc + (Array.isArray(item.records) ? item.records.length : 0), 0);
-    } else {
-      for (const bucket of this.telemetryStore.values()) {
-        totalRecords += Array.isArray(bucket.records) ? bucket.records.length : 0;
+    let totalRecords = null;
+    let totalNodes = null;
+
+    if (this.telemetryDb) {
+      try {
+        totalRecords = this.telemetryDb.getRecordCount();
+      } catch (err) {
+        this.emitLog('CALLMESH', `count telemetry records failed: ${err.message}`);
+      }
+      try {
+        totalNodes = this.telemetryDb.getDistinctMeshCount();
+      } catch (err) {
+        this.emitLog('CALLMESH', `count telemetry mesh failed: ${err.message}`);
       }
     }
+
+    if (!Number.isFinite(totalRecords) || totalRecords < 0) {
+      const source = cachedNodes;
+      totalRecords = 0;
+      if (Array.isArray(source)) {
+        totalRecords = source.reduce(
+          (acc, item) => acc + (Array.isArray(item.records) ? item.records.length : 0),
+          0
+        );
+      } else {
+        for (const bucket of this.telemetryStore.values()) {
+          totalRecords += Array.isArray(bucket.records) ? bucket.records.length : 0;
+        }
+      }
+    }
+
+    if (!Number.isFinite(totalNodes) || totalNodes < 0) {
+      if (Array.isArray(cachedNodes)) {
+        totalNodes = cachedNodes.length;
+      } else {
+        totalNodes = this.telemetryStore.size;
+      }
+    }
+
     let diskBytes = 0;
     try {
       const stats = fsSync.statSync(this.getTelemetryStorePath());
@@ -3750,7 +3809,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     return {
       totalRecords,
-      totalNodes: this.telemetryStore.size,
+      totalNodes,
       diskBytes
     };
   }
@@ -3781,42 +3840,88 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   getTelemetryNodesSummary() {
-    const items = [];
-    for (const [key, bucket] of this.telemetryStore.entries()) {
+    const bucketMap = new Map();
+
+    const ensureBucket = (meshId, nodeCandidate = null) => {
+      if (!meshId) return null;
+      let bucket = bucketMap.get(meshId);
+      if (!bucket) {
+        bucket = {
+          meshId,
+          node: null,
+          totalRecords: 0,
+          earliestSampleMs: null,
+          latestSampleMs: null,
+          metrics: new Set(),
+          meshIdOriginal: null
+        };
+        bucketMap.set(meshId, bucket);
+      }
+      if (nodeCandidate) {
+        bucket.node = mergeNodeInfo(bucket.node, nodeCandidate, { meshId });
+        if (!bucket.meshIdOriginal && nodeCandidate.meshIdOriginal) {
+          bucket.meshIdOriginal = nodeCandidate.meshIdOriginal;
+        }
+      }
+      return bucket;
+    };
+
+    const processRecord = (record, { meshIdOverride = null, nodeCandidate = null } = {}) => {
+      if (!record) return;
+      const meshId = meshIdOverride || record.meshId;
+      if (!meshId) return;
+      const bucket = ensureBucket(meshId, nodeCandidate || record.node);
+      if (!bucket) return;
+      bucket.totalRecords += 1;
+      const sample = Number(record?.sampleTimeMs ?? record?.timestampMs);
+      if (Number.isFinite(sample)) {
+        if (bucket.latestSampleMs == null || sample > bucket.latestSampleMs) {
+          bucket.latestSampleMs = sample;
+        }
+        if (bucket.earliestSampleMs == null || sample < bucket.earliestSampleMs) {
+          bucket.earliestSampleMs = sample;
+        }
+      }
+      const metrics = record?.telemetry?.metrics;
+      if (metrics && typeof metrics === 'object') {
+        for (const metricKey of Object.keys(metrics)) {
+          bucket.metrics.add(metricKey);
+        }
+      }
+    };
+
+    if (this.telemetryDb) {
+      try {
+        const snapshotRows = this.telemetryDb.fetchRecentSnapshot({
+          limitPerNode: this.telemetryMaxEntriesPerNode
+        });
+        for (const row of snapshotRows) {
+          processRecord(row);
+        }
+      } catch (err) {
+        this.emitLog('CALLMESH', `build telemetry summary failed: ${err.message}`);
+      }
+    }
+
+    for (const [meshId, bucket] of this.telemetryStore.entries()) {
       const records = Array.isArray(bucket.records) ? bucket.records : [];
-      if (!records.length) {
-        continue;
-      }
-      const metricsSet = new Set();
-      let latestSampleMs = null;
-      let earliestSampleMs = null;
       for (const record of records) {
-        const sample = Number(record?.sampleTimeMs);
-        if (Number.isFinite(sample)) {
-          if (latestSampleMs == null || sample > latestSampleMs) {
-            latestSampleMs = sample;
-          }
-          if (earliestSampleMs == null || sample < earliestSampleMs) {
-            earliestSampleMs = sample;
-          }
-        }
-        const metrics = record?.telemetry?.metrics;
-        if (metrics && typeof metrics === 'object') {
-          for (const metricKey of Object.keys(metrics)) {
-            metricsSet.add(metricKey);
-          }
-        }
+        processRecord(record, { meshIdOverride: meshId, nodeCandidate: bucket.node || null });
       }
-      const normalized = normalizeMeshId(key);
+    }
+
+    const items = [];
+    for (const [meshId, bucket] of bucketMap.entries()) {
+      const normalized = normalizeMeshId(meshId);
       items.push({
-        meshId: key,
+        meshId,
         meshIdNormalized: normalized,
-        rawMeshId: bucket.meshIdOriginal || bucket.meshId || key,
+        rawMeshId: bucket.meshIdOriginal || meshId,
         node: bucket.node ? { ...bucket.node } : null,
-        totalRecords: records.length,
-        latestSampleMs,
-        earliestSampleMs,
-        availableMetrics: Array.from(metricsSet)
+        totalRecords: bucket.totalRecords,
+        latestSampleMs: bucket.latestSampleMs,
+        earliestSampleMs: bucket.earliestSampleMs,
+        availableMetrics: Array.from(bucket.metrics)
       });
     }
 
