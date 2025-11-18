@@ -339,6 +339,8 @@ async function startMonitor(argv) {
     }
   });
 
+  const connectionOptions = {};
+
   await bridge.init({ allowRestore: true });
   const sharedDataStore = bridge.getDataStore?.();
   if (sharedDataStore) {
@@ -545,13 +547,13 @@ async function startMonitor(argv) {
       ? `Serial ${serialPath} @ ${serialBaudRate}`
       : `TCP ${tcpHost}:${tcpPort}`;
 
-  const connectionOptions = {
+  Object.assign(connectionOptions, {
     transport,
     maxLength: argv.maxLength,
     handshake: true,
     heartbeat: HEARTBEAT_INTERVAL_SECONDS,
     relayStatsPath
-  };
+  });
   if (transport === 'serial') {
     Object.assign(connectionOptions, {
       serialPath,
