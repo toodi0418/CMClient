@@ -131,6 +131,15 @@ const telemetryChartsContainer = document.getElementById('telemetry-charts');
 const telemetryTableWrapper = document.getElementById('telemetry-table-wrapper');
 const telemetryTableBody = document.getElementById('telemetry-table-body');
 const telemetryEmptyState = document.getElementById('telemetry-empty-state');
+const telemetryPagination = document.getElementById('telemetry-pagination');
+const telemetryPaginationInfo = document.getElementById('telemetry-pagination-info');
+const telemetryPaginationCurrent = document.getElementById('telemetry-pagination-current');
+const telemetryPaginationTotal = document.getElementById('telemetry-pagination-total');
+const telemetryPageFirstBtn = document.getElementById('telemetry-page-first');
+const telemetryPagePrevBtn = document.getElementById('telemetry-page-prev');
+const telemetryPageNextBtn = document.getElementById('telemetry-page-next');
+const telemetryPageLastBtn = document.getElementById('telemetry-page-last');
+const telemetryPageSizeSelect = document.getElementById('telemetry-page-size');
 const telemetryRangeSelect = document.getElementById('telemetry-range-select');
 const telemetryRangeCustomWrap = document.getElementById('telemetry-range-custom');
 const telemetryRangeStartInput = document.getElementById('telemetry-range-start');
@@ -158,6 +167,73 @@ let selectedChannelId = CHANNEL_CONFIG[0]?.id ?? 0;
 
 initializeChannelMessages();
 loadPersistedMessages();
+
+const storedTelemetryPageSize = Number(localStorage.getItem(TELEMETRY_PAGE_SIZE_KEY));
+if (Number.isFinite(storedTelemetryPageSize) && TELEMETRY_PAGE_SIZES.includes(storedTelemetryPageSize)) {
+  telemetryTablePageSize = storedTelemetryPageSize;
+}
+
+if (telemetryPageSizeSelect) {
+  const fragment = document.createDocumentFragment();
+  for (const size of TELEMETRY_PAGE_SIZES) {
+    const option = document.createElement('option');
+    option.value = String(size);
+    option.textContent = String(size);
+    fragment.appendChild(option);
+  }
+  telemetryPageSizeSelect.innerHTML = '';
+  telemetryPageSizeSelect.appendChild(fragment);
+  if (!TELEMETRY_PAGE_SIZES.includes(telemetryTablePageSize)) {
+    telemetryTablePageSize = TELEMETRY_PAGE_SIZES[0];
+  }
+  telemetryPageSizeSelect.value = String(telemetryTablePageSize);
+  telemetryPageSizeSelect.addEventListener('change', (event) => {
+    const nextSize = Number(event.target.value);
+    if (!Number.isFinite(nextSize) || nextSize <= 0 || !TELEMETRY_PAGE_SIZES.includes(nextSize)) {
+      return;
+    }
+    if (telemetryTablePageSize === nextSize) {
+      return;
+    }
+    telemetryTablePageSize = nextSize;
+    localStorage.setItem(TELEMETRY_PAGE_SIZE_KEY, String(nextSize));
+    telemetryTablePage = 1;
+    renderTelemetryView();
+  });
+}
+
+function goToTelemetryPage(page) {
+  const totalPages =
+    telemetryTableFilteredCount > 0
+      ? Math.ceil(telemetryTableFilteredCount / Math.max(1, telemetryTablePageSize))
+      : 1;
+  const clamped = Math.min(Math.max(page, 1), totalPages);
+  if (clamped === telemetryTablePage) {
+    return;
+  }
+  telemetryTablePage = clamped;
+  renderTelemetryView();
+}
+
+telemetryPageFirstBtn?.addEventListener('click', () => {
+  goToTelemetryPage(1);
+});
+
+telemetryPagePrevBtn?.addEventListener('click', () => {
+  goToTelemetryPage(telemetryTablePage - 1);
+});
+
+telemetryPageNextBtn?.addEventListener('click', () => {
+  goToTelemetryPage(telemetryTablePage + 1);
+});
+
+telemetryPageLastBtn?.addEventListener('click', () => {
+  const totalPages =
+    telemetryTableFilteredCount > 0
+      ? Math.ceil(telemetryTableFilteredCount / Math.max(1, telemetryTablePageSize))
+      : 1;
+  goToTelemetryPage(totalPages);
+});
 
 const MAX_ROWS = 200;
 let discoveredDevices = [];
@@ -243,6 +319,11 @@ const aprsCompletedQueue = [];
 const TELEMETRY_TABLE_LIMIT = 200;
 const TELEMETRY_CHART_LIMIT = 200;
 const TELEMETRY_MAX_LOCAL_RECORDS = Number.POSITIVE_INFINITY;
+const TELEMETRY_PAGE_SIZES = [25, 50, 100, 200];
+const TELEMETRY_PAGE_SIZE_KEY = 'tmag:electron:telemetry:page-size';
+let telemetryTablePageSize = 50;
+let telemetryTablePage = 1;
+let telemetryTableFilteredCount = 0;
 let telemetryMaxTotalRecords = 20000;
 const TELEMETRY_METRIC_DEFINITIONS = {
   batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
@@ -4407,6 +4488,7 @@ function applyTelemetryNodeSelection(meshId, { preserveSearch = false, hideDropd
     telemetrySearchRaw = '';
     telemetrySearchTerm = '';
   }
+  telemetryTablePage = 1;
   updateTelemetryNodeInputDisplay();
   renderTelemetryView();
   if (hideDropdown) {
@@ -4522,6 +4604,7 @@ function handleTelemetryNodeInputChange(event) {
       }
     }
     updateTelemetryNodeInputDisplay();
+    telemetryTablePage = 1;
     renderTelemetryView();
     return;
   }
@@ -4537,6 +4620,7 @@ function handleTelemetryNodeInputChange(event) {
   telemetrySearchRaw = raw;
   telemetrySearchTerm = raw.toLowerCase();
   updateTelemetryNodeInputDisplay();
+  telemetryTablePage = 1;
   renderTelemetryView();
 }
 
@@ -4840,6 +4924,42 @@ function enforceTelemetryGlobalLimit() {
   }
 }
 
+function updateTelemetryPagination(totalRecords) {
+  telemetryTableFilteredCount = totalRecords;
+  const pageSize = Math.max(1, telemetryTablePageSize);
+  const totalPages = totalRecords > 0 ? Math.ceil(totalRecords / pageSize) : 1;
+  if (telemetryTablePage > totalPages) {
+    telemetryTablePage = totalPages;
+  }
+  if (telemetryTablePage < 1) {
+    telemetryTablePage = 1;
+  }
+  const startIndex = totalRecords === 0 ? 0 : (telemetryTablePage - 1) * pageSize;
+  const endIndex = totalRecords === 0 ? 0 : Math.min(totalRecords, startIndex + pageSize);
+  if (telemetryPagination) {
+    if (totalRecords === 0) {
+      telemetryPagination.classList.add('hidden');
+      telemetryPaginationInfo && (telemetryPaginationInfo.textContent = '沒有可顯示的資料');
+      telemetryPaginationCurrent && (telemetryPaginationCurrent.textContent = '0');
+      telemetryPaginationTotal && (telemetryPaginationTotal.textContent = '0');
+    } else {
+      telemetryPagination.classList.remove('hidden');
+      if (telemetryPaginationInfo) {
+        telemetryPaginationInfo.textContent = `顯示 ${startIndex + 1}-${endIndex} / ${totalRecords} 筆`;
+      }
+      telemetryPaginationCurrent && (telemetryPaginationCurrent.textContent = String(telemetryTablePage));
+      telemetryPaginationTotal && (telemetryPaginationTotal.textContent = String(totalPages));
+    }
+    const atFirst = telemetryTablePage <= 1 || totalRecords === 0;
+    const atLast = telemetryTablePage >= totalPages || totalRecords === 0;
+    if (telemetryPageFirstBtn) telemetryPageFirstBtn.disabled = atFirst;
+    if (telemetryPagePrevBtn) telemetryPagePrevBtn.disabled = atFirst;
+    if (telemetryPageNextBtn) telemetryPageNextBtn.disabled = atLast;
+    if (telemetryPageLastBtn) telemetryPageLastBtn.disabled = atLast;
+  }
+  return { startIndex, endIndex };
+}
+
 function clearTelemetryDataLocal({ silent = false } = {}) {
   telemetryStore.clear();
   telemetryRecordIds.clear();
@@ -4847,6 +4967,8 @@ function clearTelemetryDataLocal({ silent = false } = {}) {
   telemetryNodeLookup.clear();
   telemetryNodeDisplayByMesh.clear();
   telemetryNodeOptions = [];
+  telemetryTablePage = 1;
+  telemetryTableFilteredCount = 0;
   hideTelemetryDropdown();
   telemetryNodeOptions = [];
   telemetryLastExplicitMeshId = null;
@@ -5021,6 +5143,7 @@ async function loadTelemetryRecordsForSelection(meshId = telemetrySelectedMeshId
   if (!meshId || !window.meshtastic.fetchTelemetryRange) {
     return;
   }
+  telemetryTablePage = 1;
   const meshKey = resolveTelemetryMeshKey(meshId);
   const bucket = telemetryStore.get(meshKey);
   const { startMs, endMs } = getTelemetryRangeWindow();
@@ -5612,14 +5735,21 @@ function renderTelemetryView() {
     telemetryLoading &&
     (!Array.isArray(baseRecords) || baseRecords.length === 0)
   ) {
+    telemetryTableFilteredCount = 0;
     telemetryEmptyState.classList.remove('hidden');
     telemetryEmptyState.textContent = '正在載入遙測資料...';
     telemetryChartsContainer?.classList.add('hidden');
     telemetryTableWrapper?.classList.add('hidden');
+    telemetryPagination?.classList.add('hidden');
     return;
   }
   const filteredRecords = applyTelemetryFilters(baseRecords);
   const searchFilteredRecords = filterTelemetryBySearch(filteredRecords);
+  const paginationWindow = updateTelemetryPagination(searchFilteredRecords.length);
+  const pageRecords =
+    searchFilteredRecords.length > 0
+      ? searchFilteredRecords.slice(paginationWindow.startIndex, paginationWindow.endIndex)
+      : [];
   const hasData = searchFilteredRecords.length > 0;
   const hasBase = filteredRecords.length > 0;
   telemetryEmptyState.classList.toggle('hidden', hasData);
@@ -5641,7 +5771,7 @@ function renderTelemetryView() {
     return;
   }
   renderTelemetryCharts(searchFilteredRecords);
-  renderTelemetryTable(searchFilteredRecords);
+  renderTelemetryTable(pageRecords);
 }
 
 function collectTelemetrySeries(records) {

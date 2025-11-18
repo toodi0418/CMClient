@@ -1463,6 +1463,71 @@ tbody tr:hover {
   font-size: 0.85rem;
 }
 
+.telemetry-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-top: 1px solid rgba(59, 130, 246, 0.18);
+  background: rgba(15, 23, 42, 0.78);
+}
+
+.telemetry-pagination-info {
+  color: #cbd5f5;
+  font-size: 0.9rem;
+}
+
+.telemetry-pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.telemetry-page-status {
+  color: #9ca3af;
+  font-size: 0.9rem;
+}
+
+.telemetry-page-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(30, 41, 59, 0.85);
+  color: #e2e8f0;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.telemetry-page-btn:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.35);
+  border-color: rgba(96, 165, 250, 0.6);
+}
+
+.telemetry-page-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.telemetry-page-size {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #cbd5f5;
+  font-size: 0.9rem;
+}
+
+.telemetry-page-size-select {
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(30, 41, 59, 0.9);
+  color: #e2e8f0;
+}
+
 .log-panel {
   border-radius: 12px;
   border: 1px solid rgba(59, 130, 246, 0.25);
