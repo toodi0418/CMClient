@@ -359,6 +359,11 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
 
+    this.emitLog(
+      'CALLMESH',
+      '開始遷移遙測歷史紀錄至資料庫，過程可能需要一些時間，請勿關閉程式。'
+    );
+
     let migrated = 0;
     await new Promise((resolve, reject) => {
       const stream = fsSync.createReadStream(legacyPath, { encoding: 'utf8' });
