@@ -72,6 +72,14 @@
   const flowEntryIndex = new Map();
   const pendingFlowSummaries = new Map();
   const pendingAprsUplinks = new Map();
+  const MAX_PENDING_FLOW_SUMMARIES_PER_MESH = 25;
+  const MAX_PENDING_FLOW_SUMMARIES_TOTAL = 400;
+  const PENDING_FLOW_SUMMARY_TTL_MS = 15 * 60 * 1000;
+  const pendingFlowSummaryQueue = [];
+  let pendingFlowSummaryCount = 0;
+  const MAX_PENDING_APRS_RECORDS = 200;
+  const PENDING_APRS_TTL_MS = 15 * 60 * 1000;
+  const pendingAprsQueue = [];
   let flowFilterState = 'all';
   let flowSearchTerm = '';
   const FLOW_MAX_ENTRIES = 1000;
@@ -4355,6 +4363,148 @@ function ensureRelayGuessSuffix(label, summary) {
     }
   }
 
+  function unwrapPendingFlowSummary(entry) {
+    if (!entry || typeof entry !== 'object') {
+      return entry || null;
+    }
+    if (entry.summary && typeof entry.summary === 'object') {
+      return entry.summary;
+    }
+    return entry;
+  }
+
+  function deletePendingFlowSummary(meshId, flowId) {
+    if (!meshId || !flowId) return false;
+    const bucket = pendingFlowSummaries.get(meshId);
+    if (!bucket) return false;
+    const removed = bucket.delete(flowId);
+    if (!removed) return false;
+    pendingFlowSummaryCount = Math.max(0, pendingFlowSummaryCount - 1);
+    if (!bucket.size) {
+      pendingFlowSummaries.delete(meshId);
+    }
+    return true;
+  }
+
+  function trimPendingFlowSummaries() {
+    if (!pendingFlowSummaryQueue.length) {
+      return;
+    }
+    const now = Date.now();
+    while (pendingFlowSummaryQueue.length) {
+      const head = pendingFlowSummaryQueue[0];
+      if (!head) {
+        pendingFlowSummaryQueue.shift();
+        continue;
+      }
+      const expired = head.insertedAt + PENDING_FLOW_SUMMARY_TTL_MS < now;
+      const overLimit = pendingFlowSummaryCount > MAX_PENDING_FLOW_SUMMARIES_TOTAL;
+      if (!expired && !overLimit) {
+        break;
+      }
+      pendingFlowSummaryQueue.shift();
+      if (!head.meshId || !head.flowId) {
+        continue;
+      }
+      if (!expired && !overLimit) {
+        continue;
+      }
+      deletePendingFlowSummary(head.meshId, head.flowId);
+    }
+  }
+
+  function addPendingFlowSummary(meshId, flowId, summary) {
+    if (!meshId || !flowId || !summary) return;
+    let bucket = pendingFlowSummaries.get(meshId);
+    const now = Date.now();
+    if (!bucket) {
+      bucket = new Map();
+      pendingFlowSummaries.set(meshId, bucket);
+    }
+    if (bucket.has(flowId)) {
+      bucket.set(flowId, { summary, insertedAt: now });
+      return;
+    }
+    bucket.set(flowId, { summary, insertedAt: now });
+    pendingFlowSummaryQueue.push({ meshId, flowId, insertedAt: now });
+    pendingFlowSummaryCount += 1;
+
+    while (bucket.size > MAX_PENDING_FLOW_SUMMARIES_PER_MESH) {
+      const oldestKey = bucket.keys().next().value;
+      if (!oldestKey) {
+        break;
+      }
+      const removed = deletePendingFlowSummary(meshId, oldestKey);
+      if (!removed) {
+        bucket.delete(oldestKey);
+      }
+      bucket = pendingFlowSummaries.get(meshId);
+      if (!bucket) {
+        break;
+      }
+    }
+
+    trimPendingFlowSummaries();
+  }
+
+  function normalizeAprsRecord(record) {
+    if (!record || typeof record !== 'object') {
+      return null;
+    }
+    const {
+      frame = '',
+      payload = '',
+      timestampMs = null,
+      timestampLabel = ''
+    } = record;
+    return { frame, payload, timestampMs, timestampLabel };
+  }
+
+  function discardPendingAprsRecord(flowId) {
+    if (!flowId) return;
+    pendingAprsUplinks.delete(flowId);
+  }
+
+  function trimPendingAprsRecords() {
+    if (!pendingAprsQueue.length) {
+      return;
+    }
+    const now = Date.now();
+    while (pendingAprsQueue.length) {
+      const head = pendingAprsQueue[0];
+      if (!head) {
+        pendingAprsQueue.shift();
+        continue;
+      }
+      const entry = pendingAprsUplinks.get(head.flowId);
+      if (!entry) {
+        pendingAprsQueue.shift();
+        continue;
+      }
+      const isCurrent = entry.cachedAt === head.cachedAt;
+      if (!isCurrent) {
+        pendingAprsQueue.shift();
+        continue;
+      }
+      const expired = entry.cachedAt + PENDING_APRS_TTL_MS < now;
+      const overLimit = pendingAprsUplinks.size > MAX_PENDING_APRS_RECORDS;
+      if (!expired && !overLimit) {
+        break;
+      }
+      pendingAprsQueue.shift();
+      pendingAprsUplinks.delete(head.flowId);
+    }
+  }
+
+  function rememberPendingAprsRecord(flowId, record) {
+    if (!flowId || !record) return;
+    const cachedAt = Date.now();
+    const stored = { ...record, cachedAt };
+    pendingAprsUplinks.set(flowId, stored);
+    pendingAprsQueue.push({ flowId, cachedAt });
+    trimPendingAprsRecords();
+  }
+
   function registerFlow(summary, { skipPending = false } = {}) {
     if (!summary) return;
     const type = String(summary.type || '').toLowerCase();
@@ -4382,37 +4532,16 @@ function ensureRelayGuessSuffix(label, summary) {
     const mapping = findMappingByMeshId(meshId);
     if (!mapping) {
       if (!skipPending) {
-        let bucket = pendingFlowSummaries.get(meshId);
-        if (!bucket) {
-          bucket = new Map();
-          pendingFlowSummaries.set(meshId, bucket);
-        }
-        if (!bucket.has(flowId)) {
-          const clone = cloneSummaryForPending(summary);
-          if (clone) {
-            bucket.set(flowId, clone);
-            while (bucket.size > 25) {
-              const oldestKey = bucket.keys().next().value;
-              if (oldestKey) {
-                bucket.delete(oldestKey);
-              } else {
-                break;
-              }
-            }
-          }
+        const clone = cloneSummaryForPending(summary);
+        if (clone) {
+          addPendingFlowSummary(meshId, flowId, clone);
         }
       }
       return;
     }
 
     if (!skipPending) {
-      const bucket = pendingFlowSummaries.get(meshId);
-      if (bucket) {
-        bucket.delete(flowId);
-        if (!bucket.size) {
-          pendingFlowSummaries.delete(meshId);
-        }
-      }
+      deletePendingFlowSummary(meshId, flowId);
     }
 
     const entry = buildFlowEntry(summary, {
@@ -4426,9 +4555,10 @@ function ensureRelayGuessSuffix(label, summary) {
 
     const aprsRecord = pendingAprsUplinks.get(flowId);
     if (aprsRecord) {
-      entry.aprs = aprsRecord;
+      entry.aprs = normalizeAprsRecord(aprsRecord);
       entry.status = 'aprs';
-      pendingAprsUplinks.delete(flowId);
+      discardPendingAprsRecord(flowId);
+      trimPendingAprsRecords();
     }
 
     renderFlowEntries();
@@ -4949,10 +5079,16 @@ function ensureRelayGuessSuffix(label, summary) {
     if (!meshId) return;
     const bucket = pendingFlowSummaries.get(meshId);
     if (!bucket || !bucket.size) return;
+    const bucketSize = bucket.size;
     pendingFlowSummaries.delete(meshId);
-    for (const summary of bucket.values()) {
-      registerFlow(summary, { skipPending: true });
+    pendingFlowSummaryCount = Math.max(0, pendingFlowSummaryCount - bucketSize);
+    for (const entry of bucket.values()) {
+      const summary = unwrapPendingFlowSummary(entry);
+      if (summary) {
+        registerFlow(summary, { skipPending: true });
+      }
     }
+    trimPendingFlowSummaries();
   }
 
   function refreshFlowEntryLabels() {
@@ -5035,11 +5171,13 @@ function ensureRelayGuessSuffix(label, summary) {
     if (aprsRecord) {
       const entry = flowEntryIndex.get(info.flowId);
       if (entry) {
-        entry.aprs = aprsRecord;
+        entry.aprs = normalizeAprsRecord(aprsRecord);
         entry.status = 'aprs';
+        discardPendingAprsRecord(info.flowId);
+        trimPendingAprsRecords();
         renderFlowEntries();
       } else {
-        pendingAprsUplinks.set(info.flowId, aprsRecord);
+        rememberPendingAprsRecord(info.flowId, normalizeAprsRecord(aprsRecord));
       }
     }
   }
