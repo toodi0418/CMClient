@@ -348,17 +348,6 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
 
-    let existingCount = 0;
-    try {
-      existingCount = this.telemetryDb.getRecordCount();
-    } catch (err) {
-      this.emitLog('CALLMESH', `inspect telemetry database failed: ${err.message}`);
-    }
-    if (existingCount > 0) {
-      this.emitLog('CALLMESH', 'skip telemetry jsonl migration: database already has records');
-      return;
-    }
-
     this.emitLog(
       'CALLMESH',
       '開始遷移遙測歷史紀錄至資料庫，過程可能需要一些時間，請勿關閉程式。'
