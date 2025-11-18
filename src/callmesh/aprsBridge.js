@@ -2515,6 +2515,13 @@ class CallMeshAprsBridge extends EventEmitter {
     for (const node of candidates) {
       if (!node || typeof node !== 'object') continue;
       let sourceNode = node;
+      const guessedFlag =
+        sourceNode?.guessed === true ||
+        sourceNode?.guess === true ||
+        sourceNode?.relayGuessed === true;
+      if (guessedFlag) {
+        continue;
+      }
       if (summary.type === 'Position' && summary.position && node === summary.from) {
         const position = summary.position;
         sourceNode = {
