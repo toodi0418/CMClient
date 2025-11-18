@@ -1381,8 +1381,10 @@ class MeshtasticClient extends EventEmitter {
       return Number.isFinite(num) ? num : null;
     };
 
-    const hopStartValue = toFiniteOrNull(packet.hopStart);
-    const hopLimitValue = toFiniteOrNull(packet.hopLimit);
+    const rawHopStart = toFiniteOrNull(packet.hopStart);
+    const rawHopLimit = toFiniteOrNull(packet.hopLimit);
+    const hopStartValue = rawHopStart != null && rawHopStart > 0 ? rawHopStart : null;
+    const hopLimitValue = rawHopLimit != null && rawHopLimit > 0 ? rawHopLimit : null;
     const hopLimitOnly = hopLimitValue != null && hopStartValue == null;
     let usedHops = null;
     if (hopStartValue != null && hopLimitValue != null) {
