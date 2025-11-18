@@ -9,6 +9,8 @@ const readline = require('readline');
 const { CallMeshClient, buildAgentString } = require('./client');
 const { APRSClient } = require('../aprs/client');
 const { nodeDatabase } = require('../nodeDatabase');
+const { TelemetryDatabase } = require('../storage/telemetryDatabase');
+const { CallMeshDataStore } = require('../storage/callmeshDataStore');
 const WebSocket = require('ws');
 
 const DEFAULT_APRS_SERVER = 'asia.aprs2.net';
@@ -226,6 +228,10 @@ class CallMeshAprsBridge extends EventEmitter {
     this.telemetryMaxEntriesPerNode = Number.isFinite(telemetryMaxEntriesPerNode)
       ? Math.max(10, Math.floor(telemetryMaxEntriesPerNode))
       : 500;
+    this.telemetryDb = null;
+    this.callmeshDataStorePath = path.join(this.storageDir, 'callmesh-data.sqlite');
+    this.dataStore = new CallMeshDataStore(this.callmeshDataStorePath);
+    this.dataStoreInitialized = false;
 
     this.tenmanForwardOverride =
       typeof options.shareWithTenmanMap === 'boolean' ? options.shareWithTenmanMap : null;
@@ -277,13 +283,144 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   getTelemetryStorePath() {
+    return path.join(this.storageDir, 'telemetry-records.sqlite');
+  }
+
+  getLegacyTelemetryStorePath() {
     return path.join(this.storageDir, 'telemetry-records.jsonl');
+  }
+
+  initializeDataStore() {
+    if (!this.dataStore || this.dataStoreInitialized) {
+      return;
+    }
+    try {
+      this.dataStore.init();
+      this.dataStoreInitialized = true;
+    } catch (err) {
+      this.emitLog('CALLMESH', `init callmesh data store failed: ${err.message}`);
+      throw err;
+    }
+  }
+
+  getDataStore() {
+    if (!this.dataStore) {
+      return null;
+    }
+    if (!this.dataStoreInitialized) {
+      this.initializeDataStore();
+    }
+    return this.dataStore;
+  }
+
+  async initializeTelemetryDatabase({ migrateLegacy = true } = {}) {
+    if (this.telemetryDb) {
+      return;
+    }
+    const dbPath = this.getTelemetryStorePath();
+    try {
+      this.telemetryDb = new TelemetryDatabase(dbPath);
+      this.telemetryDb.init();
+    } catch (err) {
+      this.emitLog('CALLMESH', `init telemetry database failed: ${err.message}`);
+      throw err;
+    }
+    if (migrateLegacy) {
+      await this.migrateLegacyTelemetryStore();
+    }
+  }
+
+  async migrateLegacyTelemetryStore() {
+    const legacyPath = this.getLegacyTelemetryStorePath();
+    if (!this.telemetryDb || !legacyPath) {
+      return;
+    }
+    let legacyExists = false;
+    try {
+      await fs.access(legacyPath);
+      legacyExists = true;
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') {
+        this.emitLog('CALLMESH', `check legacy telemetry file failed: ${err.message}`);
+      }
+    }
+    if (!legacyExists) {
+      return;
+    }
+
+    let existingCount = 0;
+    try {
+      existingCount = this.telemetryDb.getRecordCount();
+    } catch (err) {
+      this.emitLog('CALLMESH', `inspect telemetry database failed: ${err.message}`);
+    }
+    if (existingCount > 0) {
+      this.emitLog('CALLMESH', 'skip telemetry jsonl migration: database already has records');
+      return;
+    }
+
+    let migrated = 0;
+    await new Promise((resolve, reject) => {
+      const stream = fsSync.createReadStream(legacyPath, { encoding: 'utf8' });
+      const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+      const handleRecord = (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let parsed;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          return;
+        }
+        const normalized = this.normalizeTelemetryRecordFromDisk(parsed);
+        if (!normalized) return;
+        try {
+          this.telemetryDb.insertRecord(normalized);
+          migrated += 1;
+        } catch (err) {
+          this.emitLog('CALLMESH', `legacy telemetry insert failed: ${err.message}`);
+        }
+      };
+
+      rl.on('line', handleRecord);
+      rl.once('close', resolve);
+      rl.once('error', reject);
+      stream.once('error', reject);
+    }).catch((err) => {
+      this.emitLog('CALLMESH', `migrate telemetry jsonl failed: ${err.message}`);
+    });
+
+    if (migrated > 0) {
+      this.emitLog('CALLMESH', `migrated telemetry history from jsonl count=${migrated}`);
+    }
+
+    const migratedPath = `${legacyPath}.migrated`;
+    try {
+      await fs.rename(legacyPath, migratedPath);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return;
+      }
+      if (err && err.code === 'EEXIST') {
+        const timestamped = `${legacyPath}.migrated-${Date.now()}`;
+        try {
+          await fs.rename(legacyPath, timestamped);
+        } catch (renameErr) {
+          this.emitLog('CALLMESH', `cleanup legacy telemetry jsonl failed: ${renameErr.message}`);
+        }
+      } else if (err) {
+        this.emitLog('CALLMESH', `rename legacy telemetry jsonl failed: ${err.message}`);
+      }
+    }
   }
 
   async init({ allowRestore = true } = {}) {
     await this.ensureStorageDir();
+    this.initializeDataStore();
     await this.restoreArtifacts({ allowRestore });
     await this.restoreTelemetryState();
+    await this.initializeTelemetryDatabase({ migrateLegacy: allowRestore });
     await this.loadTelemetryStore();
     await this.restoreNodeDatabase();
     this.emitState();
@@ -323,25 +460,45 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!this.storageDir) {
       return;
     }
-    try {
-      const filePath = this.getNodeDatabaseFilePath();
-      const content = await fs.readFile(filePath, 'utf8');
-      const payload = JSON.parse(content);
-      const entries = Array.isArray(payload?.nodes)
-        ? payload.nodes
-        : Array.isArray(payload)
-          ? payload
-          : [];
-      const restored = this.nodeDatabase.replace(entries);
-      this.resetTenmanNodeSyncSignatures();
-      this.requestTenmanNodeSnapshot('restore');
-      if (restored.length) {
-        this.emitLog('NODE-DB', `restored ${restored.length} nodes from disk`);
+    let entries = null;
+    const store = this.getDataStore();
+    if (store) {
+      try {
+        entries = store.listNodes();
+      } catch (err) {
+        console.warn('從 SQLite 載入節點資料庫失敗:', err);
       }
-    } catch (err) {
-      if (err && err.code !== 'ENOENT') {
-        console.warn('載入節點資料庫失敗:', err);
+    }
+    if (!entries || !entries.length) {
+      try {
+        const filePath = this.getNodeDatabaseFilePath();
+        const content = await fs.readFile(filePath, 'utf8');
+        const payload = JSON.parse(content);
+        entries = Array.isArray(payload?.nodes)
+          ? payload.nodes
+          : Array.isArray(payload)
+            ? payload
+            : [];
+        if (entries.length && store) {
+          try {
+            store.replaceNodes(entries);
+            await fs.rm(this.getNodeDatabaseFilePath(), { force: true });
+          } catch (err) {
+            console.warn('節點資料庫遷移至 SQLite 失敗:', err);
+          }
+        }
+      } catch (err) {
+        if (err && err.code !== 'ENOENT') {
+          console.warn('載入節點資料庫失敗:', err);
+        }
+        entries = [];
       }
+    }
+    const restored = this.nodeDatabase.replace(entries || []);
+    this.resetTenmanNodeSyncSignatures();
+    this.requestTenmanNodeSnapshot('restore');
+    if (restored.length) {
+      this.emitLog('NODE-DB', `restored ${restored.length} nodes from disk`);
     }
   }
 
@@ -373,6 +530,15 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     const snapshot = this.nodeDatabase.serialize();
+    const store = this.getDataStore();
+    if (store) {
+      try {
+        store.replaceNodes(snapshot);
+        return;
+      } catch (err) {
+        console.error('寫入節點資料庫失敗:', err);
+      }
+    }
     const payload = {
       version: 1,
       updatedAt: new Date().toISOString(),
@@ -595,19 +761,52 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
 
-    const mapping = await this.loadJsonSafe(this.getMappingFilePath());
+    const store = this.getDataStore();
+
+    let mapping = store ? store.getKv('mapping') : null;
+    if (!mapping) {
+      const legacyMapping = await this.loadJsonSafe(this.getMappingFilePath());
+      if (legacyMapping && store) {
+        mapping = legacyMapping;
+        try {
+          store.setKv('mapping', mapping);
+          await fs.rm(this.getMappingFilePath(), { force: true });
+        } catch (err) {
+          this.emitLog('CALLMESH', `archive legacy mapping failed: ${err.message}`);
+        }
+      } else if (legacyMapping) {
+        mapping = legacyMapping;
+      }
+    }
     if (mapping) {
       this.callmeshState.lastMappingHash = mapping.hash ?? null;
       this.callmeshState.lastMappingSyncedAt = mapping.updatedAt ?? null;
       if (Array.isArray(mapping.items)) {
         this.callmeshState.mappingItems = mapping.items;
       }
-      this.emitLog('CALLMESH', `restore mapping hash=${this.callmeshState.lastMappingHash ?? 'null'} count=${this.callmeshState.mappingItems.length}`);
+      this.emitLog(
+        'CALLMESH',
+        `restore mapping hash=${this.callmeshState.lastMappingHash ?? 'null'} count=${this.callmeshState.mappingItems.length}`
+      );
     }
 
-    const provision = await this.loadJsonSafe(this.getProvisionFilePath());
-    if (provision?.provision) {
-      this.callmeshState.cachedProvision = cloneProvision(provision.provision);
+    let provisionPayload = store ? store.getKv('provision') : null;
+    if (!provisionPayload) {
+      const legacyProvision = await this.loadJsonSafe(this.getProvisionFilePath());
+      if (legacyProvision && store) {
+        provisionPayload = legacyProvision;
+        try {
+          store.setKv('provision', provisionPayload);
+          await fs.rm(this.getProvisionFilePath(), { force: true });
+        } catch (err) {
+          this.emitLog('CALLMESH', `archive legacy provision failed: ${err.message}`);
+        }
+      } else if (legacyProvision) {
+        provisionPayload = legacyProvision;
+      }
+    }
+    if (provisionPayload?.provision) {
+      this.callmeshState.cachedProvision = cloneProvision(provisionPayload.provision);
       this.emitLog('CALLMESH', 'restore provision cache from disk');
     }
     this.callmeshState.provision = null;
@@ -619,6 +818,19 @@ class CallMeshAprsBridge extends EventEmitter {
     await fs.rm(this.getProvisionFilePath(), { force: true });
     await fs.rm(this.getTelemetryStateFilePath(), { force: true });
     await fs.rm(this.getNodeDatabaseFilePath(), { force: true });
+    const store = this.getDataStore();
+    if (store) {
+      try {
+        store.deleteKv('mapping');
+        store.deleteKv('provision');
+        store.deleteKv('telemetry_state');
+        store.clearNodes();
+        store.saveMessageLog([]);
+        store.replaceRelayStats([]);
+      } catch (err) {
+        this.emitLog('CALLMESH', `clear sqlite artifacts failed: ${err.message}`);
+      }
+    }
     this.callmeshState.lastMappingHash = null;
     this.callmeshState.lastMappingSyncedAt = null;
     this.callmeshState.provision = null;
@@ -640,57 +852,57 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   async restoreTelemetryState() {
-    try {
-      const payload = await this.loadJsonSafe(this.getTelemetryStateFilePath());
-      const sequenceValue = Number(payload?.sequence ?? payload?.seq ?? payload?.lastSequence);
-      if (Number.isFinite(sequenceValue) && sequenceValue >= 0) {
-        const normalized = Math.floor(sequenceValue) % 1000;
-        this.aprsTelemetrySequence = normalized;
+    const store = this.getDataStore();
+    let payload = null;
+    if (store) {
+      try {
+        payload = store.getKv('telemetry_state');
+      } catch (err) {
+        this.emitLog('CALLMESH', `load telemetry state from sqlite failed: ${err.message}`);
       }
-    } catch (err) {
-      this.emitLog('CALLMESH', `restore telemetry sequence failed: ${err.message}`);
+    }
+    if (!payload) {
+      try {
+        payload = await this.loadJsonSafe(this.getTelemetryStateFilePath());
+        if (payload && store) {
+          try {
+            store.setKv('telemetry_state', payload);
+            await fs.rm(this.getTelemetryStateFilePath(), { force: true });
+          } catch (err) {
+            this.emitLog('CALLMESH', `archive legacy telemetry state failed: ${err.message}`);
+          }
+        }
+      } catch (err) {
+        this.emitLog('CALLMESH', `restore telemetry sequence failed: ${err.message}`);
+      }
+    }
+    const sequenceValue = Number(payload?.sequence ?? payload?.seq ?? payload?.lastSequence);
+    if (Number.isFinite(sequenceValue) && sequenceValue >= 0) {
+      const normalized = Math.floor(sequenceValue) % 1000;
+      this.aprsTelemetrySequence = normalized;
     }
   }
 
   async loadTelemetryStore() {
-    const filePath = this.getTelemetryStorePath();
-    try {
-      await fs.access(filePath);
-    } catch (err) {
-      if (err && err.code === 'ENOENT') {
-        return;
-      }
-      this.emitLog('CALLMESH', `telemetry history access failed: ${err.message}`);
+    if (!this.telemetryDb) {
       return;
     }
+    this.telemetryStore.clear();
+    this.telemetryRecordIds.clear();
 
     let loadedCount = 0;
     try {
-      await new Promise((resolve, reject) => {
-        const stream = fsSync.createReadStream(filePath, { encoding: 'utf8' });
-        stream.on('error', reject);
-        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-        rl.on('line', (line) => {
-          const trimmed = line.trim();
-          if (!trimmed) return;
-          let parsed;
-          try {
-            parsed = JSON.parse(trimmed);
-          } catch (err) {
-            return;
-          }
-          const normalized = this.normalizeTelemetryRecordFromDisk(parsed);
-          if (!normalized) {
-            return;
-          }
-          this.addTelemetryRecord(normalized.meshId, normalized, {
-            node: normalized.node || null,
-            persist: false,
-            emitEvent: false
-          });
-          loadedCount += 1;
+      this.telemetryDb.iterateAll((record) => {
+        const normalized = this.normalizeTelemetryRecordFromDisk(record);
+        if (!normalized) {
+          return;
+        }
+        this.addTelemetryRecord(normalized.meshId, normalized, {
+          node: normalized.node || null,
+          persist: false,
+          emitEvent: false
         });
-        rl.once('close', resolve);
+        loadedCount += 1;
       });
     } catch (err) {
       this.emitLog('CALLMESH', `restore telemetry history failed: ${err.message}`);
@@ -703,15 +915,20 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   async persistTelemetryState() {
-    try {
-      const payload = {
-        sequence: this.aprsTelemetrySequence,
-        savedAt: new Date().toISOString()
-      };
-      await this.saveJson(this.getTelemetryStateFilePath(), payload);
-    } catch (err) {
-      this.emitLog('CALLMESH', `儲存 Telemetry 序號失敗: ${err.message}`);
+    const payload = {
+      sequence: this.aprsTelemetrySequence,
+      savedAt: new Date().toISOString()
+    };
+    const store = this.getDataStore();
+    if (store) {
+      try {
+        store.setKv('telemetry_state', payload);
+        return;
+      } catch (err) {
+        this.emitLog('CALLMESH', `儲存 Telemetry 序號失敗: ${err.message}`);
+      }
     }
+    await this.saveJson(this.getTelemetryStateFilePath(), payload);
   }
 
   async performHeartbeatTick() {
@@ -2437,6 +2654,22 @@ class CallMeshAprsBridge extends EventEmitter {
     this.teardownAprsConnection();
     this.flushNodeDatabasePersistSync();
     this.meshtasticClients.clear();
+    if (this.dataStoreInitialized && this.dataStore) {
+      try {
+        this.dataStore.close();
+      } catch (err) {
+        this.emitLog('CALLMESH', `close callmesh data store failed: ${err.message}`);
+      }
+      this.dataStoreInitialized = false;
+    }
+    if (this.telemetryDb) {
+      try {
+        this.telemetryDb.close();
+      } catch (err) {
+        this.emitLog('CALLMESH', `close telemetry db failed: ${err.message}`);
+      }
+      this.telemetryDb = null;
+    }
   }
 
   // Internal helpers
@@ -2493,7 +2726,16 @@ class CallMeshAprsBridge extends EventEmitter {
       provision: canonical,
       savedAt: new Date().toISOString()
     };
-    await this.saveJson(this.getProvisionFilePath(), payload);
+    const store = this.getDataStore();
+    if (store) {
+      try {
+        store.setKv('provision', payload);
+      } catch (err) {
+        this.emitLog('CALLMESH', `儲存 provision 失敗: ${err.message}`);
+      }
+    } else {
+      await this.saveJson(this.getProvisionFilePath(), payload);
+    }
     this.emitLog(
       'CALLMESH',
       `provision received callsign=${provision?.callsign_base ?? 'N/A'} ssid=${provision?.ssid ?? 'N/A'}`
@@ -2516,7 +2758,16 @@ class CallMeshAprsBridge extends EventEmitter {
         items: response.items,
         updatedAt
       };
-      await this.saveJson(this.getMappingFilePath(), payload);
+      const store = this.getDataStore();
+      if (store) {
+        try {
+          store.setKv('mapping', payload);
+        } catch (err) {
+          this.emitLog('CALLMESH', `儲存 mapping 失敗: ${err.message}`);
+        }
+      } else {
+        await this.saveJson(this.getMappingFilePath(), payload);
+      }
       this.callmeshState.lastMappingHash = response.hash ?? this.callmeshState.lastMappingHash ?? null;
       this.callmeshState.lastMappingSyncedAt = updatedAt;
       this.callmeshState.mappingItems = response.items;
@@ -3314,10 +3565,11 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   async appendTelemetryRecord(record) {
-    const filePath = this.getTelemetryStorePath();
+    if (!this.telemetryDb) {
+      throw new Error('telemetry database not initialized');
+    }
     const payload = cloneTelemetryRecord(record) || record;
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.appendFile(filePath, `${JSON.stringify(payload)}\n`, 'utf8');
+    this.telemetryDb.insertRecord(payload);
   }
 
   buildTelemetryRecord(summary, { meshId, timestampMs = Date.now() } = {}) {
@@ -3406,7 +3658,14 @@ class CallMeshAprsBridge extends EventEmitter {
     this.telemetryRecordIds.clear();
     this.telemetryUpdatedAt = Date.now();
     try {
-      await fs.rm(this.getTelemetryStorePath(), { force: true });
+      if (this.telemetryDb) {
+        this.telemetryDb.clear();
+      }
+    } catch (err) {
+      this.emitLog('CALLMESH', `clear telemetry db failed: ${err.message}`);
+    }
+    try {
+      await fs.rm(this.getLegacyTelemetryStorePath(), { force: true });
     } catch (err) {
       if (err && err.code !== 'ENOENT') {
         this.emitLog('CALLMESH', `remove telemetry store failed: ${err.message}`);

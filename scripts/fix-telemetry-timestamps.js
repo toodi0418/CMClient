@@ -1,8 +1,8 @@
 'use strict';
 
 /**
- * Rewrite telemetry JSONL records so that every entry's sample time and telemetry
- * timestamp align with the recorded receipt time (`timestampMs`).
+ * Legacy helper：Rewrite telemetry JSONL records so that every entry's sample time
+ * and telemetry timestamp align with the recorded receipt time (`timestampMs`).
  *
  * Usage:
  *   node scripts/fix-telemetry-timestamps.js /path/to/telemetry-records.jsonl
@@ -100,4 +100,3 @@ main().catch((err) => {
   console.error(`執行失敗: ${err.message}`);
   process.exitCode = 1;
 });
-

@@ -340,6 +340,10 @@ async function startMonitor(argv) {
   });
 
   await bridge.init({ allowRestore: true });
+  const sharedDataStore = bridge.getDataStore?.();
+  if (sharedDataStore) {
+    connectionOptions.relayStatsStore = sharedDataStore;
+  }
 
   try {
     const verifyResult = await bridge.verifyApiKey(apiKey, {
@@ -400,7 +404,9 @@ async function startMonitor(argv) {
       const webDashboardOptions = {
         appVersion: pkg.version || '0.0.0',
         relayStatsPath,
+        relayStatsStore: sharedDataStore,
         messageLogPath: getMessageLogPath(),
+        messageLogStore: sharedDataStore,
         telemetryProvider: bridge
       };
       const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();

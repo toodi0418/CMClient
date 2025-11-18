@@ -11,6 +11,7 @@ const protobuf = require('protobufjs');
 
 const { unishox2_decompress_simple } = require('unishox2.siara.cc');
 const { nodeDatabase } = require('./nodeDatabase');
+const { CallMeshDataStore } = require('./storage/callmeshDataStore');
 
 const MAGIC = 0x94c3;
 const HEADER_SIZE = 4;
@@ -87,7 +88,41 @@ class MeshtasticClient extends EventEmitter {
     this._transportType = this.options.transport;
     this.nodeMap = new Map();
     this._relayLinkStats = new Map();
-    this._relayStatsPath = options.relayStatsPath ? path.resolve(options.relayStatsPath) : null;
+    this._relayStatsStore = null;
+    this._relayStatsStoreOwned = false;
+    this._relayStatsStorePath = null;
+    this._relayStatsLegacyPath = null;
+    if (options.relayStatsStore && typeof options.relayStatsStore === 'object') {
+      this._relayStatsStore = options.relayStatsStore;
+    }
+    const relayStatsPathCandidate = options.relayStatsPath
+      ? path.resolve(options.relayStatsPath)
+      : null;
+    if (!this._relayStatsStore && relayStatsPathCandidate) {
+      if (/\.sqlite$/i.test(relayStatsPathCandidate)) {
+        this._relayStatsStorePath = relayStatsPathCandidate;
+        this._relayStatsLegacyPath = relayStatsPathCandidate.replace(/\.sqlite$/i, '.json');
+      } else if (/\.json$/i.test(relayStatsPathCandidate)) {
+        this._relayStatsLegacyPath = relayStatsPathCandidate;
+        this._relayStatsStorePath = relayStatsPathCandidate.replace(/\.json$/i, '.sqlite');
+      } else {
+        this._relayStatsStorePath = relayStatsPathCandidate;
+        this._relayStatsLegacyPath = `${relayStatsPathCandidate}.json`;
+      }
+    }
+    if (!this._relayStatsStore && this._relayStatsStorePath) {
+      try {
+        this._relayStatsStore = new CallMeshDataStore(this._relayStatsStorePath);
+        this._relayStatsStore.init();
+        this._relayStatsStoreOwned = true;
+      } catch (err) {
+        console.warn(`初始化 relay stats SQLite 失敗: ${err.message}`);
+        this._relayStatsStore = null;
+      }
+    }
+    if (!this._relayStatsLegacyPath && relayStatsPathCandidate) {
+      this._relayStatsLegacyPath = relayStatsPathCandidate;
+    }
     this._relayStatsPersistIntervalMs = Number.isFinite(options.relayStatsPersistIntervalMs)
       ? Math.max(Number(options.relayStatsPersistIntervalMs), 1000)
       : 30_000;
@@ -540,11 +575,43 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _loadRelayStatsFromDisk() {
-    if (!this._relayStatsPath) {
+    const now = Date.now();
+    if (this._relayStatsStore) {
+      try {
+        const rows = this._relayStatsStore.listRelayStats();
+        if (Array.isArray(rows) && rows.length) {
+          this._relayLinkStats.clear();
+          for (const row of rows) {
+            if (!row || row.meshKey == null) continue;
+            const numericKey = Number(row.meshKey);
+            if (!Number.isFinite(numericKey) || numericKey <= 0) continue;
+            if (this._shouldIgnoreMeshId(numericKey)) continue;
+            this._relayLinkStats.set(numericKey >>> 0, {
+              snr: Number.isFinite(row.snr) ? row.snr : null,
+              rssi: Number.isFinite(row.rssi) ? row.rssi : null,
+              count: Number.isFinite(row.count) ? Math.max(1, Math.round(row.count)) : 1,
+              updatedAt: Number.isFinite(row.updatedAt) ? row.updatedAt : now
+            });
+          }
+          if (this._relayStatsLegacyPath) {
+            try {
+              fs.unlinkSync(this._relayStatsLegacyPath);
+            } catch {
+              // ignore legacy cleanup failure
+            }
+          }
+          return;
+        }
+      } catch (err) {
+        console.warn(`載入 relay stats SQLite 失敗: ${err.message}`);
+      }
+    }
+    const legacyPath = this._relayStatsLegacyPath;
+    if (!legacyPath) {
       return;
     }
     try {
-      const raw = fs.readFileSync(this._relayStatsPath, 'utf8');
+      const raw = fs.readFileSync(legacyPath, 'utf8');
       if (!raw) {
         return;
       }
@@ -552,8 +619,8 @@ class MeshtasticClient extends EventEmitter {
       if (!data || typeof data !== 'object') {
         return;
       }
+      const entries = [];
       this._relayLinkStats.clear();
-      const now = Date.now();
       for (const [key, value] of Object.entries(data)) {
         if (!value || typeof value !== 'object') continue;
         const numericKey = Number(key);
@@ -568,6 +635,21 @@ class MeshtasticClient extends EventEmitter {
           updatedAt: Number.isFinite(value.updatedAt) ? Number(value.updatedAt) : now
         };
         this._relayLinkStats.set(numericKey >>> 0, entry);
+        entries.push({
+          meshKey: String(numericKey >>> 0),
+          snr: entry.snr,
+          rssi: entry.rssi,
+          count: entry.count,
+          updatedAt: entry.updatedAt
+        });
+      }
+      if (this._relayStatsStore && entries.length) {
+        try {
+          this._relayStatsStore.replaceRelayStats(entries);
+          fs.unlinkSync(legacyPath);
+        } catch (err) {
+          console.warn(`遷移 relay stats 至 SQLite 失敗: ${err.message}`);
+        }
       }
     } catch (err) {
       if (err?.code !== 'ENOENT') {
@@ -577,7 +659,7 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _scheduleRelayStatsPersist() {
-    if (!this._relayStatsPath) {
+    if (!this._relayStatsStore && !this._relayStatsLegacyPath) {
       return;
     }
     this._relayStatsDirty = true;
@@ -595,31 +677,52 @@ class MeshtasticClient extends EventEmitter {
   }
 
   async _persistRelayStats() {
-    if (!this._relayStatsPath || !this._relayStatsDirty || this._relayStatsPersisting) {
+    if (!this._relayStatsDirty || this._relayStatsPersisting) {
       return;
     }
     this._relayStatsPersisting = true;
+    const now = Date.now();
+    const rows = [];
     const payload = {};
     for (const [key, stats] of this._relayLinkStats.entries()) {
-      payload[key] = {
+      const record = {
         snr: Number.isFinite(stats.snr) ? Number(stats.snr) : null,
         rssi: Number.isFinite(stats.rssi) ? Number(stats.rssi) : null,
         count: Number.isFinite(stats.count) ? Math.max(1, Math.round(Number(stats.count))) : 1,
-        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : Date.now()
+        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : now
       };
+      payload[key] = record;
+      rows.push({
+        meshKey: String(key),
+        snr: record.snr,
+        rssi: record.rssi,
+        count: record.count,
+        updatedAt: record.updatedAt
+      });
     }
     try {
-      await fsPromises.mkdir(path.dirname(this._relayStatsPath), { recursive: true });
-      if (Object.keys(payload).length === 0) {
-        try {
-          await fsPromises.unlink(this._relayStatsPath);
-        } catch (err) {
-          if (err?.code !== 'ENOENT') {
-            throw err;
-          }
+      if (this._relayStatsStore) {
+        this._relayStatsStore.replaceRelayStats(rows);
+        if (this._relayStatsLegacyPath) {
+          await fsPromises.rm(this._relayStatsLegacyPath, { force: true });
         }
-      } else {
-        await fsPromises.writeFile(this._relayStatsPath, JSON.stringify(payload, null, 2), 'utf8');
+      } else if (this._relayStatsLegacyPath) {
+        await fsPromises.mkdir(path.dirname(this._relayStatsLegacyPath), { recursive: true });
+        if (Object.keys(payload).length === 0) {
+          try {
+            await fsPromises.unlink(this._relayStatsLegacyPath);
+          } catch (err) {
+            if (err?.code !== 'ENOENT') {
+              throw err;
+            }
+          }
+        } else {
+          await fsPromises.writeFile(
+            this._relayStatsLegacyPath,
+            JSON.stringify(payload, null, 2),
+            'utf8'
+          );
+        }
       }
       this._relayStatsDirty = false;
     } catch (err) {
@@ -631,9 +734,6 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _flushRelayStatsPersistSync() {
-    if (!this._relayStatsPath) {
-      return;
-    }
     if (!this._relayStatsDirty || this._relayStatsPersisting) {
       return;
     }
@@ -641,27 +741,54 @@ class MeshtasticClient extends EventEmitter {
       clearTimeout(this._relayStatsPersistTimer);
       this._relayStatsPersistTimer = null;
     }
+    const now = Date.now();
+    const rows = [];
     const payload = {};
     for (const [key, stats] of this._relayLinkStats.entries()) {
-      payload[key] = {
+      const record = {
         snr: Number.isFinite(stats.snr) ? Number(stats.snr) : null,
         rssi: Number.isFinite(stats.rssi) ? Number(stats.rssi) : null,
         count: Number.isFinite(stats.count) ? Math.max(1, Math.round(Number(stats.count))) : 1,
-        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : Date.now()
+        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : now
       };
+      payload[key] = record;
+      rows.push({
+        meshKey: String(key),
+        snr: record.snr,
+        rssi: record.rssi,
+        count: record.count,
+        updatedAt: record.updatedAt
+      });
     }
     try {
-      fs.mkdirSync(path.dirname(this._relayStatsPath), { recursive: true });
+      if (this._relayStatsStore) {
+        this._relayStatsStore.replaceRelayStats(rows);
+        if (this._relayStatsLegacyPath) {
+          try {
+            fs.unlinkSync(this._relayStatsLegacyPath);
+          } catch (err) {
+            if (err?.code !== 'ENOENT') {
+              throw err;
+            }
+          }
+        }
+        this._relayStatsDirty = false;
+        return;
+      }
+      if (!this._relayStatsLegacyPath) {
+        return;
+      }
+      fs.mkdirSync(path.dirname(this._relayStatsLegacyPath), { recursive: true });
       if (Object.keys(payload).length === 0) {
         try {
-          fs.unlinkSync(this._relayStatsPath);
+          fs.unlinkSync(this._relayStatsLegacyPath);
         } catch (err) {
           if (err?.code !== 'ENOENT') {
             throw err;
           }
         }
       } else {
-        fs.writeFileSync(this._relayStatsPath, JSON.stringify(payload, null, 2), 'utf8');
+        fs.writeFileSync(this._relayStatsLegacyPath, JSON.stringify(payload, null, 2), 'utf8');
       }
       this._relayStatsDirty = false;
     } catch (err) {
@@ -704,6 +831,15 @@ class MeshtasticClient extends EventEmitter {
   stop() {
     this._clearHeartbeat();
     this._flushRelayStatsPersistSync();
+    if (this._relayStatsStoreOwned && this._relayStatsStore && typeof this._relayStatsStore.close === 'function') {
+      try {
+        this._relayStatsStore.close();
+      } catch (err) {
+        console.warn(`關閉 relay stats SQLite 失敗: ${err.message}`);
+      }
+      this._relayStatsStore = null;
+      this._relayStatsStoreOwned = false;
+    }
     if (this._serialConnectTimer) {
       clearTimeout(this._serialConnectTimer);
       this._serialConnectTimer = null;

@@ -13,12 +13,12 @@
 - **SSE 管線**：Electron 端每當遙測 `append/reset` 出現時，會同時廣播給 Renderer 與 Web Server，兩側資料來源一致。
 - **節點資料庫**：新增 `src/nodeDatabase.js`，集中維護 Mesh 節點的長名稱、模型、角色與最後出現時間；CLI、Electron、Web 均透過 Bridge 發佈 `node` / `node-snapshot` 事件使用同一份資料。
 - **節點清單座標顯示**：Electron / Web 節點頁新增「座標」欄，會顯示緯度、經度與高度（若可用），並支援以座標字串搜尋；同時過濾 `!abcd` 前綴暫存 ID。
-- **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.jsonl` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
+- **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.sqlite` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
 - **遙測 CSV 下載**：Electron 與 Web 遙測頁新增「下載 CSV」按鈕，依目前節點與範圍匯出遙測資料。
 - **遙測最後轉發與跳數**：Telemetry 紀錄同步保存最後轉發節點與跳數資訊，桌面／Web UI 及 CSV 皆可檢視（含推測提示）。
-- **GUI 訊息頻道持久化**：桌面版新增「訊息」分頁，將 CH0~CH3 文字封包以 `message-log.jsonl` （`app.getPath('userData')/callmesh/`）保存並自動復原，預設每頻道保留 200 筆，並顯示來源節點、跳數與最後轉發節點。
+- **GUI 訊息頻道持久化**：桌面版新增「訊息」分頁，將 CH0~CH3 文字封包以 `callmesh-data.sqlite` 的 `message_log` 表保存並自動復原，預設每頻道保留 200 筆，並顯示來源節點、跳數與最後轉發節點（升級時會自動匯入舊版 `message-log.jsonl`）。
 - **訊息來源名稱對齊節點資料庫**：儲存的文字訊息會帶入節點 Mesh ID，重新載入時會回查節點資料庫補齊長短名，避免僅顯示 Mesh ID。
-- **最後轉發推測升級**：`meshtasticClient` 會比對 `relay-link-stats.json` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
+- **最後轉發推測升級**：`meshtasticClient` 會比對 `callmesh-data.sqlite` 中的 `relay_stats` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
 - **Relay 提示 UI**：CLI/Electron/Web 均以圓形 `?` 按鈕提示推測結果；桌面與 Web 啟用半透明 Modal 顯示推測原因、候選節點與 Mesh ID。
 - **TENMANMAP 轉發管線**：`CallMeshAprsBridge` 會以 WebSocket 將位置封包上傳至 TENMANMAP 服務，預設全數節點皆轉發，可透過環境變數 `TENMAN_DISABLE=1` 或 CLI 旗標 `--no-share-with-tenmanmap` 全域停用；桌面版設定頁亦提供低調的分享開關；佇列、驗證與自動重連機制維持啟用。
 - **訊息距離顯示**：訊息分頁會根據節點資料庫座標與最後更新時間，顯示距離（km／m）與位置更新時間差（例如 `22.9 km (3 分鐘前)`）。
@@ -102,7 +102,7 @@ CMClient/
   - Heartbeat / WantConfig，確保連線穩定
   - 解析 Telemetry payload，將 `batteryLevel`、`voltage`、`channelUtilization`、`airUtilTx` 等量測轉換為 `summary.telemetry`（包含 `kind`、時間戳與原始 `metrics`），供 `CallMeshAprsBridge` 及前端儲存與顯示。
   - `_formatNode()` 會同時輸出 `shortName`、`longName`、`hwModel`、`role`，並交由 Bridge 回寫到節點資料庫，確保 CLI / GUI / Web 呈現一致的節點資訊。
-  - 針對 `relay_node` 僅回傳尾碼的情境，`_normalizeRelayNode()` 會整合 `nodeMap`、節點資料庫 (`nodeDatabase.list()`)、`relay-link-stats.json` 的歷史 SNR/RSSI：
+  - 針對 `relay_node` 僅回傳尾碼的情境，`_normalizeRelayNode()` 會整合 `nodeMap`、節點資料庫 (`nodeDatabase.list()`)、`callmesh-data.sqlite` 的 `relay_stats` 歷史 SNR/RSSI：
     1. 先彙整所有尾碼符合的候選節點；
     2. 以歷史樣本計算差距，選出最接近者；
     3. 回傳 `guessed=true` 並產生 `relayGuessReason`（缺樣本時列出候選清單），供前端顯示問號提示。
@@ -120,7 +120,7 @@ CMClient/
     - 所有 `nodeInfo`、`myInfo` 與 `summary` 內的節點欄位會寫入 `nodeDatabase`，統一記錄長短名、型號、角色與最後出現時間；
     - 透過 `node`、`node-snapshot` 事件推播給 Electron / Web Dashboard，確保多個介面共用同一份節點資訊。
   - 遙測資料庫：
-    - 所有含 `summary.telemetry` 的封包均寫入 `telemetry-records.jsonl`（一行一筆 JSON），並同步更新記憶體快取；
+    - 所有含 `summary.telemetry` 的封包均寫入 `telemetry-records.sqlite`（SQLite 資料庫），並同步更新記憶體快取；
     - 事件透過 `bridge.emit('telemetry')` 推播給 Electron / Web Dashboard，類型分為 `append` 與 `reset`；
     - 預設每節點僅保留 500 筆最新紀錄（避免佔用過多記憶體），但 JSONL 會完整累積，以便跨重啟保留歷史；
     - 同步回傳 `stats`（筆數、節點數、JSONL 檔案大小），前端可直接顯示。
@@ -154,14 +154,14 @@ CMClient/
 - `meshtastic:*`、`callmesh:*`、`aprs:*`、`app:*` IPC 入口都集中於此。
 - 注意：關閉應用或 IPC 錯誤時，務必呼叫 `cleanupMeshtasticClient()`、`shutdownWebDashboard()` 避免殘留連線。
 - `callmesh/bridge` 會在背景將節點快照持久化至 `CALLMESH_ARTIFACTS_DIR/node-database.json`，採 Debounce 寫入；清除 node DB 時記得同時刪除該檔案並重新推播節點快照。
-- 文字訊息封包（`summary.type === 'Text'`）會透過 `persistMessageSummary()` 寫入 `message-log.jsonl`（路徑：`<userData>/callmesh/message-log.jsonl`），每個頻道最多保留 200 筆；紀錄內容包含當下節點快照（長短名、Mesh ID），啟動時呼叫 `loadMessageLog()` 會回查節點資料庫補齊顯示名稱。前端可透過 `messages:get-snapshot` IPC 取得整份快照。
+- 文字訊息封包（`summary.type === 'Text'`）會透過 `persistMessageSummary()` 寫入 `callmesh-data.sqlite`（`message_log` 表；舊版會自動匯入並刪除 `message-log.jsonl`），每個頻道最多保留 200 筆；紀錄內容包含當下節點快照（長短名、Mesh ID），啟動時呼叫 `loadMessageLog()` 會回查節點資料庫補齊顯示名稱。前端可透過 `messages:get-snapshot` IPC 取得整份快照。
 - 寫入採用同步序列排程（`messageWritePromise`），確保大量訊息時仍會依序刷新檔案；結束應用前（`before-quit`）會嘗試 flush 一次，避免遺失最後訊息。
 - `updateClientPreferences()` 現已接受 `shareWithTenmanMap`，會即時呼叫 `bridge.setTenmanShareEnabled()`；若設定為 `null` 則回復環境變數預設。
 
 ### 3.6 Electron Renderer (`src/electron/renderer.js`)
 - 主要分頁：
   1. **監視**：封包表與計數（10 分鐘封包 / APRS 上傳 / Mapping 節點）。節點名稱會套用節點資料庫資料；若最後轉發為推測結果，欄位會顯示圓形 `?` 按鈕，點擊後使用內建 Modal 呈現推測原因、候選節點與 Mesh ID。
-  2. **訊息**：左側列出 CH0~CH3 頻道，支援未讀標記與快速切換；右側顯示訊息內容、來源節點、跳數與最後一跳摘要。初始化會呼叫 `getMessageSnapshot()` 載入 `message-log.jsonl` 的快取，並對每筆文字封包進行去重（以 `flowId` 為主）與上限裁切（預設 200 筆／頻道）；來源欄位會優先顯示節點長名稱／短名稱，若僅有 Mesh ID 會回查節點資料庫再填入。
+  2. **訊息**：左側列出 CH0~CH3 頻道，支援未讀標記與快速切換；右側顯示訊息內容、來源節點、跳數與最後一跳摘要。初始化會呼叫 `getMessageSnapshot()` 載入 `message_log` 表的快取，並對每筆文字封包進行去重（以 `flowId` 為主）與上限裁切（預設 200 筆／頻道）；來源欄位會優先顯示節點長名稱／短名稱，若僅有 Mesh ID 會回查節點資料庫再填入。
      - 若節點資料庫有座標資訊，訊息尾端會顯示距離與最後更新時間差，例如 `22.9 km (3 分鐘前)`；距離以 Provision 座標為基準計算。
   3. **遙測數據**：Chart.js 畫面與資料表，可依節點、時間範圍、指標模式切換；節點輸入框整合了 datalist 與搜尋，鍵入 Mesh ID、暱稱或任意關鍵字即可切換節點或直接套用全域篩選，輸入清空時會自動還原到最近選取節點並顯示完整資料；頁面右上角顯示「筆數 / 節點 / 檔案大小」統計並提供「清空遙測數據」按鈕。
   4. **Mapping 封包追蹤**：具 Mapping 的位置封包列表，支援搜尋、狀態篩選與 CSV 匯出；節點資訊與 APRS 狀態會即時更新。
@@ -199,8 +199,8 @@ CMClient/
 - Web Dashboard 可獨立瀏覽 (`npm run desktop` 後開 `http://localhost:7080`)，但不另提供設定 UI，所有設定仍在 Electron/CLI。
 
 ### 3.8 遙測資料庫（Telemetry Archive）
-- 遙測摘要（`summary.telemetry`）會由 `CallMeshAprsBridge` 寫入 `storageDir/telemetry-records.jsonl`，採 **JSON Lines** 形式持久化，重啟後仍能恢復歷史紀錄。
-- 新資料會同步保留在記憶體的節點快取中，每個節點最多保存 **500** 筆最新紀錄，超出時會淘汰最舊資料；刪除資料或按下「重置所有資料」時會一併移除 JSONL 檔。
+- 遙測摘要（`summary.telemetry`）會由 `CallMeshAprsBridge` 寫入 `storageDir/telemetry-records.sqlite`，改採 **SQLite** 持久化；更新後首次啟動會自動匯入舊版 `telemetry-records.jsonl` 並將原檔改名為 `.migrated` 備份。
+- 新資料會同步保留在記憶體的節點快取中，每個節點最多保存 **500** 筆最新紀錄，超出時會淘汰最舊資料；刪除資料或按下「重置所有資料」時會同步清空 SQLite 內容。
 - Telemetry 事件會透過 IPC/SSE 推播至 Electron Renderer 與 Web Dashboard：
   - `telemetry:type=append`：即時新增單筆並附上節點資訊；
   - `telemetry:type=reset`：資料被清除時，通知前端刷新。
@@ -209,18 +209,18 @@ CMClient/
 - 事件 payload 會附帶統計資訊：`totalRecords`、`totalNodes`、`diskBytes`。GUI 與 Web 直接顯示，不需自行計算。
 - Telemetry 記錄內的節點欄位會與節點資料庫合併，確保長名稱及模型資訊一致。
 - GUI 端節點輸入框同時充當搜尋欄位：輸入任意關鍵字時會保留原先節點選擇並使用文字篩選 Chart/Table；選取 datalist 項目則會直接切換節點並重置搜尋。
-- 若需校正舊檔（早期使用裝置回報時間的紀錄），可執行 `node scripts/fix-telemetry-timestamps.js <path/to/telemetry-records.jsonl>` 將所有 `sampleTime*` / `telemetry.time*` 欄位同步到相對應的 `timestampMs`，原檔會留下 `.bak` 備份。
+- 若需校正舊檔（升級前仍使用 JSONL 的環境），可執行 `node scripts/fix-telemetry-timestamps.js <path/to/telemetry-records.jsonl>` 將所有 `sampleTime*` / `telemetry.time*` 欄位同步到相對應的 `timestampMs`，原檔會留下 `.bak` 備份；SQLite 新格式不再需要此腳本。
 
 ### 3.9 節點資料庫（Node Database）
 - 透過 `src/nodeDatabase.js` 單例集中管理節點資訊，Electron / Web / CLI 共用。
-- CallMeshAprsBridge 會將節點快照持久化至 `storageDir/node-database.json`（同 `CALLMESH_ARTIFACTS_DIR`），重啟後會還原舊資料並自動清洗無效座標或 `unknown` 名稱。
+- CallMeshAprsBridge 會將節點快照持久化於 `storageDir/callmesh-data.sqlite` 的 `nodes` 表（同 `CALLMESH_ARTIFACTS_DIR`），升級時會自動匯入舊版 `node-database.json` 並清理無效座標或 `unknown` 名稱。
 - 持久化內容包含：
   - `meshId` / `meshIdOriginal` / 長短名稱 / Label
   - 解析後的硬體型號與角色（使用 proto enum 映射）
   - 最後出現時間（毫秒）、最後一次位置資訊（緯度/經度/高度）
   - 透過 CallMesh Provision 座標可計算與本地的距離；若座標無效或為 (0,0) 會自動忽略。
 - 會忽略 `!abcd****` 這類暫存 Mesh ID，避免測試節點被納入統計；前端節點表亦會排除。
-- `node-database.json` 以及遙測 JSONL 均可透過節點資料庫分頁的「清除節點資料庫」按鈕、或 `callmesh:clear` 流程一併刪除。
+- `callmesh-data.sqlite` 內的節點資料及舊版 JSON 檔案均可透過節點資料庫分頁的「清除節點資料庫」按鈕、或 `callmesh:clear` 流程一併刪除。
 
 ---
 
@@ -250,7 +250,7 @@ CMClient/
 | `TMAG_WEB_DASHBOARD`         | 設為 `0` 可禁用 Web Dashboard（不啟動 HTTP/SSE）                 |
 | `MESHTASTIC_HOST` / `PORT`   | 若未提供 CLI 參數，Electron 設定頁或 CLI Flag 需手動輸入           |
 
-Electron 會將 CallMesh 驗證資訊與 artifacts 存於 `~/Library/Application Support/<app>/callmesh/`（macOS），Windows/Linux 對應 OS 預設資料夾；同一目錄下的 `message-log.jsonl` 為桌面版訊息紀錄檔，每個頻道預設最多保留 200 筆。
+Electron 會將 CallMesh 驗證資訊與 artifacts 存於 `~/Library/Application Support/<app>/callmesh/`（macOS），Windows/Linux 對應 OS 預設資料夾；訊息紀錄、節點快照、Mapping/Provision 等資料集中存放於 `callmesh-data.sqlite`（每頻道預設最多保留 200 筆），舊版 `message-log.jsonl` 會於啟動時自動匯入並刪除。
 
 ---
 
@@ -296,12 +296,12 @@ node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 - Web Dashboard 遙測頁提供相同的節點快照與統計資訊；首次連線會先收到節點快照與最新遙測資料。
 - 節點資料庫分頁支援模糊搜尋與線上節點統計（預設視為 1 小時內更新），距離會以 Provision 座標為基準計算；表格顯示的筆數與線上數會在使用搜尋時同步標示「符合 / 總數」。座標欄會顯示 `lat, lon[, 高度]`，可直接用座標片段搜尋。
 - 節點長名稱、型號等資訊由 `nodeDatabase` 推播，CLI / GUI / Web 顯示一致；若需要擴充欄位，請從 Bridge emit 的 `node` 事件開始串接。
-- 所有節點快照會持久化於 `CALLMESH_ARTIFACTS_DIR/node-database.json`，同 `telemetry-records.jsonl` 一樣可透過節點分頁的「清除節點資料庫」或 `callmesh:clear` IPC 重新初始化。
+- 所有節點快照會持久化於 `CALLMESH_ARTIFACTS_DIR/node-database.json`，同 `telemetry-records.sqlite` 一樣可透過節點分頁的「清除節點資料庫」或 `callmesh:clear` IPC 重新初始化。
 
 ### 6.5 訊息頻道
 
-- Electron 「訊息」分頁會顯示 CH0~CH3 文字封包，並記錄在 `message-log.jsonl`（`~/Library/Application Support/<app>/callmesh/`，Windows/Linux 依 OS 對應路徑）。
-- 每個頻道預設保留最近 200 筆，若需清空可在離線狀態下刪除 `message-log.jsonl` 後重新啟動桌面程式。
+- Electron 「訊息」分頁會顯示 CH0~CH3 文字封包，並持久化於 `callmesh-data.sqlite`（`~/Library/Application Support/<app>/callmesh/`，Windows/Linux 依 OS 路徑）；舊版 JSONL 會於載入時自動匯入。
+- 每個頻道預設保留最近 200 筆，若需清空可在離線狀態下透過 UI 執行「清除訊息紀錄」，或刪除 `callmesh-data.sqlite` 後重新啟動（舊版 JSONL 亦可刪除）。
 - 支援未讀標記：切換頻道後會清除該頻道的未讀狀態；訊息清空或檔案刪除後會自動重建。
 - 來源欄會優先顯示節點長名稱／短名稱；若僅存 Mesh ID，載入時會回查節點資料庫補齊暱稱（失敗時才退回 Mesh ID）。
 
@@ -389,10 +389,8 @@ CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
 
 - `CALLMESH_ARTIFACTS_DIR`（預設 `~/.config/callmesh/`）：
   - `monitor.json`：CallMesh API 驗證結果、心跳時間。
-  - `node-database.json`：節點快照。
-  - `telemetry-records.jsonl`：遙測資料。
-  - `relay-link-stats.json`：relay 猜測歷史（SNR/RSSI）。
-  - `message-log.jsonl`：桌面版訊息紀錄。
+  - `callmesh-data.sqlite`：集中儲存節點快照（`nodes` 表）、Mapping/Provision 快取（`kv_store`）、訊息紀錄（`message_log`）與 Relay 統計（`relay_stats`）。升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl` 與 `relay-link-stats.json` 並移除備份。
+- `telemetry-records.sqlite`：遙測資料。
 - WebDashboard Snapshots：啟動時會以 `seed*` 方法注入節點、遙測、訊息快照；重新整理頁面也會取得最新資料。
 
 ### 7.7 建議維運檢查表
@@ -429,7 +427,7 @@ CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
 
 - **自發訊息同步**
   - 成功送出 TenManMap 指令後，`emitTenmanSyntheticSummary()` 會產生合成 `summary`（標記 `synthetic=true`、保留 `reply_to` / `reply_id`），透過 `bridge.emit('summary')` 推送。
-  - CLI (`src/index.js`) 與 Electron (`src/electron/main.js`) 會訂閱並持久化該 summary，因此本機廣播的訊息也會出現在訊息列表與 `message-log.jsonl` 中；Web Dashboard 同樣會收到這筆快照。
+  - CLI (`src/index.js`) 與 Electron (`src/electron/main.js`) 會訂閱並持久化該 summary，因此本機廣播的訊息也會出現在訊息列表與 `callmesh-data.sqlite` 的 `message_log` 表中；Web Dashboard 同樣會收到這筆快照。
 
 - **TenManMap 端整合建議**
   - 接收 `message.publish` 後保存 `mesh_packet_id` 與 `reply_to`，作為「回覆」按鈕的目標與 ID。
@@ -514,8 +512,8 @@ npx pkg src/index.js --targets node18-linux-x64
       - 節點資料庫搜尋、線上統計與距離是否合理（特別是 Provision 座標缺失或為 0,0 情境）
       - 遙測節點輸入框在「選取節點」與「純搜尋」兩種使用方式下渲染結果是否一致
 9. **遙測資料**
-  - 若需清空歷史記錄，請使用 GUI/Web 的「清空遙測數據」或手動刪除 `callmesh/telemetry-records.jsonl`；
-  - 若需保留舊檔但將舊資料的時間戳對齊收包時間，可在專案根目錄執行 `node scripts/fix-telemetry-timestamps.js ~/.config/callmesh/telemetry-records.jsonl`（會產生 `.bak` 備份後再覆寫原檔）；
+- 若需清空歷史記錄，請使用 GUI/Web 的「清空遙測數據」；亦可手動刪除或清空 `callmesh/telemetry-records.sqlite`（關閉應用後再操作）；
+- 若需保留舊版 JSONL 檔但將舊資料的時間戳對齊收包時間，可在升級前執行 `node scripts/fix-telemetry-timestamps.js ~/.config/callmesh/telemetry-records.jsonl`（會產生 `.bak` 備份後再覆寫原檔）；SQLite 檔案目前不支援此腳本。
   - 調整每節點快取上限可修改 `CallMeshAprsBridge` 建構子參數 `telemetryMaxEntriesPerNode`；
   - 若要顯示額外統計欄位，請從 Bridge `getTelemetryStats()` 擴充，並同步更新 Electron/Web 的顯示邏輯。
 
@@ -530,7 +528,7 @@ npx pkg src/index.js --targets node18-linux-x64
 | Web Dashboard port 被占用 | 調整 `TMAG_WEB_PORT`，或先停用其它應用；若需完全關閉 Web Dashboard，可設 `TMAG_WEB_DASHBOARD=0`。 |
 | CallMesh Key 被鎖 | 使用設定頁「重置本地資料」或刪除 `~/<userData>/callmesh/` 目錄，再重新輸入 Key。 |
 | 遙測圖表沒有資料 | 確認選擇的時間區間內有紀錄；若僅存在歷史資料，請切換至符合的日/週/月/年或自訂時間，或使用 `scripts/fix-telemetry-timestamps.js` 將舊紀錄對齊收包時間。 |
-| Telemetry JSONL 長期成長 | 可定期歸檔或壓縮 `telemetry-records.jsonl`，必要時調整 `telemetryMaxEntriesPerNode` 限制。 |
+| Telemetry SQLite 長期成長 | 可定期備份 `telemetry-records.sqlite` 後透過 `VACUUM` 或清空指令縮減檔案大小，必要時調整 `telemetryMaxEntriesPerNode` 限制。 |
 | Chart.js 未載入 | 確保 `node_modules/chart.js/dist/chart.umd.js` 存在；若 `desktop` 包裝成可攜版，記得把整個 `node_modules/chart.js` 併入發佈資產。 |
 | 節點名稱仍顯示 MeshID | 確認 `node` / `node-snapshot` 事件是否正常送達；若 API Key 尚未驗證或節點尚未回報 `nodeInfo`，會暫時只顯示 MeshID。 |
 | 遙測統計未更新 | Bridge `telemetry` 事件未觸發或被攔截，可檢查 Renderer Console；統計資料由 Bridge 計算，前端僅顯示。 |
@@ -547,6 +545,7 @@ npx pkg src/index.js --targets node18-linux-x64
 ---
 ## 版本註記
 
+- **v0.2.23**：遙測持久層改用 SQLite（`telemetry-records.sqlite`），啟動時自動匯入舊版 JSONL 並備份。
 - **v0.2.21**：恢復 TenManMap 位置 `extra` payload 與節點詳細欄位，避免既有整合收不到資料。
 - **v0.2.20**：精簡 TenManMap 上行資訊（位置僅保留必要欄位、節點同步改為 `node.snapshot`/`node.update`），預設不再顯示 ack 訊息。
 - **v0.2.13**：導入節點資料庫 (`nodeDatabase`)、推播 `node`/`node-snapshot` 事件，並在 GUI/Web 顯示遙測統計（筆數 / 節點 / 檔案大小）。

@@ -161,15 +161,26 @@ function addMessageEntry(entry) {
 }
 
 async function flushMessageLog() {
-  const filePath = getMessageLogPath();
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
   const channelEntries = Array.from(messageStore.entries()).sort((a, b) => a[0] - b[0]);
-  const lines = [];
+  const orderedEntries = [];
   for (const [, list] of channelEntries) {
     for (let i = list.length - 1; i >= 0; i -= 1) {
-      lines.push(JSON.stringify(list[i]));
+      orderedEntries.push(list[i]);
     }
   }
+  const store = bridge?.getDataStore?.();
+  if (store) {
+    try {
+      store.saveMessageLog(orderedEntries);
+      await fs.rm(getMessageLogPath(), { force: true });
+      return;
+    } catch (err) {
+      console.error('寫入訊息紀錄失敗 (SQLite):', err);
+    }
+  }
+  const filePath = getMessageLogPath();
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const lines = orderedEntries.map((entry) => JSON.stringify(entry));
   await fs.writeFile(filePath, lines.join('\n'), 'utf8');
 }
 
@@ -198,6 +209,25 @@ function getMessageSnapshot() {
 async function loadMessageLog() {
   const filePath = getMessageLogPath();
   messageStore.clear();
+  const store = bridge?.getDataStore?.();
+  if (store) {
+    try {
+      const entries = store.loadMessageLog();
+      if (Array.isArray(entries) && entries.length) {
+        for (const rawEntry of entries) {
+          const entry = sanitizeMessageSummary(rawEntry);
+          if (entry) {
+            addMessageEntry(entry);
+          }
+        }
+        await fs.rm(filePath, { force: true });
+        return;
+      }
+    } catch (err) {
+      console.warn('從 SQLite 載入訊息紀錄失敗:', err.message);
+    }
+  }
+  const migratedEntries = [];
   try {
     const content = await fs.readFile(filePath, 'utf8');
     if (!content) {
@@ -211,6 +241,7 @@ async function loadMessageLog() {
           const entry = sanitizeMessageSummary(parsed);
           if (entry) {
             addMessageEntry(entry);
+            migratedEntries.push(entry);
           }
         }
       } catch (err) {
@@ -220,6 +251,14 @@ async function loadMessageLog() {
   } catch (err) {
     if (err?.code !== 'ENOENT') {
       console.warn('載入訊息紀錄失敗:', err.message);
+    }
+  }
+  if (store && migratedEntries.length) {
+    try {
+      store.saveMessageLog(migratedEntries);
+      await fs.rm(filePath, { force: true });
+    } catch (err) {
+      console.warn('遷移訊息紀錄至 SQLite 失敗:', err.message);
     }
   }
 }
@@ -669,8 +708,8 @@ function buildCallmeshSummary() {
 }
 
 async function initialiseApp() {
-  await loadMessageLog();
   await initialiseBridge();
+  await loadMessageLog();
   await createWindow();
   await ensureWebDashboardState();
 
@@ -702,7 +741,9 @@ async function startWebDashboard() {
     const options = {
       appVersion,
       relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json'),
+      relayStatsStore: bridge?.getDataStore?.(),
       messageLogPath: getMessageLogPath(),
+      messageLogStore: bridge?.getDataStore?.(),
       telemetryProvider: bridge
     };
     const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
@@ -989,6 +1030,9 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     heartbeat: options.heartbeat ?? 0,
     relayStatsPath
   };
+  if (bridge?.getDataStore) {
+    clientOptions.relayStatsStore = bridge.getDataStore();
+  }
 
   if (Number.isFinite(options.connectTimeoutMs) && options.connectTimeoutMs > 0) {
     clientOptions.connectTimeout = options.connectTimeoutMs;

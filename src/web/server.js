@@ -116,6 +116,10 @@ class WebDashboardServer {
       typeof options.relayStatsPath === 'string' && options.relayStatsPath.trim()
         ? options.relayStatsPath.trim()
         : null;
+    this.relayStatsStore =
+      options && typeof options.relayStatsStore === 'object' ? options.relayStatsStore : null;
+    this.messageLogStore =
+      options && typeof options.messageLogStore === 'object' ? options.messageLogStore : null;
 
     this.server = null;
     this.clients = new Set();
@@ -490,19 +494,63 @@ class WebDashboardServer {
   }
 
   async _readRelayStats() {
+    if (this.relayStatsStore) {
+      try {
+        const rows = this.relayStatsStore.listRelayStats();
+        const stats = {};
+        for (const row of rows) {
+          if (!row || !row.meshKey) continue;
+          stats[row.meshKey] = {
+            snr: Number.isFinite(row.snr) ? row.snr : null,
+            rssi: Number.isFinite(row.rssi) ? row.rssi : null,
+            count: Number.isFinite(row.count) ? row.count : null,
+            updatedAt: Number.isFinite(row.updatedAt) ? row.updatedAt : null
+          };
+        }
+        if (this.relayStatsPath) {
+          try {
+            await fsPromises.rm(this.relayStatsPath, { force: true });
+          } catch {
+            // ignore cleanup error
+          }
+        }
+        return { stats, message: null };
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`讀取 sqlite relay stats 失敗: ${err.message}`);
+      }
+    }
     if (!this.relayStatsPath) {
-      return { stats: null, message: 'relayStatsPath not configured' };
+      return { stats: null, message: 'relay stats storage not configured' };
     }
     try {
       const raw = await fsPromises.readFile(this.relayStatsPath, 'utf8');
       if (!raw || !raw.trim()) {
         return { stats: {}, message: null };
       }
+      let parsed;
       try {
-        return { stats: JSON.parse(raw), message: null };
+        parsed = JSON.parse(raw);
       } catch (parseErr) {
         throw new Error(`Invalid relay stats JSON: ${parseErr.message}`);
       }
+      if (this.relayStatsStore && parsed && typeof parsed === 'object') {
+        const rows = Object.entries(parsed).map(([meshKey, value]) => ({
+          meshKey,
+          snr: Number.isFinite(value?.snr) ? value.snr : null,
+          rssi: Number.isFinite(value?.rssi) ? value.rssi : null,
+          count: Number.isFinite(value?.count) ? value.count : null,
+          updatedAt: Number.isFinite(value?.updatedAt) ? value.updatedAt : Date.now()
+        }));
+        try {
+          this.relayStatsStore.replaceRelayStats(rows);
+          await fsPromises.rm(this.relayStatsPath, { force: true });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`遷移 relay stats 至 SQLite 失敗: ${err.message}`);
+        }
+      }
+      return { stats: parsed, message: null };
     } catch (err) {
       if (err && err.code === 'ENOENT') {
         return { stats: {}, message: null };
@@ -1350,10 +1398,42 @@ class WebDashboardServer {
   }
 
   async _loadMessageLog() {
+    this.messageStore.clear();
+    const store = this.messageLogStore;
+    if (store) {
+      try {
+        const entries = store.loadMessageLog();
+        if (Array.isArray(entries) && entries.length) {
+          for (const rawEntry of entries) {
+          const entry = this._cloneMessageEntry(rawEntry);
+          if (!entry) continue;
+          const channelId = entry.channel;
+          const channelStore = this._getChannelStore(channelId);
+          const duplicateIndex = channelStore.findIndex((item) => item.flowId === entry.flowId);
+          if (duplicateIndex !== -1) {
+            channelStore.splice(duplicateIndex, 1);
+          }
+          channelStore.push(entry);
+          if (channelStore.length > MESSAGE_MAX_PER_CHANNEL) {
+            channelStore.splice(0, channelStore.length - MESSAGE_MAX_PER_CHANNEL);
+          }
+        }
+          this._ensureConfiguredChannels();
+          if (this.messageLogPath) {
+            await fsPromises.rm(this.messageLogPath, { force: true });
+          }
+          return;
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`從 SQLite 載入訊息紀錄失敗: ${err.message}`);
+      }
+    }
     if (!this.messageLogPath) {
+      this._ensureConfiguredChannels();
       return;
     }
-    this.messageStore.clear();
+    const migratedEntries = [];
     try {
       const content = await fsPromises.readFile(this.messageLogPath, 'utf8');
       if (!content) {
@@ -1375,14 +1455,15 @@ class WebDashboardServer {
           continue;
         }
         const channelId = entry.channel;
-        const store = this._getChannelStore(channelId);
-        const duplicateIndex = store.findIndex((item) => item.flowId === entry.flowId);
+        const channelStore = this._getChannelStore(channelId);
+        const duplicateIndex = channelStore.findIndex((item) => item.flowId === entry.flowId);
         if (duplicateIndex !== -1) {
-          store.splice(duplicateIndex, 1);
+          channelStore.splice(duplicateIndex, 1);
         }
-        store.push(entry);
-        if (store.length > MESSAGE_MAX_PER_CHANNEL) {
-          store.splice(0, store.length - MESSAGE_MAX_PER_CHANNEL);
+        channelStore.push(entry);
+        migratedEntries.push(entry);
+        if (channelStore.length > MESSAGE_MAX_PER_CHANNEL) {
+          channelStore.splice(0, channelStore.length - MESSAGE_MAX_PER_CHANNEL);
         }
       }
       this._ensureConfiguredChannels();
@@ -1392,10 +1473,19 @@ class WebDashboardServer {
         console.warn(`載入訊息紀錄失敗: ${err.message}`);
       }
     }
+    if (store && migratedEntries.length) {
+      try {
+        store.saveMessageLog(migratedEntries);
+        await fsPromises.rm(this.messageLogPath, { force: true });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`遷移訊息紀錄至 SQLite 失敗: ${err.message}`);
+      }
+    }
   }
 
   _scheduleMessagePersist() {
-    if (!this.messageLogPath) {
+    if (!this.messageLogStore && !this.messageLogPath) {
       return;
     }
     this._messageDirty = true;
@@ -1413,18 +1503,34 @@ class WebDashboardServer {
   }
 
   async _persistMessageLog() {
-    if (!this.messageLogPath || !this._messageDirty) {
+    if (!this._messageDirty) {
       return;
     }
     this._messageDirty = false;
-    const lines = [];
     const sortedChannels = Array.from(this.messageStore.entries()).sort((a, b) => a[0] - b[0]);
+    const orderedEntries = [];
     for (const [, list] of sortedChannels) {
-      const entries = Array.isArray(list) ? list : [];
-      for (const entry of entries) {
-        lines.push(JSON.stringify(entry));
+      const channelEntries = Array.isArray(list) ? list : [];
+      for (let i = channelEntries.length - 1; i >= 0; i -= 1) {
+        orderedEntries.push(channelEntries[i]);
       }
     }
+    if (this.messageLogStore) {
+      try {
+        this.messageLogStore.saveMessageLog(orderedEntries);
+        if (this.messageLogPath) {
+          await fsPromises.rm(this.messageLogPath, { force: true });
+        }
+        return;
+      } catch (err) {
+        this._messageDirty = true;
+        throw err;
+      }
+    }
+    if (!this.messageLogPath) {
+      return;
+    }
+    const lines = orderedEntries.map((entry) => JSON.stringify(entry));
     try {
       await fsPromises.mkdir(path.dirname(this.messageLogPath), { recursive: true });
       await fsPromises.writeFile(this.messageLogPath, lines.join('\n'), 'utf8');
@@ -1435,9 +1541,6 @@ class WebDashboardServer {
   }
 
   _flushMessagePersistSync() {
-    if (!this.messageLogPath) {
-      return;
-    }
     if (this._messagePersistTimer) {
       clearTimeout(this._messagePersistTimer);
       this._messagePersistTimer = null;
@@ -1445,14 +1548,37 @@ class WebDashboardServer {
     if (!this._messageDirty) {
       return;
     }
-    const lines = [];
     const sortedChannels = Array.from(this.messageStore.entries()).sort((a, b) => a[0] - b[0]);
+    const orderedEntries = [];
     for (const [, list] of sortedChannels) {
-      const entries = Array.isArray(list) ? list : [];
-      for (const entry of entries) {
-        lines.push(JSON.stringify(entry));
+      const channelEntries = Array.isArray(list) ? list : [];
+      for (let i = channelEntries.length - 1; i >= 0; i -= 1) {
+        orderedEntries.push(channelEntries[i]);
       }
     }
+    if (this.messageLogStore) {
+      try {
+        this.messageLogStore.saveMessageLog(orderedEntries);
+        if (this.messageLogPath) {
+          try {
+            fs.unlinkSync(this.messageLogPath);
+          } catch (err) {
+            if (err?.code !== 'ENOENT') {
+              throw err;
+            }
+          }
+        }
+        this._messageDirty = false;
+        return;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`同步寫入訊息紀錄失敗 (SQLite): ${err.message}`);
+      }
+    }
+    if (!this.messageLogPath) {
+      return;
+    }
+    const lines = orderedEntries.map((entry) => JSON.stringify(entry));
     try {
       fs.mkdirSync(path.dirname(this.messageLogPath), { recursive: true });
       fs.writeFileSync(this.messageLogPath, lines.join('\n'), 'utf8');

@@ -249,11 +249,13 @@ GUI 提供：
 
 ## 6. 維護工具
 
-- **遙測時間校正**：若早期資料受裝置時間影響，可在專案根目錄執行  
+- **遙測時間校正（升級前／JSONL）**：若早期資料受裝置時間影響，可在升級至 SQLite 版本前於專案根目錄執行  
   ```bash
   node scripts/fix-telemetry-timestamps.js ~/.config/callmesh/telemetry-records.jsonl
   ```  
   腳本會將每筆紀錄的 `timestampMs`／`sampleTimeMs`／`telemetry.timeMs` 對齊收包時刻，並保留 `.bak` 備份。
+- **遙測資料儲存**：自 v0.2.23 起改採 `~/.config/callmesh/telemetry-records.sqlite`（SQLite）；首次啟動會自動匯入舊版 JSONL 並將原檔更名為 `.migrated`。
+- **共用資料庫**：節點快照、Mapping/Provision 快取、訊息紀錄與 Relay 統計統一儲存在 `~/.config/callmesh/callmesh-data.sqlite`，升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl`、`relay-link-stats.json`。
 - **打包工具**：`scripts/pack-cli.sh`、`scripts/pack-desktop.sh` 可快速產出 CLI / GUI 可攜版（需安裝 `pkg`、`electron-packager`）。
 
 ---
