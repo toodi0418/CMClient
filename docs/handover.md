@@ -16,7 +16,7 @@
 - **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.sqlite` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
 - **遙測 CSV 下載**：Electron 與 Web 遙測頁新增「下載 CSV」按鈕，依目前節點與範圍匯出遙測資料。
 - **遙測最後轉發與跳數**：Telemetry 紀錄同步保存最後轉發節點與跳數資訊，桌面／Web UI 及 CSV 皆可檢視（含推測提示）。
-- **GUI 訊息頻道持久化**：桌面版新增「訊息」分頁，將 CH0~CH3 文字封包以 `callmesh-data.sqlite` 的 `message_log` 表保存並自動復原，預設每頻道保留 200 筆，並顯示來源節點、跳數與最後轉發節點（升級時會自動匯入舊版 `message-log.jsonl`）。
+- **GUI 訊息頻道持久化**：桌面版新增「訊息」分頁，將 CH0~CH3 文字封包以 `callmesh-data.sqlite` 的 `message_log` 表保存並自動復原，預設每頻道保留 200 筆，並顯示來源節點、跳數與最後轉發節點（升級時會自動匯入舊版 `message-log.jsonl`）。2025-11 之後改採欄位化結構，訊息主體寫入 `message_log`，節點快照同步落在 `message_nodes`，附註行寫入 `message_extra_lines`，不再持久化整筆 JSON。
 - **訊息來源名稱對齊節點資料庫**：儲存的文字訊息會帶入節點 Mesh ID，重新載入時會回查節點資料庫補齊長短名，避免僅顯示 Mesh ID。
 - **最後轉發推測升級**：`meshtasticClient` 會比對 `callmesh-data.sqlite` 中的 `relay_stats` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
 - **Relay 提示 UI**：CLI/Electron/Web 均以圓形 `?` 按鈕提示推測結果；桌面與 Web 啟用半透明 Modal 顯示推測原因、候選節點與 Mesh ID。
@@ -154,7 +154,7 @@ CMClient/
 - `meshtastic:*`、`callmesh:*`、`aprs:*`、`app:*` IPC 入口都集中於此。
 - 注意：關閉應用或 IPC 錯誤時，務必呼叫 `cleanupMeshtasticClient()`、`shutdownWebDashboard()` 避免殘留連線。
 - `callmesh/bridge` 會在背景將節點快照持久化至 `CALLMESH_ARTIFACTS_DIR/node-database.json`，採 Debounce 寫入；清除 node DB 時記得同時刪除該檔案並重新推播節點快照。
-- 文字訊息封包（`summary.type === 'Text'`）會透過 `persistMessageSummary()` 寫入 `callmesh-data.sqlite`（`message_log` 表；舊版會自動匯入並刪除 `message-log.jsonl`），每個頻道最多保留 200 筆；紀錄內容包含當下節點快照（長短名、Mesh ID），啟動時呼叫 `loadMessageLog()` 會回查節點資料庫補齊顯示名稱。前端可透過 `messages:get-snapshot` IPC 取得整份快照。
+- 文字訊息封包（`summary.type === 'Text'`）會透過 `persistMessageSummary()` 寫入 `callmesh-data.sqlite`（`message_log` / `message_nodes` / `message_extra_lines` 三表；舊版會自動匯入並刪除 `message-log.jsonl`），每個頻道最多保留 200 筆；紀錄內容包含當下節點快照（長短名、Mesh ID），啟動時呼叫 `loadMessageLog()` 會回查節點資料庫補齊顯示名稱。前端可透過 `messages:get-snapshot` IPC 取得整份快照。
 - 寫入採用同步序列排程（`messageWritePromise`），確保大量訊息時仍會依序刷新檔案；結束應用前（`before-quit`）會嘗試 flush 一次，避免遺失最後訊息。
 - `updateClientPreferences()` 現已接受 `shareWithTenmanMap`，會即時呼叫 `bridge.setTenmanShareEnabled()`；若設定為 `null` 則回復環境變數預設。
 
