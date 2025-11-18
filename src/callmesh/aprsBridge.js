@@ -2493,24 +2493,26 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   captureSummaryNodeInfo(summary, timestampMs) {
-    const candidates = [];
-    if (summary.from) candidates.push(summary.from);
-    if (summary.to) candidates.push(summary.to);
     const hops = summary?.hops || {};
     const hopStartProvided = Number.isFinite(hops.start);
     const hopLimitProvided = Number.isFinite(hops.limit);
     const hopLabel = typeof hops.label === 'string' ? hops.label.trim() : '';
-    const relayLikelyInvalid =
+    const hopMarkedInvalid =
       Boolean(summary?.relayInvalid) ||
       Boolean(hops.limitOnly) ||
       (!hopStartProvided && hopLimitProvided && hopLabel && !hopLabel.includes('/') && !hopLabel.includes('?'));
-    if (!relayLikelyInvalid) {
-      if (summary.relay) {
-        candidates.push(summary.relay);
-      }
-      if (summary.nextHop) {
-        candidates.push(summary.nextHop);
-      }
+    if (hopMarkedInvalid) {
+      return;
+    }
+
+    const candidates = [];
+    if (summary.from) candidates.push(summary.from);
+    if (summary.to) candidates.push(summary.to);
+    if (summary.relay) {
+      candidates.push(summary.relay);
+    }
+    if (summary.nextHop) {
+      candidates.push(summary.nextHop);
     }
     for (const node of candidates) {
       if (!node || typeof node !== 'object') continue;
