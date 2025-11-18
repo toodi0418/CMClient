@@ -134,6 +134,27 @@
               <div id="channel-message-list" class="channel-messages">
                 <div class="channel-message-empty">尚未收到訊息</div>
               </div>
+              <footer id="channel-pagination" class="channel-pagination hidden">
+                <div id="channel-pagination-info" class="channel-pagination-info">顯示 0-0，共 0 筆訊息</div>
+                <div class="channel-pagination-controls">
+                  <button id="channel-page-first" type="button" class="channel-page-btn" disabled>«</button>
+                  <button id="channel-page-prev" type="button" class="channel-page-btn" disabled>‹</button>
+                  <span class="channel-page-status">
+                    第 <span id="channel-pagination-current">1</span> / <span id="channel-pagination-total">1</span> 頁
+                  </span>
+                  <button id="channel-page-next" type="button" class="channel-page-btn" disabled>›</button>
+                  <button id="channel-page-last" type="button" class="channel-page-btn" disabled>»</button>
+                  <label class="channel-page-size">
+                    每頁
+                    <select id="channel-page-size">
+                      <option value="25" selected>25</option>
+                      <option value="50">50</option>
+                      <option value="100">100</option>
+                    </select>
+                    筆
+                  </label>
+                </div>
+              </footer>
             </section>
           </div>
         </article>

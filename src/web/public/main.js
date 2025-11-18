@@ -23,6 +23,15 @@
   const channelTitleLabel = document.getElementById('channel-title');
   const channelNoteLabel = document.getElementById('channel-note');
   const channelMessageList = document.getElementById('channel-message-list');
+  const channelPagination = document.getElementById('channel-pagination');
+  const channelPaginationInfo = document.getElementById('channel-pagination-info');
+  const channelPaginationCurrent = document.getElementById('channel-pagination-current');
+  const channelPaginationTotal = document.getElementById('channel-pagination-total');
+  const channelPageFirstBtn = document.getElementById('channel-page-first');
+  const channelPagePrevBtn = document.getElementById('channel-page-prev');
+  const channelPageNextBtn = document.getElementById('channel-page-next');
+  const channelPageLastBtn = document.getElementById('channel-page-last');
+  const channelPageSizeSelect = document.getElementById('channel-page-size');
   const flowPage = document.getElementById('flow-page');
   const flowList = document.getElementById('flow-list');
   const flowEmptyState = document.getElementById('flow-empty-state');
@@ -170,6 +179,9 @@
   const channelMessageStore = new Map();
   const channelNavButtons = new Map();
   const CHANNEL_MESSAGE_LIMIT = 200;
+  const CHANNEL_PAGE_SIZES = [25, 50, 100];
+  const channelPageState = new Map();
+  let channelPageSize = CHANNEL_PAGE_SIZES[0];
   let selectedChannelId = channelConfigs[0]?.id ?? null;
   let messagesNavNeedsRender = true;
   for (const channel of channelConfigs) {
@@ -181,7 +193,8 @@
   const STORAGE_KEYS = {
     callmeshProvisionOpen: 'tmag:web:callmeshProvision:open',
     telemetryRangeMode: 'tmag:web:telemetry:range-mode',
-    telemetryPageSize: 'tmag:web:telemetry:page-size'
+    telemetryPageSize: 'tmag:web:telemetry:page-size',
+    messagePageSize: 'tmag:web:messages:page-size'
   };
 
   function isValidTelemetryRangeMode(mode) {
@@ -204,6 +217,11 @@
   const storedTelemetryPageSize = Number(safeStorageGet(STORAGE_KEYS.telemetryPageSize));
   if (Number.isFinite(storedTelemetryPageSize) && TELEMETRY_PAGE_SIZES.includes(storedTelemetryPageSize)) {
     telemetryTablePageSize = storedTelemetryPageSize;
+  }
+
+  const storedMessagePageSize = Number(safeStorageGet(STORAGE_KEYS.messagePageSize));
+  if (Number.isFinite(storedMessagePageSize) && CHANNEL_PAGE_SIZES.includes(storedMessagePageSize)) {
+    channelPageSize = storedMessagePageSize;
   }
 
   function safeStorageSet(key, value) {
@@ -607,6 +625,113 @@
     return Array.isArray(store) ? store : [];
   }
 
+  function getChannelPage(channelId) {
+    const numeric = Number(channelId);
+    if (!Number.isFinite(numeric)) {
+      return 1;
+    }
+    const stored = channelPageState.get(numeric);
+    if (Number.isFinite(stored) && stored >= 1) {
+      return Math.floor(stored);
+    }
+    return 1;
+  }
+
+  function setChannelPage(channelId, page) {
+    const numericId = Number(channelId);
+    if (!Number.isFinite(numericId)) {
+      return 1;
+    }
+    const numericPage = Math.floor(Number(page));
+    const value = Number.isFinite(numericPage) && numericPage >= 1 ? numericPage : 1;
+    channelPageState.set(numericId, value);
+    return value;
+  }
+
+  function resetChannelPages() {
+    channelPageState.clear();
+  }
+
+  function updateChannelPaginationUI(channelId, stats = {}) {
+    if (
+      !channelPagination ||
+      !channelPaginationInfo ||
+      !channelPaginationCurrent ||
+      !channelPaginationTotal
+    ) {
+      return;
+    }
+    const totalEntries = Number(stats.totalEntries) || 0;
+    const totalPages = Math.max(1, Number(stats.totalPages) || 1);
+    const currentPage = Math.min(
+      Math.max(1, Number(stats.currentPage) || 1),
+      totalPages
+    );
+    const startDisplay = Number(stats.startDisplay) || 0;
+    const endDisplay = Number(stats.endDisplay) || 0;
+
+    if (channelPageSizeSelect && String(channelPageSizeSelect.value) !== String(channelPageSize)) {
+      channelPageSizeSelect.value = String(channelPageSize);
+    }
+
+    if (!totalEntries) {
+      channelPagination.classList.add('hidden');
+      channelPaginationInfo.textContent = '顯示 0-0，共 0 筆訊息';
+      channelPaginationCurrent.textContent = '1';
+      channelPaginationTotal.textContent = '1';
+      [channelPageFirstBtn, channelPagePrevBtn, channelPageNextBtn, channelPageLastBtn].forEach((btn) => {
+        if (btn) btn.disabled = true;
+      });
+      return;
+    }
+
+    channelPagination.classList.remove('hidden');
+    channelPaginationInfo.textContent = `顯示 ${startDisplay}-${endDisplay}，共 ${totalEntries} 筆訊息`;
+    channelPaginationCurrent.textContent = String(currentPage);
+    channelPaginationTotal.textContent = String(totalPages);
+    if (channelPageFirstBtn) channelPageFirstBtn.disabled = currentPage <= 1;
+    if (channelPagePrevBtn) channelPagePrevBtn.disabled = currentPage <= 1;
+    if (channelPageNextBtn) channelPageNextBtn.disabled = currentPage >= totalPages;
+    if (channelPageLastBtn) channelPageLastBtn.disabled = currentPage >= totalPages;
+  }
+
+  function goToChannelPage(channelId, targetPage) {
+    const numericId = Number(channelId);
+    if (!Number.isFinite(numericId) || numericId < 0) {
+      return;
+    }
+    const store = ensureChannelStore(numericId);
+    let pageSize = channelPageSize;
+    if (!CHANNEL_PAGE_SIZES.includes(pageSize)) {
+      pageSize = CHANNEL_PAGE_SIZES[0];
+      channelPageSize = pageSize;
+    }
+    const hasEntries = Array.isArray(store) && store.length > 0;
+    const totalPages = hasEntries ? Math.ceil(store.length / pageSize) : 1;
+    const numericTarget = Math.floor(Number(targetPage));
+    const clamped = hasEntries
+      ? Math.min(Math.max(1, Number.isFinite(numericTarget) ? numericTarget : 1), totalPages)
+      : 1;
+    const previous = getChannelPage(numericId);
+    if (previous !== clamped) {
+      setChannelPage(numericId, clamped);
+    } else {
+      // ensure state is stored even if unchanged
+      setChannelPage(numericId, clamped);
+    }
+    if (numericId === selectedChannelId) {
+      renderChannelMessages(numericId);
+    }
+  }
+
+  function goToChannelPageDelta(channelId, delta) {
+    if (!Number.isFinite(delta) || delta === 0) {
+      return;
+    }
+    const current = getChannelPage(channelId);
+    goToChannelPage(channelId, current + delta);
+  }
+
   function isMessagesPageActive() {
     return messagesPage?.classList.contains('active');
   }
@@ -752,15 +877,54 @@
       return;
     }
     const entries = ensureChannelStore(channelId);
+    let pageSize = channelPageSize;
+    if (!CHANNEL_PAGE_SIZES.includes(pageSize)) {
+      pageSize = CHANNEL_PAGE_SIZES[0];
+      channelPageSize = pageSize;
+    }
+    const totalEntries = entries.length;
+    const totalPages = totalEntries ? Math.ceil(totalEntries / pageSize) : 1;
+    let currentPage = getChannelPage(channelId);
+    if (currentPage > totalPages) {
+      currentPage = totalPages;
+      setChannelPage(channelId, currentPage);
+    }
+    if (currentPage < 1) {
+      currentPage = 1;
+      setChannelPage(channelId, currentPage);
+    }
+    let startIndex = totalEntries ? (currentPage - 1) * pageSize : 0;
+    if (startIndex >= totalEntries && totalEntries) {
+      currentPage = totalPages;
+      setChannelPage(channelId, currentPage);
+      startIndex = (currentPage - 1) * pageSize;
+    }
+    const endIndexExclusive = totalEntries ? Math.min(startIndex + pageSize, totalEntries) : 0;
+    let pageEntries = totalEntries ? entries.slice(startIndex, endIndexExclusive) : [];
+    if (!pageEntries.length && totalEntries) {
+      currentPage = 1;
+      setChannelPage(channelId, currentPage);
+      startIndex = 0;
+      pageEntries = entries.slice(0, Math.min(pageSize, totalEntries));
+    }
+    const startDisplay = totalEntries ? startIndex + 1 : 0;
+    const endDisplay = totalEntries ? startIndex + pageEntries.length : 0;
     channelMessageList.innerHTML = '';
-    if (!entries.length) {
+    if (!totalEntries) {
       const empty = document.createElement('div');
       empty.className = 'channel-message-empty';
       empty.textContent = '尚未收到訊息';
       channelMessageList.appendChild(empty);
+      updateChannelPaginationUI(channelId, {
+        totalEntries,
+        totalPages: 1,
+        currentPage: 1,
+        startDisplay: 0,
+        endDisplay: 0
+      });
       return;
     }
-    entries.forEach((entry) => {
+    pageEntries.forEach((entry) => {
       const wrapper = document.createElement('div');
       wrapper.className = 'channel-message';
 
@@ -778,6 +942,13 @@
 
       wrapper.append(text, meta);
       channelMessageList.appendChild(wrapper);
+    });
+    updateChannelPaginationUI(channelId, {
+      totalEntries,
+      totalPages,
+      currentPage,
+      startDisplay,
+      endDisplay
     });
   }
 
@@ -976,6 +1147,7 @@
   }
 
   function clearChannelMessages() {
+    resetChannelPages();
     channelMessageStore.forEach((store, channelId) => {
       if (Array.isArray(store)) {
         store.length = 0;
@@ -1491,6 +1663,59 @@
   });
 
   initializeChannelMessages();
+  if (channelPageSizeSelect) {
+    if (!CHANNEL_PAGE_SIZES.includes(channelPageSize)) {
+      channelPageSize = CHANNEL_PAGE_SIZES[0];
+    }
+    channelPageSizeSelect.value = String(channelPageSize);
+    channelPageSizeSelect.addEventListener('change', (event) => {
+      const nextSize = Number(event.target.value);
+      if (!CHANNEL_PAGE_SIZES.includes(nextSize)) {
+        channelPageSizeSelect.value = String(channelPageSize);
+        return;
+      }
+      if (channelPageSize === nextSize) {
+        return;
+      }
+      channelPageSize = nextSize;
+      safeStorageSet(STORAGE_KEYS.messagePageSize, String(channelPageSize));
+      resetChannelPages();
+      if (selectedChannelId != null) {
+        renderChannelMessages(selectedChannelId);
+      }
+    });
+  }
+
+  channelPageFirstBtn?.addEventListener('click', () => {
+    if (selectedChannelId != null) {
+      goToChannelPage(selectedChannelId, 1);
+    }
+  });
+
+  channelPagePrevBtn?.addEventListener('click', () => {
+    if (selectedChannelId != null) {
+      goToChannelPageDelta(selectedChannelId, -1);
+    }
+  });
+
+  channelPageNextBtn?.addEventListener('click', () => {
+    if (selectedChannelId != null) {
+      goToChannelPageDelta(selectedChannelId, 1);
+    }
+  });
+
+  channelPageLastBtn?.addEventListener('click', () => {
+    if (selectedChannelId != null) {
+      const store = ensureChannelStore(selectedChannelId);
+      let pageSize = channelPageSize;
+      if (!CHANNEL_PAGE_SIZES.includes(pageSize)) {
+        pageSize = CHANNEL_PAGE_SIZES[0];
+        channelPageSize = pageSize;
+      }
+      const totalPages = store.length ? Math.ceil(store.length / pageSize) : 1;
+      goToChannelPage(selectedChannelId, totalPages);
+    }
+  });
 
   flowSearchInput?.addEventListener('input', () => {
     const raw = flowSearchInput.value || '';
