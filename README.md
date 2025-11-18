@@ -255,6 +255,7 @@ GUI 提供：
   ```  
   腳本會將每筆紀錄的 `timestampMs`／`sampleTimeMs`／`telemetry.timeMs` 對齊收包時刻，並保留 `.bak` 備份。
 - **遙測資料儲存**：自 v0.2.23 起改採 `~/.config/callmesh/telemetry-records.sqlite`（SQLite）；首次啟動會自動匯入舊版 JSONL 並將原檔更名為 `.migrated`。
+- **遙測歷史復原**：若 SQLite 已寫入新資料、但仍要再次匯入 `telemetry-records.jsonl.migrated`，只要在程式關閉後把它改回 `telemetry-records.jsonl`（CLI 路徑 `~/.config/callmesh/`，GUI 路徑 `~/Library/Application Support/TMAG Monitor/callmesh/`），下次啟動會再次把整份 JSON 匯入資料庫，完成後檔案會自動改回 `.migrated` 備份。
 - **共用資料庫**：節點快照、Mapping/Provision 快取、訊息紀錄與 Relay 統計統一儲存在 `~/.config/callmesh/callmesh-data.sqlite`，升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl`、`relay-link-stats.json`。
 - **打包工具**：`scripts/pack-cli.sh`、`scripts/pack-desktop.sh` 可快速產出 CLI / GUI 可攜版（需安裝 `pkg`、`electron-packager`）。
 
