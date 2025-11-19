@@ -1153,37 +1153,113 @@ function getArtifactsDir() {
 }
 
 async function clearNodeDatabaseCli() {
-  const artifactsDir = getArtifactsDir();
-  const sqlitePath = path.join(artifactsDir, 'callmesh-data.sqlite');
-  const legacyPath = path.join(artifactsDir, 'node-database.json');
-  const relayLegacyPath = path.join(artifactsDir, 'relay-link-stats.json');
-  let store;
-  try {
-    store = new CallMeshDataStore(sqlitePath);
-    store.init();
-    store.clearNodes();
-    if (typeof store.clearRelayStats === 'function') {
-      store.clearRelayStats();
-    } else {
-      store.replaceRelayStats([]);
+  const candidates = buildNodeDataDirectories();
+  let clearedAny = false;
+  let hadError = false;
+
+  for (const dir of candidates) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await clearNodeDataDirectory(dir);
+    if (result.cleared) {
+      clearedAny = true;
     }
-    store.close();
-    store = null;
-    await fs.rm(legacyPath, { force: true });
-    await fs.rm(relayLegacyPath, { force: true });
-    console.log(`[nodes] 已清除節點資料庫與 link-state，SQLite=${sqlitePath}`);
+    if (result.error) {
+      hadError = true;
+    }
+  }
+
+  if (!clearedAny && !hadError) {
+    console.log('[nodes] 未找到可清除的節點資料庫。');
+  } else if (clearedAny && !hadError) {
     console.log('[nodes] 重新啟動 TMAG 後會隨新封包重新建立節點與 relay link 統計。');
-    process.exitCode = 0;
-  } catch (err) {
-    if (store) {
+  }
+
+  process.exitCode = hadError ? 1 : 0;
+}
+
+function buildNodeDataDirectories() {
+  const dirs = new Set();
+  dirs.add(getArtifactsDir());
+  const home = os.homedir();
+  if (process.platform === 'darwin') {
+    dirs.add(path.join(home, 'Library', 'Application Support', 'TMAG Monitor', 'callmesh'));
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+    dirs.add(path.join(appData, 'TMAG Monitor', 'callmesh'));
+  } else {
+    dirs.add(path.join(home, '.config', 'TMAG Monitor', 'callmesh'));
+  }
+  return Array.from(dirs);
+}
+
+async function clearNodeDataDirectory(dir) {
+  const result = { cleared: false, error: null };
+  if (!dir) return result;
+  const dirExists = await pathExists(dir);
+  if (!dirExists) {
+    return result;
+  }
+
+  const sqlitePath = path.join(dir, 'callmesh-data.sqlite');
+  const legacyPath = path.join(dir, 'node-database.json');
+  const relayLegacyPath = path.join(dir, 'relay-link-stats.json');
+
+  const shouldInitStore =
+    (await pathExists(sqlitePath)) || (await pathExists(legacyPath)) || (await pathExists(relayLegacyPath));
+
+  let store = null;
+  if (shouldInitStore) {
+    try {
+      store = new CallMeshDataStore(sqlitePath);
+      store.init();
+      store.clearNodes();
+      if (typeof store.clearRelayStats === 'function') {
+        store.clearRelayStats();
+      } else {
+        store.replaceRelayStats([]);
+      }
+      result.cleared = true;
+      console.log(`[nodes] cleared SQLite nodes/link-state → ${sqlitePath}`);
+    } catch (err) {
+      result.error = err;
+      console.error(`[nodes] 清除 ${sqlitePath} 失敗：${err.message}`);
+    } finally {
       try {
-        store.close();
+        store?.close();
       } catch {
         // ignore
       }
     }
-    console.error(`[nodes] 清除節點資料庫失敗：${err.message}`);
-    process.exitCode = 1;
+  }
+
+  const legacyRemoved = await removeIfExists(legacyPath);
+  const relayRemoved = await removeIfExists(relayLegacyPath);
+  if (legacyRemoved || relayRemoved) {
+    result.cleared = true;
+  }
+
+  return result;
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removeIfExists(targetPath) {
+  try {
+    await fs.rm(targetPath, { force: true });
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return false;
+    }
+    console.error(`[nodes] 移除 ${targetPath} 失敗：${err.message}`);
+    return false;
   }
 }
 
