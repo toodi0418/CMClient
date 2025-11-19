@@ -224,10 +224,7 @@ class CallMeshAprsBridge extends EventEmitter {
       source: 'unknown',
       details: {}
     };
-    this.tenmanIgnoreInboundNodes =
-      typeof options.tenmanIgnoreInboundNodes === 'boolean'
-        ? options.tenmanIgnoreInboundNodes
-        : true;
+    this.tenmanIgnoreInboundNodes = true;
 
     this.telemetryBuckets = new Map();
     this.telemetryStore = new Map();

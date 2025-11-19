@@ -38,26 +38,6 @@ const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
 const { WebDashboardServer } = require('../web/server');
 const { SerialPort } = require('serialport');
 
-function parseEnvBoolean(value, defaultValue = false) {
-  if (value === undefined || value === null) {
-    return defaultValue;
-  }
-  if (typeof value === 'boolean') {
-    return value;
-  }
-  const normalized = String(value).trim().toLowerCase();
-  if (!normalized) {
-    return defaultValue;
-  }
-  if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) {
-    return true;
-  }
-  if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) {
-    return false;
-  }
-  return defaultValue;
-}
-
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
 const MESSAGE_MAX_PER_CHANNEL = 200;
@@ -677,8 +657,7 @@ async function initialiseBridge() {
   if (storedSharePreference !== null) {
     bridgeOptions.shareWithTenmanMap = storedSharePreference;
   }
-  const ignoreTenmanInboundNodes = parseEnvBoolean(process.env.TENMAN_IGNORE_INBOUND_NODES, true);
-  bridgeOptions.tenmanIgnoreInboundNodes = ignoreTenmanInboundNodes;
+  bridgeOptions.tenmanIgnoreInboundNodes = true;
 
   bridge = new CallMeshAprsBridge(bridgeOptions);
 
