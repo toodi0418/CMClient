@@ -286,7 +286,25 @@ GUI 提供：
 - **共用資料庫**：節點快照、Mapping/Provision 快取、訊息紀錄與 Relay 統計統一儲存在 `~/.config/callmesh/callmesh-data.sqlite`，升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl`、`relay-link-stats.json`。
 - **打包工具**：`scripts/pack-cli.sh`、`scripts/pack-desktop.sh` 可快速產出 CLI / GUI 可攜版（需安裝 `pkg`、`electron-packager`）。
 
----
+### 清除節點資料庫
+
+- **CLI 旗標**  
+  ```bash
+  node src/index.js --clear-nodedb
+  ```  
+  在不啟動監控流程的情況下，會直接清空 `callmesh-data.sqlite` 的 `nodes` 表並移除舊版 `node-database.json`，完成後立即結束程式。
+- **Electron 桌面版**  
+  1. 切換到「節點資料庫」分頁。  
+  2. 點擊右上角「清除節點資料庫」，會同時清空記憶體快取與 `callmesh-data.sqlite` 中的 `nodes` 表。
+- **CLI / 服務模式**  
+  1. 停止 TMAG 程式。  
+  2. 執行下列指令（若有自訂 `CALLMESH_ARTIFACTS_DIR`，請換成對應路徑）：  
+     ```bash
+     sqlite3 ~/.config/callmesh/callmesh-data.sqlite "DELETE FROM nodes; VACUUM;"
+     ```  
+     或直接刪除 `callmesh-data.sqlite`，下次啟動時會自動重建並重新同步 Mapping / Provision。
+
+--- 
 
 ## 7. 打包指令
 

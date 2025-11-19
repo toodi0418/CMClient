@@ -11,6 +11,7 @@ const { discoverMeshtasticDevices } = require('./discovery');
 const { CallMeshClient, buildAgentString } = require('./callmesh/client');
 const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge');
 const { WebDashboardServer } = require('./web/server');
+const { CallMeshDataStore } = require('./storage/callmeshDataStore');
 const pkg = require('../package.json');
 
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
@@ -218,6 +219,11 @@ async function main() {
             type: 'boolean',
             default: false,
             describe: '啟用內建 Web Dashboard（預設為關閉）'
+          })
+          .option('clear-nodedb', {
+            type: 'boolean',
+            default: false,
+            describe: '清除本地節點資料庫（callmesh-data.sqlite → nodes 表）後立即結束'
           }),
       async (argv) => {
         await startMonitor(argv);
@@ -229,6 +235,11 @@ async function main() {
 }
 
 async function startMonitor(argv) {
+  if (argv.clearNodedb) {
+    await clearNodeDatabaseCli();
+    return;
+  }
+
   const apiKey = argv.apiKey || process.env.CALLMESH_API_KEY;
   if (!apiKey) {
     console.error('未設定 CallMesh API Key，請先設定環境變數 CALLMESH_API_KEY 後再執行。');
@@ -1139,6 +1150,34 @@ function getArtifactsDir() {
   const custom = process.env.CALLMESH_ARTIFACTS_DIR;
   if (custom) return path.resolve(custom);
   return path.dirname(getVerificationPath());
+}
+
+async function clearNodeDatabaseCli() {
+  const artifactsDir = getArtifactsDir();
+  const sqlitePath = path.join(artifactsDir, 'callmesh-data.sqlite');
+  const legacyPath = path.join(artifactsDir, 'node-database.json');
+  let store;
+  try {
+    store = new CallMeshDataStore(sqlitePath);
+    store.init();
+    store.clearNodes();
+    store.close();
+    store = null;
+    await fs.rm(legacyPath, { force: true });
+    console.log(`[nodes] 已清除節點資料庫，SQLite=${sqlitePath}`);
+    console.log('[nodes] 重新啟動 TMAG 後會隨新封包重新建立節點資料。');
+    process.exitCode = 0;
+  } catch (err) {
+    if (store) {
+      try {
+        store.close();
+      } catch {
+        // ignore
+      }
+    }
+    console.error(`[nodes] 清除節點資料庫失敗：${err.message}`);
+    process.exitCode = 1;
+  }
 }
 
 async function loadVerificationFile(filePath) {
