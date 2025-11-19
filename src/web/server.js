@@ -466,9 +466,11 @@ class WebDashboardServer {
       return;
     }
     this._readRelayStats()
-      .then(({ stats, message }) => {
+      .then(({ stats, source, details, message }) => {
         const payload = {
           relayLinkStats: stats,
+          relayLinkSource: source || undefined,
+          relayLinkDetails: details && Object.keys(details).length ? details : undefined,
           message: message || undefined,
           generatedAt: new Date().toISOString()
         };
@@ -497,6 +499,8 @@ class WebDashboardServer {
   }
 
   async _readRelayStats() {
+    let source = null;
+    const details = {};
     if (this.relayStatsStore) {
       try {
         const rows = this.relayStatsStore.listRelayStats();
@@ -510,6 +514,8 @@ class WebDashboardServer {
             updatedAt: Number.isFinite(row.updatedAt) ? row.updatedAt : null
           };
         }
+        source = 'sqlite';
+        details.sqlite = true;
         if (this.relayStatsPath) {
           try {
             await fsPromises.rm(this.relayStatsPath, { force: true });
@@ -517,19 +523,26 @@ class WebDashboardServer {
             // ignore cleanup error
           }
         }
-        return { stats, message: null };
+        return { stats, source, details, message: null };
       } catch (err) {
         // eslint-disable-next-line no-console
         console.warn(`讀取 sqlite relay stats 失敗: ${err.message}`);
       }
     }
     if (!this.relayStatsPath) {
-      return { stats: null, message: 'relay stats storage not configured' };
+      return {
+        stats: null,
+        source: source ?? 'unavailable',
+        details,
+        message: 'relay stats storage not configured'
+      };
     }
     try {
       const raw = await fsPromises.readFile(this.relayStatsPath, 'utf8');
       if (!raw || !raw.trim()) {
-        return { stats: {}, message: null };
+        source = source ?? 'legacy-json';
+        details.path = this.relayStatsPath;
+        return { stats: {}, source, details, message: null };
       }
       let parsed;
       try {
@@ -548,15 +561,21 @@ class WebDashboardServer {
         try {
           this.relayStatsStore.replaceRelayStats(rows);
           await fsPromises.rm(this.relayStatsPath, { force: true });
+          source = 'sqlite';
+          details.sqlite = true;
+          details.migrated = true;
         } catch (err) {
           // eslint-disable-next-line no-console
           console.warn(`遷移 relay stats 至 SQLite 失敗: ${err.message}`);
+          source = source ?? 'legacy-json';
         }
       }
-      return { stats: parsed, message: null };
+      source = source ?? 'legacy-json';
+      details.path = this.relayStatsPath;
+      return { stats: parsed, source, details, message: null };
     } catch (err) {
       if (err && err.code === 'ENOENT') {
-        return { stats: {}, message: null };
+        return { stats: {}, source: source ?? 'legacy-json', details: { path: this.relayStatsPath }, message: null };
       }
       throw err;
     }
