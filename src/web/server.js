@@ -475,6 +475,7 @@ class WebDashboardServer {
           relayLinkStats: stats,
           relayLinkSource: source || undefined,
           relayLinkDetails: details && Object.keys(details).length ? details : undefined,
+          nodeTotals: this._collectNodeTotals(),
           nodeSnapshotSource: this.nodeSnapshotMeta?.source ?? undefined,
           nodeSnapshotDetails:
             this.nodeSnapshotMeta?.details && Object.keys(this.nodeSnapshotMeta.details).length
@@ -505,6 +506,23 @@ class WebDashboardServer {
           )
         );
       });
+  }
+
+  _collectNodeTotals() {
+    const registryCount = this.nodeRegistry instanceof Map ? this.nodeRegistry.size : 0;
+    const details = this.nodeSnapshotMeta?.details || {};
+    const snapshotCount = Number.isFinite(details.count) ? Number(details.count) : null;
+    const restoredCount = Number.isFinite(details.restoredCount) ? Number(details.restoredCount) : null;
+    const result = {
+      registry: registryCount
+    };
+    if (snapshotCount !== null) {
+      result.snapshot = snapshotCount;
+    }
+    if (restoredCount !== null) {
+      result.restored = restoredCount;
+    }
+    return result;
   }
 
   async _readRelayStats() {
