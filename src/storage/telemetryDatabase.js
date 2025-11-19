@@ -2,7 +2,13 @@
 
 const fs = require('fs');
 const path = require('path');
-const Database = require('better-sqlite3');
+
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = require('node:sqlite'));
+} catch (err) {
+  throw new Error('TelemetryDatabase 需要 Node.js 22 的 node:sqlite 模組，請升級執行環境。');
+}
 
 const INSERT_RECORD_SQL = `
   INSERT INTO telemetry_records (
@@ -311,11 +317,13 @@ class TelemetryDatabase {
     ensureDirectory(this.filePath);
     const openOptions = {};
     if (this.options.readonly) {
-      openOptions.readonly = true;
+      openOptions.readOnly = true;
     }
-    this.db = new Database(this.filePath, openOptions);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
+    this.db = new DatabaseSync(this.filePath, openOptions);
+    if (!openOptions.readOnly) {
+      this.db.exec('PRAGMA journal_mode = WAL;');
+    }
+    this.db.exec('PRAGMA foreign_keys = ON;');
     this._applyMigrations();
     this._prepareStatements();
   }
@@ -341,6 +349,30 @@ class TelemetryDatabase {
       // eslint-disable-next-line no-console
       console.warn(`TelemetryDatabase: window functions unavailable, falling back to per-mesh queries (${err.message})`);
     }
+  }
+
+  _createTransaction(fn) {
+    return (...args) => {
+      if (!this.db) {
+        throw new Error('TelemetryDatabase 尚未初始化');
+      }
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const result = fn(...args);
+        this.db.exec('COMMIT');
+        return result;
+      } catch (err) {
+        try {
+          if (this.db?.isOpen) {
+            this.db.exec('ROLLBACK');
+          }
+        } catch (rollbackErr) {
+          // eslint-disable-next-line no-console
+          console.warn(`TelemetryDatabase: rollback failed (${rollbackErr.message})`);
+        }
+        throw err;
+      }
+    };
   }
 
   _applyMigrations() {
@@ -449,7 +481,7 @@ class TelemetryDatabase {
       const insertMetric = this.db.prepare(INSERT_METRIC_SQL);
       const deleteMetrics = this.db.prepare(DELETE_METRICS_SQL);
 
-      const migrate = this.db.transaction((rows) => {
+      const migrate = this._createTransaction((rows) => {
         for (const row of rows) {
           if (!row || !row.data) continue;
           let parsed = null;
@@ -500,7 +532,7 @@ class TelemetryDatabase {
     const insertMetric = this.statements.insertMetric;
     const deleteMetrics = this.statements.deleteMetricsForRecord;
 
-    const run = this.db.transaction(() => {
+    const run = this._createTransaction(() => {
       insertRecord.run(payload);
       deleteMetrics.run(payload.id);
       for (const metric of metrics) {
@@ -542,7 +574,7 @@ class TelemetryDatabase {
     if (!this.db) {
       throw new Error('TelemetryDatabase 尚未初始化');
     }
-    const clear = this.db.transaction(() => {
+    const clear = this._createTransaction(() => {
       this.statements.clearMetrics.run();
       this.statements.clearRecords.run();
     });

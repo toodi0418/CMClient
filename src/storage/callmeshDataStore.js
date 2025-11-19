@@ -2,7 +2,13 @@
 
 const fs = require('fs');
 const path = require('path');
-const Database = require('better-sqlite3');
+
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = require('node:sqlite'));
+} catch (err) {
+  throw new Error('CallMeshDataStore 需要 Node.js 22 的 node:sqlite 模組，請升級執行環境。');
+}
 
 function ensureDirectory(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -250,9 +256,9 @@ class CallMeshDataStore {
   init() {
     if (this.db) return;
     ensureDirectory(this.filePath);
-    this.db = new Database(this.filePath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
+    this.db = new DatabaseSync(this.filePath);
+    this.db.exec('PRAGMA journal_mode = WAL;');
+    this.db.exec('PRAGMA foreign_keys = ON;');
     this._migrateLegacyMessageLog();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS kv_store (
@@ -474,6 +480,30 @@ class CallMeshDataStore {
     `);
   }
 
+  _createTransaction(fn) {
+    return (...args) => {
+      if (!this.db) {
+        throw new Error('CallMeshDataStore 尚未初始化');
+      }
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const result = fn(...args);
+        this.db.exec('COMMIT');
+        return result;
+      } catch (err) {
+        try {
+          if (this.db?.isOpen) {
+            this.db.exec('ROLLBACK');
+          }
+        } catch (rollbackErr) {
+          // eslint-disable-next-line no-console
+          console.warn(`CallMeshDataStore: rollback failed (${rollbackErr.message})`);
+        }
+        throw err;
+      }
+    };
+  }
+
   _migrateLegacyMessageLog() {
     const tableInfo = this.db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='message_log'")
@@ -555,7 +585,7 @@ class CallMeshDataStore {
       const insertNode = this.db.prepare(INSERT_MESSAGE_NODE_SQL);
       const insertExtraLine = this.db.prepare(INSERT_MESSAGE_EXTRA_LINE_SQL);
 
-      const migrate = this.db.transaction((rows) => {
+      const migrate = this._createTransaction((rows) => {
         let fallbackPosition = 0;
         for (const row of rows) {
           if (!row) {
@@ -698,7 +728,7 @@ class CallMeshDataStore {
     }
     const now = Date.now();
     const insert = this.statements.insertNode;
-    const exec = this.db.transaction((entries) => {
+    const exec = this._createTransaction((entries) => {
       this.statements.deleteNodes.run();
       for (const entry of entries) {
         if (!entry || typeof entry !== 'object') continue;
@@ -749,7 +779,7 @@ class CallMeshDataStore {
     const insertEntry = this.statements.insertMessageEntry;
     const insertNode = this.statements.insertMessageNode;
     const insertExtraLine = this.statements.insertMessageExtraLine;
-    const exec = this.db.transaction((items) => {
+    const exec = this._createTransaction((items) => {
       this.statements.deleteMessages.run();
       this.statements.deleteMessageNodes.run();
       this.statements.deleteMessageExtraLines.run();
@@ -934,7 +964,7 @@ class CallMeshDataStore {
       throw new Error('CallMeshDataStore 尚未初始化');
     }
     const upsert = this.statements.upsertRelayStat;
-    const exec = this.db.transaction((items) => {
+    const exec = this._createTransaction((items) => {
       this.statements.clearRelayStats.run();
       for (const entry of items) {
         if (!entry || typeof entry !== 'object' || !entry.meshKey) continue;

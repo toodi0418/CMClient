@@ -25,7 +25,7 @@ TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合�
 
 ## 2. 環境需求
 
-- Node.js 18 以上（建議使用 LTS 版本）
+- Node.js 22 以上（需支援內建 `node:sqlite`）
 - Meshtastic 裝置或 Gateway（TCP API 或 Serial 連線）
 - CallMesh 平台有效的 API Key（環境變數 `CALLMESH_API_KEY`）
 - （若使用 APRS）穩定的網際網路連線
@@ -51,13 +51,13 @@ npm install
    ```bash
    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
    source ~/.nvm/nvm.sh
-   nvm install 18
-   nvm use 18
+   nvm install 22
+   nvm use 22
    ```  
    完成後 `node -v`、`npm -v` 應該能顯示版本號。
 
 2. **Windows**  
-   前往 [Node.js 官方網站](https://nodejs.org/en/download) 下載 LTS 安裝程式，依指示完成安裝後重新開啟終端機（PowerShell / CMD）。  
+   前往 [Node.js 官方網站](https://nodejs.org/en/download) 下載 Node.js 22 LTS 安裝程式，依指示完成安裝後重新開啟終端機（PowerShell / CMD）。  
    驗證：  
    ```powershell
    node -v
@@ -123,11 +123,11 @@ npm install       # 套件若有更新會同步安裝
 # 系統更新 + 安裝 git / curl
 sudo apt update && sudo apt install -y git curl
 
-# 安裝 nvm 並使用 Node.js 18（建議 LTS）
+# 安裝 nvm 並使用 Node.js 22（建議 LTS）
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
 source ~/.nvm/nvm.sh
-nvm install 18
-nvm use 18
+nvm install 22
+nvm use 22
 
 # 取得 TMAG 並安裝依賴
 git clone https://github.com/toodi0418/CMClient.git
@@ -144,7 +144,7 @@ node src/index.js --host <節點ip> --port 4403
 ```bash
 npx pkg src/index.js \
   --config package.json \
-  --targets node18-linux-armv7 \
+  --targets node22-linux-armv7 \
   --compress Brotli --public \
   --output tmag-cli-linux-armv7
 ```
@@ -280,11 +280,11 @@ npm install
 
 npx pkg src/index.js \
   --config package.json \
-  --targets node18-linux-armv7 \
+  --targets node22-linux-armv7 \
   --compress Brotli --public \
   --output tmag-cli-linux-armv7
 ```
-或針對 64 位元 Pi OS 使用 `--targets node18-linux-arm64`。
+或針對 64 位元 Pi OS 使用 `--targets node22-linux-arm64`。
 
 ### Docker 佈署
 
