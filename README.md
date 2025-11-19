@@ -64,6 +64,33 @@ npm install
    npm -v
    ```
 
+### 如何升級 Node.js 到最新版本
+
+- **使用 nvm（macOS / Linux）**  
+  ```bash
+  nvm install 22 --latest-npm           # 安裝或更新 22.x 最新版
+  nvm alias default 22                  # （可選）設為預設版本
+  nvm use 22
+  node -v && npm -v                     # 確認版本
+  ```
+- **使用 Homebrew（macOS）**  
+  ```bash
+  brew update
+  brew upgrade node@22
+  echo 'export PATH="/usr/local/opt/node@22/bin:$PATH"' >> ~/.zshrc
+  source ~/.zshrc
+  node -v && npm -v
+  ```
+- **Windows**  
+  - 重新下載並執行 Node.js 22 LTS 安裝程式；或  
+  - 若使用 [nvm-windows](https://github.com/coreybutler/nvm-windows)，可執行：  
+    ```powershell
+    nvm install 22.21.1
+    nvm use 22.21.1
+    node -v
+    npm -v
+    ```
+
 ### 必備環境變數
 
 ```bash
