@@ -218,6 +218,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsLastPositionDigest = new Map();
     this.aprsSkippedMeshIds = new Set();
     this.nodeDatabase = nodeDatabase;
+    this.telemetrySeededNodes = new Set();
     this.nodeDatabasePersistTimer = null;
     this.nodeDatabasePersistDelayMs = 250;
     this.nodeDatabaseSourceInfo = {
@@ -435,8 +436,21 @@ class CallMeshAprsBridge extends EventEmitter {
     };
   }
 
-  getNodeSnapshot() {
-    return this.nodeDatabase.list();
+  getNodeSnapshot({ includeTelemetrySeeded = false } = {}) {
+    const snapshot = this.nodeDatabase.list();
+    if (includeTelemetrySeeded) {
+      return snapshot;
+    }
+    return snapshot.filter((node) => {
+      const meshId =
+        node?.meshId ??
+        node?.meshIdNormalized ??
+        node?.meshIdOriginal ??
+        null;
+      const normalized = normalizeMeshId(meshId);
+      if (!normalized) return true;
+      return !this.telemetrySeededNodes.has(normalized);
+    });
   }
 
   getNodeDatabaseSourceInfo() {
@@ -445,13 +459,15 @@ class CallMeshAprsBridge extends EventEmitter {
       source: info.source ?? 'unknown',
       details: {
         ...(info.details ? { ...info.details } : {}),
-        tenmanIgnoreInboundNodes: this.tenmanIgnoreInboundNodes
+        tenmanIgnoreInboundNodes: this.tenmanIgnoreInboundNodes,
+        telemetrySeededCount: this.telemetrySeededNodes.size
       }
     };
   }
 
   clearNodeDatabase() {
     const cleared = this.nodeDatabase.clear();
+    this.telemetrySeededNodes.clear();
     this.scheduleNodeDatabasePersist();
     this.emitLog('NODE-DB', `cleared node database count=${cleared}`);
     this.resetTenmanNodeSyncSignatures();
@@ -465,7 +481,7 @@ class CallMeshAprsBridge extends EventEmitter {
     };
     return {
       cleared,
-      nodes: this.nodeDatabase.list()
+      nodes: this.getNodeSnapshot()
     };
   }
 
@@ -529,12 +545,16 @@ class CallMeshAprsBridge extends EventEmitter {
       }
     }
     const restored = this.nodeDatabase.replace(entries || []);
-    const telemetrySeed = this.seedNodesFromTelemetrySnapshot({ limitPerNode: 1 });
-    if (telemetrySeed.seeded) {
-      this.emitLog(
-        'NODE-DB',
-        `seeded ${telemetrySeed.seeded}/${telemetrySeed.total} nodes from telemetry snapshot`
-      );
+    this.telemetrySeededNodes.clear();
+    let telemetrySeed = { seeded: 0, total: 0 };
+    if (Array.isArray(entries) && entries.length) {
+      telemetrySeed = this.seedNodesFromTelemetrySnapshot({ limitPerNode: 1 });
+      if (telemetrySeed.seeded) {
+        this.emitLog(
+          'NODE-DB',
+          `seeded ${telemetrySeed.seeded}/${telemetrySeed.total} nodes from telemetry snapshot`
+        );
+      }
     }
     this.resetTenmanNodeSyncSignatures();
     this.requestTenmanNodeSnapshot('restore');
@@ -580,7 +600,7 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!this.storageDir) {
       return;
     }
-    const snapshot = this.nodeDatabase.serialize();
+    const snapshot = this.getNodeSnapshot();
     const store = this.getDataStore();
     if (store) {
       try {
@@ -631,7 +651,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.selfMeshId = normalizeMeshId(meshId);
   }
 
-  upsertNodeInfo(node, { timestamp } = {}) {
+  upsertNodeInfo(node, { timestamp, suppressEmit = false, source = null, suppressPersist = false } = {}) {
     if (!node || typeof node !== 'object') {
       return null;
     }
@@ -673,8 +693,16 @@ class CallMeshAprsBridge extends EventEmitter {
       lastSeenAt: Number.isFinite(timestamp) ? Number(timestamp) : Date.now()
     };
     const result = this.nodeDatabase.upsert(normalized, info);
+    if (source !== 'telemetry-seed') {
+      this.telemetrySeededNodes.delete(normalized);
+    }
     if (result.changed) {
-      this.forwardTenmanNodeUpdate(result.node);
+      if (source === 'telemetry-seed') {
+        this.telemetrySeededNodes.add(normalized);
+      } else {
+        this.telemetrySeededNodes.delete(normalized);
+        this.forwardTenmanNodeUpdate(result.node);
+      }
       const label = buildNodeLabel(result.node);
       const rawId = result.node.meshId || result.node.meshIdOriginal || '';
       const normalizedId = normalizeMeshId(rawId);
@@ -705,8 +733,14 @@ class CallMeshAprsBridge extends EventEmitter {
         label,
         lastSeenAt: result.node.lastSeenAt
       };
-      this.emit('node', payload);
-      this.scheduleNodeDatabasePersist();
+      if (!suppressEmit) {
+        this.emit('node', payload);
+      }
+      if (!suppressPersist) {
+        this.scheduleNodeDatabasePersist();
+      }
+    } else if (source === 'telemetry-seed') {
+      this.telemetrySeededNodes.add(normalized);
     }
     return result.node;
   }
@@ -729,6 +763,10 @@ class CallMeshAprsBridge extends EventEmitter {
         const normalized = normalizeMeshId(meshIdRaw);
         if (!normalized) continue;
         const existed = this.nodeDatabase.get(normalized);
+        if (existed) {
+          this.telemetrySeededNodes.delete(normalized);
+          continue;
+        }
         const nodeInfo = {
           ...(record?.node && typeof record.node === 'object' ? { ...record.node } : {}),
           meshId: meshIdRaw ?? normalized,
@@ -742,9 +780,12 @@ class CallMeshAprsBridge extends EventEmitter {
                 : Date.now()
         };
         const merged = this.upsertNodeInfo(nodeInfo, {
-          timestamp: Number.isFinite(nodeInfo.lastSeenAt) ? nodeInfo.lastSeenAt : Date.now()
+          timestamp: Number.isFinite(nodeInfo.lastSeenAt) ? nodeInfo.lastSeenAt : Date.now(),
+          suppressEmit: true,
+          source: 'telemetry-seed',
+          suppressPersist: true
         });
-        if (!existed && merged) {
+        if (merged) {
           seeded += 1;
         }
       }
@@ -1384,9 +1425,7 @@ class CallMeshAprsBridge extends EventEmitter {
       if (!syncState) {
         return false;
       }
-      const rawNodes =
-        typeof this.nodeDatabase?.list === 'function' ? this.nodeDatabase.list() : [];
-      const nodes = Array.isArray(rawNodes) ? rawNodes : [];
+      const nodes = this.getNodeSnapshot();
       const nodePayloads = [];
       const signatures = new Map();
       for (const node of nodes) {
