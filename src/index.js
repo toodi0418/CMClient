@@ -805,12 +805,30 @@ async function startMonitor(argv) {
 }
 
 function formatNodes(summary) {
-  const from = summary.from?.label || 'unknown';
-  const to = summary.to?.label;
-  if (!to) {
-    return from;
+  const resolveLabel = (node) => {
+    if (!node || typeof node !== 'object') return null;
+    const label =
+      (typeof node.label === 'string' && node.label.trim()) ||
+      (typeof node.longName === 'string' && node.longName.trim()) ||
+      (typeof node.shortName === 'string' && node.shortName.trim()) ||
+      null;
+    if (label) {
+      return label;
+    }
+    const mesh =
+      (typeof node.meshId === 'string' && node.meshId.trim()) ||
+      (typeof node.meshIdNormalized === 'string' && node.meshIdNormalized.trim()) ||
+      (typeof node.meshIdOriginal === 'string' && node.meshIdOriginal.trim()) ||
+      null;
+    return mesh;
+  };
+
+  const fromLabel = resolveLabel(summary?.from) || 'unknown';
+  const toLabel = resolveLabel(summary?.to);
+  if (!toLabel) {
+    return fromLabel;
   }
-  return `${from} -> ${to}`;
+  return `${fromLabel} -> ${toLabel}`;
 }
 
 function padValue(value, width) {
