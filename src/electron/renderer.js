@@ -2953,7 +2953,7 @@ function updatePlatformStatus() {
 function hydrateSummaryNode(node, fallbackMeshId = null) {
   const meshCandidate = node?.meshId ?? node?.meshIdNormalized ?? fallbackMeshId;
   const registryNode = getRegistryNode(meshCandidate);
-  const upserted = node ? upsertNodeRegistry(node) : null;
+  const upserted = node ? upsertNodeRegistry(node, { allowCreate: false }) : null;
   const merged = mergeNodeMetadata(node, upserted, registryNode);
   return merged || node || registryNode || null;
 }
@@ -4408,7 +4408,8 @@ function mergeNodeMetadata(...sources) {
   return result;
 }
 
-function upsertNodeRegistry(entry) {
+function upsertNodeRegistry(entry, options = {}) {
+  const allowCreate = options.allowCreate !== false;
   if (!entry || typeof entry !== 'object') return null;
   const keyCandidate = entry.meshId || entry.meshIdNormalized || entry.meshIdOriginal;
   const normalized = normalizeMeshId(keyCandidate);
@@ -4418,6 +4419,9 @@ function upsertNodeRegistry(entry) {
     return null;
   }
   const existing = nodeRegistry.get(normalized) || null;
+  if (!existing && !allowCreate) {
+    return null;
+  }
   const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
   if (merged) {
     nodeRegistry.set(normalized, merged);

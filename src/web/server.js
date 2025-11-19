@@ -1067,11 +1067,14 @@ class WebDashboardServer {
     }
 
     if (sanitizedNode && sanitizedNode.meshIdNormalized) {
-      this._upsertNode({
-        ...sanitizedNode,
-        meshId: sanitizedNode.meshId ?? key,
-        meshIdNormalized: sanitizedNode.meshIdNormalized ?? normalized
-      });
+      this._upsertNode(
+        {
+          ...sanitizedNode,
+          meshId: sanitizedNode.meshId ?? key,
+          meshIdNormalized: sanitizedNode.meshIdNormalized ?? normalized
+        },
+        { allowCreate: false }
+      );
     }
 
     if (Array.isArray(bucket.records)) {
@@ -1180,11 +1183,14 @@ class WebDashboardServer {
     const sanitizedNode = node ? sanitizeTelemetryNode(node) : null;
     let registryNode = null;
     if (sanitizedNode && normalizedMeshId) {
-      registryNode = this._upsertNode({
-        ...sanitizedNode,
-        meshId: sanitizedNode.meshId ?? meshId,
-        meshIdNormalized: sanitizedNode.meshIdNormalized ?? normalizedMeshId
-      });
+      registryNode = this._upsertNode(
+        {
+          ...sanitizedNode,
+          meshId: sanitizedNode.meshId ?? meshId,
+          meshIdNormalized: sanitizedNode.meshIdNormalized ?? normalizedMeshId
+        },
+        { allowCreate: false }
+      );
     } else if (normalizedMeshId) {
       registryNode = this.nodeRegistry.get(normalizedMeshId) || null;
     }
@@ -1561,7 +1567,8 @@ class WebDashboardServer {
     return nodes;
   }
 
-  _upsertNode(info) {
+  _upsertNode(info, options = {}) {
+    const allowCreate = options.allowCreate !== false;
     if (!info || typeof info !== 'object') {
       return null;
     }
@@ -1570,14 +1577,20 @@ class WebDashboardServer {
     if (!normalized) {
       return null;
     }
-    const existing = this.nodeRegistry.get(normalized) || {
-      meshId: normalized,
-      meshIdNormalized: normalized
-    };
-    const merged = mergeNodeInfo(existing, {
+    const existing = this.nodeRegistry.get(normalized);
+    if (!existing && !allowCreate) {
+      return null;
+    }
+    const base =
+      existing ||
+      {
+        meshId: normalized,
+        meshIdNormalized: normalized
+      };
+    const merged = mergeNodeInfo(base, {
       ...info,
       meshIdNormalized: normalized,
-      meshId: info.meshId || existing.meshId || normalized
+      meshId: info.meshId || base.meshId || normalized
     });
     this.nodeRegistry.set(normalized, merged);
     return cloneJson(merged);
@@ -2003,11 +2016,14 @@ class WebDashboardServer {
 
     let registryNode = normalized ? this.nodeRegistry.get(normalized) : null;
     if (node && normalized) {
-      registryNode = this._upsertNode({
-        meshId: meshCandidate,
-        meshIdNormalized: normalized,
-        ...node
-      });
+      registryNode = this._upsertNode(
+        {
+          meshId: meshCandidate,
+          meshIdNormalized: normalized,
+          ...node
+        },
+        { allowCreate: false }
+      );
     }
 
     if (!registryNode && !node) {
