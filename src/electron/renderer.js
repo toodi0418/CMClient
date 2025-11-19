@@ -429,10 +429,11 @@ let telemetryLoadingMeshId = null;
 let telemetryFetchToken = 0;
 let telemetrySummaryUpdatedAt = null;
 const nodeRegistry = new Map();
-const IGNORED_MESH_PREFIX = '!abcd';
 
-function isIgnoredMeshId(_meshId) {
-  return false;
+function isIgnoredMeshId(meshId) {
+  const normalized = normalizeMeshId(meshId);
+  if (!normalized) return false;
+  return normalized.toLowerCase().startsWith('!abcd');
 }
 let nodeSnapshotLoaded = false;
 
@@ -2953,7 +2954,7 @@ function updatePlatformStatus() {
 function hydrateSummaryNode(node, fallbackMeshId = null) {
   const meshCandidate = node?.meshId ?? node?.meshIdNormalized ?? fallbackMeshId;
   const registryNode = getRegistryNode(meshCandidate);
-  const upserted = node ? upsertNodeRegistry(node, { allowCreate: false }) : null;
+  const upserted = node ? upsertNodeRegistry(node) : null;
   const merged = mergeNodeMetadata(node, upserted, registryNode);
   return merged || node || registryNode || null;
 }
@@ -4408,23 +4409,16 @@ function mergeNodeMetadata(...sources) {
   return result;
 }
 
-function upsertNodeRegistry(entry, options = {}) {
-  const allowCreate = options.allowCreate !== false;
+function upsertNodeRegistry(entry) {
   if (!entry || typeof entry !== 'object') return null;
   const keyCandidate = entry.meshId || entry.meshIdNormalized || entry.meshIdOriginal;
   const normalized = normalizeMeshId(keyCandidate);
   if (!normalized) return null;
-  if (
-    isIgnoredMeshId(normalized) ||
-    isIgnoredMeshId(entry.meshIdOriginal)
-  ) {
+  if (isIgnoredMeshId(normalized) || isIgnoredMeshId(entry.meshIdOriginal)) {
     nodeRegistry.delete(normalized);
     return null;
   }
   const existing = nodeRegistry.get(normalized) || null;
-  if (!existing && !allowCreate) {
-    return null;
-  }
   const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
   if (merged) {
     nodeRegistry.set(normalized, merged);
@@ -4435,9 +4429,7 @@ function upsertNodeRegistry(entry, options = {}) {
 
 function getSortedNodeRegistryEntries() {
   const entries = Array.from(nodeRegistry.values()).filter(
-    (entry) =>
-      !isIgnoredMeshId(entry.meshId) &&
-      !isIgnoredMeshId(entry.meshIdOriginal)
+    (entry) => !isIgnoredMeshId(entry.meshId) && !isIgnoredMeshId(entry.meshIdOriginal)
   );
   entries.sort((a, b) => {
     const timeA = typeof a.lastSeenAt === 'number'
