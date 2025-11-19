@@ -4453,15 +4453,37 @@ function ensureRelayGuessSuffix(label, summary) {
     if (display) {
       return display;
     }
-    const mesh =
-      summary.from?.meshId ||
-      summary.from?.meshIdNormalized ||
-      summary.from?.meshIdOriginal ||
-      summary.fromMeshId ||
-      summary.fromMeshIdNormalized ||
-      summary.fromMeshIdOriginal ||
-      '';
-    return mesh || 'unknown';
+    const pickValidMesh = (...values) => {
+      for (const value of values) {
+        if (typeof value !== 'string') continue;
+        const trimmed = value.trim();
+        if (!trimmed) continue;
+        const lowered = trimmed.toLowerCase();
+        if (lowered === 'unknown' || lowered === '__unknown__' || lowered === 'null') {
+          continue;
+        }
+        return trimmed;
+      }
+      return '';
+    };
+    const mesh = pickValidMesh(
+      summary.from?.meshId,
+      summary.from?.meshIdNormalized,
+      summary.from?.meshIdOriginal,
+      summary.fromMeshId,
+      summary.fromMeshIdNormalized,
+      summary.fromMeshIdOriginal
+    );
+    if (mesh) {
+      return mesh;
+    }
+    if (typeof summary.detail === 'string') {
+      const match = summary.detail.match(/(![0-9a-f]{6,8})/i);
+      if (match && match[1]) {
+        return match[1];
+      }
+    }
+    return 'unknown';
   }
 
   function getDetailExtraSegments(summary) {
