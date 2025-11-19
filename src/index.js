@@ -89,6 +89,26 @@ function resolveTelemetryMaxTotalRecords() {
   return Math.floor(value);
 }
 
+function parseEnvBoolean(value, defaultValue = false) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) {
+    return defaultValue;
+  }
+  if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) {
+    return false;
+  }
+  return defaultValue;
+}
+
 function toWebCallmeshState(state) {
   if (!state || typeof state !== 'object') {
     return null;
@@ -224,6 +244,11 @@ async function main() {
             type: 'boolean',
             default: false,
             describe: '清除節點資料庫與 Link-State（callmesh-data.sqlite → nodes / relay_stats）後立即結束'
+          })
+          .option('tenman-ignore-inbound-nodes', {
+            type: 'boolean',
+            default: true,
+            describe: '忽略 TenManMap 傳回的節點事件（node.update / node.snapshot）；可用 --no-tenman-ignore-inbound-nodes 覆寫'
           }),
       async (argv) => {
         await startMonitor(argv);
@@ -275,6 +300,11 @@ async function startMonitor(argv) {
   if (shareWithTenmanMapOverride !== null) {
     bridgeOptions.shareWithTenmanMap = shareWithTenmanMapOverride;
   }
+  const ignoreTenmanInboundNodes =
+    typeof argv.tenmanIgnoreInboundNodes === 'boolean'
+      ? argv.tenmanIgnoreInboundNodes
+      : parseEnvBoolean(process.env.TENMAN_IGNORE_INBOUND_NODES, true);
+  bridgeOptions.tenmanIgnoreInboundNodes = ignoreTenmanInboundNodes;
 
   const bridge = new CallMeshAprsBridge(bridgeOptions);
 

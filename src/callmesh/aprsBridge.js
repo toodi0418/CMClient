@@ -224,6 +224,10 @@ class CallMeshAprsBridge extends EventEmitter {
       source: 'unknown',
       details: {}
     };
+    this.tenmanIgnoreInboundNodes =
+      typeof options.tenmanIgnoreInboundNodes === 'boolean'
+        ? options.tenmanIgnoreInboundNodes
+        : true;
 
     this.telemetryBuckets = new Map();
     this.telemetryStore = new Map();
@@ -442,7 +446,10 @@ class CallMeshAprsBridge extends EventEmitter {
     const info = this.nodeDatabaseSourceInfo || {};
     return {
       source: info.source ?? 'unknown',
-      details: info.details ? { ...info.details } : {}
+      details: {
+        ...(info.details ? { ...info.details } : {}),
+        tenmanIgnoreInboundNodes: this.tenmanIgnoreInboundNodes
+      }
     };
   }
 
@@ -2513,6 +2520,19 @@ class CallMeshAprsBridge extends EventEmitter {
         maybePromise.catch((err) => {
           this.emitLog('TENMAN', `處理 send_message 指令失敗: ${err.message}`);
         });
+      }
+      return;
+    }
+
+    if (
+      this.tenmanIgnoreInboundNodes &&
+      (parsed?.action === 'node.update' ||
+        parsed?.action === 'node.snapshot' ||
+        parsed?.type === 'node.update' ||
+        parsed?.type === 'node.snapshot')
+    ) {
+      if (TENMAN_FORWARD_VERBOSE_LOG) {
+        this.emitLog('TENMAN', `忽略來自 TenManMap 的 ${parsed?.action || parsed?.type || 'node event'}`);
       }
       return;
     }
