@@ -271,6 +271,7 @@ class WebDashboardServer {
     if (!summary) return;
     const base = this.selfMeshId ? { ...summary, selfMeshId: this.selfMeshId } : { ...summary };
     const payload = this._hydrateSummaryNodes(base);
+    this._ensureSummarySource(payload);
     this._appendSummary(payload);
     this._broadcast({ type: 'summary', payload });
     this._broadcastMetrics();
@@ -2009,6 +2010,73 @@ class WebDashboardServer {
     return next;
   }
 
+  _ensureSummarySource(summary) {
+    if (!summary || typeof summary !== 'object') {
+      return summary;
+    }
+    const pickCandidate = (...values) => {
+      for (const value of values) {
+        if (isUnknownLike(value)) continue;
+        return String(value).trim();
+      }
+      return null;
+    };
+
+    let meshId = pickCandidate(
+      summary.from?.meshId,
+      summary.from?.meshIdOriginal,
+      summary.from?.meshIdNormalized && `!${summary.from.meshIdNormalized}`,
+      summary.fromMeshId,
+      summary.fromMeshIdOriginal,
+      summary.fromMeshIdNormalized && `!${summary.fromMeshIdNormalized}`
+    );
+
+    if (!meshId && typeof summary.detail === 'string') {
+      const match = summary.detail.match(/(![0-9a-f]{6,8})/i);
+      if (match && match[1]) {
+        meshId = match[1];
+      }
+    }
+
+    if (!meshId) {
+      return summary;
+    }
+
+    const prefixed = toPrefixedMeshId(meshId);
+    if (!prefixed) {
+      return summary;
+    }
+    const normalized = normalizeMeshId(prefixed);
+
+    if (!summary.from || typeof summary.from !== 'object') {
+      summary.from = {};
+    }
+    if (isUnknownLike(summary.from.meshId)) {
+      summary.from.meshId = prefixed;
+    }
+    if (isUnknownLike(summary.from.meshIdOriginal)) {
+      summary.from.meshIdOriginal = prefixed;
+    }
+    if (isUnknownLike(summary.from.meshIdNormalized) && normalized) {
+      summary.from.meshIdNormalized = normalized;
+    }
+    if (isUnknownLike(summary.from.label)) {
+      summary.from.label = prefixed;
+    }
+    summary.fromMeshId = summary.fromMeshId && !isUnknownLike(summary.fromMeshId) ? summary.fromMeshId : prefixed;
+    summary.fromMeshIdOriginal =
+      summary.fromMeshIdOriginal && !isUnknownLike(summary.fromMeshIdOriginal)
+        ? summary.fromMeshIdOriginal
+        : prefixed;
+    if (normalized) {
+      summary.fromMeshIdNormalized =
+        summary.fromMeshIdNormalized && !isUnknownLike(summary.fromMeshIdNormalized)
+          ? summary.fromMeshIdNormalized
+          : normalized;
+    }
+    return summary;
+  }
+
   _hydrateSummaryNode(node, fallbackMeshId = null) {
     const meshCandidate =
       node?.meshId || node?.meshIdNormalized || node?.meshIdOriginal || fallbackMeshId;
@@ -2040,6 +2108,32 @@ class WebDashboardServer {
 module.exports = {
   WebDashboardServer
 };
+
+function isUnknownLike(value) {
+  if (value == null) return true;
+  const text = String(value).trim();
+  if (!text) return true;
+  const lower = text.toLowerCase();
+  return lower === 'unknown' || lower === '__unknown__' || lower === 'null';
+}
+
+function toPrefixedMeshId(value) {
+  if (!value || typeof value !== 'string') {
+    return null;
+  }
+  let text = value.trim();
+  if (!text) return null;
+  if (text.toLowerCase().startsWith('0x')) {
+    text = text.slice(2);
+  }
+  if (!text.startsWith('!') && /^[0-9a-f]{6,8}$/i.test(text)) {
+    return `!${text.toLowerCase()}`;
+  }
+  if (text.startsWith('!')) {
+    return `!${text.slice(1).toLowerCase()}`;
+  }
+  return text;
+}
 
 function normalizeMeshId(meshId) {
   if (meshId == null) return null;
