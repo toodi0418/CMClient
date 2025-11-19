@@ -13,17 +13,9 @@ const normalizeMeshId = (meshId) => {
   return value.startsWith('!') ? value.toLowerCase() : `!${value.toLowerCase()}`;
 };
 
-const isPlaceholderMeshId = (meshId) => {
-  if (!meshId) return false;
-  return /^!0{6}[0-9a-f]{2}$/.test(String(meshId).toLowerCase());
-};
+const isPlaceholderMeshId = (_meshId) => false;
 
-const isIgnoredMeshId = (meshId) => {
-  if (!meshId) return false;
-  const normalized = normalizeMeshId(meshId);
-  if (!normalized) return false;
-  return normalized.toLowerCase().startsWith('!abcd');
-};
+const isIgnoredMeshId = (_meshId) => false;
 
 class NodeDatabase {
   constructor() {
@@ -33,18 +25,6 @@ class NodeDatabase {
   upsert(meshId, payload = {}) {
     const normalized = normalizeMeshId(meshId);
     if (!normalized) {
-      return { changed: false, node: null };
-    }
-    if (isIgnoredMeshId(normalized) || isIgnoredMeshId(payload.meshIdOriginal)) {
-      if (this.nodes.has(normalized)) {
-        this.nodes.delete(normalized);
-      }
-      return { changed: false, node: null };
-    }
-    if (isPlaceholderMeshId(normalized) || isPlaceholderMeshId(payload.meshIdOriginal)) {
-      if (this.nodes.has(normalized)) {
-        this.nodes.delete(normalized);
-      }
       return { changed: false, node: null };
     }
     const existing = this.nodes.get(normalized) || {
@@ -124,9 +104,6 @@ class NodeDatabase {
     if (!normalized) {
       return null;
     }
-    if (isIgnoredMeshId(normalized)) {
-      return null;
-    }
     const stored = this.nodes.get(normalized);
     return stored ? { ...stored } : null;
   }
@@ -134,19 +111,12 @@ class NodeDatabase {
   merge(meshId, info = {}) {
     const normalized = normalizeMeshId(meshId);
     if (!normalized) return;
-    if (isIgnoredMeshId(normalized) || isIgnoredMeshId(info?.meshIdOriginal)) {
-      if (this.nodes.has(normalized)) {
-        this.nodes.delete(normalized);
-      }
-      return null;
-    }
     const result = this.upsert(normalized, info);
     return result.node;
   }
 
   list() {
     return Array.from(this.nodes.values())
-      .filter((node) => !isIgnoredMeshId(node.meshId) && !isIgnoredMeshId(node.meshIdOriginal))
       .map((node) => ({ ...node }))
       .sort((a, b) => {
         const timeA = Number.isFinite(a.lastSeenAt)
@@ -188,12 +158,6 @@ class NodeDatabase {
     for (const entry of entries) {
       const normalized = normalizeMeshId(entry?.meshId ?? entry?.meshIdNormalized ?? entry?.meshIdOriginal);
       if (!normalized) continue;
-      if (isIgnoredMeshId(normalized) || isIgnoredMeshId(entry?.meshIdOriginal)) {
-        continue;
-      }
-      if (isPlaceholderMeshId(normalized) || isPlaceholderMeshId(entry?.meshIdOriginal)) {
-        continue;
-      }
       let lastSeenAt = null;
       const candidate = entry?.lastSeenAt;
       if (Number.isFinite(candidate)) {
