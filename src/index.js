@@ -223,7 +223,7 @@ async function main() {
           .option('clear-nodedb', {
             type: 'boolean',
             default: false,
-            describe: '清除本地節點資料庫（callmesh-data.sqlite → nodes 表）後立即結束'
+            describe: '清除節點資料庫與 Link-State（callmesh-data.sqlite → nodes / relay_stats）後立即結束'
           }),
       async (argv) => {
         await startMonitor(argv);
@@ -1156,16 +1156,23 @@ async function clearNodeDatabaseCli() {
   const artifactsDir = getArtifactsDir();
   const sqlitePath = path.join(artifactsDir, 'callmesh-data.sqlite');
   const legacyPath = path.join(artifactsDir, 'node-database.json');
+  const relayLegacyPath = path.join(artifactsDir, 'relay-link-stats.json');
   let store;
   try {
     store = new CallMeshDataStore(sqlitePath);
     store.init();
     store.clearNodes();
+    if (typeof store.clearRelayStats === 'function') {
+      store.clearRelayStats();
+    } else {
+      store.replaceRelayStats([]);
+    }
     store.close();
     store = null;
     await fs.rm(legacyPath, { force: true });
-    console.log(`[nodes] 已清除節點資料庫，SQLite=${sqlitePath}`);
-    console.log('[nodes] 重新啟動 TMAG 後會隨新封包重新建立節點資料。');
+    await fs.rm(relayLegacyPath, { force: true });
+    console.log(`[nodes] 已清除節點資料庫與 link-state，SQLite=${sqlitePath}`);
+    console.log('[nodes] 重新啟動 TMAG 後會隨新封包重新建立節點與 relay link 統計。');
     process.exitCode = 0;
   } catch (err) {
     if (store) {

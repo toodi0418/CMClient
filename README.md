@@ -292,7 +292,7 @@ GUI 提供：
   ```bash
   node src/index.js --clear-nodedb
   ```  
-  在不啟動監控流程的情況下，會直接清空 `callmesh-data.sqlite` 的 `nodes` 表並移除舊版 `node-database.json`，完成後立即結束程式。
+  在不啟動監控流程的情況下，會直接清空 `callmesh-data.sqlite` 的 `nodes` 與 `relay_stats` 表，並移除舊版 `node-database.json` / `relay-link-stats.json`，完成後立即結束程式。
 - **Electron 桌面版**  
   1. 切換到「節點資料庫」分頁。  
   2. 點擊右上角「清除節點資料庫」，會同時清空記憶體快取與 `callmesh-data.sqlite` 中的 `nodes` 表。

@@ -980,6 +980,13 @@ class CallMeshDataStore {
     exec(entries);
   }
 
+  clearRelayStats() {
+    if (!this.db) {
+      throw new Error('CallMeshDataStore 尚未初始化');
+    }
+    this.statements.clearRelayStats.run();
+  }
+
   upsertRelayStat(entry) {
     if (!this.db) {
       throw new Error('CallMeshDataStore 尚未初始化');
