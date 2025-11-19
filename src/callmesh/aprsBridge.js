@@ -529,6 +529,13 @@ class CallMeshAprsBridge extends EventEmitter {
       }
     }
     const restored = this.nodeDatabase.replace(entries || []);
+    const telemetrySeed = this.seedNodesFromTelemetrySnapshot({ limitPerNode: 1 });
+    if (telemetrySeed.seeded) {
+      this.emitLog(
+        'NODE-DB',
+        `seeded ${telemetrySeed.seeded}/${telemetrySeed.total} nodes from telemetry snapshot`
+      );
+    }
     this.resetTenmanNodeSyncSignatures();
     this.requestTenmanNodeSnapshot('restore');
     this.nodeDatabaseSourceInfo = {
@@ -536,7 +543,9 @@ class CallMeshAprsBridge extends EventEmitter {
       details: {
         ...details,
         restoredCount: restored.length,
-        restoredAt: Date.now()
+        restoredAt: Date.now(),
+        telemetrySeeded: telemetrySeed.seeded,
+        telemetrySeedSample: telemetrySeed.total
       }
     };
     if (restored.length) {
@@ -663,9 +672,6 @@ class CallMeshAprsBridge extends EventEmitter {
       altitude,
       lastSeenAt: Number.isFinite(timestamp) ? Number(timestamp) : Date.now()
     };
-    if (/^!0{6}[0-9a-f]{2}$/i.test(info.meshIdOriginal || '') || /^!0{6}[0-9a-f]{2}$/i.test(normalized)) {
-      return null;
-    }
     const result = this.nodeDatabase.upsert(normalized, info);
     if (result.changed) {
       this.forwardTenmanNodeUpdate(result.node);
@@ -703,6 +709,50 @@ class CallMeshAprsBridge extends EventEmitter {
       this.scheduleNodeDatabasePersist();
     }
     return result.node;
+  }
+
+  seedNodesFromTelemetrySnapshot({ limitPerNode = 1 } = {}) {
+    if (!this.telemetryDb) {
+      return { seeded: 0, total: 0 };
+    }
+    let seeded = 0;
+    let total = 0;
+    try {
+      const snapshot = this.telemetryDb.fetchRecentSnapshot({ limitPerNode });
+      if (!Array.isArray(snapshot) || snapshot.length === 0) {
+        return { seeded: 0, total: 0 };
+      }
+      total = snapshot.length;
+      for (const record of snapshot) {
+        if (!record) continue;
+        const meshIdRaw = record?.node?.meshId ?? record?.meshId ?? null;
+        const normalized = normalizeMeshId(meshIdRaw);
+        if (!normalized) continue;
+        const existed = this.nodeDatabase.get(normalized);
+        const nodeInfo = {
+          ...(record?.node && typeof record.node === 'object' ? { ...record.node } : {}),
+          meshId: meshIdRaw ?? normalized,
+          meshIdNormalized: normalizeMeshId(meshIdRaw ?? normalized),
+          meshIdOriginal: record?.node?.meshIdOriginal ?? meshIdRaw ?? normalized,
+          lastSeenAt:
+            Number.isFinite(record?.node?.lastSeenAt)
+              ? record.node.lastSeenAt
+              : Number.isFinite(record?.timestampMs)
+                ? record.timestampMs
+                : Date.now()
+        };
+        const merged = this.upsertNodeInfo(nodeInfo, {
+          timestamp: Number.isFinite(nodeInfo.lastSeenAt) ? nodeInfo.lastSeenAt : Date.now()
+        });
+        if (!existed && merged) {
+          seeded += 1;
+        }
+      }
+    } catch (err) {
+      this.emitLog('NODE-DB', `seed nodes from telemetry failed: ${err.message}`);
+      return { seeded: 0, total: 0 };
+    }
+    return { seeded, total };
   }
 
   setApiKey(apiKey, { markVerified = true } = {}) {
