@@ -145,6 +145,14 @@
     if (!normalized) return false;
     return normalized.toLowerCase().startsWith('!abcd');
   }
+
+  function isUnknownLike(value) {
+    if (value === undefined || value === null) return true;
+    const text = String(value).trim();
+    if (!text) return true;
+    const lower = text.toLowerCase();
+    return lower === 'unknown' || lower === '__unknown__' || lower === 'null';
+  }
   let nodeSnapshotLoaded = false;
   const TELEMETRY_TABLE_LIMIT = 200;
   const TELEMETRY_CHART_LIMIT = 200;
@@ -4481,6 +4489,12 @@ function ensureRelayGuessSuffix(label, summary) {
       const match = summary.detail.match(/(![0-9a-f]{6,8})/i);
       if (match && match[1]) {
         return match[1];
+      }
+    }
+    if (summary.flowId) {
+      const callsign = flowAprsCallsigns.get(summary.flowId);
+      if (callsign && !isUnknownLike(callsign)) {
+        return callsign;
       }
     }
     return 'unknown';
