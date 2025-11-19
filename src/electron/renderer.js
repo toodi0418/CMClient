@@ -1460,15 +1460,14 @@ function resumeAutoReconnect({ reason = '', resetFailures = true, silent = false
 
 function normalizeMeshId(meshId) {
   if (meshId == null) return null;
-  const value = String(meshId).trim();
+  let value = String(meshId).trim();
   if (!value) return null;
   if (value.startsWith('!')) {
-    return value.toLowerCase();
+    value = value.slice(1);
+  } else if (value.toLowerCase().startsWith('0x')) {
+    value = value.slice(2);
   }
-  if (value.startsWith('0x') || value.startsWith('0X')) {
-    return `!${value.slice(2).toLowerCase()}`;
-  }
-  return `!${value.toLowerCase()}`;
+  return value.toLowerCase();
 }
 
 function loadPreferences() {
