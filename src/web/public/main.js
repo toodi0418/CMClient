@@ -4453,7 +4453,14 @@ function ensureRelayGuessSuffix(label, summary) {
     if (display) {
       return display;
     }
-    const mesh = summary.from?.meshId || summary.from?.meshIdNormalized || summary.from?.meshIdOriginal || '';
+    const mesh =
+      summary.from?.meshId ||
+      summary.from?.meshIdNormalized ||
+      summary.from?.meshIdOriginal ||
+      summary.fromMeshId ||
+      summary.fromMeshIdNormalized ||
+      summary.fromMeshIdOriginal ||
+      '';
     return mesh || 'unknown';
   }
 
