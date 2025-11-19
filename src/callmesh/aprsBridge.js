@@ -2494,8 +2494,8 @@ class CallMeshAprsBridge extends EventEmitter {
 
   captureSummaryNodeInfo(summary, timestampMs) {
     const hops = summary?.hops || {};
-    const hopStartProvided = Number.isFinite(hops.start);
-    const hopLimitProvided = Number.isFinite(hops.limit);
+    const hopStartProvided = hops.start !== undefined && hops.start !== null;
+    const hopLimitProvided = hops.limit !== undefined && hops.limit !== null;
     const hopLabel = typeof hops.label === 'string' ? hops.label.trim() : '';
     const hopMarkedInvalid =
       Boolean(summary?.relayInvalid) ||
