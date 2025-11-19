@@ -22,6 +22,7 @@
 - **Relay 提示 UI**：CLI/Electron/Web 均以圓形 `?` 按鈕提示推測結果；桌面與 Web 啟用半透明 Modal 顯示推測原因、候選節點與 Mesh ID。
 - **TENMANMAP 轉發管線**：`CallMeshAprsBridge` 會以 WebSocket 將位置封包上傳至 TENMANMAP 服務，預設全數節點皆轉發，可透過環境變數 `TENMAN_DISABLE=1` 或 CLI 旗標 `--no-share-with-tenmanmap` 全域停用；桌面版設定頁亦提供低調的分享開關；佇列、驗證與自動重連機制維持啟用。
 - **訊息距離顯示**：訊息分頁會根據節點資料庫座標與最後更新時間，顯示距離（km／m）與位置更新時間差（例如 `22.9 km (3 分鐘前)`）。
+- **訊息列表分頁**：Web Dashboard 與 Electron 訊息頁新增分頁控制（預設每頁 25 筆，可切換至 50／100），支援快速跳頁、前後一頁以及保留每頻道的目前頁碼與每頁筆數設定。
 - **遙測時間戳統一**：所有 Telemetry 紀錄寫入時都會以收包當下的時間 (`timestampMs`) 為準，同步更新 `sampleTime*` 與 `telemetry.time*` 欄位，避免裝置 RTC 漂移造成前端區間掛零。
 - **CLI 旗標**：預設關閉 Web UI；若需啟動可加上 `--web-ui`。Electron 亦可透過設定頁切換，或以 `TMAG_WEB_DASHBOARD` 強制指定。
 - **連線設定即時套用**：Electron 設定頁調整 TCP/Serial 模式、主機位址或 Serial 裝置後，會即時觸發重連並沿用更新後參數，無需手動點擊「連線」。
@@ -204,6 +205,7 @@ CMClient/
   - 節點資料庫整合：
     - 所有 `nodeInfo`、`myInfo` 與 `summary` 內的節點欄位會寫入 `nodeDatabase`，統一記錄長短名、型號、角色與最後出現時間；
     - 透過 `node`、`node-snapshot` 事件推播給 Electron / Web Dashboard，確保多個介面共用同一份節點資訊。
+    - UI 若將封包標記為「最後轉發：無效」（`summary.relayInvalid`、`hops.limitOnly` 等情況），`captureSummaryNodeInfo()` 會整筆忽略，不再寫入節點資料庫，以避免無效/猜測節點污染快照（2025-11-19 調整）。
   - 遙測資料庫：
     - 所有含 `summary.telemetry` 的封包均寫入 `telemetry-records.sqlite`（SQLite 資料庫），並同步更新記憶體快取；
     - 事件透過 `bridge.emit('telemetry')` 推播給 Electron / Web Dashboard，類型分為 `append` 與 `reset`；
@@ -387,7 +389,8 @@ node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 ### 6.5 訊息頻道
 
 - Electron 「訊息」分頁會顯示 CH0~CH3 文字封包，並持久化於 `callmesh-data.sqlite`（`~/Library/Application Support/<app>/callmesh/`，Windows/Linux 依 OS 路徑）；舊版 JSONL 會於載入時自動匯入。
-- 每個頻道預設保留最近 200 筆，若需清空可在離線狀態下透過 UI 執行「清除訊息紀錄」，或刪除 `callmesh-data.sqlite` 後重新啟動（舊版 JSONL 亦可刪除）。
+- Web Dashboard 與 Electron 均提供分頁功能：預設每頁 25 筆，可切換至 50 / 100 筆；支援跳至第一／最後一頁與前一頁／下一頁。頁碼與每頁筆數會記錄於瀏覽器 `localStorage` 或 Electron `localStorage`，針對每個頻道獨立保存。
+- 每個頻道預設保留最近 200 筆（後端裁切），若需清空可在離線狀態下透過 UI 執行「清除訊息紀錄」，或刪除 `callmesh-data.sqlite` 後重新啟動（舊版 JSONL 亦可刪除）。
 - 支援未讀標記：切換頻道後會清除該頻道的未讀狀態；訊息清空或檔案刪除後會自動重建。
 - 來源欄會優先顯示節點長名稱／短名稱；若僅存 Mesh ID，載入時會回查節點資料庫補齊暱稱（失敗時才退回 Mesh ID）。
 
