@@ -139,11 +139,10 @@
     telemetryNodeInput?.getAttribute('placeholder') || '輸入節點 Mesh ID 或搜尋關鍵字';
   const nodeRegistry = new Map();
   const MESH_ID_PATTERN = /^![0-9a-f]{8}$/i;
+  const IGNORED_MESH_PREFIX = '!abcd';
 
   function isIgnoredMeshId(meshId) {
-    const normalized = normalizeMeshId(meshId);
-    if (!normalized) return false;
-    return normalized.toLowerCase().startsWith('!abcd');
+    return false;
   }
   let nodeSnapshotLoaded = false;
   const TELEMETRY_TABLE_LIMIT = 200;
@@ -1354,7 +1353,9 @@
 
   function getSortedNodeRegistryEntries() {
     const entries = Array.from(nodeRegistry.values()).filter(
-      (entry) => !isIgnoredMeshId(entry.meshId) && !isIgnoredMeshId(entry.meshIdOriginal)
+      (entry) =>
+        !isIgnoredMeshId(entry.meshId) &&
+        !isIgnoredMeshId(entry.meshIdOriginal)
     );
     entries.sort((a, b) => {
       const tsA = getNodeLastSeenTimestamp(a) || 0;
@@ -1512,16 +1513,24 @@
     }
   }
 
-  function upsertNodeRegistry(entry) {
+  function upsertNodeRegistry(entry, options = {}) {
+    const allowCreate = options.allowCreate !== false;
     if (!entry || typeof entry !== 'object') return null;
     const candidate = entry.meshId || entry.meshIdNormalized || entry.meshIdOriginal;
     const normalized = normalizeMeshId(candidate);
     if (!normalized) return null;
-    if (isIgnoredMeshId(normalized) || isIgnoredMeshId(entry.meshIdOriginal)) {
+    if (
+      isIgnoredMeshId(normalized) ||
+      isIgnoredMeshId(entry.meshIdOriginal)
+    ) {
       nodeRegistry.delete(normalized);
       return null;
     }
-    const existing = nodeRegistry.get(normalized) || {};
+    const existing = nodeRegistry.get(normalized) || null;
+    if (!existing && !allowCreate) {
+      return null;
+    }
+    const base = existing || {};
     const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
     if (merged) {
       nodeRegistry.set(normalized, merged);
@@ -2355,7 +2364,7 @@ function ensureRelayGuessSuffix(label, summary) {
       record.node = sanitizeTelemetryNodeData(record.node);
     }
     if (mergedNode && mergedNode.meshIdNormalized) {
-      upsertNodeRegistry(mergedNode);
+      upsertNodeRegistry(mergedNode, { allowCreate: false });
     }
     record.meshId = record.meshId ?? key;
     record.rawMeshId = rawMeshId || record.rawMeshId || null;
@@ -3027,7 +3036,7 @@ function ensureRelayGuessSuffix(label, summary) {
         }
       }
       if (sanitizedNode && sanitizedNode.meshIdNormalized) {
-        upsertNodeRegistry(sanitizedNode);
+        upsertNodeRegistry(sanitizedNode, { allowCreate: false });
       }
 
       if (Array.isArray(bucket.records)) {
@@ -4263,7 +4272,7 @@ function ensureRelayGuessSuffix(label, summary) {
         Number.isFinite(bucket.totalRecords) && (!bucket.records || bucket.records.length < bucket.totalRecords);
       telemetryStore.set(meshKey, bucket);
       if (sanitizedNode && sanitizedNode.meshIdNormalized) {
-        upsertNodeRegistry(sanitizedNode);
+        upsertNodeRegistry(sanitizedNode, { allowCreate: false });
       }
       seenKeys.add(meshKey);
     }
@@ -4339,7 +4348,7 @@ function ensureRelayGuessSuffix(label, summary) {
       const sanitizedNode = sanitizeTelemetryNodeData(node.node);
       if (sanitizedNode) {
         bucket.node = mergeNodeMetadata(bucket.node, sanitizedNode);
-        upsertNodeRegistry(sanitizedNode);
+        upsertNodeRegistry(sanitizedNode, { allowCreate: false });
       }
       const clones = node.records.map((item) => cloneTelemetry(item));
       bucket.records = clones;
@@ -4679,7 +4688,7 @@ function ensureRelayGuessSuffix(label, summary) {
   function hydrateSummaryNode(node, fallbackMeshId = null) {
     const meshCandidate = node?.meshId ?? node?.meshIdNormalized ?? fallbackMeshId;
     const registryNode = getRegistryNode(meshCandidate);
-    const upserted = node ? upsertNodeRegistry(node) : null;
+    const upserted = node ? upsertNodeRegistry(node, { allowCreate: false }) : null;
     const merged = mergeNodeMetadata(node, upserted, registryNode);
     return merged || node || registryNode || null;
   }
