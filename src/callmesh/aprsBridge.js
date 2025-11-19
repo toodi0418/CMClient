@@ -468,6 +468,15 @@ class CallMeshAprsBridge extends EventEmitter {
   clearNodeDatabase() {
     const cleared = this.nodeDatabase.clear();
     this.telemetrySeededNodes.clear();
+    for (const client of this.meshtasticClients) {
+      if (client && typeof client.clearNodeCache === 'function') {
+        try {
+          client.clearNodeCache();
+        } catch (err) {
+          this.emitLog('MESHTASTIC', `clear node cache failed: ${err.message}`);
+        }
+      }
+    }
     this.scheduleNodeDatabasePersist();
     this.emitLog('NODE-DB', `cleared node database count=${cleared}`);
     this.resetTenmanNodeSyncSignatures();
@@ -651,7 +660,10 @@ class CallMeshAprsBridge extends EventEmitter {
     this.selfMeshId = normalizeMeshId(meshId);
   }
 
-  upsertNodeInfo(node, { timestamp, suppressEmit = false, source = null, suppressPersist = false } = {}) {
+  upsertNodeInfo(
+    node,
+    { timestamp, suppressEmit = false, source = null, suppressPersist = false, allowCreate = true } = {}
+  ) {
     if (!node || typeof node !== 'object') {
       return null;
     }
@@ -692,6 +704,12 @@ class CallMeshAprsBridge extends EventEmitter {
       altitude,
       lastSeenAt: Number.isFinite(timestamp) ? Number(timestamp) : Date.now()
     };
+    if (!allowCreate) {
+      const existing = this.nodeDatabase.get(normalized);
+      if (!existing) {
+        return null;
+      }
+    }
     const result = this.nodeDatabase.upsert(normalized, info);
     if (source !== 'telemetry-seed') {
       this.telemetrySeededNodes.delete(normalized);
@@ -2696,7 +2714,10 @@ class CallMeshAprsBridge extends EventEmitter {
           altitude: node.altitude ?? position.altitude ?? position.alt ?? null
         };
       }
-      const merged = this.upsertNodeInfo(sourceNode, { timestamp: timestampMs });
+      const merged = this.upsertNodeInfo(sourceNode, {
+        timestamp: timestampMs,
+        allowCreate: false
+      });
       if (merged) {
         const enriched = mergeNodeInfo(node, merged);
         if (enriched) {

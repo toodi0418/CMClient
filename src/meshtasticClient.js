@@ -1265,6 +1265,10 @@ class MeshtasticClient extends EventEmitter {
     }
   }
 
+  clearNodeCache() {
+    this.nodeMap.clear();
+  }
+
   _updateNodeCache(message) {
     switch (message.payloadVariant) {
       case 'nodeInfo': {
