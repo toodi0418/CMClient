@@ -4665,14 +4665,15 @@ function ensureRelayGuessSuffix(label, summary) {
 
   function normalizeMeshId(meshId) {
     if (meshId == null) return null;
-    let value = String(meshId).trim();
+    const value = String(meshId).trim();
     if (!value) return null;
     if (value.startsWith('!')) {
-      value = value.slice(1);
-    } else if (value.toLowerCase().startsWith('0x')) {
-      value = value.slice(2);
+      return value.toLowerCase();
     }
-    return value.toLowerCase();
+    if (value.startsWith('0x') || value.startsWith('0X')) {
+      return `!${value.slice(2).toLowerCase()}`;
+    }
+    return `!${value.toLowerCase()}`;
   }
 
   function hydrateSummaryNode(node, fallbackMeshId = null) {

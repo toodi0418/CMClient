@@ -1459,11 +1459,16 @@ function resumeAutoReconnect({ reason = '', resetFailures = true, silent = false
 }
 
 function normalizeMeshId(meshId) {
-  if (!meshId) return null;
-  if (meshId.startsWith('0x') || meshId.startsWith('0X')) {
-    return `!${meshId.slice(2)}`.toLowerCase();
+  if (meshId == null) return null;
+  const value = String(meshId).trim();
+  if (!value) return null;
+  if (value.startsWith('!')) {
+    return value.toLowerCase();
   }
-  return meshId.toLowerCase();
+  if (value.startsWith('0x') || value.startsWith('0X')) {
+    return `!${value.slice(2).toLowerCase()}`;
+  }
+  return `!${value.toLowerCase()}`;
 }
 
 function loadPreferences() {
