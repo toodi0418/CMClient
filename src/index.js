@@ -436,9 +436,8 @@ async function startMonitor(argv) {
       }
       try {
         const nodeSnapshot = bridge.getNodeSnapshot();
-        if (Array.isArray(nodeSnapshot) && nodeSnapshot.length) {
-          webServer.seedNodeSnapshot(nodeSnapshot);
-        }
+        const nodeSourceInfo = bridge.getNodeDatabaseSourceInfo();
+        webServer.seedNodeSnapshot(nodeSnapshot, nodeSourceInfo);
       } catch (err) {
         console.warn(`初始化 Web 節點快照失敗：${err.message}`);
       }

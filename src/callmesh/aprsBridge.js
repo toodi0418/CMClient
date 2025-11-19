@@ -220,6 +220,10 @@ class CallMeshAprsBridge extends EventEmitter {
     this.nodeDatabase = nodeDatabase;
     this.nodeDatabasePersistTimer = null;
     this.nodeDatabasePersistDelayMs = 250;
+    this.nodeDatabaseSourceInfo = {
+      source: 'unknown',
+      details: {}
+    };
 
     this.telemetryBuckets = new Map();
     this.telemetryStore = new Map();
@@ -434,12 +438,27 @@ class CallMeshAprsBridge extends EventEmitter {
     return this.nodeDatabase.list();
   }
 
+  getNodeDatabaseSourceInfo() {
+    const info = this.nodeDatabaseSourceInfo || {};
+    return {
+      source: info.source ?? 'unknown',
+      details: info.details ? { ...info.details } : {}
+    };
+  }
+
   clearNodeDatabase() {
     const cleared = this.nodeDatabase.clear();
     this.scheduleNodeDatabasePersist();
     this.emitLog('NODE-DB', `cleared node database count=${cleared}`);
     this.resetTenmanNodeSyncSignatures();
     this.requestTenmanNodeSnapshot('cleared');
+    this.nodeDatabaseSourceInfo = {
+      source: 'cleared',
+      details: {
+        at: Date.now(),
+        cleared
+      }
+    };
     return {
       cleared,
       nodes: this.nodeDatabase.list()
@@ -455,10 +474,18 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     let entries = null;
+    let source = 'empty';
+    const details = {};
     const store = this.getDataStore();
     if (store) {
       try {
         entries = store.listNodes();
+        if (Array.isArray(entries) && entries.length) {
+          source = 'sqlite';
+          details.sqlite = true;
+          details.path = this.callmeshDataStorePath;
+          details.count = entries.length;
+        }
       } catch (err) {
         console.warn('從 SQLite 載入節點資料庫失敗:', err);
       }
@@ -473,12 +500,21 @@ class CallMeshAprsBridge extends EventEmitter {
           : Array.isArray(payload)
             ? payload
             : [];
+        if (entries.length) {
+          source = 'legacy-json';
+          details.path = filePath;
+          details.count = entries.length;
+        }
         if (entries.length && store) {
           try {
             store.replaceNodes(entries);
             await fs.rm(this.getNodeDatabaseFilePath(), { force: true });
+            source = 'sqlite';
+            details.sqlite = true;
           } catch (err) {
             console.warn('節點資料庫遷移至 SQLite 失敗:', err);
+            source = 'legacy-json';
+            details.sqlite = false;
           }
         }
       } catch (err) {
@@ -491,6 +527,14 @@ class CallMeshAprsBridge extends EventEmitter {
     const restored = this.nodeDatabase.replace(entries || []);
     this.resetTenmanNodeSyncSignatures();
     this.requestTenmanNodeSnapshot('restore');
+    this.nodeDatabaseSourceInfo = {
+      source,
+      details: {
+        ...details,
+        restoredCount: restored.length,
+        restoredAt: Date.now()
+      }
+    };
     if (restored.length) {
       this.emitLog('NODE-DB', `restored ${restored.length} nodes from disk`);
     }
@@ -840,6 +884,13 @@ class CallMeshAprsBridge extends EventEmitter {
     this.scheduleNodeDatabasePersist();
     this.resetTenmanNodeSyncSignatures();
     this.requestTenmanNodeSnapshot('artifacts-cleared');
+    this.nodeDatabaseSourceInfo = {
+      source: 'cleared',
+      details: {
+        reason: 'clear-artifacts',
+        at: Date.now()
+      }
+    };
     await this.clearTelemetryStore({ silent: false });
     this.emitLog('CALLMESH', 'cleared local mapping/provision cache');
     this.updateAprsProvision(null);

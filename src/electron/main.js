@@ -800,7 +800,8 @@ async function ensureWebDashboardState() {
       }
       if (bridge) {
         const nodes = bridge.getNodeSnapshot();
-        webServer?.seedNodeSnapshot(nodes);
+        const nodeMeta = bridge.getNodeDatabaseSourceInfo();
+        webServer?.seedNodeSnapshot(nodes, nodeMeta);
       }
       webServer?.seedMessageSnapshot(getMessageSnapshot());
       await syncWebTelemetrySnapshot();
@@ -875,7 +876,8 @@ ipcMain.handle('nodes:clear', async () => {
     const result = bridge.clearNodeDatabase();
     const snapshot = Array.isArray(result?.nodes) ? result.nodes : [];
     mainWindow?.webContents.send('meshtastic:node-snapshot', snapshot);
-    webServer?.seedNodeSnapshot(snapshot);
+    const nodeMeta = bridge.getNodeDatabaseSourceInfo();
+    webServer?.seedNodeSnapshot(snapshot, nodeMeta);
     return {
       success: true,
       cleared: Number.isFinite(result?.cleared) ? result.cleared : 0,

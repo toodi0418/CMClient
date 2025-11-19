@@ -158,6 +158,10 @@ class WebDashboardServer {
     this.telemetryRecordOrder = [];
     this.telemetrySummary = new Map();
     this.telemetrySummaryUpdatedAt = null;
+    this.nodeSnapshotMeta = {
+      source: 'unknown',
+      details: {}
+    };
     this.lastTelemetrySummary = null;
     this.telemetryUpdatedAt = null;
     this.telemetryStats = {
@@ -471,6 +475,11 @@ class WebDashboardServer {
           relayLinkStats: stats,
           relayLinkSource: source || undefined,
           relayLinkDetails: details && Object.keys(details).length ? details : undefined,
+          nodeSnapshotSource: this.nodeSnapshotMeta?.source ?? undefined,
+          nodeSnapshotDetails:
+            this.nodeSnapshotMeta?.details && Object.keys(this.nodeSnapshotMeta.details).length
+              ? this.nodeSnapshotMeta.details
+              : undefined,
           message: message || undefined,
           generatedAt: new Date().toISOString()
         };
@@ -1496,8 +1505,14 @@ class WebDashboardServer {
     this._broadcast({ type: 'node', payload: merged });
   }
 
-  seedNodeSnapshot(list = []) {
+  seedNodeSnapshot(list = [], info = null) {
     this.nodeRegistry.clear();
+    if (info && typeof info === 'object') {
+      this.nodeSnapshotMeta = {
+        source: info.source ?? 'unknown',
+        details: info.details ? { ...info.details } : {}
+      };
+    }
     const snapshot = [];
     if (Array.isArray(list)) {
       for (const entry of list) {
