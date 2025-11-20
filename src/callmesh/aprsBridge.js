@@ -172,7 +172,8 @@ class CallMeshAprsBridge extends EventEmitter {
       aprsServer = DEFAULT_APRS_SERVER,
       aprsPort = DEFAULT_APRS_PORT,
       fetchImpl = globalThis.fetch,
-      telemetryMaxEntriesPerNode = 500
+      telemetryMaxEntriesPerNode = 500,
+      allowRadioNodeMetadata
     } = options;
 
     if (!storageDir) {
@@ -226,6 +227,12 @@ class CallMeshAprsBridge extends EventEmitter {
       details: {}
     };
     this.tenmanIgnoreInboundNodes = true;
+    const radioMetadataEnv = String(process.env.TMAG_ALLOW_RADIO_NODE_METADATA || '')
+      .trim()
+      .toLowerCase();
+    const envRadioMetadata = ['1', 'true', 'yes', 'on'].includes(radioMetadataEnv);
+    this.allowRadioNodeMetadata =
+      typeof allowRadioNodeMetadata === 'boolean' ? allowRadioNodeMetadata : envRadioMetadata;
 
     this.telemetryBuckets = new Map();
     this.telemetryStore = new Map();
@@ -468,6 +475,7 @@ class CallMeshAprsBridge extends EventEmitter {
   clearNodeDatabase() {
     const cleared = this.nodeDatabase.clear();
     this.telemetrySeededNodes.clear();
+    let relayCleared = 0;
     for (const client of this.meshtasticClients) {
       if (client && typeof client.clearNodeCache === 'function') {
         try {
@@ -476,20 +484,32 @@ class CallMeshAprsBridge extends EventEmitter {
           this.emitLog('MESHTASTIC', `clear node cache failed: ${err.message}`);
         }
       }
+      if (client && typeof client.clearRelayLinkStats === 'function') {
+        try {
+          const result = client.clearRelayLinkStats();
+          if (result && Number.isFinite(result.cleared)) {
+            relayCleared += result.cleared;
+          }
+        } catch (err) {
+          this.emitLog('MESHTASTIC', `clear relay link-state failed: ${err.message}`);
+        }
+      }
     }
     this.scheduleNodeDatabasePersist();
-    this.emitLog('NODE-DB', `cleared node database count=${cleared}`);
+    this.emitLog('NODE-DB', `cleared node database count=${cleared}, relay-link-state=${relayCleared}`);
     this.resetTenmanNodeSyncSignatures();
     this.requestTenmanNodeSnapshot('cleared');
     this.nodeDatabaseSourceInfo = {
       source: 'cleared',
       details: {
         at: Date.now(),
-        cleared
+        cleared,
+        relayLinkCleared: relayCleared
       }
     };
     return {
       cleared,
+      relayLinkCleared: relayCleared,
       nodes: this.getNodeSnapshot()
     };
   }
@@ -555,16 +575,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     const restored = this.nodeDatabase.replace(entries || []);
     this.telemetrySeededNodes.clear();
-    let telemetrySeed = { seeded: 0, total: 0 };
-    if (Array.isArray(entries) && entries.length) {
-      telemetrySeed = this.seedNodesFromTelemetrySnapshot({ limitPerNode: 1 });
-      if (telemetrySeed.seeded) {
-        this.emitLog(
-          'NODE-DB',
-          `seeded ${telemetrySeed.seeded}/${telemetrySeed.total} nodes from telemetry snapshot`
-        );
-      }
-    }
+    const telemetrySeed = { seeded: 0, total: 0 };
     this.resetTenmanNodeSyncSignatures();
     this.requestTenmanNodeSnapshot('restore');
     this.nodeDatabaseSourceInfo = {
@@ -662,7 +673,14 @@ class CallMeshAprsBridge extends EventEmitter {
 
   upsertNodeInfo(
     node,
-    { timestamp, suppressEmit = false, source = null, suppressPersist = false, allowCreate = true } = {}
+    {
+      timestamp,
+      suppressEmit = false,
+      source = null,
+      suppressPersist = false,
+      allowCreate = true,
+      allowMetadata = false
+    } = {}
   ) {
     if (!node || typeof node !== 'object') {
       return null;
@@ -673,6 +691,7 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!normalized) {
       return null;
     }
+    const existing = this.nodeDatabase.get(normalized);
     const parseNumber = (value) => {
       const num = Number(value);
       return Number.isFinite(num) ? num : null;
@@ -691,24 +710,36 @@ class CallMeshAprsBridge extends EventEmitter {
     const roleRaw = node.role ?? null;
     const hwModelInfo = resolveHardwareModel(hwModelRaw);
     const roleInfo = resolveDeviceRole(roleRaw);
+    const selectMetadata = (incoming, existingValue) => {
+      if (allowMetadata) {
+        return incoming ?? existingValue ?? null;
+      }
+      if (existingValue == null) {
+        return incoming ?? null;
+      }
+      return existingValue ?? null;
+    };
+    const shortNameCandidate = node.shortName ?? node.short_name ?? null;
+    const longNameCandidate = node.longName ?? node.long_name ?? null;
+    const hwModelCandidate = hwModelInfo.code ?? (hwModelRaw != null ? String(hwModelRaw) : null);
+    const hwModelLabelCandidate = hwModelInfo.label ?? null;
+    const roleCandidate = roleInfo.code ?? (roleRaw != null ? String(roleRaw) : null);
+    const roleLabelCandidate = roleInfo.label ?? null;
     const info = {
       meshIdOriginal: meshIdCandidate ?? null,
-      shortName: node.shortName ?? node.short_name ?? null,
-      longName: node.longName ?? node.long_name ?? null,
-      hwModel: hwModelInfo.code ?? (hwModelRaw != null ? String(hwModelRaw) : null),
-      hwModelLabel: hwModelInfo.label ?? null,
-      role: roleInfo.code ?? (roleRaw != null ? String(roleRaw) : null),
-      roleLabel: roleInfo.label ?? null,
+      shortName: selectMetadata(shortNameCandidate, existing?.shortName ?? null),
+      longName: selectMetadata(longNameCandidate, existing?.longName ?? null),
+      hwModel: selectMetadata(hwModelCandidate, existing?.hwModel ?? null),
+      hwModelLabel: selectMetadata(hwModelLabelCandidate, existing?.hwModelLabel ?? null),
+      role: selectMetadata(roleCandidate, existing?.role ?? null),
+      roleLabel: selectMetadata(roleLabelCandidate, existing?.roleLabel ?? null),
       latitude,
       longitude,
       altitude,
       lastSeenAt: Number.isFinite(timestamp) ? Number(timestamp) : Date.now()
     };
-    if (!allowCreate) {
-      const existing = this.nodeDatabase.get(normalized);
-      if (!existing) {
-        return null;
-      }
+    if (!allowCreate && !existing) {
+      return null;
     }
     const result = this.nodeDatabase.upsert(normalized, info);
     if (source !== 'telemetry-seed') {
@@ -801,7 +832,8 @@ class CallMeshAprsBridge extends EventEmitter {
           timestamp: Number.isFinite(nodeInfo.lastSeenAt) ? nodeInfo.lastSeenAt : Date.now(),
           suppressEmit: true,
           source: 'telemetry-seed',
-          suppressPersist: true
+          suppressPersist: true,
+          allowMetadata: false
         });
         if (merged) {
           seeded += 1;
@@ -2660,7 +2692,10 @@ class CallMeshAprsBridge extends EventEmitter {
       this.selfMeshId = meshCandidate;
     }
     if (info?.node) {
-      const merged = this.upsertNodeInfo(info.node, { timestamp: Date.now() });
+      const merged = this.upsertNodeInfo(info.node, {
+        timestamp: Date.now(),
+        allowMetadata: true
+      });
       if (merged) {
         info.node = mergeNodeInfo(info.node, merged) || info.node;
       }
@@ -2714,10 +2749,41 @@ class CallMeshAprsBridge extends EventEmitter {
           altitude: node.altitude ?? position.altitude ?? position.alt ?? null
         };
       }
-      const merged = this.upsertNodeInfo(sourceNode, {
-        timestamp: timestampMs,
-        allowCreate: false
-      });
+    const summaryType = typeof summary?.type === 'string' ? summary.type.trim().toLowerCase() : '';
+    const allowMetadataFromSummary = summaryType === 'nodeinfo';
+    const normalizedMeshId =
+      normalizeMeshId(
+        sourceNode.meshId ??
+          sourceNode.meshIdNormalized ??
+          sourceNode.meshIdOriginal ??
+          sourceNode.mesh_id ??
+          sourceNode.mesh_id_normalized ??
+          sourceNode.mesh_id_original ??
+          sourceNode.id ??
+          null
+      ) || null;
+    const allowCreateFromSummary = Boolean(normalizedMeshId);
+    if (normalizedMeshId && !sourceNode.meshId && !sourceNode.meshIdNormalized) {
+      sourceNode.meshId = normalizedMeshId;
+      sourceNode.meshIdNormalized = normalizedMeshId;
+    }
+    const nodeForUpsert = allowMetadataFromSummary
+      ? sourceNode
+      : {
+          ...sourceNode,
+          shortName: null,
+          longName: null,
+          hwModel: null,
+          hwModelLabel: null,
+          role: null,
+          roleLabel: null,
+          label: null
+        };
+    const merged = this.upsertNodeInfo(nodeForUpsert, {
+      timestamp: timestampMs,
+      allowCreate: allowCreateFromSummary,
+      allowMetadata: allowMetadataFromSummary || this.allowRadioNodeMetadata
+    });
       if (merged) {
         const enriched = mergeNodeInfo(node, merged);
         if (enriched) {

@@ -178,6 +178,55 @@ const channelNoteLabel = document.getElementById('channel-note');
 const channelNavButtons = new Map();
 let selectedChannelId = CHANNEL_CONFIG[0]?.id ?? 0;
 
+const TELEMETRY_TABLE_LIMIT = 200;
+const TELEMETRY_CHART_LIMIT = 200;
+const TELEMETRY_MAX_LOCAL_RECORDS = Number.POSITIVE_INFINITY;
+const TELEMETRY_PAGE_SIZES = [25, 50, 100, 200];
+const TELEMETRY_PAGE_SIZE_KEY = 'tmag:electron:telemetry:page-size';
+let telemetryTablePageSize = 50;
+let telemetryTablePage = 1;
+let telemetryTableFilteredCount = 0;
+let telemetryMaxTotalRecords = 20000;
+const TELEMETRY_METRIC_DEFINITIONS = {
+  batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
+  voltage: { label: '電壓', unit: 'V', decimals: 2, chart: true },
+  channelUtilization: { label: '通道使用率', unit: '%', decimals: 1, clamp: [0, 100], chart: true },
+  airUtilTx: { label: '空中時間 (TX)', unit: '%', decimals: 1, clamp: [0, 100], chart: true },
+  temperature: { label: '溫度', unit: '°C', decimals: 1, chart: true },
+  relativeHumidity: { label: '濕度', unit: '%', decimals: 0, clamp: [0, 100], chart: true },
+  barometricPressure: { label: '氣壓', unit: 'hPa', decimals: 1, chart: true },
+  uptimeSeconds: {
+    label: '運行時間',
+    chart: false,
+    formatter: (value) => formatSecondsAsDuration(value)
+  }
+};
+
+const telemetryStore = new Map();
+const telemetryRecordIds = new Set();
+const telemetryRecordOrder = [];
+let telemetrySelectedMeshId = null;
+let telemetryUpdatedAt = null;
+let telemetryRangeMode = 'day';
+let telemetryCustomRange = {
+  startMs: null,
+  endMs: null
+};
+let telemetryChartMode = 'all';
+let telemetryChartMetric = null;
+const telemetryCharts = new Map();
+const telemetryNodeLookup = new Map();
+const telemetryNodeDisplayByMesh = new Map();
+let telemetryNodeOptions = [];
+let telemetryDropdownVisible = false;
+let telemetryDropdownInteracting = false;
+let telemetryLoading = false;
+let telemetryLoadingMeshId = null;
+let telemetryFetchToken = 0;
+let telemetrySummaryUpdatedAt = null;
+const nodeRegistry = new Map();
+let nodeSnapshotLoaded = false;
+
 initializeChannelMessages();
 loadPersistedMessages();
 
@@ -382,60 +431,6 @@ let flowCaptureEnabledAt = 0;
 let totalAprsUploaded = 0;
 const aprsCompletedFlowIds = new Set();
 const aprsCompletedQueue = [];
-const TELEMETRY_TABLE_LIMIT = 200;
-const TELEMETRY_CHART_LIMIT = 200;
-const TELEMETRY_MAX_LOCAL_RECORDS = Number.POSITIVE_INFINITY;
-const TELEMETRY_PAGE_SIZES = [25, 50, 100, 200];
-const TELEMETRY_PAGE_SIZE_KEY = 'tmag:electron:telemetry:page-size';
-let telemetryTablePageSize = 50;
-let telemetryTablePage = 1;
-let telemetryTableFilteredCount = 0;
-let telemetryMaxTotalRecords = 20000;
-const TELEMETRY_METRIC_DEFINITIONS = {
-  batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
-  voltage: { label: '電壓', unit: 'V', decimals: 2, chart: true },
-  channelUtilization: { label: '通道使用率', unit: '%', decimals: 1, clamp: [0, 100], chart: true },
-  airUtilTx: { label: '空中時間 (TX)', unit: '%', decimals: 1, clamp: [0, 100], chart: true },
-  temperature: { label: '溫度', unit: '°C', decimals: 1, chart: true },
-  relativeHumidity: { label: '濕度', unit: '%', decimals: 0, clamp: [0, 100], chart: true },
-  barometricPressure: { label: '氣壓', unit: 'hPa', decimals: 1, chart: true },
-  uptimeSeconds: {
-    label: '運行時間',
-    chart: false,
-    formatter: (value) => formatSecondsAsDuration(value)
-  }
-};
-
-const telemetryStore = new Map();
-const telemetryRecordIds = new Set();
-const telemetryRecordOrder = [];
-let telemetrySelectedMeshId = null;
-let telemetryUpdatedAt = null;
-let telemetryRangeMode = 'day';
-let telemetryCustomRange = {
-  startMs: null,
-  endMs: null
-};
-let telemetryChartMode = 'all';
-let telemetryChartMetric = null;
-const telemetryCharts = new Map();
-const telemetryNodeLookup = new Map();
-const telemetryNodeDisplayByMesh = new Map();
-let telemetryNodeOptions = [];
-let telemetryDropdownVisible = false;
-let telemetryDropdownInteracting = false;
-let telemetryLoading = false;
-let telemetryLoadingMeshId = null;
-let telemetryFetchToken = 0;
-let telemetrySummaryUpdatedAt = null;
-const nodeRegistry = new Map();
-
-function isIgnoredMeshId(meshId) {
-  const normalized = normalizeMeshId(meshId);
-  if (!normalized) return false;
-  return normalized.toLowerCase().startsWith('!abcd');
-}
-let nodeSnapshotLoaded = false;
 
 const AUTO_CONNECT_MAX_ATTEMPTS = 3;
 const AUTO_CONNECT_DELAY_MS = 5000;
@@ -1468,6 +1463,12 @@ function normalizeMeshId(meshId) {
     value = value.slice(2);
   }
   return value.toLowerCase();
+}
+
+function isIgnoredMeshId(meshId) {
+  const normalized = normalizeMeshId(meshId);
+  if (!normalized) return false;
+  return normalized.toLowerCase().startsWith('!abcd');
 }
 
 function loadPreferences() {
@@ -2977,21 +2978,8 @@ function hydrateSummaryNodes(summary) {
   return summary;
 }
 
-function appendSummaryRow(summary) {
-  if (!summary) return;
-  hydrateSummaryNodes(summary);
-  registerPacketActivity(summary);
-  maybeUpdateSelfNodeFromSummary(summary);
-  const nodesLabel = formatNodes(summary);
-  const detailSnippet = summary.detail ? ` detail=${summary.detail}` : '';
-  appendLog('SUMMARY', `${summary.timestampLabel || ''} ${nodesLabel} ${summary.type || ''}${detailSnippet}`.trim());
-  const fragment = rowTemplate.content.cloneNode(true);
-  const row = fragment.querySelector('tr');
-
-  row.querySelector('.time').textContent = summary.timestampLabel ?? '';
-  row.querySelector('.nodes').textContent = nodesLabel;
-  const relayCell = row.querySelector('.relay');
-  const hopInfo = extractHopInfo(summary);
+function renderRelayCell(relayCell, summary) {
+  if (!relayCell || !summary) return;
   const relayLabel = computeRelayLabel(summary);
   let relayGuessed = isRelayGuessed(summary);
   if (relayLabel === '直收' || relayLabel === 'Self') {
@@ -3000,8 +2988,7 @@ function appendSummaryRow(summary) {
   const relayGuessReason = relayGuessed ? summary.relayGuessReason || RELAY_GUESS_EXPLANATION : '';
   relayCell.innerHTML = '';
   const relayLabelSpan = document.createElement('span');
-  const relayDisplay = relayLabel || (relayGuessed ? '未知' : '—');
-  relayLabelSpan.textContent = relayDisplay;
+  relayLabelSpan.textContent = relayLabel || (relayGuessed ? '未知' : '—');
   relayCell.appendChild(relayLabelSpan);
 
   const relayMeshId =
@@ -3029,9 +3016,9 @@ function appendSummaryRow(summary) {
   }
 
   if (relayGuessed) {
-    const reason = relayGuessReason || RELAY_GUESS_EXPLANATION;
     relayCell.classList.add('relay-guess');
     relayCell.dataset.relayGuess = 'true';
+    const reason = relayGuessReason || RELAY_GUESS_EXPLANATION;
     const hintButton = document.createElement('button');
     hintButton.type = 'button';
     hintButton.className = 'relay-hint-btn';
@@ -3057,6 +3044,24 @@ function appendSummaryRow(summary) {
   } else {
     relayCell.removeAttribute('title');
   }
+}
+
+function appendSummaryRow(summary) {
+  if (!summary) return;
+  hydrateSummaryNodes(summary);
+  registerPacketActivity(summary);
+  maybeUpdateSelfNodeFromSummary(summary);
+  const nodesLabel = formatNodes(summary);
+  const detailSnippet = summary.detail ? ` detail=${summary.detail}` : '';
+  appendLog('SUMMARY', `${summary.timestampLabel || ''} ${nodesLabel} ${summary.type || ''}${detailSnippet}`.trim());
+  const fragment = rowTemplate.content.cloneNode(true);
+  const row = fragment.querySelector('tr');
+
+  row.__summary = summary;
+  row.querySelector('.time').textContent = summary.timestampLabel ?? '';
+  row.querySelector('.nodes').textContent = nodesLabel;
+  renderRelayCell(row.querySelector('.relay'), summary);
+  const hopInfo = extractHopInfo(summary);
   row.querySelector('.channel').textContent = summary.channel ?? '';
   row.querySelector('.snr').textContent = formatNumber(summary.snr, 2);
   row.querySelector('.rssi').textContent = formatNumber(summary.rssi, 0);
@@ -4951,6 +4956,42 @@ function handleNodeEvent(payload) {
   refreshFlowEntryLabels();
   renderFlowEntries();
   renderChannelMessages(selectedChannelId);
+}
+
+function refreshSummarySelfLabels() {
+  if (!tableBody) return;
+  const rows = Array.from(tableBody.querySelectorAll('tr'));
+  for (const row of rows) {
+    const summary = row?.__summary;
+    if (!summary) continue;
+    if (!summary.selfMeshId && selfNodeState.meshId) {
+      summary.selfMeshId = selfNodeState.meshId;
+    }
+    hydrateSummaryNodes(summary);
+    const nodesCell = row.querySelector('.nodes');
+    if (nodesCell) {
+      nodesCell.textContent = formatNodes(summary);
+    }
+    renderRelayCell(row.querySelector('.relay'), summary);
+    const channelCell = row.querySelector('.channel');
+    if (channelCell) {
+      channelCell.textContent = summary.channel ?? '';
+    }
+    const hopInfo = extractHopInfo(summary);
+    const hopsCell = row.querySelector('.hops');
+    if (hopsCell) {
+      hopsCell.textContent = hopInfo.limitOnly ? '無效' : hopInfo.hopsLabel || summary.hops?.label || '';
+    }
+    const detailMain = row.querySelector('.detail-main');
+    if (detailMain) {
+      detailMain.textContent = summary.detail || '';
+    }
+    const detailExtra = row.querySelector('.detail-extra');
+    if (detailExtra) {
+      const extras = Array.isArray(summary.extraLines) ? summary.extraLines.filter(Boolean) : [];
+      detailExtra.textContent = extras.join('\n');
+    }
+  }
 }
 
 function updateTelemetryNodesWithRegistry(normalizedMeshId, registryInfo) {

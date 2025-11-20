@@ -6,7 +6,15 @@ const fs = require('fs');
 const { URL } = require('url');
 const fsPromises = fs.promises;
 
-const DEFAULT_PORT = Number(process.env.TMAG_WEB_PORT) || 7080;
+const MAX_PORT_NUMBER = 65_535;
+const MAX_PORT_FALLBACK_ATTEMPTS = 50;
+const DEFAULT_PORT_FALLBACK_ATTEMPTS = 15;
+const RAW_ENV_PORT =
+  typeof process.env.TMAG_WEB_PORT === 'string'
+    ? process.env.TMAG_WEB_PORT.trim()
+    : process.env.TMAG_WEB_PORT;
+const ENV_PORT_DEFINED = Boolean(RAW_ENV_PORT);
+const DEFAULT_PORT = normalizePortNumber(RAW_ENV_PORT, 7080);
 const DEFAULT_HOST = process.env.TMAG_WEB_HOST || '0.0.0.0';
 const PACKET_WINDOW_MS = 10 * 60 * 1000;
 const PACKET_BUCKET_MS = 60 * 1000;
@@ -104,10 +112,36 @@ const FALLBACK_VERSION = (() => {
   return '0.0.0';
 })();
 
+function normalizePortNumber(rawValue, fallback) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return fallback;
+  }
+  const numeric = Number(rawValue);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  const port = Math.floor(numeric);
+  if (port < 1 || port > MAX_PORT_NUMBER) {
+    return fallback;
+  }
+  return port;
+}
+
 class WebDashboardServer {
   constructor(options = {}) {
-    this.port = options.port ?? DEFAULT_PORT;
+    const preferredPort = normalizePortNumber(options.port, DEFAULT_PORT);
+    this.port = preferredPort;
+    this.preferredPort = preferredPort;
     this.host = options.host ?? DEFAULT_HOST;
+    const fallbackAttempts =
+      Number.isFinite(options.portFallbackAttempts) && options.portFallbackAttempts > 0
+        ? Math.min(Math.floor(options.portFallbackAttempts), MAX_PORT_FALLBACK_ATTEMPTS)
+        : DEFAULT_PORT_FALLBACK_ATTEMPTS;
+    this.portFallbackAttempts = fallbackAttempts;
+    this.autoPortFallback =
+      typeof options.autoPortFallback === 'boolean'
+        ? options.autoPortFallback
+        : !ENV_PORT_DEFINED;
     this.inactivityPingMs = options.inactivityPingMs ?? 15_000;
     this.appVersion = typeof options.appVersion === 'string' && options.appVersion.trim()
       ? options.appVersion.trim()
@@ -188,56 +222,135 @@ class WebDashboardServer {
 
     await this._loadMessageLog();
 
-    this.server = http.createServer((req, res) => {
-      const parsedUrl = (() => {
-        try {
-          return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-        } catch {
-          return { pathname: req.url };
-        }
-      })();
-      const pathname = parsedUrl.pathname || req.url;
-      if (pathname === '/api/events') {
-        this._handleEventStream(req, res);
-        return;
-      }
-      if (pathname === '/api/telemetry/export.csv') {
-        this._handleTelemetryExportRequest(req, res);
-        return;
-      }
-      if (pathname === '/api/telemetry') {
-        this._handleTelemetryRequest(req, res);
-        return;
-      }
-      if (pathname === '/debug') {
-        this._handleDebugRequest(req, res);
-        return;
-      }
-      this._serveStatic(req, res);
-    });
+    const preferredPort = this._resolvePreferredPort();
+    const candidatePorts = this._buildPortCandidates(preferredPort);
+    let lastError = null;
 
-    await new Promise((resolve, reject) => {
-      const cleanup = (err) => {
-        this.server?.off('listening', onListening);
-        this.server?.off('error', onError);
-        if (err) {
-          reject(err);
-        } else {
-          resolve();
+    for (const portCandidate of candidatePorts) {
+      try {
+        const server = await this._listenOnPort(portCandidate);
+        this.server = server;
+        this.port = portCandidate;
+        this._startPing();
+        if (portCandidate !== preferredPort) {
+          console.warn(
+            `[WEB] Dashboard 連接埠 ${preferredPort} 已被佔用，改為 ${portCandidate}`
+          );
         }
+        // eslint-disable-next-line no-console
+        console.log(`[WEB] Dashboard listening at http://${this.host}:${this.port}`);
+        return;
+      } catch (err) {
+        lastError = err;
+        if (err && err.code === 'EADDRINUSE' && this.autoPortFallback) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+    throw new Error('無法啟動 Web Dashboard：沒有可用的連接埠');
+  }
+
+  _createHttpServer() {
+    return http.createServer((req, res) => {
+      this._handleHttpRequest(req, res);
+    });
+  }
+
+  _handleHttpRequest(req, res) {
+    const parsedUrl = (() => {
+      try {
+        return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+      } catch {
+        return { pathname: req.url };
+      }
+    })();
+    const pathname = parsedUrl.pathname || req.url;
+    if (pathname === '/api/events') {
+      this._handleEventStream(req, res);
+      return;
+    }
+    if (pathname === '/api/telemetry/export.csv') {
+      this._handleTelemetryExportRequest(req, res);
+      return;
+    }
+    if (pathname === '/api/telemetry') {
+      this._handleTelemetryRequest(req, res);
+      return;
+    }
+    if (pathname === '/debug') {
+      this._handleDebugRequest(req, res);
+      return;
+    }
+    this._serveStatic(req, res);
+  }
+
+  async _listenOnPort(port) {
+    const server = this._createHttpServer();
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        server.off('listening', onListening);
+        server.off('error', onError);
       };
 
-      const onListening = () => cleanup();
-      const onError = (err) => cleanup(err);
+      const onListening = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (err) => {
+        cleanup();
+        try {
+          server.close();
+        } catch {
+          // ignore
+        }
+        reject(err);
+      };
 
-      this.server.once('listening', onListening);
-      this.server.once('error', onError);
-      this.server.listen(this.port, this.host);
+      server.once('listening', onListening);
+      server.once('error', onError);
+      server.listen(port, this.host);
     });
+    return server;
+  }
 
-    this._startPing();
-    // eslint-disable-next-line no-console
-    console.log(`[WEB] Dashboard listening at http://${this.host}:${this.port}`);
+  _buildPortCandidates(preferredPort) {
+    const seen = new Set();
+    const candidates = [];
+    const addCandidate = (value) => {
+      const portNumber = normalizePortNumber(value, null);
+      if (!portNumber || seen.has(portNumber)) {
+        return;
+      }
+      seen.add(portNumber);
+      candidates.push(portNumber);
+    };
+
+    addCandidate(preferredPort);
+    if (this.autoPortFallback) {
+      for (let i = 1; i <= this.portFallbackAttempts; i += 1) {
+        const candidate = preferredPort + i;
+        if (candidate > MAX_PORT_NUMBER) {
+          break;
+        }
+        addCandidate(candidate);
+      }
+    }
+    return candidates;
+  }
+
+  _resolvePreferredPort() {
+    if (Number.isFinite(this.preferredPort) && this.preferredPort > 0) {
+      return this.preferredPort;
+    }
+    if (Number.isFinite(this.port) && this.port > 0) {
+      return this.port;
+    }
+    return DEFAULT_PORT;
   }
 
   async stop() {

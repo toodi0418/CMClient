@@ -647,6 +647,21 @@ tbody tr:hover {
   color: #f87171;
 }
 
+.type {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.type-icon {
+  font-size: 1.1rem;
+  filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.25));
+}
+
+.detail-main {
+  font-weight: 500;
+}
+
 .info-cell {
   white-space: normal;
   overflow: hidden;
@@ -662,10 +677,16 @@ tbody tr:hover {
 }
 
 .info-cell .detail-extra {
-  display: block;
+  display: flex;
+  flex-direction: column;
   margin-top: 4px;
   color: #cbd5f5;
   font-size: 0.8rem;
+  gap: 4px;
+}
+
+.info-cell .detail-extra span {
+  display: block;
 }
 
 .info-cell .aprs-badge {

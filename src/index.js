@@ -12,6 +12,7 @@ const { CallMeshClient, buildAgentString } = require('./callmesh/client');
 const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge');
 const { WebDashboardServer } = require('./web/server');
 const { CallMeshDataStore } = require('./storage/callmeshDataStore');
+const { sanitizeSummaryForDisplay } = require('./utils/summaryDisplay');
 const pkg = require('../package.json');
 
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
@@ -707,8 +708,9 @@ async function startMonitor(argv) {
     if (!synthetic) {
       bridge.handleMeshtasticSummary(summary);
     }
-    webServer?.publishSummary(summary);
-    tryPublishWebMessage(webServer, summary);
+    const displaySummary = sanitizeSummaryForDisplay(summary) || summary;
+    webServer?.publishSummary(displaySummary);
+    tryPublishWebMessage(webServer, displaySummary);
 
     if (argv.format !== 'summary') {
       return;
@@ -720,25 +722,25 @@ async function startMonitor(argv) {
       headerPrinted = true;
     }
 
-    const nodesLabel = formatNodes(summary);
-    const relayLabel = computeRelayLabel(summary, { selfMeshId });
+    const nodesLabel = formatNodes(displaySummary);
+    const relayLabel = computeRelayLabel(displaySummary, { selfMeshId });
     const relayCol = padEnd(relayLabel, 12);
-    const channelCol = padValue(summary.channel ?? '', 2);
-    const snrCol = formatSignal(summary.snr, 2, 6, summary, { selfMeshId });
-    const rssiCol = formatSignal(summary.rssi, 0, 5, summary, { selfMeshId });
-    const typeCol = String(summary.type || '').padEnd(12);
-    const hopsCol = (summary.hops?.label || '').padEnd(7);
-    const detail = summary.detail || '';
+    const channelCol = padValue(displaySummary.channel ?? '', 2);
+    const snrCol = formatSignal(displaySummary.snr, 2, 6, displaySummary, { selfMeshId });
+    const rssiCol = formatSignal(displaySummary.rssi, 0, 5, displaySummary, { selfMeshId });
+    const typeCol = String(displaySummary.type || '').padEnd(12);
+    const hopsCol = (displaySummary.hops?.label || '').padEnd(7);
+    const detail = displaySummary.detail || '';
 
-    const line = `${(summary.timestampLabel ?? '').padEnd(19)} | ${nodesLabel.padEnd(27)} | ${relayCol} | ${channelCol} | ${snrCol} | ${rssiCol} | ${typeCol} | ${hopsCol} | ${detail}`;
+    const line = `${(displaySummary.timestampLabel ?? '').padEnd(19)} | ${nodesLabel.padEnd(27)} | ${relayCol} | ${channelCol} | ${snrCol} | ${rssiCol} | ${typeCol} | ${hopsCol} | ${detail}`;
     console.log(line.trimEnd());
 
-    if (argv['show-raw'] && summary.rawHex) {
-      console.log(`  raw: ${summary.rawHex}`);
+    if (argv['show-raw'] && displaySummary.rawHex) {
+      console.log(`  raw: ${displaySummary.rawHex}`);
     }
 
-    if (Array.isArray(summary.extraLines)) {
-      for (const extra of summary.extraLines) {
+    if (Array.isArray(displaySummary.extraLines)) {
+      for (const extra of displaySummary.extraLines) {
         console.log(`  ${extra}`);
       }
     }
@@ -1201,11 +1203,14 @@ function buildNodeDataDirectories() {
   const home = os.homedir();
   if (process.platform === 'darwin') {
     dirs.add(path.join(home, 'Library', 'Application Support', 'TMAG Monitor', 'callmesh'));
+    dirs.add(path.join(home, 'Library', 'Application Support', 'Electron', 'callmesh'));
   } else if (process.platform === 'win32') {
     const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
     dirs.add(path.join(appData, 'TMAG Monitor', 'callmesh'));
+    dirs.add(path.join(appData, 'Electron', 'callmesh'));
   } else {
     dirs.add(path.join(home, '.config', 'TMAG Monitor', 'callmesh'));
+    dirs.add(path.join(home, '.config', 'Electron', 'callmesh'));
   }
   return Array.from(dirs);
 }

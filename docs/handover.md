@@ -11,7 +11,7 @@
 - **遙測圖表**：Chart.js Tooltip 會依實際最小差距動態套用小數位數，避免相同值因四捨五入看似變化；Y 軸／最新值同步採用此精度。
 - **Web Telemetry 初始同步**：Electron 啟動以及 API Key 驗證流程完成後，都會將最新遙測快照播送給 Web Server，確保頁面立即有資料。
 - **SSE 管線**：Electron 端每當遙測 `append/reset` 出現時，會同時廣播給 Renderer 與 Web Server，兩側資料來源一致。
-- **節點資料庫**：新增 `src/nodeDatabase.js`，集中維護 Mesh 節點的長名稱、模型、角色與最後出現時間；CLI、Electron、Web 均透過 Bridge 發佈 `node` / `node-snapshot` 事件使用同一份資料。
+- **節點資料庫**：新增 `src/nodeDatabase.js`，集中維護 Mesh 節點的長名稱、模型、角色與最後出現時間；CLI、Electron、Web 均透過 Bridge 發佈 `node` / `node-snapshot` 事件使用同一份資料。2025-11-20 起，只要收到含合法 Mesh ID 的封包（NodeInfo / MyInfo / 其他 summary）即可立即建立節點，之後再由 NodeInfo 慢慢補齊名稱與型號，避免清庫後畫面長時間只有 Mesh ID。
 - **節點清單座標顯示**：Electron / Web 節點頁新增「座標」欄，會顯示緯度、經度與高度（若可用），並支援以座標字串搜尋；同時過濾 `!abcd` 前綴暫存 ID。
 - **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.sqlite` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
 - **遙測 CSV 下載**：Electron 與 Web 遙測頁新增「下載 CSV」按鈕，依目前節點與範圍匯出遙測資料。
@@ -215,9 +215,16 @@ CMClient/
 ### 3.3 節點資料庫 (`src/nodeDatabase.js`)
 - 採用 `Map` 快取 Mesh 節點資訊，索引鍵為正規化後的 `meshId`（`!xxxxxxxx`）。
 - 儲存欄位：`shortName`、`longName`、`hwModel`、`role`、原始 Mesh ID、最後出現時間；同時生成 `label` 供 UI 直接顯示。
-- `CallMeshAprsBridge` 為唯一寫入入口，會在收到 `nodeInfo`、`myInfo` 或 `summary` 時更新節點並廣播 `node` 事件。
+- `CallMeshAprsBridge` 為唯一寫入入口；只要來源資料帶有合法 Mesh ID，summary 也會立即建立節點，並且 **只有 NodeInfo / MyInfo** 可以更新名稱、型號與角色（無論是否開啟 `TMAG_ALLOW_RADIO_NODE_METADATA`），其餘封包僅提供 Mesh ID 與 lastSeen。若 summary 被判定為「最後轉發：無效 / limit only」或 relay 尾碼無法在本地 `relay_stats` 內找到對應樣本，會直接忽略該節點更新，避免污染資料庫。
+- 預設不再採用電台回報的節點暱稱；若確實需要沿用電台上的名稱，可在啟動前設定 `TMAG_ALLOW_RADIO_NODE_METADATA=1`（或在程式碼中將 `allowRadioNodeMetadata` 設為 `true`），此時 NodeInfo/MyInfo 仍會回填長短名與硬體資訊。
+- 清除節點資料庫 (`clear node db`) 會同時清空 `MeshtasticClient.nodeMap`，確保重新收包前節點名稱保持空白；清除後任何帶 Mesh ID 的封包都會先建立空白節點，再由 NodeInfo 補上名稱與型號。
+- CLI 的 `node src/index.js --clear-nodedb` 會同時掃描 CLI 預設資料夾與 Electron `userData`（包括開發模式的 `~/Library/Application Support/Electron/callmesh/` 等路徑），確保 GUI/CLI 任一流程產生的節點資訊都能一併清除。
+- 無論從 CLI 旗標或 GUI/IPC 觸發清除，都會同步要求所有 MeshtasticClient 重設 relay link-state（SNR/RSSI 推測資料），並清空 `relay_stats` / `relay-link-stats.json`，避免舊的轉發推測結果在清庫後殘留。
 - 提供 `getNodeSnapshot()` 供 CLI/Electron/Web 取得一次性列表；Electron 啟動、Web SSE 初始連線時會送出 `node-snapshot`。
 - 若需持久化，可自行在 Bridge 初始化時擴充序列化流程，目前預設為記憶體常駐。
+- 自 2025-11 之後啟動時不再從 `telemetry-records.sqlite` 自動補種節點，避免清庫後又被歷史暱稱灌回；僅會根據目前收到的封包（含 Mesh ID 者）即時建檔。
+- 若要完全清空節點名稱，請執行 `clear node db` 後重新啟動流程；Bridge 會清除節點資料庫與 Meshtastic client 的 `nodeMap`，直到收回新的 NodeInfo 為止。
+- Web Dashboard 的 SSE (`/api/events`) 會在每次連線時先送出目前 `summaryRows` 快取（`summary-batch`），這批資料可能包含先前錄到的 NodeInfo/relay 推測描述。重啟 Web server 或清空快取前，既有的 `summary-batch` 會維持不變，即使節點資料庫已清空仍可能看到舊的候選節點說明。
 
 ### 3.4 CLI (`src/index.js`)
 - 指令：
@@ -236,7 +243,7 @@ CMClient/
 ### 3.5 Electron 主行程 (`src/electron/main.js`)
 - 建立 `BrowserWindow`、註冊 IPC handler、啟動 MeshtasticClient 與 CallMeshAprsBridge。
 - 自動啟動 **Web Dashboard Server (`WebDashboardServer`)**：
-  - 預設 `http://0.0.0.0:7080` (可用 `TMAG_WEB_HOST` / `TMAG_WEB_PORT` 調整)
+  - 預設 `http://0.0.0.0:7080`（可用 `TMAG_WEB_HOST` / `TMAG_WEB_PORT` 調整，若該連接埠被占用會自動往上尋找可用連接埠並在 log 顯示實際位址）
   - `TMAG_WEB_DASHBOARD=0` 可禁用
 - `meshtastic:*`、`callmesh:*`、`aprs:*`、`app:*` IPC 入口都集中於此。
 - 注意：關閉應用或 IPC 錯誤時，務必呼叫 `cleanupMeshtasticClient()`、`shutdownWebDashboard()` 避免殘留連線。
@@ -261,7 +268,7 @@ CMClient/
   - 表格以最後出現時間由新到舊排序，線上統計以「一小時內更新」為準並同步顯示「符合條件 / 總線上」。
   - 搜尋框支援名稱、Mesh ID、型號、角色與 Label 模糊匹配；結果會同步影響統計與表格內容。
   - 座標欄位會顯示 `lat, lon[, 高度]`；可直接以座標片段或 Mesh ID 搜尋對應節點。
-- 節點事件：Renderer 會接收 `node`、`node-snapshot` 事件，更新本地節點快取並同步至封包表、Flow 追蹤與 Telemetry 表格。
+- 節點事件：Renderer 會接收 `node`、`node-snapshot` 事件，更新本地節點快取並同步至封包表、Flow 追蹤與 Telemetry 表格；Bridge 會在收到任何含 Mesh ID 的封包時即刻發出對應 `node` 事件，之後再由 NodeInfo 補齊其餘欄位。
 - 遙測處理：
   - 初始化時透過 `getTelemetrySnapshot()` 與 `getNodeSnapshot()` 建立快取；
   - `telemetry:update` 事件附帶統計數據，直接反映在頁面統計區；
@@ -273,7 +280,7 @@ CMClient/
 - **伺服器 (`src/web/server.js`)**
   - HTTP 靜態資產 + `GET /api/events` (Server-Sent Events)。
   - 推播事件：`status`、`callmesh`、`summary` / `summary-batch`、`log`、`log-batch`、`aprs`、`metrics`、`self`、`telemetry-*`、`node`、`node-snapshot`。
-  - 伺服器端維護節點資料庫：收到 `node` 事件或 Telemetry/summary 內含節點資訊時即時更新，初次連線會先送完整快照。
+- 伺服器端維護節點資料庫：優先透過 `node-snapshot` / `node` 事件同步，並會在 Bridge 收到任何含 Mesh ID 的封包後即刻建立節點，再等待 NodeInfo/MyInfo 補齊資料。初次連線仍會先送完整快照，不再從遙測紀錄補種。
   - 遙測資料庫同樣保留 500 筆/節點，並在 `telemetry-snapshot/append/reset` 事件中附帶統計（筆數、節點數、磁碟大小）。
   - 計數邏輯與 Electron 對齊：`packetLast10Min`、`aprsUploaded`、`mappingCount`。
 - **前端 (`src/web/public/main.js`)**
@@ -282,8 +289,9 @@ CMClient/
   - Mapping 封包追蹤支援搜尋、狀態篩選與節點 metadata（長名稱、模型、角色）；APRS 上傳狀態與 CLI 保持一致，Flow 列表同樣支援點擊 `?` 按鈕呼出 Modal 說明。
   - 訊息分頁與桌面版同步：會從節點資料庫補齊「來自」欄位的長名稱，歷史訊息也會在載入時回查 Mesh ID 映射。
   - `node`、`node-snapshot` 事件會同步更新節點暱稱與型號，Flow/Telemetry/封包表都會受益。
+- 前端仍僅透過 `node-snapshot` / `node` 事件新增節點；Bridge 已在收到含 Mesh ID 的封包時預先發佈 `node` 事件，因此清庫後仍能靠最新封包快速建立空白節點，再由 NodeInfo/MyInfo 補上詳細資訊。
   - 節點頁同樣新增座標欄與距離欄，搜尋可使用座標片段或節點暱稱。
-- Web Dashboard 可獨立瀏覽 (`npm run desktop` 後開 `http://localhost:7080`)，但不另提供設定 UI，所有設定仍在 Electron/CLI。
+- Web Dashboard 可獨立瀏覽（啟動後依 log 顯示的實際網址；預設為 `http://localhost:7080`），但不另提供設定 UI，所有設定仍在 Electron/CLI。
 
 ### 3.8 遙測資料庫（Telemetry Archive）
 - 遙測摘要（`summary.telemetry`）會由 `CallMeshAprsBridge` 寫入 `storageDir/telemetry-records.sqlite`，改採 **SQLite** 持久化；更新後首次啟動會自動匯入舊版 `telemetry-records.jsonl` 並將原檔改名為 `.migrated` 備份。2025-11 之後的版本改為以 `telemetry_records` / `telemetry_metrics` 正規化資料表存放各欄位與量測值（不再保存整筆 JSON），升級時會自動遷移舊版 SQLite。
@@ -334,8 +342,9 @@ CMClient/
 | `CALLMESH_API_KEY`           | CallMesh 驗證用。未設定時 CLI/GUI/WEB 一律鎖定                   |
 | `CALLMESH_ARTIFACTS_DIR`     | CLI 模式下的 CallMesh artifacts 目錄 (`~/.config/callmesh/`)       |
 | `CALLMESH_VERIFICATION_FILE` | CLI 驗證快取檔；未指定時預設 `~/.config/callmesh/monitor.json`     |
-| `TMAG_WEB_HOST` / `PORT`     | Web Dashboard 服務位置，預設 `0.0.0.0:7080`                      |
+| `TMAG_WEB_HOST` / `PORT`     | Web Dashboard 服務位置，預設 `0.0.0.0:7080`；預設連接埠被占用會自動往上尋找可用 Port 並在 log 顯示實際位址 |
 | `TMAG_WEB_DASHBOARD`         | 設為 `0` 可禁用 Web Dashboard（不啟動 HTTP/SSE）                 |
+| `TMAG_ALLOW_RADIO_NODE_METADATA` | 設為 `1` 可允許 NodeInfo/MyInfo 從電台帶入暱稱與硬體資訊；預設不啟用，僅保留節點資料庫內的名稱 |
 | `MESHTASTIC_HOST` / `PORT`   | 若未提供 CLI 參數，Electron 設定頁或 CLI Flag 需手動輸入           |
 
 Electron 會將 CallMesh 驗證資訊與 artifacts 存於 `~/Library/Application Support/<app>/callmesh/`（macOS），Windows/Linux 對應 OS 預設資料夾；訊息紀錄、節點快照、Mapping/Provision 等資料集中存放於 `callmesh-data.sqlite`（每頻道預設最多保留 200 筆），舊版 `message-log.jsonl` 會於啟動時自動匯入並刪除。
@@ -353,10 +362,19 @@ npm run desktop        # 啟動 Electron + Web Dashboard
 npm start              # CLI 模式
 ```
 
+啟動 GUI 前建議先確認本機沒有殘留的 Electron/TMAG 進程，特別是在頻繁重啟或測試時。可透過下列指令檢查並清除：
+
+```bash
+pgrep -fl "src/electron/main.js"    # 列出仍在運行的實例
+kill <pid> ...                      # 如有需要手動結束
+```
+
+若需全自動處理，可先用 `pgrep -f` 取得 PID 後再啟動新的 `npm run desktop`，避免 port 被占用或開出多個視窗。
+
 ### 6.2 Web Dashboard
 
 1. 啟動 `npm run desktop`
-2. 開瀏覽器至 `http://localhost:7080`
+2. 開瀏覽器至啟動 log 顯示的實際網址（預設為 `http://localhost:7080`）
 3. 若需禁用：`TMAG_WEB_DASHBOARD=0 npm run desktop`
 
 ### 6.3 CLI

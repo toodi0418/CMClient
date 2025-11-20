@@ -109,6 +109,9 @@
   const MAX_SUMMARY_ROWS = 200;
   const logEntries = [];
   const MAX_LOG_ENTRIES = 200;
+  const SUMMARY_REPLAY_GUARD_DRIFT_MS = 1000;
+  let summaryReplayGuardActive = false;
+  let summaryReplayGuardCutoffMs = 0;
   const telemetryStore = new Map();
   const telemetryRecordIds = new Set();
   const telemetryRecordOrder = [];
@@ -182,6 +185,26 @@
     { id: 2, code: 'CH2', name: 'Signal Test', note: '訊號測試、天線調校專用' },
     { id: 3, code: 'CH3', name: 'Emergency', note: '緊急狀況 / 救援聯絡' }
   ];
+  const TYPE_ICONS = {
+    Position: '📍',
+    Telemetry: '🔋',
+    EnvTelemetry: '🌡️',
+    Routing: '🧭',
+    RouteRequest: '🧭',
+    RouteReply: '🧭',
+    RouteError: '⚠️',
+    Text: '💬',
+    NodeInfo: '🧑‍🤝‍🧑',
+    Admin: '🛠️',
+    Traceroute: '🛰️',
+    Waypoint: '🗺️',
+    StoreForward: '🗃️',
+    PaxCounter: '👥',
+    RemoteHardware: '🔌',
+    KeyVerification: '🔑',
+    NeighborInfo: '🤝',
+    Encrypted: '🔒'
+  };
   const channelConfigs = CHANNEL_CONFIG.map((item) => ({ ...item }));
   const channelConfigMap = new Map(channelConfigs.map((item) => [item.id, item]));
   const channelMessageStore = new Map();
@@ -4457,10 +4480,8 @@ function ensureRelayGuessSuffix(label, summary) {
 
   function formatSource(summary) {
     if (!summary) return 'unknown';
-    const display = formatNodeDisplayLabel(summary.from);
-    if (display) {
-      return display;
-    }
+    const fromLabel = formatNodeDisplayLabel(summary.from);
+    const toLabel = summary.to ? formatNodeDisplayLabel(summary.to) : '';
     const pickValidMesh = (...values) => {
       for (const value of values) {
         if (typeof value !== 'string') continue;
@@ -4474,63 +4495,92 @@ function ensureRelayGuessSuffix(label, summary) {
       }
       return '';
     };
-    const mesh = pickValidMesh(
-      summary.from?.meshId,
-      summary.from?.meshIdNormalized,
-      summary.from?.meshIdOriginal,
-      summary.fromMeshId,
-      summary.fromMeshIdNormalized,
-      summary.fromMeshIdOriginal
-    );
-    if (mesh) {
-      return mesh;
+
+    let resolvedFrom = fromLabel;
+    if (!resolvedFrom) {
+      resolvedFrom = pickValidMesh(
+        summary.from?.meshId,
+        summary.from?.meshIdNormalized,
+        summary.from?.meshIdOriginal,
+        summary.fromMeshId,
+        summary.fromMeshIdNormalized,
+        summary.fromMeshIdOriginal
+      );
     }
-    if (typeof summary.detail === 'string') {
+
+    if (!resolvedFrom && typeof summary.detail === 'string') {
       const match = summary.detail.match(/(![0-9a-f]{6,8})/i);
       if (match && match[1]) {
-        return match[1];
+        resolvedFrom = match[1];
       }
     }
-    if (summary.flowId) {
+
+    if (!resolvedFrom && summary.flowId) {
       const callsign = flowAprsCallsigns.get(summary.flowId);
       if (callsign && !isUnknownLike(callsign)) {
-        return callsign;
+        resolvedFrom = callsign;
       }
     }
-    return 'unknown';
+
+    if (!resolvedFrom) {
+      resolvedFrom = 'unknown';
+    }
+
+    if (toLabel) {
+      return `${resolvedFrom} → ${toLabel}`;
+    }
+    return resolvedFrom;
   }
 
-  function getDetailExtraSegments(summary) {
-    if (!summary || !Array.isArray(summary.extraLines) || !summary.extraLines.length) {
-      return [];
-    }
-    return summary.extraLines
-      .map((line) => {
-        if (line === null || line === undefined) return '';
-        const text = String(line).trim();
-        return text ? `<span class="detail-extra">${escapeHtml(text)}</span>` : '';
-      })
-      .filter(Boolean);
-  }
-
-  function formatDetail(summary) {
-    const detail = summary.detail || '';
-    const segments = [];
-    if (detail) {
-      segments.push(escapeHtml(detail));
-    }
-    const extraSegments = getDetailExtraSegments(summary);
-    if (extraSegments.length) {
-      segments.push(...extraSegments);
-    }
+  function updateDetailCell(cell, summary) {
+    if (!cell) return;
+    cell.classList.add('info-cell');
+    cell.innerHTML = '';
+    const detailText = typeof summary?.detail === 'string' ? summary.detail.trim() : '';
+    const extras = Array.isArray(summary?.extraLines)
+      ? summary.extraLines
+          .map((line) => (line === null || line === undefined ? '' : String(line).trim()))
+          .filter(Boolean)
+      : [];
     const distanceLabel = formatDistance(summary);
+
+    const mainEl = document.createElement('div');
+    mainEl.className = 'detail-main';
+    mainEl.textContent = detailText;
+    cell.appendChild(mainEl);
+
+    if (extras.length) {
+      const extrasEl = document.createElement('div');
+      extrasEl.className = 'detail-extra';
+      for (const line of extras) {
+        const span = document.createElement('span');
+        span.textContent = line;
+        extrasEl.appendChild(span);
+      }
+      cell.appendChild(extrasEl);
+    }
+
     if (distanceLabel) {
-      segments.push(`<span class="detail-distance">${escapeHtml(distanceLabel)}</span>`);
+      const distanceEl = document.createElement('div');
+      distanceEl.className = 'detail-distance';
+      distanceEl.textContent = distanceLabel;
+      cell.appendChild(distanceEl);
     }
-    if (!segments.length) {
-      return '';
-    }
-    return segments.join('<br/>');
+  }
+
+  function renderTypeCell(cell, summary) {
+    if (!cell) return;
+    cell.classList.add('type');
+    cell.innerHTML = '';
+    const typeKey = typeof summary?.type === 'string' ? summary.type.trim() : '';
+    const displayType = typeKey || '—';
+    const icon = TYPE_ICONS[typeKey] || '📦';
+    const iconEl = document.createElement('span');
+    iconEl.className = 'type-icon';
+    iconEl.textContent = icon;
+    const textEl = document.createElement('span');
+    textEl.textContent = displayType;
+    cell.append(iconEl, textEl);
   }
 
   function formatDistance(summary) {
@@ -4761,22 +4811,26 @@ function ensureRelayGuessSuffix(label, summary) {
     const timeLabel = escapeHtml(summary.timestampLabel || formatTimestamp(summary.timestamp));
     const relayLabel = escapeHtml(formatRelay(summary));
     const sourceLabel = escapeHtml(formatSource(summary));
-    const hopsLabel = escapeHtml(formatHops(summary.hops));
-    const typeLabel = escapeHtml(summary.type || '—');
     const channelLabel = escapeHtml(formatChannel(summary.channel));
+    const hopInfo = extractHopInfo(summary);
+    const hopsLabel = hopInfo.limitOnly
+      ? '無效'
+      : hopInfo.hopsLabel || formatHops(summary.hops) || '';
 
     tr.innerHTML = `
       <td>${timeLabel}</td>
       <td>${sourceLabel}</td>
       <td>${relayLabel}</td>
-      <td>${typeLabel}</td>
       <td>${channelLabel}</td>
-      <td>${hopsLabel}</td>
       <td class="${snrClass}">${formatNumber(summary.snr, 2)}</td>
       <td>${formatNumber(summary.rssi, 0)}</td>
-      <td class="info-cell">${formatDetail(summary)}</td>
+      <td class="type"></td>
+      <td>${escapeHtml(hopsLabel || '—')}</td>
+      <td class="info-cell"></td>
     `;
     updateRelayCellDisplay(tr.cells[2], summary);
+    renderTypeCell(tr.querySelector('.type'), summary);
+    updateDetailCell(tr.querySelector('.info-cell'), summary);
     return tr;
   }
 
@@ -4794,12 +4848,32 @@ function ensureRelayGuessSuffix(label, summary) {
     badge.textContent = `APRS: ${callsign}`;
   }
 
+  function shouldDiscardSummaryForReplay(summary) {
+    if (!summaryReplayGuardActive) {
+      return false;
+    }
+    const timestampMs = extractSummaryTimestampMs(summary);
+    if (!Number.isFinite(timestampMs)) {
+      summaryReplayGuardActive = false;
+      return false;
+    }
+    if (timestampMs + SUMMARY_REPLAY_GUARD_DRIFT_MS < summaryReplayGuardCutoffMs) {
+      return true;
+    }
+    summaryReplayGuardActive = false;
+    return false;
+  }
+
   function appendSummary(summary) {
     if (!summary.selfMeshId && currentSelfMeshId) {
       summary.selfMeshId = currentSelfMeshId;
     }
 
     hydrateSummaryNodes(summary);
+
+    if (shouldDiscardSummaryForReplay(summary)) {
+      return;
+    }
 
     const row = createSummaryRow(summary);
     row.__summaryData = summary;
@@ -5921,17 +5995,34 @@ function ensureRelayGuessSuffix(label, summary) {
       if (sourceCell) {
         sourceCell.textContent = formatSource(summary);
       }
-      const channelCell = row.cells?.[4];
+      const channelCell = row.cells?.[3];
       if (channelCell) {
         channelCell.textContent = formatChannel(summary.channel);
       }
-      const hopsCell = row.cells?.[5];
+      const snrCell = row.cells?.[4];
+      if (snrCell) {
+        snrCell.classList.toggle('snr-positive', typeof summary.snr === 'number' && summary.snr >= 0);
+        snrCell.classList.toggle('snr-negative', typeof summary.snr === 'number' && summary.snr < 0);
+        snrCell.textContent = formatNumber(summary.snr, 2);
+      }
+      const rssiCell = row.cells?.[5];
+      if (rssiCell) {
+        rssiCell.textContent = formatNumber(summary.rssi, 0);
+      }
+      const typeCell = row.cells?.[6];
+      if (typeCell) {
+        renderTypeCell(typeCell, summary);
+      }
+      const hopsCell = row.cells?.[7];
       if (hopsCell) {
-        hopsCell.textContent = formatHops(summary.hops);
+        const hopInfo = extractHopInfo(summary);
+        hopsCell.textContent = hopInfo.limitOnly
+          ? '無效'
+          : hopInfo.hopsLabel || formatHops(summary.hops) || '—';
       }
       const detailCell = row.cells?.[8];
       if (detailCell) {
-        detailCell.innerHTML = formatDetail(summary);
+        updateDetailCell(detailCell, summary);
         const flowId = summary.flowId;
         if (flowId) {
           const badgeCallsign = flowAprsCallsigns.get(flowId);
@@ -5943,7 +6034,13 @@ function ensureRelayGuessSuffix(label, summary) {
     }
   }
 
+  function resetSummaryReplayGuard() {
+    summaryReplayGuardActive = true;
+    summaryReplayGuardCutoffMs = Date.now();
+  }
+
   function connectStream() {
+    resetSummaryReplayGuard();
     const source = new EventSource('/api/events');
 
     source.onmessage = (event) => {

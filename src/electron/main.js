@@ -36,6 +36,7 @@ const MeshtasticClient = require('../meshtasticClient');
 const { discoverMeshtasticDevices } = require('../discovery');
 const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
 const { WebDashboardServer } = require('../web/server');
+const { sanitizeSummaryForDisplay } = require('../utils/summaryDisplay');
 const { SerialPort } = require('serialport');
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
@@ -1103,6 +1104,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   const processSummary = (summary, { synthetic = false } = {}) => {
     if (!summary) return;
     let messageEntry = null;
+    let displaySummary = summary;
     try {
       if (!synthetic) {
         bridge?.handleMeshtasticSummary(summary);
@@ -1110,13 +1112,14 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     } catch (err) {
       console.error('處理 APRS Summary 時發生錯誤:', err);
     }
+    displaySummary = sanitizeSummaryForDisplay(summary) || summary;
     try {
-      messageEntry = persistMessageSummary(summary);
+      messageEntry = persistMessageSummary(displaySummary);
     } catch (err) {
       console.error('寫入訊息紀錄失敗:', err);
     }
-    mainWindow?.webContents.send('meshtastic:summary', summary);
-    webServer?.publishSummary(summary);
+    mainWindow?.webContents.send('meshtastic:summary', displaySummary);
+    webServer?.publishSummary(displaySummary);
     if (messageEntry) {
       webServer?.publishMessage(messageEntry);
     }
