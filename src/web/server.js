@@ -853,6 +853,10 @@ class WebDashboardServer {
       this._write(res, { type: 'self', payload: { meshId: this.selfMeshId } });
     }
     this._write(res, { type: 'metrics', payload: this.metrics });
+    const nodeSnapshot = this._buildNodeSnapshot();
+    if (nodeSnapshot.length) {
+      this._write(res, { type: 'node-snapshot', payload: nodeSnapshot });
+    }
     if (this.summaryRows.length) {
       this._write(res, { type: 'summary-batch', payload: this.summaryRows });
     }
@@ -869,10 +873,6 @@ class WebDashboardServer {
     }
     if (this.lastAprsInfo) {
       this._write(res, { type: 'aprs', payload: this.lastAprsInfo });
-    }
-    const nodeSnapshot = this._buildNodeSnapshot();
-    if (nodeSnapshot.length) {
-      this._write(res, { type: 'node-snapshot', payload: nodeSnapshot });
     }
     this._write(res, {
       type: 'message-snapshot',

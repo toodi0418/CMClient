@@ -4478,58 +4478,37 @@ function ensureRelayGuessSuffix(label, summary) {
     return String(channel);
   }
 
-  function formatSource(summary) {
-    if (!summary) return 'unknown';
-    const fromLabel = formatNodeDisplayLabel(summary.from);
-    const toLabel = summary.to ? formatNodeDisplayLabel(summary.to) : '';
-    const pickValidMesh = (...values) => {
-      for (const value of values) {
-        if (typeof value !== 'string') continue;
-        const trimmed = value.trim();
-        if (!trimmed) continue;
-        const lowered = trimmed.toLowerCase();
-        if (lowered === 'unknown' || lowered === '__unknown__' || lowered === 'null') {
-          continue;
-        }
-        return trimmed;
-      }
-      return '';
-    };
-
-    let resolvedFrom = fromLabel;
-    if (!resolvedFrom) {
-      resolvedFrom = pickValidMesh(
-        summary.from?.meshId,
-        summary.from?.meshIdNormalized,
-        summary.from?.meshIdOriginal,
-        summary.fromMeshId,
-        summary.fromMeshIdNormalized,
-        summary.fromMeshIdOriginal
-      );
+  function formatNodeDisplay(node) {
+    if (!node) {
+      return 'unknown';
     }
-
-    if (!resolvedFrom && typeof summary.detail === 'string') {
-      const match = summary.detail.match(/(![0-9a-f]{6,8})/i);
-      if (match && match[1]) {
-        resolvedFrom = match[1];
-      }
+    const name =
+      sanitizeNodeName(node.longName) ||
+      sanitizeNodeName(node.shortName) ||
+      sanitizeNodeName(node.label);
+    let meshId = node.meshId || node.meshIdOriginal || node.meshIdNormalized || '';
+    if (meshId && meshId.startsWith('0x')) {
+      meshId = `!${meshId.slice(2)}`;
     }
-
-    if (!resolvedFrom && summary.flowId) {
-      const callsign = flowAprsCallsigns.get(summary.flowId);
-      if (callsign && !isUnknownLike(callsign)) {
-        resolvedFrom = callsign;
-      }
+    if (name && meshId) {
+      return name.includes(meshId) ? name : `${name} (${meshId})`;
     }
-
-    if (!resolvedFrom) {
-      resolvedFrom = 'unknown';
+    if (name) {
+      return name;
     }
-
-    if (toLabel) {
-      return `${resolvedFrom} → ${toLabel}`;
+    if (meshId) {
+      return meshId;
     }
-    return resolvedFrom;
+    return 'unknown';
+  }
+
+  function formatNodes(summary) {
+    const fromLabel = formatNodeDisplay(summary?.from);
+    const toLabel = summary?.to ? formatNodeDisplay(summary.to) : null;
+    if (!toLabel) {
+      return fromLabel;
+    }
+    return `${fromLabel} → ${toLabel}`;
   }
 
   function updateDetailCell(cell, summary) {
@@ -4810,7 +4789,7 @@ function ensureRelayGuessSuffix(label, summary) {
         : '';
     const timeLabel = escapeHtml(summary.timestampLabel || formatTimestamp(summary.timestamp));
     const relayLabel = escapeHtml(formatRelay(summary));
-    const sourceLabel = escapeHtml(formatSource(summary));
+    const nodesLabel = escapeHtml(formatNodes(summary));
     const channelLabel = escapeHtml(formatChannel(summary.channel));
     const hopInfo = extractHopInfo(summary);
     const hopsLabel = hopInfo.limitOnly
@@ -4819,7 +4798,7 @@ function ensureRelayGuessSuffix(label, summary) {
 
     tr.innerHTML = `
       <td>${timeLabel}</td>
-      <td>${sourceLabel}</td>
+      <td>${nodesLabel}</td>
       <td>${relayLabel}</td>
       <td>${channelLabel}</td>
       <td class="${snrClass}">${formatNumber(summary.snr, 2)}</td>
@@ -4848,8 +4827,8 @@ function ensureRelayGuessSuffix(label, summary) {
     badge.textContent = `APRS: ${callsign}`;
   }
 
-  function shouldDiscardSummaryForReplay(summary) {
-    if (!summaryReplayGuardActive) {
+  function shouldDiscardSummaryForReplay(summary, { skipGuard = false } = {}) {
+    if (skipGuard || !summaryReplayGuardActive) {
       return false;
     }
     const timestampMs = extractSummaryTimestampMs(summary);
@@ -4864,14 +4843,14 @@ function ensureRelayGuessSuffix(label, summary) {
     return false;
   }
 
-  function appendSummary(summary) {
+  function appendSummary(summary, options = {}) {
     if (!summary.selfMeshId && currentSelfMeshId) {
       summary.selfMeshId = currentSelfMeshId;
     }
 
     hydrateSummaryNodes(summary);
 
-    if (shouldDiscardSummaryForReplay(summary)) {
+    if (shouldDiscardSummaryForReplay(summary, options)) {
       return;
     }
 
@@ -4933,7 +4912,7 @@ function ensureRelayGuessSuffix(label, summary) {
       if (!cells || cells.length < 3) {
         continue;
       }
-      cells[1].textContent = formatSource(summary);
+      cells[1].textContent = formatNodes(summary);
       updateRelayCellDisplay(cells[2], summary);
     }
   }
@@ -5955,7 +5934,7 @@ function ensureRelayGuessSuffix(label, summary) {
   function handleSummaryBatch(list) {
     if (!Array.isArray(list)) return;
     for (let i = list.length - 1; i >= 0; i -= 1) {
-      appendSummary(list[i]);
+      appendSummary(list[i], { skipGuard: true });
     }
   }
 
@@ -5993,7 +5972,7 @@ function ensureRelayGuessSuffix(label, summary) {
       }
       const sourceCell = row.cells?.[1];
       if (sourceCell) {
-        sourceCell.textContent = formatSource(summary);
+        sourceCell.textContent = formatNodes(summary);
       }
       const channelCell = row.cells?.[3];
       if (channelCell) {
