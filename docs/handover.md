@@ -402,6 +402,15 @@ node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 - `--summary-log-dir`：自訂輸出目錄（若未指定則寫入 `callmesh/logs`）。兩個旗標可同時使用，適用於長時間紀錄或與外部分析腳本串接。
 - Log 檔格式為 JSONL，可直接用 `rg` / `jq` 快速篩選，例如：`rg '\"to\":.*!dd8778e7' summary-20251122.jsonl`.
 
+#### Summary Log 分析建議
+
+- 公開頻道容易遭惡意節點洗版（改色情名稱、亂造 Mesh ID）。啟用 `--summary-log` 後，可用下列範例快速檢索：
+  - 指定 Mesh ID：`rg '\"from\":\{[^}]*!550d885b' ~/.config/callmesh/logs/summary-*.jsonl`
+  - 指定暱稱關鍵字：`rg '"longName":".*淫娃' summary-20251122.jsonl`
+  - Directed 目標：`rg '"to":\{[^}]*!dd8778e7' summary-20251122.jsonl`
+- `synthetic=true` 代表 TenManMap / 本機產生的合成 summary，可與真實封包區隔；`relay`、`hops`、`flowId` 有助於追蹤中繼與 TenMan ack。
+- 若要在本地遮蔽垃圾節點，可依 log 建立黑名單，在 `CallMeshAprsBridge.captureSummaryNodeInfo()` 或 CLI `handleSummary()` 內過濾（檢測名稱關鍵字或 Mesh ID 後直接 return）。但要徹底杜絕，仍需改用私有頻道 / 自訂加密 key，避免外部節點連入。
+
 - Electron 設定頁的「連線模式」可切換 TCP/Serial，Serial 模式可從清單選擇偵測到的裝置或手動輸入 `serial:///` 路徑。
 
 ### 6.4 遙測與節點資料

@@ -2271,21 +2271,22 @@ function buildNodeLabel(node) {
 }
 
 function mergeNodeInfo(existing = {}, incoming = {}) {
+  const baseExisting = existing && typeof existing === 'object' ? existing : {};
   const result = {
-    meshId: existing.meshId ?? null,
-    meshIdOriginal: existing.meshIdOriginal ?? null,
-    meshIdNormalized: existing.meshIdNormalized ?? null,
-    shortName: existing.shortName ?? null,
-    longName: existing.longName ?? null,
-    hwModel: existing.hwModel ?? null,
-    hwModelLabel: existing.hwModelLabel ?? null,
-    role: existing.role ?? null,
-    roleLabel: existing.roleLabel ?? null,
-    latitude: existing.latitude ?? null,
-    longitude: existing.longitude ?? null,
-    altitude: existing.altitude ?? null,
-    label: existing.label ?? null,
-    lastSeenAt: existing.lastSeenAt ?? null
+    meshId: baseExisting.meshId ?? null,
+    meshIdOriginal: baseExisting.meshIdOriginal ?? null,
+    meshIdNormalized: baseExisting.meshIdNormalized ?? null,
+    shortName: baseExisting.shortName ?? null,
+    longName: baseExisting.longName ?? null,
+    hwModel: baseExisting.hwModel ?? null,
+    hwModelLabel: baseExisting.hwModelLabel ?? null,
+    role: baseExisting.role ?? null,
+    roleLabel: baseExisting.roleLabel ?? null,
+    latitude: baseExisting.latitude ?? null,
+    longitude: baseExisting.longitude ?? null,
+    altitude: baseExisting.altitude ?? null,
+    label: baseExisting.label ?? null,
+    lastSeenAt: baseExisting.lastSeenAt ?? null
   };
   const sources = Array.isArray(incoming) ? incoming : [incoming];
   for (const source of sources) {
