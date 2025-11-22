@@ -30,6 +30,25 @@ const APRS_TELEMETRY_INTERVAL_MS = 6 * 60 * 60_000;
 const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
+const DEFAULT_APRS_FEED_FILTER = 'filter b/BU,BV,BM,BX';
+const APRS_FEED_FILTER_COMMAND =
+  (String(process.env.TMAG_APRS_FEED_FILTER || '').trim() || DEFAULT_APRS_FEED_FILTER);
+const APRS_PACKET_CACHE_TTL_MS = 30 * 60_000;
+const APRS_PACKET_RECENT_WINDOW_MS = 60_000;
+const APRS_LOCAL_TX_WINDOW_MS = 30_000;
+const APRS_DELAY_SUPPRESS_DEFAULT_MS = 10_000;
+const APRS_CALLSIGN_RECENT_SUPPRESS_MS = (() => {
+  const raw = process.env.TMAG_APRS_DELAY_WINDOW_MS;
+  if (raw === undefined || raw === null || raw === '') {
+    return APRS_DELAY_SUPPRESS_DEFAULT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return APRS_DELAY_SUPPRESS_DEFAULT_MS;
+  }
+  return Math.max(0, Math.floor(parsed));
+})();
+const APRS_PACKET_KEY_SEPARATOR = '\u0001';
 
 const TENMAN_FORWARD_WS_ENDPOINT = 'wss://tenmanmap.yakumo.tw/ws';
 const TENMAN_FORWARD_DEFAULT_ENABLED =
@@ -218,6 +237,11 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsTelemetrySequence = 0;
     this.aprsLastPositionDigest = new Map();
     this.aprsSkippedMeshIds = new Set();
+    this.mappingIndexByMeshId = new Map();
+    this.aprsAllowedCallsigns = new Set();
+    this.aprsPacketCache = new Map();
+    this.aprsCallsignSummary = new Map();
+    this.aprsLocalTxHistory = new Map();
     this.nodeDatabase = nodeDatabase;
     this.telemetrySeededNodes = new Set();
     this.nodeDatabasePersistTimer = null;
@@ -281,6 +305,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.heartbeatRunning = false;
 
     this.lastTelemetryPersistAt = 0;
+    this.refreshMappingIndexes('init');
   }
 
   getMappingFilePath() {
@@ -938,6 +963,7 @@ class CallMeshAprsBridge extends EventEmitter {
       this.callmeshState.lastMappingHash = null;
       this.callmeshState.lastMappingSyncedAt = null;
       this.callmeshState.mappingItems = [];
+      this.refreshMappingIndexes('restore-disabled');
       this.callmeshState.cachedProvision = null;
       this.callmeshState.provision = null;
       this.updateAprsProvision(null);
@@ -972,6 +998,7 @@ class CallMeshAprsBridge extends EventEmitter {
         `restore mapping hash=${this.callmeshState.lastMappingHash ?? 'null'} count=${this.callmeshState.mappingItems.length}`
       );
     }
+    this.refreshMappingIndexes('restore');
 
     let provisionPayload = store ? store.getKv('provision') : null;
     if (!provisionPayload) {
@@ -1020,6 +1047,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.callmeshState.cachedProvision = null;
     this.callmeshState.lastProvisionRaw = null;
     this.callmeshState.mappingItems = [];
+    this.refreshMappingIndexes('clear-artifacts');
     this.aprsLastPositionDigest.clear();
     this.aprsSkippedMeshIds.clear();
     this.aprsTelemetrySequence = 0;
@@ -2840,7 +2868,8 @@ class CallMeshAprsBridge extends EventEmitter {
       callsign: this.aprsState.callsign,
       passcode: this.aprsState.passcode,
       version: this.appVersion,
-      softwareName: 'TMAG'
+      softwareName: 'TMAG',
+      filterCommand: APRS_FEED_FILTER_COMMAND
     };
 
     if (!this.aprsClient) {
@@ -3010,6 +3039,7 @@ class CallMeshAprsBridge extends EventEmitter {
       this.callmeshState.lastMappingHash = response.hash ?? this.callmeshState.lastMappingHash ?? null;
       this.callmeshState.lastMappingSyncedAt = updatedAt;
       this.callmeshState.mappingItems = response.items;
+      this.refreshMappingIndexes('sync');
       this.emitLog(
         'CALLMESH',
         `mapping synced hash=${this.callmeshState.lastMappingHash ?? 'null'} items=${response.items.length}`
@@ -3146,44 +3176,44 @@ class CallMeshAprsBridge extends EventEmitter {
         this.updateAprsActualServer(serverMatch[1]);
       }
       if (!this.aprsLoginVerified && /\bverified\b/i.test(normalized)) {
-      this.aprsLoginVerified = true;
-      this.emitLog('APRS', 'login verified');
-      const shouldSendInitialBeacon = this.aprsLastBeaconAt === 0;
-      if (shouldSendInitialBeacon) {
-        this.sendAprsBeacon('aprs-verified');
-      } else {
-        this.restartAprsBeaconLoop('interval');
-      }
-
-      const shouldSendInitialDefinitions = this.aprsLastTelemetryAt === 0;
-      const shouldSendInitialTelemetryData = this.aprsLastTelemetryDataAt === 0;
-
-      if (!shouldSendInitialDefinitions) {
-        this.scheduleAprsTelemetryDefinitions('interval');
-      }
-      if (!shouldSendInitialTelemetryData) {
-        this.scheduleAprsTelemetryData('interval');
-      }
-
-      if (shouldSendInitialDefinitions) {
-        this.sendAprsTelemetryDefinitions('login', { force: true });
-      }
-      if (shouldSendInitialTelemetryData) {
-        this.sendAprsTelemetryData('login', { force: true });
-      }
-
-      if (this.aprsLastStatusAt === 0) {
-        const statusSent = this.sendAprsStatus('login');
-        if (!statusSent) {
-          this.emitLog('APRS', 'status send skipped at login');
+        this.aprsLoginVerified = true;
+        this.emitLog('APRS', 'login verified');
+        const shouldSendInitialBeacon = this.aprsLastBeaconAt === 0;
+        if (shouldSendInitialBeacon) {
+          this.sendAprsBeacon('aprs-verified');
+        } else {
+          this.restartAprsBeaconLoop('interval');
         }
-      }
 
-      if (this.aprsLastStatusAt !== 0) {
-        this.aprsLastStatusAt = Date.now();
+        const shouldSendInitialDefinitions = this.aprsLastTelemetryAt === 0;
+        const shouldSendInitialTelemetryData = this.aprsLastTelemetryDataAt === 0;
+
+        if (!shouldSendInitialDefinitions) {
+          this.scheduleAprsTelemetryDefinitions('interval');
+        }
+        if (!shouldSendInitialTelemetryData) {
+          this.scheduleAprsTelemetryData('interval');
+        }
+
+        if (shouldSendInitialDefinitions) {
+          this.sendAprsTelemetryDefinitions('login', { force: true });
+        }
+        if (shouldSendInitialTelemetryData) {
+          this.sendAprsTelemetryData('login', { force: true });
+        }
+
+        if (this.aprsLastStatusAt === 0) {
+          const statusSent = this.sendAprsStatus('login');
+          if (!statusSent) {
+            this.emitLog('APRS', 'status send skipped at login');
+          }
+        }
+
+        if (this.aprsLastStatusAt !== 0) {
+          this.aprsLastStatusAt = Date.now();
+        }
+        this.startAprsStatusLoop();
       }
-      this.startAprsStatusLoop();
-    }
       return;
     }
 
@@ -3194,6 +3224,110 @@ class CallMeshAprsBridge extends EventEmitter {
       }
       return;
     }
+
+    if (normalized.startsWith('#')) {
+      return;
+    }
+
+    const parsed = parseAprsFrameLine(normalized);
+    if (!parsed) {
+      return;
+    }
+    if (!this.isAprsCallsignAllowed(parsed.sourceCallsign)) {
+      return;
+    }
+    this.handleAprsFeedPacket(parsed.sourceCallsign, parsed.infoString);
+  }
+
+  handleAprsFeedPacket(callsign, infoString, timestamp = Date.now()) {
+    if (!callsign) return;
+    if (infoString === undefined || infoString === null) return;
+    this.storeAprsPacketRecord(callsign, infoString, timestamp);
+  }
+
+  storeAprsPacketRecord(callsign, infoString, timestamp = Date.now()) {
+    const key = buildAprsPacketCacheKey(callsign, infoString);
+    if (!key) return;
+    const normalizedCallsign = normalizeAprsCallsign(callsign);
+    this.aprsPacketCache.set(key, timestamp);
+    if (normalizedCallsign) {
+      const normalizedInfo =
+        typeof infoString === 'string' ? infoString : String(infoString ?? '');
+      this.aprsCallsignSummary.set(normalizedCallsign, {
+        lastSeen: timestamp,
+        lastInfo: normalizedInfo
+      });
+    }
+    this.pruneAprsPacketCache(timestamp);
+  }
+
+  pruneAprsPacketCache(now = Date.now()) {
+    for (const [key, seenAt] of Array.from(this.aprsPacketCache.entries())) {
+      if (!Number.isFinite(seenAt) || now - seenAt > APRS_PACKET_CACHE_TTL_MS) {
+        this.aprsPacketCache.delete(key);
+      }
+    }
+    for (const [callsign, summary] of Array.from(this.aprsCallsignSummary.entries())) {
+      const seenAt = summary?.lastSeen ?? 0;
+      if (!Number.isFinite(seenAt) || now - seenAt > APRS_PACKET_CACHE_TTL_MS) {
+        this.aprsCallsignSummary.delete(callsign);
+      }
+    }
+    for (const [key, seenAt] of Array.from(this.aprsLocalTxHistory.entries())) {
+      if (!Number.isFinite(seenAt) || now - seenAt > APRS_LOCAL_TX_WINDOW_MS) {
+        this.aprsLocalTxHistory.delete(key);
+      }
+    }
+  }
+
+  hasAprsPacketBeenSeenRecently(callsign, infoString, now = Date.now()) {
+    const key = buildAprsPacketCacheKey(callsign, infoString);
+    if (!key) return false;
+    const seenAt = this.aprsPacketCache.get(key);
+    if (!Number.isFinite(seenAt)) {
+      return false;
+    }
+    if (now - seenAt <= APRS_PACKET_RECENT_WINDOW_MS) {
+      return true;
+    }
+    if (now - seenAt > APRS_PACKET_CACHE_TTL_MS) {
+      this.aprsPacketCache.delete(key);
+    }
+    return false;
+  }
+
+  recordLocalAprsTransmission(callsign, infoString, timestamp = Date.now()) {
+    const key = buildAprsPacketCacheKey(callsign, infoString);
+    if (!key) return;
+    this.aprsLocalTxHistory.set(key, timestamp);
+    this.storeAprsPacketRecord(callsign, infoString, timestamp);
+  }
+
+  hasLocalAprsTransmission(callsign, infoString, now = Date.now()) {
+    const key = buildAprsPacketCacheKey(callsign, infoString);
+    if (!key) return false;
+    const seenAt = this.aprsLocalTxHistory.get(key);
+    if (!Number.isFinite(seenAt)) {
+      return false;
+    }
+    if (now - seenAt <= APRS_LOCAL_TX_WINDOW_MS) {
+      return true;
+    }
+    if (now - seenAt > APRS_LOCAL_TX_WINDOW_MS) {
+      this.aprsLocalTxHistory.delete(key);
+    }
+    return false;
+  }
+
+  shouldSuppressDueToRecentCallsignActivity(callsign, now = Date.now()) {
+    if (APRS_CALLSIGN_RECENT_SUPPRESS_MS <= 0) return false;
+    const normalized = normalizeAprsCallsign(callsign);
+    if (!normalized) return false;
+    const summary = this.aprsCallsignSummary.get(normalized);
+    if (!summary || !Number.isFinite(summary.lastSeen)) {
+      return false;
+    }
+    return now - summary.lastSeen < APRS_CALLSIGN_RECENT_SUPPRESS_MS;
   }
 
   handleAprsConnected() {
@@ -3379,8 +3513,9 @@ class CallMeshAprsBridge extends EventEmitter {
     const isSelfMesh = meshId && this.selfMeshId && meshId === this.selfMeshId;
 
     const mapping = meshId ? this.findMappingForMeshId(meshId) : null;
+    const mappingAllowed = mapping ? isMappingEntryEnabled(mapping) : false;
 
-    if (!mapping) {
+    if (!mapping || !mappingAllowed) {
       if (meshId && !this.aprsSkippedMeshIds.has(meshId)) {
         this.aprsSkippedMeshIds.add(meshId);
       }
@@ -3397,6 +3532,10 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     if (meshId && this.aprsSkippedMeshIds.has(meshId)) {
       this.aprsSkippedMeshIds.delete(meshId);
+    }
+    const normalizedCallsign = normalizeAprsCallsign(sourceCallsign);
+    if (!normalizedCallsign) {
+      return;
     }
 
     let commentSource = '';
@@ -3471,6 +3610,22 @@ class CallMeshAprsBridge extends EventEmitter {
       speedKnots
     });
     if (!payload) return;
+    const now = Date.now();
+
+    if (this.hasLocalAprsTransmission(normalizedCallsign, payload, now)) {
+      this.emitLog('APRS', `uplink skipped (local repeat) callsign=${normalizedCallsign}`);
+      return;
+    }
+
+    if (this.hasAprsPacketBeenSeenRecently(normalizedCallsign, payload, now)) {
+      this.emitLog('APRS', `uplink skipped (seen on APRS-IS) callsign=${normalizedCallsign}`);
+      return;
+    }
+
+    if (this.shouldSuppressDueToRecentCallsignActivity(normalizedCallsign, now)) {
+      this.emitLog('APRS', `uplink skipped (recent APRS activity) callsign=${normalizedCallsign}`);
+      return;
+    }
 
     const qCallsign = this.getProvisionAprsCallsign() || this.aprsState.callsign;
     const pathParts = [APRS_MESH_PATH, APRS_Q_CONSTRUCT];
@@ -3479,6 +3634,7 @@ class CallMeshAprsBridge extends EventEmitter {
     const sent = this.aprsClient.sendLine(frame);
     if (sent) {
       this.recordTelemetryAprsForward(summary.timestampMs);
+      this.recordLocalAprsTransmission(normalizedCallsign, payload, now);
       if (meshId) {
         this.rememberAprsPositionDigest(meshId, digest);
       }
@@ -3518,12 +3674,77 @@ class CallMeshAprsBridge extends EventEmitter {
     );
   }
 
-  findMappingForMeshId(meshId) {
-    if (!meshId || !Array.isArray(this.callmeshState.mappingItems)) return null;
+  refreshMappingIndexes(_reason = 'update') {
+    this.mappingIndexByMeshId.clear();
+    this.aprsAllowedCallsigns.clear();
+    if (!Array.isArray(this.callmeshState.mappingItems)) {
+      return;
+    }
     for (const item of this.callmeshState.mappingItems) {
       if (!item) continue;
+      const meshId = normalizeMeshId(item.mesh_id ?? item.meshId);
+      if (meshId) {
+        this.mappingIndexByMeshId.set(meshId, item);
+      }
+      if (!isMappingEntryEnabled(item)) {
+        continue;
+      }
+      const callsign = normalizeAprsCallsign(deriveAprsCallsignFromMapping(item));
+      if (callsign) {
+        this.aprsAllowedCallsigns.add(callsign);
+      }
+    }
+    this.pruneAprsCachesByWhitelist(_reason);
+  }
+
+  pruneAprsCachesByWhitelist(_reason = 'update') {
+    if (!this.aprsAllowedCallsigns.size) {
+      this.aprsPacketCache.clear();
+      this.aprsCallsignSummary.clear();
+      this.aprsLocalTxHistory.clear();
+      return;
+    }
+    for (const key of Array.from(this.aprsPacketCache.keys())) {
+      const callsign = extractCallsignFromAprsKey(key);
+      if (callsign && !this.aprsAllowedCallsigns.has(callsign)) {
+        this.aprsPacketCache.delete(key);
+      }
+    }
+    for (const key of Array.from(this.aprsLocalTxHistory.keys())) {
+      const callsign = extractCallsignFromAprsKey(key);
+      if (callsign && !this.aprsAllowedCallsigns.has(callsign)) {
+        this.aprsLocalTxHistory.delete(key);
+      }
+    }
+    for (const callsign of Array.from(this.aprsCallsignSummary.keys())) {
+      if (!this.aprsAllowedCallsigns.has(callsign)) {
+        this.aprsCallsignSummary.delete(callsign);
+      }
+    }
+  }
+
+  isAprsCallsignAllowed(callsign) {
+    const normalized = normalizeAprsCallsign(callsign);
+    if (!normalized) return false;
+    if (!this.aprsAllowedCallsigns.size) return false;
+    return this.aprsAllowedCallsigns.has(normalized);
+  }
+
+  findMappingForMeshId(meshId) {
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) return null;
+    if (this.mappingIndexByMeshId.has(normalized)) {
+      return this.mappingIndexByMeshId.get(normalized) || null;
+    }
+    if (!Array.isArray(this.callmeshState.mappingItems)) {
+      return null;
+    }
+    for (const item of this.callmeshState.mappingItems) {
+      if (!item) continue;
+      if (!isMappingEntryEnabled(item)) continue;
       const candidate = normalizeMeshId(item.mesh_id ?? item.meshId);
-      if (candidate && candidate === meshId) {
+      if (candidate && candidate === normalized) {
+        this.mappingIndexByMeshId.set(normalized, item);
         return item;
       }
     }
@@ -5578,6 +5799,66 @@ function deriveAprsCallsignFromMapping(mapping) {
   }
   if (mapping.callsign) return String(mapping.callsign).toUpperCase();
   return null;
+}
+
+function normalizeAprsCallsign(callsign) {
+  if (callsign == null) return null;
+  const trimmed = String(callsign).trim();
+  if (!trimmed) return null;
+  return trimmed.toUpperCase();
+}
+
+function parseAprsFrameLine(line) {
+  if (!line) return null;
+  const trimmed = String(line).trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/^([A-Za-z0-9]{1,9}(?:-[A-Za-z0-9]{1,2})?)>[^:]*:(.*)$/);
+  if (!match) {
+    return null;
+  }
+  const sourceCallsign = normalizeAprsCallsign(match[1]);
+  if (!sourceCallsign) {
+    return null;
+  }
+  return {
+    sourceCallsign,
+    infoString: match[2]
+  };
+}
+
+function buildAprsPacketCacheKey(callsign, infoString) {
+  const normalizedCallsign = normalizeAprsCallsign(callsign);
+  if (!normalizedCallsign) return null;
+  const normalizedInfo =
+    typeof infoString === 'string' ? infoString : String(infoString ?? '');
+  return `${normalizedCallsign}${APRS_PACKET_KEY_SEPARATOR}${normalizedInfo}`;
+}
+
+function extractCallsignFromAprsKey(key) {
+  if (typeof key !== 'string') return null;
+  const index = key.indexOf(APRS_PACKET_KEY_SEPARATOR);
+  if (index === -1) {
+    return normalizeAprsCallsign(key);
+  }
+  return normalizeAprsCallsign(key.slice(0, index));
+}
+
+function isMappingEntryEnabled(mapping) {
+  if (!mapping) return false;
+  const flagCandidates = [
+    mapping.enabled,
+    mapping.aprs_enabled,
+    mapping.aprsEnabled,
+    mapping.allow_aprs,
+    mapping.allowAprs
+  ];
+  for (const flag of flagCandidates) {
+    if (flag === undefined || flag === null) {
+      continue;
+    }
+    return Boolean(flag);
+  }
+  return true;
 }
 
 function formatTelemetryValue(value) {
