@@ -755,6 +755,65 @@ class TelemetryDatabase {
     return rows.map((row) => this._composeRecord(row, metricsMap.get(row.id) || []));
   }
 
+  *streamRecords({ meshId, startMs = null, endMs = null, order = 'asc' } = {}) {
+    if (!this.db) {
+      throw new Error('TelemetryDatabase 尚未初始化');
+    }
+    const normalizedMeshId = sanitizeText(meshId);
+    if (!normalizedMeshId) {
+      return;
+    }
+    const params = { meshId: normalizedMeshId };
+    const conditions = ['mesh_id = @meshId'];
+    if (Number.isFinite(Number(startMs))) {
+      params.startMs = Math.floor(Number(startMs));
+      conditions.push('timestamp_ms >= @startMs');
+    }
+    if (Number.isFinite(Number(endMs))) {
+      params.endMs = Math.floor(Number(endMs));
+      conditions.push('timestamp_ms <= @endMs');
+    }
+    const direction = String(order).toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+    const sql = `
+      SELECT *
+      FROM telemetry_records
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY timestamp_ms ${direction}
+    `;
+    const stmt = this.db.prepare(sql);
+    const rowsIterable =
+      typeof stmt.iterate === 'function' ? stmt.iterate(params) : stmt.all(params);
+    const batch = [];
+    const batchSize = 256;
+    const flushBatch = (rows) => {
+      if (!rows.length) {
+        return [];
+      }
+      const metricsMap = this._fetchMetricsForRecords(rows.map((row) => row.id));
+      return rows.map((row) => this._composeRecord(row, metricsMap.get(row.id) || []));
+    };
+    for (const row of rowsIterable) {
+      batch.push(row);
+      if (batch.length >= batchSize) {
+        const composed = flushBatch(batch);
+        batch.length = 0;
+        for (const record of composed) {
+          if (record) {
+            yield record;
+          }
+        }
+      }
+    }
+    if (batch.length) {
+      const composed = flushBatch(batch);
+      for (const record of composed) {
+        if (record) {
+          yield record;
+        }
+      }
+    }
+  }
+
   _serializeRecord(record) {
     if (!record || typeof record !== 'object') {
       return null;

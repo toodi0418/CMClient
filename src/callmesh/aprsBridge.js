@@ -4595,7 +4595,21 @@ class CallMeshAprsBridge extends EventEmitter {
     startMs,
     endMs
   }) {
-    const filePath = this.getTelemetryStorePath();
+    if (this.telemetryDb) {
+      const records = this.telemetryDb.streamRecords({
+        meshId,
+        startMs,
+        endMs,
+        order: 'asc'
+      });
+      for (const record of records) {
+        if (!record) continue;
+        yield record;
+      }
+      return;
+    }
+
+    const filePath = this.getLegacyTelemetryStorePath();
     let stream;
     try {
       await fs.access(filePath, fsSync.constants.F_OK);
