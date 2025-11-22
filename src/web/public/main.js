@@ -4813,9 +4813,8 @@ function ensureRelayGuessSuffix(label, summary) {
     return tr;
   }
 
-  function setAprsBadge(row, callsign) {
-    if (!row || !callsign) return;
-    row.dataset.aprsCallsign = callsign;
+  function setAprsBadge(row, text, { variant = 'success', datasetValue = null } = {}) {
+    if (!row || !text) return;
     const infoCell = row.querySelector('.info-cell');
     if (!infoCell) return;
     let badge = infoCell.querySelector('.aprs-badge');
@@ -4824,7 +4823,44 @@ function ensureRelayGuessSuffix(label, summary) {
       badge.className = 'aprs-badge';
       infoCell.appendChild(badge);
     }
-    badge.textContent = `APRS: ${callsign}`;
+    if (variant === 'success') {
+      if (datasetValue) {
+        row.dataset.aprsCallsign = datasetValue;
+      }
+      badge.classList.remove('aprs-badge-rejected');
+    } else {
+      delete row.dataset.aprsCallsign;
+      badge.classList.add('aprs-badge-rejected');
+    }
+    badge.textContent = text;
+  }
+
+  function formatAprsRejectedBadge(summary) {
+    if (!summary) return '條件不符';
+    if (typeof summary.aprsRejectedLabel === 'string' && summary.aprsRejectedLabel.trim()) {
+      return summary.aprsRejectedLabel.trim();
+    }
+    const reason = String(summary.aprsRejectedReason || '').toLowerCase();
+    switch (reason) {
+      case 'local-repeat':
+        return '本機冷卻時間內已上傳';
+      case 'seen-on-feed':
+        return 'APRS-IS 已有相同封包';
+      case 'recent-activity':
+        return '呼號冷卻中';
+      default:
+        return '不符合 APRS 上傳條件';
+    }
+  }
+
+  function applyAprsState(row, summary) {
+    if (!row || !summary) return;
+    if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) {
+      const label = formatAprsRejectedBadge(summary);
+      row.classList.remove('summary-row-aprs');
+      row.classList.add('summary-row-aprs-rejected');
+      setAprsBadge(row, `APRS 拒絕：${label}`, { variant: 'rejected' });
+    }
   }
 
   function shouldDiscardSummaryForReplay(summary, { skipGuard = false } = {}) {
@@ -4870,11 +4906,12 @@ function ensureRelayGuessSuffix(label, summary) {
       flowRowMap.set(flowId, row);
       if (aprsHighlightedFlows.has(flowId)) {
         row.classList.add('summary-row-aprs');
+        row.classList.remove('summary-row-aprs-rejected');
         aprsHighlightedFlows.delete(flowId);
       }
       const aprsCallsign = flowAprsCallsigns.get(flowId);
       if (aprsCallsign) {
-        setAprsBadge(row, aprsCallsign);
+        setAprsBadge(row, `APRS: ${aprsCallsign}`, { variant: 'success', datasetValue: aprsCallsign });
       }
     }
 
@@ -4898,6 +4935,7 @@ function ensureRelayGuessSuffix(label, summary) {
     }
 
     registerFlow(summary);
+    applyAprsState(row, summary);
   }
 
   function refreshSummaryRows() {
@@ -5716,9 +5754,10 @@ function ensureRelayGuessSuffix(label, summary) {
     const row = flowRowMap.get(info.flowId);
     if (row) {
       row.classList.add('summary-row-aprs');
+      row.classList.remove('summary-row-aprs-rejected');
       aprsHighlightedFlows.delete(info.flowId);
       if (callsign) {
-        setAprsBadge(row, callsign);
+        setAprsBadge(row, `APRS: ${callsign}`, { variant: 'success', datasetValue: callsign });
       }
     }
     const aprsRecord = buildAprsRecord(info);
@@ -6006,10 +6045,11 @@ function ensureRelayGuessSuffix(label, summary) {
         if (flowId) {
           const badgeCallsign = flowAprsCallsigns.get(flowId);
           if (badgeCallsign) {
-            setAprsBadge(row, badgeCallsign);
+            setAprsBadge(row, `APRS: ${badgeCallsign}`, { variant: 'success', datasetValue: badgeCallsign });
           }
         }
       }
+      applyAprsState(row, summary);
     }
   }
 

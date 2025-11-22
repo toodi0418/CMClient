@@ -3327,7 +3327,14 @@ class CallMeshAprsBridge extends EventEmitter {
     if (!summary || !Number.isFinite(summary.lastSeen)) {
       return false;
     }
-    return now - summary.lastSeen < APRS_CALLSIGN_RECENT_SUPPRESS_MS;
+    const elapsed = now - summary.lastSeen;
+    if (elapsed < APRS_CALLSIGN_RECENT_SUPPRESS_MS) {
+      return {
+        remainingMs: Math.max(0, APRS_CALLSIGN_RECENT_SUPPRESS_MS - elapsed),
+        elapsedMs: elapsed
+      };
+    }
+    return false;
   }
 
   handleAprsConnected() {
@@ -3613,16 +3620,30 @@ class CallMeshAprsBridge extends EventEmitter {
     const now = Date.now();
 
     if (this.hasLocalAprsTransmission(normalizedCallsign, payload, now)) {
+      this.markAprsSummaryRejected(summary, 'local-repeat', {
+        callsign: normalizedCallsign,
+        windowMs: APRS_LOCAL_TX_WINDOW_MS
+      });
       this.emitLog('APRS', `uplink skipped (local repeat) callsign=${normalizedCallsign}`);
       return;
     }
 
     if (this.hasAprsPacketBeenSeenRecently(normalizedCallsign, payload, now)) {
+      this.markAprsSummaryRejected(summary, 'seen-on-feed', {
+        callsign: normalizedCallsign,
+        windowMs: APRS_PACKET_RECENT_WINDOW_MS
+      });
       this.emitLog('APRS', `uplink skipped (seen on APRS-IS) callsign=${normalizedCallsign}`);
       return;
     }
 
-    if (this.shouldSuppressDueToRecentCallsignActivity(normalizedCallsign, now)) {
+    const recentSuppression = this.shouldSuppressDueToRecentCallsignActivity(normalizedCallsign, now);
+    if (recentSuppression) {
+      this.markAprsSummaryRejected(summary, 'recent-activity', {
+        callsign: normalizedCallsign,
+        windowMs: APRS_CALLSIGN_RECENT_SUPPRESS_MS,
+        remainingMs: recentSuppression.remainingMs
+      });
       this.emitLog('APRS', `uplink skipped (recent APRS activity) callsign=${normalizedCallsign}`);
       return;
     }
@@ -3663,6 +3684,33 @@ class CallMeshAprsBridge extends EventEmitter {
       if (firstKey) {
         this.aprsLastPositionDigest.delete(firstKey);
       }
+    }
+  }
+
+  markAprsSummaryRejected(summary, reasonCode, context = {}) {
+    if (!summary || typeof summary !== 'object') {
+      return;
+    }
+    if (!Array.isArray(summary.extraLines)) {
+      summary.extraLines = [];
+    }
+    const code = reasonCode || 'unknown';
+    const label = formatAprsRejectionLabel(code, context) || '不符合 APRS 上傳條件';
+    const message = `APRS 略過：${label}`;
+    summary.aprsRejected = true;
+    summary.aprsRejectedReason = code;
+    summary.aprsRejectedLabel = label;
+    summary.aprsRejectedAt = Date.now();
+    const rejectionContext = {};
+    if (Number.isFinite(context?.windowMs)) {
+      rejectionContext.windowMs = context.windowMs;
+    }
+    if (Number.isFinite(context?.remainingMs)) {
+      rejectionContext.remainingMs = context.remainingMs;
+    }
+    summary.aprsRejectedContext = rejectionContext;
+    if (!summary.extraLines.includes(message)) {
+      summary.extraLines.push(message);
     }
   }
 
@@ -5859,6 +5907,53 @@ function isMappingEntryEnabled(mapping) {
     return Boolean(flag);
   }
   return true;
+}
+
+function formatAprsRejectionLabel(reason, context = {}) {
+  const normalized = typeof reason === 'string' ? reason.toLowerCase() : '';
+  const windowLabel = Number.isFinite(context.windowMs)
+    ? formatDurationZh(context.windowMs)
+    : null;
+  const remainingLabel = Number.isFinite(context.remainingMs)
+    ? formatDurationZh(context.remainingMs)
+    : null;
+  switch (normalized) {
+    case 'local-repeat':
+      return windowLabel ? `本機 ${windowLabel} 內已上傳` : '本機冷卻時間內已上傳';
+    case 'seen-on-feed':
+      return windowLabel ? `APRS-IS ${windowLabel} 內已有相同封包` : 'APRS-IS 已存在相同封包';
+    case 'recent-activity':
+      if (remainingLabel) {
+        return `呼號冷卻中（剩餘 ${remainingLabel}）`;
+      }
+      return windowLabel ? `呼號冷卻中（需等待 ${windowLabel}）` : '呼號冷卻中';
+    default:
+      return context.message || '不符合 APRS 上傳條件';
+  }
+}
+
+function formatDurationZh(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return null;
+  }
+  const totalSeconds = Math.max(1, Math.round(ms / 1000));
+  if (totalSeconds >= 3600) {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.round((totalSeconds % 3600) / 60);
+    if (minutes > 0) {
+      return `${hours} 小時 ${minutes} 分鐘`;
+    }
+    return `${hours} 小時`;
+  }
+  if (totalSeconds >= 60) {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (seconds > 0) {
+      return `${minutes} 分 ${seconds} 秒`;
+    }
+    return `${minutes} 分鐘`;
+  }
+  return `${totalSeconds} 秒`;
 }
 
 function formatTelemetryValue(value) {
