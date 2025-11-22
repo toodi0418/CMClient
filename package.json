@@ -24,9 +24,9 @@
     "yargs": "^17.7.2"
   },
   "devDependencies": {
+    "@yao-pkg/pkg": "^6.10.1",
     "electron": "^39.2.2",
-    "electron-packager": "^17.1.2",
-    "pkg": "^5.8.1"
+    "electron-packager": "^17.1.2"
   },
   "pkg": {
     "assets": [
