@@ -11,6 +11,8 @@
 - **遙測圖表**：Chart.js Tooltip 會依實際最小差距動態套用小數位數，避免相同值因四捨五入看似變化；Y 軸／最新值同步採用此精度。
 - **Web Telemetry 初始同步**：Electron 啟動以及 API Key 驗證流程完成後，都會將最新遙測快照播送給 Web Server，確保頁面立即有資料。
 - **SSE 管線**：Electron 端每當遙測 `append/reset` 出現時，會同時廣播給 Renderer 與 Web Server，兩側資料來源一致。
+- **CLI Summary Log**：`node src/index.js` 新增 `--summary-log` 旗標，會將所有 summary 事件寫入 `CALLMESH_ARTIFACTS_DIR/logs/summary-YYYYMMDD.jsonl`；亦可用 `--summary-log-dir` 指定輸出目錄，便於追蹤 directed 封包或分析網路事件。
+- **Web 封包摘要對齊 GUI**：Web Dashboard 的封包表格改用與 GUI 相同的欄位順序、型別 icon、Detail DOM 與節點顯示邏輯，並在 SSE 初始階段先送出 `node-snapshot` 再推 `summary-batch`，避免連線剛建立時一度出現 `unknown`。
 - **節點資料庫**：新增 `src/nodeDatabase.js`，集中維護 Mesh 節點的長名稱、模型、角色與最後出現時間；CLI、Electron、Web 均透過 Bridge 發佈 `node` / `node-snapshot` 事件使用同一份資料。2025-11-20 起，只要收到含合法 Mesh ID 的封包（NodeInfo / MyInfo / 其他 summary）即可立即建立節點，之後再由 NodeInfo 慢慢補齊名稱與型號，避免清庫後畫面長時間只有 Mesh ID。
 - **節點清單座標顯示**：Electron / Web 節點頁新增「座標」欄，會顯示緯度、經度與高度（若可用），並支援以座標字串搜尋；同時過濾 `!abcd` 前綴暫存 ID。
 - **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.sqlite` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
@@ -376,6 +378,8 @@ kill <pid> ...                      # 如有需要手動結束
 1. 啟動 `npm run desktop`
 2. 開瀏覽器至啟動 log 顯示的實際網址（預設為 `http://localhost:7080`）
 3. 若需禁用：`TMAG_WEB_DASHBOARD=0 npm run desktop`
+4. 監視頁的「來源 → 目的」欄位使用與 GUI 完全一致的 `formatNodes` 輸出，節點名稱會優先套用節點資料庫長／短名，並附上 Mesh ID；SSE 初始快照亦會先送 `node-snapshot` 再送 `summary-batch`，確保頁面開啟時不會短暫顯示 `unknown`。
+5. Electron 端已對 `startWebDashboard()` 加上啟動 guard，短時間內多次切換 Web UI 或偏好設定時不會再啟動多個 Web Server（以前會一路佔用 7080 以上的 port）。若 log 出現 `Dashboard 連接埠 7080 已被佔用`，可重整確認是否有舊版執行檔殘留，而非 UI 競態所致。
 
 ### 6.3 CLI
 
@@ -393,6 +397,10 @@ node src/index.js --connection serial --serial-path /dev/ttyUSB0 --serial-baud 1
 # 或可直接透過 host 指定 serial:// 路徑（同樣採 115200 bps，若需其他速率再帶 --serial-baud）
 node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 ```
+
+- `--summary-log`：啟用後會把所有 summary 事件寫入 `CALLMESH_ARTIFACTS_DIR/logs/summary-YYYYMMDD.jsonl`，內容包含 from/to/relay/hops 等欄位，方便追查 directed 封包。
+- `--summary-log-dir`：自訂輸出目錄（若未指定則寫入 `callmesh/logs`）。兩個旗標可同時使用，適用於長時間紀錄或與外部分析腳本串接。
+- Log 檔格式為 JSONL，可直接用 `rg` / `jq` 快速篩選，例如：`rg '\"to\":.*!dd8778e7' summary-20251122.jsonl`.
 
 - Electron 設定頁的「連線模式」可切換 TCP/Serial，Serial 模式可從清單選擇偵測到的裝置或手動輸入 `serial:///` 路徑。
 

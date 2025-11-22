@@ -271,6 +271,7 @@ let callmeshRestoreAllowed = true;
 let lastCallmeshStateSnapshot = null;
 let cachedClientPreferences = null;
 let webServer = null;
+let webServerStartPromise = null;
 let lastMeshtasticStatus = { status: 'idle' };
 
 process.on('uncaughtException', (err) => {
@@ -737,31 +738,48 @@ async function startWebDashboard() {
   if (webServer) {
     return true;
   }
-  try {
-    const options = {
-      appVersion,
-      relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json'),
-      relayStatsStore: bridge?.getDataStore?.(),
-      messageLogPath: getMessageLogPath(),
-      messageLogStore: bridge?.getDataStore?.(),
-      telemetryProvider: bridge
-    };
-    const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
-    if (telemetryMaxTotalOverride) {
-      options.telemetryMaxTotalRecords = telemetryMaxTotalOverride;
-    }
-    const server = new WebDashboardServer(options);
-    await server.start();
-    server.setAppVersion(appVersion);
-    webServer = server;
-    return true;
-  } catch (err) {
-    console.error('啟動 Web Dashboard 失敗:', err);
-    return false;
+  if (webServerStartPromise) {
+    await webServerStartPromise;
+    return Boolean(webServer);
   }
+  webServerStartPromise = (async () => {
+    try {
+      const options = {
+        appVersion,
+        relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json'),
+        relayStatsStore: bridge?.getDataStore?.(),
+        messageLogPath: getMessageLogPath(),
+        messageLogStore: bridge?.getDataStore?.(),
+        telemetryProvider: bridge
+      };
+      const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
+      if (telemetryMaxTotalOverride) {
+        options.telemetryMaxTotalRecords = telemetryMaxTotalOverride;
+      }
+      const server = new WebDashboardServer(options);
+      await server.start();
+      server.setAppVersion(appVersion);
+      webServer = server;
+      return true;
+    } catch (err) {
+      console.error('啟動 Web Dashboard 失敗:', err);
+      return false;
+    } finally {
+      webServerStartPromise = null;
+    }
+  })();
+  return webServerStartPromise;
 }
 
 async function shutdownWebDashboard() {
+  const pendingStart = webServerStartPromise;
+  if (pendingStart) {
+    try {
+      await pendingStart;
+    } catch {
+      // ignore start errors, continue shutdown
+    }
+  }
   if (!webServer) return;
   try {
     await webServer.stop();

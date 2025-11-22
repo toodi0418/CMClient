@@ -22,6 +22,104 @@ function getMessageLogPath() {
   return path.join(getArtifactsDir(), MESSAGE_LOG_FILENAME);
 }
 
+function sanitizeStringArray(arr) {
+  return Array.isArray(arr)
+    ? arr
+        .map((line) => (typeof line === 'string' ? line.trim() : ''))
+        .filter(Boolean)
+    : [];
+}
+
+function sanitizeNodeForLog(node) {
+  if (!node || typeof node !== 'object') {
+    return null;
+  }
+  const pick = (value) => (typeof value === 'string' ? value : null);
+  return {
+    label: pick(node.label),
+    meshId: pick(node.meshId),
+    meshIdNormalized: pick(node.meshIdNormalized),
+    meshIdOriginal: pick(node.meshIdOriginal),
+    shortName: pick(node.shortName),
+    longName: pick(node.longName)
+  };
+}
+
+function createSummaryFileLogger(baseDir, { prefix = 'summary' } = {}) {
+  let writeChain = Promise.resolve();
+  let currentDateKey = null;
+  let currentFilePath = null;
+
+  const ensureDirectory = async () => {
+    await fs.mkdir(baseDir, { recursive: true });
+  };
+
+  const formatDateKey = (timestampMs) => {
+    const date = new Date(timestampMs);
+    const pad = (value) => String(value).padStart(2, '0');
+    const year = date.getFullYear();
+    const month = pad(date.getMonth() + 1);
+    const day = pad(date.getDate());
+    return `${year}${month}${day}`;
+  };
+
+  const ensureFilePath = async (timestampMs) => {
+    const dateKey = formatDateKey(timestampMs);
+    if (currentDateKey === dateKey && currentFilePath) {
+      return currentFilePath;
+    }
+    await ensureDirectory();
+    currentDateKey = dateKey;
+    currentFilePath = path.join(baseDir, `${prefix}-${dateKey}.jsonl`);
+    return currentFilePath;
+  };
+
+  const buildEntry = (summary, timestampMs) => {
+    const timestampIso = new Date(timestampMs).toISOString();
+    return {
+      timestamp: timestampIso,
+      timestampMs,
+      type: summary.type ?? null,
+      channel: summary.channel ?? null,
+      from: sanitizeNodeForLog(summary.from),
+      to: sanitizeNodeForLog(summary.to),
+      relay: sanitizeNodeForLog(summary.relay),
+      hops: summary.hops || null,
+      snr: Number.isFinite(summary.snr) ? Number(summary.snr) : null,
+      rssi: Number.isFinite(summary.rssi) ? Number(summary.rssi) : null,
+      detail: typeof summary.detail === 'string' ? summary.detail : null,
+      extraLines: sanitizeStringArray(summary.extraLines),
+      meshPacketId: Number.isFinite(summary.meshPacketId) ? Number(summary.meshPacketId) : null,
+      flowId:
+        typeof summary.flowId === 'string' && summary.flowId.trim() ? summary.flowId.trim() : null,
+      replyId: Number.isFinite(summary.replyId) ? Number(summary.replyId) : null,
+      replyTo: typeof summary.replyTo === 'string' ? summary.replyTo : null,
+      scope: typeof summary.scope === 'string' ? summary.scope : null,
+      synthetic: Boolean(summary.synthetic),
+      rawHex: typeof summary.rawHex === 'string' ? summary.rawHex : null
+    };
+  };
+
+  return {
+    log(summary) {
+      if (!summary) return;
+      const timestampMs = Number.isFinite(summary.timestampMs)
+        ? Number(summary.timestampMs)
+        : Date.now();
+      writeChain = writeChain
+        .catch(() => {})
+        .then(async () => {
+          const filePath = await ensureFilePath(timestampMs);
+          const entry = buildEntry(summary, timestampMs);
+          await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf8');
+        })
+        .catch((err) => {
+          console.warn(`寫入 summary log 失敗：${err.message}`);
+        });
+    }
+  };
+}
+
 function tryPublishWebMessage(webServer, summary) {
   if (!webServer || !summary || typeof summary !== 'object') {
     return;
@@ -34,12 +132,6 @@ function tryPublishWebMessage(webServer, summary) {
   if (!Number.isFinite(channelId) || channelId < 0) {
     return;
   }
-  const sanitizeStringArray = (arr) =>
-    Array.isArray(arr)
-      ? arr
-          .map((line) => (typeof line === 'string' ? line.trim() : ''))
-          .filter(Boolean)
-      : [];
   const detail = typeof summary.detail === 'string' ? summary.detail : '';
   const extraLines = sanitizeStringArray(summary.extraLines);
   const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
@@ -221,6 +313,15 @@ async function main() {
             default: false,
             describe: '啟用內建 Web Dashboard（預設為關閉）'
           })
+          .option('summary-log', {
+            type: 'boolean',
+            default: false,
+            describe: '啟用 Summary 事件 JSONL 紀錄'
+          })
+          .option('summary-log-dir', {
+            type: 'string',
+            describe: '自訂 Summary Log 儲存目錄（預設為 artifacts/logs）'
+          })
           .option('clear-nodedb', {
             type: 'boolean',
             default: false,
@@ -264,6 +365,15 @@ async function startMonitor(argv) {
   const artifactsDir = getArtifactsDir();
   const shareWithTenmanMapOverride =
     argv.noShareWithTenmanmap ? false : null;
+  const summaryLogRequested = Boolean(argv.summaryLog || argv.summaryLogDir);
+  let summaryLogger = null;
+  if (summaryLogRequested) {
+    const summaryLogDir = path.resolve(
+      argv.summaryLogDir || path.join(artifactsDir, 'logs')
+    );
+    summaryLogger = createSummaryFileLogger(summaryLogDir);
+    console.log(`[SUMMARY-LOG] 將 Summary 事件寫入 ${summaryLogDir}`);
+  }
 
   const bridgeOptions = {
     storageDir: artifactsDir,
@@ -711,6 +821,7 @@ async function startMonitor(argv) {
     const displaySummary = sanitizeSummaryForDisplay(summary) || summary;
     webServer?.publishSummary(displaySummary);
     tryPublishWebMessage(webServer, displaySummary);
+    summaryLogger?.log(displaySummary);
 
     if (argv.format !== 'summary') {
       return;
