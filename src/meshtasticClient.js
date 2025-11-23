@@ -11,6 +11,7 @@ const protobuf = require('protobufjs');
 
 const { unishox2_decompress_simple } = require('unishox2.siara.cc');
 const { nodeDatabase } = require('./nodeDatabase');
+const { CallMeshDataStore } = require('./storage/callmeshDataStore');
 
 const MAGIC = 0x94c3;
 const HEADER_SIZE = 4;
@@ -87,7 +88,41 @@ class MeshtasticClient extends EventEmitter {
     this._transportType = this.options.transport;
     this.nodeMap = new Map();
     this._relayLinkStats = new Map();
-    this._relayStatsPath = options.relayStatsPath ? path.resolve(options.relayStatsPath) : null;
+    this._relayStatsStore = null;
+    this._relayStatsStoreOwned = false;
+    this._relayStatsStorePath = null;
+    this._relayStatsLegacyPath = null;
+    if (options.relayStatsStore && typeof options.relayStatsStore === 'object') {
+      this._relayStatsStore = options.relayStatsStore;
+    }
+    const relayStatsPathCandidate = options.relayStatsPath
+      ? path.resolve(options.relayStatsPath)
+      : null;
+    if (!this._relayStatsStore && relayStatsPathCandidate) {
+      if (/\.sqlite$/i.test(relayStatsPathCandidate)) {
+        this._relayStatsStorePath = relayStatsPathCandidate;
+        this._relayStatsLegacyPath = relayStatsPathCandidate.replace(/\.sqlite$/i, '.json');
+      } else if (/\.json$/i.test(relayStatsPathCandidate)) {
+        this._relayStatsLegacyPath = relayStatsPathCandidate;
+        this._relayStatsStorePath = relayStatsPathCandidate.replace(/\.json$/i, '.sqlite');
+      } else {
+        this._relayStatsStorePath = relayStatsPathCandidate;
+        this._relayStatsLegacyPath = `${relayStatsPathCandidate}.json`;
+      }
+    }
+    if (!this._relayStatsStore && this._relayStatsStorePath) {
+      try {
+        this._relayStatsStore = new CallMeshDataStore(this._relayStatsStorePath);
+        this._relayStatsStore.init();
+        this._relayStatsStoreOwned = true;
+      } catch (err) {
+        console.warn(`初始化 relay stats SQLite 失敗: ${err.message}`);
+        this._relayStatsStore = null;
+      }
+    }
+    if (!this._relayStatsLegacyPath && relayStatsPathCandidate) {
+      this._relayStatsLegacyPath = relayStatsPathCandidate;
+    }
     this._relayStatsPersistIntervalMs = Number.isFinite(options.relayStatsPersistIntervalMs)
       ? Math.max(Number(options.relayStatsPersistIntervalMs), 1000)
       : 30_000;
@@ -148,6 +183,7 @@ class MeshtasticClient extends EventEmitter {
     // the firmware sets relay_node to the full node id, but in some cases only
     // the low byte is populated (e.g. 0x24 for node ending with 0x24).
     if (raw === 0) return { nodeId: 0, guessed: false };
+    const isTruncatedId = raw <= 0xff;
     if (raw > 0xff) {
       return { nodeId: raw >>> 0, guessed: false };
     }
@@ -159,48 +195,6 @@ class MeshtasticClient extends EventEmitter {
     let selfNormalized = this._selfNodeNormalized || null;
     if (!selfNormalized && selfNumeric != null) {
       selfNormalized = formatHexId(selfNumeric);
-    }
-    const tailCandidates = this._relayTailCandidates.get(raw);
-    if (tailCandidates && tailCandidates.size) {
-      for (const candidate of tailCandidates) {
-        if (!Number.isFinite(candidate)) continue;
-        const numericCandidate = candidate >>> 0;
-        if (selfNumeric != null && numericCandidate === selfNumeric) {
-          continue;
-        }
-        if (this._shouldIgnoreMeshId(numericCandidate)) {
-          continue;
-        }
-        matches.add(numericCandidate);
-      }
-    }
-    for (const [num, entry] of this.nodeMap.entries()) {
-      const numeric = Number(num) >>> 0;
-      if (this._shouldIgnoreMeshId(numeric)) {
-        continue;
-      }
-      if (selfNumeric != null && numeric === selfNumeric) {
-        continue;
-      }
-      if ((numeric & 0xff) === raw && !matches.has(numeric)) {
-        matches.add(numeric);
-      }
-      const idStr = typeof entry?.id === 'string' ? entry.id : null;
-      if (idStr) {
-        const cleaned = idStr.replace(/[^0-9a-fA-F]/g, '');
-        if (cleaned.length === 8) {
-          const parsed = parseInt(cleaned, 16) >>> 0;
-          if (this._shouldIgnoreMeshId(parsed)) {
-            continue;
-          }
-          if (selfNumeric != null && parsed === selfNumeric) {
-            continue;
-          }
-          if ((parsed & 0xff) === raw && !matches.has(parsed)) {
-            matches.add(parsed);
-          }
-        }
-      }
     }
     for (const key of this._relayLinkStats.keys()) {
       const candidate = Number(key) >>> 0;
@@ -214,48 +208,35 @@ class MeshtasticClient extends EventEmitter {
         matches.add(candidate);
       }
     }
-    try {
-      const dbEntries = typeof nodeDatabase?.list === 'function' ? nodeDatabase.list() : [];
-      if (Array.isArray(dbEntries)) {
-        for (const entry of dbEntries) {
-          const meshCandidate =
-            entry?.meshId ||
-            entry?.meshIdNormalized ||
-            entry?.meshIdOriginal ||
-            entry?.mesh_id ||
-            entry?.mesh_id_normalized ||
-            entry?.mesh_id_original;
-          const normalized = normalizeMeshId(meshCandidate);
-          if (!normalized) continue;
-          if (this._shouldIgnoreMeshId(normalized)) {
-            continue;
-          }
-          if (selfNormalized && normalized === selfNormalized) {
-            continue;
-          }
-          const numeric = parseInt(normalized.slice(1), 16);
-          if (!Number.isFinite(numeric)) continue;
-          const candidate = numeric >>> 0;
-          if (selfNumeric != null && candidate === selfNumeric) {
-            continue;
-          }
-          if ((candidate & 0xff) === raw && !matches.has(candidate)) {
-            matches.add(candidate);
-          }
-        }
-      }
-    } catch (err) {
-      if (process.env.DEBUG_RELAY_GUESS) {
-        console.warn('[relay-guess] node database access failed:', err.message);
-      }
-    }
     if (matches.size === 1) {
       const [match] = matches;
       if (selfNumeric != null && (match >>> 0) === selfNumeric) {
         return null;
       }
+      const normalizedId = formatHexId(match >>> 0);
+      let hasNodeRecord = false;
+      try {
+        hasNodeRecord = Boolean(nodeDatabase?.get?.(normalizedId));
+      } catch {
+        hasNodeRecord = false;
+      }
+      const missingDbRecord = !hasNodeRecord;
+      const guessed = isTruncatedId || missingDbRecord;
+      const reasonParts = [];
+      if (missingDbRecord) {
+        reasonParts.push('節點資料庫尚未包含完整 Mesh ID');
+      }
+      if (isTruncatedId) {
+        reasonParts.push('韌體僅提供節點尾碼');
+      }
       this._recordRelayTailCandidate(match >>> 0);
-      return { nodeId: match >>> 0, guessed: false };
+      return {
+        nodeId: match >>> 0,
+        guessed,
+        reason: reasonParts.length ? reasonParts.join('；') : undefined,
+        tailNodeId: raw >>> 0,
+        forceTailLabel: missingDbRecord
+      };
     }
     const candidates = Array.from(matches);
     const guessResult = this._guessRelayCandidate(candidates, { snr, rssi });
@@ -263,7 +244,11 @@ class MeshtasticClient extends EventEmitter {
       if (guessResult.nodeId != null) {
         this._recordRelayTailCandidate(guessResult.nodeId);
       }
-      return guessResult;
+      return {
+        ...guessResult,
+        tailNodeId: guessResult.tailNodeId ?? raw >>> 0,
+        forceTailLabel: guessResult.forceTailLabel || isTruncatedId
+      };
     }
     if (matches.size > 1) {
       const suffix = raw.toString(16).padStart(2, '0').toUpperCase();
@@ -278,7 +263,9 @@ class MeshtasticClient extends EventEmitter {
       return {
         nodeId: raw >>> 0,
         guessed: true,
-        reason: parts.join('；')
+        reason: parts.join('；'),
+        tailNodeId: raw >>> 0,
+        forceTailLabel: true
       };
     }
     const fallbackNodeId = raw >>> 0;
@@ -286,7 +273,13 @@ class MeshtasticClient extends EventEmitter {
       return null;
     }
     this._recordRelayTailCandidate(fallbackNodeId);
-    return { nodeId: fallbackNodeId, guessed: false };
+    return {
+      nodeId: fallbackNodeId,
+      guessed: true,
+      reason: '僅收到節點尾碼',
+      tailNodeId: fallbackNodeId,
+      forceTailLabel: true
+    };
   }
 
   _recordRelayLinkMetrics(nodeId, { snr = null, rssi = null } = {}) {
@@ -495,8 +488,11 @@ class MeshtasticClient extends EventEmitter {
     return labels;
   }
 
-  _isDirectReception(summary, { relayNodeId, usedHops, hasRelayResult }) {
+  _isDirectReception(summary, { relayNodeId, usedHops, hasRelayResult, hopLimitOnly = false }) {
     if (!summary || typeof summary !== 'object') {
+      return false;
+    }
+    if (hopLimitOnly) {
       return false;
     }
     const relayExists = relayNodeId != null && relayNodeId !== 0;
@@ -540,11 +536,43 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _loadRelayStatsFromDisk() {
-    if (!this._relayStatsPath) {
+    const now = Date.now();
+    if (this._relayStatsStore) {
+      try {
+        const rows = this._relayStatsStore.listRelayStats();
+        if (Array.isArray(rows) && rows.length) {
+          this._relayLinkStats.clear();
+          for (const row of rows) {
+            if (!row || row.meshKey == null) continue;
+            const numericKey = Number(row.meshKey);
+            if (!Number.isFinite(numericKey) || numericKey <= 0) continue;
+            if (this._shouldIgnoreMeshId(numericKey)) continue;
+            this._relayLinkStats.set(numericKey >>> 0, {
+              snr: Number.isFinite(row.snr) ? row.snr : null,
+              rssi: Number.isFinite(row.rssi) ? row.rssi : null,
+              count: Number.isFinite(row.count) ? Math.max(1, Math.round(row.count)) : 1,
+              updatedAt: Number.isFinite(row.updatedAt) ? row.updatedAt : now
+            });
+          }
+          if (this._relayStatsLegacyPath) {
+            try {
+              fs.unlinkSync(this._relayStatsLegacyPath);
+            } catch {
+              // ignore legacy cleanup failure
+            }
+          }
+          return;
+        }
+      } catch (err) {
+        console.warn(`載入 relay stats SQLite 失敗: ${err.message}`);
+      }
+    }
+    const legacyPath = this._relayStatsLegacyPath;
+    if (!legacyPath) {
       return;
     }
     try {
-      const raw = fs.readFileSync(this._relayStatsPath, 'utf8');
+      const raw = fs.readFileSync(legacyPath, 'utf8');
       if (!raw) {
         return;
       }
@@ -552,8 +580,8 @@ class MeshtasticClient extends EventEmitter {
       if (!data || typeof data !== 'object') {
         return;
       }
+      const entries = [];
       this._relayLinkStats.clear();
-      const now = Date.now();
       for (const [key, value] of Object.entries(data)) {
         if (!value || typeof value !== 'object') continue;
         const numericKey = Number(key);
@@ -568,6 +596,21 @@ class MeshtasticClient extends EventEmitter {
           updatedAt: Number.isFinite(value.updatedAt) ? Number(value.updatedAt) : now
         };
         this._relayLinkStats.set(numericKey >>> 0, entry);
+        entries.push({
+          meshKey: String(numericKey >>> 0),
+          snr: entry.snr,
+          rssi: entry.rssi,
+          count: entry.count,
+          updatedAt: entry.updatedAt
+        });
+      }
+      if (this._relayStatsStore && entries.length) {
+        try {
+          this._relayStatsStore.replaceRelayStats(entries);
+          fs.unlinkSync(legacyPath);
+        } catch (err) {
+          console.warn(`遷移 relay stats 至 SQLite 失敗: ${err.message}`);
+        }
       }
     } catch (err) {
       if (err?.code !== 'ENOENT') {
@@ -577,7 +620,7 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _scheduleRelayStatsPersist() {
-    if (!this._relayStatsPath) {
+    if (!this._relayStatsStore && !this._relayStatsLegacyPath) {
       return;
     }
     this._relayStatsDirty = true;
@@ -595,31 +638,52 @@ class MeshtasticClient extends EventEmitter {
   }
 
   async _persistRelayStats() {
-    if (!this._relayStatsPath || !this._relayStatsDirty || this._relayStatsPersisting) {
+    if (!this._relayStatsDirty || this._relayStatsPersisting) {
       return;
     }
     this._relayStatsPersisting = true;
+    const now = Date.now();
+    const rows = [];
     const payload = {};
     for (const [key, stats] of this._relayLinkStats.entries()) {
-      payload[key] = {
+      const record = {
         snr: Number.isFinite(stats.snr) ? Number(stats.snr) : null,
         rssi: Number.isFinite(stats.rssi) ? Number(stats.rssi) : null,
         count: Number.isFinite(stats.count) ? Math.max(1, Math.round(Number(stats.count))) : 1,
-        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : Date.now()
+        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : now
       };
+      payload[key] = record;
+      rows.push({
+        meshKey: String(key),
+        snr: record.snr,
+        rssi: record.rssi,
+        count: record.count,
+        updatedAt: record.updatedAt
+      });
     }
     try {
-      await fsPromises.mkdir(path.dirname(this._relayStatsPath), { recursive: true });
-      if (Object.keys(payload).length === 0) {
-        try {
-          await fsPromises.unlink(this._relayStatsPath);
-        } catch (err) {
-          if (err?.code !== 'ENOENT') {
-            throw err;
-          }
+      if (this._relayStatsStore) {
+        this._relayStatsStore.replaceRelayStats(rows);
+        if (this._relayStatsLegacyPath) {
+          await fsPromises.rm(this._relayStatsLegacyPath, { force: true });
         }
-      } else {
-        await fsPromises.writeFile(this._relayStatsPath, JSON.stringify(payload, null, 2), 'utf8');
+      } else if (this._relayStatsLegacyPath) {
+        await fsPromises.mkdir(path.dirname(this._relayStatsLegacyPath), { recursive: true });
+        if (Object.keys(payload).length === 0) {
+          try {
+            await fsPromises.unlink(this._relayStatsLegacyPath);
+          } catch (err) {
+            if (err?.code !== 'ENOENT') {
+              throw err;
+            }
+          }
+        } else {
+          await fsPromises.writeFile(
+            this._relayStatsLegacyPath,
+            JSON.stringify(payload, null, 2),
+            'utf8'
+          );
+        }
       }
       this._relayStatsDirty = false;
     } catch (err) {
@@ -631,9 +695,6 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _flushRelayStatsPersistSync() {
-    if (!this._relayStatsPath) {
-      return;
-    }
     if (!this._relayStatsDirty || this._relayStatsPersisting) {
       return;
     }
@@ -641,27 +702,54 @@ class MeshtasticClient extends EventEmitter {
       clearTimeout(this._relayStatsPersistTimer);
       this._relayStatsPersistTimer = null;
     }
+    const now = Date.now();
+    const rows = [];
     const payload = {};
     for (const [key, stats] of this._relayLinkStats.entries()) {
-      payload[key] = {
+      const record = {
         snr: Number.isFinite(stats.snr) ? Number(stats.snr) : null,
         rssi: Number.isFinite(stats.rssi) ? Number(stats.rssi) : null,
         count: Number.isFinite(stats.count) ? Math.max(1, Math.round(Number(stats.count))) : 1,
-        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : Date.now()
+        updatedAt: Number.isFinite(stats.updatedAt) ? Number(stats.updatedAt) : now
       };
+      payload[key] = record;
+      rows.push({
+        meshKey: String(key),
+        snr: record.snr,
+        rssi: record.rssi,
+        count: record.count,
+        updatedAt: record.updatedAt
+      });
     }
     try {
-      fs.mkdirSync(path.dirname(this._relayStatsPath), { recursive: true });
+      if (this._relayStatsStore) {
+        this._relayStatsStore.replaceRelayStats(rows);
+        if (this._relayStatsLegacyPath) {
+          try {
+            fs.unlinkSync(this._relayStatsLegacyPath);
+          } catch (err) {
+            if (err?.code !== 'ENOENT') {
+              throw err;
+            }
+          }
+        }
+        this._relayStatsDirty = false;
+        return;
+      }
+      if (!this._relayStatsLegacyPath) {
+        return;
+      }
+      fs.mkdirSync(path.dirname(this._relayStatsLegacyPath), { recursive: true });
       if (Object.keys(payload).length === 0) {
         try {
-          fs.unlinkSync(this._relayStatsPath);
+          fs.unlinkSync(this._relayStatsLegacyPath);
         } catch (err) {
           if (err?.code !== 'ENOENT') {
             throw err;
           }
         }
       } else {
-        fs.writeFileSync(this._relayStatsPath, JSON.stringify(payload, null, 2), 'utf8');
+        fs.writeFileSync(this._relayStatsLegacyPath, JSON.stringify(payload, null, 2), 'utf8');
       }
       this._relayStatsDirty = false;
     } catch (err) {
@@ -704,6 +792,15 @@ class MeshtasticClient extends EventEmitter {
   stop() {
     this._clearHeartbeat();
     this._flushRelayStatsPersistSync();
+    if (this._relayStatsStoreOwned && this._relayStatsStore && typeof this._relayStatsStore.close === 'function') {
+      try {
+        this._relayStatsStore.close();
+      } catch (err) {
+        console.warn(`關閉 relay stats SQLite 失敗: ${err.message}`);
+      }
+      this._relayStatsStore = null;
+      this._relayStatsStoreOwned = false;
+    }
     if (this._serialConnectTimer) {
       clearTimeout(this._serialConnectTimer);
       this._serialConnectTimer = null;
@@ -1126,6 +1223,62 @@ class MeshtasticClient extends EventEmitter {
     }
   }
 
+  clearNodeCache() {
+    this.nodeMap.clear();
+  }
+
+  clearRelayLinkStats({ clearPersistent = true } = {}) {
+    const clearedEntries = this._relayLinkStats.size;
+    this._relayLinkStats.clear();
+    if (this._relayTailCandidates && typeof this._relayTailCandidates.clear === 'function') {
+      this._relayTailCandidates.clear();
+    }
+    if (this._relayStatsPersistTimer) {
+      clearTimeout(this._relayStatsPersistTimer);
+      this._relayStatsPersistTimer = null;
+    }
+    this._relayStatsDirty = false;
+    this._relayStatsPersisting = false;
+
+    if (clearPersistent) {
+      if (this._relayStatsStore) {
+        try {
+          if (typeof this._relayStatsStore.clearRelayStats === 'function') {
+            this._relayStatsStore.clearRelayStats();
+          } else if (typeof this._relayStatsStore.replaceRelayStats === 'function') {
+            this._relayStatsStore.replaceRelayStats([]);
+          }
+        } catch (err) {
+          console.warn(`[relay-guess] clear relay stats store failed: ${err.message}`);
+        }
+      }
+
+      const deletePath = (filePath) => {
+        if (!filePath) {
+          return;
+        }
+        try {
+          fs.unlinkSync(filePath);
+        } catch (err) {
+          if (err && err.code !== 'ENOENT') {
+            console.warn(`[relay-guess] remove relay stats file failed (${filePath}): ${err.message}`);
+          }
+        }
+      };
+
+      if (this._relayStatsLegacyPath) {
+        deletePath(this._relayStatsLegacyPath);
+      }
+      if (this._relayStatsStoreOwned && this._relayStatsStorePath) {
+        deletePath(this._relayStatsStorePath);
+      }
+    }
+
+    return {
+      cleared: clearedEntries
+    };
+  }
+
   _updateNodeCache(message) {
     switch (message.payloadVariant) {
       case 'nodeInfo': {
@@ -1229,17 +1382,32 @@ class MeshtasticClient extends EventEmitter {
         ? new Date(packetRxTimeSeconds * 1000)
         : new Date();
     const fromInfo = this._formatNode(packet.from);
+    if (fromInfo && decodeInfo?.nodeInfo) {
+      this._applyDecodedNodeInfo(fromInfo, decodeInfo.nodeInfo);
+    }
     const toInfo = packet.to === BROADCAST_ADDR ? null : this._formatNode(packet.to);
     const linkMetrics = {
       snr: Number.isFinite(packet.rxSnr) ? Number(packet.rxSnr) : null,
       rssi: Number.isFinite(packet.rxRssi) ? Number(packet.rxRssi) : null
     };
-    const hopStart = Number(packet.hopStart);
-    const hopLimit = Number(packet.hopLimit);
+    const toFiniteOrNull = (value) => {
+      if (value === null || value === undefined) {
+        return null;
+      }
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+
+    const rawHopStart = toFiniteOrNull(packet.hopStart);
+    const rawHopLimit = toFiniteOrNull(packet.hopLimit);
+    const hopStartValue = rawHopStart != null && rawHopStart > 0 ? rawHopStart : null;
+    const hopLimitValue = rawHopLimit != null && rawHopLimit >= 0 ? rawHopLimit : null;
+    const hopLimitOnly =
+      hopLimitValue != null && hopLimitValue > 0 && hopStartValue == null;
     let usedHops = null;
-    if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
-      usedHops = Math.max(hopStart - hopLimit, 0);
-    } else if (Number.isFinite(hopStart) && !Number.isFinite(hopLimit)) {
+    if (hopStartValue != null && hopLimitValue != null) {
+      usedHops = Math.max(hopStartValue - hopLimitValue, 0);
+    } else if (hopStartValue != null && hopLimitValue == null) {
       usedHops = 0;
     }
 
@@ -1389,9 +1557,10 @@ class MeshtasticClient extends EventEmitter {
       snr: packet.rxSnr ?? null,
       rssi: packet.rxRssi ?? null,
       hops: {
-        limit: packet.hopLimit ?? null,
-        start: packet.hopStart ?? null,
-        label: formatHops(packet.hopLimit, packet.hopStart)
+        limit: hopLimitValue,
+        start: hopStartValue,
+        label: formatHops(hopLimitValue, hopStartValue),
+        limitOnly: hopLimitOnly
       },
       type: decodeInfo?.type || friendlyPortLabel(portInfo.name, portInfo.id),
       detail: decodeInfo?.details || '',
@@ -1415,6 +1584,27 @@ class MeshtasticClient extends EventEmitter {
       rawHex,
       rawLength: Buffer.isBuffer(payload) ? payload.length : 0
     };
+    if (relayResult && Number.isFinite(relayResult.nodeId)) {
+      if (relayResult.guessed && relayResult.reason && !summary.relayGuessReason) {
+        summary.relayGuessReason = relayResult.reason;
+      }
+      if (relayResult.forceTailLabel && Number.isFinite(relayResult.tailNodeId)) {
+        const tailMeshId = formatHexId(relayResult.tailNodeId >>> 0);
+        relayInfo = {
+          label: tailMeshId,
+          meshId: tailMeshId,
+          meshIdNormalized: tailMeshId,
+          meshIdOriginal: tailMeshId,
+          shortName: null,
+          longName: null,
+          hwModel: null,
+          role: null,
+          raw: relayResult.tailNodeId >>> 0
+        };
+        summary.relay = relayInfo;
+      }
+    }
+    summary.relayInvalid = hopLimitOnly;
 
     const directRelayNodeId =
       relayResult && Number.isFinite(relayResult.nodeId) ? relayResult.nodeId : relayNodeId;
@@ -1422,7 +1612,8 @@ class MeshtasticClient extends EventEmitter {
     const isDirect = this._isDirectReception(summary, {
       relayNodeId: directRelayNodeId,
       usedHops,
-      hasRelayResult: Boolean(relayResult)
+      hasRelayResult: Boolean(relayResult),
+      hopLimitOnly
     });
 
     if (isDirect && packet.from != null) {
@@ -1732,18 +1923,25 @@ class MeshtasticClient extends EventEmitter {
           if (user.id) {
             parts.push(`(${user.id})`);
           }
-        const extras = [];
-        if (user.hwModel) extras.push(`model: ${String(user.hwModel)}`);
-        if (user.role) extras.push(`role: ${String(user.role)}`);
-        if (user.shortName && user.shortName !== user.longName) {
-          extras.push(`short: ${user.shortName}`);
+          const extras = [];
+          if (user.hwModel) extras.push(`model: ${String(user.hwModel)}`);
+          if (user.role) extras.push(`role: ${String(user.role)}`);
+          if (user.shortName && user.shortName !== user.longName) {
+            extras.push(`short: ${user.shortName}`);
+          }
+          return {
+            type: 'NodeInfo',
+            details: parts.join(' '),
+            extraLines: extras,
+            nodeInfo: {
+              id: typeof user.id === 'string' && user.id.trim() ? user.id.trim() : null,
+              longName: typeof user.longName === 'string' && user.longName.trim() ? user.longName.trim() : null,
+              shortName: typeof user.shortName === 'string' && user.shortName.trim() ? user.shortName.trim() : null,
+              hwModel: user.hwModel ?? null,
+              role: user.role ?? null
+            }
+          };
         }
-        return {
-          type: 'NodeInfo',
-          details: parts.join(' '),
-          extraLines: extras
-        };
-      }
         case 'CAYENNE_APP': {
           return decodeCayennePayload(payload);
         }
@@ -1772,25 +1970,81 @@ class MeshtasticClient extends EventEmitter {
 
   _formatNode(nodeNum) {
     if (nodeNum == null) {
-      return { label: 'unknown', meshId: null };
+      return { label: 'unknown', meshId: null, meshIdNormalized: null };
     }
     const num = nodeNum >>> 0;
     const entry = this.nodeMap.get(num);
-    let meshId = entry?.id || formatHexId(num);
-    if (meshId && meshId.startsWith('0x')) {
-      meshId = `!${meshId.slice(2)}`;
-    }
-    const name = entry?.shortName || entry?.longName;
-    const label = name && meshId ? `${name} (${meshId})` : name || meshId;
+    const meshIdRaw = entry?.id || formatHexId(num);
+    const normalizedMeshId = normalizeMeshId(meshIdRaw);
+    const meshId = normalizedMeshId || meshIdRaw;
+    const label =
+      this._composeNodeLabel({
+        longName: entry?.longName,
+        shortName: entry?.shortName,
+        meshId
+      }) || meshId || 'unknown';
     return {
       label,
       meshId,
+      meshIdNormalized: normalizedMeshId || null,
+      meshIdOriginal: meshIdRaw || null,
       shortName: entry?.shortName,
       longName: entry?.longName,
       hwModel: entry?.hwModel ?? null,
       role: entry?.role ?? null,
       raw: num
     };
+  }
+
+  _composeNodeLabel({ longName, shortName, meshId } = {}) {
+    const longNameTrimmed =
+      typeof longName === 'string' && longName.trim() ? longName.trim() : null;
+    const shortNameTrimmed =
+      typeof shortName === 'string' && shortName.trim() ? shortName.trim() : null;
+    const name = longNameTrimmed || shortNameTrimmed || null;
+    if (name && meshId) {
+      return `${name} (${meshId})`;
+    }
+    return name || meshId || null;
+  }
+
+  _applyDecodedNodeInfo(targetNode, decodedNodeInfo = {}) {
+    if (!targetNode || typeof targetNode !== 'object' || !decodedNodeInfo) {
+      return;
+    }
+    const sanitizeText = (value) =>
+      typeof value === 'string' && value.trim() ? value.trim() : null;
+    const meshIdCandidate =
+      decodedNodeInfo.id ?? decodedNodeInfo.meshId ?? decodedNodeInfo.meshIdNormalized ?? null;
+    const normalized = normalizeMeshId(meshIdCandidate);
+    if (normalized) {
+      targetNode.meshId = targetNode.meshId ?? normalized;
+      targetNode.meshIdNormalized = normalized;
+      targetNode.meshIdOriginal =
+        targetNode.meshIdOriginal ?? meshIdCandidate ?? normalized;
+    }
+    const longName = sanitizeText(decodedNodeInfo.longName);
+    if (!targetNode.longName && longName) {
+      targetNode.longName = longName;
+    }
+    const shortName = sanitizeText(decodedNodeInfo.shortName);
+    if (!targetNode.shortName && shortName) {
+      targetNode.shortName = shortName;
+    }
+    if (targetNode.hwModel == null && decodedNodeInfo.hwModel != null) {
+      targetNode.hwModel = decodedNodeInfo.hwModel;
+    }
+    if (targetNode.role == null && decodedNodeInfo.role != null) {
+      targetNode.role = decodedNodeInfo.role;
+    }
+    const recomputedLabel = this._composeNodeLabel({
+      longName: targetNode.longName,
+      shortName: targetNode.shortName,
+      meshId: targetNode.meshId
+    });
+    if (recomputedLabel) {
+      targetNode.label = recomputedLabel;
+    }
   }
 
   _shouldEmitPacket(packet) {

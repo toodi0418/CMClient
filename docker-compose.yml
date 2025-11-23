@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  callmesh-client:
+    container_name: callmesh-client
+    image: callmesh-client:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      CALLMESH_API_KEY: "${CALLMESH_API_KEY}"
+      CALLMESH_ARTIFACTS_DIR: "/data/callmesh"
+      CALLMESH_VERIFICATION_FILE: "/data/callmesh/monitor.json"
+      TMAG_WEB_DASHBOARD: "${TMAG_WEB_DASHBOARD:-1}"
+      TENMAN_DISABLE: "${TENMAN_DISABLE:-0}"
+    volumes:
+      - callmesh-data:/data/callmesh
+    ports:
+      - "${TMAG_WEB_PORT:-7080}:7080"
+    command:
+      - "npm"
+      - "start"
+      - "--"
+      - "--host"
+      - "${MESHTASTIC_HOST:-meshtastic.local}"
+      - "--port"
+      - "${MESHTASTIC_PORT:-4403}"
+
+volumes:
+  callmesh-data:

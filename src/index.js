@@ -11,6 +11,8 @@ const { discoverMeshtasticDevices } = require('./discovery');
 const { CallMeshClient, buildAgentString } = require('./callmesh/client');
 const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge');
 const { WebDashboardServer } = require('./web/server');
+const { CallMeshDataStore } = require('./storage/callmeshDataStore');
+const { sanitizeSummaryForDisplay } = require('./utils/summaryDisplay');
 const pkg = require('../package.json');
 
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
@@ -18,6 +20,104 @@ let bridgeSummaryListener = null;
 
 function getMessageLogPath() {
   return path.join(getArtifactsDir(), MESSAGE_LOG_FILENAME);
+}
+
+function sanitizeStringArray(arr) {
+  return Array.isArray(arr)
+    ? arr
+        .map((line) => (typeof line === 'string' ? line.trim() : ''))
+        .filter(Boolean)
+    : [];
+}
+
+function sanitizeNodeForLog(node) {
+  if (!node || typeof node !== 'object') {
+    return null;
+  }
+  const pick = (value) => (typeof value === 'string' ? value : null);
+  return {
+    label: pick(node.label),
+    meshId: pick(node.meshId),
+    meshIdNormalized: pick(node.meshIdNormalized),
+    meshIdOriginal: pick(node.meshIdOriginal),
+    shortName: pick(node.shortName),
+    longName: pick(node.longName)
+  };
+}
+
+function createSummaryFileLogger(baseDir, { prefix = 'summary' } = {}) {
+  let writeChain = Promise.resolve();
+  let currentDateKey = null;
+  let currentFilePath = null;
+
+  const ensureDirectory = async () => {
+    await fs.mkdir(baseDir, { recursive: true });
+  };
+
+  const formatDateKey = (timestampMs) => {
+    const date = new Date(timestampMs);
+    const pad = (value) => String(value).padStart(2, '0');
+    const year = date.getFullYear();
+    const month = pad(date.getMonth() + 1);
+    const day = pad(date.getDate());
+    return `${year}${month}${day}`;
+  };
+
+  const ensureFilePath = async (timestampMs) => {
+    const dateKey = formatDateKey(timestampMs);
+    if (currentDateKey === dateKey && currentFilePath) {
+      return currentFilePath;
+    }
+    await ensureDirectory();
+    currentDateKey = dateKey;
+    currentFilePath = path.join(baseDir, `${prefix}-${dateKey}.jsonl`);
+    return currentFilePath;
+  };
+
+  const buildEntry = (summary, timestampMs) => {
+    const timestampIso = new Date(timestampMs).toISOString();
+    return {
+      timestamp: timestampIso,
+      timestampMs,
+      type: summary.type ?? null,
+      channel: summary.channel ?? null,
+      from: sanitizeNodeForLog(summary.from),
+      to: sanitizeNodeForLog(summary.to),
+      relay: sanitizeNodeForLog(summary.relay),
+      hops: summary.hops || null,
+      snr: Number.isFinite(summary.snr) ? Number(summary.snr) : null,
+      rssi: Number.isFinite(summary.rssi) ? Number(summary.rssi) : null,
+      detail: typeof summary.detail === 'string' ? summary.detail : null,
+      extraLines: sanitizeStringArray(summary.extraLines),
+      meshPacketId: Number.isFinite(summary.meshPacketId) ? Number(summary.meshPacketId) : null,
+      flowId:
+        typeof summary.flowId === 'string' && summary.flowId.trim() ? summary.flowId.trim() : null,
+      replyId: Number.isFinite(summary.replyId) ? Number(summary.replyId) : null,
+      replyTo: typeof summary.replyTo === 'string' ? summary.replyTo : null,
+      scope: typeof summary.scope === 'string' ? summary.scope : null,
+      synthetic: Boolean(summary.synthetic),
+      rawHex: typeof summary.rawHex === 'string' ? summary.rawHex : null
+    };
+  };
+
+  return {
+    log(summary) {
+      if (!summary) return;
+      const timestampMs = Number.isFinite(summary.timestampMs)
+        ? Number(summary.timestampMs)
+        : Date.now();
+      writeChain = writeChain
+        .catch(() => {})
+        .then(async () => {
+          const filePath = await ensureFilePath(timestampMs);
+          const entry = buildEntry(summary, timestampMs);
+          await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, 'utf8');
+        })
+        .catch((err) => {
+          console.warn(`寫入 summary log 失敗：${err.message}`);
+        });
+    }
+  };
 }
 
 function tryPublishWebMessage(webServer, summary) {
@@ -32,12 +132,6 @@ function tryPublishWebMessage(webServer, summary) {
   if (!Number.isFinite(channelId) || channelId < 0) {
     return;
   }
-  const sanitizeStringArray = (arr) =>
-    Array.isArray(arr)
-      ? arr
-          .map((line) => (typeof line === 'string' ? line.trim() : ''))
-          .filter(Boolean)
-      : [];
   const detail = typeof summary.detail === 'string' ? summary.detail : '';
   const extraLines = sanitizeStringArray(summary.extraLines);
   const timestampMs = Number.isFinite(summary.timestampMs) ? Number(summary.timestampMs) : Date.now();
@@ -73,6 +167,19 @@ function tryPublishWebMessage(webServer, summary) {
   } catch (err) {
     console.warn(`推播文字訊息失敗：${err.message}`);
   }
+}
+
+function resolveTelemetryMaxTotalRecords() {
+  const raw = process.env.TMAG_WEB_TELEMETRY_MAX_TOTAL;
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(`TMAG_WEB_TELEMETRY_MAX_TOTAL 必須為正整數，已忽略：${raw}`);
+    return undefined;
+  }
+  return Math.floor(value);
 }
 
 function toWebCallmeshState(state) {
@@ -205,6 +312,20 @@ async function main() {
             type: 'boolean',
             default: false,
             describe: '啟用內建 Web Dashboard（預設為關閉）'
+          })
+          .option('summary-log', {
+            type: 'boolean',
+            default: false,
+            describe: '啟用 Summary 事件 JSONL 紀錄'
+          })
+          .option('summary-log-dir', {
+            type: 'string',
+            describe: '自訂 Summary Log 儲存目錄（預設為 artifacts/logs）'
+          })
+          .option('clear-nodedb', {
+            type: 'boolean',
+            default: false,
+            describe: '清除節點資料庫與 Link-State（callmesh-data.sqlite → nodes / relay_stats）後立即結束'
           }),
       async (argv) => {
         await startMonitor(argv);
@@ -216,6 +337,11 @@ async function main() {
 }
 
 async function startMonitor(argv) {
+  if (argv.clearNodedb) {
+    await clearNodeDatabaseCli();
+    return;
+  }
+
   const apiKey = argv.apiKey || process.env.CALLMESH_API_KEY;
   if (!apiKey) {
     console.error('未設定 CallMesh API Key，請先設定環境變數 CALLMESH_API_KEY 後再執行。');
@@ -239,6 +365,15 @@ async function startMonitor(argv) {
   const artifactsDir = getArtifactsDir();
   const shareWithTenmanMapOverride =
     argv.noShareWithTenmanmap ? false : null;
+  const summaryLogRequested = Boolean(argv.summaryLog || argv.summaryLogDir);
+  let summaryLogger = null;
+  if (summaryLogRequested) {
+    const summaryLogDir = path.resolve(
+      argv.summaryLogDir || path.join(artifactsDir, 'logs')
+    );
+    summaryLogger = createSummaryFileLogger(summaryLogDir);
+    console.log(`[SUMMARY-LOG] 將 Summary 事件寫入 ${summaryLogDir}`);
+  }
 
   const bridgeOptions = {
     storageDir: artifactsDir,
@@ -251,6 +386,7 @@ async function startMonitor(argv) {
   if (shareWithTenmanMapOverride !== null) {
     bridgeOptions.shareWithTenmanMap = shareWithTenmanMapOverride;
   }
+  bridgeOptions.tenmanIgnoreInboundNodes = true;
 
   const bridge = new CallMeshAprsBridge(bridgeOptions);
 
@@ -326,7 +462,13 @@ async function startMonitor(argv) {
     }
   });
 
+  const connectionOptions = {};
+
   await bridge.init({ allowRestore: true });
+  const sharedDataStore = bridge.getDataStore?.();
+  if (sharedDataStore) {
+    connectionOptions.relayStatsStore = sharedDataStore;
+  }
 
   try {
     const verifyResult = await bridge.verifyApiKey(apiKey, {
@@ -384,11 +526,20 @@ async function startMonitor(argv) {
 
   if (webUiEnabled && !webServer) {
     try {
-      webServer = new WebDashboardServer({
+      const webDashboardOptions = {
         appVersion: pkg.version || '0.0.0',
         relayStatsPath,
-        messageLogPath: getMessageLogPath()
-      });
+        relayStatsStore: sharedDataStore,
+        messageLogPath: getMessageLogPath(),
+        messageLogStore: sharedDataStore,
+        telemetryProvider: bridge,
+        aprsDebugProvider: () => bridge.getAprsDebugSnapshot()
+      };
+      const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
+      if (telemetryMaxTotalOverride) {
+        webDashboardOptions.telemetryMaxTotalRecords = telemetryMaxTotalOverride;
+      }
+      webServer = new WebDashboardServer(webDashboardOptions);
       await webServer.start();
       webServer.setAppVersion(pkg.version || '0.0.0');
       webServer.publishStatus({ status: 'disconnected' });
@@ -398,22 +549,20 @@ async function startMonitor(argv) {
       }
       try {
         const nodeSnapshot = bridge.getNodeSnapshot();
-        if (Array.isArray(nodeSnapshot) && nodeSnapshot.length) {
-          webServer.seedNodeSnapshot(nodeSnapshot);
-        }
+        const nodeSourceInfo = bridge.getNodeDatabaseSourceInfo();
+        webServer.seedNodeSnapshot(nodeSnapshot, nodeSourceInfo);
       } catch (err) {
         console.warn(`初始化 Web 節點快照失敗：${err.message}`);
       }
-      if (typeof bridge.getTelemetrySnapshot === 'function') {
+      // 避免同步讀取大量遙測資料阻塞事件迴圈，啟動時改以背景程序載入 Telemetry 快照。
+      setTimeout(() => {
         try {
-          const telemetrySnapshot = await bridge.getTelemetrySnapshot({
-            limitPerNode: webServer.telemetryMaxPerNode
-          });
-          webServer.seedTelemetrySnapshot(telemetrySnapshot);
+          const summary = bridge.getTelemetrySummary();
+          webServer.seedTelemetrySummary(summary);
         } catch (err) {
-          console.warn(`初始化 Web Telemetry 失敗：${err.message}`);
+          console.warn(`初始化 Web 遙測摘要失敗：${err.message}`);
         }
-      }
+      }, 0);
     } catch (err) {
       console.warn(`啟動 Web Dashboard 失敗：${err.message}`);
       webServer = null;
@@ -520,13 +669,13 @@ async function startMonitor(argv) {
       ? `Serial ${serialPath} @ ${serialBaudRate}`
       : `TCP ${tcpHost}:${tcpPort}`;
 
-  const connectionOptions = {
+  Object.assign(connectionOptions, {
     transport,
     maxLength: argv.maxLength,
     handshake: true,
     heartbeat: HEARTBEAT_INTERVAL_SECONDS,
     relayStatsPath
-  };
+  });
   if (transport === 'serial') {
     Object.assign(connectionOptions, {
       serialPath,
@@ -670,8 +819,10 @@ async function startMonitor(argv) {
     if (!synthetic) {
       bridge.handleMeshtasticSummary(summary);
     }
-    webServer?.publishSummary(summary);
-    tryPublishWebMessage(webServer, summary);
+    const displaySummary = sanitizeSummaryForDisplay(summary) || summary;
+    webServer?.publishSummary(displaySummary);
+    tryPublishWebMessage(webServer, displaySummary);
+    summaryLogger?.log(displaySummary);
 
     if (argv.format !== 'summary') {
       return;
@@ -683,25 +834,25 @@ async function startMonitor(argv) {
       headerPrinted = true;
     }
 
-    const nodesLabel = formatNodes(summary);
-    const relayLabel = computeRelayLabel(summary, { selfMeshId });
+    const nodesLabel = formatNodes(displaySummary);
+    const relayLabel = computeRelayLabel(displaySummary, { selfMeshId });
     const relayCol = padEnd(relayLabel, 12);
-    const channelCol = padValue(summary.channel ?? '', 2);
-    const snrCol = formatSignal(summary.snr, 2, 6, summary, { selfMeshId });
-    const rssiCol = formatSignal(summary.rssi, 0, 5, summary, { selfMeshId });
-    const typeCol = String(summary.type || '').padEnd(12);
-    const hopsCol = (summary.hops?.label || '').padEnd(7);
-    const detail = summary.detail || '';
+    const channelCol = padValue(displaySummary.channel ?? '', 2);
+    const snrCol = formatSignal(displaySummary.snr, 2, 6, displaySummary, { selfMeshId });
+    const rssiCol = formatSignal(displaySummary.rssi, 0, 5, displaySummary, { selfMeshId });
+    const typeCol = String(displaySummary.type || '').padEnd(12);
+    const hopsCol = (displaySummary.hops?.label || '').padEnd(7);
+    const detail = displaySummary.detail || '';
 
-    const line = `${(summary.timestampLabel ?? '').padEnd(19)} | ${nodesLabel.padEnd(27)} | ${relayCol} | ${channelCol} | ${snrCol} | ${rssiCol} | ${typeCol} | ${hopsCol} | ${detail}`;
+    const line = `${(displaySummary.timestampLabel ?? '').padEnd(19)} | ${nodesLabel.padEnd(27)} | ${relayCol} | ${channelCol} | ${snrCol} | ${rssiCol} | ${typeCol} | ${hopsCol} | ${detail}`;
     console.log(line.trimEnd());
 
-    if (argv['show-raw'] && summary.rawHex) {
-      console.log(`  raw: ${summary.rawHex}`);
+    if (argv['show-raw'] && displaySummary.rawHex) {
+      console.log(`  raw: ${displaySummary.rawHex}`);
     }
 
-    if (Array.isArray(summary.extraLines)) {
-      for (const extra of summary.extraLines) {
+    if (Array.isArray(displaySummary.extraLines)) {
+      for (const extra of displaySummary.extraLines) {
         console.log(`  ${extra}`);
       }
     }
@@ -768,12 +919,30 @@ async function startMonitor(argv) {
 }
 
 function formatNodes(summary) {
-  const from = summary.from?.label || 'unknown';
-  const to = summary.to?.label;
-  if (!to) {
-    return from;
+  const resolveLabel = (node) => {
+    if (!node || typeof node !== 'object') return null;
+    const label =
+      (typeof node.label === 'string' && node.label.trim()) ||
+      (typeof node.longName === 'string' && node.longName.trim()) ||
+      (typeof node.shortName === 'string' && node.shortName.trim()) ||
+      null;
+    if (label) {
+      return label;
+    }
+    const mesh =
+      (typeof node.meshId === 'string' && node.meshId.trim()) ||
+      (typeof node.meshIdNormalized === 'string' && node.meshIdNormalized.trim()) ||
+      (typeof node.meshIdOriginal === 'string' && node.meshIdOriginal.trim()) ||
+      null;
+    return mesh;
+  };
+
+  const fromLabel = resolveLabel(summary?.from) || 'unknown';
+  const toLabel = resolveLabel(summary?.to);
+  if (!toLabel) {
+    return fromLabel;
   }
-  return `${from} -> ${to}`;
+  return `${fromLabel} -> ${toLabel}`;
 }
 
 function padValue(value, width) {
@@ -817,37 +986,57 @@ function formatRelayLabel(entry) {
 }
 
 function extractHopInfo(summary) {
-  const hopStart = Number(summary.hops?.start);
-  const hopLimit = Number(summary.hops?.limit);
-  const label = typeof summary.hops?.label === 'string' ? summary.hops.label.trim() : '';
+  const hops = summary?.hops || {};
+  const label = typeof hops.label === 'string' ? hops.label.trim() : '';
+  const hopStartProvided = hops.start !== undefined && hops.start !== null;
+  const hopLimitProvided = hops.limit !== undefined && hops.limit !== null;
+  const toFiniteOrNull = (value) => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  };
+  const hopStart = hopStartProvided ? toFiniteOrNull(hops.start) : null;
+  const hopLimit = hopLimitProvided ? toFiniteOrNull(hops.limit) : null;
+  const limitOnly =
+    Boolean(hops.limitOnly) ||
+    (!hopStartProvided && hopLimitProvided && label && !label.includes('/') && !label.includes('?'));
+
   let used = null;
-  let total = Number.isFinite(hopStart) ? hopStart : null;
+  let total = hopStart != null ? hopStart : null;
 
-  if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
-    used = Math.max(hopStart - hopLimit, 0);
-  } else {
-    const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
-    if (match) {
-      used = Number(match[1]);
-      if (!Number.isFinite(total)) {
-        total = Number(match[2]);
-      }
-    } else if (/^\d+$/.test(label)) {
+  if (!limitOnly) {
+    if (hopStart != null && hopLimit != null) {
+      used = Math.max(hopStart - hopLimit, 0);
+    } else if (hopStart != null && hopLimit == null) {
       used = 0;
+    } else {
+      const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
+      if (match) {
+        used = Number(match[1]);
+        if (!Number.isFinite(total)) {
+          total = Number(match[2]);
+        }
+      } else if (/^\d+$/.test(label) && hopStart === 0) {
+        used = 0;
+        total = Number.isFinite(total) ? total : 0;
+      }
     }
-  }
 
-  if (!Number.isFinite(total)) {
-    const match = label.match(/\/\s*(\d+)/);
-    if (match) {
-      total = Number(match[1]);
+    if (!Number.isFinite(total)) {
+      const match = label.match(/\/\s*(\d+)/);
+      if (match) {
+        total = Number(match[1]);
+      }
     }
+  } else {
+    used = null;
+    total = null;
   }
 
   return {
     usedHops: Number.isFinite(used) ? used : null,
     totalHops: Number.isFinite(total) ? total : null,
-    hopsLabel: label
+    hopsLabel: label,
+    limitOnly
   };
 }
 
@@ -882,7 +1071,11 @@ function computeRelayLabel(summary, { selfMeshId } = {}) {
     return '直收';
   }
 
-  const { usedHops, hopsLabel } = extractHopInfo(summary);
+  const hopInfo = extractHopInfo(summary);
+  if (summary.relayInvalid || hopInfo.limitOnly) {
+    return '無效';
+  }
+  const { usedHops, hopsLabel } = hopInfo;
   const zeroHop =
     usedHops === 0 ||
     hopsLabel === '0/0' ||
@@ -1089,6 +1282,120 @@ function getArtifactsDir() {
   const custom = process.env.CALLMESH_ARTIFACTS_DIR;
   if (custom) return path.resolve(custom);
   return path.dirname(getVerificationPath());
+}
+
+async function clearNodeDatabaseCli() {
+  const candidates = buildNodeDataDirectories();
+  let clearedAny = false;
+  let hadError = false;
+
+  for (const dir of candidates) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await clearNodeDataDirectory(dir);
+    if (result.cleared) {
+      clearedAny = true;
+    }
+    if (result.error) {
+      hadError = true;
+    }
+  }
+
+  if (!clearedAny && !hadError) {
+    console.log('[nodes] 未找到可清除的節點資料庫。');
+  } else if (clearedAny && !hadError) {
+    console.log('[nodes] 重新啟動 TMAG 後會隨新封包重新建立節點與 relay link 統計。');
+  }
+
+  process.exitCode = hadError ? 1 : 0;
+}
+
+function buildNodeDataDirectories() {
+  const dirs = new Set();
+  dirs.add(getArtifactsDir());
+  const home = os.homedir();
+  if (process.platform === 'darwin') {
+    dirs.add(path.join(home, 'Library', 'Application Support', 'TMAG Monitor', 'callmesh'));
+    dirs.add(path.join(home, 'Library', 'Application Support', 'Electron', 'callmesh'));
+  } else if (process.platform === 'win32') {
+    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+    dirs.add(path.join(appData, 'TMAG Monitor', 'callmesh'));
+    dirs.add(path.join(appData, 'Electron', 'callmesh'));
+  } else {
+    dirs.add(path.join(home, '.config', 'TMAG Monitor', 'callmesh'));
+    dirs.add(path.join(home, '.config', 'Electron', 'callmesh'));
+  }
+  return Array.from(dirs);
+}
+
+async function clearNodeDataDirectory(dir) {
+  const result = { cleared: false, error: null };
+  if (!dir) return result;
+  const dirExists = await pathExists(dir);
+  if (!dirExists) {
+    return result;
+  }
+
+  const sqlitePath = path.join(dir, 'callmesh-data.sqlite');
+  const legacyPath = path.join(dir, 'node-database.json');
+  const relayLegacyPath = path.join(dir, 'relay-link-stats.json');
+
+  const shouldInitStore =
+    (await pathExists(sqlitePath)) || (await pathExists(legacyPath)) || (await pathExists(relayLegacyPath));
+
+  let store = null;
+  if (shouldInitStore) {
+    try {
+      store = new CallMeshDataStore(sqlitePath);
+      store.init();
+      store.clearNodes();
+      if (typeof store.clearRelayStats === 'function') {
+        store.clearRelayStats();
+      } else {
+        store.replaceRelayStats([]);
+      }
+      result.cleared = true;
+      console.log(`[nodes] cleared SQLite nodes/link-state → ${sqlitePath}`);
+    } catch (err) {
+      result.error = err;
+      console.error(`[nodes] 清除 ${sqlitePath} 失敗：${err.message}`);
+    } finally {
+      try {
+        store?.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const legacyRemoved = await removeIfExists(legacyPath);
+  const relayRemoved = await removeIfExists(relayLegacyPath);
+  if (legacyRemoved || relayRemoved) {
+    result.cleared = true;
+  }
+
+  return result;
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removeIfExists(targetPath) {
+  try {
+    await fs.rm(targetPath, { force: true });
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return false;
+    }
+    console.error(`[nodes] 移除 ${targetPath} 失敗：${err.message}`);
+    return false;
+  }
 }
 
 async function loadVerificationFile(filePath) {

@@ -98,6 +98,27 @@
               <div id="channel-message-list" class="channel-messages">
                 <div class="channel-message-empty">尚未收到訊息</div>
               </div>
+              <footer id="channel-pagination" class="channel-pagination hidden">
+                <div id="channel-pagination-info" class="channel-pagination-info">顯示 0-0，共 0 筆訊息</div>
+                <div class="channel-pagination-controls">
+                  <button id="channel-page-first" type="button" class="channel-page-btn" disabled>«</button>
+                  <button id="channel-page-prev" type="button" class="channel-page-btn" disabled>‹</button>
+                  <span class="channel-page-status">
+                    第 <span id="channel-pagination-current">1</span> / <span id="channel-pagination-total">1</span> 頁
+                  </span>
+                  <button id="channel-page-next" type="button" class="channel-page-btn" disabled>›</button>
+                  <button id="channel-page-last" type="button" class="channel-page-btn" disabled>»</button>
+                  <label class="channel-page-size">
+                    每頁
+                    <select id="channel-page-size">
+                      <option value="25" selected>25</option>
+                      <option value="50">50</option>
+                      <option value="100">100</option>
+                    </select>
+                    筆
+                  </label>
+                </div>
+              </footer>
             </section>
           </div>
         </section>
@@ -127,6 +148,10 @@
             <div class="telemetry-range-controls">
               <label for="telemetry-range-select">範圍</label>
               <select id="telemetry-range-select">
+                <option value="hour1">近 1 小時</option>
+                <option value="hour3">近 3 小時</option>
+                <option value="hour6">近 6 小時</option>
+                <option value="hour12">近 12 小時</option>
                 <option value="day">近 24 小時</option>
                 <option value="week">近 7 天</option>
                 <option value="month">近 30 天</option>
@@ -180,6 +205,22 @@
               </thead>
               <tbody id="telemetry-table-body"></tbody>
             </table>
+            <div id="telemetry-pagination" class="telemetry-pagination hidden">
+              <div id="telemetry-pagination-info" class="telemetry-pagination-info">—</div>
+              <div class="telemetry-pagination-controls">
+                <button type="button" id="telemetry-page-first" class="telemetry-page-btn" aria-label="第一頁">«</button>
+                <button type="button" id="telemetry-page-prev" class="telemetry-page-btn" aria-label="上一頁">‹</button>
+                <span class="telemetry-page-status">
+                  第 <span id="telemetry-pagination-current">1</span> / <span id="telemetry-pagination-total">1</span> 頁
+                </span>
+                <button type="button" id="telemetry-page-next" class="telemetry-page-btn" aria-label="下一頁">›</button>
+                <button type="button" id="telemetry-page-last" class="telemetry-page-btn" aria-label="最後一頁">»</button>
+                <label class="telemetry-page-size">
+                  每頁
+                  <select id="telemetry-page-size" class="telemetry-page-size-select"></select>
+                </label>
+              </div>
+            </div>
           </section>
         </section>
       </section>

@@ -47,6 +47,8 @@ contextBridge.exposeInMainWorld('meshtastic', {
     return () => ipcRenderer.removeListener('meshtastic:aprs-uplink', listener);
   },
   getTelemetrySnapshot: (options) => ipcRenderer.invoke('telemetry:get-snapshot', options),
+  getTelemetryAvailableNodes: () => ipcRenderer.invoke('telemetry:get-available'),
+  fetchTelemetryRange: (options) => ipcRenderer.invoke('telemetry:fetch-range', options),
   onTelemetry: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('telemetry:update', listener);

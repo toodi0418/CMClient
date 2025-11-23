@@ -22,13 +22,13 @@ TMAG 是一套使用 Node.js 打造的 **Meshtastic → APRS Gateway**，整合�
 - **穩定時間戳**：Telemetry 紀錄寫入時會使用收包當下的時間戳，避免裝置 RTC 漂移造成前端區間掛零。
 - **節點資料庫共用**：內建 `nodeDatabase` 集中維護節點長短名、模型、座標等資訊，CLI / Electron / Web 透過 `node`、`node-snapshot` 事件共享同一份資料，節點清單支援座標搜尋與距離顯示。
 - **訊息與 Relay 體驗**：GUI/Web 會持久化 CH0~CH3 文字訊息（含節點暱稱、最後轉發資訊），同時提供 Relay 推測提示 UI，能追蹤候選節點與推測理由。
-- **TENMANMAP 轉發**：可將選定節點的即時位置透過 WebSocket 轉送到 TENMAN 地圖服務，支援白名單、佇列與自動重連。
+- **APRS 去重**：橋接層內建三層快取（feed 30 分鐘、本地與座標 30 秒），即使 Meshtastic 網路延遲 30 秒～10 分鐘，也能避免不同站重複 uplink 造成位置回朔或浪費 APRS-IS 配額。
 
 ---
 
 ## 2. 環境需求
 
-- Node.js 18 以上（建議使用 LTS 版本）
+- Node.js 22 以上（需支援內建 `node:sqlite`）
 - Meshtastic 裝置或 Gateway（TCP API 或 Serial 連線）
 - CallMesh 平台有效的 API Key（環境變數 `CALLMESH_API_KEY`）
 - （若使用 APRS）穩定的網際網路連線
@@ -54,18 +54,45 @@ npm install
    ```bash
    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
    source ~/.nvm/nvm.sh
-   nvm install 18
-   nvm use 18
+   nvm install 22
+   nvm use 22
    ```  
    完成後 `node -v`、`npm -v` 應該能顯示版本號。
 
 2. **Windows**  
-   前往 [Node.js 官方網站](https://nodejs.org/en/download) 下載 LTS 安裝程式，依指示完成安裝後重新開啟終端機（PowerShell / CMD）。  
+   前往 [Node.js 官方網站](https://nodejs.org/en/download) 下載 Node.js 22 LTS 安裝程式，依指示完成安裝後重新開啟終端機（PowerShell / CMD）。  
    驗證：  
    ```powershell
    node -v
    npm -v
    ```
+
+### 如何升級 Node.js 到最新版本
+
+- **使用 nvm（macOS / Linux）**  
+  ```bash
+  nvm install 22 --latest-npm           # 安裝或更新 22.x 最新版
+  nvm alias default 22                  # （可選）設為預設版本
+  nvm use 22
+  node -v && npm -v                     # 確認版本
+  ```
+- **使用 Homebrew（macOS）**  
+  ```bash
+  brew update
+  brew upgrade node@22
+  echo 'export PATH="/usr/local/opt/node@22/bin:$PATH"' >> ~/.zshrc
+  source ~/.zshrc
+  node -v && npm -v
+  ```
+- **Windows**  
+  - 重新下載並執行 Node.js 22 LTS 安裝程式；或  
+  - 若使用 [nvm-windows](https://github.com/coreybutler/nvm-windows)，可執行：  
+    ```powershell
+    nvm install 22.21.1
+    nvm use 22.21.1
+    node -v
+    npm -v
+    ```
 
 ### 必備環境變數
 
@@ -126,11 +153,11 @@ npm install       # 套件若有更新會同步安裝
 # 系統更新 + 安裝 git / curl
 sudo apt update && sudo apt install -y git curl
 
-# 安裝 nvm 並使用 Node.js 18（建議 LTS）
+# 安裝 nvm 並使用 Node.js 22（建議 LTS）
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
 source ~/.nvm/nvm.sh
-nvm install 18
-nvm use 18
+nvm install 22
+nvm use 22
 
 # 取得 TMAG 並安裝依賴
 git clone https://github.com/toodi0418/CMClient.git
@@ -147,7 +174,7 @@ node src/index.js --host <節點ip> --port 4403
 ```bash
 npx pkg src/index.js \
   --config package.json \
-  --targets node18-linux-armv7 \
+  --targets node22-linux-armv7 \
   --compress Brotli --public \
   --output tmag-cli-linux-armv7
 ```
@@ -231,6 +258,18 @@ node src/index.js callmesh sync \
 
 指令詳情可見 `docs/callmesh-client.md`。
 
+### APRS 去重與偵錯
+
+- **改善動機**：Meshtastic 網路偶爾塞住，封包可能延遲 30 秒到 10 分鐘才送到另一個站台。若每站都再次 uplink，同一筆位置會在 APRS-IS 上「倒退」，也浪費配額。
+- **三層快取**（皆為記憶體資料，重啟即清空）  
+  1. `aprsPacketCache` / `aprsCallsignSummary`：記錄 30 分鐘內 APRS-IS feed 已出現的 payload／呼號，只要再看到相同呼號＋payload，就標記 `seen-on-feed` 並跳過上傳。  
+  2. `aprsLocalTxHistory`：保留本地 uplink 的 payload 30 秒，用來擋掉 UI/排程誤觸造成的重送。  
+  3. `aprsLastPositionDigest`：同一 Mesh ID 30 秒內座標＋符號＋註解完全相同就不再上傳，避免 GPS 靜止時不停重複。  
+- **使用方式**：任何實例都可開 `http://<host>:7080/debug` 檢視 `aprsDedup`，快速判斷某筆為何被擋。例如 `packetCache` 命中代表 feed 已有、`localTxHistory` 命中代表 30 秒內剛由本機上傳。  
+- **自訂與除錯**：  
+  - `TMAG_APRS_FEED_FILTER` / `TMAG_APRS_FEED_RADIUS_KM` 用來覆寫監聽範圍，未設定時會依 Provision 座標自動套用 `#filter r/<lat>/<lon>/300`。  
+  - `TMAG_APRS_LOG_VERBOSE=1` 可恢復完整的 APRS tx/rx/keepalive log，預設靜音避免噴 log。  
+
 ---
 
 ## 5. Electron 桌面版
@@ -252,14 +291,35 @@ GUI 提供：
 
 ## 6. 維護工具
 
-- **遙測時間校正**：若早期資料受裝置時間影響，可在專案根目錄執行  
+- **遙測時間校正（升級前／JSONL）**：若早期資料受裝置時間影響，可在升級至 SQLite 版本前於專案根目錄執行  
   ```bash
   node scripts/fix-telemetry-timestamps.js ~/.config/callmesh/telemetry-records.jsonl
   ```  
   腳本會將每筆紀錄的 `timestampMs`／`sampleTimeMs`／`telemetry.timeMs` 對齊收包時刻，並保留 `.bak` 備份。
+- **遙測資料儲存**：自 v0.2.23 起改採 `~/.config/callmesh/telemetry-records.sqlite`（SQLite）；首次啟動會自動匯入舊版 JSONL 並將原檔更名為 `.migrated`。
+- **遙測歷史復原**：若 SQLite 已寫入新資料、但仍要再次匯入 `telemetry-records.jsonl.migrated`，只要在程式關閉後把它改回 `telemetry-records.jsonl`（CLI 路徑 `~/.config/callmesh/`，GUI 路徑 `~/Library/Application Support/TMAG Monitor/callmesh/`），下次啟動會再次把整份 JSON 匯入資料庫，完成後檔案會自動改回 `.migrated` 備份。
+- **共用資料庫**：節點快照、Mapping/Provision 快取、訊息紀錄與 Relay 統計統一儲存在 `~/.config/callmesh/callmesh-data.sqlite`，升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl`、`relay-link-stats.json`。
 - **打包工具**：`scripts/pack-cli.sh`、`scripts/pack-desktop.sh` 可快速產出 CLI / GUI 可攜版（需安裝 `pkg`、`electron-packager`）。
 
----
+### 清除節點資料庫
+
+- **CLI 旗標**  
+  ```bash
+  node src/index.js --clear-nodedb
+  ```  
+  在不啟動監控流程的情況下，會直接清空 `callmesh-data.sqlite` 的 `nodes` 與 `relay_stats` 表，並移除舊版 `node-database.json` / `relay-link-stats.json`，完成後立即結束程式。指令會同時掃描 CLI 預設資料夾與 Electron（含開發模式）使用的 `userData` 路徑，macOS 例如 `~/Library/Application Support/Electron/callmesh/`。
+- **Electron 桌面版**  
+  1. 切換到「節點資料庫」分頁。  
+  2. 點擊右上角「清除節點資料庫」，會同時清空記憶體快取、`callmesh-data.sqlite` 中的 `nodes` 表，以及 relay link-state（`relay_stats` / `relay-link-stats.json`）。
+- **CLI / 服務模式**  
+  1. 停止 TMAG 程式。  
+  2. 執行下列指令（若有自訂 `CALLMESH_ARTIFACTS_DIR`，請換成對應路徑）：  
+     ```bash
+     sqlite3 ~/.config/callmesh/callmesh-data.sqlite "DELETE FROM nodes; VACUUM;"
+     ```  
+     或直接刪除 `callmesh-data.sqlite`，下次啟動時會自動重建並重新同步 Mapping / Provision。
+
+--- 
 
 ## 7. 打包指令
 
@@ -280,11 +340,61 @@ npm install
 
 npx pkg src/index.js \
   --config package.json \
-  --targets node18-linux-armv7 \
+  --targets node22-linux-armv7 \
   --compress Brotli --public \
   --output tmag-cli-linux-armv7
 ```
-或針對 64 位元 Pi OS 使用 `--targets node18-linux-arm64`。
+或針對 64 位元 Pi OS 使用 `--targets node22-linux-arm64`。
+
+### Docker 佈署
+
+GitHub Actions 會自動執行 **Build & Publish Docker Image** workflow，並把映像推送到 GitHub Container Registry（GHCR）。預設路徑為 `ghcr.io/<OWNER>/<REPO>:<tag>`，實際名稱等於 GitHub 倉庫的 `owner/repo`，例如 `ghcr.io/toodi0418/cmclient:latest`。常見流程如下：
+
+1. **取得映像**
+   - 從 GHCR 下載：  
+     ```bash
+     docker pull ghcr.io/<OWNER>/<REPO>:latest
+     ```
+   - 或在原始碼目錄自行建置：  
+     ```bash
+     docker build -t callmesh-client .
+     ```
+   - 若已透過 `docker save callmesh-client:latest -o callmesh-client.tar` 匯出，可在其他主機使用 `docker load -i callmesh-client.tar` 匯入。
+
+2. **準備環境與 compose**
+   - 根目錄已有 `.env` 範本，填入 `CALLMESH_API_KEY`、`MESHTASTIC_HOST`、`TMAG_WEB_PORT` 等參數。
+   - `docker-compose.yml` 會：
+     - 以 `.env` 中的參數建置/啟動 `callmesh-client`；
+     - 將 `/data/callmesh` 透過 volume `callmesh-data` 持久化 CallMesh 驗證、歷史遙測與訊息記錄；
+     - 預設開啟 Web Dashboard（7080 埠），如需停用可把 `TMAG_WEB_DASHBOARD` 設為 `0`。
+
+3. **啟動**
+   ```bash
+   docker compose up -d --build
+   ```
+   - 變更設定後重新載入：`docker compose up -d`。
+   - 查看日誌：`docker compose logs -f`.
+   - 需改用 Serial 裝置時，可在 `docker-compose.yml` 新增：
+     ```yaml
+     devices:
+       - /dev/ttyUSB0:/dev/ttyUSB0
+     command:
+       - npm
+       - start
+       - --
+       - --connection
+       - serial
+       - --serial-path
+       - /dev/ttyUSB0
+       - --serial-baud
+       - "115200"
+     ```
+
+4. **群暉 NAS 提示**
+   - 在 DSM「Container Manager」建立專案時，直接匯入 repo 內的 `docker-compose.yml`，並把 `.env` 一併上傳。
+   - 若想把資料存進共享資料夾，可將 compose 內的 volume 改為 `./data:/data/callmesh`，確保資料夾具有讀寫權限。
+   - Serial 連線需要在 Container Manager → 編輯容器 → 裝置中勾選 `/dev/ttyUSB*`，同時於 compose 增加 `devices`。
+   - 開放 Web Dashboard 時，務必在 DSM 防火牆放行 `TMAG_WEB_PORT`（預設 7080）。
 
 ---
 

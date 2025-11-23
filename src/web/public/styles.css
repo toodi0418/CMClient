@@ -324,6 +324,77 @@ main {
   padding-right: 4px;
 }
 
+.channel-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.58);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+}
+
+.channel-pagination.hidden {
+  display: none;
+}
+
+.channel-pagination-info {
+  color: #cbd5f5;
+  font-size: 0.9rem;
+}
+
+.channel-pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.channel-page-status {
+  color: rgba(148, 163, 184, 0.9);
+  font-size: 0.9rem;
+}
+
+.channel-page-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(30, 41, 59, 0.85);
+  color: #e2e8f0;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.channel-page-btn:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.35);
+  border-color: rgba(96, 165, 250, 0.6);
+}
+
+.channel-page-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.channel-page-size {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #cbd5f5;
+  font-size: 0.9rem;
+}
+
+.channel-page-size select {
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  background: rgba(15, 23, 42, 0.95);
+  color: #e2e8f0;
+  font-size: 0.9rem;
+}
+
 .channel-message {
   padding: 12px 14px;
   border-radius: 10px;
@@ -549,11 +620,11 @@ tbody tr:nth-child(odd) {
 }
 
 .summary-row-mapped {
-  background: rgba(59, 130, 246, 0.18);
+  background: rgba(14, 165, 233, 0.18);
 }
 
 .summary-row-mapped:hover {
-  background: rgba(59, 130, 246, 0.28);
+  background: rgba(14, 165, 233, 0.28);
 }
 
 tbody tr:hover {
@@ -561,11 +632,19 @@ tbody tr:hover {
 }
 
 .summary-row-aprs {
-  background: rgba(72, 187, 120, 0.2) !important;
+  background: rgba(34, 197, 94, 0.22) !important;
 }
 
 .summary-row-aprs:hover {
-  background: rgba(72, 187, 120, 0.3) !important;
+  background: rgba(22, 163, 74, 0.32) !important;
+}
+
+.summary-row-aprs-rejected {
+  background: rgba(248, 113, 113, 0.22) !important;
+}
+
+.summary-row-aprs-rejected:hover {
+  background: rgba(239, 68, 68, 0.32) !important;
 }
 
 .snr-positive {
@@ -574,6 +653,21 @@ tbody tr:hover {
 
 .snr-negative {
   color: #f87171;
+}
+
+.type {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.type-icon {
+  font-size: 1.1rem;
+  filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.25));
+}
+
+.detail-main {
+  font-weight: 500;
 }
 
 .info-cell {
@@ -591,10 +685,16 @@ tbody tr:hover {
 }
 
 .info-cell .detail-extra {
-  display: block;
+  display: flex;
+  flex-direction: column;
   margin-top: 4px;
   color: #cbd5f5;
   font-size: 0.8rem;
+  gap: 4px;
+}
+
+.info-cell .detail-extra span {
+  display: block;
 }
 
 .info-cell .aprs-badge {
@@ -602,10 +702,17 @@ tbody tr:hover {
   display: inline-block;
   padding: 2px 6px;
   border-radius: 6px;
-  background: rgba(253, 186, 116, 0.2);
-  color: #fbbf24;
+  background: rgba(34, 197, 94, 0.18);
+  color: #bbf7d0;
   font-size: 0.75rem;
   font-family: 'JetBrains Mono', monospace;
+  border: 1px solid rgba(34, 197, 94, 0.35);
+}
+
+.info-cell .aprs-badge.aprs-badge-rejected {
+  background: rgba(248, 113, 113, 0.2);
+  color: #fecdd3;
+  border-color: rgba(248, 113, 113, 0.45);
 }
 
 .flow-panel {
@@ -774,6 +881,13 @@ tbody tr:hover {
 .flow-item-status--pending {
   background: rgba(250, 204, 21, 0.25);
   color: #facc15;
+}
+
+.flow-item-status .flow-status-hint-btn {
+  width: 20px;
+  height: 20px;
+  margin-left: 8px;
+  font-size: 0.7rem;
 }
 
 .flow-item-path {
@@ -1461,6 +1575,71 @@ tbody tr:hover {
 .telemetry-table-extra {
   color: #94a3b8;
   font-size: 0.85rem;
+}
+
+.telemetry-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-top: 1px solid rgba(59, 130, 246, 0.18);
+  background: rgba(15, 23, 42, 0.78);
+}
+
+.telemetry-pagination-info {
+  color: #cbd5f5;
+  font-size: 0.9rem;
+}
+
+.telemetry-pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.telemetry-page-status {
+  color: #9ca3af;
+  font-size: 0.9rem;
+}
+
+.telemetry-page-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(30, 41, 59, 0.85);
+  color: #e2e8f0;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.telemetry-page-btn:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.35);
+  border-color: rgba(96, 165, 250, 0.6);
+}
+
+.telemetry-page-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.telemetry-page-size {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #cbd5f5;
+  font-size: 0.9rem;
+}
+
+.telemetry-page-size-select {
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(30, 41, 59, 0.9);
+  color: #e2e8f0;
 }
 
 .log-panel {

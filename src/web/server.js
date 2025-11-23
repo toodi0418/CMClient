@@ -6,7 +6,15 @@ const fs = require('fs');
 const { URL } = require('url');
 const fsPromises = fs.promises;
 
-const DEFAULT_PORT = Number(process.env.TMAG_WEB_PORT) || 7080;
+const MAX_PORT_NUMBER = 65_535;
+const MAX_PORT_FALLBACK_ATTEMPTS = 50;
+const DEFAULT_PORT_FALLBACK_ATTEMPTS = 15;
+const RAW_ENV_PORT =
+  typeof process.env.TMAG_WEB_PORT === 'string'
+    ? process.env.TMAG_WEB_PORT.trim()
+    : process.env.TMAG_WEB_PORT;
+const ENV_PORT_DEFINED = Boolean(RAW_ENV_PORT);
+const DEFAULT_PORT = normalizePortNumber(RAW_ENV_PORT, 7080);
 const DEFAULT_HOST = process.env.TMAG_WEB_HOST || '0.0.0.0';
 const PACKET_WINDOW_MS = 10 * 60 * 1000;
 const PACKET_BUCKET_MS = 60 * 1000;
@@ -15,8 +23,22 @@ const MAX_LOG_ENTRIES = 200;
 const APRS_HISTORY_MAX = 5000;
 const APRS_RECORD_HISTORY_MAX = 5000;
 const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
+const DEFAULT_TELEMETRY_MAX_TOTAL_RECORDS = 20000;
 const MESSAGE_MAX_PER_CHANNEL = 200;
 const MESSAGE_PERSIST_INTERVAL_MS = 2000;
+const TELEMETRY_METRIC_DEFINITIONS = {
+  batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150] },
+  voltage: { label: '電壓', unit: 'V', decimals: 2 },
+  channelUtilization: { label: '通道使用率', unit: '%', decimals: 1, clamp: [0, 100] },
+  airUtilTx: { label: '空中時間 (TX)', unit: '%', decimals: 1, clamp: [0, 100] },
+  temperature: { label: '溫度', unit: '°C', decimals: 1 },
+  relativeHumidity: { label: '濕度', unit: '%', decimals: 0, clamp: [0, 100] },
+  barometricPressure: { label: '氣壓', unit: 'hPa', decimals: 1 },
+  uptimeSeconds: {
+    label: '運行時間',
+    formatter: (value) => formatSecondsAsDuration(value)
+  }
+};
 const CHANNEL_CONFIG = [
   { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
   { id: 1, code: 'CH1', name: 'Mesh TW', note: '跨節點廣播與共通交換' },
@@ -90,10 +112,36 @@ const FALLBACK_VERSION = (() => {
   return '0.0.0';
 })();
 
+function normalizePortNumber(rawValue, fallback) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return fallback;
+  }
+  const numeric = Number(rawValue);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  const port = Math.floor(numeric);
+  if (port < 1 || port > MAX_PORT_NUMBER) {
+    return fallback;
+  }
+  return port;
+}
+
 class WebDashboardServer {
   constructor(options = {}) {
-    this.port = options.port ?? DEFAULT_PORT;
+    const preferredPort = normalizePortNumber(options.port, DEFAULT_PORT);
+    this.port = preferredPort;
+    this.preferredPort = preferredPort;
     this.host = options.host ?? DEFAULT_HOST;
+    const fallbackAttempts =
+      Number.isFinite(options.portFallbackAttempts) && options.portFallbackAttempts > 0
+        ? Math.min(Math.floor(options.portFallbackAttempts), MAX_PORT_FALLBACK_ATTEMPTS)
+        : DEFAULT_PORT_FALLBACK_ATTEMPTS;
+    this.portFallbackAttempts = fallbackAttempts;
+    this.autoPortFallback =
+      typeof options.autoPortFallback === 'boolean'
+        ? options.autoPortFallback
+        : !ENV_PORT_DEFINED;
     this.inactivityPingMs = options.inactivityPingMs ?? 15_000;
     this.appVersion = typeof options.appVersion === 'string' && options.appVersion.trim()
       ? options.appVersion.trim()
@@ -102,6 +150,12 @@ class WebDashboardServer {
       typeof options.relayStatsPath === 'string' && options.relayStatsPath.trim()
         ? options.relayStatsPath.trim()
         : null;
+    this.relayStatsStore =
+      options && typeof options.relayStatsStore === 'object' ? options.relayStatsStore : null;
+    this.messageLogStore =
+      options && typeof options.messageLogStore === 'object' ? options.messageLogStore : null;
+    this.aprsDebugProvider =
+      typeof options.aprsDebugProvider === 'function' ? options.aprsDebugProvider : null;
 
     this.server = null;
     this.clients = new Set();
@@ -129,8 +183,22 @@ class WebDashboardServer {
       Number.isFinite(options.telemetryMaxPerNode) && options.telemetryMaxPerNode > 0
         ? Math.floor(options.telemetryMaxPerNode)
         : DEFAULT_TELEMETRY_MAX_PER_NODE;
+    this.telemetryMaxTotalRecords =
+      Number.isFinite(options.telemetryMaxTotalRecords) && options.telemetryMaxTotalRecords > 0
+        ? Math.floor(options.telemetryMaxTotalRecords)
+        : DEFAULT_TELEMETRY_MAX_TOTAL_RECORDS;
+    this.telemetryProvider =
+      options && typeof options.telemetryProvider === 'object' ? options.telemetryProvider : null;
     this.telemetryStore = new Map();
     this.telemetryRecordIds = new Set();
+    this.telemetryRecordOrder = [];
+    this.telemetrySummary = new Map();
+    this.telemetrySummaryUpdatedAt = null;
+    this.nodeSnapshotMeta = {
+      source: 'unknown',
+      details: {}
+    };
+    this.lastTelemetrySummary = null;
     this.telemetryUpdatedAt = null;
     this.telemetryStats = {
       totalRecords: 0,
@@ -156,48 +224,135 @@ class WebDashboardServer {
 
     await this._loadMessageLog();
 
-    this.server = http.createServer((req, res) => {
-      const parsedUrl = (() => {
-        try {
-          return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-        } catch {
-          return { pathname: req.url };
-        }
-      })();
-      const pathname = parsedUrl.pathname || req.url;
-      if (pathname === '/api/events') {
-        this._handleEventStream(req, res);
-        return;
-      }
-      if (pathname === '/debug') {
-        this._handleDebugRequest(req, res);
-        return;
-      }
-      this._serveStatic(req, res);
-    });
+    const preferredPort = this._resolvePreferredPort();
+    const candidatePorts = this._buildPortCandidates(preferredPort);
+    let lastError = null;
 
-    await new Promise((resolve, reject) => {
-      const cleanup = (err) => {
-        this.server?.off('listening', onListening);
-        this.server?.off('error', onError);
-        if (err) {
-          reject(err);
-        } else {
-          resolve();
+    for (const portCandidate of candidatePorts) {
+      try {
+        const server = await this._listenOnPort(portCandidate);
+        this.server = server;
+        this.port = portCandidate;
+        this._startPing();
+        if (portCandidate !== preferredPort) {
+          console.warn(
+            `[WEB] Dashboard 連接埠 ${preferredPort} 已被佔用，改為 ${portCandidate}`
+          );
         }
+        // eslint-disable-next-line no-console
+        console.log(`[WEB] Dashboard listening at http://${this.host}:${this.port}`);
+        return;
+      } catch (err) {
+        lastError = err;
+        if (err && err.code === 'EADDRINUSE' && this.autoPortFallback) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+    throw new Error('無法啟動 Web Dashboard：沒有可用的連接埠');
+  }
+
+  _createHttpServer() {
+    return http.createServer((req, res) => {
+      this._handleHttpRequest(req, res);
+    });
+  }
+
+  _handleHttpRequest(req, res) {
+    const parsedUrl = (() => {
+      try {
+        return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+      } catch {
+        return { pathname: req.url };
+      }
+    })();
+    const pathname = parsedUrl.pathname || req.url;
+    if (pathname === '/api/events') {
+      this._handleEventStream(req, res);
+      return;
+    }
+    if (pathname === '/api/telemetry/export.csv') {
+      this._handleTelemetryExportRequest(req, res);
+      return;
+    }
+    if (pathname === '/api/telemetry') {
+      this._handleTelemetryRequest(req, res);
+      return;
+    }
+    if (pathname === '/debug') {
+      this._handleDebugRequest(req, res);
+      return;
+    }
+    this._serveStatic(req, res);
+  }
+
+  async _listenOnPort(port) {
+    const server = this._createHttpServer();
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        server.off('listening', onListening);
+        server.off('error', onError);
       };
 
-      const onListening = () => cleanup();
-      const onError = (err) => cleanup(err);
+      const onListening = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (err) => {
+        cleanup();
+        try {
+          server.close();
+        } catch {
+          // ignore
+        }
+        reject(err);
+      };
 
-      this.server.once('listening', onListening);
-      this.server.once('error', onError);
-      this.server.listen(this.port, this.host);
+      server.once('listening', onListening);
+      server.once('error', onError);
+      server.listen(port, this.host);
     });
+    return server;
+  }
 
-    this._startPing();
-    // eslint-disable-next-line no-console
-    console.log(`[WEB] Dashboard listening at http://${this.host}:${this.port}`);
+  _buildPortCandidates(preferredPort) {
+    const seen = new Set();
+    const candidates = [];
+    const addCandidate = (value) => {
+      const portNumber = normalizePortNumber(value, null);
+      if (!portNumber || seen.has(portNumber)) {
+        return;
+      }
+      seen.add(portNumber);
+      candidates.push(portNumber);
+    };
+
+    addCandidate(preferredPort);
+    if (this.autoPortFallback) {
+      for (let i = 1; i <= this.portFallbackAttempts; i += 1) {
+        const candidate = preferredPort + i;
+        if (candidate > MAX_PORT_NUMBER) {
+          break;
+        }
+        addCandidate(candidate);
+      }
+    }
+    return candidates;
+  }
+
+  _resolvePreferredPort() {
+    if (Number.isFinite(this.preferredPort) && this.preferredPort > 0) {
+      return this.preferredPort;
+    }
+    if (Number.isFinite(this.port) && this.port > 0) {
+      return this.port;
+    }
+    return DEFAULT_PORT;
   }
 
   async stop() {
@@ -231,6 +386,7 @@ class WebDashboardServer {
     if (!summary) return;
     const base = this.selfMeshId ? { ...summary, selfMeshId: this.selfMeshId } : { ...summary };
     const payload = this._hydrateSummaryNodes(base);
+    this._ensureSummarySource(payload);
     this._appendSummary(payload);
     this._broadcast({ type: 'summary', payload });
     this._broadcastMetrics();
@@ -282,6 +438,7 @@ class WebDashboardServer {
     if (payload.type === 'reset') {
       this.telemetryStore.clear();
       this.telemetryRecordIds.clear();
+      this.telemetryRecordOrder = [];
       this.telemetryUpdatedAt =
         Number.isFinite(payload.updatedAt) && payload.updatedAt > 0
           ? Number(payload.updatedAt)
@@ -289,7 +446,7 @@ class WebDashboardServer {
       const stats = this._computeTelemetryStats();
       this._broadcast({
         type: 'telemetry-reset',
-        payload: { updatedAt: this.telemetryUpdatedAt, stats }
+        payload: { updatedAt: this.telemetryUpdatedAt, stats, maxTotalRecords: this.telemetryMaxTotalRecords }
       });
       return;
     }
@@ -318,7 +475,8 @@ class WebDashboardServer {
         node: nodeInfo,
         record,
         updatedAt: this.telemetryUpdatedAt,
-        stats
+        stats,
+        maxTotalRecords: this.telemetryMaxTotalRecords
       }
     });
   }
@@ -326,6 +484,7 @@ class WebDashboardServer {
   seedTelemetrySnapshot(snapshot = {}) {
     this.telemetryStore.clear();
     this.telemetryRecordIds.clear();
+    this.telemetryRecordOrder = [];
 
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
     for (const node of nodes) {
@@ -426,10 +585,20 @@ class WebDashboardServer {
       res.end(JSON.stringify({ error: 'Method Not Allowed', allowed: ['GET'] }));
       return;
     }
-    this._readRelayStats()
-      .then(({ stats, message }) => {
+    Promise.all([this._readRelayStats(), this._collectAprsDebugSnapshot()])
+      .then(([relayInfo, aprsDebug]) => {
+        const { stats, source, details, message } = relayInfo;
         const payload = {
           relayLinkStats: stats,
+          relayLinkSource: source || undefined,
+          relayLinkDetails: details && Object.keys(details).length ? details : undefined,
+          nodeTotals: this._collectNodeTotals(),
+          nodeSnapshotSource: this.nodeSnapshotMeta?.source ?? undefined,
+          nodeSnapshotDetails:
+            this.nodeSnapshotMeta?.details && Object.keys(this.nodeSnapshotMeta.details).length
+              ? this.nodeSnapshotMeta.details
+              : undefined,
+          aprsDedup: aprsDebug || undefined,
           message: message || undefined,
           generatedAt: new Date().toISOString()
         };
@@ -457,23 +626,118 @@ class WebDashboardServer {
       });
   }
 
+  _collectNodeTotals() {
+    const registryCount = this.nodeRegistry instanceof Map ? this.nodeRegistry.size : 0;
+    const details = this.nodeSnapshotMeta?.details || {};
+    const snapshotCount = Number.isFinite(details.count) ? Number(details.count) : null;
+    const restoredCount = Number.isFinite(details.restoredCount) ? Number(details.restoredCount) : null;
+    const result = {
+      registry: registryCount
+    };
+    if (snapshotCount !== null) {
+      result.snapshot = snapshotCount;
+    }
+    if (restoredCount !== null) {
+      result.restored = restoredCount;
+    }
+    return result;
+  }
+
+  async _collectAprsDebugSnapshot() {
+    if (!this.aprsDebugProvider) {
+      return null;
+    }
+    try {
+      const snapshot = await Promise.resolve(this.aprsDebugProvider());
+      if (snapshot && typeof snapshot === 'object') {
+        return snapshot;
+      }
+      return snapshot ?? null;
+    } catch (err) {
+      return {
+        error: err?.message || 'failed to collect APRS debug snapshot'
+      };
+    }
+  }
+
   async _readRelayStats() {
+    let source = null;
+    const details = {};
+    if (this.relayStatsStore) {
+      try {
+        const rows = this.relayStatsStore.listRelayStats();
+        const stats = {};
+        for (const row of rows) {
+          if (!row || !row.meshKey) continue;
+          stats[row.meshKey] = {
+            snr: Number.isFinite(row.snr) ? row.snr : null,
+            rssi: Number.isFinite(row.rssi) ? row.rssi : null,
+            count: Number.isFinite(row.count) ? row.count : null,
+            updatedAt: Number.isFinite(row.updatedAt) ? row.updatedAt : null
+          };
+        }
+        source = 'sqlite';
+        details.sqlite = true;
+        if (this.relayStatsPath) {
+          try {
+            await fsPromises.rm(this.relayStatsPath, { force: true });
+          } catch {
+            // ignore cleanup error
+          }
+        }
+        return { stats, source, details, message: null };
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`讀取 sqlite relay stats 失敗: ${err.message}`);
+      }
+    }
     if (!this.relayStatsPath) {
-      return { stats: null, message: 'relayStatsPath not configured' };
+      return {
+        stats: null,
+        source: source ?? 'unavailable',
+        details,
+        message: 'relay stats storage not configured'
+      };
     }
     try {
       const raw = await fsPromises.readFile(this.relayStatsPath, 'utf8');
       if (!raw || !raw.trim()) {
-        return { stats: {}, message: null };
+        source = source ?? 'legacy-json';
+        details.path = this.relayStatsPath;
+        return { stats: {}, source, details, message: null };
       }
+      let parsed;
       try {
-        return { stats: JSON.parse(raw), message: null };
+        parsed = JSON.parse(raw);
       } catch (parseErr) {
         throw new Error(`Invalid relay stats JSON: ${parseErr.message}`);
       }
+      if (this.relayStatsStore && parsed && typeof parsed === 'object') {
+        const rows = Object.entries(parsed).map(([meshKey, value]) => ({
+          meshKey,
+          snr: Number.isFinite(value?.snr) ? value.snr : null,
+          rssi: Number.isFinite(value?.rssi) ? value.rssi : null,
+          count: Number.isFinite(value?.count) ? value.count : null,
+          updatedAt: Number.isFinite(value?.updatedAt) ? value.updatedAt : Date.now()
+        }));
+        try {
+          this.relayStatsStore.replaceRelayStats(rows);
+          await fsPromises.rm(this.relayStatsPath, { force: true });
+          source = 'sqlite';
+          details.sqlite = true;
+          details.migrated = true;
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn(`遷移 relay stats 至 SQLite 失敗: ${err.message}`);
+          source = source ?? 'legacy-json';
+        }
+      }
+      source = source ?? 'legacy-json';
+      details.path = this.relayStatsPath;
+      return { stats: parsed, source, details, message: null };
     } catch (err) {
       if (err && err.code === 'ENOENT') {
-        return { stats: {}, message: null };
+        return { stats: {}, source: source ?? 'legacy-json', details: { path: this.relayStatsPath }, message: null };
       }
       throw err;
     }
@@ -610,6 +874,10 @@ class WebDashboardServer {
       this._write(res, { type: 'self', payload: { meshId: this.selfMeshId } });
     }
     this._write(res, { type: 'metrics', payload: this.metrics });
+    const nodeSnapshot = this._buildNodeSnapshot();
+    if (nodeSnapshot.length) {
+      this._write(res, { type: 'node-snapshot', payload: nodeSnapshot });
+    }
     if (this.summaryRows.length) {
       this._write(res, { type: 'summary-batch', payload: this.summaryRows });
     }
@@ -627,18 +895,418 @@ class WebDashboardServer {
     if (this.lastAprsInfo) {
       this._write(res, { type: 'aprs', payload: this.lastAprsInfo });
     }
-    const nodeSnapshot = this._buildNodeSnapshot();
-    if (nodeSnapshot.length) {
-      this._write(res, { type: 'node-snapshot', payload: nodeSnapshot });
-    }
     this._write(res, {
       type: 'message-snapshot',
       payload: this._buildMessageSnapshotPayload()
     });
-    this._write(res, {
-      type: 'telemetry-snapshot',
-      payload: this._buildTelemetrySnapshot()
+    if (this.lastTelemetrySummary) {
+      this._write(res, {
+        type: 'telemetry-summary',
+        payload: this.lastTelemetrySummary
+      });
+    } else {
+      this._write(res, {
+        type: 'telemetry-summary',
+        payload: this._buildTelemetrySummaryPayload()
+      });
+    }
+  }
+
+  async _handleTelemetryExportRequest(req, res) {
+    const respond = (status, payload) => {
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(payload));
+    };
+
+    if (!req.method || req.method.toUpperCase() !== 'GET') {
+      respond(405, { error: 'Method Not Allowed', allowed: ['GET'] });
+      return;
+    }
+
+    let url;
+    try {
+      url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    } catch {
+      respond(400, { error: 'Invalid URL' });
+      return;
+    }
+
+    const meshIdParam = url.searchParams.get('meshId') || url.searchParams.get('mesh_id');
+    if (!meshIdParam) {
+      respond(400, { error: 'meshId is required' });
+      return;
+    }
+    const startRaw = url.searchParams.get('startMs') ?? url.searchParams.get('start');
+    const endRaw = url.searchParams.get('endMs') ?? url.searchParams.get('end');
+    const searchRaw = url.searchParams.get('search');
+
+    const startMs = Number.isFinite(Number(startRaw)) ? Number(startRaw) : null;
+    const endMs = Number.isFinite(Number(endRaw)) ? Number(endRaw) : null;
+    if (startMs != null && endMs != null && startMs > endMs) {
+      respond(400, { error: 'startMs must be less than or equal to endMs' });
+      return;
+    }
+    const searchTerm = typeof searchRaw === 'string' && searchRaw.trim() ? searchRaw.trim().toLowerCase() : '';
+
+    if (!this.telemetryProvider) {
+      respond(503, { error: 'telemetry provider unavailable' });
+      return;
+    }
+
+    const iteratorOptions = {
+      meshId: meshIdParam,
+      startMs,
+      endMs
+    };
+
+    const createIterator = () => {
+      if (typeof this.telemetryProvider.streamTelemetryRecords === 'function') {
+        return this.telemetryProvider.streamTelemetryRecords(iteratorOptions);
+      }
+      return (async function* fallback(self) {
+        try {
+          const payload = await self.telemetryProvider.getTelemetryRecordsForRange({
+            ...iteratorOptions,
+            limit: null
+          });
+          if (Array.isArray(payload?.records)) {
+            for (const record of payload.records) {
+              yield record;
+            }
+          }
+        } catch (err) {
+          throw err;
+        }
+      })(this);
+    };
+
+    const metricKeysInUseSet = new Set();
+    const extraMetricKeySet = new Set();
+    let totalRecords = 0;
+
+    try {
+      for await (const record of createIterator()) {
+        if (!record) continue;
+        if (searchTerm && !recordMatchesSearch(record, searchTerm)) {
+          continue;
+        }
+        totalRecords += 1;
+        collectTelemetryMetricKeys(record, metricKeysInUseSet, extraMetricKeySet);
+      }
+    } catch (err) {
+      console.warn(`預備遙測匯出失敗：${err.message}`);
+      respond(500, { error: 'failed to prepare export' });
+      return;
+    }
+
+    const baseMetricOrder = Object.keys(TELEMETRY_METRIC_DEFINITIONS);
+    const metricKeysInUse = baseMetricOrder.filter((key) => metricKeysInUseSet.has(key));
+    const extraMetricKeys = Array.from(extraMetricKeySet).sort((a, b) => a.localeCompare(b));
+
+    const normalizedName = normalizeMeshId(meshIdParam) || meshIdParam || 'telemetry';
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeName = normalizedName.replace(/[^0-9a-z_-]/gi, '');
+    const fileName = `telemetry-${safeName || 'export'}-${timestamp}.csv`;
+
+    res.writeHead(200, {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${fileName}"`,
+      'Cache-Control': 'no-store, max-age=0',
+      'X-Total-Records': String(totalRecords)
     });
+    res.write('\ufeff');
+
+    const headerColumns = [
+      '時間 (ISO)',
+      'Unix 秒',
+      'MeshID',
+      '節點',
+      'Channel',
+      'SNR',
+      'RSSI',
+      '詳細',
+      '最後轉發',
+      '最後轉發 MeshID',
+      '最後轉發為推測',
+      '最後轉發說明',
+      '跳數',
+      'Hop Start',
+      'Hop Limit',
+      ...metricKeysInUse.map((key) => {
+        const def = TELEMETRY_METRIC_DEFINITIONS[key] || {};
+        const label = def.label || key;
+        return def.unit ? `${label} (${def.unit})` : label;
+      }),
+      ...extraMetricKeys
+    ];
+    res.write(headerColumns.map(escapeCsvValue).join(',') + '\n');
+
+    try {
+      for await (const record of createIterator()) {
+        if (!record) continue;
+        if (searchTerm && !recordMatchesSearch(record, searchTerm)) {
+          continue;
+        }
+        res.write(
+          buildTelemetryCsvLine(record, {
+            metricKeysInUse,
+            extraMetricKeys
+          })
+        );
+      }
+    } catch (err) {
+      console.warn(`遙測匯出中斷：${err.message}`);
+      res.end();
+      return;
+    }
+
+    res.end();
+  }
+
+  _handleTelemetryRequest(req, res) {
+    const respond = (status, payload) => {
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(payload));
+    };
+
+    if (!req.method || req.method.toUpperCase() !== 'GET') {
+      respond(405, { error: 'Method Not Allowed', allowed: ['GET'] });
+      return;
+    }
+
+    let url;
+    try {
+      url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    } catch {
+      respond(400, { error: 'Invalid URL' });
+      return;
+    }
+
+    const meshIdParam = url.searchParams.get('meshId') || url.searchParams.get('mesh_id');
+    const limitRaw = url.searchParams.get('limit') ?? url.searchParams.get('limitPerNode');
+    const startRaw = url.searchParams.get('startMs') ?? url.searchParams.get('start');
+    const endRaw = url.searchParams.get('endMs') ?? url.searchParams.get('end');
+
+    let limit = null;
+    if (limitRaw != null && `${limitRaw}`.trim() !== '') {
+      const parsedLimit = Number(limitRaw);
+      if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
+        limit = Math.floor(parsedLimit);
+      }
+    }
+    const startMs = Number.isFinite(Number(startRaw)) ? Number(startRaw) : null;
+    const endMs = Number.isFinite(Number(endRaw)) ? Number(endRaw) : null;
+    if (startMs != null && endMs != null && startMs > endMs) {
+      respond(400, { error: 'startMs must be less than or equal to endMs' });
+      return;
+    }
+
+    if (!meshIdParam) {
+      const payload = this._buildTelemetrySummaryPayload();
+      respond(200, payload);
+      return;
+    }
+
+    if (!this.telemetryProvider || typeof this.telemetryProvider.getTelemetryRecordsForMesh !== 'function') {
+      respond(503, { error: 'telemetry provider unavailable' });
+      return;
+    }
+
+    try {
+      const detail = this.telemetryProvider.getTelemetryRecordsForMesh(meshIdParam, {
+        limit,
+        startMs,
+        endMs
+      });
+      if (!detail) {
+        respond(404, { error: 'telemetry not found' });
+        return;
+      }
+      this._ingestTelemetryDetail(detail, { startMs, endMs, limit });
+      const response = {
+        ...detail,
+        range: {
+          startMs: startMs != null ? startMs : null,
+          endMs: endMs != null ? endMs : null
+        },
+        requestedLimit: limit != null ? limit : null,
+        updatedAt: Date.now(),
+        stats: this._computeTelemetryStats()
+      };
+      respond(200, response);
+    } catch (err) {
+      console.error(`處理遙測請求失敗：${err.message}`);
+      respond(500, { error: 'internal error' });
+    }
+  }
+
+  _ingestTelemetryDetail(detail, options = {}) {
+    if (!detail || typeof detail !== 'object') {
+      return;
+    }
+    const { startMs = null, endMs = null, limit = null } = options || {};
+    const meshId = detail.meshId || detail.rawMeshId || detail.meshIdNormalized;
+    if (!meshId) {
+      return;
+    }
+    const key = String(meshId);
+    const normalized = normalizeMeshId(meshId);
+    const sanitizedNode = sanitizeTelemetryNode(detail.node);
+    let bucket = this.telemetryStore.get(key);
+    if (!bucket) {
+      bucket = {
+        meshId: key,
+        rawMeshId: detail.rawMeshId || key,
+        node: sanitizedNode ? cloneJson(sanitizedNode) : null,
+        records: [],
+        recordIdSet: new Set(),
+        loadedRange: null,
+        loadedCount: 0,
+        totalRecords: Number.isFinite(detail.totalRecords) ? Number(detail.totalRecords) : 0,
+        metrics: new Set(Array.isArray(detail.availableMetrics) ? detail.availableMetrics : []),
+        latestSampleMs: Number.isFinite(detail.latestSampleMs) ? Number(detail.latestSampleMs) : null,
+        earliestSampleMs: Number.isFinite(detail.earliestSampleMs) ? Number(detail.earliestSampleMs) : null,
+        partial: false
+      };
+      this.telemetryStore.set(key, bucket);
+    } else {
+      if (detail.rawMeshId && !bucket.rawMeshId) {
+        bucket.rawMeshId = detail.rawMeshId;
+      }
+      if (sanitizedNode) {
+        bucket.node = mergeNodeInfo(bucket.node, sanitizedNode, { meshId: key });
+      }
+      bucket.totalRecords = Number.isFinite(detail.totalRecords) ? Number(detail.totalRecords) : bucket.totalRecords;
+      bucket.latestSampleMs = Number.isFinite(detail.latestSampleMs)
+        ? Number(detail.latestSampleMs)
+        : bucket.latestSampleMs;
+      bucket.earliestSampleMs = Number.isFinite(detail.earliestSampleMs)
+        ? Number(detail.earliestSampleMs)
+        : bucket.earliestSampleMs;
+      if (!bucket.metrics) {
+        bucket.metrics = new Set();
+      }
+      if (Array.isArray(detail.availableMetrics)) {
+        for (const metric of detail.availableMetrics) {
+          bucket.metrics.add(metric);
+        }
+      }
+    }
+
+    if (sanitizedNode && sanitizedNode.meshIdNormalized) {
+      this._upsertNode(
+        {
+          ...sanitizedNode,
+          meshId: sanitizedNode.meshId ?? key,
+          meshIdNormalized: sanitizedNode.meshIdNormalized ?? normalized
+        },
+        { allowCreate: false }
+      );
+    }
+
+    if (Array.isArray(bucket.records)) {
+      for (const existing of bucket.records) {
+        if (existing?.id) {
+          this.telemetryRecordIds.delete(existing.id);
+        }
+      }
+    }
+
+    const records = Array.isArray(detail.records)
+      ? detail.records.map((record) => cloneJson(record))
+      : [];
+    bucket.records = records;
+    bucket.recordIdSet = new Set();
+    for (const record of records) {
+      if (record?.id) {
+        bucket.recordIdSet.add(record.id);
+        this.telemetryRecordIds.add(record.id);
+      }
+    }
+    bucket.loadedRange = {
+      startMs: startMs != null ? startMs : null,
+      endMs: endMs != null ? endMs : null,
+      limit: limit != null ? limit : null
+    };
+    const filteredCount = Number.isFinite(detail.filteredCount) ? Number(detail.filteredCount) : records.length;
+    bucket.loadedCount = filteredCount;
+    bucket.totalRecords = Number.isFinite(detail.totalRecords) ? Number(detail.totalRecords) : records.length;
+    bucket.partial = Number.isFinite(bucket.totalRecords) && filteredCount < bucket.totalRecords;
+
+    this._updateTelemetrySummaryEntry(key, {
+      rawMeshId: bucket.rawMeshId,
+      node: bucket.node,
+      totalRecords: bucket.totalRecords,
+      latestSampleMs: bucket.latestSampleMs,
+      earliestSampleMs: bucket.earliestSampleMs,
+      availableMetrics: Array.isArray(detail.availableMetrics) ? detail.availableMetrics : []
+    });
+    this._computeTelemetryStats();
+  }
+
+  _updateTelemetrySummaryEntry(meshId, updates = {}) {
+    if (!meshId) {
+      return;
+    }
+    const normalized = normalizeMeshId(meshId);
+    const key = normalized || meshId;
+    if (!key) {
+      return;
+    }
+    let entry = this.telemetrySummary.get(key);
+    if (!entry) {
+      entry = {
+        meshId: updates.rawMeshId || meshId,
+        meshIdNormalized: normalized || normalizeMeshId(meshId) || meshId,
+        rawMeshId: updates.rawMeshId || meshId,
+        node: null,
+        totalRecords: 0,
+        latestSampleMs: null,
+        availableMetrics: new Set()
+      };
+      this.telemetrySummary.set(key, entry);
+    }
+    if (updates.rawMeshId && !entry.rawMeshId) {
+      entry.rawMeshId = updates.rawMeshId;
+    }
+    if (updates.node) {
+      entry.node = mergeNodeInfo(entry.node, updates.node, { meshId });
+    }
+    if (Number.isFinite(updates.totalRecords)) {
+      entry.totalRecords = Number(updates.totalRecords);
+    } else if (Number.isFinite(updates.totalRecordsDelta)) {
+      entry.totalRecords = Number(entry.totalRecords || 0) + Number(updates.totalRecordsDelta);
+    }
+    if (Number.isFinite(updates.latestSampleMs)) {
+      const latest = Number(updates.latestSampleMs);
+      entry.latestSampleMs = entry.latestSampleMs != null ? Math.max(entry.latestSampleMs, latest) : latest;
+      if (entry.earliestSampleMs == null) {
+        entry.earliestSampleMs = latest;
+      }
+    }
+    if (Number.isFinite(updates.earliestSampleMs)) {
+      const earliest = Number(updates.earliestSampleMs);
+      entry.earliestSampleMs =
+        entry.earliestSampleMs != null ? Math.min(entry.earliestSampleMs, earliest) : earliest;
+    }
+    if (Array.isArray(updates.availableMetrics)) {
+      if (!entry.availableMetrics) {
+        entry.availableMetrics = new Set();
+      }
+      for (const metric of updates.availableMetrics) {
+        entry.availableMetrics.add(metric);
+      }
+    }
+    this.telemetrySummaryUpdatedAt = Date.now();
+    this.lastTelemetrySummary = null;
   }
 
   _appendTelemetryRecord(meshId, node, record) {
@@ -650,11 +1318,14 @@ class WebDashboardServer {
     const sanitizedNode = node ? sanitizeTelemetryNode(node) : null;
     let registryNode = null;
     if (sanitizedNode && normalizedMeshId) {
-      registryNode = this._upsertNode({
-        ...sanitizedNode,
-        meshId: sanitizedNode.meshId ?? meshId,
-        meshIdNormalized: sanitizedNode.meshIdNormalized ?? normalizedMeshId
-      });
+      registryNode = this._upsertNode(
+        {
+          ...sanitizedNode,
+          meshId: sanitizedNode.meshId ?? meshId,
+          meshIdNormalized: sanitizedNode.meshIdNormalized ?? normalizedMeshId
+        },
+        { allowCreate: false }
+      );
     } else if (normalizedMeshId) {
       registryNode = this.nodeRegistry.get(normalizedMeshId) || null;
     }
@@ -665,9 +1336,11 @@ class WebDashboardServer {
       record.node ? sanitizeTelemetryNode(record.node) : null,
       registryNode
     );
+    const rawMeshId = record.rawMeshId || record.meshId || meshId;
     if (!bucket) {
       bucket = {
         meshId: key,
+        rawMeshId: rawMeshId || meshId,
         node: mergedNode,
         records: []
       };
@@ -675,8 +1348,23 @@ class WebDashboardServer {
     } else if (mergedNode) {
       bucket.node = mergedNode;
     }
+    if (rawMeshId && !bucket.rawMeshId) {
+      bucket.rawMeshId = rawMeshId;
+    }
     if (mergedNode) {
       record.node = mergeNodeInfo(record.node ? sanitizeTelemetryNode(record.node) : {}, mergedNode);
+    }
+    const sampleMs = Number.isFinite(record.sampleTimeMs)
+      ? Number(record.sampleTimeMs)
+      : Number.isFinite(record.timestampMs)
+        ? Number(record.timestampMs)
+        : Date.now();
+    record.sampleTimeMs = Number.isFinite(sampleMs) ? sampleMs : Date.now();
+    if (!Number.isFinite(record.timestampMs)) {
+      record.timestampMs = record.sampleTimeMs;
+    }
+    if (!record.id) {
+      record.id = `${key}-${record.sampleTimeMs}-${Math.random().toString(16).slice(2, 10)}`;
     }
     if (record.id) {
       this.telemetryRecordIds.add(record.id);
@@ -688,7 +1376,153 @@ class WebDashboardServer {
       for (const item of removed) {
         if (item?.id) {
           this.telemetryRecordIds.delete(item.id);
+          this._removeTelemetryOrderEntry(key, item.id);
         }
+      }
+    }
+    if (record.id) {
+      this._trackTelemetryRecord(key, record.id);
+    }
+    const metricKeys = [];
+    if (record?.telemetry?.metrics && typeof record.telemetry.metrics === 'object') {
+      for (const metricKey of Object.keys(record.telemetry.metrics)) {
+        metricKeys.push(metricKey);
+      }
+    }
+    this._updateTelemetrySummaryEntry(key, {
+      rawMeshId: bucket.rawMeshId || key,
+      node: bucket.node,
+      totalRecordsDelta: 1,
+      latestSampleMs: record.sampleTimeMs,
+      availableMetrics: metricKeys
+    });
+    this._computeTelemetryStats();
+    this._enforceTelemetryGlobalLimit();
+  }
+
+  seedTelemetrySummary(summary = []) {
+    this.telemetrySummary.clear();
+    const nodes = Array.isArray(summary)
+      ? summary
+      : Array.isArray(summary?.nodes)
+        ? summary.nodes
+        : [];
+    for (const entry of nodes) {
+      if (!entry) continue;
+      const meshId = entry.meshId || entry.rawMeshId || entry.meshIdNormalized;
+      const normalized = normalizeMeshId(meshId);
+      if (!meshId && !normalized) {
+        continue;
+      }
+      const key = normalized || meshId;
+      const node = sanitizeTelemetryNode(entry.node);
+      const availableMetrics = Array.isArray(entry?.availableMetrics)
+        ? entry.availableMetrics
+        : [];
+      const latestSample =
+        Number.isFinite(entry?.latestSampleMs) && entry.latestSampleMs > 0
+          ? Number(entry.latestSampleMs)
+          : null;
+      const earliestSample =
+        Number.isFinite(entry?.earliestSampleMs) && entry.earliestSampleMs > 0
+          ? Number(entry.earliestSampleMs)
+          : null;
+      this.telemetrySummary.set(key, {
+        meshId: meshId || normalized || key,
+        meshIdNormalized: normalized || normalizeMeshId(meshId) || key,
+        rawMeshId: entry?.rawMeshId || meshId || normalized || key,
+        node,
+        totalRecords: Number.isFinite(entry?.totalRecords) ? Number(entry.totalRecords) : 0,
+        latestSampleMs: latestSample,
+        earliestSampleMs: earliestSample,
+        availableMetrics: new Set(availableMetrics)
+      });
+    }
+    const providedUpdatedAt =
+      Number.isFinite(summary?.updatedAt) && summary.updatedAt > 0
+        ? Number(summary.updatedAt)
+        : Date.now();
+    this.telemetrySummaryUpdatedAt = providedUpdatedAt;
+    if (summary && typeof summary === 'object' && summary.stats) {
+      this._applyTelemetryStatsPayload(summary.stats);
+    }
+    const payload = this._buildTelemetrySummaryPayload();
+    this.lastTelemetrySummary = payload;
+    this._computeTelemetryStats();
+    this._broadcast({
+      type: 'telemetry-summary',
+      payload
+    });
+  }
+
+  _findTelemetryBucket(meshId) {
+    if (!meshId) {
+      return { bucket: null, key: null };
+    }
+    if (this.telemetryStore.has(meshId)) {
+      return { bucket: this.telemetryStore.get(meshId), key: meshId };
+    }
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) {
+      return { bucket: null, key: null };
+    }
+    for (const [key, bucket] of this.telemetryStore.entries()) {
+      if (!bucket) continue;
+      const keyNormalized = normalizeMeshId(key);
+      const rawNormalized = normalizeMeshId(bucket.rawMeshId);
+      if (keyNormalized === normalized || rawNormalized === normalized) {
+        return { bucket, key };
+      }
+    }
+    return { bucket: null, key: null };
+  }
+
+  _trackTelemetryRecord(meshKey, recordId) {
+    if (!recordId) {
+      return;
+    }
+    this.telemetryRecordOrder.push({ meshId: meshKey, recordId });
+  }
+
+  _removeTelemetryOrderEntry(meshKey, recordId) {
+    if (!recordId || this.telemetryRecordOrder.length === 0) {
+      return;
+    }
+    for (let i = this.telemetryRecordOrder.length - 1; i >= 0; i -= 1) {
+      const entry = this.telemetryRecordOrder[i];
+      if (entry.recordId === recordId && (meshKey == null || entry.meshId === meshKey)) {
+        this.telemetryRecordOrder.splice(i, 1);
+        break;
+      }
+    }
+  }
+
+  _enforceTelemetryGlobalLimit() {
+    const maxTotal = this.telemetryMaxTotalRecords;
+    if (!Number.isFinite(maxTotal) || maxTotal <= 0) {
+      return;
+    }
+    while (this.telemetryRecordOrder.length > maxTotal) {
+      const oldest = this.telemetryRecordOrder.shift();
+      if (!oldest) {
+        break;
+      }
+      const bucket = this.telemetryStore.get(oldest.meshId);
+      if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+        this.telemetryRecordIds.delete(oldest.recordId);
+        continue;
+      }
+      const index = bucket.records.findIndex((item) => item?.id === oldest.recordId);
+      if (index === -1) {
+        this.telemetryRecordIds.delete(oldest.recordId);
+        continue;
+      }
+      const [removed] = bucket.records.splice(index, 1);
+      if (removed?.id) {
+        this.telemetryRecordIds.delete(removed.id);
+      }
+      if (!bucket.records.length) {
+        this.telemetryStore.delete(oldest.meshId);
       }
     }
   }
@@ -696,20 +1530,38 @@ class WebDashboardServer {
   _buildTelemetrySnapshot(limitPerNode = this.telemetryMaxPerNode) {
     const nodes = [];
     for (const bucket of this.telemetryStore.values()) {
-      if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+      if (!bucket) {
         continue;
       }
-      const records = bucket.records;
-      const limit =
-        Number.isFinite(limitPerNode) && limitPerNode > 0
-          ? Math.floor(limitPerNode)
-          : records.length;
-      const start = records.length > limit ? records.length - limit : 0;
-      const slice = records.slice(start).map((record) => cloneJson(record));
+      const records = Array.isArray(bucket.records) ? bucket.records : [];
+      let latestSampleMs = null;
+      let earliestSampleMs = null;
+      const metricsSet = new Set();
+      for (const record of records) {
+        const sample = Number(record?.sampleTimeMs);
+        if (Number.isFinite(sample)) {
+          if (latestSampleMs == null || sample > latestSampleMs) {
+            latestSampleMs = sample;
+          }
+          if (earliestSampleMs == null || sample < earliestSampleMs) {
+            earliestSampleMs = sample;
+          }
+        }
+        const metrics = record?.telemetry?.metrics;
+        if (metrics && typeof metrics === 'object') {
+          for (const key of Object.keys(metrics)) {
+            metricsSet.add(key);
+          }
+        }
+      }
       nodes.push({
         meshId: bucket.meshId,
+        rawMeshId: bucket.rawMeshId || bucket.meshId,
         node: bucket.node ? cloneJson(bucket.node) : null,
-        records: slice
+        totalRecords: records.length,
+        latestSampleMs,
+        earliestSampleMs,
+        metrics: Array.from(metricsSet)
       });
     }
     nodes.sort((a, b) => {
@@ -723,7 +1575,48 @@ class WebDashboardServer {
     return {
       updatedAt: this.telemetryUpdatedAt,
       nodes,
-      stats
+      stats,
+      maxTotalRecords: this.telemetryMaxTotalRecords
+    };
+  }
+
+  _buildTelemetrySummaryPayload() {
+    const nodes = [];
+    for (const entry of this.telemetrySummary.values()) {
+      if (!entry) continue;
+      nodes.push({
+        meshId: entry.meshId,
+        meshIdNormalized: entry.meshIdNormalized || normalizeMeshId(entry.meshId),
+        rawMeshId: entry.rawMeshId || entry.meshId,
+        node: entry.node ? cloneJson(entry.node) : null,
+        totalRecords: Number.isFinite(entry.totalRecords) ? Number(entry.totalRecords) : 0,
+        latestSampleMs: Number.isFinite(entry.latestSampleMs) ? Number(entry.latestSampleMs) : null,
+        earliestSampleMs: Number.isFinite(entry.earliestSampleMs) ? Number(entry.earliestSampleMs) : null,
+        availableMetrics: Array.from(entry.availableMetrics ?? [])
+      });
+    }
+    nodes.sort((a, b) => {
+      const timeA = Number.isFinite(a.latestSampleMs) ? a.latestSampleMs : -Infinity;
+      const timeB = Number.isFinite(b.latestSampleMs) ? b.latestSampleMs : -Infinity;
+      if (timeB !== timeA) {
+        return timeB - timeA;
+      }
+      const countA = Number.isFinite(a.totalRecords) ? a.totalRecords : 0;
+      const countB = Number.isFinite(b.totalRecords) ? b.totalRecords : 0;
+      if (countB !== countA) {
+        return countB - countA;
+      }
+      const labelA = (a.node?.label || a.meshId || '').toLowerCase();
+      const labelB = (b.node?.label || b.meshId || '').toLowerCase();
+      if (labelA < labelB) return -1;
+      if (labelA > labelB) return 1;
+      return 0;
+    });
+    return {
+      nodes,
+      updatedAt: this.telemetrySummaryUpdatedAt ?? Date.now(),
+      stats: this._computeTelemetryStats(),
+      maxTotalRecords: this.telemetryMaxTotalRecords
     };
   }
 
@@ -738,11 +1631,22 @@ class WebDashboardServer {
 
   _computeTelemetryStats() {
     let totalRecords = 0;
-    for (const bucket of this.telemetryStore.values()) {
-      if (!bucket || !Array.isArray(bucket.records)) continue;
-      totalRecords += bucket.records.length;
+    let totalNodes = 0;
+    if (this.telemetrySummary.size) {
+      for (const entry of this.telemetrySummary.values()) {
+        if (!entry) continue;
+        totalNodes += 1;
+        if (Number.isFinite(entry.totalRecords)) {
+          totalRecords += Number(entry.totalRecords);
+        }
+      }
+    } else {
+      for (const bucket of this.telemetryStore.values()) {
+        if (!bucket || !Array.isArray(bucket.records)) continue;
+        totalRecords += bucket.records.length;
+      }
+      totalNodes = this.telemetryStore.size;
     }
-    const totalNodes = this.telemetryStore.size;
     const diskBytes = Number.isFinite(this.telemetryStats.diskBytes) ? this.telemetryStats.diskBytes : 0;
     this.telemetryStats = {
       totalRecords,
@@ -760,8 +1664,14 @@ class WebDashboardServer {
     this._broadcast({ type: 'node', payload: merged });
   }
 
-  seedNodeSnapshot(list = []) {
+  seedNodeSnapshot(list = [], info = null) {
     this.nodeRegistry.clear();
+    if (info && typeof info === 'object') {
+      this.nodeSnapshotMeta = {
+        source: info.source ?? 'unknown',
+        details: info.details ? { ...info.details } : {}
+      };
+    }
     const snapshot = [];
     if (Array.isArray(list)) {
       for (const entry of list) {
@@ -792,7 +1702,8 @@ class WebDashboardServer {
     return nodes;
   }
 
-  _upsertNode(info) {
+  _upsertNode(info, options = {}) {
+    const allowCreate = options.allowCreate !== false;
     if (!info || typeof info !== 'object') {
       return null;
     }
@@ -801,14 +1712,20 @@ class WebDashboardServer {
     if (!normalized) {
       return null;
     }
-    const existing = this.nodeRegistry.get(normalized) || {
-      meshId: normalized,
-      meshIdNormalized: normalized
-    };
-    const merged = mergeNodeInfo(existing, {
+    const existing = this.nodeRegistry.get(normalized);
+    if (!existing && !allowCreate) {
+      return null;
+    }
+    const base =
+      existing ||
+      {
+        meshId: normalized,
+        meshIdNormalized: normalized
+      };
+    const merged = mergeNodeInfo(base, {
       ...info,
       meshIdNormalized: normalized,
-      meshId: info.meshId || existing.meshId || normalized
+      meshId: info.meshId || base.meshId || normalized
     });
     this.nodeRegistry.set(normalized, merged);
     return cloneJson(merged);
@@ -910,10 +1827,42 @@ class WebDashboardServer {
   }
 
   async _loadMessageLog() {
+    this.messageStore.clear();
+    const store = this.messageLogStore;
+    if (store) {
+      try {
+        const entries = store.loadMessageLog();
+        if (Array.isArray(entries) && entries.length) {
+          for (const rawEntry of entries) {
+          const entry = this._cloneMessageEntry(rawEntry);
+          if (!entry) continue;
+          const channelId = entry.channel;
+          const channelStore = this._getChannelStore(channelId);
+          const duplicateIndex = channelStore.findIndex((item) => item.flowId === entry.flowId);
+          if (duplicateIndex !== -1) {
+            channelStore.splice(duplicateIndex, 1);
+          }
+          channelStore.push(entry);
+          if (channelStore.length > MESSAGE_MAX_PER_CHANNEL) {
+            channelStore.splice(0, channelStore.length - MESSAGE_MAX_PER_CHANNEL);
+          }
+        }
+          this._ensureConfiguredChannels();
+          if (this.messageLogPath) {
+            await fsPromises.rm(this.messageLogPath, { force: true });
+          }
+          return;
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`從 SQLite 載入訊息紀錄失敗: ${err.message}`);
+      }
+    }
     if (!this.messageLogPath) {
+      this._ensureConfiguredChannels();
       return;
     }
-    this.messageStore.clear();
+    const migratedEntries = [];
     try {
       const content = await fsPromises.readFile(this.messageLogPath, 'utf8');
       if (!content) {
@@ -935,14 +1884,15 @@ class WebDashboardServer {
           continue;
         }
         const channelId = entry.channel;
-        const store = this._getChannelStore(channelId);
-        const duplicateIndex = store.findIndex((item) => item.flowId === entry.flowId);
+        const channelStore = this._getChannelStore(channelId);
+        const duplicateIndex = channelStore.findIndex((item) => item.flowId === entry.flowId);
         if (duplicateIndex !== -1) {
-          store.splice(duplicateIndex, 1);
+          channelStore.splice(duplicateIndex, 1);
         }
-        store.push(entry);
-        if (store.length > MESSAGE_MAX_PER_CHANNEL) {
-          store.splice(0, store.length - MESSAGE_MAX_PER_CHANNEL);
+        channelStore.push(entry);
+        migratedEntries.push(entry);
+        if (channelStore.length > MESSAGE_MAX_PER_CHANNEL) {
+          channelStore.splice(0, channelStore.length - MESSAGE_MAX_PER_CHANNEL);
         }
       }
       this._ensureConfiguredChannels();
@@ -952,10 +1902,19 @@ class WebDashboardServer {
         console.warn(`載入訊息紀錄失敗: ${err.message}`);
       }
     }
+    if (store && migratedEntries.length) {
+      try {
+        store.saveMessageLog(migratedEntries);
+        await fsPromises.rm(this.messageLogPath, { force: true });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`遷移訊息紀錄至 SQLite 失敗: ${err.message}`);
+      }
+    }
   }
 
   _scheduleMessagePersist() {
-    if (!this.messageLogPath) {
+    if (!this.messageLogStore && !this.messageLogPath) {
       return;
     }
     this._messageDirty = true;
@@ -973,18 +1932,34 @@ class WebDashboardServer {
   }
 
   async _persistMessageLog() {
-    if (!this.messageLogPath || !this._messageDirty) {
+    if (!this._messageDirty) {
       return;
     }
     this._messageDirty = false;
-    const lines = [];
     const sortedChannels = Array.from(this.messageStore.entries()).sort((a, b) => a[0] - b[0]);
+    const orderedEntries = [];
     for (const [, list] of sortedChannels) {
-      const entries = Array.isArray(list) ? list : [];
-      for (const entry of entries) {
-        lines.push(JSON.stringify(entry));
+      const channelEntries = Array.isArray(list) ? list : [];
+      for (let i = channelEntries.length - 1; i >= 0; i -= 1) {
+        orderedEntries.push(channelEntries[i]);
       }
     }
+    if (this.messageLogStore) {
+      try {
+        this.messageLogStore.saveMessageLog(orderedEntries);
+        if (this.messageLogPath) {
+          await fsPromises.rm(this.messageLogPath, { force: true });
+        }
+        return;
+      } catch (err) {
+        this._messageDirty = true;
+        throw err;
+      }
+    }
+    if (!this.messageLogPath) {
+      return;
+    }
+    const lines = orderedEntries.map((entry) => JSON.stringify(entry));
     try {
       await fsPromises.mkdir(path.dirname(this.messageLogPath), { recursive: true });
       await fsPromises.writeFile(this.messageLogPath, lines.join('\n'), 'utf8');
@@ -995,9 +1970,6 @@ class WebDashboardServer {
   }
 
   _flushMessagePersistSync() {
-    if (!this.messageLogPath) {
-      return;
-    }
     if (this._messagePersistTimer) {
       clearTimeout(this._messagePersistTimer);
       this._messagePersistTimer = null;
@@ -1005,14 +1977,37 @@ class WebDashboardServer {
     if (!this._messageDirty) {
       return;
     }
-    const lines = [];
     const sortedChannels = Array.from(this.messageStore.entries()).sort((a, b) => a[0] - b[0]);
+    const orderedEntries = [];
     for (const [, list] of sortedChannels) {
-      const entries = Array.isArray(list) ? list : [];
-      for (const entry of entries) {
-        lines.push(JSON.stringify(entry));
+      const channelEntries = Array.isArray(list) ? list : [];
+      for (let i = channelEntries.length - 1; i >= 0; i -= 1) {
+        orderedEntries.push(channelEntries[i]);
       }
     }
+    if (this.messageLogStore) {
+      try {
+        this.messageLogStore.saveMessageLog(orderedEntries);
+        if (this.messageLogPath) {
+          try {
+            fs.unlinkSync(this.messageLogPath);
+          } catch (err) {
+            if (err?.code !== 'ENOENT') {
+              throw err;
+            }
+          }
+        }
+        this._messageDirty = false;
+        return;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`同步寫入訊息紀錄失敗 (SQLite): ${err.message}`);
+      }
+    }
+    if (!this.messageLogPath) {
+      return;
+    }
+    const lines = orderedEntries.map((entry) => JSON.stringify(entry));
     try {
       fs.mkdirSync(path.dirname(this.messageLogPath), { recursive: true });
       fs.writeFileSync(this.messageLogPath, lines.join('\n'), 'utf8');
@@ -1149,6 +2144,73 @@ class WebDashboardServer {
     return next;
   }
 
+  _ensureSummarySource(summary) {
+    if (!summary || typeof summary !== 'object') {
+      return summary;
+    }
+    const pickCandidate = (...values) => {
+      for (const value of values) {
+        if (isUnknownLike(value)) continue;
+        return String(value).trim();
+      }
+      return null;
+    };
+
+    let meshId = pickCandidate(
+      summary.from?.meshId,
+      summary.from?.meshIdOriginal,
+      summary.from?.meshIdNormalized && `!${summary.from.meshIdNormalized}`,
+      summary.fromMeshId,
+      summary.fromMeshIdOriginal,
+      summary.fromMeshIdNormalized && `!${summary.fromMeshIdNormalized}`
+    );
+
+    if (!meshId && typeof summary.detail === 'string') {
+      const match = summary.detail.match(/(![0-9a-f]{6,8})/i);
+      if (match && match[1]) {
+        meshId = match[1];
+      }
+    }
+
+    if (!meshId) {
+      return summary;
+    }
+
+    const prefixed = toPrefixedMeshId(meshId);
+    if (!prefixed) {
+      return summary;
+    }
+    const normalized = normalizeMeshId(prefixed);
+
+    if (!summary.from || typeof summary.from !== 'object') {
+      summary.from = {};
+    }
+    if (isUnknownLike(summary.from.meshId)) {
+      summary.from.meshId = prefixed;
+    }
+    if (isUnknownLike(summary.from.meshIdOriginal)) {
+      summary.from.meshIdOriginal = prefixed;
+    }
+    if (isUnknownLike(summary.from.meshIdNormalized) && normalized) {
+      summary.from.meshIdNormalized = normalized;
+    }
+    if (isUnknownLike(summary.from.label)) {
+      summary.from.label = prefixed;
+    }
+    summary.fromMeshId = summary.fromMeshId && !isUnknownLike(summary.fromMeshId) ? summary.fromMeshId : prefixed;
+    summary.fromMeshIdOriginal =
+      summary.fromMeshIdOriginal && !isUnknownLike(summary.fromMeshIdOriginal)
+        ? summary.fromMeshIdOriginal
+        : prefixed;
+    if (normalized) {
+      summary.fromMeshIdNormalized =
+        summary.fromMeshIdNormalized && !isUnknownLike(summary.fromMeshIdNormalized)
+          ? summary.fromMeshIdNormalized
+          : normalized;
+    }
+    return summary;
+  }
+
   _hydrateSummaryNode(node, fallbackMeshId = null) {
     const meshCandidate =
       node?.meshId || node?.meshIdNormalized || node?.meshIdOriginal || fallbackMeshId;
@@ -1156,11 +2218,14 @@ class WebDashboardServer {
 
     let registryNode = normalized ? this.nodeRegistry.get(normalized) : null;
     if (node && normalized) {
-      registryNode = this._upsertNode({
-        meshId: meshCandidate,
-        meshIdNormalized: normalized,
-        ...node
-      });
+      registryNode = this._upsertNode(
+        {
+          meshId: meshCandidate,
+          meshIdNormalized: normalized,
+          ...node
+        },
+        { allowCreate: false }
+      );
     }
 
     if (!registryNode && !node) {
@@ -1177,6 +2242,32 @@ class WebDashboardServer {
 module.exports = {
   WebDashboardServer
 };
+
+function isUnknownLike(value) {
+  if (value == null) return true;
+  const text = String(value).trim();
+  if (!text) return true;
+  const lower = text.toLowerCase();
+  return lower === 'unknown' || lower === '__unknown__' || lower === 'null';
+}
+
+function toPrefixedMeshId(value) {
+  if (!value || typeof value !== 'string') {
+    return null;
+  }
+  let text = value.trim();
+  if (!text) return null;
+  if (text.toLowerCase().startsWith('0x')) {
+    text = text.slice(2);
+  }
+  if (!text.startsWith('!') && /^[0-9a-f]{6,8}$/i.test(text)) {
+    return `!${text.toLowerCase()}`;
+  }
+  if (text.startsWith('!')) {
+    return `!${text.slice(1).toLowerCase()}`;
+  }
+  return text;
+}
 
 function normalizeMeshId(meshId) {
   if (meshId == null) return null;
@@ -1201,21 +2292,22 @@ function buildNodeLabel(node) {
 }
 
 function mergeNodeInfo(existing = {}, incoming = {}) {
+  const baseExisting = existing && typeof existing === 'object' ? existing : {};
   const result = {
-    meshId: existing.meshId ?? null,
-    meshIdOriginal: existing.meshIdOriginal ?? null,
-    meshIdNormalized: existing.meshIdNormalized ?? null,
-    shortName: existing.shortName ?? null,
-    longName: existing.longName ?? null,
-    hwModel: existing.hwModel ?? null,
-    hwModelLabel: existing.hwModelLabel ?? null,
-    role: existing.role ?? null,
-    roleLabel: existing.roleLabel ?? null,
-    latitude: existing.latitude ?? null,
-    longitude: existing.longitude ?? null,
-    altitude: existing.altitude ?? null,
-    label: existing.label ?? null,
-    lastSeenAt: existing.lastSeenAt ?? null
+    meshId: baseExisting.meshId ?? null,
+    meshIdOriginal: baseExisting.meshIdOriginal ?? null,
+    meshIdNormalized: baseExisting.meshIdNormalized ?? null,
+    shortName: baseExisting.shortName ?? null,
+    longName: baseExisting.longName ?? null,
+    hwModel: baseExisting.hwModel ?? null,
+    hwModelLabel: baseExisting.hwModelLabel ?? null,
+    role: baseExisting.role ?? null,
+    roleLabel: baseExisting.roleLabel ?? null,
+    latitude: baseExisting.latitude ?? null,
+    longitude: baseExisting.longitude ?? null,
+    altitude: baseExisting.altitude ?? null,
+    label: baseExisting.label ?? null,
+    lastSeenAt: baseExisting.lastSeenAt ?? null
   };
   const sources = Array.isArray(incoming) ? incoming : [incoming];
   for (const source of sources) {
@@ -1309,6 +2401,300 @@ function mergeNodeInfo(existing = {}, incoming = {}) {
     result.label = buildNodeLabel(result);
   }
   return result;
+}
+
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function formatSecondsAsDuration(seconds) {
+  const numeric = Number(seconds);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return '';
+  }
+  let remaining = Math.floor(numeric);
+  const units = [
+    { label: '年', seconds: 365 * 24 * 60 * 60 },
+    { label: '天', seconds: 24 * 60 * 60 },
+    { label: '時', seconds: 60 * 60 },
+    { label: '分', seconds: 60 },
+    { label: '秒', seconds: 1 }
+  ];
+  const parts = [];
+  for (const unit of units) {
+    const value = Math.floor(remaining / unit.seconds);
+    if (value > 0 || (unit.seconds === 1 && !parts.length)) {
+      parts.push(`${value}${unit.label}`);
+    }
+    remaining -= value * unit.seconds;
+  }
+  return parts.join('');
+}
+
+function trimTrailingZeros(value) {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  if (!value.includes('.')) {
+    return value;
+  }
+  return value.replace(/\.?0+$/, '');
+}
+
+function clampMetricValue(metricName, numeric) {
+  const def = TELEMETRY_METRIC_DEFINITIONS[metricName];
+  if (!Number.isFinite(numeric)) {
+    return numeric;
+  }
+  if (def?.clamp) {
+    return Math.min(Math.max(numeric, def.clamp[0]), def.clamp[1]);
+  }
+  return numeric;
+}
+
+function formatNumericForCsv(value, digits = null) {
+  if (!Number.isFinite(value)) return '';
+  if (digits == null) {
+    return String(value);
+  }
+  const fixed = value.toFixed(digits);
+  return fixed.replace(/0+$/, '').replace(/\.$/, '') || '0';
+}
+
+function flattenTelemetryMetrics(metrics, prefix = '', target = []) {
+  if (!metrics || typeof metrics !== 'object') {
+    return target;
+  }
+  for (const [key, value] of Object.entries(metrics)) {
+    if (value == null) continue;
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'string') {
+      target.push([path, value]);
+    } else if (Array.isArray(value)) {
+      if (!value.length) continue;
+      target.push([
+        path,
+        value
+          .map((item) => (typeof item === 'number' ? trimTrailingZeros(item.toFixed(2)) : String(item)))
+          .join(', ')
+      ]);
+    } else if (typeof value === 'object') {
+      flattenTelemetryMetrics(value, path, target);
+    }
+  }
+  return target;
+}
+
+function formatTelemetryValue(metricName, rawValue) {
+  const def = TELEMETRY_METRIC_DEFINITIONS[metricName];
+  if (def?.formatter) {
+    try {
+      return def.formatter(rawValue);
+    } catch {
+      // ignore formatter errors
+    }
+  }
+  const numeric = Number(rawValue);
+  if (Number.isFinite(numeric)) {
+    const clamped = clampMetricValue(metricName, numeric);
+    const decimals =
+      def?.decimals != null
+        ? def.decimals
+        : Math.abs(clamped) >= 100
+          ? 0
+          : Math.abs(clamped) >= 10
+            ? 1
+            : 2;
+    let formatted = clamped.toFixed(decimals);
+    formatted = trimTrailingZeros(formatted);
+    return def?.unit ? `${formatted}${def.unit}` : formatted;
+  }
+  if (rawValue == null) {
+    return '';
+  }
+  if (typeof rawValue === 'boolean') {
+    return rawValue ? 'true' : 'false';
+  }
+  return String(rawValue);
+}
+
+function buildTelemetryRelayDescriptor(record) {
+  if (!record) return '';
+  const relay = record.relay || {};
+  const label =
+    (typeof record.relayLabel === 'string' && record.relayLabel.trim()) ||
+    (typeof relay.label === 'string' && relay.label.trim()) ||
+    (typeof relay.longName === 'string' && relay.longName.trim()) ||
+    (typeof relay.shortName === 'string' && relay.shortName.trim()) ||
+    (typeof record.relayMeshId === 'string' && record.relayMeshId.trim()) ||
+    (typeof record.relayMeshIdNormalized === 'string' && record.relayMeshIdNormalized.trim()) ||
+    '';
+  if (!label) {
+    return '';
+  }
+  const guessed = Boolean(record.relayGuessed || relay.guessed);
+  return guessed ? `${label} (?)` : label;
+}
+
+function buildTelemetryHopsDescriptor(record) {
+  if (!record) return '';
+  if (Number.isFinite(record.hopsUsed) && Number.isFinite(record.hopsTotal)) {
+    return `${record.hopsUsed}/${record.hopsTotal}`;
+  }
+  if (Number.isFinite(record.hopsUsed)) {
+    return String(record.hopsUsed);
+  }
+  if (typeof record.hopsLabel === 'string' && record.hopsLabel.trim()) {
+    return record.hopsLabel.trim();
+  }
+  const hops = record.hops || {};
+  if (Number.isFinite(hops.start) && Number.isFinite(hops.limit)) {
+    const used = Math.max(hops.start - hops.limit, 0);
+    return `${used}/${hops.start}`;
+  }
+  return '';
+}
+
+function collectTelemetryMetricKeys(record, metricSet, extraSet) {
+  if (!record || typeof record !== 'object') {
+    return;
+  }
+  const metrics = record.telemetry?.metrics;
+  if (!metrics || typeof metrics !== 'object') {
+    return;
+  }
+  for (const key of Object.keys(TELEMETRY_METRIC_DEFINITIONS)) {
+    if (metrics[key] != null) {
+      metricSet.add(key);
+    }
+  }
+  for (const [path] of flattenTelemetryMetrics(metrics)) {
+    if (!TELEMETRY_METRIC_DEFINITIONS[path]) {
+      extraSet.add(path);
+    }
+  }
+}
+
+function buildTelemetryCsvLine(record, { metricKeysInUse, extraMetricKeys }) {
+  const timeMs = Number(record?.sampleTimeMs ?? record?.timestampMs);
+  const isoTime = Number.isFinite(timeMs) ? new Date(timeMs).toISOString() : '';
+  const unixSeconds = Number.isFinite(timeMs) ? Math.floor(timeMs / 1000) : '';
+  const meshId = record.meshId || record.node?.meshId || '';
+  const nodeLabel = buildNodeLabel(record.node) || meshId || '';
+  const channelValue = Number.isFinite(record.channel) ? record.channel : '';
+  const snrValue = Number.isFinite(record.snr) ? formatNumericForCsv(record.snr, 2) : '';
+  const rssiValue = Number.isFinite(record.rssi) ? formatNumericForCsv(record.rssi, 0) : '';
+  const detailValue = record.detail || '';
+  const relayDescriptor = buildTelemetryRelayDescriptor(record) || '';
+  const relayMeshValue =
+    record.relayMeshId ||
+    record.relayMeshIdNormalized ||
+    record.relay?.meshId ||
+    record.relay?.meshIdNormalized ||
+    '';
+  const relayGuessFlag = record.relayGuessed ? 'true' : '';
+  const relayReason = record.relayGuessReason || '';
+  const hopsDescriptor = buildTelemetryHopsDescriptor(record) || '';
+  const hopStart = Number.isFinite(record.hops?.start) ? record.hops.start : '';
+  const hopLimit = Number.isFinite(record.hops?.limit) ? record.hops.limit : '';
+
+  const row = [
+    escapeCsvValue(isoTime),
+    escapeCsvValue(unixSeconds),
+    escapeCsvValue(meshId),
+    escapeCsvValue(nodeLabel),
+    escapeCsvValue(channelValue),
+    escapeCsvValue(snrValue),
+    escapeCsvValue(rssiValue),
+    escapeCsvValue(detailValue),
+    escapeCsvValue(relayDescriptor),
+    escapeCsvValue(relayMeshValue),
+    escapeCsvValue(relayGuessFlag),
+    escapeCsvValue(relayReason),
+    escapeCsvValue(hopsDescriptor),
+    escapeCsvValue(hopStart),
+    escapeCsvValue(hopLimit)
+  ];
+
+  const metrics = record.telemetry?.metrics || {};
+  for (const key of metricKeysInUse) {
+    const raw = metrics[key];
+    const formatted = raw == null ? '' : formatTelemetryValue(key, raw);
+    row.push(escapeCsvValue(formatted));
+  }
+
+  const flatMetrics = new Map(flattenTelemetryMetrics(metrics));
+  for (const key of extraMetricKeys) {
+    let value = flatMetrics.has(key) ? flatMetrics.get(key) : '';
+    if (typeof value === 'number') {
+      value = trimTrailingZeros(value.toFixed(2));
+    } else if (typeof value === 'boolean') {
+      value = value ? 'true' : 'false';
+    }
+    row.push(escapeCsvValue(value));
+  }
+
+  return `${row.join(',')}\n`;
+}
+
+function recordMatchesSearch(record, searchTerm) {
+  if (!searchTerm) return true;
+  const haystack = collectSearchTokens(record);
+  if (!haystack.length) {
+    return false;
+  }
+  return haystack.some((value) => {
+    if (value == null) return false;
+    return String(value).toLowerCase().includes(searchTerm);
+  });
+}
+
+function collectSearchTokens(record) {
+  if (!record) return [];
+  const tokens = [];
+  const node = record.node || {};
+  tokens.push(
+    node.label,
+    node.longName,
+    node.shortName,
+    node.hwModelLabel,
+    node.roleLabel,
+    record.meshId,
+    node.meshId,
+    node.meshIdOriginal,
+    node.meshIdNormalized
+  );
+  const relay = record.relay || {};
+  tokens.push(
+    record.relayLabel,
+    record.relayMeshId,
+    record.relayMeshIdNormalized,
+    relay.label,
+    relay.longName,
+    relay.shortName
+  );
+  if (record.relayGuessReason) {
+    tokens.push(record.relayGuessReason);
+  }
+  if (record.detail) tokens.push(record.detail);
+  if (record.channel != null) tokens.push(`ch ${record.channel}`);
+  if (Number.isFinite(record.snr)) tokens.push(`snr ${record.snr}`);
+  if (Number.isFinite(record.rssi)) tokens.push(`rssi ${record.rssi}`);
+  if (record.hopsLabel) tokens.push(record.hopsLabel);
+  if (Number.isFinite(record.hopsUsed)) tokens.push(`hops ${record.hopsUsed}`);
+  if (Number.isFinite(record.hopsTotal)) tokens.push(`hops ${record.hopsUsed ?? ''}/${record.hopsTotal}`);
+  if (record.relayGuessReason) tokens.push(record.relayGuessReason);
+  const metrics = record.telemetry?.metrics || {};
+  for (const [path, value] of flattenTelemetryMetrics(metrics)) {
+    tokens.push(path);
+    tokens.push(value);
+  }
+  return tokens;
 }
 function sanitizeCallmeshProvision(provision) {
   if (!provision || typeof provision !== 'object') {

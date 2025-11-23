@@ -36,6 +36,7 @@ const MeshtasticClient = require('../meshtasticClient');
 const { discoverMeshtasticDevices } = require('../discovery');
 const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
 const { WebDashboardServer } = require('../web/server');
+const { sanitizeSummaryForDisplay } = require('../utils/summaryDisplay');
 const { SerialPort } = require('serialport');
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
@@ -48,6 +49,19 @@ let bridgeSummaryListener = null;
 
 function getMessageLogPath() {
   return path.join(getCallMeshDataDir(), MESSAGE_LOG_FILENAME);
+}
+
+function resolveTelemetryMaxTotalRecords() {
+  const raw = process.env.TMAG_WEB_TELEMETRY_MAX_TOTAL;
+  if (!raw) {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.warn(`TMAG_WEB_TELEMETRY_MAX_TOTAL 必須為正整數，已忽略：${raw}`);
+    return undefined;
+  }
+  return Math.floor(value);
 }
 
 function sanitizeMessageNodeForPersist(node) {
@@ -148,15 +162,26 @@ function addMessageEntry(entry) {
 }
 
 async function flushMessageLog() {
-  const filePath = getMessageLogPath();
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
   const channelEntries = Array.from(messageStore.entries()).sort((a, b) => a[0] - b[0]);
-  const lines = [];
+  const orderedEntries = [];
   for (const [, list] of channelEntries) {
     for (let i = list.length - 1; i >= 0; i -= 1) {
-      lines.push(JSON.stringify(list[i]));
+      orderedEntries.push(list[i]);
     }
   }
+  const store = bridge?.getDataStore?.();
+  if (store) {
+    try {
+      store.saveMessageLog(orderedEntries);
+      await fs.rm(getMessageLogPath(), { force: true });
+      return;
+    } catch (err) {
+      console.error('寫入訊息紀錄失敗 (SQLite):', err);
+    }
+  }
+  const filePath = getMessageLogPath();
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const lines = orderedEntries.map((entry) => JSON.stringify(entry));
   await fs.writeFile(filePath, lines.join('\n'), 'utf8');
 }
 
@@ -185,6 +210,25 @@ function getMessageSnapshot() {
 async function loadMessageLog() {
   const filePath = getMessageLogPath();
   messageStore.clear();
+  const store = bridge?.getDataStore?.();
+  if (store) {
+    try {
+      const entries = store.loadMessageLog();
+      if (Array.isArray(entries) && entries.length) {
+        for (const rawEntry of entries) {
+          const entry = sanitizeMessageSummary(rawEntry);
+          if (entry) {
+            addMessageEntry(entry);
+          }
+        }
+        await fs.rm(filePath, { force: true });
+        return;
+      }
+    } catch (err) {
+      console.warn('從 SQLite 載入訊息紀錄失敗:', err.message);
+    }
+  }
+  const migratedEntries = [];
   try {
     const content = await fs.readFile(filePath, 'utf8');
     if (!content) {
@@ -198,6 +242,7 @@ async function loadMessageLog() {
           const entry = sanitizeMessageSummary(parsed);
           if (entry) {
             addMessageEntry(entry);
+            migratedEntries.push(entry);
           }
         }
       } catch (err) {
@@ -209,6 +254,14 @@ async function loadMessageLog() {
       console.warn('載入訊息紀錄失敗:', err.message);
     }
   }
+  if (store && migratedEntries.length) {
+    try {
+      store.saveMessageLog(migratedEntries);
+      await fs.rm(filePath, { force: true });
+    } catch (err) {
+      console.warn('遷移訊息紀錄至 SQLite 失敗:', err.message);
+    }
+  }
 }
 
 let mainWindow = null;
@@ -218,6 +271,7 @@ let callmeshRestoreAllowed = true;
 let lastCallmeshStateSnapshot = null;
 let cachedClientPreferences = null;
 let webServer = null;
+let webServerStartPromise = null;
 let lastMeshtasticStatus = { status: 'idle' };
 
 process.on('uncaughtException', (err) => {
@@ -502,16 +556,14 @@ function sendNodeInfo(payload) {
 }
 
 async function syncWebTelemetrySnapshot() {
-  if (!bridge || !webServer || typeof bridge.getTelemetrySnapshot !== 'function') {
+  if (!bridge || !webServer || typeof bridge.getTelemetrySummary !== 'function') {
     return;
   }
   try {
-    const snapshot = await bridge.getTelemetrySnapshot({
-      limitPerNode: webServer.telemetryMaxPerNode
-    });
-    webServer.seedTelemetrySnapshot(snapshot);
+    const summary = bridge.getTelemetrySummary();
+    webServer.seedTelemetrySummary(summary);
   } catch (err) {
-    console.warn('同步 Web Telemetry Snapshot 失敗:', err);
+    console.warn('同步 Web Telemetry 摘要失敗:', err);
   }
 }
 
@@ -607,6 +659,7 @@ async function initialiseBridge() {
   if (storedSharePreference !== null) {
     bridgeOptions.shareWithTenmanMap = storedSharePreference;
   }
+  bridgeOptions.tenmanIgnoreInboundNodes = true;
 
   bridge = new CallMeshAprsBridge(bridgeOptions);
 
@@ -656,8 +709,8 @@ function buildCallmeshSummary() {
 }
 
 async function initialiseApp() {
-  await loadMessageLog();
   await initialiseBridge();
+  await loadMessageLog();
   await createWindow();
   await ensureWebDashboardState();
 
@@ -685,22 +738,49 @@ async function startWebDashboard() {
   if (webServer) {
     return true;
   }
-  try {
-    const server = new WebDashboardServer({
-      appVersion,
-      relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json')
-    });
-    await server.start();
-    server.setAppVersion(appVersion);
-    webServer = server;
-    return true;
-  } catch (err) {
-    console.error('啟動 Web Dashboard 失敗:', err);
-    return false;
+  if (webServerStartPromise) {
+    await webServerStartPromise;
+    return Boolean(webServer);
   }
+  webServerStartPromise = (async () => {
+    try {
+      const options = {
+        appVersion,
+        relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json'),
+        relayStatsStore: bridge?.getDataStore?.(),
+        messageLogPath: getMessageLogPath(),
+        messageLogStore: bridge?.getDataStore?.(),
+        telemetryProvider: bridge,
+        aprsDebugProvider: () => bridge.getAprsDebugSnapshot()
+      };
+      const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
+      if (telemetryMaxTotalOverride) {
+        options.telemetryMaxTotalRecords = telemetryMaxTotalOverride;
+      }
+      const server = new WebDashboardServer(options);
+      await server.start();
+      server.setAppVersion(appVersion);
+      webServer = server;
+      return true;
+    } catch (err) {
+      console.error('啟動 Web Dashboard 失敗:', err);
+      return false;
+    } finally {
+      webServerStartPromise = null;
+    }
+  })();
+  return webServerStartPromise;
 }
 
 async function shutdownWebDashboard() {
+  const pendingStart = webServerStartPromise;
+  if (pendingStart) {
+    try {
+      await pendingStart;
+    } catch {
+      // ignore start errors, continue shutdown
+    }
+  }
   if (!webServer) return;
   try {
     await webServer.stop();
@@ -741,7 +821,8 @@ async function ensureWebDashboardState() {
       }
       if (bridge) {
         const nodes = bridge.getNodeSnapshot();
-        webServer?.seedNodeSnapshot(nodes);
+        const nodeMeta = bridge.getNodeDatabaseSourceInfo();
+        webServer?.seedNodeSnapshot(nodes, nodeMeta);
       }
       webServer?.seedMessageSnapshot(getMessageSnapshot());
       await syncWebTelemetrySnapshot();
@@ -816,7 +897,8 @@ ipcMain.handle('nodes:clear', async () => {
     const result = bridge.clearNodeDatabase();
     const snapshot = Array.isArray(result?.nodes) ? result.nodes : [];
     mainWindow?.webContents.send('meshtastic:node-snapshot', snapshot);
-    webServer?.seedNodeSnapshot(snapshot);
+    const nodeMeta = bridge.getNodeDatabaseSourceInfo();
+    webServer?.seedNodeSnapshot(snapshot, nodeMeta);
     return {
       success: true,
       cleared: Number.isFinite(result?.cleared) ? result.cleared : 0,
@@ -969,6 +1051,9 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     heartbeat: options.heartbeat ?? 0,
     relayStatsPath
   };
+  if (bridge?.getDataStore) {
+    clientOptions.relayStatsStore = bridge.getDataStore();
+  }
 
   if (Number.isFinite(options.connectTimeoutMs) && options.connectTimeoutMs > 0) {
     clientOptions.connectTimeout = options.connectTimeoutMs;
@@ -1038,6 +1123,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   const processSummary = (summary, { synthetic = false } = {}) => {
     if (!summary) return;
     let messageEntry = null;
+    let displaySummary = summary;
     try {
       if (!synthetic) {
         bridge?.handleMeshtasticSummary(summary);
@@ -1045,13 +1131,14 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     } catch (err) {
       console.error('處理 APRS Summary 時發生錯誤:', err);
     }
+    displaySummary = sanitizeSummaryForDisplay(summary) || summary;
     try {
-      messageEntry = persistMessageSummary(summary);
+      messageEntry = persistMessageSummary(displaySummary);
     } catch (err) {
       console.error('寫入訊息紀錄失敗:', err);
     }
-    mainWindow?.webContents.send('meshtastic:summary', summary);
-    webServer?.publishSummary(summary);
+    mainWindow?.webContents.send('meshtastic:summary', displaySummary);
+    webServer?.publishSummary(displaySummary);
     if (messageEntry) {
       webServer?.publishMessage(messageEntry);
     }
@@ -1287,19 +1374,132 @@ ipcMain.handle('telemetry:get-snapshot', async (_event, options = {}) => {
   if (!bridge) {
     return {
       updatedAt: Date.now(),
-      nodes: []
+      nodes: [],
+      summary: [],
+      stats: {
+        totalRecords: 0,
+        totalNodes: 0,
+        diskBytes: 0
+      }
     };
   }
   try {
-    const limit = Number.isFinite(options?.limitPerNode) ? options.limitPerNode : undefined;
-    return bridge.getTelemetrySnapshot({
-      limitPerNode: limit
-    });
+    const summary = bridge.getTelemetrySummary();
+    const updatedAt =
+      Number.isFinite(summary?.updatedAt) && summary.updatedAt > 0
+        ? Number(summary.updatedAt)
+        : bridge.telemetryUpdatedAt;
+    const nodes = Array.isArray(summary?.nodes) ? summary.nodes : [];
+    const stats =
+      summary?.stats && typeof summary.stats === 'object'
+        ? summary.stats
+        : bridge.getTelemetryStats();
+    return {
+      updatedAt,
+      nodes,
+      summary: nodes,
+      stats
+    };
   } catch (err) {
     console.error('取得遙測快照失敗:', err);
     return {
       updatedAt: Date.now(),
-      nodes: []
+      nodes: [],
+      summary: [],
+      stats: {
+        totalRecords: 0,
+        totalNodes: 0,
+        diskBytes: 0
+      },
+      error: err.message
+    };
+  }
+});
+
+ipcMain.handle('telemetry:get-available', async () => {
+  const fallback = {
+    updatedAt: Date.now(),
+    nodes: [],
+    summary: [],
+    stats: {
+      totalRecords: 0,
+      totalNodes: 0,
+      diskBytes: 0
+    }
+  };
+  if (!bridge) {
+    return fallback;
+  }
+  try {
+    const summary = bridge.getTelemetrySummary();
+    const updatedAt =
+      Number.isFinite(summary?.updatedAt) && summary.updatedAt > 0
+        ? Number(summary.updatedAt)
+        : bridge.telemetryUpdatedAt;
+    const nodes = Array.isArray(summary?.nodes) ? summary.nodes : [];
+    const stats =
+      summary?.stats && typeof summary.stats === 'object'
+        ? summary.stats
+        : bridge.getTelemetryStats();
+    return {
+      updatedAt,
+      nodes,
+      summary: nodes,
+      stats
+    };
+  } catch (err) {
+    console.error('取得遙測節點清單失敗:', err);
+    return fallback;
+  }
+});
+
+ipcMain.handle('telemetry:fetch-range', async (_event, options = {}) => {
+  const meshId = options?.meshId || options?.mesh_id || null;
+  const fallback = {
+    meshId,
+    rawMeshId: meshId,
+    meshIdNormalized: meshId,
+    node: null,
+    records: [],
+    totalRecords: 0,
+    filteredCount: 0,
+    latestSampleMs: null,
+    earliestSampleMs: null,
+    availableMetrics: [],
+    range: {
+      startMs: options?.startMs ?? options?.start ?? null,
+      endMs: options?.endMs ?? options?.end ?? null
+    },
+    requestedLimit: options?.limit ?? null,
+    updatedAt: Date.now(),
+    stats: {
+      totalRecords: 0,
+      totalNodes: 0,
+      diskBytes: 0
+    },
+    error: bridge ? null : 'bridge not initialised'
+  };
+  if (!bridge) {
+    return fallback;
+  }
+  try {
+    const limit = Number.isFinite(options?.limit) ? Number(options.limit) : undefined;
+    const startMs = Number.isFinite(options?.startMs ?? options?.start)
+      ? Number(options?.startMs ?? options?.start)
+      : null;
+    const endMs = Number.isFinite(options?.endMs ?? options?.end)
+      ? Number(options?.endMs ?? options?.end)
+      : null;
+    return bridge.getTelemetryRecordsForMesh(meshId, {
+      limit,
+      startMs,
+      endMs
+    });
+  } catch (err) {
+    console.error('取得遙測範圍資料失敗:', err);
+    return {
+      ...fallback,
+      error: err.message || 'unknown error'
     };
   }
 });

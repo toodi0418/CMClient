@@ -13,6 +13,15 @@ class APRSClient extends EventEmitter {
     this.version = options.version || '0.0.0';
     this.softwareName = options.softwareName || 'TMAG';
     this.log = options.log || (() => {});
+    const filterCandidate =
+      Object.prototype.hasOwnProperty.call(options, 'filterCommand') ?
+        options.filterCommand :
+        'filter m/2';
+    if (typeof filterCandidate === 'string' && filterCandidate.trim()) {
+      this.filterCommand = filterCandidate.trim();
+    } else {
+      this.filterCommand = null;
+    }
 
     this.socket = null;
     this.reconnectTimer = null;
@@ -60,6 +69,15 @@ class APRSClient extends EventEmitter {
     if (config.version && config.version !== this.version) {
       this.version = config.version;
       changed = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(config, 'filterCommand')) {
+      const candidate = config.filterCommand;
+      const normalized =
+        typeof candidate === 'string' && candidate.trim() ? candidate.trim() : null;
+      if (normalized !== this.filterCommand) {
+        this.filterCommand = normalized;
+        changed = true;
+      }
     }
     if (changed && this.connected) {
       this._log('APRS', 'configuration changed，重新連線');
@@ -130,9 +148,13 @@ class APRSClient extends EventEmitter {
   _onConnect() {
     this.connected = true;
     this._log('APRS', 'connected');
-    const login = `user ${this.callsign} pass ${this.passcode} vers ${this.softwareName} ${this.version} filter m/2\r\n`;
+    const loginFilterSection = this.filterCommand ? '' : ' filter m/2';
+    const login = `user ${this.callsign} pass ${this.passcode} vers ${this.softwareName} ${this.version}${loginFilterSection}\r\n`;
     this.socket.write(login);
     this.socket.write(`# TMAG connected at ${new Date().toISOString()}\r\n`);
+    if (this.filterCommand) {
+      this.socket.write(`${this.filterCommand}\r\n`);
+    }
     this._scheduleKeepalive();
     this.emit('connected', {
       server: this.server,

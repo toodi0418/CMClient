@@ -23,6 +23,15 @@
   const channelTitleLabel = document.getElementById('channel-title');
   const channelNoteLabel = document.getElementById('channel-note');
   const channelMessageList = document.getElementById('channel-message-list');
+  const channelPagination = document.getElementById('channel-pagination');
+  const channelPaginationInfo = document.getElementById('channel-pagination-info');
+  const channelPaginationCurrent = document.getElementById('channel-pagination-current');
+  const channelPaginationTotal = document.getElementById('channel-pagination-total');
+  const channelPageFirstBtn = document.getElementById('channel-page-first');
+  const channelPagePrevBtn = document.getElementById('channel-page-prev');
+  const channelPageNextBtn = document.getElementById('channel-page-next');
+  const channelPageLastBtn = document.getElementById('channel-page-last');
+  const channelPageSizeSelect = document.getElementById('channel-page-size');
   const flowPage = document.getElementById('flow-page');
   const flowList = document.getElementById('flow-list');
   const flowEmptyState = document.getElementById('flow-empty-state');
@@ -46,6 +55,15 @@
   const telemetryStatsNodes = document.getElementById('telemetry-stats-nodes');
   const telemetryStatsDisk = document.getElementById('telemetry-stats-disk');
   const telemetryDownloadBtn = document.getElementById('telemetry-download-btn');
+  const telemetryPagination = document.getElementById('telemetry-pagination');
+  const telemetryPaginationInfo = document.getElementById('telemetry-pagination-info');
+  const telemetryPaginationCurrent = document.getElementById('telemetry-pagination-current');
+  const telemetryPaginationTotal = document.getElementById('telemetry-pagination-total');
+  const telemetryPageFirstBtn = document.getElementById('telemetry-page-first');
+  const telemetryPagePrevBtn = document.getElementById('telemetry-page-prev');
+  const telemetryPageNextBtn = document.getElementById('telemetry-page-next');
+  const telemetryPageLastBtn = document.getElementById('telemetry-page-last');
+  const telemetryPageSizeSelect = document.getElementById('telemetry-page-size');
   const nodesTableWrapper = document.getElementById('nodes-table-wrapper');
   const nodesTableBody = document.getElementById('nodes-table-body');
   const nodesEmptyState = document.getElementById('nodes-empty-state');
@@ -72,6 +90,14 @@
   const flowEntryIndex = new Map();
   const pendingFlowSummaries = new Map();
   const pendingAprsUplinks = new Map();
+  const MAX_PENDING_FLOW_SUMMARIES_PER_MESH = 25;
+  const MAX_PENDING_FLOW_SUMMARIES_TOTAL = 400;
+  const PENDING_FLOW_SUMMARY_TTL_MS = 15 * 60 * 1000;
+  const pendingFlowSummaryQueue = [];
+  let pendingFlowSummaryCount = 0;
+  const MAX_PENDING_APRS_RECORDS = 200;
+  const PENDING_APRS_TTL_MS = 15 * 60 * 1000;
+  const pendingAprsQueue = [];
   let flowFilterState = 'all';
   let flowSearchTerm = '';
   const FLOW_MAX_ENTRIES = 1000;
@@ -83,8 +109,12 @@
   const MAX_SUMMARY_ROWS = 200;
   const logEntries = [];
   const MAX_LOG_ENTRIES = 200;
+  const SUMMARY_REPLAY_GUARD_DRIFT_MS = 1000;
+  let summaryReplayGuardActive = false;
+  let summaryReplayGuardCutoffMs = 0;
   const telemetryStore = new Map();
   const telemetryRecordIds = new Set();
+  const telemetryRecordOrder = [];
   const telemetryCharts = new Map();
   let telemetrySelectedMeshId = null;
   const telemetryNodeLookup = new Map();
@@ -98,11 +128,16 @@
   let telemetryDropdownInteracting = false;
   let nodesSearchTerm = '';
   let nodesStatusResetTimer = null;
+  const TELEMETRY_RANGE_OPTIONS = ['hour1', 'hour3', 'hour6', 'hour12', 'day', 'week', 'month', 'year', 'custom'];
   let telemetryRangeMode = 'day';
   let telemetryCustomRange = { startMs: null, endMs: null };
   let telemetryChartMode = 'all';
   let telemetryChartMetric = null;
   let telemetryUpdatedAt = null;
+  let telemetryLoading = false;
+  let telemetryLoadingMeshId = null;
+  let telemetryFetchController = null;
+  let telemetryLastFetchKey = null;
   const telemetryNodeInputDefaultPlaceholder =
     telemetryNodeInput?.getAttribute('placeholder') || '輸入節點 Mesh ID 或搜尋關鍵字';
   const nodeRegistry = new Map();
@@ -113,10 +148,23 @@
     if (!normalized) return false;
     return normalized.toLowerCase().startsWith('!abcd');
   }
+
+  function isUnknownLike(value) {
+    if (value === undefined || value === null) return true;
+    const text = String(value).trim();
+    if (!text) return true;
+    const lower = text.toLowerCase();
+    return lower === 'unknown' || lower === '__unknown__' || lower === 'null';
+  }
   let nodeSnapshotLoaded = false;
   const TELEMETRY_TABLE_LIMIT = 200;
   const TELEMETRY_CHART_LIMIT = 200;
-  const TELEMETRY_MAX_LOCAL_RECORDS = 500;
+  const TELEMETRY_MAX_LOCAL_RECORDS = Number.POSITIVE_INFINITY;
+  const TELEMETRY_PAGE_SIZES = [25, 50, 100, 200];
+  let telemetryTablePageSize = 50;
+  let telemetryTablePage = 1;
+  let telemetryTableFilteredCount = 0;
+  let telemetryMaxTotalRecords = 20000;
   const TELEMETRY_METRIC_DEFINITIONS = {
     batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
     voltage: { label: '電壓', unit: 'V', decimals: 2, chart: true },
@@ -137,11 +185,34 @@
     { id: 2, code: 'CH2', name: 'Signal Test', note: '訊號測試、天線調校專用' },
     { id: 3, code: 'CH3', name: 'Emergency', note: '緊急狀況 / 救援聯絡' }
   ];
+  const TYPE_ICONS = {
+    Position: '📍',
+    Telemetry: '🔋',
+    EnvTelemetry: '🌡️',
+    Routing: '🧭',
+    RouteRequest: '🧭',
+    RouteReply: '🧭',
+    RouteError: '⚠️',
+    Text: '💬',
+    NodeInfo: '🧑‍🤝‍🧑',
+    Admin: '🛠️',
+    Traceroute: '🛰️',
+    Waypoint: '🗺️',
+    StoreForward: '🗃️',
+    PaxCounter: '👥',
+    RemoteHardware: '🔌',
+    KeyVerification: '🔑',
+    NeighborInfo: '🤝',
+    Encrypted: '🔒'
+  };
   const channelConfigs = CHANNEL_CONFIG.map((item) => ({ ...item }));
   const channelConfigMap = new Map(channelConfigs.map((item) => [item.id, item]));
   const channelMessageStore = new Map();
   const channelNavButtons = new Map();
   const CHANNEL_MESSAGE_LIMIT = 200;
+  const CHANNEL_PAGE_SIZES = [25, 50, 100];
+  const channelPageState = new Map();
+  let channelPageSize = CHANNEL_PAGE_SIZES[0];
   let selectedChannelId = channelConfigs[0]?.id ?? null;
   let messagesNavNeedsRender = true;
   for (const channel of channelConfigs) {
@@ -151,8 +222,15 @@
   const METERS_PER_FOOT = 0.3048;
   const NODE_ONLINE_WINDOW_MS = 60 * 60 * 1000;
   const STORAGE_KEYS = {
-    callmeshProvisionOpen: 'tmag:web:callmeshProvision:open'
+    callmeshProvisionOpen: 'tmag:web:callmeshProvision:open',
+    telemetryRangeMode: 'tmag:web:telemetry:range-mode',
+    telemetryPageSize: 'tmag:web:telemetry:page-size',
+    messagePageSize: 'tmag:web:messages:page-size'
   };
+
+  function isValidTelemetryRangeMode(mode) {
+    return typeof mode === 'string' && TELEMETRY_RANGE_OPTIONS.includes(mode);
+  }
 
   function safeStorageGet(key) {
     try {
@@ -160,6 +238,21 @@
     } catch {
       return null;
     }
+  }
+
+  const storedTelemetryRangeMode = safeStorageGet(STORAGE_KEYS.telemetryRangeMode);
+  if (isValidTelemetryRangeMode(storedTelemetryRangeMode)) {
+    telemetryRangeMode = storedTelemetryRangeMode;
+  }
+
+  const storedTelemetryPageSize = Number(safeStorageGet(STORAGE_KEYS.telemetryPageSize));
+  if (Number.isFinite(storedTelemetryPageSize) && TELEMETRY_PAGE_SIZES.includes(storedTelemetryPageSize)) {
+    telemetryTablePageSize = storedTelemetryPageSize;
+  }
+
+  const storedMessagePageSize = Number(safeStorageGet(STORAGE_KEYS.messagePageSize));
+  if (Number.isFinite(storedMessagePageSize) && CHANNEL_PAGE_SIZES.includes(storedMessagePageSize)) {
+    channelPageSize = storedMessagePageSize;
   }
 
   function safeStorageSet(key, value) {
@@ -194,6 +287,68 @@
     if (event.target === relayHintModal) {
       closeRelayHintDialog();
     }
+  });
+
+  if (telemetryPageSizeSelect) {
+    const fragment = document.createDocumentFragment();
+    for (const size of TELEMETRY_PAGE_SIZES) {
+      const option = document.createElement('option');
+      option.value = String(size);
+      option.textContent = String(size);
+      fragment.appendChild(option);
+    }
+    telemetryPageSizeSelect.innerHTML = '';
+    telemetryPageSizeSelect.appendChild(fragment);
+    if (!TELEMETRY_PAGE_SIZES.includes(telemetryTablePageSize)) {
+      telemetryTablePageSize = TELEMETRY_PAGE_SIZES[0];
+    }
+    telemetryPageSizeSelect.value = String(telemetryTablePageSize);
+    telemetryPageSizeSelect.addEventListener('change', (event) => {
+      const nextSize = Number(event.target.value);
+      if (!Number.isFinite(nextSize) || nextSize <= 0 || !TELEMETRY_PAGE_SIZES.includes(nextSize)) {
+        return;
+      }
+      if (telemetryTablePageSize === nextSize) {
+        return;
+      }
+      telemetryTablePageSize = nextSize;
+      safeStorageSet(STORAGE_KEYS.telemetryPageSize, String(nextSize));
+      telemetryTablePage = 1;
+      renderTelemetryView();
+    });
+  }
+
+  function goToTelemetryPage(page) {
+    const totalPages =
+      telemetryTableFilteredCount > 0
+        ? Math.ceil(telemetryTableFilteredCount / Math.max(1, telemetryTablePageSize))
+        : 1;
+    const clamped = Math.min(Math.max(page, 1), totalPages);
+    if (clamped === telemetryTablePage) {
+      return;
+    }
+    telemetryTablePage = clamped;
+    renderTelemetryView();
+  }
+
+  telemetryPageFirstBtn?.addEventListener('click', () => {
+    goToTelemetryPage(1);
+  });
+
+  telemetryPagePrevBtn?.addEventListener('click', () => {
+    goToTelemetryPage(telemetryTablePage - 1);
+  });
+
+  telemetryPageNextBtn?.addEventListener('click', () => {
+    goToTelemetryPage(telemetryTablePage + 1);
+  });
+
+  telemetryPageLastBtn?.addEventListener('click', () => {
+    const totalPages =
+      telemetryTableFilteredCount > 0
+        ? Math.ceil(telemetryTableFilteredCount / Math.max(1, telemetryTablePageSize))
+        : 1;
+    goToTelemetryPage(totalPages);
   });
 
   document.addEventListener('keydown', (event) => {
@@ -501,6 +656,113 @@
     return Array.isArray(store) ? store : [];
   }
 
+  function getChannelPage(channelId) {
+    const numeric = Number(channelId);
+    if (!Number.isFinite(numeric)) {
+      return 1;
+    }
+    const stored = channelPageState.get(numeric);
+    if (Number.isFinite(stored) && stored >= 1) {
+      return Math.floor(stored);
+    }
+    return 1;
+  }
+
+  function setChannelPage(channelId, page) {
+    const numericId = Number(channelId);
+    if (!Number.isFinite(numericId)) {
+      return 1;
+    }
+    const numericPage = Math.floor(Number(page));
+    const value = Number.isFinite(numericPage) && numericPage >= 1 ? numericPage : 1;
+    channelPageState.set(numericId, value);
+    return value;
+  }
+
+  function resetChannelPages() {
+    channelPageState.clear();
+  }
+
+  function updateChannelPaginationUI(channelId, stats = {}) {
+    if (
+      !channelPagination ||
+      !channelPaginationInfo ||
+      !channelPaginationCurrent ||
+      !channelPaginationTotal
+    ) {
+      return;
+    }
+    const totalEntries = Number(stats.totalEntries) || 0;
+    const totalPages = Math.max(1, Number(stats.totalPages) || 1);
+    const currentPage = Math.min(
+      Math.max(1, Number(stats.currentPage) || 1),
+      totalPages
+    );
+    const startDisplay = Number(stats.startDisplay) || 0;
+    const endDisplay = Number(stats.endDisplay) || 0;
+
+    if (channelPageSizeSelect && String(channelPageSizeSelect.value) !== String(channelPageSize)) {
+      channelPageSizeSelect.value = String(channelPageSize);
+    }
+
+    if (!totalEntries) {
+      channelPagination.classList.add('hidden');
+      channelPaginationInfo.textContent = '顯示 0-0，共 0 筆訊息';
+      channelPaginationCurrent.textContent = '1';
+      channelPaginationTotal.textContent = '1';
+      [channelPageFirstBtn, channelPagePrevBtn, channelPageNextBtn, channelPageLastBtn].forEach((btn) => {
+        if (btn) btn.disabled = true;
+      });
+      return;
+    }
+
+    channelPagination.classList.remove('hidden');
+    channelPaginationInfo.textContent = `顯示 ${startDisplay}-${endDisplay}，共 ${totalEntries} 筆訊息`;
+    channelPaginationCurrent.textContent = String(currentPage);
+    channelPaginationTotal.textContent = String(totalPages);
+    if (channelPageFirstBtn) channelPageFirstBtn.disabled = currentPage <= 1;
+    if (channelPagePrevBtn) channelPagePrevBtn.disabled = currentPage <= 1;
+    if (channelPageNextBtn) channelPageNextBtn.disabled = currentPage >= totalPages;
+    if (channelPageLastBtn) channelPageLastBtn.disabled = currentPage >= totalPages;
+  }
+
+  function goToChannelPage(channelId, targetPage) {
+    const numericId = Number(channelId);
+    if (!Number.isFinite(numericId) || numericId < 0) {
+      return;
+    }
+    const store = ensureChannelStore(numericId);
+    let pageSize = channelPageSize;
+    if (!CHANNEL_PAGE_SIZES.includes(pageSize)) {
+      pageSize = CHANNEL_PAGE_SIZES[0];
+      channelPageSize = pageSize;
+    }
+    const hasEntries = Array.isArray(store) && store.length > 0;
+    const totalPages = hasEntries ? Math.ceil(store.length / pageSize) : 1;
+    const numericTarget = Math.floor(Number(targetPage));
+    const clamped = hasEntries
+      ? Math.min(Math.max(1, Number.isFinite(numericTarget) ? numericTarget : 1), totalPages)
+      : 1;
+    const previous = getChannelPage(numericId);
+    if (previous !== clamped) {
+      setChannelPage(numericId, clamped);
+    } else {
+      // ensure state is stored even if unchanged
+      setChannelPage(numericId, clamped);
+    }
+    if (numericId === selectedChannelId) {
+      renderChannelMessages(numericId);
+    }
+  }
+
+  function goToChannelPageDelta(channelId, delta) {
+    if (!Number.isFinite(delta) || delta === 0) {
+      return;
+    }
+    const current = getChannelPage(channelId);
+    goToChannelPage(channelId, current + delta);
+  }
+
   function isMessagesPageActive() {
     return messagesPage?.classList.contains('active');
   }
@@ -646,15 +908,54 @@
       return;
     }
     const entries = ensureChannelStore(channelId);
+    let pageSize = channelPageSize;
+    if (!CHANNEL_PAGE_SIZES.includes(pageSize)) {
+      pageSize = CHANNEL_PAGE_SIZES[0];
+      channelPageSize = pageSize;
+    }
+    const totalEntries = entries.length;
+    const totalPages = totalEntries ? Math.ceil(totalEntries / pageSize) : 1;
+    let currentPage = getChannelPage(channelId);
+    if (currentPage > totalPages) {
+      currentPage = totalPages;
+      setChannelPage(channelId, currentPage);
+    }
+    if (currentPage < 1) {
+      currentPage = 1;
+      setChannelPage(channelId, currentPage);
+    }
+    let startIndex = totalEntries ? (currentPage - 1) * pageSize : 0;
+    if (startIndex >= totalEntries && totalEntries) {
+      currentPage = totalPages;
+      setChannelPage(channelId, currentPage);
+      startIndex = (currentPage - 1) * pageSize;
+    }
+    const endIndexExclusive = totalEntries ? Math.min(startIndex + pageSize, totalEntries) : 0;
+    let pageEntries = totalEntries ? entries.slice(startIndex, endIndexExclusive) : [];
+    if (!pageEntries.length && totalEntries) {
+      currentPage = 1;
+      setChannelPage(channelId, currentPage);
+      startIndex = 0;
+      pageEntries = entries.slice(0, Math.min(pageSize, totalEntries));
+    }
+    const startDisplay = totalEntries ? startIndex + 1 : 0;
+    const endDisplay = totalEntries ? startIndex + pageEntries.length : 0;
     channelMessageList.innerHTML = '';
-    if (!entries.length) {
+    if (!totalEntries) {
       const empty = document.createElement('div');
       empty.className = 'channel-message-empty';
       empty.textContent = '尚未收到訊息';
       channelMessageList.appendChild(empty);
+      updateChannelPaginationUI(channelId, {
+        totalEntries,
+        totalPages: 1,
+        currentPage: 1,
+        startDisplay: 0,
+        endDisplay: 0
+      });
       return;
     }
-    entries.forEach((entry) => {
+    pageEntries.forEach((entry) => {
       const wrapper = document.createElement('div');
       wrapper.className = 'channel-message';
 
@@ -672,6 +973,13 @@
 
       wrapper.append(text, meta);
       channelMessageList.appendChild(wrapper);
+    });
+    updateChannelPaginationUI(channelId, {
+      totalEntries,
+      totalPages,
+      currentPage,
+      startDisplay,
+      endDisplay
     });
   }
 
@@ -805,6 +1113,9 @@
   }
 
   function buildMessageHopLabel(summary, hopInfo) {
+    if (hopInfo.limitOnly) {
+      return '跳數：無效';
+    }
     if (hopInfo.usedHops === 0) {
       return '跳數：0 (直收)';
     }
@@ -867,6 +1178,7 @@
   }
 
   function clearChannelMessages() {
+    resetChannelPages();
     channelMessageStore.forEach((store, channelId) => {
       if (Array.isArray(store)) {
         store.length = 0;
@@ -1231,7 +1543,8 @@
     }
   }
 
-  function upsertNodeRegistry(entry) {
+  function upsertNodeRegistry(entry, options = {}) {
+    const allowCreate = options.allowCreate !== false;
     if (!entry || typeof entry !== 'object') return null;
     const candidate = entry.meshId || entry.meshIdNormalized || entry.meshIdOriginal;
     const normalized = normalizeMeshId(candidate);
@@ -1240,7 +1553,11 @@
       nodeRegistry.delete(normalized);
       return null;
     }
-    const existing = nodeRegistry.get(normalized) || {};
+    const existing = nodeRegistry.get(normalized) || null;
+    if (!existing && !allowCreate) {
+      return null;
+    }
+    const base = existing || {};
     const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
     if (merged) {
       nodeRegistry.set(normalized, merged);
@@ -1382,6 +1699,59 @@
   });
 
   initializeChannelMessages();
+  if (channelPageSizeSelect) {
+    if (!CHANNEL_PAGE_SIZES.includes(channelPageSize)) {
+      channelPageSize = CHANNEL_PAGE_SIZES[0];
+    }
+    channelPageSizeSelect.value = String(channelPageSize);
+    channelPageSizeSelect.addEventListener('change', (event) => {
+      const nextSize = Number(event.target.value);
+      if (!CHANNEL_PAGE_SIZES.includes(nextSize)) {
+        channelPageSizeSelect.value = String(channelPageSize);
+        return;
+      }
+      if (channelPageSize === nextSize) {
+        return;
+      }
+      channelPageSize = nextSize;
+      safeStorageSet(STORAGE_KEYS.messagePageSize, String(channelPageSize));
+      resetChannelPages();
+      if (selectedChannelId != null) {
+        renderChannelMessages(selectedChannelId);
+      }
+    });
+  }
+
+  channelPageFirstBtn?.addEventListener('click', () => {
+    if (selectedChannelId != null) {
+      goToChannelPage(selectedChannelId, 1);
+    }
+  });
+
+  channelPagePrevBtn?.addEventListener('click', () => {
+    if (selectedChannelId != null) {
+      goToChannelPageDelta(selectedChannelId, -1);
+    }
+  });
+
+  channelPageNextBtn?.addEventListener('click', () => {
+    if (selectedChannelId != null) {
+      goToChannelPageDelta(selectedChannelId, 1);
+    }
+  });
+
+  channelPageLastBtn?.addEventListener('click', () => {
+    if (selectedChannelId != null) {
+      const store = ensureChannelStore(selectedChannelId);
+      let pageSize = channelPageSize;
+      if (!CHANNEL_PAGE_SIZES.includes(pageSize)) {
+        pageSize = CHANNEL_PAGE_SIZES[0];
+        channelPageSize = pageSize;
+      }
+      const totalPages = store.length ? Math.ceil(store.length / pageSize) : 1;
+      goToChannelPage(selectedChannelId, totalPages);
+    }
+  });
 
   flowSearchInput?.addEventListener('input', () => {
     const raw = flowSearchInput.value || '';
@@ -1473,7 +1843,7 @@
 
   telemetryRangeSelect?.addEventListener('change', (event) => {
     const mode = event.target.value;
-    setTelemetryRangeMode(mode);
+    setTelemetryRangeMode(mode, { persist: true });
   });
 
   function handleTelemetryRangeInputChange() {
@@ -1497,7 +1867,8 @@
     ensureTelemetryCustomDefaults();
     updateTelemetryRangeInputs();
     refreshTelemetrySelectors();
-    renderTelemetryView();
+    loadTelemetryRecordsForSelection(telemetrySelectedMeshId, { force: true });
+    safeStorageSet(STORAGE_KEYS.telemetryRangeMode, 'custom');
   }
 
   telemetryRangeStartInput?.addEventListener('change', handleTelemetryRangeInputChange);
@@ -1599,6 +1970,9 @@ function ensureRelayGuessSuffix(label, summary) {
     }
 
     const hopInfo = extractHopInfo(summary);
+    if (summary.relayInvalid || hopInfo.limitOnly) {
+      return ensureRelayGuessSuffix('無效', summary);
+    }
     const normalizedHopsLabel = hopInfo.hopsLabel || '';
     const zeroHop = hopInfo.usedHops === 0 || /^0(?:\s*\/|$)/.test(normalizedHopsLabel);
 
@@ -1830,6 +2204,101 @@ function ensureRelayGuessSuffix(label, summary) {
     return mergeNodeMetadata(base, registry);
   }
 
+  function trackTelemetryRecord(meshId, recordId) {
+    if (!recordId) {
+      return;
+    }
+    telemetryRecordOrder.push({ meshId, recordId });
+  }
+
+  function removeTelemetryOrderEntry(meshId, recordId) {
+    if (!recordId || telemetryRecordOrder.length === 0) {
+      return;
+    }
+    for (let i = telemetryRecordOrder.length - 1; i >= 0; i -= 1) {
+      const entry = telemetryRecordOrder[i];
+      if (entry.recordId === recordId && (meshId == null || entry.meshId === meshId)) {
+        telemetryRecordOrder.splice(i, 1);
+        break;
+      }
+    }
+  }
+
+  function updateTelemetryMaxTotalRecords(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return;
+    }
+    telemetryMaxTotalRecords = Math.floor(numeric);
+  }
+
+  function enforceTelemetryGlobalLimit() {
+    if (!Number.isFinite(telemetryMaxTotalRecords) || telemetryMaxTotalRecords <= 0) {
+      return;
+    }
+    while (telemetryRecordOrder.length > telemetryMaxTotalRecords) {
+      const oldest = telemetryRecordOrder.shift();
+      if (!oldest) {
+        break;
+      }
+      const bucket = telemetryStore.get(oldest.meshId);
+      if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+        telemetryRecordIds.delete(oldest.recordId);
+        continue;
+      }
+      const index = bucket.records.findIndex((item) => item?.id === oldest.recordId);
+      if (index === -1) {
+        telemetryRecordIds.delete(oldest.recordId);
+        continue;
+      }
+      const [removed] = bucket.records.splice(index, 1);
+      if (removed?.id) {
+        telemetryRecordIds.delete(removed.id);
+      }
+      if (!bucket.records.length) {
+        telemetryStore.delete(oldest.meshId);
+      }
+    }
+  }
+
+  function updateTelemetryPagination(totalRecords) {
+    telemetryTableFilteredCount = totalRecords;
+    const pageSize = Math.max(1, telemetryTablePageSize);
+    const totalPages = totalRecords > 0 ? Math.ceil(totalRecords / pageSize) : 1;
+    if (telemetryTablePage > totalPages) {
+      telemetryTablePage = totalPages;
+    }
+    if (telemetryTablePage < 1) {
+      telemetryTablePage = 1;
+    }
+    const startIndex = totalRecords === 0 ? 0 : (telemetryTablePage - 1) * pageSize;
+    const endIndex = totalRecords === 0 ? 0 : Math.min(totalRecords, startIndex + pageSize);
+    if (telemetryPagination) {
+      if (totalRecords === 0) {
+        telemetryPagination.classList.add('hidden');
+        if (telemetryPaginationInfo) {
+          telemetryPaginationInfo.textContent = '沒有可顯示的資料';
+        }
+        telemetryPaginationCurrent && (telemetryPaginationCurrent.textContent = '0');
+        telemetryPaginationTotal && (telemetryPaginationTotal.textContent = '0');
+      } else {
+        telemetryPagination.classList.remove('hidden');
+        if (telemetryPaginationInfo) {
+          telemetryPaginationInfo.textContent = `顯示 ${startIndex + 1}-${endIndex} / ${totalRecords} 筆`;
+        }
+        telemetryPaginationCurrent && (telemetryPaginationCurrent.textContent = String(telemetryTablePage));
+        telemetryPaginationTotal && (telemetryPaginationTotal.textContent = String(totalPages));
+      }
+      const atFirst = telemetryTablePage <= 1 || totalRecords === 0;
+      const atLast = telemetryTablePage >= totalPages || totalRecords === 0;
+      if (telemetryPageFirstBtn) telemetryPageFirstBtn.disabled = atFirst;
+      if (telemetryPagePrevBtn) telemetryPagePrevBtn.disabled = atFirst;
+      if (telemetryPageNextBtn) telemetryPageNextBtn.disabled = atLast;
+      if (telemetryPageLastBtn) telemetryPageLastBtn.disabled = atLast;
+    }
+    return { startIndex, endIndex };
+  }
+
   function formatTelemetryNodeLabel(meshId, node) {
     const normalized =
       (node?.meshIdNormalized && String(node.meshIdNormalized).trim()) ||
@@ -1890,17 +2359,20 @@ function ensureRelayGuessSuffix(label, summary) {
     if (!record.id) {
       record.id = `${meshKey}-${record.sampleTimeMs}-${Math.random().toString(16).slice(2, 10)}`;
     }
-    if (telemetryRecordIds.has(record.id)) {
-      return null;
-    }
     const key = meshKey;
     let bucket = telemetryStore.get(key);
     if (!bucket) {
       bucket = {
         meshId: key,
-        rawMeshId,
+        rawMeshId: rawMeshId || key,
         node: null,
-        records: []
+        records: [],
+        recordIdSet: new Set(),
+        loadedRange: null,
+        totalRecords: 0,
+        metrics: new Set(),
+        latestSampleMs: null,
+        earliestSampleMs: null
       };
       telemetryStore.set(key, bucket);
     } else if (rawMeshId && !bucket.rawMeshId) {
@@ -1919,29 +2391,118 @@ function ensureRelayGuessSuffix(label, summary) {
       record.node = sanitizeTelemetryNodeData(record.node);
     }
     if (mergedNode && mergedNode.meshIdNormalized) {
-      upsertNodeRegistry(mergedNode);
+      upsertNodeRegistry(mergedNode, { allowCreate: false });
     }
     record.meshId = record.meshId ?? key;
     record.rawMeshId = rawMeshId || record.rawMeshId || null;
-    telemetryRecordIds.add(record.id);
+
+    const metrics = record.telemetry?.metrics;
+    if (metrics && typeof metrics === 'object') {
+      if (!bucket.metrics) {
+        bucket.metrics = new Set();
+      }
+      for (const metricKey of Object.keys(metrics)) {
+        bucket.metrics.add(metricKey);
+      }
+    }
+    const sampleTime = Number(record.sampleTimeMs);
+    if (Number.isFinite(sampleTime)) {
+      if (bucket.latestSampleMs == null || sampleTime > bucket.latestSampleMs) {
+        bucket.latestSampleMs = sampleTime;
+      }
+      if (bucket.earliestSampleMs == null || sampleTime < bucket.earliestSampleMs) {
+        bucket.earliestSampleMs = sampleTime;
+      }
+    }
+    bucket.totalRecords = Number.isFinite(bucket.totalRecords)
+      ? bucket.totalRecords + 1
+      : (Array.isArray(bucket.records) ? bucket.records.length : 0) + 1;
+
+    const currentWindow = getTelemetryRangeWindow();
+    const currentStart = Number.isFinite(currentWindow.startMs) ? Number(currentWindow.startMs) : null;
+    const currentEnd = Number.isFinite(currentWindow.endMs) ? Number(currentWindow.endMs) : null;
+    const relativeRangeActive = isRelativeTelemetryRange();
+
+    if (!bucket.loadedRange && relativeRangeActive) {
+      bucket.loadedRange = {
+        startMs: currentStart,
+        endMs: currentEnd
+      };
+    }
+
+    const hasLoadedRange =
+      bucket.loadedRange && typeof bucket.loadedRange === 'object' && Array.isArray(bucket.records);
+    if (!hasLoadedRange) {
+      return record;
+    }
+
+    let startLimit = Number.isFinite(bucket.loadedRange.startMs) ? Number(bucket.loadedRange.startMs) : null;
+    let endLimit = Number.isFinite(bucket.loadedRange.endMs) ? Number(bucket.loadedRange.endMs) : null;
+    if (relativeRangeActive) {
+      startLimit = currentStart ?? startLimit;
+      endLimit = currentEnd ?? endLimit;
+      bucket.loadedRange = {
+        startMs: Number.isFinite(startLimit) ? startLimit : null,
+        endMs: Number.isFinite(endLimit) ? endLimit : null
+      };
+    }
+
+    if (Number.isFinite(sampleTime) && startLimit != null && sampleTime < startLimit) {
+      return record;
+    }
+    if (Number.isFinite(sampleTime) && endLimit != null && sampleTime > endLimit) {
+      return record;
+    }
+    if (record.id && bucket.recordIdSet && bucket.recordIdSet.has(record.id)) {
+      return null;
+    }
     bucket.records.push(record);
     bucket.records.sort((a, b) => a.sampleTimeMs - b.sampleTimeMs);
+    if (record.id) {
+      if (!bucket.recordIdSet) {
+        bucket.recordIdSet = new Set();
+      }
+      bucket.recordIdSet.add(record.id);
+      telemetryRecordIds.add(record.id);
+    }
     while (bucket.records.length > TELEMETRY_MAX_LOCAL_RECORDS) {
       const removed = bucket.records.shift();
       if (removed?.id) {
+        bucket.recordIdSet?.delete(removed.id);
         telemetryRecordIds.delete(removed.id);
+        removeTelemetryOrderEntry(key, removed.id);
       }
     }
+    bucket.loadedCount = bucket.records.length;
+    if (Number.isFinite(bucket.totalRecords)) {
+      bucket.partial = bucket.totalRecords > bucket.loadedCount;
+    } else {
+      bucket.partial = false;
+    }
+    if (record.id) {
+      trackTelemetryRecord(key, record.id);
+    }
+    enforceTelemetryGlobalLimit();
     return record;
   }
 
   function clearTelemetryDataLocal({ silent = false } = {}) {
+    if (telemetryFetchController) {
+      telemetryFetchController.abort();
+      telemetryFetchController = null;
+    }
+    telemetryLoading = false;
+    telemetryLoadingMeshId = null;
+    telemetryLastFetchKey = null;
     telemetryStore.clear();
     telemetryRecordIds.clear();
+    telemetryRecordOrder.length = 0;
     telemetrySelectedMeshId = null;
     telemetryNodeLookup.clear();
     telemetryNodeDisplayByMesh.clear();
     telemetryNodeOptions = [];
+    telemetryTablePage = 1;
+    telemetryTableFilteredCount = 0;
     telemetrySearchRaw = '';
     telemetrySearchTerm = '';
     telemetryLastExplicitMeshId = null;
@@ -2060,9 +2621,8 @@ function ensureRelayGuessSuffix(label, summary) {
     }
   }
 
-  function setTelemetryRangeMode(mode, { skipRender = false } = {}) {
-    const allowed = new Set(['day', 'week', 'month', 'year', 'custom']);
-    if (!allowed.has(mode)) {
+  function setTelemetryRangeMode(mode, { skipRender = false, persist = false } = {}) {
+    if (!isValidTelemetryRangeMode(mode)) {
       mode = 'day';
     }
     telemetryRangeMode = mode;
@@ -2078,7 +2638,10 @@ function ensureRelayGuessSuffix(label, summary) {
     updateTelemetryRangeInputs();
     refreshTelemetrySelectors();
     if (!skipRender) {
-      renderTelemetryView();
+      loadTelemetryRecordsForSelection(telemetrySelectedMeshId, { force: true });
+    }
+    if (persist) {
+      safeStorageSet(STORAGE_KEYS.telemetryRangeMode, telemetryRangeMode);
     }
   }
 
@@ -2097,6 +2660,26 @@ function ensureRelayGuessSuffix(label, summary) {
 
   function getTelemetryRangeWindow(now = Date.now()) {
     switch (telemetryRangeMode) {
+      case 'hour1':
+        return {
+          startMs: now - 1 * 60 * 60 * 1000,
+          endMs: now
+        };
+      case 'hour3':
+        return {
+          startMs: now - 3 * 60 * 60 * 1000,
+          endMs: now
+        };
+      case 'hour6':
+        return {
+          startMs: now - 6 * 60 * 60 * 1000,
+          endMs: now
+        };
+      case 'hour12':
+        return {
+          startMs: now - 12 * 60 * 60 * 1000,
+          endMs: now
+        };
       case 'day':
         return {
           startMs: now - 24 * 60 * 60 * 1000,
@@ -2133,6 +2716,25 @@ function ensureRelayGuessSuffix(label, summary) {
       default:
         return { startMs: null, endMs: null };
     }
+  }
+
+  const TELEMETRY_RANGE_DURATIONS = {
+    hour1: 1 * 60 * 60 * 1000,
+    hour3: 3 * 60 * 60 * 1000,
+    hour6: 6 * 60 * 60 * 1000,
+    hour12: 12 * 60 * 60 * 1000,
+    day: 24 * 60 * 60 * 1000,
+    week: 7 * 24 * 60 * 60 * 1000,
+    month: 30 * 24 * 60 * 60 * 1000,
+    year: 365 * 24 * 60 * 60 * 1000
+  };
+
+  function getTelemetryRangeDuration(mode = telemetryRangeMode) {
+    return TELEMETRY_RANGE_DURATIONS[mode] ?? null;
+  }
+
+  function isRelativeTelemetryRange(mode = telemetryRangeMode) {
+    return mode !== 'custom' && getTelemetryRangeDuration(mode) != null;
   }
 
   function applyTelemetryFilters(records) {
@@ -2319,12 +2921,222 @@ function ensureRelayGuessSuffix(label, summary) {
       telemetrySearchRaw = '';
       telemetrySearchTerm = '';
     }
+    telemetryTablePage = 1;
     updateTelemetryNodeInputDisplay();
-    renderTelemetryView();
     if (hideDropdown) {
       hideTelemetryDropdown();
     } else {
       renderTelemetryDropdown({ force: true });
+    }
+    loadTelemetryRecordsForSelection(meshId);
+  }
+
+  async function requestTelemetryRange({ meshId, startMs = null, endMs = null, limit = null, signal } = {}) {
+    if (!meshId) {
+      throw new Error('meshId is required');
+    }
+    const params = new URLSearchParams();
+    params.set('meshId', meshId);
+    if (Number.isFinite(Number(startMs))) {
+      params.set('startMs', String(Math.floor(Number(startMs))));
+    }
+    if (Number.isFinite(Number(endMs))) {
+      params.set('endMs', String(Math.floor(Number(endMs))));
+    }
+    if (limit != null && Number.isFinite(Number(limit)) && Number(limit) > 0) {
+      params.set('limit', String(Math.floor(Number(limit))));
+    }
+    const response = await fetch(`/api/telemetry?${params.toString()}`, {
+      signal,
+      headers: {
+        Accept: 'application/json'
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('Invalid telemetry response');
+    }
+    return payload;
+  }
+
+  async function loadTelemetryRecordsForSelection(
+    meshId = telemetrySelectedMeshId,
+    { force = false } = {}
+  ) {
+    if (!meshId) {
+      renderTelemetryView();
+      return;
+    }
+    telemetryTablePage = 1;
+    const { startMs, endMs } = getTelemetryRangeWindow();
+    const fetchKey = `${meshId}:${startMs ?? ''}:${endMs ?? ''}`;
+    const existingBucket = telemetryStore.get(meshId);
+    if (
+      !force &&
+      existingBucket &&
+      existingBucket.loadedRange &&
+      existingBucket.loadedRange.startMs === (startMs ?? null) &&
+      existingBucket.loadedRange.endMs === (endMs ?? null) &&
+      Array.isArray(existingBucket.records) &&
+      existingBucket.records.length
+    ) {
+      telemetrySelectedMeshId = meshId;
+      telemetryLoading = false;
+      telemetryLoadingMeshId = null;
+      telemetryLastFetchKey = fetchKey;
+      renderTelemetryView();
+      return;
+    }
+
+    if (telemetryFetchController) {
+      telemetryFetchController.abort();
+    }
+    telemetryFetchController = new AbortController();
+    telemetryLoading = true;
+    telemetryLoadingMeshId = meshId;
+    telemetryLastFetchKey = fetchKey;
+    renderTelemetryView();
+
+    try {
+      const payload = await requestTelemetryRange({
+        meshId,
+        startMs,
+        endMs,
+        signal: telemetryFetchController.signal
+      });
+      if (telemetryFetchController.signal.aborted) {
+        return;
+      }
+      const bucketKey = resolveTelemetryMeshKey(payload.meshId || meshId);
+      if (!bucketKey) {
+        throw new Error('Invalid telemetry response');
+      }
+      const sanitizedNode = sanitizeTelemetryNodeData(payload.node);
+      let bucket = telemetryStore.get(bucketKey);
+      if (!bucket) {
+        bucket = {
+          meshId: bucketKey,
+          rawMeshId: payload.rawMeshId || payload.meshId || bucketKey,
+          node: sanitizedNode,
+          records: [],
+          recordIdSet: new Set(),
+          loadedRange: null,
+          loadedCount: 0,
+          totalRecords: Number.isFinite(payload.totalRecords) ? Number(payload.totalRecords) : 0,
+          metrics: new Set(Array.isArray(payload.availableMetrics) ? payload.availableMetrics : []),
+          latestSampleMs: Number.isFinite(payload.latestSampleMs)
+            ? Number(payload.latestSampleMs)
+            : null,
+          earliestSampleMs: Number.isFinite(payload.earliestSampleMs)
+            ? Number(payload.earliestSampleMs)
+            : null,
+          partial: false,
+          summaryOnly: false
+        };
+        telemetryStore.set(bucketKey, bucket);
+      } else {
+        if (payload.rawMeshId && !bucket.rawMeshId) {
+          bucket.rawMeshId = payload.rawMeshId;
+        }
+        if (sanitizedNode) {
+          bucket.node = mergeNodeMetadata(bucket.node, sanitizedNode);
+        }
+        if (Number.isFinite(payload.totalRecords)) {
+          bucket.totalRecords = Number(payload.totalRecords);
+        }
+        if (Number.isFinite(payload.latestSampleMs)) {
+          bucket.latestSampleMs = Number(payload.latestSampleMs);
+        }
+        if (Number.isFinite(payload.earliestSampleMs)) {
+          bucket.earliestSampleMs = Number(payload.earliestSampleMs);
+        }
+        if (!bucket.metrics) {
+          bucket.metrics = new Set();
+        }
+        if (Array.isArray(payload.availableMetrics)) {
+          for (const metricKey of payload.availableMetrics) {
+            bucket.metrics.add(metricKey);
+          }
+        }
+      }
+      if (sanitizedNode && sanitizedNode.meshIdNormalized) {
+        upsertNodeRegistry(sanitizedNode, { allowCreate: false });
+      }
+
+      if (Array.isArray(bucket.records)) {
+        for (const existing of bucket.records) {
+          if (existing?.id) {
+            telemetryRecordIds.delete(existing.id);
+            bucket.recordIdSet?.delete(existing.id);
+          }
+        }
+      }
+
+      const fetchedRecords = Array.isArray(payload.records) ? payload.records : [];
+      bucket.records = fetchedRecords.map((item) => cloneTelemetry(item));
+      bucket.summaryOnly = false;
+      bucket.recordIdSet = new Set();
+      for (const rec of bucket.records) {
+        if (rec?.id) {
+          bucket.recordIdSet.add(rec.id);
+          telemetryRecordIds.add(rec.id);
+        }
+      }
+      bucket.loadedRange = {
+        startMs: startMs != null ? startMs : null,
+        endMs: endMs != null ? endMs : null,
+        limit: null
+      };
+      const totalRecords = Number.isFinite(payload.totalRecords)
+        ? Number(payload.totalRecords)
+        : fetchedRecords.length;
+      bucket.totalRecords = totalRecords;
+      const loadedCount = Math.min(
+        Number.isFinite(payload.filteredCount) ? Number(payload.filteredCount) : bucket.records.length,
+        bucket.records.length
+      );
+      bucket.loadedCount = loadedCount;
+      bucket.partial =
+        Number.isFinite(bucket.totalRecords) &&
+        Number.isFinite(loadedCount) &&
+        loadedCount < bucket.totalRecords;
+      if (!Number.isFinite(bucket.latestSampleMs) || bucket.latestSampleMs == null) {
+        const latestFromRecords = bucket.records.length
+          ? bucket.records[bucket.records.length - 1].sampleTimeMs
+          : null;
+        bucket.latestSampleMs = Number.isFinite(latestFromRecords) ? Number(latestFromRecords) : bucket.latestSampleMs;
+      }
+      if (!Number.isFinite(bucket.earliestSampleMs) || bucket.earliestSampleMs == null) {
+        const earliestFromRecords = bucket.records.length ? bucket.records[0].sampleTimeMs : null;
+        if (Number.isFinite(earliestFromRecords)) {
+          bucket.earliestSampleMs = Number(earliestFromRecords);
+        }
+      }
+
+      telemetrySelectedMeshId = bucketKey;
+      telemetryLastExplicitMeshId = bucketKey;
+      telemetryLoading = false;
+      telemetryLoadingMeshId = null;
+      telemetryFetchController = null;
+      refreshTelemetrySelectors(bucketKey);
+      updateTelemetryNodeInputDisplay();
+      renderTelemetryView();
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return;
+      }
+      telemetryLoading = false;
+      telemetryLoadingMeshId = null;
+      telemetryFetchController = null;
+      console.error('載入遙測資料失敗：', err);
+      if (telemetryEmptyState) {
+        telemetryEmptyState.classList.remove('hidden');
+        telemetryEmptyState.textContent = `載入遙測資料失敗：${err.message}`;
+      }
+      renderTelemetryView();
     }
   }
 
@@ -2428,6 +3240,7 @@ function ensureRelayGuessSuffix(label, summary) {
         }
       }
       updateTelemetryNodeInputDisplay();
+      telemetryTablePage = 1;
       renderTelemetryView();
       return;
     }
@@ -2441,6 +3254,7 @@ function ensureRelayGuessSuffix(label, summary) {
     telemetrySearchRaw = raw;
     telemetrySearchTerm = raw.toLowerCase();
     updateTelemetryNodeInputDisplay();
+    telemetryTablePage = 1;
     renderTelemetryView();
   }
 
@@ -2454,69 +3268,35 @@ function ensureRelayGuessSuffix(label, summary) {
     if (!telemetryNodeInput) {
       return;
     }
-    const previous = telemetrySelectedMeshId;
+    const previousSelection = telemetrySelectedMeshId;
     const searchActive = Boolean(telemetrySearchRaw);
     const { startMs, endMs } = getTelemetryRangeWindow();
     const nodes = [];
     for (const bucket of telemetryStore.values()) {
-      if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
-        continue;
-      }
-      const metricsAny = new Set();
-      const metricsInRange = new Set();
-      let latestTimeAny = null;
-      let latestTimeInRange = null;
-      for (const record of bucket.records) {
-        const metrics = record.telemetry?.metrics;
-        if (!metrics || typeof metrics !== 'object') {
-          continue;
-        }
-        const metricKeys = Object.keys(metrics);
-        if (!metricKeys.length) {
-          continue;
-        }
-        for (const key of metricKeys) {
-          metricsAny.add(key);
-        }
-        const time = Number(record.sampleTimeMs);
-        if (!Number.isFinite(time)) {
-          continue;
-        }
-        if (latestTimeAny == null || time > latestTimeAny) {
-          latestTimeAny = time;
-        }
-        if (startMs != null && time < startMs) {
-          continue;
-        }
-        if (endMs != null && time > endMs) {
-          continue;
-        }
-        for (const key of metricKeys) {
-          metricsInRange.add(key);
-        }
-        if (latestTimeInRange == null || time > latestTimeInRange) {
-          latestTimeInRange = time;
-        }
-      }
-      if (!metricsAny.size) {
-        continue;
-      }
+      if (!bucket) continue;
       const meshKey = bucket.meshId || resolveTelemetryMeshKey(bucket.rawMeshId);
+      if (!meshKey) continue;
       const labelBase = formatTelemetryNodeLabel(meshKey, bucket.node);
-      const hasInRange = metricsInRange.size > 0;
-      const displayCount = hasInRange ? metricsInRange.size : metricsAny.size;
-      const latestMs = Number.isFinite(latestTimeInRange)
-        ? latestTimeInRange
-        : Number.isFinite(latestTimeAny)
-          ? latestTimeAny
-          : null;
+      const metricsCount = bucket.metrics instanceof Set ? bucket.metrics.size : 0;
+      const latestMs = Number.isFinite(bucket.latestSampleMs) ? bucket.latestSampleMs : null;
+      const totalRecords = Number.isFinite(bucket.totalRecords) ? bucket.totalRecords : 0;
+      let label = labelBase;
+      const hasLoadedRange =
+        bucket.loadedRange &&
+        bucket.loadedRange.startMs === (startMs ?? null) &&
+        bucket.loadedRange.endMs === (endMs ?? null);
+      if (hasLoadedRange && (!Array.isArray(bucket.records) || !bucket.records.length)) {
+        label = `${labelBase}（區間無資料）`;
+      } else if (totalRecords === 0) {
+        label = `${labelBase}（尚無資料）`;
+      }
       nodes.push({
         meshId: meshKey,
         rawMeshId: bucket.rawMeshId || meshKey,
-        label: hasInRange ? labelBase : `${labelBase}（區間無資料）`,
+        label,
         baseLabel: labelBase,
-        count: displayCount,
-        hasInRange,
+        metricsCount,
+        totalRecords,
         latestMs
       });
     }
@@ -2534,7 +3314,7 @@ function ensureRelayGuessSuffix(label, summary) {
       if (telemetryNodeInput) {
         telemetryNodeInput.value = '';
         telemetryNodeInput.disabled = true;
-        telemetryNodeInput.placeholder = '所選區間無遙測資料';
+        telemetryNodeInput.placeholder = '尚未收到遙測資料';
       }
       return;
     }
@@ -2543,16 +3323,13 @@ function ensureRelayGuessSuffix(label, summary) {
     telemetryNodeInput.placeholder = telemetryNodeInputDefaultPlaceholder;
 
     nodes.sort((a, b) => {
-      if (a.hasInRange !== b.hasInRange) {
-        return a.hasInRange ? -1 : 1;
-      }
       const aTime = Number.isFinite(a.latestMs) ? a.latestMs : -Infinity;
       const bTime = Number.isFinite(b.latestMs) ? b.latestMs : -Infinity;
       if (bTime !== aTime) {
         return bTime - aTime;
       }
-      if (b.count !== a.count) {
-        return b.count - a.count;
+      if (b.totalRecords !== a.totalRecords) {
+        return b.totalRecords - a.totalRecords;
       }
       return a.baseLabel.localeCompare(b.baseLabel, 'zh-Hant', { sensitivity: 'base' });
     });
@@ -2621,26 +3398,32 @@ function ensureRelayGuessSuffix(label, summary) {
 
     const candidateMeshIds = telemetryNodeOptions.map((option) => option.meshId).filter(Boolean);
     const preferredRaw = resolveMeshId(preferredMeshId);
-    const previousRaw = resolveMeshId(previous);
+    const previousRaw = resolveMeshId(previousSelection);
+    const explicitRaw = resolveMeshId(telemetryLastExplicitMeshId);
 
     let nextSelection = previousRaw;
     if (preferredRaw && candidateMeshIds.includes(preferredRaw)) {
       nextSelection = preferredRaw;
-    }
-    if (nextSelection && !candidateMeshIds.includes(nextSelection)) {
+    } else if (previousRaw && candidateMeshIds.includes(previousRaw)) {
+      nextSelection = previousRaw;
+    } else if (explicitRaw && candidateMeshIds.includes(explicitRaw)) {
+      nextSelection = explicitRaw;
+    } else if (candidateMeshIds.includes(telemetrySelectedMeshId)) {
+      nextSelection = telemetrySelectedMeshId;
+    } else {
       nextSelection = null;
     }
-    if (!nextSelection && candidateMeshIds.length) {
-      nextSelection = candidateMeshIds[0];
-    }
+
     telemetrySelectedMeshId = nextSelection;
-    telemetryLastExplicitMeshId = nextSelection;
-    telemetrySearchRaw = '';
-    telemetrySearchTerm = '';
-    updateTelemetryNodeInputDisplay();
+    if (nextSelection) {
+      telemetryNodeInput.placeholder = telemetryNodeInputDefaultPlaceholder;
+    } else {
+      telemetryNodeInput.placeholder = '選擇節點以載入資料';
+    }
     if (!telemetryDropdownVisible) {
       renderTelemetryDropdown();
     }
+    updateTelemetryNodeInputDisplay();
   }
 
   function getTelemetryRecordsForSelection() {
@@ -3300,23 +4083,75 @@ function ensureRelayGuessSuffix(label, summary) {
     if (!telemetryTableBody || !telemetryEmptyState) {
       return;
     }
-    if (!telemetrySelectedMeshId && telemetryStore.size && !telemetrySearchRaw) {
-      const firstKey = telemetryStore.keys().next().value;
-      telemetrySelectedMeshId = firstKey || null;
-      telemetryLastExplicitMeshId = telemetrySelectedMeshId;
-      updateTelemetryNodeInputDisplay();
-      if (!telemetryDropdownVisible) {
-        renderTelemetryDropdown();
+    if (!telemetrySelectedMeshId) {
+      if (telemetryDownloadBtn) {
+        telemetryDownloadBtn.disabled = true;
+        telemetryDownloadBtn.title = '請先選擇節點';
       }
+      telemetryTableFilteredCount = 0;
+      if (telemetryPagination) {
+        telemetryPagination.classList.add('hidden');
+      }
+      destroyAllTelemetryCharts();
+      if (telemetryChartsContainer) {
+        telemetryChartsContainer.classList.add('hidden');
+        telemetryChartsContainer.innerHTML = '';
+      }
+      if (telemetryTableWrapper) {
+        telemetryTableWrapper.classList.add('hidden');
+      }
+      telemetryTableBody.innerHTML = '';
+      telemetryEmptyState.classList.remove('hidden');
+      telemetryEmptyState.textContent = '請選擇節點以載入遙測資料。';
+      return;
+    }
+    if (telemetryLoading && telemetryLoadingMeshId === telemetrySelectedMeshId) {
+      if (telemetryDownloadBtn) {
+        telemetryDownloadBtn.disabled = true;
+        telemetryDownloadBtn.title = '資料載入中';
+      }
+      telemetryTableFilteredCount = 0;
+      if (telemetryPagination) {
+        telemetryPagination.classList.add('hidden');
+      }
+      destroyAllTelemetryCharts();
+      if (telemetryChartsContainer) {
+        telemetryChartsContainer.classList.add('hidden');
+        telemetryChartsContainer.innerHTML = '';
+      }
+      if (telemetryTableWrapper) {
+        telemetryTableWrapper.classList.add('hidden');
+      }
+      telemetryTableBody.innerHTML = '';
+      telemetryEmptyState.classList.remove('hidden');
+      telemetryEmptyState.textContent = '載入遙測資料中...';
+      return;
     }
     const baseRecords = getTelemetryRecordsForSelection();
     const filteredRecords = applyTelemetryFilters(baseRecords);
     const searchFilteredRecords = filterTelemetryBySearch(filteredRecords);
+    const paginationWindow = updateTelemetryPagination(searchFilteredRecords.length);
+    const pageRecords =
+      searchFilteredRecords.length > 0
+        ? searchFilteredRecords.slice(paginationWindow.startIndex, paginationWindow.endIndex)
+        : [];
     const hasData = searchFilteredRecords.length > 0;
     const hasBase = baseRecords.length > 0;
     if (telemetryDownloadBtn) {
       telemetryDownloadBtn.disabled = !hasData;
-      telemetryDownloadBtn.title = hasData ? '' : '目前沒有可匯出的遙測資料';
+      if (!hasData) {
+        telemetryDownloadBtn.title = '目前沒有可匯出的遙測資料';
+      } else {
+        const bucket = telemetrySelectedMeshId ? telemetryStore.get(telemetrySelectedMeshId) : null;
+        if (bucket && bucket.partial && Number.isFinite(bucket.totalRecords)) {
+          const loadedCount = Number.isFinite(bucket.loadedCount)
+            ? bucket.loadedCount
+            : bucket.records.length;
+          telemetryDownloadBtn.title = `目前僅載入 ${loadedCount} / ${bucket.totalRecords} 筆，匯出會下載完整區間資料。`;
+        } else {
+          telemetryDownloadBtn.title = '';
+        }
+      }
     }
     telemetryEmptyState.classList.toggle('hidden', hasData);
     if (telemetryTableWrapper) {
@@ -3339,181 +4174,231 @@ function ensureRelayGuessSuffix(label, summary) {
       return;
     }
     renderTelemetryCharts(searchFilteredRecords);
-    renderTelemetryTable(searchFilteredRecords);
+    renderTelemetryTable(pageRecords);
   }
 
   function downloadTelemetryCsv() {
-    const baseRecords = getTelemetryRecordsForSelection();
-    const filteredRecords = applyTelemetryFilters(baseRecords);
-    const exportRecords = filterTelemetryBySearch(filteredRecords);
-    if (!exportRecords.length) {
+    const meshId = telemetrySelectedMeshId || telemetryLastExplicitMeshId;
+    if (!meshId) {
+      appendLog({ tag: 'telemetry', message: '尚未選擇節點，無法匯出遙測資料' });
+      return;
+    }
+    if (telemetryLoading && telemetryLoadingMeshId === meshId) {
+      appendLog({ tag: 'telemetry', message: '資料載入中，請稍候再試匯出' });
+      return;
+    }
+
+    const bucket = telemetryStore.get(meshId);
+    const hasKnownRecords =
+      (bucket && Number.isFinite(bucket.totalRecords) && bucket.totalRecords > 0) ||
+      (bucket && Array.isArray(bucket.records) && bucket.records.length > 0);
+    if (!hasKnownRecords) {
       appendLog({ tag: 'telemetry', message: '目前沒有可匯出的遙測資料' });
       return;
     }
 
-    const metricKeysInUse = Object.keys(TELEMETRY_METRIC_DEFINITIONS).filter((key) =>
-      exportRecords.some((record) => record?.telemetry?.metrics?.[key] != null)
-    );
-    const knownMetricKeySet = new Set(metricKeysInUse);
-    const extraMetricKeySet = new Set();
-    for (const record of exportRecords) {
-      const flat = flattenTelemetryMetrics(record.telemetry?.metrics || {});
-      for (const [key] of flat) {
-        if (!key) continue;
-        if (knownMetricKeySet.has(key)) continue;
-        extraMetricKeySet.add(key);
-      }
+    const button = telemetryDownloadBtn || null;
+    if (button) {
+      button.disabled = true;
+      button.textContent = '準備中…';
+      button.title = '資料匯出中';
     }
-    const extraMetricKeys = Array.from(extraMetricKeySet).sort((a, b) => a.localeCompare(b));
 
-    const header = [
-      '時間 (ISO)',
-      'Unix 秒',
-      'MeshID',
-      '節點',
-      'Channel',
-      'SNR',
-      'RSSI',
-      '詳細',
-      '最後轉發',
-      '最後轉發 MeshID',
-      '最後轉發為推測',
-      '最後轉發說明',
-      '跳數',
-      'Hop Start',
-      'Hop Limit',
-      ...metricKeysInUse.map((key) => {
-        const def = TELEMETRY_METRIC_DEFINITIONS[key] || {};
-        const baseLabel = def.label || key;
-        return def.unit ? `${baseLabel} (${def.unit})` : baseLabel;
-      }),
-      ...extraMetricKeys
-    ];
+    const { startMs, endMs } = getTelemetryRangeWindow();
+    const params = new URLSearchParams();
+    params.set('meshId', meshId);
+    if (startMs != null) {
+      params.set('startMs', String(Math.floor(startMs)));
+    }
+    if (endMs != null) {
+      params.set('endMs', String(Math.floor(endMs)));
+    }
+    if (telemetrySearchTerm) {
+      params.set('search', telemetrySearchRaw || telemetrySearchTerm);
+    }
 
-    const rows = exportRecords.map((record) => {
-      const timeMs = Number(record.sampleTimeMs);
-      const isoTime = Number.isFinite(timeMs) ? new Date(timeMs).toISOString() : '';
-      const unixSeconds = Number.isFinite(timeMs) ? Math.floor(timeMs / 1000) : '';
-      const meshId = record.meshId || record.node?.meshId || '';
-      const nodeLabel = record.node
-        ? formatTelemetryNodeLabel(meshId, record.node)
-        : meshId || '未知節點';
-      const channelValue = Number.isFinite(record.channel) ? record.channel : '';
-      const snrValue = formatNumericForCsv(record.snr, 2);
-      const rssiValue = formatNumericForCsv(record.rssi, 0);
-      const detailValue = record.detail || '';
-      const relayDescriptor = buildTelemetryRelayDescriptor(record) || '';
-      const relayMeshValue =
-        record.relayMeshId ||
-        record.relayMeshIdNormalized ||
-        record.relay?.meshId ||
-        record.relay?.meshIdNormalized ||
-        '';
-      const relayGuessFlag = record.relayGuessed ? 'true' : '';
-      const relayReason = record.relayGuessReason || '';
-      const hopsDescriptor =
-        buildTelemetryHopsDescriptor(record) ||
-        (record.hopsLabel || '');
-      const hopStart =
-        Number.isFinite(record.hops?.start) ? record.hops.start : '';
-      const hopLimit =
-        Number.isFinite(record.hops?.limit) ? record.hops.limit : '';
-      const row = [
-        escapeCsvValue(isoTime),
-        escapeCsvValue(unixSeconds),
-        escapeCsvValue(meshId),
-        escapeCsvValue(nodeLabel),
-        escapeCsvValue(channelValue),
-        escapeCsvValue(snrValue),
-        escapeCsvValue(rssiValue),
-        escapeCsvValue(detailValue),
-        escapeCsvValue(relayDescriptor),
-        escapeCsvValue(relayMeshValue),
-        escapeCsvValue(relayGuessFlag),
-        escapeCsvValue(relayReason),
-        escapeCsvValue(hopsDescriptor),
-        escapeCsvValue(hopStart),
-        escapeCsvValue(hopLimit)
-      ];
-
-      for (const key of metricKeysInUse) {
-        const raw = record.telemetry?.metrics?.[key];
-        const formatted = raw == null ? '' : formatTelemetryValue(key, raw);
-        row.push(escapeCsvValue(formatted));
-      }
-
-      const flatMetrics = new Map(flattenTelemetryMetrics(record.telemetry?.metrics || {}));
-      for (const key of extraMetricKeys) {
-        let value = flatMetrics.has(key) ? flatMetrics.get(key) : '';
-        if (typeof value === 'number') {
-          value = trimTrailingZeros(value.toFixed(2));
-        } else if (typeof value === 'boolean') {
-          value = value ? 'true' : 'false';
-        }
-        row.push(escapeCsvValue(value));
-      }
-
-      return row.join(',');
-    });
-
-    const csvContent = [header.map(escapeCsvValue).join(','), ...rows].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const meshIdLabel =
-      normalizeMeshId(telemetrySelectedMeshId) || telemetrySelectedMeshId || 'telemetry';
-    const safeMeshId = meshIdLabel ? meshIdLabel.replace(/[^0-9a-zA-Z_-]+/g, '') : 'telemetry';
+    const url = `/api/telemetry/export.csv?${params.toString()}`;
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `telemetry-${safeMeshId || 'export'}-${timestamp}.csv`;
+    anchor.download = '';
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+
     const logLabel =
-      telemetryNodeDisplayByMesh.get(telemetrySelectedMeshId || '') ||
-      normalizeMeshId(telemetrySelectedMeshId) ||
-      telemetrySelectedMeshId ||
+      telemetryNodeDisplayByMesh.get(meshId || '') ||
+      normalizeMeshId(meshId) ||
+      meshId ||
       '未選擇節點';
     appendLog({
       tag: 'telemetry',
-      message: `已匯出 ${rows.length} 筆遙測資料 (${logLabel})`
+      message: `已開始匯出遙測資料 (${logLabel})`
     });
+
+    if (button) {
+      setTimeout(() => {
+        button.disabled = false;
+        button.textContent = '下載 CSV';
+        button.title = bucket && bucket.partial && Number.isFinite(bucket.totalRecords)
+          ? `目前僅載入 ${bucket.loadedCount ?? bucket.records.length} / ${bucket.totalRecords} 筆，匯出會下載完整區間資料。`
+          : '';
+      }, 1500);
+    }
+  }
+
+  function applyTelemetrySummary(payload) {
+    const previousSelection = telemetrySelectedMeshId;
+    const nodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+    const seenKeys = new Set();
+    for (const entry of nodes) {
+      const meshIdRaw = entry?.meshId ?? entry?.rawMeshId ?? entry?.meshIdNormalized;
+      const meshKey = resolveTelemetryMeshKey(meshIdRaw);
+      if (!meshKey) continue;
+      const sanitizedNode = sanitizeTelemetryNodeData(entry?.node);
+      let bucket = telemetryStore.get(meshKey);
+      if (!bucket) {
+        bucket = {
+          meshId: meshKey,
+          rawMeshId: entry?.rawMeshId || meshIdRaw || meshKey,
+          node: sanitizedNode,
+          records: [],
+          recordIdSet: new Set(),
+          loadedRange: null,
+          loadedCount: 0,
+          totalRecords: Number.isFinite(entry?.totalRecords) ? Number(entry.totalRecords) : 0,
+          metrics: new Set(Array.isArray(entry?.availableMetrics) ? entry.availableMetrics : []),
+          latestSampleMs: Number.isFinite(entry?.latestSampleMs) ? Number(entry.latestSampleMs) : null,
+          earliestSampleMs: null,
+          partial: false,
+          summaryOnly: true
+        };
+      } else {
+        if (entry?.rawMeshId && !bucket.rawMeshId) {
+          bucket.rawMeshId = entry.rawMeshId;
+        }
+        if (sanitizedNode) {
+          bucket.node = mergeNodeMetadata(bucket.node, sanitizedNode);
+        }
+        if (!bucket.metrics) {
+          bucket.metrics = new Set();
+        }
+        if (Array.isArray(entry?.availableMetrics)) {
+          for (const metricKey of entry.availableMetrics) {
+            bucket.metrics.add(metricKey);
+          }
+        }
+        if (Number.isFinite(entry?.totalRecords)) {
+          bucket.totalRecords = Number(entry.totalRecords);
+        }
+        if (Number.isFinite(entry?.latestSampleMs)) {
+          bucket.latestSampleMs = Number(entry.latestSampleMs);
+        }
+        bucket.summaryOnly = bucket.records?.length ? false : bucket.summaryOnly;
+      }
+      bucket.partial =
+        Number.isFinite(bucket.totalRecords) && (!bucket.records || bucket.records.length < bucket.totalRecords);
+      telemetryStore.set(meshKey, bucket);
+      if (sanitizedNode && sanitizedNode.meshIdNormalized) {
+        upsertNodeRegistry(sanitizedNode, { allowCreate: false });
+      }
+      seenKeys.add(meshKey);
+    }
+    for (const meshKey of Array.from(telemetryStore.keys())) {
+      if (!seenKeys.has(meshKey)) {
+        const bucket = telemetryStore.get(meshKey);
+        if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+          telemetryStore.delete(meshKey);
+        }
+      }
+    }
+    if (payload?.stats) {
+      updateTelemetryStats(payload.stats);
+    }
+    telemetryUpdatedAt = payload?.updatedAt ?? telemetryUpdatedAt ?? Date.now();
+    const resolvedSelection = previousSelection && telemetryStore.has(previousSelection) ? previousSelection : telemetrySelectedMeshId;
+    telemetrySelectedMeshId = resolvedSelection;
+    refreshTelemetrySelectors(resolvedSelection);
+    updateTelemetryNodeInputDisplay();
+    renderTelemetryView();
+    updateTelemetryUpdatedAtLabel();
   }
 
   function applyTelemetrySnapshot(snapshot) {
-    const previousSelection = telemetrySelectedMeshId;
-    clearTelemetryDataLocal({ silent: true });
     if (!snapshot || !Array.isArray(snapshot.nodes)) {
-      telemetrySelectedMeshId = null;
+      if (Number.isFinite(snapshot?.maxTotalRecords) && snapshot.maxTotalRecords > 0) {
+        updateTelemetryMaxTotalRecords(snapshot.maxTotalRecords);
+      }
       telemetryUpdatedAt = snapshot?.updatedAt ?? telemetryUpdatedAt ?? null;
+      updateTelemetryStats(snapshot?.stats);
       refreshTelemetrySelectors();
       renderTelemetryView();
       updateTelemetryUpdatedAtLabel();
       return;
     }
+
+    if (Number.isFinite(snapshot.maxTotalRecords) && snapshot.maxTotalRecords > 0) {
+      updateTelemetryMaxTotalRecords(snapshot.maxTotalRecords);
+    }
+
+    const summaryPayload = {
+      nodes: snapshot.nodes.map((node) => ({
+        meshId: node?.meshId ?? node?.rawMeshId ?? node?.meshIdNormalized,
+        rawMeshId: node?.rawMeshId ?? node?.meshId ?? null,
+        node: node?.node,
+        totalRecords: Number.isFinite(node?.totalRecords)
+          ? Number(node.totalRecords)
+          : Array.isArray(node?.records)
+            ? node.records.length
+            : 0,
+        latestSampleMs: Number.isFinite(node?.latestSampleMs)
+          ? Number(node.latestSampleMs)
+          : Array.isArray(node?.records) && node.records.length
+            ? Number(node.records[node.records.length - 1]?.sampleTimeMs ?? node.records[node.records.length - 1]?.timestampMs)
+            : null,
+        availableMetrics: Array.isArray(node?.metrics) ? node.metrics : []
+      })),
+      stats: snapshot.stats,
+      updatedAt: snapshot.updatedAt
+    };
+    applyTelemetrySummary(summaryPayload);
+
     for (const node of snapshot.nodes) {
-      const meshId = node?.meshId;
-      if (!meshId) continue;
-      const nodeInfo = sanitizeTelemetryNodeData(node.node);
-      const records = Array.isArray(node.records) ? node.records : [];
-      for (const rawRecord of records) {
-        addTelemetryRecord(meshId, nodeInfo, rawRecord);
+      if (!Array.isArray(node?.records) || !node.records.length) continue;
+      const meshIdRaw = node?.meshId ?? node?.rawMeshId ?? node?.meshIdNormalized;
+      const meshKey = resolveTelemetryMeshKey(meshIdRaw);
+      if (!meshKey) continue;
+      const bucket = telemetryStore.get(meshKey);
+      if (!bucket) continue;
+      if (node?.rawMeshId && !bucket.rawMeshId) {
+        bucket.rawMeshId = node.rawMeshId;
       }
-    }
-    telemetryUpdatedAt = snapshot.updatedAt ?? Date.now();
-    refreshTelemetrySelectors(previousSelection);
-    if (previousSelection && telemetryStore.has(previousSelection)) {
-      telemetrySelectedMeshId = previousSelection;
-      telemetryLastExplicitMeshId = previousSelection;
-      updateTelemetryNodeInputDisplay();
-      if (!telemetryDropdownVisible) {
-        renderTelemetryDropdown();
+      const sanitizedNode = sanitizeTelemetryNodeData(node.node);
+      if (sanitizedNode) {
+        bucket.node = mergeNodeMetadata(bucket.node, sanitizedNode);
+        upsertNodeRegistry(sanitizedNode, { allowCreate: false });
       }
+      const clones = node.records.map((item) => cloneTelemetry(item));
+      bucket.records = clones;
+      bucket.recordIdSet = new Set();
+      for (const rec of clones) {
+        if (rec?.id) {
+          bucket.recordIdSet.add(rec.id);
+          telemetryRecordIds.add(rec.id);
+        }
+      }
+      bucket.loadedRange = null;
+      bucket.loadedCount = clones.length;
+      if (!bucket.metrics) {
+        bucket.metrics = new Set();
+      }
+      bucket.partial = Number.isFinite(bucket.totalRecords) && bucket.loadedCount < bucket.totalRecords;
+      bucket.summaryOnly = false;
     }
-    renderTelemetryView();
+
+    telemetryUpdatedAt = snapshot.updatedAt ?? telemetryUpdatedAt ?? Date.now();
     updateTelemetryUpdatedAtLabel();
     updateTelemetryStats(snapshot.stats);
+    renderTelemetryView();
   }
 
   function handleTelemetryAppend(payload) {
@@ -3522,6 +4407,9 @@ function ensureRelayGuessSuffix(label, summary) {
     }
     if (payload.type && payload.type !== 'append') {
       return;
+    }
+    if (Number.isFinite(payload.maxTotalRecords) && payload.maxTotalRecords > 0) {
+      updateTelemetryMaxTotalRecords(payload.maxTotalRecords);
     }
     const meshId = payload.meshId || payload.record?.meshId;
     const record = addTelemetryRecord(meshId, payload.node, payload.record);
@@ -3533,19 +4421,14 @@ function ensureRelayGuessSuffix(label, summary) {
         ? Number(payload.updatedAt)
         : Date.now();
     const previousSelection = telemetrySelectedMeshId;
-    refreshTelemetrySelectors(previousSelection || meshId);
+    refreshTelemetrySelectors(previousSelection);
     if (previousSelection && telemetryStore.has(previousSelection)) {
       telemetrySelectedMeshId = previousSelection;
-      telemetryLastExplicitMeshId = previousSelection;
-    } else if (!telemetrySelectedMeshId && meshId) {
-      telemetrySelectedMeshId = meshId;
-      telemetryLastExplicitMeshId = meshId;
+    } else if (telemetrySelectedMeshId && !telemetryStore.has(telemetrySelectedMeshId)) {
+      telemetrySelectedMeshId = null;
     }
     updateTelemetryNodeInputDisplay();
-    if (!telemetryDropdownVisible) {
-      renderTelemetryDropdown();
-    }
-    if (telemetrySelectedMeshId === meshId) {
+    if (record && telemetrySelectedMeshId && normalizeMeshId(telemetrySelectedMeshId) === normalizeMeshId(meshId)) {
       renderTelemetryView();
     }
     updateTelemetryUpdatedAtLabel();
@@ -3558,6 +4441,9 @@ function ensureRelayGuessSuffix(label, summary) {
     }
     if (payload.type && payload.type !== 'reset') {
       return;
+    }
+    if (Number.isFinite(payload.maxTotalRecords) && payload.maxTotalRecords > 0) {
+      updateTelemetryMaxTotalRecords(payload.maxTotalRecords);
     }
     telemetryUpdatedAt =
       Number.isFinite(payload.updatedAt) && payload.updatedAt > 0
@@ -3592,47 +4478,88 @@ function ensureRelayGuessSuffix(label, summary) {
     return String(channel);
   }
 
-  function formatSource(summary) {
-    if (!summary) return 'unknown';
-    const display = formatNodeDisplayLabel(summary.from);
-    if (display) {
-      return display;
+  function formatNodeDisplay(node) {
+    if (!node) {
+      return 'unknown';
     }
-    const mesh = summary.from?.meshId || summary.from?.meshIdNormalized || summary.from?.meshIdOriginal || '';
-    return mesh || 'unknown';
+    const name =
+      sanitizeNodeName(node.longName) ||
+      sanitizeNodeName(node.shortName) ||
+      sanitizeNodeName(node.label);
+    let meshId = node.meshId || node.meshIdOriginal || node.meshIdNormalized || '';
+    if (meshId && meshId.startsWith('0x')) {
+      meshId = `!${meshId.slice(2)}`;
+    }
+    if (name && meshId) {
+      return name.includes(meshId) ? name : `${name} (${meshId})`;
+    }
+    if (name) {
+      return name;
+    }
+    if (meshId) {
+      return meshId;
+    }
+    return 'unknown';
   }
 
-  function getDetailExtraSegments(summary) {
-    if (!summary || !Array.isArray(summary.extraLines) || !summary.extraLines.length) {
-      return [];
+  function formatNodes(summary) {
+    const fromLabel = formatNodeDisplay(summary?.from);
+    const toLabel = summary?.to ? formatNodeDisplay(summary.to) : null;
+    if (!toLabel) {
+      return fromLabel;
     }
-    return summary.extraLines
-      .map((line) => {
-        if (line === null || line === undefined) return '';
-        const text = String(line).trim();
-        return text ? `<span class="detail-extra">${escapeHtml(text)}</span>` : '';
-      })
-      .filter(Boolean);
+    return `${fromLabel} → ${toLabel}`;
   }
 
-  function formatDetail(summary) {
-    const detail = summary.detail || '';
-    const segments = [];
-    if (detail) {
-      segments.push(escapeHtml(detail));
-    }
-    const extraSegments = getDetailExtraSegments(summary);
-    if (extraSegments.length) {
-      segments.push(...extraSegments);
-    }
+  function updateDetailCell(cell, summary) {
+    if (!cell) return;
+    cell.classList.add('info-cell');
+    cell.innerHTML = '';
+    const detailText = typeof summary?.detail === 'string' ? summary.detail.trim() : '';
+    const extras = Array.isArray(summary?.extraLines)
+      ? summary.extraLines
+          .map((line) => (line === null || line === undefined ? '' : String(line).trim()))
+          .filter(Boolean)
+      : [];
     const distanceLabel = formatDistance(summary);
+
+    const mainEl = document.createElement('div');
+    mainEl.className = 'detail-main';
+    mainEl.textContent = detailText;
+    cell.appendChild(mainEl);
+
+    if (extras.length) {
+      const extrasEl = document.createElement('div');
+      extrasEl.className = 'detail-extra';
+      for (const line of extras) {
+        const span = document.createElement('span');
+        span.textContent = line;
+        extrasEl.appendChild(span);
+      }
+      cell.appendChild(extrasEl);
+    }
+
     if (distanceLabel) {
-      segments.push(`<span class="detail-distance">${escapeHtml(distanceLabel)}</span>`);
+      const distanceEl = document.createElement('div');
+      distanceEl.className = 'detail-distance';
+      distanceEl.textContent = distanceLabel;
+      cell.appendChild(distanceEl);
     }
-    if (!segments.length) {
-      return '';
-    }
-    return segments.join('<br/>');
+  }
+
+  function renderTypeCell(cell, summary) {
+    if (!cell) return;
+    cell.classList.add('type');
+    cell.innerHTML = '';
+    const typeKey = typeof summary?.type === 'string' ? summary.type.trim() : '';
+    const displayType = typeKey || '—';
+    const icon = TYPE_ICONS[typeKey] || '📦';
+    const iconEl = document.createElement('span');
+    iconEl.className = 'type-icon';
+    iconEl.textContent = icon;
+    const textEl = document.createElement('span');
+    textEl.textContent = displayType;
+    cell.append(iconEl, textEl);
   }
 
   function formatDistance(summary) {
@@ -3828,7 +4755,7 @@ function ensureRelayGuessSuffix(label, summary) {
   function hydrateSummaryNode(node, fallbackMeshId = null) {
     const meshCandidate = node?.meshId ?? node?.meshIdNormalized ?? fallbackMeshId;
     const registryNode = getRegistryNode(meshCandidate);
-    const upserted = node ? upsertNodeRegistry(node) : null;
+    const upserted = node ? upsertNodeRegistry(node, { allowCreate: false }) : null;
     const merged = mergeNodeMetadata(node, upserted, registryNode);
     return merged || node || registryNode || null;
   }
@@ -3862,29 +4789,32 @@ function ensureRelayGuessSuffix(label, summary) {
         : '';
     const timeLabel = escapeHtml(summary.timestampLabel || formatTimestamp(summary.timestamp));
     const relayLabel = escapeHtml(formatRelay(summary));
-    const sourceLabel = escapeHtml(formatSource(summary));
-    const hopsLabel = escapeHtml(formatHops(summary.hops));
-    const typeLabel = escapeHtml(summary.type || '—');
+    const nodesLabel = escapeHtml(formatNodes(summary));
     const channelLabel = escapeHtml(formatChannel(summary.channel));
+    const hopInfo = extractHopInfo(summary);
+    const hopsLabel = hopInfo.limitOnly
+      ? '無效'
+      : hopInfo.hopsLabel || formatHops(summary.hops) || '';
 
     tr.innerHTML = `
       <td>${timeLabel}</td>
-      <td>${sourceLabel}</td>
+      <td>${nodesLabel}</td>
       <td>${relayLabel}</td>
-      <td>${typeLabel}</td>
       <td>${channelLabel}</td>
-      <td>${hopsLabel}</td>
       <td class="${snrClass}">${formatNumber(summary.snr, 2)}</td>
       <td>${formatNumber(summary.rssi, 0)}</td>
-      <td class="info-cell">${formatDetail(summary)}</td>
+      <td class="type"></td>
+      <td>${escapeHtml(hopsLabel || '—')}</td>
+      <td class="info-cell"></td>
     `;
     updateRelayCellDisplay(tr.cells[2], summary);
+    renderTypeCell(tr.querySelector('.type'), summary);
+    updateDetailCell(tr.querySelector('.info-cell'), summary);
     return tr;
   }
 
-  function setAprsBadge(row, callsign) {
-    if (!row || !callsign) return;
-    row.dataset.aprsCallsign = callsign;
+  function setAprsBadge(row, text, { variant = 'success', datasetValue = null } = {}) {
+    if (!row || !text) return;
     const infoCell = row.querySelector('.info-cell');
     if (!infoCell) return;
     let badge = infoCell.querySelector('.aprs-badge');
@@ -3893,15 +4823,148 @@ function ensureRelayGuessSuffix(label, summary) {
       badge.className = 'aprs-badge';
       infoCell.appendChild(badge);
     }
-    badge.textContent = `APRS: ${callsign}`;
+    if (datasetValue) {
+      row.dataset.aprsCallsign = datasetValue;
+    } else if (variant !== 'success') {
+      delete row.dataset.aprsCallsign;
+    }
+    if (variant === 'success') {
+      badge.classList.remove('aprs-badge-rejected');
+    } else {
+      badge.classList.add('aprs-badge-rejected');
+    }
+    badge.textContent = text;
   }
 
-  function appendSummary(summary) {
+  function formatAprsRejectedBadge(summary) {
+    if (!summary) return '條件不符';
+    if (typeof summary.aprsRejectedLabel === 'string' && summary.aprsRejectedLabel.trim()) {
+      return summary.aprsRejectedLabel.trim();
+    }
+    const reason = String(summary.aprsRejectedReason || '').toLowerCase();
+    switch (reason) {
+      case 'local-repeat':
+        return '本機冷卻時間內已上傳';
+      case 'seen-on-feed':
+        return 'APRS-IS 已有相同封包';
+      case 'recent-activity':
+        return '呼號冷卻中';
+      default:
+        return '不符合 APRS 上傳條件';
+    }
+  }
+
+  function deriveSummaryAprsCallsign(summary) {
+    if (!summary) return null;
+    const candidateValues = [
+      summary.aprsCallsign,
+      summary.aprs_callsign,
+      summary.mappingCallsign,
+      summary.mapping_callsign,
+      summary.callsign
+    ];
+    for (const value of candidateValues) {
+      const normalized = normalizeProvisionCallsignString(value);
+      if (normalized) {
+        return normalized;
+      }
+    }
+    const meshId =
+      normalizeMeshId(summary?.from?.meshId || summary?.from?.meshIdNormalized) ||
+      normalizeMeshId(summary?.meshId || summary?.meshIdNormalized);
+    if (meshId) {
+      const mapping = findMappingByMeshId(meshId);
+      if (mapping) {
+        const mappingCallsign = formatMappingCallsign(mapping);
+        if (mappingCallsign) {
+          return mappingCallsign;
+        }
+      }
+    }
+    return null;
+  }
+
+  function deriveFlowPendingReason(summary) {
+    if (!summary) return null;
+    if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) {
+      return formatAprsRejectedBadge(summary);
+    }
+    const extras = Array.isArray(summary.extraLines) ? summary.extraLines : [];
+    for (const line of extras) {
+      if (typeof line !== 'string') continue;
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (/^APRS /.test(trimmed) || trimmed.includes('APRS')) {
+        return trimmed.replace(/^APRS 略過：?/, '').trim() || trimmed;
+      }
+    }
+    return null;
+  }
+
+  function collectFlowPendingDetails(summary) {
+    if (!summary) return [];
+    const extras = Array.isArray(summary.extraLines) ? summary.extraLines : [];
+    return extras.filter((line) => typeof line === 'string' && line.trim()).slice(0, 5);
+  }
+
+  function showFlowPendingReason(entry) {
+    if (!entry?.pendingReason) return;
+    const lines = [entry.pendingReason];
+    const context = entry.pendingReasonContext;
+    if (context && Number.isFinite(context.remainingMs)) {
+      const seconds = Math.max(1, Math.ceil(context.remainingMs / 1000));
+      lines.push(`冷卻剩餘：約 ${seconds} 秒`);
+    }
+    if (Array.isArray(entry.pendingReasonDetails)) {
+      entry.pendingReasonDetails.forEach((line) => {
+        if (line && !lines.includes(line)) {
+          lines.push(line);
+        }
+      });
+    }
+    window.alert(lines.filter(Boolean).join('\n'));
+  }
+
+  function applyAprsState(row, summary) {
+    if (!row || !summary) return;
+    if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) {
+      const label = formatAprsRejectedBadge(summary);
+      const aprsCallsign = deriveSummaryAprsCallsign(summary);
+      const badgeText = aprsCallsign
+        ? `APRS: ${aprsCallsign}${label ? `（${label}）` : ''}`
+        : `APRS 拒絕：${label}`;
+      row.classList.remove('summary-row-aprs');
+      row.classList.add('summary-row-aprs-rejected');
+      setAprsBadge(row, badgeText, { variant: 'rejected', datasetValue: aprsCallsign });
+    }
+  }
+
+  function shouldDiscardSummaryForReplay(summary, { skipGuard = false } = {}) {
+    if (skipGuard || !summaryReplayGuardActive) {
+      return false;
+    }
+    const timestampMs = extractSummaryTimestampMs(summary);
+    if (!Number.isFinite(timestampMs)) {
+      summaryReplayGuardActive = false;
+      return false;
+    }
+    if (timestampMs + SUMMARY_REPLAY_GUARD_DRIFT_MS < summaryReplayGuardCutoffMs) {
+      return true;
+    }
+    summaryReplayGuardActive = false;
+    return false;
+  }
+
+  function appendSummary(summary, options = {}) {
     if (!summary.selfMeshId && currentSelfMeshId) {
       summary.selfMeshId = currentSelfMeshId;
     }
 
     hydrateSummaryNodes(summary);
+
+    if (shouldDiscardSummaryForReplay(summary, options)) {
+      return;
+    }
 
     const row = createSummaryRow(summary);
     row.__summaryData = summary;
@@ -3919,11 +4982,12 @@ function ensureRelayGuessSuffix(label, summary) {
       flowRowMap.set(flowId, row);
       if (aprsHighlightedFlows.has(flowId)) {
         row.classList.add('summary-row-aprs');
+        row.classList.remove('summary-row-aprs-rejected');
         aprsHighlightedFlows.delete(flowId);
       }
       const aprsCallsign = flowAprsCallsigns.get(flowId);
       if (aprsCallsign) {
-        setAprsBadge(row, aprsCallsign);
+        setAprsBadge(row, `APRS: ${aprsCallsign}`, { variant: 'success', datasetValue: aprsCallsign });
       }
     }
 
@@ -3947,6 +5011,7 @@ function ensureRelayGuessSuffix(label, summary) {
     }
 
     registerFlow(summary);
+    applyAprsState(row, summary);
   }
 
   function refreshSummaryRows() {
@@ -3961,9 +5026,151 @@ function ensureRelayGuessSuffix(label, summary) {
       if (!cells || cells.length < 3) {
         continue;
       }
-      cells[1].textContent = formatSource(summary);
+      cells[1].textContent = formatNodes(summary);
       updateRelayCellDisplay(cells[2], summary);
     }
+  }
+
+  function unwrapPendingFlowSummary(entry) {
+    if (!entry || typeof entry !== 'object') {
+      return entry || null;
+    }
+    if (entry.summary && typeof entry.summary === 'object') {
+      return entry.summary;
+    }
+    return entry;
+  }
+
+  function deletePendingFlowSummary(meshId, flowId) {
+    if (!meshId || !flowId) return false;
+    const bucket = pendingFlowSummaries.get(meshId);
+    if (!bucket) return false;
+    const removed = bucket.delete(flowId);
+    if (!removed) return false;
+    pendingFlowSummaryCount = Math.max(0, pendingFlowSummaryCount - 1);
+    if (!bucket.size) {
+      pendingFlowSummaries.delete(meshId);
+    }
+    return true;
+  }
+
+  function trimPendingFlowSummaries() {
+    if (!pendingFlowSummaryQueue.length) {
+      return;
+    }
+    const now = Date.now();
+    while (pendingFlowSummaryQueue.length) {
+      const head = pendingFlowSummaryQueue[0];
+      if (!head) {
+        pendingFlowSummaryQueue.shift();
+        continue;
+      }
+      const expired = head.insertedAt + PENDING_FLOW_SUMMARY_TTL_MS < now;
+      const overLimit = pendingFlowSummaryCount > MAX_PENDING_FLOW_SUMMARIES_TOTAL;
+      if (!expired && !overLimit) {
+        break;
+      }
+      pendingFlowSummaryQueue.shift();
+      if (!head.meshId || !head.flowId) {
+        continue;
+      }
+      if (!expired && !overLimit) {
+        continue;
+      }
+      deletePendingFlowSummary(head.meshId, head.flowId);
+    }
+  }
+
+  function addPendingFlowSummary(meshId, flowId, summary) {
+    if (!meshId || !flowId || !summary) return;
+    let bucket = pendingFlowSummaries.get(meshId);
+    const now = Date.now();
+    if (!bucket) {
+      bucket = new Map();
+      pendingFlowSummaries.set(meshId, bucket);
+    }
+    if (bucket.has(flowId)) {
+      bucket.set(flowId, { summary, insertedAt: now });
+      return;
+    }
+    bucket.set(flowId, { summary, insertedAt: now });
+    pendingFlowSummaryQueue.push({ meshId, flowId, insertedAt: now });
+    pendingFlowSummaryCount += 1;
+
+    while (bucket.size > MAX_PENDING_FLOW_SUMMARIES_PER_MESH) {
+      const oldestKey = bucket.keys().next().value;
+      if (!oldestKey) {
+        break;
+      }
+      const removed = deletePendingFlowSummary(meshId, oldestKey);
+      if (!removed) {
+        bucket.delete(oldestKey);
+      }
+      bucket = pendingFlowSummaries.get(meshId);
+      if (!bucket) {
+        break;
+      }
+    }
+
+    trimPendingFlowSummaries();
+  }
+
+  function normalizeAprsRecord(record) {
+    if (!record || typeof record !== 'object') {
+      return null;
+    }
+    const {
+      frame = '',
+      payload = '',
+      timestampMs = null,
+      timestampLabel = ''
+    } = record;
+    return { frame, payload, timestampMs, timestampLabel };
+  }
+
+  function discardPendingAprsRecord(flowId) {
+    if (!flowId) return;
+    pendingAprsUplinks.delete(flowId);
+  }
+
+  function trimPendingAprsRecords() {
+    if (!pendingAprsQueue.length) {
+      return;
+    }
+    const now = Date.now();
+    while (pendingAprsQueue.length) {
+      const head = pendingAprsQueue[0];
+      if (!head) {
+        pendingAprsQueue.shift();
+        continue;
+      }
+      const entry = pendingAprsUplinks.get(head.flowId);
+      if (!entry) {
+        pendingAprsQueue.shift();
+        continue;
+      }
+      const isCurrent = entry.cachedAt === head.cachedAt;
+      if (!isCurrent) {
+        pendingAprsQueue.shift();
+        continue;
+      }
+      const expired = entry.cachedAt + PENDING_APRS_TTL_MS < now;
+      const overLimit = pendingAprsUplinks.size > MAX_PENDING_APRS_RECORDS;
+      if (!expired && !overLimit) {
+        break;
+      }
+      pendingAprsQueue.shift();
+      pendingAprsUplinks.delete(head.flowId);
+    }
+  }
+
+  function rememberPendingAprsRecord(flowId, record) {
+    if (!flowId || !record) return;
+    const cachedAt = Date.now();
+    const stored = { ...record, cachedAt };
+    pendingAprsUplinks.set(flowId, stored);
+    pendingAprsQueue.push({ flowId, cachedAt });
+    trimPendingAprsRecords();
   }
 
   function registerFlow(summary, { skipPending = false } = {}) {
@@ -3993,37 +5200,16 @@ function ensureRelayGuessSuffix(label, summary) {
     const mapping = findMappingByMeshId(meshId);
     if (!mapping) {
       if (!skipPending) {
-        let bucket = pendingFlowSummaries.get(meshId);
-        if (!bucket) {
-          bucket = new Map();
-          pendingFlowSummaries.set(meshId, bucket);
-        }
-        if (!bucket.has(flowId)) {
-          const clone = cloneSummaryForPending(summary);
-          if (clone) {
-            bucket.set(flowId, clone);
-            while (bucket.size > 25) {
-              const oldestKey = bucket.keys().next().value;
-              if (oldestKey) {
-                bucket.delete(oldestKey);
-              } else {
-                break;
-              }
-            }
-          }
+        const clone = cloneSummaryForPending(summary);
+        if (clone) {
+          addPendingFlowSummary(meshId, flowId, clone);
         }
       }
       return;
     }
 
     if (!skipPending) {
-      const bucket = pendingFlowSummaries.get(meshId);
-      if (bucket) {
-        bucket.delete(flowId);
-        if (!bucket.size) {
-          pendingFlowSummaries.delete(meshId);
-        }
-      }
+      deletePendingFlowSummary(meshId, flowId);
     }
 
     const entry = buildFlowEntry(summary, {
@@ -4037,9 +5223,10 @@ function ensureRelayGuessSuffix(label, summary) {
 
     const aprsRecord = pendingAprsUplinks.get(flowId);
     if (aprsRecord) {
-      entry.aprs = aprsRecord;
+      entry.aprs = normalizeAprsRecord(aprsRecord);
       entry.status = 'aprs';
-      pendingAprsUplinks.delete(flowId);
+      discardPendingAprsRecord(flowId);
+      trimPendingAprsRecords();
     }
 
     renderFlowEntries();
@@ -4088,7 +5275,7 @@ function ensureRelayGuessSuffix(label, summary) {
       relayLabel,
       relayGuess: relayGuessed,
       relayGuessReason,
-      hopsLabel: hopInfo.hopsLabel || formatHops(summary.hops),
+      hopsLabel: hopInfo.limitOnly ? '無效' : hopInfo.hopsLabel || formatHops(summary.hops),
       hopsUsed: hopInfo.usedHops,
       hopsTotal: hopInfo.totalHops,
       snr: Number.isFinite(summary.snr) ? Number(summary.snr) : null,
@@ -4109,6 +5296,15 @@ function ensureRelayGuessSuffix(label, summary) {
 
     if (!entry.comment && extras.length) {
       entry.comment = extras.join('\n');
+    }
+
+    const pendingReason = deriveFlowPendingReason(summary);
+    if (pendingReason) {
+      entry.pendingReason = pendingReason;
+      entry.pendingReasonDetails = collectFlowPendingDetails(summary);
+      if (summary.aprsRejectedContext) {
+        entry.pendingReasonContext = summary.aprsRejectedContext;
+      }
     }
 
     return entry;
@@ -4141,7 +5337,7 @@ function ensureRelayGuessSuffix(label, summary) {
       '';
     entry.relayMeshIdNormalized = normalizeMeshId(entry.relayMeshId) || entry.relayMeshIdNormalized || '';
     const hopInfo = extractHopInfo(summary);
-    entry.hopsLabel = hopInfo.hopsLabel || formatHops(summary.hops);
+    entry.hopsLabel = hopInfo.limitOnly ? '無效' : hopInfo.hopsLabel || formatHops(summary.hops);
     entry.hopsUsed = hopInfo.usedHops;
     entry.hopsTotal = hopInfo.totalHops;
     entry.snr = Number.isFinite(summary.snr) ? Number(summary.snr) : entry.snr;
@@ -4154,6 +5350,18 @@ function ensureRelayGuessSuffix(label, summary) {
     entry.altitude = resolveAltitudeMeters(position);
     entry.speedKph = computeSpeedKph(position);
     entry.satsInView = Number.isFinite(position.satsInView) ? Number(position.satsInView) : entry.satsInView;
+    const pendingReason = deriveFlowPendingReason(summary);
+    if (pendingReason) {
+      entry.pendingReason = pendingReason;
+      entry.pendingReasonDetails = collectFlowPendingDetails(summary);
+      if (summary.aprsRejectedContext) {
+        entry.pendingReasonContext = summary.aprsRejectedContext;
+      }
+    } else if (!entry.aprs) {
+      delete entry.pendingReason;
+      delete entry.pendingReasonDetails;
+      delete entry.pendingReasonContext;
+    }
 
     const mapping = findMappingByMeshId(entry.meshId);
     if (mapping) {
@@ -4251,6 +5459,19 @@ function ensureRelayGuessSuffix(label, summary) {
     const status = document.createElement('span');
     status.className = `flow-item-status ${entry.aprs ? 'flow-item-status--aprs' : 'flow-item-status--pending'}`;
     status.textContent = entry.aprs ? '已上傳 APRS' : '待上傳';
+    if (!entry.aprs && entry.pendingReason) {
+      const hintBtn = document.createElement('button');
+      hintBtn.type = 'button';
+      hintBtn.className = 'relay-hint-btn flow-status-hint-btn';
+      hintBtn.textContent = '?';
+      hintBtn.title = entry.pendingReason;
+      hintBtn.setAttribute('aria-label', '顯示待上傳原因');
+      hintBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        showFlowPendingReason(entry);
+      });
+      status.appendChild(hintBtn);
+    }
 
     header.append(title, status);
     item.appendChild(header);
@@ -4560,10 +5781,16 @@ function ensureRelayGuessSuffix(label, summary) {
     if (!meshId) return;
     const bucket = pendingFlowSummaries.get(meshId);
     if (!bucket || !bucket.size) return;
+    const bucketSize = bucket.size;
     pendingFlowSummaries.delete(meshId);
-    for (const summary of bucket.values()) {
-      registerFlow(summary, { skipPending: true });
+    pendingFlowSummaryCount = Math.max(0, pendingFlowSummaryCount - bucketSize);
+    for (const entry of bucket.values()) {
+      const summary = unwrapPendingFlowSummary(entry);
+      if (summary) {
+        registerFlow(summary, { skipPending: true });
+      }
     }
+    trimPendingFlowSummaries();
   }
 
   function refreshFlowEntryLabels() {
@@ -4637,20 +5864,23 @@ function ensureRelayGuessSuffix(label, summary) {
     const row = flowRowMap.get(info.flowId);
     if (row) {
       row.classList.add('summary-row-aprs');
+      row.classList.remove('summary-row-aprs-rejected');
       aprsHighlightedFlows.delete(info.flowId);
       if (callsign) {
-        setAprsBadge(row, callsign);
+        setAprsBadge(row, `APRS: ${callsign}`, { variant: 'success', datasetValue: callsign });
       }
     }
     const aprsRecord = buildAprsRecord(info);
     if (aprsRecord) {
       const entry = flowEntryIndex.get(info.flowId);
       if (entry) {
-        entry.aprs = aprsRecord;
+        entry.aprs = normalizeAprsRecord(aprsRecord);
         entry.status = 'aprs';
+        discardPendingAprsRecord(info.flowId);
+        trimPendingAprsRecords();
         renderFlowEntries();
       } else {
-        pendingAprsUplinks.set(info.flowId, aprsRecord);
+        rememberPendingAprsRecord(info.flowId, normalizeAprsRecord(aprsRecord));
       }
     }
   }
@@ -4695,37 +5925,55 @@ function ensureRelayGuessSuffix(label, summary) {
 
   function extractHopInfo(summary) {
     const hops = summary.hops || {};
-    const hopStart = Number(hops.start);
-    const hopLimit = Number(hops.limit);
     const label = typeof hops.label === 'string' ? hops.label.trim() : '';
+    const hopStartProvided = hops.start !== undefined && hops.start !== null;
+    const hopLimitProvided = hops.limit !== undefined && hops.limit !== null;
+    const toFiniteOrNull = (value) => {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const hopStart = hopStartProvided ? toFiniteOrNull(hops.start) : null;
+    const hopLimit = hopLimitProvided ? toFiniteOrNull(hops.limit) : null;
+    const limitOnly =
+      Boolean(hops.limitOnly) ||
+      (!hopStartProvided && hopLimitProvided && label && !label.includes('/') && !label.includes('?'));
     let used = null;
-    let total = Number.isFinite(hopStart) ? hopStart : null;
+    let total = hopStart != null ? hopStart : null;
 
-    if (Number.isFinite(hopStart) && Number.isFinite(hopLimit)) {
-      used = Math.max(hopStart - hopLimit, 0);
-    } else {
-      const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
-      if (match) {
-        used = Number(match[1]);
-        if (!Number.isFinite(total)) {
-          total = Number(match[2]);
-        }
-      } else if (/^\d+$/.test(label)) {
+    if (!limitOnly) {
+      if (hopStart != null && hopLimit != null) {
+        used = Math.max(hopStart - hopLimit, 0);
+      } else if (hopStart != null && hopLimit == null) {
         used = 0;
+      } else {
+        const match = label.match(/^(\d+)\s*\/\s*(\d+)/);
+        if (match) {
+          used = Number(match[1]);
+          if (!Number.isFinite(total)) {
+            total = Number(match[2]);
+          }
+        } else if (/^\d+$/.test(label) && hopStart === 0) {
+          used = 0;
+          total = Number.isFinite(total) ? total : 0;
+        }
       }
-    }
 
-    if (!Number.isFinite(total)) {
-      const match = label.match(/\/\s*(\d+)/);
-      if (match) {
-        total = Number(match[1]);
+      if (!Number.isFinite(total)) {
+        const match = label.match(/\/\s*(\d+)/);
+        if (match) {
+          total = Number(match[1]);
+        }
       }
+    } else {
+      used = null;
+      total = null;
     }
 
     return {
       usedHops: Number.isFinite(used) ? used : null,
       totalHops: Number.isFinite(total) ? total : null,
-      hopsLabel: label
+      hopsLabel: label,
+      limitOnly
     };
   }
 
@@ -4835,7 +6083,7 @@ function ensureRelayGuessSuffix(label, summary) {
   function handleSummaryBatch(list) {
     if (!Array.isArray(list)) return;
     for (let i = list.length - 1; i >= 0; i -= 1) {
-      appendSummary(list[i]);
+      appendSummary(list[i], { skipGuard: true });
     }
   }
 
@@ -4873,31 +6121,55 @@ function ensureRelayGuessSuffix(label, summary) {
       }
       const sourceCell = row.cells?.[1];
       if (sourceCell) {
-        sourceCell.textContent = formatSource(summary);
+        sourceCell.textContent = formatNodes(summary);
       }
-      const channelCell = row.cells?.[4];
+      const channelCell = row.cells?.[3];
       if (channelCell) {
         channelCell.textContent = formatChannel(summary.channel);
       }
-      const hopsCell = row.cells?.[5];
+      const snrCell = row.cells?.[4];
+      if (snrCell) {
+        snrCell.classList.toggle('snr-positive', typeof summary.snr === 'number' && summary.snr >= 0);
+        snrCell.classList.toggle('snr-negative', typeof summary.snr === 'number' && summary.snr < 0);
+        snrCell.textContent = formatNumber(summary.snr, 2);
+      }
+      const rssiCell = row.cells?.[5];
+      if (rssiCell) {
+        rssiCell.textContent = formatNumber(summary.rssi, 0);
+      }
+      const typeCell = row.cells?.[6];
+      if (typeCell) {
+        renderTypeCell(typeCell, summary);
+      }
+      const hopsCell = row.cells?.[7];
       if (hopsCell) {
-        hopsCell.textContent = formatHops(summary.hops);
+        const hopInfo = extractHopInfo(summary);
+        hopsCell.textContent = hopInfo.limitOnly
+          ? '無效'
+          : hopInfo.hopsLabel || formatHops(summary.hops) || '—';
       }
       const detailCell = row.cells?.[8];
       if (detailCell) {
-        detailCell.innerHTML = formatDetail(summary);
+        updateDetailCell(detailCell, summary);
         const flowId = summary.flowId;
         if (flowId) {
           const badgeCallsign = flowAprsCallsigns.get(flowId);
           if (badgeCallsign) {
-            setAprsBadge(row, badgeCallsign);
+            setAprsBadge(row, `APRS: ${badgeCallsign}`, { variant: 'success', datasetValue: badgeCallsign });
           }
         }
       }
+      applyAprsState(row, summary);
     }
   }
 
+  function resetSummaryReplayGuard() {
+    summaryReplayGuardActive = true;
+    summaryReplayGuardCutoffMs = Date.now();
+  }
+
   function connectStream() {
+    resetSummaryReplayGuard();
     const source = new EventSource('/api/events');
 
     source.onmessage = (event) => {
@@ -4932,6 +6204,9 @@ function ensureRelayGuessSuffix(label, summary) {
             break;
           case 'log-batch':
             handleLogBatch(packet.payload);
+            break;
+          case 'telemetry-summary':
+            applyTelemetrySummary(packet.payload);
             break;
           case 'telemetry-snapshot':
             applyTelemetrySnapshot(packet.payload);
@@ -4974,6 +6249,7 @@ function ensureRelayGuessSuffix(label, summary) {
     };
   }
 
+  setTelemetryRangeMode(telemetryRangeMode, { skipRender: true });
   renderNodeDatabase();
   connectStream();
 })();
