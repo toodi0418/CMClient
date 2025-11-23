@@ -446,7 +446,18 @@ AUTO_UPDATE_POLL_SECONDS=300            # 多少秒檢查一次遠端更新
   並確認宿主機已授權 Docker 存取該裝置（Linux 可能需要將使用者加入 `dialout`）。
 - **CallMesh / TenManMap**：容器會將 artifacts 寫入 volume `/data/callmesh`，可把 `callmesh-data` 綁到實體資料夾以便備份或跨版本沿用，確保 Key/Mapping/遙測都能持續。
 
-#### 開機自動啟動（systemd）
+#### Docker 自動啟動
+
+容器本身在 `docker-compose.yml` 內已設定 `restart: unless-stopped`，只要 Docker daemon 在開機時啟動，就會自動還原 TMAG 服務。常見做法：
+
+1. 確認 Docker 服務開機自啟：  
+   ```bash
+   sudo systemctl enable --now docker
+   ```
+   （或依系統使用 `service docker start`）
+2. 開機後若 Docker daemon 先啟動，compose 也會自動復原上一個狀態；若需要更明確的控制（例如先載入 `.env`、跑 `docker compose up -d`）可加上 systemd unit，下方提供範例。
+
+##### systemd unit 範例
 
 1. 複製範例 unit 檔並依實際路徑調整 `WorkingDirectory=`（需指向含 `docker-compose.yml` 的資料夾）：  
    ```bash
