@@ -4823,13 +4823,14 @@ function ensureRelayGuessSuffix(label, summary) {
       badge.className = 'aprs-badge';
       infoCell.appendChild(badge);
     }
+    if (datasetValue) {
+      row.dataset.aprsCallsign = datasetValue;
+    } else if (variant !== 'success') {
+      delete row.dataset.aprsCallsign;
+    }
     if (variant === 'success') {
-      if (datasetValue) {
-        row.dataset.aprsCallsign = datasetValue;
-      }
       badge.classList.remove('aprs-badge-rejected');
     } else {
-      delete row.dataset.aprsCallsign;
       badge.classList.add('aprs-badge-rejected');
     }
     badge.textContent = text;
@@ -4851,6 +4852,36 @@ function ensureRelayGuessSuffix(label, summary) {
       default:
         return '不符合 APRS 上傳條件';
     }
+  }
+
+  function deriveSummaryAprsCallsign(summary) {
+    if (!summary) return null;
+    const candidateValues = [
+      summary.aprsCallsign,
+      summary.aprs_callsign,
+      summary.mappingCallsign,
+      summary.mapping_callsign,
+      summary.callsign
+    ];
+    for (const value of candidateValues) {
+      const normalized = normalizeProvisionCallsignString(value);
+      if (normalized) {
+        return normalized;
+      }
+    }
+    const meshId =
+      normalizeMeshId(summary?.from?.meshId || summary?.from?.meshIdNormalized) ||
+      normalizeMeshId(summary?.meshId || summary?.meshIdNormalized);
+    if (meshId) {
+      const mapping = findMappingByMeshId(meshId);
+      if (mapping) {
+        const mappingCallsign = formatMappingCallsign(mapping);
+        if (mappingCallsign) {
+          return mappingCallsign;
+        }
+      }
+    }
+    return null;
   }
 
   function deriveFlowPendingReason(summary) {
@@ -4898,9 +4929,13 @@ function ensureRelayGuessSuffix(label, summary) {
     if (!row || !summary) return;
     if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) {
       const label = formatAprsRejectedBadge(summary);
+      const aprsCallsign = deriveSummaryAprsCallsign(summary);
+      const badgeText = aprsCallsign
+        ? `APRS: ${aprsCallsign}${label ? `（${label}）` : ''}`
+        : `APRS 拒絕：${label}`;
       row.classList.remove('summary-row-aprs');
       row.classList.add('summary-row-aprs-rejected');
-      setAprsBadge(row, `APRS 拒絕：${label}`, { variant: 'rejected' });
+      setAprsBadge(row, badgeText, { variant: 'rejected', datasetValue: aprsCallsign });
     }
   }
 
