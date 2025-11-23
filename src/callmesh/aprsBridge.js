@@ -2874,12 +2874,6 @@ class CallMeshAprsBridge extends EventEmitter {
 
     if (!this.aprsClient) {
       const logForwarder = (tag, message) => {
-        if (tag === 'APRS') {
-          const text = String(message || '');
-          if (/^rx\s+#\s*aprsc\b/i.test(text)) {
-            return;
-          }
-        }
         this.emitLog(tag, message);
       };
       this.aprsClient = new APRSClient({
