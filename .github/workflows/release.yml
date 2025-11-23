@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 env:
-  NODE_VERSION: 20
+  NODE_VERSION: 22
 
 jobs:
   create-release:
@@ -124,6 +124,11 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm,arm64
+
       - name: Install dependencies
         run: npm ci
 
@@ -141,7 +146,7 @@ jobs:
           mkdir -p dist/cli
           npx pkg src/index.js \
             --config package.json \
-            --targets node18-linux-x64 \
+            --targets node22-linux-x64 \
             --compress Brotli \
             --public \
             --output dist/cli/tmag-cli-linux-x64
@@ -151,7 +156,7 @@ jobs:
           mkdir -p dist/cli
           npx pkg src/index.js \
             --config package.json \
-            --targets node18-linux-arm64 \
+            --targets node22-linux-arm64 \
             --compress Brotli \
             --public \
             --output dist/cli/tmag-cli-linux-arm64
@@ -159,12 +164,19 @@ jobs:
       - name: Build Linux CLI (armv7)
         run: |
           mkdir -p dist/cli
-          npx pkg src/index.js \
-            --config package.json \
-            --targets node18-linux-armv7 \
-            --compress Brotli \
-            --public \
-            --output dist/cli/tmag-cli-linux-armv7
+          docker run --rm --platform linux/arm/v7 \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            node:22-bookworm bash -lc "\
+              set -euo pipefail && \
+              apt-get update >/dev/null && \
+              apt-get install -y --no-install-recommends python3 build-essential zip >/dev/null && \
+              npm ci && \
+              npx pkg src/index.js --config package.json --targets node22-linux-armv7 --compress Brotli --public --output dist/cli/tmag-cli-linux-armv7 && \
+              VERSION=\$(node -p \"require('./package.json').version\") && \
+              cd dist/cli && zip -9 \"tmag-cli-linux-armv7-v\${VERSION}.zip\" tmag-cli-linux-armv7 \
+            "
+          sudo chown -R $USER:$USER dist/cli
 
       - name: Determine version
         id: linux_version
@@ -234,7 +246,7 @@ jobs:
           if (-not (Test-Path dist\cli)) { New-Item -ItemType Directory -Path dist\cli | Out-Null }
           npx pkg src/index.js `
             --config package.json `
-            --targets node18-win-x64 `
+            --targets node22-win-x64 `
             --compress Brotli `
             --public `
             --output dist/cli/tmag-cli-win-x64.exe

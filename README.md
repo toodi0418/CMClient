@@ -346,6 +346,7 @@ npx pkg src/index.js \
 ```
 或針對 64 位元 Pi OS 使用 `--targets node22-linux-arm64`。  
 （從 v0.2.26 起，GitHub Release 會附上預編譯的 `tmag-cli-linux-armv7`，可直接下載使用；若需客製修改才需自行編譯。）
+官方提供的 CLI 執行檔（macOS / Windows / Linux x64 / Linux arm64 / Linux armv7）一律以 Node.js 22 打包，請確保目標環境允許執行對應的靜態 binary。
 
 ### Docker 佈署
 
