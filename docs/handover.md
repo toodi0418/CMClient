@@ -429,6 +429,7 @@ node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 - 若懷疑 APRS feed 沒回傳資料，可先查看 `/debug` → `aprsDedup.packetCache` 是否有任何條目，再檢查 `aprsDedup.aprsState.connected/loginVerified`、或查看 Log 分頁的 `[APRS] rx ...` 訊息（已解除靜音，會完整顯示 server 回傳內容）。
 - `TMAG_APRS_FEED_FILTER` 可覆寫預設範圍；若未設定，會依 CallMesh 下發的座標自動套用 `#filter r/<lat>/<lon>/300`（半徑 300 km）。若需要自訂，請直接填入完整 `#filter ...` 指令（或輸入 `none` 讓伺服器回到預設 m/2），調整後重啟流程並透過 `/debug` → `aprsDedup.packetCache` 驗證是否收到新呼號。
 - APRS Log 預設靜音（不再顯示大量 `rx/tx/keepalive` 行）。若需回復原本的詳細輸出，請設定 `TMAG_APRS_LOG_VERBOSE=1` 後重啟。
+- APRS 去重快取僅存在於記憶體：`packetCache` / `callsignSummary` 每 30 分鐘自動清除一次，`localTxHistory` 與 `lastPositionDigest` 則以 30 秒為窗口防止重複上傳。重啟程式或手動清除節點資料庫都會同時把這些快取清空，需要透過 `/debug` 即時檢視。
 
 ### 6.5 訊息頻道
 
