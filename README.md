@@ -350,7 +350,7 @@ npx pkg src/index.js \
 
 ### Docker 佈署
 
-GitHub Actions 會自動執行 **Build & Publish Docker Image** workflow，並把映像推送到 GitHub Container Registry（GHCR）。本專案的映像位置是 `ghcr.io/toodi0418/cmclient:<tag>`（例如 `ghcr.io/toodi0418/cmclient:latest`），現已提供 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 三種架構。常見流程如下：
+GitHub Actions 會自動執行 **Build & Publish Docker Image** workflow，並把映像推送到 GitHub Container Registry（GHCR）。本專案的映像位置是 `ghcr.io/toodi0418/cmclient:<tag>`（例如 `ghcr.io/toodi0418/cmclient:latest`），現已提供 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 三種架構；基底映像為 `node:22-bookworm-slim`，容器內預設即為 Node.js 22。常見流程如下：
 
 1. **取得映像**
    - 從 GHCR 下載：  

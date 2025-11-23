@@ -351,6 +351,7 @@ CMClient/
 | `CALLMESH_API_KEY`           | CallMesh 驗證用。未設定時 CLI/GUI/WEB 一律鎖定                   |
 | `CALLMESH_ARTIFACTS_DIR`     | CLI 模式下的 CallMesh artifacts 目錄 (`~/.config/callmesh/`)       |
 | `CALLMESH_VERIFICATION_FILE` | CLI 驗證快取檔；未指定時預設 `~/.config/callmesh/monitor.json`     |
+| `NODE_VERSION`               | 開發/CI/Docker 一律採 Node.js 22（Docker 映像基底亦為 `node:22-bookworm-slim`） |
 | `TMAG_WEB_HOST` / `PORT`     | Web Dashboard 服務位置，預設 `0.0.0.0:7080`；預設連接埠被占用會自動往上尋找可用 Port 並在 log 顯示實際位址 |
 | `TMAG_WEB_DASHBOARD`         | 設為 `0` 可禁用 Web Dashboard（不啟動 HTTP/SSE）                 |
 | `TMAG_ALLOW_RADIO_NODE_METADATA` | 設為 `1` 可允許 NodeInfo/MyInfo 從電台帶入暱稱與硬體資訊；預設不啟用，僅保留節點資料庫內的名稱 |
