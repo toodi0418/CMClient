@@ -355,6 +355,12 @@ CMClient/
 | `TMAG_WEB_DASHBOARD`         | 設為 `0` 可禁用 Web Dashboard（不啟動 HTTP/SSE）                 |
 | `TMAG_ALLOW_RADIO_NODE_METADATA` | 設為 `1` 可允許 NodeInfo/MyInfo 從電台帶入暱稱與硬體資訊；預設不啟用，僅保留節點資料庫內的名稱 |
 | `MESHTASTIC_HOST` / `PORT`   | 若未提供 CLI 參數，Electron 設定頁或 CLI Flag 需手動輸入           |
+| `AUTO_UPDATE` | Docker 佈署預設 `1`，entrypoint 會同步 repo 並在背景輪詢更新（支援 main/dev）；設 `0` 則改用映像內建版本 |
+| `AUTO_UPDATE_REPO` | 自動更新所使用的 Git repository URL，預設 `https://github.com/toodi0418/CMClient.git` |
+| `AUTO_UPDATE_BRANCH` | 自動更新追蹤分支，可填 `main`（預設）或 `dev`，其他值會回退 `main` |
+| `AUTO_UPDATE_WORKDIR` | 自動更新的工作目錄，預設 `/data/callmesh/app-src`（與 artifacts 共享 volume 以保留 clone 與依賴） |
+| `AUTO_UPDATE_REMOTE` | git remote 名稱，預設 `origin`，多 remote 情境可改為其他名稱 |
+| `AUTO_UPDATE_POLL_SECONDS` | 背景檢查遠端更新的秒數，預設 300；過小可能造成頻繁 `git fetch` 與重啟 |
 
 Electron 會將 CallMesh 驗證資訊與 artifacts 存於 `~/Library/Application Support/<app>/callmesh/`（macOS），Windows/Linux 對應 OS 預設資料夾；訊息紀錄、節點快照、Mapping/Provision 等資料集中存放於 `callmesh-data.sqlite`（每頻道預設最多保留 200 筆），舊版 `message-log.jsonl` 會於啟動時自動匯入並刪除。
 

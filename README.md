@@ -348,12 +348,12 @@ npx pkg src/index.js \
 
 ### Docker 佈署
 
-GitHub Actions 會自動執行 **Build & Publish Docker Image** workflow，並把映像推送到 GitHub Container Registry（GHCR）。預設路徑為 `ghcr.io/<OWNER>/<REPO>:<tag>`，實際名稱等於 GitHub 倉庫的 `owner/repo`，例如 `ghcr.io/toodi0418/cmclient:latest`。常見流程如下：
+GitHub Actions 會自動執行 **Build & Publish Docker Image** workflow，並把映像推送到 GitHub Container Registry（GHCR）。本專案的映像位置是 `ghcr.io/toodi0418/cmclient:<tag>`（例如 `ghcr.io/toodi0418/cmclient:latest`）。常見流程如下：
 
 1. **取得映像**
    - 從 GHCR 下載：  
      ```bash
-     docker pull ghcr.io/<OWNER>/<REPO>:latest
+     docker pull ghcr.io/toodi0418/cmclient:latest
      ```
    - 或在原始碼目錄自行建置：  
      ```bash
@@ -395,6 +395,68 @@ GitHub Actions 會自動執行 **Build & Publish Docker Image** workflow，並�
    - 若想把資料存進共享資料夾，可將 compose 內的 volume 改為 `./data:/data/callmesh`，確保資料夾具有讀寫權限。
    - Serial 連線需要在 Container Manager → 編輯容器 → 裝置中勾選 `/dev/ttyUSB*`，同時於 compose 增加 `devices`。
    - 開放 Web Dashboard 時，務必在 DSM 防火牆放行 `TMAG_WEB_PORT`（預設 7080）。
+
+#### `.env` 範本與環境變數
+
+```env
+CALLMESH_API_KEY=cm_xxxxx               # CallMesh 發放的 API Key，沒有就會一直卡在 locked
+MESHTASTIC_HOST=meshtastic.local        # 目標 Meshtastic TCP host，可填 IP 或 mDNS 名稱
+MESHTASTIC_PORT=4403                    # Meshtastic TCP 監聽 port，預設 4403
+TMAG_WEB_PORT=7080                      # Web Dashboard 映射到主機的 port
+TMAG_WEB_DASHBOARD=1                    # 設為 0 可完全關閉 Web Dashboard
+TENMAN_DISABLE=0                        # 1=停用 TenManMap 上傳
+AUTO_UPDATE=1                           # 1=啟動時自動 git pull 指定分支（main/dev）
+AUTO_UPDATE_BRANCH=main                 # main（預設）或 dev，其他值會回退 main
+AUTO_UPDATE_WORKDIR=/data/callmesh/app-src
+AUTO_UPDATE_REPO=https://github.com/toodi0418/CMClient.git
+AUTO_UPDATE_POLL_SECONDS=300            # 多少秒檢查一次遠端更新
+```
+
+- `.env` 會被 `docker-compose.yml` 自動讀取；如果部署在會commit 的環境，建議以 `cp .env .env.local` 再編輯以免誤傳敏感資訊。
+- `CALLMESH_API_KEY` 必填；`MESHTASTIC_HOST/PORT` 需能被容器解析與連線，若 Meshtastic 裝置在同一主機可直接填 `host.docker.internal` 或本機 IP。
+- 修改 `.env` 內容後重新套用 `docker compose up -d`.
+
+#### 常見操作流程
+
+1. **建置/更新映像**：在 repo 根目錄執行 `docker compose build`（或 `docker compose pull` 直接拉 GHCR 版本）。
+2. **啟動服務**：`docker compose up -d --build`（會依 `AUTO_UPDATE` 決定是否在 entrypoint 重新 git pull）。
+3. **查看狀態/日誌**：`docker compose logs -f callmesh-client`，確認 CallMesh 驗證、Meshtastic 連線與 APRS 流程是否正常。
+4. **重啟或變更設定**：更新 `.env` → `docker compose up -d`；如需乾淨重建可先 `docker compose down` 再 `up -d`.
+5. **除錯**：`docker exec -it callmesh-client /bin/bash` 進入容器，可檢查 `/data/callmesh` 內的 artifacts 或執行 `npm start -- --help`。
+
+#### 連線方式
+
+- **Web Dashboard**：啟動後在瀏覽器輸入 `http://<部署主機IP>:<TMAG_WEB_PORT>`（預設 7080），首次載入會要求 CallMesh API Key 通過驗證後才顯示資料。
+- **Meshtastic TCP**：容器會依 `.env` 的 `MESHTASTIC_HOST/PORT` 直接連線，請確保該 host/port 對 Docker network 可達；若目標在同一臺主機，可填 `host.docker.internal` 或實際 IP。
+- **Meshtastic Serial**：在 `docker-compose.yml` 的 service 內加入
+  ```yaml
+  devices:
+    - /dev/ttyUSB0:/dev/ttyUSB0
+  command:
+    - npm
+    - start
+    - --
+    - --connection
+    - serial
+    - --serial-path
+    - /dev/ttyUSB0
+    - --serial-baud
+    - "115200"
+  ```
+  並確認宿主機已授權 Docker 存取該裝置（Linux 可能需要將使用者加入 `dialout`）。
+- **CallMesh / TenManMap**：容器會將 artifacts 寫入 volume `/data/callmesh`，可把 `callmesh-data` 綁到實體資料夾以便備份或跨版本沿用，確保 Key/Mapping/遙測都能持續。
+
+### Docker 自動更新（main / dev）
+
+- `docker-entrypoint.sh` 會先把指定分支同步到 `/data/callmesh/app-src`，執行 `npm ci --omit=dev` 後啟動程式，並持續以 `AUTO_UPDATE_POLL_SECONDS`（預設 300 秒）輪詢遠端。偵測到 `main` / `dev` 有新 commit 時，會優雅地停止目前的 `npm start`、重新 `git pull + npm ci`，再自動重啟服務，整個流程不需重建容器。
+- 預設 `AUTO_UPDATE=1`、`AUTO_UPDATE_BRANCH=main`。若希望跟進開發版可把 `.env` 設成 `AUTO_UPDATE_BRANCH=dev`；若要完全依賴發佈映像，則把 `AUTO_UPDATE=0`，entrypoint 會直接執行 `/app` 內的打包版本。
+- 相關環境變數：
+  - `AUTO_UPDATE_REPO`：Git repository URL（需可匿名讀取），預設 `https://github.com/toodi0418/CMClient.git`。
+  - `AUTO_UPDATE_BRANCH`：同步分支（僅接受 `main` 或 `dev`，其餘值會回退 `main`）。
+  - `AUTO_UPDATE_WORKDIR`：同步與安裝依賴的目錄，預設 `/data/callmesh/app-src`，與 artifacts 共用 volume 以節省重複下載。
+  - `AUTO_UPDATE_REMOTE`：git remote 名稱，預設 `origin`。
+  - `AUTO_UPDATE_POLL_SECONDS`：背景輪詢間隔秒數，調越小更新越即時但 `git fetch` 會更頻繁。
+- 當環境無法連網或使用私有 repo 時，可把 `AUTO_UPDATE=0` 並手動執行 `docker pull` / `docker compose up -d --build` 來更新。
 
 ---
 
