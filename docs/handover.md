@@ -604,7 +604,29 @@ CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
 3. 若需手動觸發（例如補傳舊 tag），可在 Actions → **Build & Publish Release** 使用 `Run workflow`，輸入 `release_tag`（例如 `v0.2.18`）；必要時可使用 `gh workflow run "Build & Publish Release" --ref main -f release_tag=v0.2.18`。
 4. 若要額外附檔或修改說明，再使用 `gh release edit` 或 GitHub UI 調整即可。
 
-### 8.2 本地打包
+### 8.2 Release 說明（v0.2.25 vs v0.2.22）
+
+**重點新增**
+- 遙測與訊息儲存全面改為 SQLite 正規化 schema，啟動時以非阻塞方式載入快照，支援串流查詢、CSV 匯出與時段快捷範圍；過去 JSONL 會自動匯入並顯示進度。
+- 節點資料庫與 CLI 旗標升級：新增 `--clear-nodedb`、`--summary-log` 等開關，僅允許 snapshot 建立節點並忽略 invalid relay/hop limit 封包，UI 會在缺資料時改顯示 Mesh ID。
+- APRS / TenManMap 管線強化：自動化 feed filter、dedup window、呼號/拒絕原因顯示、`/debug` snapshot、TenMan inbound 篩選等功能，並可依需求靜音或開啟詳細 log。
+- Docker 版新增 `docker-entrypoint.sh` 自動更新迴圈，可在背景輪詢 `main`/`dev`（預設 300 秒）偵測新 commit 後自動 `git pull + npm ci + restart`，同時 README/.env 補齊部署與連線指引。
+- 提供 `systemd/callmesh-client.service.example`，依據實際路徑修改後即可讓主機開機時自動執行 `docker compose up -d`。
+
+**修正與調整**
+- Web Dashboard 與 GUI 的 summary/telemetry 呈現完全同步：補齊來源/目的 Mesh ID、hop invalid 判定與節點名稱 fallback。
+- Node/relay 事件增加多層防護（placeholder Mesh ID、limit-only hop、TenMan inbound 一律忽略），並在 `/debug` 揭露資料來源。
+- APRS 呼號遺失、pending 狀態與拒絕後呼號重設等問題全數修正，CLI summary log 也統一使用收包時戳，避免時間桶計算漂移。
+- Telemetry CSV/查詢改採串流輸出，長時間視窗不再造成 UI 卡頓；TenManMap 互動亦加入節流、reply id、relay 說明等補強。
+
+**注意事項**
+1. 需要 Node 22（`package.json` 已限制，CI 與 pkg 亦改用 node22）。
+2. 首次啟動會將 `telemetry-records.jsonl`、舊訊息表等資料匯入 SQLite，過程請勿強制結束並確保 `CALLMESH_ARTIFACTS_DIR` 有足夠磁碟空間。
+3. Docker `.env` 預設 `AUTO_UPDATE=1`、`AUTO_UPDATE_POLL_SECONDS=300`，偵測到新 commit 會自動重啟；若環境無法連網或要鎖定映像，務必改設 `AUTO_UPDATE=0`。
+4. 套用 systemd 範例時需將 `WorkingDirectory` 改成實際專案路徑並 `sudo systemctl daemon-reload && sudo systemctl enable --now callmesh-client`。
+5. APRS feed filter 現由程式自動設定，如需自訂範圍請透過環境變數覆寫並搭配 `/debug` 驗證；TenMan inbound 預設被忽略，若要放行需調整 Bridge 設定。
+
+### 8.3 本地打包
 
 僅作備援（仍以 Actions 產物為主）：
 
