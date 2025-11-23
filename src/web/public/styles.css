@@ -883,6 +883,13 @@ tbody tr:hover {
   color: #facc15;
 }
 
+.flow-item-status .flow-status-hint-btn {
+  width: 20px;
+  height: 20px;
+  margin-left: 8px;
+  font-size: 0.7rem;
+}
+
 .flow-item-path {
   font-size: 0.95rem;
   color: #cbd5f5;

@@ -1422,6 +1422,13 @@ header {
   color: #fed7aa;
 }
 
+.flow-item-status .flow-status-hint-btn {
+  width: 20px;
+  height: 20px;
+  margin-left: 8px;
+  font-size: 0.7rem;
+}
+
 .flow-item-path,
 .flow-item-detail,
 .flow-item-comment {

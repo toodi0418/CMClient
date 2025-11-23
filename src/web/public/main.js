@@ -4853,6 +4853,47 @@ function ensureRelayGuessSuffix(label, summary) {
     }
   }
 
+  function deriveFlowPendingReason(summary) {
+    if (!summary) return null;
+    if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) {
+      return formatAprsRejectedBadge(summary);
+    }
+    const extras = Array.isArray(summary.extraLines) ? summary.extraLines : [];
+    for (const line of extras) {
+      if (typeof line !== 'string') continue;
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (/^APRS /.test(trimmed) || trimmed.includes('APRS')) {
+        return trimmed.replace(/^APRS 略過：?/, '').trim() || trimmed;
+      }
+    }
+    return null;
+  }
+
+  function collectFlowPendingDetails(summary) {
+    if (!summary) return [];
+    const extras = Array.isArray(summary.extraLines) ? summary.extraLines : [];
+    return extras.filter((line) => typeof line === 'string' && line.trim()).slice(0, 5);
+  }
+
+  function showFlowPendingReason(entry) {
+    if (!entry?.pendingReason) return;
+    const lines = [entry.pendingReason];
+    const context = entry.pendingReasonContext;
+    if (context && Number.isFinite(context.remainingMs)) {
+      const seconds = Math.max(1, Math.ceil(context.remainingMs / 1000));
+      lines.push(`冷卻剩餘：約 ${seconds} 秒`);
+    }
+    if (Array.isArray(entry.pendingReasonDetails)) {
+      entry.pendingReasonDetails.forEach((line) => {
+        if (line && !lines.includes(line)) {
+          lines.push(line);
+        }
+      });
+    }
+    window.alert(lines.filter(Boolean).join('\n'));
+  }
+
   function applyAprsState(row, summary) {
     if (!row || !summary) return;
     if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) {
@@ -5222,6 +5263,15 @@ function ensureRelayGuessSuffix(label, summary) {
       entry.comment = extras.join('\n');
     }
 
+    const pendingReason = deriveFlowPendingReason(summary);
+    if (pendingReason) {
+      entry.pendingReason = pendingReason;
+      entry.pendingReasonDetails = collectFlowPendingDetails(summary);
+      if (summary.aprsRejectedContext) {
+        entry.pendingReasonContext = summary.aprsRejectedContext;
+      }
+    }
+
     return entry;
   }
 
@@ -5265,6 +5315,18 @@ function ensureRelayGuessSuffix(label, summary) {
     entry.altitude = resolveAltitudeMeters(position);
     entry.speedKph = computeSpeedKph(position);
     entry.satsInView = Number.isFinite(position.satsInView) ? Number(position.satsInView) : entry.satsInView;
+    const pendingReason = deriveFlowPendingReason(summary);
+    if (pendingReason) {
+      entry.pendingReason = pendingReason;
+      entry.pendingReasonDetails = collectFlowPendingDetails(summary);
+      if (summary.aprsRejectedContext) {
+        entry.pendingReasonContext = summary.aprsRejectedContext;
+      }
+    } else if (!entry.aprs) {
+      delete entry.pendingReason;
+      delete entry.pendingReasonDetails;
+      delete entry.pendingReasonContext;
+    }
 
     const mapping = findMappingByMeshId(entry.meshId);
     if (mapping) {
@@ -5362,6 +5424,19 @@ function ensureRelayGuessSuffix(label, summary) {
     const status = document.createElement('span');
     status.className = `flow-item-status ${entry.aprs ? 'flow-item-status--aprs' : 'flow-item-status--pending'}`;
     status.textContent = entry.aprs ? '已上傳 APRS' : '待上傳';
+    if (!entry.aprs && entry.pendingReason) {
+      const hintBtn = document.createElement('button');
+      hintBtn.type = 'button';
+      hintBtn.className = 'relay-hint-btn flow-status-hint-btn';
+      hintBtn.textContent = '?';
+      hintBtn.title = entry.pendingReason;
+      hintBtn.setAttribute('aria-label', '顯示待上傳原因');
+      hintBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        showFlowPendingReason(entry);
+      });
+      status.appendChild(hintBtn);
+    }
 
     header.append(title, status);
     item.appendChild(header);

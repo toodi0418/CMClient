@@ -537,6 +537,68 @@ function ensureRelayGuessSuffix(label, summary) {
   return value;
 }
 
+function formatAprsRejectedLabel(summary) {
+  if (!summary) return null;
+  const explicitLabel =
+    typeof summary.aprsRejectedLabel === 'string' ? summary.aprsRejectedLabel.trim() : '';
+  if (explicitLabel) {
+    return explicitLabel;
+  }
+  const reason = String(summary.aprsRejectedReason || '').toLowerCase();
+  switch (reason) {
+    case 'local-repeat':
+      return '本機冷卻時間內已上傳';
+    case 'seen-on-feed':
+      return 'APRS-IS 已有相同封包';
+    case 'recent-activity':
+      return '呼號冷卻中';
+    default:
+      return summary.aprsRejected ? '不符合 APRS 上傳條件' : null;
+  }
+}
+
+function derivePendingAprsReason(summary) {
+  if (!summary) return null;
+  if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) {
+    const label = formatAprsRejectedLabel(summary);
+    if (label) return label;
+  }
+  const extras = Array.isArray(summary.extraLines) ? summary.extraLines : [];
+  for (const line of extras) {
+    if (typeof line !== 'string') continue;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (/^APRS /.test(trimmed) || trimmed.includes('APRS')) {
+      return trimmed.replace(/^APRS 略過：?/, '').trim() || trimmed;
+    }
+  }
+  return null;
+}
+
+function collectPendingReasonDetails(summary) {
+  if (!summary) return [];
+  const lines = Array.isArray(summary.extraLines) ? summary.extraLines : [];
+  return lines.filter((line) => typeof line === 'string' && line.trim()).slice(0, 5);
+}
+
+function showPendingAprsReason(entry) {
+  if (!entry?.pendingReason) return;
+  const lines = [entry.pendingReason];
+  const { pendingReasonContext: context } = entry;
+  if (context && Number.isFinite(context.remainingMs)) {
+    const seconds = Math.max(1, Math.ceil(context.remainingMs / 1000));
+    lines.push(`冷卻剩餘：約 ${seconds} 秒`);
+  }
+  if (Array.isArray(entry.pendingReasonDetails)) {
+    entry.pendingReasonDetails.forEach((line) => {
+      if (line && !lines.includes(line)) {
+        lines.push(line);
+      }
+    });
+  }
+  window.alert(lines.filter(Boolean).join('\n'));
+}
+
 function formatRelayLabel(relay) {
   if (!relay) return '';
   const meshId =
@@ -3257,6 +3319,17 @@ function registerPacketFlow(summary, { skipPending = false } = {}) {
     aprs: null
   };
 
+  if (!summary.aprs) {
+    const pendingReason = derivePendingAprsReason(summary);
+    if (pendingReason) {
+      entry.pendingReason = pendingReason;
+      entry.pendingReasonDetails = collectPendingReasonDetails(summary);
+      if (summary.aprsRejectedContext) {
+        entry.pendingReasonContext = summary.aprsRejectedContext;
+      }
+    }
+  }
+
   const pendingAprs = pendingAprsUplinks.get(flowId);
   if (pendingAprs) {
     entry.aprs = pendingAprs;
@@ -3366,6 +3439,19 @@ function renderFlowEntries() {
     const statusEl = document.createElement('div');
     statusEl.className = `flow-item-status ${entry.aprs ? 'flow-item-status--uploaded' : 'flow-item-status--pending'}`;
     statusEl.textContent = entry.aprs ? '已上傳 APRS' : '待上傳';
+    if (!entry.aprs && entry.pendingReason) {
+      const hintBtn = document.createElement('button');
+      hintBtn.type = 'button';
+      hintBtn.className = 'relay-hint-btn flow-status-hint-btn';
+      hintBtn.textContent = '?';
+      hintBtn.title = entry.pendingReason;
+      hintBtn.setAttribute('aria-label', '顯示待上傳原因');
+      hintBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        showPendingAprsReason(entry);
+      });
+      statusEl.appendChild(hintBtn);
+    }
     header.appendChild(statusEl);
     item.appendChild(header);
 
