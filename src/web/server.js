@@ -154,6 +154,8 @@ class WebDashboardServer {
       options && typeof options.relayStatsStore === 'object' ? options.relayStatsStore : null;
     this.messageLogStore =
       options && typeof options.messageLogStore === 'object' ? options.messageLogStore : null;
+    this.aprsDebugProvider =
+      typeof options.aprsDebugProvider === 'function' ? options.aprsDebugProvider : null;
 
     this.server = null;
     this.clients = new Set();
@@ -583,8 +585,9 @@ class WebDashboardServer {
       res.end(JSON.stringify({ error: 'Method Not Allowed', allowed: ['GET'] }));
       return;
     }
-    this._readRelayStats()
-      .then(({ stats, source, details, message }) => {
+    Promise.all([this._readRelayStats(), this._collectAprsDebugSnapshot()])
+      .then(([relayInfo, aprsDebug]) => {
+        const { stats, source, details, message } = relayInfo;
         const payload = {
           relayLinkStats: stats,
           relayLinkSource: source || undefined,
@@ -595,6 +598,7 @@ class WebDashboardServer {
             this.nodeSnapshotMeta?.details && Object.keys(this.nodeSnapshotMeta.details).length
               ? this.nodeSnapshotMeta.details
               : undefined,
+          aprsDedup: aprsDebug || undefined,
           message: message || undefined,
           generatedAt: new Date().toISOString()
         };
@@ -637,6 +641,23 @@ class WebDashboardServer {
       result.restored = restoredCount;
     }
     return result;
+  }
+
+  async _collectAprsDebugSnapshot() {
+    if (!this.aprsDebugProvider) {
+      return null;
+    }
+    try {
+      const snapshot = await Promise.resolve(this.aprsDebugProvider());
+      if (snapshot && typeof snapshot === 'object') {
+        return snapshot;
+      }
+      return snapshot ?? null;
+    } catch (err) {
+      return {
+        error: err?.message || 'failed to collect APRS debug snapshot'
+      };
+    }
   }
 
   async _readRelayStats() {

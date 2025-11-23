@@ -750,7 +750,8 @@ async function startWebDashboard() {
         relayStatsStore: bridge?.getDataStore?.(),
         messageLogPath: getMessageLogPath(),
         messageLogStore: bridge?.getDataStore?.(),
-        telemetryProvider: bridge
+        telemetryProvider: bridge,
+        aprsDebugProvider: () => bridge.getAprsDebugSnapshot()
       };
       const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
       if (telemetryMaxTotalOverride) {

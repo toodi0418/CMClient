@@ -532,7 +532,8 @@ async function startMonitor(argv) {
         relayStatsStore: sharedDataStore,
         messageLogPath: getMessageLogPath(),
         messageLogStore: sharedDataStore,
-        telemetryProvider: bridge
+        telemetryProvider: bridge,
+        aprsDebugProvider: () => bridge.getAprsDebugSnapshot()
       };
       const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
       if (telemetryMaxTotalOverride) {

@@ -3714,6 +3714,80 @@ class CallMeshAprsBridge extends EventEmitter {
     }
   }
 
+  getAprsDebugSnapshot() {
+    const now = Date.now();
+    const buildPacketEntry = (key, timestamp) => {
+      const { callsign, infoString } = splitAprsPacketKey(key);
+      return {
+        callsign,
+        infoString,
+        lastSeenMs: Number.isFinite(timestamp) ? timestamp : null,
+        lastSeenIso: Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null
+      };
+    };
+    const packetCache = Array.from(this.aprsPacketCache.entries()).map(([key, ts]) =>
+      buildPacketEntry(key, ts)
+    );
+    packetCache.sort((a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0));
+
+    const localTxHistory = Array.from(this.aprsLocalTxHistory.entries()).map(([key, ts]) =>
+      buildPacketEntry(key, ts)
+    );
+    localTxHistory.sort((a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0));
+
+    const callsignSummary = Array.from(this.aprsCallsignSummary.entries()).map(
+      ([callsign, summary]) => ({
+        callsign,
+        lastSeenMs: Number.isFinite(summary?.lastSeen) ? summary.lastSeen : null,
+        lastSeenIso: Number.isFinite(summary?.lastSeen)
+          ? new Date(summary.lastSeen).toISOString()
+          : null,
+        lastInfo: summary?.lastInfo || null
+      })
+    );
+    callsignSummary.sort((a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0));
+
+    const lastPositionDigest = Array.from(this.aprsLastPositionDigest.entries()).map(
+      ([meshId, entry]) => ({
+        meshId,
+        digest: entry?.digest || null,
+        timestampMs: Number.isFinite(entry?.timestamp) ? entry.timestamp : null,
+        timestampIso: Number.isFinite(entry?.timestamp)
+          ? new Date(entry.timestamp).toISOString()
+          : null,
+        ageMs: Number.isFinite(entry?.timestamp) ? now - entry.timestamp : null
+      })
+    );
+    lastPositionDigest.sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0));
+
+    return {
+      generatedAt: new Date(now).toISOString(),
+      aprsState: {
+        callsign: this.aprsState.callsign,
+        callsignBase: this.aprsState.callsignBase,
+        ssid: this.aprsState.ssid,
+        server: this.aprsState.server,
+        connected: Boolean(this.aprsClient?.connected),
+        loginVerified: Boolean(this.aprsLoginVerified),
+        lastBeaconAt: this.aprsLastBeaconAt || null,
+        lastTelemetryAt: this.aprsLastTelemetryAt || null
+      },
+      allowedCallsigns: Array.from(this.aprsAllowedCallsigns).sort(),
+      skippedMeshIds: Array.from(this.aprsSkippedMeshIds).sort(),
+      mappingIndexSize: this.mappingIndexByMeshId.size,
+      packetCache,
+      localTxHistory,
+      callsignSummary,
+      lastPositionDigest,
+      stats: {
+        packetCacheSize: this.aprsPacketCache.size,
+        localTxHistorySize: this.aprsLocalTxHistory.size,
+        callsignSummarySize: this.aprsCallsignSummary.size,
+        lastPositionDigestSize: this.aprsLastPositionDigest.size
+      }
+    };
+  }
+
   getProvisionAprsCallsign() {
     if (!this.callmeshState.provision) return null;
     return formatAprsCallsign(
@@ -5889,6 +5963,19 @@ function extractCallsignFromAprsKey(key) {
     return normalizeAprsCallsign(key);
   }
   return normalizeAprsCallsign(key.slice(0, index));
+}
+
+function splitAprsPacketKey(key) {
+  if (typeof key !== 'string') {
+    return { callsign: null, infoString: null };
+  }
+  const separatorIndex = key.indexOf(APRS_PACKET_KEY_SEPARATOR);
+  if (separatorIndex === -1) {
+    return { callsign: normalizeAprsCallsign(key), infoString: null };
+  }
+  const callsign = normalizeAprsCallsign(key.slice(0, separatorIndex));
+  const infoString = key.slice(separatorIndex + 1);
+  return { callsign, infoString };
 }
 
 function isMappingEntryEnabled(mapping) {
