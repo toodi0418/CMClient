@@ -447,6 +447,7 @@ AUTO_UPDATE_POLL_SECONDS=300            # 多少秒檢查一次遠端更新
   ```
   並確認宿主機已授權 Docker 存取該裝置（Linux 可能需要將使用者加入 `dialout`）。
 - **CallMesh / TenManMap**：容器會將 artifacts 寫入 volume `/data/callmesh`，可把 `callmesh-data` 綁到實體資料夾以便備份或跨版本沿用，確保 Key/Mapping/遙測都能持續。
+- **映像更新**：官方 GHCR 映像（`ghcr.io/toodi0418/cmclient:<tag>`）基底為 `node:22-bookworm-slim`。若要套用最新 runtime，請先 `docker compose pull`（或 `docker pull ghcr.io/toodi0418/cmclient:latest`）再 `docker compose up -d --build`；若自己 build，記得在成功後執行 `docker compose up -d` 以重建容器。
 
 #### Docker 自動啟動
 
@@ -475,6 +476,18 @@ AUTO_UPDATE_POLL_SECONDS=300            # 多少秒檢查一次遠端更新
 3. 之後主機開機時會先啟動 Docker，再由 systemd 執行 `docker compose up -d`。若需暫停服務可 `sudo systemctl stop callmesh-client`，並於調整設定後 `sudo systemctl restart callmesh-client`。
 
 > 提醒：compose 內已設定 `restart: unless-stopped`，可確保 Docker daemon 重啟時自動復原；systemd unit 則負責在 OS 開機時立即執行 compose，適合長期部署。
+
+#### Docker 映像更新流程
+
+1. 觀察 GitHub Actions 的 **Build & Publish Docker Image** workflow（或手動 `docker compose build`），確認最新映像已產出。
+2. 在部署主機執行：
+   ```bash
+   docker compose pull                # 或 docker pull ghcr.io/toodi0418/cmclient:latest
+   docker compose up -d --build
+   ```
+   這會把容器換成最新的 Node 22 runtime，同時保留 volume 內資料。
+3. 若想確認版本，可在容器內跑 `node -v` 或使用 `docker inspect` 檢視 `Config.Image`。
+4. entrypoint 仍會依 `AUTO_UPDATE` 在背景同步 repo，更新映像後建議再 `docker compose restart`，確保 runtime 與程式碼都重新載入。
 
 ### Docker 自動更新（main / dev）
 
