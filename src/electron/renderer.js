@@ -15,6 +15,7 @@ let channelPageSize = MESSAGE_PAGE_SIZES[0];
 CHANNEL_CONFIG.forEach((channel) => {
   channelMessageStore.set(channel.id, []);
 });
+const summaryRowMap = new Map();
 
 const form = document.getElementById('connection-form');
 const connectBtn = document.getElementById('connect-btn');
@@ -597,6 +598,96 @@ function showPendingAprsReason(entry) {
     });
   }
   window.alert(lines.filter(Boolean).join('\n'));
+}
+
+function extractAprsCallsignFromInfo(info) {
+  if (!info) return null;
+  const frame = info.frame || info.payload || '';
+  if (typeof frame !== 'string' || !frame) {
+    return null;
+  }
+  const match = frame.match(/^([A-Za-z0-9]{1,9}(?:-[0-9A-Z]{1,2})?)[>]/);
+  return match && match[1] ? match[1].toUpperCase() : null;
+}
+
+function normalizeAprsCallsignValue(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const normalized = String(value).trim().toUpperCase();
+  return normalized || null;
+}
+
+function deriveSummaryAprsCallsign(summary) {
+  if (!summary) return null;
+  const candidates = [
+    summary.aprsCallsign,
+    summary.aprs_callsign,
+    summary.mappingCallsign,
+    summary.mapping_callsign,
+    summary.callsign
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeAprsCallsignValue(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  const meshId =
+    normalizeMeshId(summary?.from?.meshId || summary?.from?.meshIdNormalized) ||
+    normalizeMeshId(summary?.meshId || summary?.meshIdNormalized);
+  if (meshId) {
+    const mapping = findMappingByMeshId(meshId);
+    if (mapping) {
+      const mappingCallsign = formatMappingCallsign(mapping);
+      if (mappingCallsign) {
+        return mappingCallsign;
+      }
+    }
+  }
+  return null;
+}
+
+function setSummaryAprsBadge(row, text, { variant = 'success', datasetValue = null } = {}) {
+  if (!row) return;
+  const detailMain = row.querySelector('.detail-main');
+  if (!detailMain) return;
+  let badge = detailMain.querySelector('.summary-aprs-badge');
+  if (!text) {
+    if (badge) {
+      badge.remove();
+    }
+    delete row.dataset.aprsCallsign;
+    return;
+  }
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.className = 'summary-aprs-badge';
+    detailMain.appendChild(badge);
+  }
+  badge.textContent = text;
+  if (variant === 'rejected') {
+    badge.classList.add('summary-aprs-badge--rejected');
+  } else {
+    badge.classList.remove('summary-aprs-badge--rejected');
+  }
+  if (datasetValue) {
+    row.dataset.aprsCallsign = datasetValue;
+  } else {
+    delete row.dataset.aprsCallsign;
+  }
+}
+
+function applySummaryAprsState(row, summary) {
+  if (!row || !summary) return;
+  const callsign = deriveSummaryAprsCallsign(summary);
+  if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) {
+    const label = formatAprsRejectedLabel(summary) || '不符合 APRS 上傳條件';
+    const text = callsign ? `APRS: ${callsign}（${label}）` : `APRS 拒絕：${label}`;
+    setSummaryAprsBadge(row, text, { variant: 'rejected', datasetValue: callsign });
+  } else {
+    setSummaryAprsBadge(row, null);
+  }
 }
 
 function formatRelayLabel(relay) {
@@ -3144,15 +3235,26 @@ function appendSummaryRow(summary) {
     extras.push(...summary.extraLines);
   }
   row.querySelector('.detail-extra').textContent = extras.join('\n');
+  applySummaryAprsState(row, summary);
 
   tableBody.insertBefore(fragment, tableBody.firstChild);
 
   while (tableBody.children.length > MAX_ROWS) {
-    tableBody.removeChild(tableBody.lastChild);
+    const lastRow = tableBody.lastChild;
+    if (lastRow?.dataset?.flowId) {
+      summaryRowMap.delete(lastRow.dataset.flowId);
+    }
+    if (lastRow) {
+      tableBody.removeChild(lastRow);
+    }
   }
 
   recordChannelMessage(summary);
   registerPacketFlow(summary);
+  if (summary.flowId) {
+    row.dataset.flowId = summary.flowId;
+    summaryRowMap.set(summary.flowId, row);
+  }
 }
 
 function clearSummaryTable() {
@@ -3163,6 +3265,7 @@ function clearSummaryTable() {
   packetBuckets.clear();
   packetSummaryLast10Min = 0;
   clearPacketFlowData();
+  summaryRowMap.clear();
 }
 
 function clearPacketFlowData() {
@@ -3654,6 +3757,27 @@ function handleAprsUplink(info) {
   renderFlowEntries();
   if (incremented || !hadAprs) {
     updateDashboardCounters();
+  }
+  const summaryRow = summaryRowMap.get(flowId);
+  if (summaryRow) {
+    const summaryData = summaryRow.__summary;
+    const aprsCallsign =
+      extractAprsCallsignFromInfo(info) ||
+      entry?.callsign ||
+      deriveSummaryAprsCallsign(summaryData);
+    if (summaryData) {
+      summaryData.aprsRejected = false;
+      summaryData.aprsRejectedReason = null;
+      summaryData.aprsRejectedLabel = null;
+      if (aprsCallsign) {
+        summaryData.aprsCallsign = aprsCallsign;
+      }
+    }
+    const badgeText = aprsCallsign ? `APRS: ${aprsCallsign}` : 'APRS 已上傳';
+    setSummaryAprsBadge(summaryRow, badgeText, {
+      variant: 'success',
+      datasetValue: aprsCallsign || null
+    });
   }
 }
 

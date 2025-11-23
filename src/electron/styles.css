@@ -2141,6 +2141,28 @@ tbody tr.position-highlight:hover {
 
 .detail-main {
   font-weight: 500;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.summary-aprs-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  background: rgba(59, 130, 246, 0.22);
+  color: #bfdbfe;
+  text-transform: uppercase;
+}
+
+.summary-aprs-badge--rejected {
+  background: rgba(239, 68, 68, 0.28);
+  color: #fecaca;
 }
 
 .type {

@@ -3565,6 +3565,9 @@ class CallMeshAprsBridge extends EventEmitter {
       this.aprsSkippedMeshIds.delete(meshId);
     }
     const normalizedCallsign = normalizeAprsCallsign(sourceCallsign);
+    if (normalizedCallsign) {
+      summary.aprsCallsign = normalizedCallsign;
+    }
     if (!normalizedCallsign) {
       return;
     }
