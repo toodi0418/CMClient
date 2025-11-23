@@ -263,6 +263,7 @@ CMClient/
      - 若節點資料庫有座標資訊，訊息尾端會顯示距離與最後更新時間差，例如 `22.9 km (3 分鐘前)`；距離以 Provision 座標為基準計算。
   3. **遙測數據**：Chart.js 畫面與資料表，可依節點、時間範圍、指標模式切換；節點輸入框整合了 datalist 與搜尋，鍵入 Mesh ID、暱稱或任意關鍵字即可切換節點或直接套用全域篩選，輸入清空時會自動還原到最近選取節點並顯示完整資料；頁面右上角顯示「筆數 / 節點 / 檔案大小」統計並提供「清空遙測數據」按鈕。
   4. **Mapping 封包追蹤**：具 Mapping 的位置封包列表，支援搜尋、狀態篩選與 CSV 匯出；節點資訊與 APRS 狀態會即時更新。
+     - 流程狀態若顯示「待上傳」會出現 `?` 按鈕，點擊即可看到「APRS-IS 已有相同封包」「呼號冷卻中」等實際拒絕原因；即使被去重拒絕，封包摘要與 Flow 列都會標示 `APRS: <呼號>`，方便追蹤是哪個呼號被節流。
   5. **設定**：設定 Meshtastic Host、CallMesh API Key、APRS Server、信標間隔，並可切換是否啟用 Web UI。
      - 連線模式、主機欄位與 Serial 裝置現在具備 **即時套用**；修改後會透過 `scheduleConnectionApply()` 觸發重連，不需再按「連線」。
      - 「允許與 TenManMap 及合作夥伴分享資料」為預設開啟的低調開關；取消勾選時會呼叫 `savePreferences()` 與 `updateClientPreferences()`，進而更新 `CallMeshAprsBridge.setTenmanShareEnabled(false)`。
