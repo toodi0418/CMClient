@@ -30,9 +30,16 @@ const APRS_TELEMETRY_INTERVAL_MS = 6 * 60 * 60_000;
 const APRS_TELEMETRY_DATA_INTERVAL_MS = 10 * 60_000;
 const TELEMETRY_BUCKET_MS = 60_000;
 const TELEMETRY_WINDOW_MS = APRS_TELEMETRY_DATA_INTERVAL_MS;
-const DEFAULT_APRS_FEED_FILTER = 'filter b/BU,BV,BM,BX';
-const APRS_FEED_FILTER_COMMAND =
-  (String(process.env.TMAG_APRS_FEED_FILTER || '').trim() || DEFAULT_APRS_FEED_FILTER);
+const DEFAULT_APRS_FEED_RADIUS_KM = (() => {
+  const raw = Number(process.env.TMAG_APRS_FEED_RADIUS_KM);
+  if (Number.isFinite(raw) && raw > 0) {
+    return raw;
+  }
+  return 300;
+})();
+const STATIC_APRS_FEED_FILTER_COMMAND = normalizeAprsFilterCommand(
+  process.env.TMAG_APRS_FEED_FILTER
+);
 const APRS_PACKET_CACHE_TTL_MS = 30 * 60_000;
 const APRS_PACKET_RECENT_WINDOW_MS = 30 * 60_000;
 const APRS_LOCAL_TX_WINDOW_MS = 30_000;
@@ -242,6 +249,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsPacketCache = new Map();
     this.aprsCallsignSummary = new Map();
     this.aprsLocalTxHistory = new Map();
+    this.aprsFeedFilterCommand = this.computeAprsFeedFilterCommand();
     this.nodeDatabase = nodeDatabase;
     this.telemetrySeededNodes = new Set();
     this.nodeDatabasePersistTimer = null;
@@ -2869,7 +2877,7 @@ class CallMeshAprsBridge extends EventEmitter {
       passcode: this.aprsState.passcode,
       version: this.appVersion,
       softwareName: 'TMAG',
-      filterCommand: APRS_FEED_FILTER_COMMAND
+      filterCommand: this.aprsFeedFilterCommand
     };
 
     if (!this.aprsClient) {
@@ -3790,6 +3798,51 @@ class CallMeshAprsBridge extends EventEmitter {
     );
   }
 
+  getProvisionCoordinates() {
+    const provision = this.callmeshState.provision;
+    if (!provision) return null;
+    const lat = Number(provision.latitude ?? provision.lat);
+    const lon = Number(provision.longitude ?? provision.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return null;
+    }
+    return { lat, lon };
+  }
+
+  computeAprsFeedFilterCommand() {
+    if (STATIC_APRS_FEED_FILTER_COMMAND) {
+      return STATIC_APRS_FEED_FILTER_COMMAND;
+    }
+    if (!Number.isFinite(DEFAULT_APRS_FEED_RADIUS_KM) || DEFAULT_APRS_FEED_RADIUS_KM <= 0) {
+      return null;
+    }
+    const coords = this.getProvisionCoordinates();
+    if (!coords) {
+      return null;
+    }
+    const radius = Math.max(1, Math.round(DEFAULT_APRS_FEED_RADIUS_KM));
+    const { lat, lon } = coords;
+    const latStr = lat.toFixed(4);
+    const lonStr = lon.toFixed(4);
+    return `#filter r/${latStr}/${lonStr}/${radius}`;
+  }
+
+  refreshAprsFeedFilter(reason = 'update') {
+    const next = this.computeAprsFeedFilterCommand();
+    if (next === this.aprsFeedFilterCommand) {
+      return;
+    }
+    this.aprsFeedFilterCommand = next;
+    if (next) {
+      this.emitLog('APRS', `feed filter set (${reason}): ${next}`);
+    } else {
+      this.emitLog('APRS', `feed filter cleared (${reason}); using server default`);
+    }
+    if (this.aprsClient) {
+      this.aprsClient.updateConfig({ filterCommand: next });
+    }
+  }
+
   refreshMappingIndexes(_reason = 'update') {
     this.mappingIndexByMeshId.clear();
     this.aprsAllowedCallsigns.clear();
@@ -3869,6 +3922,8 @@ class CallMeshAprsBridge extends EventEmitter {
 
   updateAprsProvision(provision) {
     if (!provision) {
+      this.callmeshState.provision = null;
+      this.refreshAprsFeedFilter('provision-cleared');
       this.aprsState.callsignBase = null;
       this.aprsState.callsign = null;
       this.aprsState.ssid = null;
@@ -3883,6 +3938,9 @@ class CallMeshAprsBridge extends EventEmitter {
       this.teardownAprsConnection();
       return;
     }
+
+    this.callmeshState.provision = provision;
+    this.refreshAprsFeedFilter('provision-update');
 
     const prevBase = this.aprsState.callsignBase || null;
     const prevSsid = this.aprsState.ssid ?? null;
@@ -5588,6 +5646,23 @@ function sortObject(input) {
     return sorted;
   }
   return input;
+}
+
+function normalizeAprsFilterCommand(raw) {
+  if (raw === undefined || raw === null) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  if (lowered === 'none' || lowered === 'default') {
+    return null;
+  }
+  if (trimmed.startsWith('#')) {
+    return trimmed;
+  }
+  if (/^filter\s+/i.test(trimmed)) {
+    return `#${trimmed}`;
+  }
+  return `#filter ${trimmed}`;
 }
 
 function computeAprsPasscode(callsignBase) {

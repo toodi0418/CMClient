@@ -7,6 +7,7 @@
 ## 0. 目前狀態更新（2025-11）
 
 - **Web Dashboard 事件精簡**：`callmesh` SSE payload 僅保留前端使用欄位（狀態、Mapping 摘要、Provision、APRS 狀態），敏感資訊如 `verifiedKey`、agent 字串已移除。
+- **/debug 新增 APRS 去重快照**：`http://<host>:7080/debug` 現在會回傳 `aprsDedup` 區段，包含目前連線狀態、`packetCache` / `localTxHistory` / `callsignSummary` 等快取內容，可直接驗證哪些呼號被伺服器下發或被節流。
 - **CallMesh 狀態顯示調整**：GUI/Web 均以「正常／異常」兩態對外呈現；異常代表未驗證 Key 或處於 degraded。
 - **遙測圖表**：Chart.js Tooltip 會依實際最小差距動態套用小數位數，避免相同值因四捨五入看似變化；Y 軸／最新值同步採用此精度。
 - **Web Telemetry 初始同步**：Electron 啟動以及 API Key 驗證流程完成後，都會將最新遙測快照播送給 Web Server，確保頁面立即有資料。
@@ -202,6 +203,7 @@ CMClient/
   - 驗證 API Key → Heartbeat → Mapping / Provision 同步
   - 持久化 artifacts (`~/<userData>/callmesh/` / `~/.config/callmesh/`)
   - APRS-IS 連線管理：登入、keepalive、斷線重試
+  - `getAprsDebugSnapshot()` 可輸出去重快取（allowedCallsigns、packetCache、localTxHistory、callsignSummary、lastPositionDigest 等），`/debug` 會借此顯示 APRS 實際收到/略過的封包，排查「伺服器是否有資料下發」時直接查詢即可。
   - Beacon/Telemetry 排程、CallMesh degraded 模式
   - Flow 管理：為每個 `summary` 製作 `flowId`，APR S 上傳後透過 `aprs-uplink` 事件回報
   - 節點資料庫整合：
@@ -420,6 +422,12 @@ node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 - 節點資料庫分頁支援模糊搜尋與線上節點統計（預設視為 1 小時內更新），距離會以 Provision 座標為基準計算；表格顯示的筆數與線上數會在使用搜尋時同步標示「符合 / 總數」。座標欄會顯示 `lat, lon[, 高度]`，可直接用座標片段搜尋。
 - 節點長名稱、型號等資訊由 `nodeDatabase` 推播，CLI / GUI / Web 顯示一致；若需要擴充欄位，請從 Bridge emit 的 `node` 事件開始串接。
 - 所有節點快照會持久化於 `CALLMESH_ARTIFACTS_DIR/node-database.json`，同 `telemetry-records.sqlite` 一樣可透過節點分頁的「清除節點資料庫」或 `callmesh:clear` IPC 重新初始化。
+
+### 6.4.1 APRS 偵錯
+
+- 任一執行中的 CLI / Electron / Web Dashboard 皆會掛載 `http://<host>:<port>/debug` 端點，回傳 JSON 內含 `relayLinkStats` 以及 `aprsDedup`；後者直接呼叫 `CallMeshAprsBridge.getAprsDebugSnapshot()`，可檢視 `allowedCallsigns`、`packetCache`（最近從 APRS-IS 收到的封包）、`localTxHistory`（本機送出的封包）、`callsignSummary`（呼號冷卻狀態）、`lastPositionDigest` 等欄位。
+- 若懷疑 APRS feed 沒回傳資料，可先查看 `/debug` → `aprsDedup.packetCache` 是否有任何條目，再檢查 `aprsDedup.aprsState.connected/loginVerified`、或查看 Log 分頁的 `[APRS] rx ...` 訊息（已解除靜音，會完整顯示 server 回傳內容）。
+- `TMAG_APRS_FEED_FILTER` 可覆寫預設範圍；若未設定，會依 CallMesh 下發的座標自動套用 `#filter r/<lat>/<lon>/300`（半徑 300 km）。若需要自訂，請直接填入完整 `#filter ...` 指令（或輸入 `none` 讓伺服器回到預設 m/2），調整後重啟流程並透過 `/debug` → `aprsDedup.packetCache` 驗證是否收到新呼號。
 
 ### 6.5 訊息頻道
 
