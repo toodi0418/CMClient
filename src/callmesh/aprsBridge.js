@@ -40,6 +40,10 @@ const DEFAULT_APRS_FEED_RADIUS_KM = (() => {
 const STATIC_APRS_FEED_FILTER_COMMAND = normalizeAprsFilterCommand(
   process.env.TMAG_APRS_FEED_FILTER
 );
+const APRS_LOG_VERBOSE =
+  ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.TMAG_APRS_LOG_VERBOSE || '').trim().toLowerCase()
+  );
 const APRS_PACKET_CACHE_TTL_MS = 30 * 60_000;
 const APRS_PACKET_RECENT_WINDOW_MS = 30 * 60_000;
 const APRS_LOCAL_TX_WINDOW_MS = 30_000;
@@ -250,6 +254,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsCallsignSummary = new Map();
     this.aprsLocalTxHistory = new Map();
     this.aprsFeedFilterCommand = this.computeAprsFeedFilterCommand();
+    this.aprsVerboseLog = APRS_LOG_VERBOSE;
     this.nodeDatabase = nodeDatabase;
     this.telemetrySeededNodes = new Set();
     this.nodeDatabasePersistTimer = null;
@@ -2882,6 +2887,9 @@ class CallMeshAprsBridge extends EventEmitter {
 
     if (!this.aprsClient) {
       const logForwarder = (tag, message) => {
+        if (tag === 'APRS' && this.shouldSuppressAprsClientLog(message)) {
+          return;
+        }
         this.emitLog(tag, message);
       };
       this.aprsClient = new APRSClient({
@@ -3066,6 +3074,20 @@ class CallMeshAprsBridge extends EventEmitter {
       timestamp: new Date().toISOString()
     };
     this.emit('log', entry);
+  }
+
+  shouldSuppressAprsClientLog(message) {
+    if (this.aprsVerboseLog) return false;
+    if (!message || typeof message !== 'string') {
+      return false;
+    }
+    const normalized = message.trim().toLowerCase();
+    if (!normalized) return false;
+    return (
+      normalized.startsWith('rx ') ||
+      normalized.startsWith('tx ') ||
+      normalized.startsWith('keepalive')
+    );
   }
 
   emitAprsUplink(info) {
