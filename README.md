@@ -446,6 +446,23 @@ AUTO_UPDATE_POLL_SECONDS=300            # 多少秒檢查一次遠端更新
   並確認宿主機已授權 Docker 存取該裝置（Linux 可能需要將使用者加入 `dialout`）。
 - **CallMesh / TenManMap**：容器會將 artifacts 寫入 volume `/data/callmesh`，可把 `callmesh-data` 綁到實體資料夾以便備份或跨版本沿用，確保 Key/Mapping/遙測都能持續。
 
+#### 開機自動啟動（systemd）
+
+1. 複製範例 unit 檔並依實際路徑調整 `WorkingDirectory=`（需指向含 `docker-compose.yml` 的資料夾）：  
+   ```bash
+   sudo cp systemd/callmesh-client.service.example /etc/systemd/system/callmesh-client.service
+   sudo sed -i 's#/opt/CMClient#/home/<user>/CMClient#g' /etc/systemd/system/callmesh-client.service
+   ```
+   （或以 `nano`/`vim` 編輯，並確認 `docker compose up -d` 指令沒有其他自訂參數）
+2. 重新載入 systemd 並啟用服務：  
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now callmesh-client.service
+   ```
+3. 之後主機開機時會先啟動 Docker，再由 systemd 執行 `docker compose up -d`。若需暫停服務可 `sudo systemctl stop callmesh-client`，並於調整設定後 `sudo systemctl restart callmesh-client`。
+
+> 提醒：compose 內已設定 `restart: unless-stopped`，可確保 Docker daemon 重啟時自動復原；systemd unit 則負責在 OS 開機時立即執行 compose，適合長期部署。
+
 ### Docker 自動更新（main / dev）
 
 - `docker-entrypoint.sh` 會先把指定分支同步到 `/data/callmesh/app-src`，執行 `npm ci --omit=dev` 後啟動程式，並持續以 `AUTO_UPDATE_POLL_SECONDS`（預設 300 秒）輪詢遠端。偵測到 `main` / `dev` 有新 commit 時，會優雅地停止目前的 `npm start`、重新 `git pull + npm ci`，再自動重啟服務，整個流程不需重建容器。
