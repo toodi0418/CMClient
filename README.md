@@ -344,7 +344,8 @@ npx pkg src/index.js \
   --compress Brotli --public \
   --output tmag-cli-linux-armv7
 ```
-或針對 64 位元 Pi OS 使用 `--targets node22-linux-arm64`。
+或針對 64 位元 Pi OS 使用 `--targets node22-linux-arm64`。  
+（從 v0.2.26 起，GitHub Release 會附上預編譯的 `tmag-cli-linux-armv7`，可直接下載使用；若需客製修改才需自行編譯。）
 
 ### Docker 佈署
 

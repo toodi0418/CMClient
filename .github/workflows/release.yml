@@ -156,6 +156,16 @@ jobs:
             --public \
             --output dist/cli/tmag-cli-linux-arm64
 
+      - name: Build Linux CLI (armv7)
+        run: |
+          mkdir -p dist/cli
+          npx pkg src/index.js \
+            --config package.json \
+            --targets node18-linux-armv7 \
+            --compress Brotli \
+            --public \
+            --output dist/cli/tmag-cli-linux-armv7
+
       - name: Determine version
         id: linux_version
         run: |
@@ -172,7 +182,7 @@ jobs:
             exit 1
           fi
           (cd dist && zip -9 -r "TMAG_Monitor-linux-x64-v${version}.zip" "$gui_dir")
-          for target in linux-x64 linux-arm64; do
+          for target in linux-x64 linux-arm64 linux-armv7; do
             cli_path="dist/cli/tmag-cli-${target}"
             if [ ! -f "$cli_path" ]; then
               echo "CLI binary missing: $cli_path" >&2
@@ -190,6 +200,7 @@ jobs:
             "dist/TMAG_Monitor-linux-x64-v${{ steps.linux_version.outputs.version }}.zip" \
             "dist/cli/tmag-cli-linux-x64-v${{ steps.linux_version.outputs.version }}.zip" \
             "dist/cli/tmag-cli-linux-arm64-v${{ steps.linux_version.outputs.version }}.zip" \
+            "dist/cli/tmag-cli-linux-armv7-v${{ steps.linux_version.outputs.version }}.zip" \
             --clobber
 
   build-windows:
