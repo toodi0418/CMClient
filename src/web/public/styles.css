@@ -632,12 +632,11 @@ tbody tr:nth-child(odd) {
 }
 
 .summary-row-mapped {
-  position: relative;
-  box-shadow: inset 0 0 0 2px rgba(14, 165, 233, 0.5);
+  box-shadow: inset 0 0 0 1px rgba(14, 165, 233, 0.4);
 }
 
 .summary-row-mapped:hover {
-  box-shadow: inset 0 0 0 2px rgba(14, 165, 233, 0.8);
+  box-shadow: inset 0 0 0 1px rgba(14, 165, 233, 0.7);
 }
 
 tbody tr:hover {
