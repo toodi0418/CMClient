@@ -4949,6 +4949,9 @@ function ensureRelayGuessSuffix(label, summary) {
       SUMMARY_ROW_HOP_ONE_CLASS,
       SUMMARY_ROW_HOP_MULTI_CLASS
     );
+    if (!row.classList.contains('summary-row-mapped')) {
+      return;
+    }
     const hopInfo = extractHopInfo(summary);
     if (!hopInfo || hopInfo.limitOnly || hopInfo.usedHops == null) {
       return;
