@@ -4954,7 +4954,8 @@ function ensureRelayGuessSuffix(label, summary) {
 
   function updateAprsSuccessClass(row) {
     if (!row) return;
-    if (row.dataset.aprsSuccess === '1' && !hasHopHighlight(row)) {
+    const isPositionRow = row.dataset.summaryType === 'position';
+    if (row.dataset.aprsSuccess === '1' && !hasHopHighlight(row) && isPositionRow) {
       row.classList.add('summary-row-aprs');
       row.classList.remove('summary-row-aprs-rejected');
     } else {
@@ -5005,6 +5006,22 @@ function ensureRelayGuessSuffix(label, summary) {
     updateAprsSuccessClass(row);
   }
 
+  function applySummaryTypeClass(row, summary) {
+    if (!row || !summary) return;
+    const typeKey =
+      typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+    if (typeKey) {
+      row.dataset.summaryType = typeKey;
+    } else {
+      delete row.dataset.summaryType;
+    }
+    if (typeKey === 'position') {
+      row.classList.add('summary-row-position');
+    } else {
+      row.classList.remove('summary-row-position');
+    }
+  }
+
   function shouldDiscardSummaryForReplay(summary, { skipGuard = false } = {}) {
     if (skipGuard || !summaryReplayGuardActive) {
       return false;
@@ -5034,6 +5051,7 @@ function ensureRelayGuessSuffix(label, summary) {
 
     const row = createSummaryRow(summary);
     row.__summaryData = summary;
+    applySummaryTypeClass(row, summary);
     const meshId = normalizeMeshId(summary?.from?.meshId || summary?.from?.meshIdNormalized);
     if (meshId) {
       row.dataset.meshId = meshId;
@@ -5089,6 +5107,7 @@ function ensureRelayGuessSuffix(label, summary) {
       if (!row || !row.__summaryData) continue;
       const summary = row.__summaryData;
       hydrateSummaryNodes(summary);
+      applySummaryTypeClass(row, summary);
       const cells = row.children;
       if (!cells || cells.length < 3) {
         continue;

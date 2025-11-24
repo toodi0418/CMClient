@@ -620,18 +620,26 @@ tbody tr:nth-child(odd) {
 }
 
 .summary-row-mapped {
+  background-color: transparent;
+}
+
+.summary-row-position.summary-row-mapped {
   background-color: rgba(14, 165, 233, 0.24);
 }
 
-.summary-row-mapped:hover {
+.summary-row-position.summary-row-mapped:hover {
   background-color: rgba(14, 165, 233, 0.32);
 }
 
 .summary-row-aprs {
+  background-color: transparent;
+}
+
+.summary-row-position.summary-row-aprs {
   background-color: rgba(34, 197, 94, 0.24);
 }
 
-.summary-row-aprs:hover {
+.summary-row-position.summary-row-aprs:hover {
   background-color: rgba(22, 163, 74, 0.34);
 }
 
