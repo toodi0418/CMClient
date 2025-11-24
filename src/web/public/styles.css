@@ -644,11 +644,11 @@ tbody tr:hover {
 }
 
 .summary-row-aprs {
-  background: rgba(34, 197, 94, 0.22) !important;
+  box-shadow: inset 0 0 0 2px rgba(34, 197, 94, 0.45);
 }
 
 .summary-row-aprs:hover {
-  background: rgba(22, 163, 74, 0.32) !important;
+  box-shadow: inset 0 0 0 2px rgba(22, 163, 74, 0.65);
 }
 
 .summary-row-aprs-rejected {
