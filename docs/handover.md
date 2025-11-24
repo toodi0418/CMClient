@@ -611,7 +611,8 @@ CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
 - 遙測與訊息儲存全面改為 SQLite 正規化 schema，啟動時以非阻塞方式載入快照，支援串流查詢、CSV 匯出與時段快捷範圍；過去 JSONL 會自動匯入並顯示進度。
 - 節點資料庫與 CLI 旗標升級：新增 `--clear-nodedb`、`--summary-log` 等開關，僅允許 snapshot 建立節點並忽略 invalid relay/hop limit 封包，UI 會在缺資料時改顯示 Mesh ID。
 - APRS / TenManMap 管線強化：自動化 feed filter、dedup window、呼號/拒絕原因顯示、`/debug` snapshot、TenMan inbound 篩選等功能，並可依需求靜音或開啟詳細 log。
-- Docker 版新增 `docker-entrypoint.sh` 自動更新迴圈，可在背景輪詢 `main`/`dev`（預設 300 秒）偵測新 commit 後自動 `git pull + npm ci + restart`，同時 README/.env 補齊部署與連線指引。
+- Docker 版新增 `docker-entrypoint.sh` 自動更新迴圈，可在背景輪詢 `main`/`dev`（預設 300 秒）偵測新 commit 後自動 `git pull + npm ci + restart`，同時 README/.env 補齊部署與連線指引；2025-11-24 起 official image 改用 `node:22-bookworm-slim` 並維持 amd64 / arm64 / armv7 multi-arch。
+- Release CLI（macOS / Windows / Linux x64 / Linux arm64）已於 2025-11-24 重新打包為 Node.js 22 runtime。armv7 目前僅透過 Docker 映像支援，如需在 armv7 裝置使用 CLI 請自行 `pkg` 或改跑 container。
 - 提供 `systemd/callmesh-client.service.example`，依據實際路徑修改後即可讓主機開機時自動執行 `docker compose up -d`。
 
 **修正與調整**
@@ -626,6 +627,7 @@ CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
 3. Docker `.env` 預設 `AUTO_UPDATE=1`、`AUTO_UPDATE_POLL_SECONDS=300`，偵測到新 commit 會自動重啟；若環境無法連網或要鎖定映像，務必改設 `AUTO_UPDATE=0`。
 4. 套用 systemd 範例時需將 `WorkingDirectory` 改成實際專案路徑並 `sudo systemctl daemon-reload && sudo systemctl enable --now callmesh-client`。
 5. APRS feed filter 現由程式自動設定，如需自訂範圍請透過環境變數覆寫並搭配 `/debug` 驗證；TenMan inbound 預設被忽略，若要放行需調整 Bridge 設定。
+6. 若需 armv7 平台，請改用 Docker（GHCR multi-arch 提供 `linux/arm/v7` manifests）；官方 Release 目前僅發佈 macOS / Windows / Linux x64 / Linux arm64 CLI，可自行透過 `pkg` 編譯 armv7 版本。
 
 ### 8.3 本地打包
 
