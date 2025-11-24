@@ -4949,7 +4949,13 @@ function ensureRelayGuessSuffix(label, summary) {
       SUMMARY_ROW_HOP_ONE_CLASS,
       SUMMARY_ROW_HOP_MULTI_CLASS
     );
-    if (!row.classList.contains('summary-row-mapped')) {
+    const isMapping = row.classList.contains('summary-row-mapped');
+    if (!isMapping) {
+      return;
+    }
+    const isPositionPacket =
+      typeof summary.type === 'string' && summary.type.trim().toLowerCase() === 'position';
+    if (!isPositionPacket) {
       return;
     }
     const hopInfo = extractHopInfo(summary);
