@@ -253,6 +253,8 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsPacketCache = new Map();
     this.aprsCallsignSummary = new Map();
     this.aprsLocalTxHistory = new Map();
+    this.aprsCachePersistTimer = null;
+    this.aprsCachePersistDelayMs = 1500;
     this.aprsFeedFilterCommand = this.computeAprsFeedFilterCommand();
     this.aprsVerboseLog = APRS_LOG_VERBOSE;
     this.nodeDatabase = nodeDatabase;
@@ -468,6 +470,9 @@ class CallMeshAprsBridge extends EventEmitter {
     await this.initializeTelemetryDatabase({ migrateLegacy: allowRestore });
     await this.loadTelemetryStore();
     await this.restoreNodeDatabase();
+    if (allowRestore) {
+      this.restoreAprsDedupCaches();
+    }
     this.emitState();
   }
 
@@ -631,6 +636,102 @@ class CallMeshAprsBridge extends EventEmitter {
     }
   }
 
+  restoreAprsDedupCaches() {
+    const store = this.getDataStore();
+    if (!store) {
+      return;
+    }
+    let snapshot = null;
+    try {
+      snapshot = store.loadAprsDedupSnapshot();
+    } catch (err) {
+      this.emitLog('APRS', `restore aprs dedup snapshot failed: ${err.message}`);
+      return;
+    }
+    if (!snapshot) {
+      return;
+    }
+    const now = Date.now();
+    const packetTtl = APRS_PACKET_CACHE_TTL_MS;
+    const localTxTtl = APRS_LOCAL_TX_WINDOW_MS;
+    let restoredPackets = 0;
+    let restoredLocalTx = 0;
+    let restoredCallsigns = 0;
+    let restoredDigests = 0;
+
+    if (Array.isArray(snapshot.packetCache)) {
+      this.aprsPacketCache.clear();
+      for (const entry of snapshot.packetCache) {
+        const key = typeof entry?.packetKey === 'string' ? entry.packetKey : entry?.key;
+        const seenAt = Number(entry?.lastSeenMs ?? entry?.lastSeen);
+        if (typeof key !== 'string' || !Number.isFinite(seenAt)) continue;
+        if (now - seenAt > packetTtl) continue;
+        this.aprsPacketCache.set(key, seenAt);
+        restoredPackets += 1;
+      }
+    }
+
+    if (Array.isArray(snapshot.localTxHistory)) {
+      this.aprsLocalTxHistory.clear();
+      for (const entry of snapshot.localTxHistory) {
+        const key = typeof entry?.packetKey === 'string' ? entry.packetKey : entry?.key;
+        const seenAt = Number(entry?.lastSeenMs ?? entry?.lastSeen);
+        if (typeof key !== 'string' || !Number.isFinite(seenAt)) continue;
+        if (now - seenAt > localTxTtl) continue;
+        this.aprsLocalTxHistory.set(key, seenAt);
+        restoredLocalTx += 1;
+      }
+    }
+
+    if (Array.isArray(snapshot.callsignSummary)) {
+      this.aprsCallsignSummary.clear();
+      for (const entry of snapshot.callsignSummary) {
+        const callsign = normalizeAprsCallsign(entry?.callsign ?? entry?.callSign);
+        if (!callsign) continue;
+        const seenAt = Number(entry?.lastSeenMs ?? entry?.lastSeen);
+        if (Number.isFinite(seenAt) && now - seenAt > packetTtl) {
+          continue;
+        }
+        const lastInfo =
+          entry?.lastInfo === undefined || entry?.lastInfo === null
+            ? null
+            : String(entry.lastInfo);
+        this.aprsCallsignSummary.set(callsign, {
+          lastSeen: Number.isFinite(seenAt) ? seenAt : null,
+          lastInfo
+        });
+        restoredCallsigns += 1;
+      }
+    }
+
+    if (Array.isArray(snapshot.positionDigest)) {
+      this.aprsLastPositionDigest.clear();
+      for (const entry of snapshot.positionDigest) {
+        const meshId = normalizeMeshId(entry?.meshId ?? entry?.mesh_id);
+        if (!meshId) continue;
+        const digest = typeof entry?.digest === 'string' ? entry.digest : null;
+        const timestampMs = Number(entry?.timestampMs ?? entry?.timestamp);
+        this.aprsLastPositionDigest.set(meshId, {
+          digest,
+          timestamp: Number.isFinite(timestampMs) ? timestampMs : null
+        });
+        restoredDigests += 1;
+        if (this.aprsLastPositionDigest.size > APRS_POSITION_CACHE_LIMIT) {
+          break;
+        }
+      }
+    }
+
+    if (restoredPackets || restoredLocalTx || restoredCallsigns || restoredDigests) {
+      this.emitLog(
+        'APRS',
+        `restored aprs dedup snapshot packet=${restoredPackets} local_tx=${restoredLocalTx} callsign=${restoredCallsigns} digest=${restoredDigests}`
+      );
+    }
+    this.pruneAprsCachesByWhitelist('restore');
+    this.scheduleAprsCachePersist();
+  }
+
   scheduleNodeDatabasePersist() {
     if (!this.storageDir) {
       return;
@@ -703,6 +804,119 @@ class CallMeshAprsBridge extends EventEmitter {
         console.error('寫入節點資料庫失敗:', err);
       });
     }
+  }
+
+  scheduleAprsCachePersist() {
+    if (!this.storageDir) {
+      return;
+    }
+    if (this.aprsCachePersistTimer) {
+      return;
+    }
+    this.aprsCachePersistTimer = setTimeout(() => {
+      this.aprsCachePersistTimer = null;
+      try {
+        this.persistAprsCaches();
+      } catch (err) {
+        this.emitLog('APRS', `persist aprs dedup snapshot failed: ${err.message}`);
+      }
+    }, this.aprsCachePersistDelayMs);
+    this.aprsCachePersistTimer.unref?.();
+  }
+
+  cancelAprsCachePersist() {
+    if (this.aprsCachePersistTimer) {
+      clearTimeout(this.aprsCachePersistTimer);
+      this.aprsCachePersistTimer = null;
+    }
+  }
+
+  persistAprsCaches() {
+    if (!this.storageDir) {
+      return;
+    }
+    const store = this.getDataStore();
+    if (!store) {
+      return;
+    }
+    try {
+      const snapshot = this.buildAprsDedupSnapshot();
+      store.saveAprsDedupSnapshot(snapshot);
+    } catch (err) {
+      this.emitLog('APRS', `寫入 APRS 去重快取失敗: ${err.message}`);
+    }
+  }
+
+  flushAprsCachePersistSync() {
+    if (!this.storageDir) {
+      return;
+    }
+    this.cancelAprsCachePersist();
+    try {
+      this.persistAprsCaches();
+    } catch (err) {
+      this.emitLog('APRS', `同步寫入 APRS 去重快取失敗: ${err.message}`);
+    }
+  }
+
+  buildAprsDedupSnapshot() {
+    const packetCache = [];
+    for (const [key, lastSeenMs] of this.aprsPacketCache.entries()) {
+      if (typeof key !== 'string' || !Number.isFinite(lastSeenMs)) continue;
+      const { callsign, infoString } = splitAprsPacketKey(key);
+      packetCache.push({
+        packetKey: key,
+        callsign,
+        infoString,
+        lastSeenMs: Math.floor(lastSeenMs)
+      });
+    }
+
+    const localTxHistory = [];
+    for (const [key, lastSeenMs] of this.aprsLocalTxHistory.entries()) {
+      if (typeof key !== 'string' || !Number.isFinite(lastSeenMs)) continue;
+      const { callsign, infoString } = splitAprsPacketKey(key);
+      localTxHistory.push({
+        packetKey: key,
+        callsign,
+        infoString,
+        lastSeenMs: Math.floor(lastSeenMs)
+      });
+    }
+
+    const callsignSummary = [];
+    for (const [callsign, summary] of this.aprsCallsignSummary.entries()) {
+      const normalized = normalizeAprsCallsign(callsign);
+      if (!normalized) continue;
+      const lastSeen = Number.isFinite(summary?.lastSeen) ? Math.floor(summary.lastSeen) : null;
+      const lastInfo =
+        summary?.lastInfo === undefined || summary?.lastInfo === null
+          ? null
+          : String(summary.lastInfo);
+      callsignSummary.push({
+        callsign: normalized,
+        lastSeenMs: lastSeen,
+        lastInfo
+      });
+    }
+
+    const positionDigest = [];
+    for (const [meshId, entry] of this.aprsLastPositionDigest.entries()) {
+      const normalizedMeshId = normalizeMeshId(meshId);
+      if (!normalizedMeshId) continue;
+      positionDigest.push({
+        meshId: normalizedMeshId,
+        digest: entry?.digest ?? null,
+        timestampMs: Number.isFinite(entry?.timestamp) ? Math.floor(entry.timestamp) : null
+      });
+    }
+
+    return {
+      packetCache,
+      localTxHistory,
+      callsignSummary,
+      positionDigest
+    };
   }
 
   setSelfMeshId(meshId) {
@@ -1050,6 +1264,7 @@ class CallMeshAprsBridge extends EventEmitter {
         store.clearNodes();
         store.saveMessageLog([]);
         store.replaceRelayStats([]);
+        store.saveAprsDedupSnapshot({});
       } catch (err) {
         this.emitLog('CALLMESH', `clear sqlite artifacts failed: ${err.message}`);
       }
@@ -1080,6 +1295,7 @@ class CallMeshAprsBridge extends EventEmitter {
     await this.clearTelemetryStore({ silent: false });
     this.emitLog('CALLMESH', 'cleared local mapping/provision cache');
     this.updateAprsProvision(null);
+    this.scheduleAprsCachePersist();
   }
 
   async restoreTelemetryState() {
@@ -2931,6 +3147,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.stopHeartbeatLoop();
     this.teardownAprsConnection();
     this.flushNodeDatabasePersistSync();
+    this.flushAprsCachePersistSync();
     this.meshtasticClients.clear();
     if (this.dataStoreInitialized && this.dataStore) {
       try {
@@ -3000,6 +3217,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.callmeshState.cachedProvision = cloneProvision(provision);
     this.callmeshState.lastProvisionRaw = incomingRaw;
     this.aprsLastPositionDigest.clear();
+    this.scheduleAprsCachePersist();
     const payload = {
       provision: canonical,
       savedAt: new Date().toISOString()
@@ -3283,24 +3501,32 @@ class CallMeshAprsBridge extends EventEmitter {
       });
     }
     this.pruneAprsPacketCache(timestamp);
+    this.scheduleAprsCachePersist();
   }
 
   pruneAprsPacketCache(now = Date.now()) {
+    let modified = false;
     for (const [key, seenAt] of Array.from(this.aprsPacketCache.entries())) {
       if (!Number.isFinite(seenAt) || now - seenAt > APRS_PACKET_CACHE_TTL_MS) {
         this.aprsPacketCache.delete(key);
+        modified = true;
       }
     }
     for (const [callsign, summary] of Array.from(this.aprsCallsignSummary.entries())) {
       const seenAt = summary?.lastSeen ?? 0;
       if (!Number.isFinite(seenAt) || now - seenAt > APRS_PACKET_CACHE_TTL_MS) {
         this.aprsCallsignSummary.delete(callsign);
+        modified = true;
       }
     }
     for (const [key, seenAt] of Array.from(this.aprsLocalTxHistory.entries())) {
       if (!Number.isFinite(seenAt) || now - seenAt > APRS_LOCAL_TX_WINDOW_MS) {
         this.aprsLocalTxHistory.delete(key);
+        modified = true;
       }
+    }
+    if (modified) {
+      this.scheduleAprsCachePersist();
     }
   }
 
@@ -3316,6 +3542,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     if (now - seenAt > APRS_PACKET_CACHE_TTL_MS) {
       this.aprsPacketCache.delete(key);
+      this.scheduleAprsCachePersist();
     }
     return false;
   }
@@ -3339,6 +3566,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     if (now - seenAt > APRS_LOCAL_TX_WINDOW_MS) {
       this.aprsLocalTxHistory.delete(key);
+      this.scheduleAprsCachePersist();
     }
     return false;
   }
@@ -3712,6 +3940,7 @@ class CallMeshAprsBridge extends EventEmitter {
         this.aprsLastPositionDigest.delete(firstKey);
       }
     }
+    this.scheduleAprsCachePersist();
   }
 
   markAprsSummaryRejected(summary, reasonCode, context = {}) {
@@ -3892,28 +4121,47 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   pruneAprsCachesByWhitelist(_reason = 'update') {
+    let modified = false;
     if (!this.aprsAllowedCallsigns.size) {
-      this.aprsPacketCache.clear();
-      this.aprsCallsignSummary.clear();
-      this.aprsLocalTxHistory.clear();
+      if (this.aprsPacketCache.size) {
+        this.aprsPacketCache.clear();
+        modified = true;
+      }
+      if (this.aprsCallsignSummary.size) {
+        this.aprsCallsignSummary.clear();
+        modified = true;
+      }
+      if (this.aprsLocalTxHistory.size) {
+        this.aprsLocalTxHistory.clear();
+        modified = true;
+      }
+      if (modified) {
+        this.scheduleAprsCachePersist();
+      }
       return;
     }
     for (const key of Array.from(this.aprsPacketCache.keys())) {
       const callsign = extractCallsignFromAprsKey(key);
       if (callsign && !this.aprsAllowedCallsigns.has(callsign)) {
         this.aprsPacketCache.delete(key);
+        modified = true;
       }
     }
     for (const key of Array.from(this.aprsLocalTxHistory.keys())) {
       const callsign = extractCallsignFromAprsKey(key);
       if (callsign && !this.aprsAllowedCallsigns.has(callsign)) {
         this.aprsLocalTxHistory.delete(key);
+        modified = true;
       }
     }
     for (const callsign of Array.from(this.aprsCallsignSummary.keys())) {
       if (!this.aprsAllowedCallsigns.has(callsign)) {
         this.aprsCallsignSummary.delete(callsign);
+        modified = true;
       }
+    }
+    if (modified) {
+      this.scheduleAprsCachePersist();
     }
   }
 

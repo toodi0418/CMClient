@@ -210,6 +210,69 @@ function sanitizeMessageEntry(entry, { fallbackFlowId, fallbackChannel, fallback
   };
 }
 
+function sanitizeAprsPacketSnapshotEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const packetKey = sanitizeText(entry.packetKey ?? entry.key);
+  const lastSeenMs = toFiniteInteger(entry.lastSeenMs ?? entry.lastSeen);
+  if (!packetKey || lastSeenMs == null) {
+    return null;
+  }
+  const callsign = sanitizeText(entry.callsign ?? entry.callSign);
+  let infoValue = entry.infoString;
+  if (infoValue === undefined || infoValue === null) {
+    infoValue = entry.info;
+  }
+  const info =
+    infoValue === undefined || infoValue === null ? null : String(infoValue);
+  return {
+    packetKey,
+    callsign,
+    info,
+    lastSeenMs
+  };
+}
+
+function sanitizeAprsCallsignSummaryEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const callsign = sanitizeText(entry.callsign ?? entry.callSign);
+  if (!callsign) {
+    return null;
+  }
+  const lastSeenMs = toFiniteInteger(entry.lastSeenMs ?? entry.lastSeen);
+  let infoValue = entry.lastInfo;
+  if (infoValue === undefined || infoValue === null) {
+    infoValue = entry.lastInfoText ?? entry.info ?? null;
+  }
+  const lastInfo =
+    infoValue === undefined || infoValue === null ? null : String(infoValue);
+  return {
+    callsign,
+    lastSeenMs,
+    lastInfo
+  };
+}
+
+function sanitizeAprsPositionDigestEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const meshId = sanitizeText(entry.meshId ?? entry.mesh_id);
+  if (!meshId) {
+    return null;
+  }
+  const digest = sanitizeText(entry.digest);
+  const timestampMs = toFiniteInteger(entry.timestampMs ?? entry.timestamp);
+  return {
+    meshId,
+    digest,
+    timestampMs
+  };
+}
+
 function buildMessageNodeFromRow(row) {
   if (!row) {
     return null;
@@ -337,6 +400,38 @@ class CallMeshDataStore {
         rssi REAL,
         count INTEGER,
         updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS aprs_packet_cache (
+        packet_key TEXT PRIMARY KEY,
+        callsign TEXT,
+        info TEXT,
+        last_seen_ms INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_aprs_packet_cache_callsign
+        ON aprs_packet_cache(callsign);
+
+      CREATE TABLE IF NOT EXISTS aprs_local_tx (
+        packet_key TEXT PRIMARY KEY,
+        callsign TEXT,
+        info TEXT,
+        last_seen_ms INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_aprs_local_tx_callsign
+        ON aprs_local_tx(callsign);
+
+      CREATE TABLE IF NOT EXISTS aprs_callsign_summary (
+        callsign TEXT PRIMARY KEY,
+        last_seen_ms INTEGER,
+        last_info TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS aprs_position_digest (
+        mesh_id TEXT PRIMARY KEY,
+        digest TEXT,
+        timestamp_ms INTEGER
       );
     `);
 
@@ -477,6 +572,52 @@ class CallMeshDataStore {
     this.statements.selectRelayStats = this.db.prepare(`
       SELECT mesh_key AS meshKey, snr, rssi, count, updated_at AS updatedAt
       FROM relay_stats
+    `);
+
+    this.statements.clearAprsPacketCache = this.db.prepare('DELETE FROM aprs_packet_cache');
+    this.statements.insertAprsPacketCache = this.db.prepare(`
+      INSERT INTO aprs_packet_cache (packet_key, callsign, info, last_seen_ms)
+      VALUES (@packetKey, @callsign, @info, @lastSeenMs)
+    `);
+    this.statements.selectAprsPacketCache = this.db.prepare(`
+      SELECT packet_key AS packetKey, callsign, info, last_seen_ms AS lastSeenMs
+      FROM aprs_packet_cache
+    `);
+
+    this.statements.clearAprsLocalTx = this.db.prepare('DELETE FROM aprs_local_tx');
+    this.statements.insertAprsLocalTx = this.db.prepare(`
+      INSERT INTO aprs_local_tx (packet_key, callsign, info, last_seen_ms)
+      VALUES (@packetKey, @callsign, @info, @lastSeenMs)
+    `);
+    this.statements.selectAprsLocalTx = this.db.prepare(`
+      SELECT packet_key AS packetKey, callsign, info, last_seen_ms AS lastSeenMs
+      FROM aprs_local_tx
+    `);
+
+    this.statements.clearAprsCallsignSummary = this.db.prepare('DELETE FROM aprs_callsign_summary');
+    this.statements.insertAprsCallsignSummary = this.db.prepare(`
+      INSERT INTO aprs_callsign_summary (callsign, last_seen_ms, last_info)
+      VALUES (@callsign, @lastSeenMs, @lastInfo)
+      ON CONFLICT(callsign) DO UPDATE SET
+        last_seen_ms = excluded.last_seen_ms,
+        last_info = excluded.last_info
+    `);
+    this.statements.selectAprsCallsignSummary = this.db.prepare(`
+      SELECT callsign, last_seen_ms AS lastSeenMs, last_info AS lastInfo
+      FROM aprs_callsign_summary
+    `);
+
+    this.statements.clearAprsPositionDigest = this.db.prepare('DELETE FROM aprs_position_digest');
+    this.statements.insertAprsPositionDigest = this.db.prepare(`
+      INSERT INTO aprs_position_digest (mesh_id, digest, timestamp_ms)
+      VALUES (@meshId, @digest, @timestampMs)
+      ON CONFLICT(mesh_id) DO UPDATE SET
+        digest = excluded.digest,
+        timestamp_ms = excluded.timestamp_ms
+    `);
+    this.statements.selectAprsPositionDigest = this.db.prepare(`
+      SELECT mesh_id AS meshId, digest, timestamp_ms AS timestampMs
+      FROM aprs_position_digest
     `);
   }
 
@@ -1008,6 +1149,98 @@ class CallMeshDataStore {
       throw new Error('CallMeshDataStore 尚未初始化');
     }
     return this.statements.selectRelayStats.all();
+  }
+
+  saveAprsDedupSnapshot(snapshot = {}) {
+    if (!this.db) {
+      throw new Error('CallMeshDataStore 尚未初始化');
+    }
+    const packetEntries = Array.isArray(snapshot.packetCache) ? snapshot.packetCache : [];
+    const localEntries = Array.isArray(snapshot.localTxHistory) ? snapshot.localTxHistory : [];
+    const callsignEntries = Array.isArray(snapshot.callsignSummary) ? snapshot.callsignSummary : [];
+    const digestEntries = Array.isArray(snapshot.positionDigest) ? snapshot.positionDigest : [];
+    const exec = this._createTransaction((payload) => {
+      this.statements.clearAprsPacketCache.run();
+      for (const entry of payload.packetEntries) {
+        const sanitized = sanitizeAprsPacketSnapshotEntry(entry);
+        if (!sanitized) continue;
+        this.statements.insertAprsPacketCache.run(sanitized);
+      }
+
+      this.statements.clearAprsLocalTx.run();
+      for (const entry of payload.localEntries) {
+        const sanitized = sanitizeAprsPacketSnapshotEntry(entry);
+        if (!sanitized) continue;
+        this.statements.insertAprsLocalTx.run(sanitized);
+      }
+
+      this.statements.clearAprsCallsignSummary.run();
+      for (const entry of payload.callsignEntries) {
+        const sanitized = sanitizeAprsCallsignSummaryEntry(entry);
+        if (!sanitized) continue;
+        this.statements.insertAprsCallsignSummary.run({
+          callsign: sanitized.callsign,
+          lastSeenMs: sanitized.lastSeenMs,
+          lastInfo: sanitized.lastInfo
+        });
+      }
+
+      this.statements.clearAprsPositionDigest.run();
+      for (const entry of payload.digestEntries) {
+        const sanitized = sanitizeAprsPositionDigestEntry(entry);
+        if (!sanitized) continue;
+        this.statements.insertAprsPositionDigest.run({
+          meshId: sanitized.meshId,
+          digest: sanitized.digest,
+          timestampMs: sanitized.timestampMs
+        });
+      }
+    });
+    exec({
+      packetEntries,
+      localEntries,
+      callsignEntries,
+      digestEntries
+    });
+  }
+
+  loadAprsDedupSnapshot() {
+    if (!this.db) {
+      throw new Error('CallMeshDataStore 尚未初始化');
+    }
+    const packetCache = this.statements.selectAprsPacketCache.all().map((row) => ({
+      packetKey: sanitizeText(row.packetKey),
+      callsign: sanitizeText(row.callsign),
+      infoString:
+        row.info === undefined || row.info === null ? null : String(row.info),
+      lastSeenMs: toFiniteInteger(row.lastSeenMs)
+    }));
+    const localTxHistory = this.statements.selectAprsLocalTx.all().map((row) => ({
+      packetKey: sanitizeText(row.packetKey),
+      callsign: sanitizeText(row.callsign),
+      infoString:
+        row.info === undefined || row.info === null ? null : String(row.info),
+      lastSeenMs: toFiniteInteger(row.lastSeenMs)
+    }));
+    const callsignSummary = this.statements.selectAprsCallsignSummary.all().map((row) => ({
+      callsign: sanitizeText(row.callsign),
+      lastSeenMs: toFiniteInteger(row.lastSeenMs),
+      lastInfo:
+        row.lastInfo === undefined || row.lastInfo === null ? null : String(row.lastInfo)
+    }));
+    const positionDigest = this.statements.selectAprsPositionDigest.all().map((row) => ({
+      meshId: sanitizeText(row.meshId),
+      digest: sanitizeText(row.digest),
+      timestampMs: toFiniteInteger(row.timestampMs)
+    }));
+    return {
+      packetCache: packetCache.filter((entry) => entry.packetKey && entry.lastSeenMs != null),
+      localTxHistory: localTxHistory.filter(
+        (entry) => entry.packetKey && entry.lastSeenMs != null
+      ),
+      callsignSummary: callsignSummary.filter((entry) => entry.callsign),
+      positionDigest: positionDigest.filter((entry) => entry.meshId)
+    };
   }
 }
 

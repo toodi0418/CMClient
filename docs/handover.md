@@ -8,6 +8,7 @@
 
 - **Web Dashboard 事件精簡**：`callmesh` SSE payload 僅保留前端使用欄位（狀態、Mapping 摘要、Provision、APRS 狀態），敏感資訊如 `verifiedKey`、agent 字串已移除。
 - **/debug 新增 APRS 去重快照**：`http://<host>:7080/debug` 現在會回傳 `aprsDedup` 區段，包含目前連線狀態、`packetCache` / `localTxHistory` / `callsignSummary` 等快取內容，可直接驗證哪些呼號被伺服器下發或被節流。
+- **APRS 去重快取持久化**：`aprs_packet_cache`、`aprs_local_tx`、`aprs_callsign_summary`、`aprs_position_digest` 同步寫入 `callmesh-data.sqlite`，重啟後會自動載回並重新套用 TTL，避免服務重啟時短暫失去去重記憶。
 - **CallMesh 狀態顯示調整**：GUI/Web 均以「正常／異常」兩態對外呈現；異常代表未驗證 Key 或處於 degraded。
 - **遙測圖表**：Chart.js Tooltip 會依實際最小差距動態套用小數位數，避免相同值因四捨五入看似變化；Y 軸／最新值同步採用此精度。
 - **Web Telemetry 初始同步**：Electron 啟動以及 API Key 驗證流程完成後，都會將最新遙測快照播送給 Web Server，確保頁面立即有資料。
@@ -430,7 +431,7 @@ node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 - 若懷疑 APRS feed 沒回傳資料，可先查看 `/debug` → `aprsDedup.packetCache` 是否有任何條目，再檢查 `aprsDedup.aprsState.connected/loginVerified`、或查看 Log 分頁的 `[APRS] rx ...` 訊息（已解除靜音，會完整顯示 server 回傳內容）。
 - `TMAG_APRS_FEED_FILTER` 可覆寫預設範圍；若未設定，會依 CallMesh 下發的座標自動套用 `#filter r/<lat>/<lon>/300`（半徑 300 km）。若需要自訂，請直接填入完整 `#filter ...` 指令（或輸入 `none` 讓伺服器回到預設 m/2），調整後重啟流程並透過 `/debug` → `aprsDedup.packetCache` 驗證是否收到新呼號。
 - APRS Log 預設靜音（不再顯示大量 `rx/tx/keepalive` 行）。若需回復原本的詳細輸出，請設定 `TMAG_APRS_LOG_VERBOSE=1` 後重啟。
-- APRS 去重快取僅存在於記憶體：`packetCache` / `callsignSummary` 每 30 分鐘自動清除一次，`localTxHistory` 與 `lastPositionDigest` 則以 30 秒為窗口防止重複上傳。重啟程式或手動清除節點資料庫都會同時把這些快取清空，需要透過 `/debug` 即時檢視。
+- APRS 去重快取現在會同步寫入 `callmesh-data.sqlite`（`aprs_packet_cache` / `aprs_local_tx` / `aprs_callsign_summary` / `aprs_position_digest`），跨重啟仍會載回，但啟動時會重新套用 30 分鐘（`packetCache` / `callsignSummary`）與 30 秒（`localTxHistory`）的 TTL，舊資料會立即被修剪。清除資料或 `CALLMESH_ARTIFACTS_DIR` 時也會一併清空這些表。
 
 ### 6.5 訊息頻道
 
@@ -524,7 +525,7 @@ CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
 
 - `CALLMESH_ARTIFACTS_DIR`（預設 `~/.config/callmesh/`）：
   - `monitor.json`：CallMesh API 驗證結果、心跳時間。
-  - `callmesh-data.sqlite`：集中儲存節點快照（`nodes` 表）、Mapping/Provision 快取（`kv_store`）、訊息紀錄（`message_log`）與 Relay 統計（`relay_stats`）。升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl` 與 `relay-link-stats.json` 並移除備份。
+  - `callmesh-data.sqlite`：集中儲存節點快照（`nodes` 表）、Mapping/Provision 快取（`kv_store`）、訊息紀錄（`message_log`）與 Relay 統計（`relay_stats`），同時新增 `aprs_packet_cache` / `aprs_local_tx` / `aprs_callsign_summary` / `aprs_position_digest` 表持久化 APRS 去重快取。升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl` 與 `relay-link-stats.json` 並移除備份。
 - `telemetry-records.sqlite`：遙測資料。
 - WebDashboard Snapshots：啟動時會以 `seed*` 方法注入節點、遙測、訊息快照；重新整理頁面也會取得最新資料。
 
