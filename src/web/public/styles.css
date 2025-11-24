@@ -619,6 +619,30 @@ tbody tr:nth-child(odd) {
   background: rgba(17, 24, 39, 0.65);
 }
 
+.summary-row-mapped {
+  background-color: rgba(14, 165, 233, 0.14);
+}
+
+.summary-row-mapped:hover {
+  background-color: rgba(14, 165, 233, 0.22);
+}
+
+.summary-row-aprs {
+  background-color: rgba(34, 197, 94, 0.18);
+}
+
+.summary-row-aprs:hover {
+  background-color: rgba(22, 163, 74, 0.28);
+}
+
+.summary-row-aprs-rejected {
+  background: rgba(248, 113, 113, 0.22) !important;
+}
+
+.summary-row-aprs-rejected:hover {
+  background: rgba(239, 68, 68, 0.32) !important;
+}
+
 .summary-row-hop-direct {
   background-color: rgba(59, 130, 246, 0.2);
 }
@@ -631,32 +655,8 @@ tbody tr:nth-child(odd) {
   background-color: rgba(192, 132, 252, 0.22);
 }
 
-.summary-row-mapped {
-  box-shadow: inset 0 0 0 1px rgba(14, 165, 233, 0.4);
-}
-
-.summary-row-mapped:hover {
-  box-shadow: inset 0 0 0 1px rgba(14, 165, 233, 0.7);
-}
-
 tbody tr:hover {
   background: rgba(59, 130, 246, 0.25) !important;
-}
-
-.summary-row-aprs {
-  box-shadow: inset 0 0 0 2px rgba(34, 197, 94, 0.45);
-}
-
-.summary-row-aprs:hover {
-  box-shadow: inset 0 0 0 2px rgba(22, 163, 74, 0.65);
-}
-
-.summary-row-aprs-rejected {
-  background: rgba(248, 113, 113, 0.22) !important;
-}
-
-.summary-row-aprs-rejected:hover {
-  background: rgba(239, 68, 68, 0.32) !important;
 }
 
 .snr-positive {
