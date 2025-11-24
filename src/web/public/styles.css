@@ -624,11 +624,11 @@ tbody tr:nth-child(odd) {
 }
 
 .summary-row-position.summary-row-mapped {
-  box-shadow: inset 0 6px 0 rgba(14, 165, 233, 0.45);
+  background-color: rgba(14, 165, 233, 0.24);
 }
 
 .summary-row-position.summary-row-mapped:hover {
-  box-shadow: inset 0 6px 0 rgba(14, 165, 233, 0.6);
+  background-color: rgba(14, 165, 233, 0.32);
 }
 
 .summary-row-aprs {
@@ -636,11 +636,11 @@ tbody tr:nth-child(odd) {
 }
 
 .summary-row-position.summary-row-aprs {
-  box-shadow: inset 0 -6px 0 rgba(34, 197, 94, 0.45);
+  background-color: rgba(34, 197, 94, 0.24);
 }
 
 .summary-row-position.summary-row-aprs:hover {
-  box-shadow: inset 0 -6px 0 rgba(22, 163, 74, 0.6);
+  background-color: rgba(22, 163, 74, 0.34);
 }
 
 .summary-row-aprs-rejected {
@@ -652,15 +652,15 @@ tbody tr:nth-child(odd) {
 }
 
 .summary-row-hop-direct {
-  background-color: rgba(59, 130, 246, 0.2);
+  background-color: rgba(59, 130, 246, 0.2) !important;
 }
 
 .summary-row-hop-one {
-  background-color: rgba(251, 191, 36, 0.22);
+  background-color: rgba(251, 191, 36, 0.22) !important;
 }
 
 .summary-row-hop-multi {
-  background-color: rgba(192, 132, 252, 0.22);
+  background-color: rgba(192, 132, 252, 0.22) !important;
 }
 
 tbody tr:hover {
