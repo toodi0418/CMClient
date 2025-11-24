@@ -4936,10 +4936,40 @@ function ensureRelayGuessSuffix(label, summary) {
       const badgeText = aprsCallsign
         ? `APRS: ${aprsCallsign}${label ? `（${label}）` : ''}`
         : `APRS 拒絕：${label}`;
+      delete row.dataset.aprsSuccess;
       row.classList.remove('summary-row-aprs');
       row.classList.add('summary-row-aprs-rejected');
       setAprsBadge(row, badgeText, { variant: 'rejected', datasetValue: aprsCallsign });
     }
+  }
+
+  function hasHopHighlight(row) {
+    if (!row) return false;
+    return (
+      row.classList.contains(SUMMARY_ROW_HOP_DIRECT_CLASS) ||
+      row.classList.contains(SUMMARY_ROW_HOP_ONE_CLASS) ||
+      row.classList.contains(SUMMARY_ROW_HOP_MULTI_CLASS)
+    );
+  }
+
+  function updateAprsSuccessClass(row) {
+    if (!row) return;
+    if (row.dataset.aprsSuccess === '1' && !hasHopHighlight(row)) {
+      row.classList.add('summary-row-aprs');
+      row.classList.remove('summary-row-aprs-rejected');
+    } else {
+      row.classList.remove('summary-row-aprs');
+    }
+  }
+
+  function setAprsSuccessFlag(row, enabled) {
+    if (!row) return;
+    if (enabled) {
+      row.dataset.aprsSuccess = '1';
+    } else {
+      delete row.dataset.aprsSuccess;
+    }
+    updateAprsSuccessClass(row);
   }
 
   function applyHopHighlight(row, summary) {
@@ -4951,15 +4981,18 @@ function ensureRelayGuessSuffix(label, summary) {
     );
     const isMapping = row.classList.contains('summary-row-mapped');
     if (!isMapping) {
+      updateAprsSuccessClass(row);
       return;
     }
     const isPositionPacket =
       typeof summary.type === 'string' && summary.type.trim().toLowerCase() === 'position';
     if (!isPositionPacket) {
+      updateAprsSuccessClass(row);
       return;
     }
     const hopInfo = extractHopInfo(summary);
     if (!hopInfo || hopInfo.limitOnly || hopInfo.usedHops == null) {
+      updateAprsSuccessClass(row);
       return;
     }
     if (hopInfo.usedHops <= 0) {
@@ -4969,6 +5002,7 @@ function ensureRelayGuessSuffix(label, summary) {
     } else if (hopInfo.usedHops > 1) {
       row.classList.add(SUMMARY_ROW_HOP_MULTI_CLASS);
     }
+    updateAprsSuccessClass(row);
   }
 
   function shouldDiscardSummaryForReplay(summary, { skipGuard = false } = {}) {
@@ -5015,8 +5049,7 @@ function ensureRelayGuessSuffix(label, summary) {
       row.dataset.flowId = flowId;
       flowRowMap.set(flowId, row);
       if (aprsHighlightedFlows.has(flowId)) {
-        row.classList.add('summary-row-aprs');
-        row.classList.remove('summary-row-aprs-rejected');
+        setAprsSuccessFlag(row, true);
         aprsHighlightedFlows.delete(flowId);
       }
       const aprsCallsign = flowAprsCallsigns.get(flowId);
@@ -5897,8 +5930,7 @@ function ensureRelayGuessSuffix(label, summary) {
     aprsHighlightedFlows.add(info.flowId);
     const row = flowRowMap.get(info.flowId);
     if (row) {
-      row.classList.add('summary-row-aprs');
-      row.classList.remove('summary-row-aprs-rejected');
+      setAprsSuccessFlag(row, true);
       aprsHighlightedFlows.delete(info.flowId);
       if (callsign) {
         setAprsBadge(row, `APRS: ${callsign}`, { variant: 'success', datasetValue: callsign });
