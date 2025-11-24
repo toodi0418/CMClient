@@ -174,9 +174,9 @@ node src/index.js --host <節點ip> --port 4403
 ```bash
 npx pkg src/index.js \
   --config package.json \
-  --targets node22-linux-armv7 \
+  --targets node22-linux-arm64 \
   --compress Brotli --public \
-  --output tmag-cli-linux-armv7
+  --output tmag-cli-linux-arm64
 ```
 
 ---
@@ -340,13 +340,12 @@ npm install
 
 npx pkg src/index.js \
   --config package.json \
-  --targets node22-linux-armv7 \
+  --targets node22-linux-arm64 \
   --compress Brotli --public \
-  --output tmag-cli-linux-armv7
+  --output tmag-cli-linux-arm64
 ```
-或針對 64 位元 Pi OS 使用 `--targets node22-linux-arm64`。  
-（從 v0.2.26 起，GitHub Release 會附上預編譯的 `tmag-cli-linux-armv7`，可直接下載使用；若需客製修改才需自行編譯。）
-官方提供的 CLI 執行檔（macOS / Windows / Linux x64 / Linux arm64 / Linux armv7）一律以 Node.js 22 打包，請確保目標環境允許執行對應的靜態 binary。
+或針對 64 位元 Pi OS 使用 `--targets node22-linux-arm64`（Release 目前提供 macOS / Windows / Linux x64 / Linux arm64 版本）。
+官方提供的 CLI 執行檔均以 Node.js 22 打包，請確保目標環境允許執行對應的靜態 binary。
 
 ### Docker 佈署
 
@@ -372,11 +371,11 @@ GitHub Actions 會自動執行 **Build & Publish Docker Image** workflow，並�
 
 3. **啟動**
    ```bash
-   docker compose up -d --build
-   ```
-   - 變更設定後重新載入：`docker compose up -d`。
-   - 查看日誌：`docker compose logs -f`.
-   - 需改用 Serial 裝置時，可在 `docker-compose.yml` 新增：
+docker compose up -d --build
+```
+- 變更設定後重新載入：`docker compose up -d`。
+- 查看日誌：`docker compose logs -f`.
+- 需改用 Serial 裝置時，可在 `docker-compose.yml` 新增：
      ```yaml
      devices:
        - /dev/ttyUSB0:/dev/ttyUSB0

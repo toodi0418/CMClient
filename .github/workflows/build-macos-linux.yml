@@ -94,10 +94,6 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: 設定 QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm,arm64
 
       - name: 安裝相依套件
         run: npm ci
@@ -131,22 +127,6 @@ jobs:
             --public \
             --output dist/cli/tmag-cli-linux-arm64
 
-      - name: 建置 Linux CLI (ARMv7)
-        run: |
-          mkdir -p dist/cli
-          docker run --rm --platform linux/arm/v7 \
-            -v "$PWD":/workspace \
-            -w /workspace \
-            node:22-bookworm bash -lc "\
-              set -euo pipefail && \
-              apt-get update >/dev/null && \
-              apt-get install -y --no-install-recommends python3 build-essential zip >/dev/null && \
-              npm ci && \
-              npx pkg src/index.js --config package.json --targets node22-linux-armv7 --compress Brotli --public --output dist/cli/tmag-cli-linux-armv7 && \
-              VERSION=\$(node -p \"require('./package.json').version\") && \
-              cd dist/cli && zip -9 \"tmag-cli-linux-armv7-v\${VERSION}.zip\" tmag-cli-linux-armv7 \
-            "
-          sudo chown -R $USER:$USER dist/cli
 
       - name: 取得版本號
         id: linux_vars
@@ -173,7 +153,7 @@ jobs:
             zip -9 -r "TMAG_Monitor-linux-x64-v${version}.zip" "$gui_dir"
           )
 
-          for target in linux-x64 linux-arm64 linux-armv7; do
+          for target in linux-x64 linux-arm64; do
             cli_path="dist/cli/tmag-cli-${target}"
             if [ ! -f "$cli_path" ]; then
               echo "找不到 CLI：$cli_path" >&2
