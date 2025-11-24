@@ -632,11 +632,12 @@ tbody tr:nth-child(odd) {
 }
 
 .summary-row-mapped {
-  background-image: linear-gradient(0deg, rgba(14, 165, 233, 0.18), rgba(14, 165, 233, 0.18));
+  position: relative;
+  box-shadow: inset 0 0 0 2px rgba(14, 165, 233, 0.5);
 }
 
 .summary-row-mapped:hover {
-  background-image: linear-gradient(0deg, rgba(14, 165, 233, 0.28), rgba(14, 165, 233, 0.28));
+  box-shadow: inset 0 0 0 2px rgba(14, 165, 233, 0.8);
 }
 
 tbody tr:hover {
