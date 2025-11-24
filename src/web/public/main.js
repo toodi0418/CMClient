@@ -81,6 +81,9 @@
   const relayHintOkBtn = document.getElementById('relay-hint-ok');
 
   const summaryRows = [];
+  const SUMMARY_ROW_HOP_DIRECT_CLASS = 'summary-row-hop-direct';
+  const SUMMARY_ROW_HOP_ONE_CLASS = 'summary-row-hop-one';
+  const SUMMARY_ROW_HOP_MULTI_CLASS = 'summary-row-hop-multi';
   const flowRowMap = new Map();
   const aprsHighlightedFlows = new Set();
   const mappingMeshIds = new Set();
@@ -4939,6 +4942,26 @@ function ensureRelayGuessSuffix(label, summary) {
     }
   }
 
+  function applyHopHighlight(row, summary) {
+    if (!row || !summary) return;
+    row.classList.remove(
+      SUMMARY_ROW_HOP_DIRECT_CLASS,
+      SUMMARY_ROW_HOP_ONE_CLASS,
+      SUMMARY_ROW_HOP_MULTI_CLASS
+    );
+    const hopInfo = extractHopInfo(summary);
+    if (!hopInfo || hopInfo.limitOnly || hopInfo.usedHops == null) {
+      return;
+    }
+    if (hopInfo.usedHops <= 0) {
+      row.classList.add(SUMMARY_ROW_HOP_DIRECT_CLASS);
+    } else if (hopInfo.usedHops === 1) {
+      row.classList.add(SUMMARY_ROW_HOP_ONE_CLASS);
+    } else if (hopInfo.usedHops > 1) {
+      row.classList.add(SUMMARY_ROW_HOP_MULTI_CLASS);
+    }
+  }
+
   function shouldDiscardSummaryForReplay(summary, { skipGuard = false } = {}) {
     if (skipGuard || !summaryReplayGuardActive) {
       return false;
@@ -4975,6 +4998,8 @@ function ensureRelayGuessSuffix(label, summary) {
         row.classList.add('summary-row-mapped');
       }
     }
+
+    applyHopHighlight(row, summary);
 
     const flowId = summary?.flowId;
     if (flowId) {
@@ -6115,6 +6140,7 @@ function ensureRelayGuessSuffix(label, summary) {
       if (!summary.selfMeshId && currentSelfMeshId) {
         summary.selfMeshId = currentSelfMeshId;
       }
+      applyHopHighlight(row, summary);
       const relayCell = row.cells?.[2];
       if (relayCell) {
         updateRelayCellDisplay(relayCell, summary);
