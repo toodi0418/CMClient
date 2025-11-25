@@ -2715,6 +2715,9 @@ class CallMeshAprsBridge extends EventEmitter {
     if (ws) {
       try {
         ws.removeAllListeners();
+        ws.once('error', () => {
+          // Swallow termination errors to避免在連線尚未建立時拋出未處理例外
+        });
         ws.terminate();
       } catch {
         // ignore
