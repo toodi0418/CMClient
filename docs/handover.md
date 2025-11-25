@@ -15,6 +15,7 @@
 - **SSE 管線**：Electron 端每當遙測 `append/reset` 出現時，會同時廣播給 Renderer 與 Web Server，兩側資料來源一致。
 - **CLI Summary Log**：`node src/index.js` 新增 `--summary-log` 旗標，會將所有 summary 事件寫入 `CALLMESH_ARTIFACTS_DIR/logs/summary-YYYYMMDD.jsonl`；亦可用 `--summary-log-dir` 指定輸出目錄，便於追蹤 directed 封包或分析網路事件。
 - **Web 封包摘要對齊 GUI**：Web Dashboard 的封包表格改用與 GUI 相同的欄位順序、型別 icon、Detail DOM 與節點顯示邏輯，並在 SSE 初始階段先送出 `node-snapshot` 再推 `summary-batch`，避免連線剛建立時一度出現 `unknown`。
+- **封包底色規則**：只有 `type=Position` 的封包會套用 Mapping／APRS／跳數底色；Mapping 位置封包顯示青色底，APR S 成功顯示綠色底，並依跳數染成「直收（藍）／1 跳（黃）／>1 跳（紫）」，拒絕上傳則仍以紅底標示。
 - **節點資料庫**：新增 `src/nodeDatabase.js`，集中維護 Mesh 節點的長名稱、模型、角色與最後出現時間；CLI、Electron、Web 均透過 Bridge 發佈 `node` / `node-snapshot` 事件使用同一份資料。2025-11-20 起，只要收到含合法 Mesh ID 的封包（NodeInfo / MyInfo / 其他 summary）即可立即建立節點，之後再由 NodeInfo 慢慢補齊名稱與型號，避免清庫後畫面長時間只有 Mesh ID。
 - **節點清單座標顯示**：Electron / Web 節點頁新增「座標」欄，會顯示緯度、經度與高度（若可用），並支援以座標字串搜尋；同時過濾 `!abcd` 前綴暫存 ID。
 - **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.sqlite` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
