@@ -6539,6 +6539,15 @@ function buildTelemetryChartConfig(metricName, def, series) {
       yScaleOptions.max = axisMax;
       yScaleOptions.suggestedMax = axisMax;
     }
+    yScaleOptions.ticks.includeBounds = true;
+    yScaleOptions.ticks.autoSkip = false;
+    const range = Number(axisMax) - Number(axisMin);
+    if (Number.isFinite(range) && range > 0) {
+      const rawStep = range / 5;
+      const step = rawStep >= 1 ? Math.round(rawStep) : Number(rawStep.toFixed(2));
+      yScaleOptions.ticks.stepSize = step > 0 ? step : undefined;
+      yScaleOptions.ticks.maxTicksLimit = 6;
+    }
   }
   return {
     type: 'line',
@@ -6728,6 +6737,10 @@ function buildBatteryComboChartConfig(datasets) {
           max: 100,
           ticks: {
             color: '#cbd5f5',
+            autoSkip: false,
+            includeBounds: true,
+            stepSize: 20,
+            maxTicksLimit: 6,
             callback: (value) => formatTelemetryValue('batteryLevel', value) || value
           },
           grid: {
