@@ -6047,6 +6047,7 @@ function refreshTelemetrySelectors(preferredMeshId = null) {
       }
 
       const nodeInfo = bucket.node || {};
+      const shortName = sanitizeNodeName(nodeInfo.shortName) || null;
       const displayNode = {
         ...nodeInfo,
         meshId: nodeInfo.meshId || meshKey || rawMeshId,
@@ -6067,7 +6068,8 @@ function refreshTelemetrySelectors(preferredMeshId = null) {
         label,
         count: metricKeys.size,
         latestMs: Number.isFinite(latestTime) ? latestTime : null,
-        totalRecords
+        totalRecords,
+        shortName
       };
     })
     .filter(Boolean);
@@ -6112,6 +6114,9 @@ function refreshTelemetrySelectors(preferredMeshId = null) {
     if (item.label) {
       telemetryNodeLookup.set(item.label.toLowerCase(), meshIdNormalized);
     }
+    if (item.shortName) {
+      telemetryNodeLookup.set(item.shortName.toLowerCase(), meshIdNormalized);
+    }
     telemetryNodeLookup.set(display.toLowerCase(), meshIdNormalized);
 
     const searchKeys = new Set();
@@ -6126,6 +6131,9 @@ function refreshTelemetrySelectors(preferredMeshId = null) {
     }
     if (item.label) {
       searchKeys.add(item.label.toLowerCase());
+    }
+    if (item.shortName) {
+      searchKeys.add(item.shortName.toLowerCase());
     }
     telemetryNodeOptions.push({
       meshId: meshIdNormalized,

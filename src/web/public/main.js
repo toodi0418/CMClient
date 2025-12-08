@@ -3399,6 +3399,7 @@ function ensureRelayGuessSuffix(label, summary) {
         rawMeshId: bucket.rawMeshId || meshKey,
         label,
         baseLabel: labelBase,
+        shortName: sanitizeNodeName(bucket.node?.shortName) || null,
         metricsCount,
         totalRecords,
         latestMs
@@ -3458,6 +3459,9 @@ function ensureRelayGuessSuffix(label, summary) {
       if (item.baseLabel) {
         telemetryNodeLookup.set(item.baseLabel.toLowerCase(), meshIdRaw);
       }
+      if (item.shortName) {
+        telemetryNodeLookup.set(item.shortName.toLowerCase(), meshIdRaw);
+      }
       telemetryNodeLookup.set(display.toLowerCase(), meshIdRaw);
 
       const searchKeys = new Set();
@@ -3475,6 +3479,9 @@ function ensureRelayGuessSuffix(label, summary) {
       }
       if (item.baseLabel) {
         searchKeys.add(item.baseLabel.toLowerCase());
+      }
+      if (item.shortName) {
+        searchKeys.add(item.shortName.toLowerCase());
       }
       telemetryNodeOptions.push({
         meshId: meshIdRaw,
