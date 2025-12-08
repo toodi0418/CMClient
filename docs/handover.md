@@ -35,6 +35,7 @@
 - **TenManMap 分享偏好持久化**：CLI (`--no-share-with-tenmanmap`)、環境變數 (`TENMAN_DISABLE=1`) 與 GUI 勾選會寫入偏好檔並呼叫 `setTenmanShareEnabled()`，即時控制資料是否同步至 TenManMap 與其合作夥伴。
 - **TenManMap 訊息互通**：TenManMap WebSocket 現可接收 Meshtastic 文字封包（`message.publish`），並支援透過 `send_message` 命令回傳廣播文字；套用 5 秒節流與長度檢查，詳細規格見 `docs/tenmanmap-message-bridge.md`。
 - **TenManMap 回覆與自發訊息同步**：TenManMap 下行訊息可攜帶 `destination` / `reply_id`；橋接層會在廣播時保留 `reply_to`、在 Meshtastic 封包寫入 `reply_id`，並回報新的 `mesh_packet_id`。CLI / Electron / Web 會發出合成 summary 以顯示自身送出的訊息（含回覆箭頭資訊），iOS/Android App 亦可藉由 `reply_id` 顯示回覆符號。
+- **TenManMap WebSocket 容錯**：`resetTenmanWebsocket()` 會在呼叫 `terminate()` 前先註冊一次性 `error` 監聽，確保 5xx 或早期關閉導致的「WebSocket was closed before the connection was established」不再泡泡到頂層而讓橋接流程崩潰。
 
 ## 1. 專案定位與核心價值
 
