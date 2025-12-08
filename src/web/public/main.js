@@ -218,7 +218,14 @@
       chart: true,
       chartAxisRange: [0, 100]
     },
-    voltage: { label: '電壓', unit: 'V', decimals: 2, chart: true },
+    voltage: {
+      label: '電壓',
+      unit: 'V',
+      decimals: 2,
+      clamp: [2.8, 4.3],
+      chart: true,
+      chartAxisRange: [2.8, 4.3]
+    },
     channelUtilization: { label: '通道使用率', unit: '%', decimals: 1, clamp: [0, 100], chart: true },
     airUtilTx: { label: '空中時間 (TX)', unit: '%', decimals: 1, clamp: [0, 100], chart: true },
     temperature: { label: '溫度', unit: '°C', decimals: 1, chart: true },

@@ -22,6 +22,7 @@
 - **遙測 CSV 下載**：Electron 與 Web 遙測頁新增「下載 CSV」按鈕，依目前節點與範圍匯出遙測資料。
 - **遙測最後轉發與跳數**：Telemetry 紀錄同步保存最後轉發節點與跳數資訊，桌面／Web UI 及 CSV 皆可檢視（含推測提示）。
 - **遙測電量圖表整合**：Web Dashboard 與 Electron Telemetry 將電量、通道使用率與空中時間集中在同一張百分比圖（電量折線、其他為散點），Y 軸固定 0%~100%，方便快速比較趨勢。
+- **遙測電壓刻度固定**：考量現場節點皆為 18650 1S，電壓圖表 Y 軸固定 2.8~4.3 V，便於觀察充放電變化並自動裁切雜訊。
 - **GUI 訊息頻道持久化**：桌面版新增「訊息」分頁，將 CH0~CH3 文字封包以 `callmesh-data.sqlite` 的 `message_log` 表保存並自動復原，預設每頻道保留 200 筆，並顯示來源節點、跳數與最後轉發節點（升級時會自動匯入舊版 `message-log.jsonl`）。2025-11 之後改採欄位化結構，訊息主體寫入 `message_log`，節點快照同步落在 `message_nodes`，附註行寫入 `message_extra_lines`，不再持久化整筆 JSON。
 - **訊息來源名稱對齊節點資料庫**：儲存的文字訊息會帶入節點 Mesh ID，重新載入時會回查節點資料庫補齊長短名，避免僅顯示 Mesh ID。
 - **最後轉發推測升級**：`meshtasticClient` 會比對 `callmesh-data.sqlite` 中的 `relay_stats` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
