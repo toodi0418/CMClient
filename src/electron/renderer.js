@@ -189,7 +189,14 @@ let telemetryTablePage = 1;
 let telemetryTableFilteredCount = 0;
 let telemetryMaxTotalRecords = 20000;
 const TELEMETRY_METRIC_DEFINITIONS = {
-  batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150], chart: true },
+  batteryLevel: {
+    label: '電量',
+    unit: '%',
+    decimals: 0,
+    clamp: [0, 100],
+    chart: true,
+    chartAxisRange: [0, 100]
+  },
   voltage: { label: '電壓', unit: 'V', decimals: 2, chart: true },
   channelUtilization: { label: '通道使用率', unit: '%', decimals: 1, clamp: [0, 100], chart: true },
   airUtilTx: { label: '空中時間 (TX)', unit: '%', decimals: 1, clamp: [0, 100], chart: true },
@@ -202,6 +209,58 @@ const TELEMETRY_METRIC_DEFINITIONS = {
     formatter: (value) => formatSecondsAsDuration(value)
   }
 };
+const BATTERY_COMBO_CHART_KEY = '__batteryComboChart__';
+const BATTERY_COMBO_METRICS = [
+  {
+    name: 'batteryLevel',
+    styles: {
+      borderColor: '#60a5fa',
+      backgroundColor: 'rgba(96, 165, 250, 0.15)',
+      pointBackgroundColor: '#93c5fd',
+      pointBorderColor: '#60a5fa',
+      pointRadius: 0,
+      pointHoverRadius: 3,
+      borderWidth: 2,
+      tension: 0.25,
+      fill: false,
+      showLine: true,
+      order: 1
+    }
+  },
+  {
+    name: 'channelUtilization',
+    styles: {
+      borderColor: '#34d399',
+      backgroundColor: 'rgba(16, 185, 129, 0.25)',
+      pointBackgroundColor: '#6ee7b7',
+      pointBorderColor: '#10b981',
+      pointRadius: 4,
+      pointHoverRadius: 6,
+      borderWidth: 0,
+      tension: 0,
+      fill: false,
+      showLine: false,
+      order: 2
+    }
+  },
+  {
+    name: 'airUtilTx',
+    styles: {
+      borderColor: '#f97316',
+      backgroundColor: 'rgba(249, 115, 22, 0.25)',
+      pointBackgroundColor: '#fdba74',
+      pointBorderColor: '#f97316',
+      pointRadius: 4,
+      pointHoverRadius: 6,
+      borderWidth: 0,
+      tension: 0,
+      fill: false,
+      showLine: false,
+      order: 3
+    }
+  }
+];
+const BATTERY_COMBO_METRIC_SET = new Set(BATTERY_COMBO_METRICS.map((item) => item.name));
 
 const telemetryStore = new Map();
 const telemetryRecordIds = new Set();
@@ -6326,7 +6385,15 @@ function renderTelemetryCharts(records) {
   }
 
   const seriesMap = collectTelemetrySeries(records);
-  const metricsList = updateTelemetryMetricOptions(seriesMap);
+  let metricsList = updateTelemetryMetricOptions(seriesMap);
+  const activeMetrics = new Set();
+  let combinedChartRendered = false;
+
+  if (telemetryChartMode === 'all') {
+    metricsList = metricsList.filter((metric) => !BATTERY_COMBO_METRIC_SET.has(metric));
+    combinedChartRendered = renderBatteryComboChart(seriesMap, activeMetrics);
+  }
+
   let metricsToRender = [];
   if (telemetryChartMode === 'single') {
     if (telemetryChartMetric && !seriesMap.has(telemetryChartMetric)) {
@@ -6346,14 +6413,12 @@ function renderTelemetryCharts(records) {
     metricsToRender = metricsList;
   }
 
-  if (!metricsToRender.length) {
+  if (!metricsToRender.length && !combinedChartRendered) {
     destroyAllTelemetryCharts();
     telemetryChartsContainer.classList.add('hidden');
     telemetryChartsContainer.innerHTML = '';
     return;
   }
-
-  const activeMetrics = new Set();
 
   for (const metricName of metricsToRender) {
     const series = seriesMap.get(metricName);
@@ -6439,6 +6504,26 @@ function renderTelemetryCharts(records) {
 function buildTelemetryChartConfig(metricName, def, series) {
   const dataset = series.map((point) => ({ x: point.time, y: point.value }));
   const labelText = def.label || metricName;
+  const yScaleOptions = {
+    ticks: {
+      color: '#cbd5f5',
+      callback: (value) => formatTelemetryValue(metricName, value) || value
+    },
+    grid: {
+      color: 'rgba(148, 163, 184, 0.12)'
+    }
+  };
+  if (Array.isArray(def?.chartAxisRange)) {
+    const [axisMin, axisMax] = def.chartAxisRange;
+    if (Number.isFinite(axisMin)) {
+      yScaleOptions.min = axisMin;
+      yScaleOptions.suggestedMin = axisMin;
+    }
+    if (Number.isFinite(axisMax)) {
+      yScaleOptions.max = axisMax;
+      yScaleOptions.suggestedMax = axisMax;
+    }
+  }
   return {
     type: 'line',
     data: {
@@ -6478,15 +6563,7 @@ function buildTelemetryChartConfig(metricName, def, series) {
             color: 'rgba(148, 163, 184, 0.12)'
           }
         },
-        y: {
-          ticks: {
-            color: '#cbd5f5',
-            callback: (value) => formatTelemetryValue(metricName, value) || value
-          },
-          grid: {
-            color: 'rgba(148, 163, 184, 0.12)'
-          }
-        }
+        y: yScaleOptions
       },
       plugins: {
         legend: {
@@ -6502,6 +6579,170 @@ function buildTelemetryChartConfig(metricName, def, series) {
               const value = ctx.parsed?.y;
               const formatted = formatTelemetryValue(metricName, value) || value;
               return `${labelText}: ${formatted}`;
+            }
+          }
+        }
+      }
+    }
+  };
+}
+
+function renderBatteryComboChart(seriesMap, activeMetrics) {
+  if (!telemetryChartsContainer) {
+    return false;
+  }
+  const available = [];
+  for (const meta of BATTERY_COMBO_METRICS) {
+    const series = seriesMap.get(meta.name);
+    if (Array.isArray(series) && series.length) {
+      available.push({ meta, series });
+    }
+  }
+  if (!available.length) {
+    return false;
+  }
+  activeMetrics.add(BATTERY_COMBO_CHART_KEY);
+  const datasetEntries = available.map(({ meta, series }) => {
+    const def = TELEMETRY_METRIC_DEFINITIONS[meta.name] || { label: meta.name };
+    const points = series.map((point) => ({ x: point.time, y: point.value }));
+    const styles = meta.styles || {};
+    return {
+      meta,
+      latestValue: series[series.length - 1]?.value ?? null,
+      dataset: {
+        label: def.label || meta.name,
+        data: points,
+        telemetryMetric: meta.name,
+        borderColor: styles.borderColor || '#60a5fa',
+        backgroundColor: styles.backgroundColor ?? 'rgba(96, 165, 250, 0.18)',
+        pointBackgroundColor: styles.pointBackgroundColor ?? styles.backgroundColor ?? '#bfdbfe',
+        pointBorderColor: styles.pointBorderColor ?? styles.borderColor ?? '#60a5fa',
+        pointRadius: styles.pointRadius ?? 3,
+        pointHoverRadius: styles.pointHoverRadius ?? styles.pointRadius ?? 4,
+        borderWidth: styles.borderWidth ?? 2,
+        tension: styles.tension ?? 0,
+        fill: styles.fill ?? false,
+        showLine: styles.showLine ?? false,
+        order: styles.order ?? 1
+      }
+    };
+  });
+  if (!datasetEntries.length) {
+    return false;
+  }
+  const datasets = datasetEntries.map((entry) => entry.dataset);
+  const batteryEntry = datasetEntries.find((entry) => entry.meta.name === 'batteryLevel');
+  const latestEntry = batteryEntry || datasetEntries[0];
+  const latestMetric = latestEntry?.meta?.name;
+  const latestValue = latestEntry?.latestValue;
+  const latestLabel =
+    latestMetric != null ? formatTelemetryValue(latestMetric, latestValue) || '—' : '—';
+
+  let view = telemetryCharts.get(BATTERY_COMBO_CHART_KEY);
+  if (!view) {
+    const card = document.createElement('article');
+    card.className = 'telemetry-chart-card';
+    const header = document.createElement('div');
+    header.className = 'telemetry-chart-header';
+    const title = document.createElement('span');
+    title.className = 'telemetry-chart-title';
+    title.textContent = '電量 / 通道使用率 / 空中時間';
+    const latest = document.createElement('span');
+    latest.className = 'telemetry-chart-latest';
+    latest.textContent = latestLabel;
+    header.append(title, latest);
+    const canvasWrap = document.createElement('div');
+    canvasWrap.className = 'telemetry-chart-canvas-wrap';
+    const canvas = document.createElement('canvas');
+    canvasWrap.appendChild(canvas);
+    card.append(header, canvasWrap);
+    const ctx = canvas.getContext('2d');
+    const chart = new window.Chart(ctx, buildBatteryComboChartConfig(datasets));
+    view = {
+      chart,
+      card,
+      titleEl: title,
+      latestEl: latest
+    };
+    telemetryCharts.set(BATTERY_COMBO_CHART_KEY, view);
+  } else {
+    view.chart.data.datasets = datasets;
+    view.chart.update('none');
+  }
+  if (view.latestEl) {
+    view.latestEl.textContent = latestLabel;
+  }
+  const firstChild = telemetryChartsContainer.firstChild;
+  if (firstChild) {
+    telemetryChartsContainer.insertBefore(view.card, firstChild);
+  } else {
+    telemetryChartsContainer.appendChild(view.card);
+  }
+  return true;
+}
+
+function buildBatteryComboChartConfig(datasets) {
+  return {
+    type: 'line',
+    data: {
+      datasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      parsing: false,
+      animation: false,
+      interaction: {
+        mode: 'nearest',
+        intersect: false
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          ticks: {
+            color: '#cbd5f5',
+            callback: (value) => formatTelemetryAxisTick(value)
+          },
+          grid: {
+            color: 'rgba(148, 163, 184, 0.12)'
+          }
+        },
+        y: {
+          min: 0,
+          max: 100,
+          ticks: {
+            color: '#cbd5f5',
+            callback: (value) => formatTelemetryValue('batteryLevel', value) || value
+          },
+          grid: {
+            color: 'rgba(148, 163, 184, 0.12)'
+          }
+        }
+      },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'bottom',
+          labels: {
+            color: '#cbd5f5',
+            usePointStyle: true,
+            padding: 12
+          }
+        },
+        tooltip: {
+          callbacks: {
+            title: (items) => {
+              if (!items || !items.length) return '';
+              return new Date(items[0].parsed.x).toLocaleString();
+            },
+            label: (ctx) => {
+              const dataset = ctx.dataset ?? {};
+              const metricName = dataset.telemetryMetric;
+              const formatted =
+                metricName != null
+                  ? formatTelemetryValue(metricName, ctx.parsed?.y) || ctx.parsed?.y
+                  : ctx.parsed?.y;
+              return `${dataset.label || ''}: ${formatted}`;
             }
           }
         }
