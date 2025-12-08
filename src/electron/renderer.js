@@ -261,6 +261,7 @@ const BATTERY_COMBO_METRICS = [
   }
 ];
 const BATTERY_COMBO_METRIC_SET = new Set(BATTERY_COMBO_METRICS.map((item) => item.name));
+const BATTERY_COMBO_TOOLTIP_MAX_DELTA_MS = 5 * 60 * 1000;
 
 const telemetryStore = new Map();
 const telemetryRecordIds = new Set();
@@ -6736,19 +6737,72 @@ function buildBatteryComboChartConfig(datasets) {
               return new Date(items[0].parsed.x).toLocaleString();
             },
             label: (ctx) => {
+              const tooltip = ctx.chart?.tooltip;
+              const anchor = tooltip?.dataPoints?.[0];
+              if (!anchor) {
+                const dataset = ctx.dataset ?? {};
+                return `${dataset.label || ''}: ${ctx.formattedValue ?? ctx.parsed?.y ?? ''}`;
+              }
+              if (ctx.datasetIndex !== anchor.datasetIndex) {
+                return null;
+              }
+              const anchorX = anchor.parsed?.x;
+              const lines = buildBatteryComboTooltipLines(ctx.chart, anchorX);
+              if (lines && lines.length) {
+                return lines;
+              }
               const dataset = ctx.dataset ?? {};
-              const metricName = dataset.telemetryMetric;
-              const formatted =
-                metricName != null
-                  ? formatTelemetryValue(metricName, ctx.parsed?.y) || ctx.parsed?.y
-                  : ctx.parsed?.y;
-              return `${dataset.label || ''}: ${formatted}`;
+              return `${dataset.label || ''}: ${ctx.formattedValue ?? ctx.parsed?.y ?? ''}`;
             }
           }
         }
       }
     }
   };
+}
+
+function buildBatteryComboTooltipLines(chart, anchorX) {
+  if (!chart || !Number.isFinite(anchorX)) {
+    return null;
+  }
+  const lines = [];
+  for (const dataset of chart.data.datasets || []) {
+    const point = findPointNearX(dataset.data, anchorX, BATTERY_COMBO_TOOLTIP_MAX_DELTA_MS);
+    if (!point) continue;
+    const metricName = dataset.telemetryMetric;
+    const formatted =
+      metricName != null ? formatTelemetryValue(metricName, point.y) || point.y : point.y;
+    lines.push(`${dataset.label || ''}: ${formatted}`);
+  }
+  return lines.length ? lines : null;
+}
+
+function findPointNearX(data, targetX, tolerance = BATTERY_COMBO_TOOLTIP_MAX_DELTA_MS) {
+  if (!Array.isArray(data) || !Number.isFinite(targetX)) {
+    return null;
+  }
+  let closestPoint = null;
+  let minDelta = Infinity;
+  for (const entry of data) {
+    if (!entry) continue;
+    const x = Number(entry.x ?? entry[0]);
+    const y = Number(entry.y ?? entry[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      continue;
+    }
+    const delta = Math.abs(x - targetX);
+    if (delta < minDelta) {
+      minDelta = delta;
+      closestPoint = { x, y };
+    }
+  }
+  if (!closestPoint) {
+    return null;
+  }
+  if (Number.isFinite(tolerance) && minDelta > tolerance) {
+    return null;
+  }
+  return closestPoint;
 }
 
 function destroyAllTelemetryCharts() {
