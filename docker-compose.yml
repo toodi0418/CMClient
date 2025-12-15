@@ -19,6 +19,8 @@ services:
       AUTO_UPDATE_BRANCH: "${AUTO_UPDATE_BRANCH:-main}"
       AUTO_UPDATE_WORKDIR: "${AUTO_UPDATE_WORKDIR:-/data/callmesh/app-src}"
       AUTO_UPDATE_POLL_SECONDS: "${AUTO_UPDATE_POLL_SECONDS:-300}"
+      MESHTASTIC_HOST: "${MESHTASTIC_HOST}"
+      MESHTASTIC_PORT: "${MESHTASTIC_PORT}"
     volumes:
       - callmesh-data:/data/callmesh
     ports:
