@@ -3979,6 +3979,7 @@ function ensureRelayGuessSuffix(label, summary) {
       latestMetric != null
         ? formatTelemetryFixed(latestMetric, latestValue, latestDecimals) || '—'
         : '—';
+    const statusLabel = formatBatteryComboStatusLabel(datasetEntries);
 
     let view = telemetryCharts.get(BATTERY_COMBO_CHART_KEY);
     if (!view) {
@@ -3993,18 +3994,22 @@ function ensureRelayGuessSuffix(label, summary) {
       latest.className = 'telemetry-chart-latest';
       latest.textContent = latestLabel;
       header.append(title, latest);
+      const status = document.createElement('div');
+      status.className = 'telemetry-chart-status';
+      status.textContent = statusLabel;
       const canvasWrap = document.createElement('div');
       canvasWrap.className = 'telemetry-chart-canvas-wrap';
       const canvas = document.createElement('canvas');
       canvasWrap.appendChild(canvas);
-      card.append(header, canvasWrap);
+      card.append(header, status, canvasWrap);
       const ctx = canvas.getContext('2d');
       const chart = new window.Chart(ctx, buildBatteryComboChartConfig(datasets));
       view = {
         chart,
         card,
         titleEl: title,
-        latestEl: latest
+        latestEl: latest,
+        statusEl: status
       };
       telemetryCharts.set(BATTERY_COMBO_CHART_KEY, view);
     } else {
@@ -4013,6 +4018,9 @@ function ensureRelayGuessSuffix(label, summary) {
     }
     if (view.latestEl) {
       view.latestEl.textContent = latestLabel;
+    }
+    if (view.statusEl) {
+      view.statusEl.textContent = statusLabel;
     }
     const firstChild = telemetryChartsContainer.firstChild;
     if (firstChild) {
@@ -4105,6 +4113,25 @@ function ensureRelayGuessSuffix(label, summary) {
         }
       }
     };
+  }
+
+  function formatBatteryComboStatusLabel(datasetEntries) {
+    if (!Array.isArray(datasetEntries) || !datasetEntries.length) {
+      return '目前狀態：—';
+    }
+    const parts = [];
+    for (const entry of datasetEntries) {
+      const metricName = entry?.meta?.name;
+      if (!metricName) {
+        continue;
+      }
+      const def = TELEMETRY_METRIC_DEFINITIONS[metricName] || {};
+      const label = def.label || metricName;
+      const formatted =
+        formatTelemetryFixed(metricName, entry?.latestValue, entry?.decimals) || '—';
+      parts.push(`${label} ${formatted}`);
+    }
+    return `目前狀態：${parts.length ? parts.join(' ｜ ') : '—'}`;
   }
 
   function buildBatteryComboTooltipLines(chart, anchorX) {

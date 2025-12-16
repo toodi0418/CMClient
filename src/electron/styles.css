@@ -1236,6 +1236,12 @@ header {
   color: #cbd5f5;
 }
 
+.telemetry-chart-status {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  color: #a5b4fc;
+}
+
 .telemetry-chart-card canvas {
   width: 100%;
   height: 100%;

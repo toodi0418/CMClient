@@ -1415,6 +1415,12 @@ tbody tr:hover {
   color: #cbd5f5;
 }
 
+.telemetry-chart-status {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: #a5b4fc;
+}
+
 .telemetry-chart-canvas-wrap {
   position: relative;
   width: 100%;

@@ -178,6 +178,21 @@ class MeshtasticClient extends EventEmitter {
     return normalized.toLowerCase().startsWith('!abcd');
   }
 
+  _getNodeDatabaseRecord(meshId) {
+    if (!meshId) {
+      return null;
+    }
+    if (typeof nodeDatabase?.get !== 'function') {
+      return null;
+    }
+    try {
+      return nodeDatabase.get(meshId);
+    } catch (err) {
+      console.warn(`[relay-guess] nodeDatabase lookup failed: ${err.message}`);
+      return null;
+    }
+  }
+
   _normalizeRelayNode(relayNode, { snr = null, rssi = null } = {}) {
     const raw = Number(relayNode) >>> 0;
     // the firmware sets relay_node to the full node id, but in some cases only
@@ -214,12 +229,7 @@ class MeshtasticClient extends EventEmitter {
         return null;
       }
       const normalizedId = formatHexId(match >>> 0);
-      let hasNodeRecord = false;
-      try {
-        hasNodeRecord = Boolean(nodeDatabase?.get?.(normalizedId));
-      } catch {
-        hasNodeRecord = false;
-      }
+      const hasNodeRecord = Boolean(this._getNodeDatabaseRecord(normalizedId));
       const missingDbRecord = !hasNodeRecord;
       const guessed = isTruncatedId || missingDbRecord;
       const reasonParts = [];
@@ -240,16 +250,26 @@ class MeshtasticClient extends EventEmitter {
     }
     const candidates = Array.from(matches);
     const guessResult = this._guessRelayCandidate(candidates, { snr, rssi });
-    if (guessResult) {
-      if (guessResult.nodeId != null) {
-        this._recordRelayTailCandidate(guessResult.nodeId);
+      if (guessResult) {
+        if (guessResult.nodeId != null) {
+          this._recordRelayTailCandidate(guessResult.nodeId);
+        }
+        let forceTailLabel = Boolean(guessResult.forceTailLabel);
+        if (!forceTailLabel && guessResult.nodeId != null) {
+          const normalizedCandidate = formatHexId(guessResult.nodeId >>> 0);
+          const hasNodeRecord = Boolean(this._getNodeDatabaseRecord(normalizedCandidate));
+          if (isTruncatedId && !hasNodeRecord) {
+            forceTailLabel = true;
+          }
+        } else if (!forceTailLabel && isTruncatedId) {
+          forceTailLabel = true;
+        }
+        return {
+          ...guessResult,
+          tailNodeId: guessResult.tailNodeId ?? raw >>> 0,
+          forceTailLabel
+        };
       }
-      return {
-        ...guessResult,
-        tailNodeId: guessResult.tailNodeId ?? raw >>> 0,
-        forceTailLabel: guessResult.forceTailLabel || isTruncatedId
-      };
-    }
     if (matches.size > 1) {
       const suffix = raw.toString(16).padStart(2, '0').toUpperCase();
       const labels = this._describeRelayCandidates(candidates);
@@ -1973,25 +1993,32 @@ class MeshtasticClient extends EventEmitter {
       return { label: 'unknown', meshId: null, meshIdNormalized: null };
     }
     const num = nodeNum >>> 0;
-    const entry = this.nodeMap.get(num);
+    const entry = this.nodeMap.get(num) || null;
     const meshIdRaw = entry?.id || formatHexId(num);
     const normalizedMeshId = normalizeMeshId(meshIdRaw);
     const meshId = normalizedMeshId || meshIdRaw;
+    const dbRecord = this._getNodeDatabaseRecord(normalizedMeshId || meshId);
+    const resolvedLongName = entry?.longName ?? dbRecord?.longName ?? null;
+    const resolvedShortName = entry?.shortName ?? dbRecord?.shortName ?? null;
+    const resolvedHwModel = entry?.hwModel ?? dbRecord?.hwModel ?? null;
+    const resolvedRole = entry?.role ?? dbRecord?.role ?? null;
+    const resolvedMeshIdOriginal =
+      entry?.meshIdOriginal || entry?.id || dbRecord?.meshIdOriginal || meshIdRaw || null;
     const label =
       this._composeNodeLabel({
-        longName: entry?.longName,
-        shortName: entry?.shortName,
+        longName: resolvedLongName,
+        shortName: resolvedShortName,
         meshId
       }) || meshId || 'unknown';
     return {
       label,
       meshId,
       meshIdNormalized: normalizedMeshId || null,
-      meshIdOriginal: meshIdRaw || null,
-      shortName: entry?.shortName,
-      longName: entry?.longName,
-      hwModel: entry?.hwModel ?? null,
-      role: entry?.role ?? null,
+      meshIdOriginal: resolvedMeshIdOriginal,
+      shortName: resolvedShortName,
+      longName: resolvedLongName,
+      hwModel: resolvedHwModel,
+      role: resolvedRole,
       raw: num
     };
   }
