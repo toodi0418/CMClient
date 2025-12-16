@@ -6633,6 +6633,7 @@ function renderBatteryComboChart(seriesMap, activeMetrics) {
     const styles = meta.styles || {};
     return {
       meta,
+      series,
       latestValue: series[series.length - 1]?.value ?? null,
       dataset: {
         label: def.label || meta.name,
@@ -6662,7 +6663,8 @@ function renderBatteryComboChart(seriesMap, activeMetrics) {
   const latestValue = latestEntry?.latestValue;
   const latestLabel =
     latestMetric != null ? formatTelemetryValue(latestMetric, latestValue) || '—' : '—';
-  const statusLabel = formatBatteryComboStatus(datasetEntries);
+  const { statusText, trendText } = formatBatteryComboStatus(datasetEntries);
+  const combinedStatus = trendText ? `${statusText} ｜ 電量成長 ${trendText}` : statusText;
 
   let view = telemetryCharts.get(BATTERY_COMBO_CHART_KEY);
   if (!view) {
@@ -6679,7 +6681,7 @@ function renderBatteryComboChart(seriesMap, activeMetrics) {
     header.append(title, latest);
     const status = document.createElement('div');
     status.className = 'telemetry-chart-status';
-    status.textContent = statusLabel;
+    status.textContent = combinedStatus;
     const canvasWrap = document.createElement('div');
     canvasWrap.className = 'telemetry-chart-canvas-wrap';
     const canvas = document.createElement('canvas');
@@ -6703,7 +6705,7 @@ function renderBatteryComboChart(seriesMap, activeMetrics) {
     view.latestEl.textContent = latestLabel;
   }
   if (view.statusEl) {
-    view.statusEl.textContent = statusLabel;
+    view.statusEl.textContent = combinedStatus;
   }
   const firstChild = telemetryChartsContainer.firstChild;
   if (firstChild) {
@@ -6798,21 +6800,62 @@ function buildBatteryComboChartConfig(datasets) {
 }
 
 function formatBatteryComboStatus(entries) {
-  if (!Array.isArray(entries) || !entries.length) {
-    return '目前狀態：—';
-  }
   const parts = [];
-  for (const entry of entries) {
-    const metricName = entry?.meta?.name;
-    if (!metricName) {
-      continue;
+  if (Array.isArray(entries)) {
+    for (const entry of entries) {
+      const metricName = entry?.meta?.name;
+      if (!metricName) {
+        continue;
+      }
+      const def = TELEMETRY_METRIC_DEFINITIONS[metricName] || {};
+      const label = def.label || metricName;
+      const formatted = formatTelemetryValue(metricName, entry?.latestValue) || '—';
+      parts.push(`${label} ${formatted}`);
     }
-    const def = TELEMETRY_METRIC_DEFINITIONS[metricName] || {};
-    const label = def.label || metricName;
-    const formatted = formatTelemetryValue(metricName, entry?.latestValue) || '—';
-    parts.push(`${label} ${formatted}`);
   }
-  return `目前狀態：${parts.length ? parts.join(' ｜ ') : '—'}`;
+  const statusText = `目前狀態：${parts.length ? parts.join(' ｜ ') : '—'}`;
+  const trendText = formatBatteryComboTrend(entries);
+  return { statusText, trendText };
+}
+
+function formatBatteryComboTrend(entries) {
+  if (!Array.isArray(entries)) {
+    return null;
+  }
+  const batteryEntry = entries.find((entry) => entry?.meta?.name === 'batteryLevel');
+  if (!batteryEntry || !Array.isArray(batteryEntry.series)) {
+    return null;
+  }
+  const delta = computeBatteryAverageDelta(batteryEntry.series);
+  if (!Number.isFinite(delta)) {
+    return null;
+  }
+  const decimals = Math.abs(delta) >= 1 ? 1 : 2;
+  let rounded = Number(delta.toFixed(decimals));
+  if (Object.is(rounded, -0)) {
+    rounded = 0;
+  }
+  const sign = rounded > 0 ? '+' : '';
+  return `${sign}${rounded.toFixed(decimals)}%`;
+}
+
+function computeBatteryAverageDelta(series) {
+  if (!Array.isArray(series) || series.length < 2) {
+    return null;
+  }
+  const values = series
+    .map((point) => Number(point?.value ?? point?.y))
+    .filter((value) => Number.isFinite(value));
+  if (values.length < 2) {
+    return null;
+  }
+  const edgeCount = Math.max(1, Math.floor(values.length * 0.2));
+  const headValues = values.slice(0, edgeCount);
+  const tailValues = values.slice(-edgeCount);
+  const avg = (items) => items.reduce((sum, value) => sum + value, 0) / items.length;
+  const startAvg = avg(headValues);
+  const endAvg = avg(tailValues);
+  return endAvg - startAvg;
 }
 
 function buildBatteryComboTooltipLines(chart, anchorX) {

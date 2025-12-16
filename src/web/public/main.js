@@ -3947,6 +3947,7 @@ function ensureRelayGuessSuffix(label, summary) {
         meta,
         decimals,
         latestValue: series[series.length - 1]?.value ?? null,
+        series,
         dataset: {
           label: def.label || meta.name,
           data: points,
@@ -3979,7 +3980,8 @@ function ensureRelayGuessSuffix(label, summary) {
       latestMetric != null
         ? formatTelemetryFixed(latestMetric, latestValue, latestDecimals) || '—'
         : '—';
-    const statusLabel = formatBatteryComboStatusLabel(datasetEntries);
+    const { statusText, trendText } = formatBatteryComboStatusLabel(datasetEntries);
+    const combinedStatus = trendText ? `${statusText} ｜ 電量成長 ${trendText}` : statusText;
 
     let view = telemetryCharts.get(BATTERY_COMBO_CHART_KEY);
     if (!view) {
@@ -3996,7 +3998,7 @@ function ensureRelayGuessSuffix(label, summary) {
       header.append(title, latest);
       const status = document.createElement('div');
       status.className = 'telemetry-chart-status';
-      status.textContent = statusLabel;
+      status.textContent = combinedStatus;
       const canvasWrap = document.createElement('div');
       canvasWrap.className = 'telemetry-chart-canvas-wrap';
       const canvas = document.createElement('canvas');
@@ -4020,7 +4022,7 @@ function ensureRelayGuessSuffix(label, summary) {
       view.latestEl.textContent = latestLabel;
     }
     if (view.statusEl) {
-      view.statusEl.textContent = statusLabel;
+      view.statusEl.textContent = combinedStatus;
     }
     const firstChild = telemetryChartsContainer.firstChild;
     if (firstChild) {
@@ -4116,22 +4118,63 @@ function ensureRelayGuessSuffix(label, summary) {
   }
 
   function formatBatteryComboStatusLabel(datasetEntries) {
-    if (!Array.isArray(datasetEntries) || !datasetEntries.length) {
-      return '目前狀態：—';
-    }
     const parts = [];
-    for (const entry of datasetEntries) {
-      const metricName = entry?.meta?.name;
-      if (!metricName) {
-        continue;
+    if (Array.isArray(datasetEntries)) {
+      for (const entry of datasetEntries) {
+        const metricName = entry?.meta?.name;
+        if (!metricName) {
+          continue;
+        }
+        const def = TELEMETRY_METRIC_DEFINITIONS[metricName] || {};
+        const label = def.label || metricName;
+        const formatted =
+          formatTelemetryFixed(metricName, entry?.latestValue, entry?.decimals) || '—';
+        parts.push(`${label} ${formatted}`);
       }
-      const def = TELEMETRY_METRIC_DEFINITIONS[metricName] || {};
-      const label = def.label || metricName;
-      const formatted =
-        formatTelemetryFixed(metricName, entry?.latestValue, entry?.decimals) || '—';
-      parts.push(`${label} ${formatted}`);
     }
-    return `目前狀態：${parts.length ? parts.join(' ｜ ') : '—'}`;
+    const statusText = `目前狀態：${parts.length ? parts.join(' ｜ ') : '—'}`;
+    const trendText = formatBatteryComboTrendLabel(datasetEntries);
+    return { statusText, trendText };
+  }
+
+  function formatBatteryComboTrendLabel(datasetEntries) {
+    if (!Array.isArray(datasetEntries)) {
+      return null;
+    }
+    const entry = datasetEntries.find((item) => item?.meta?.name === 'batteryLevel');
+    if (!entry || !Array.isArray(entry.series)) {
+      return null;
+    }
+    const delta = computeBatteryAverageDelta(entry.series);
+    if (!Number.isFinite(delta)) {
+      return null;
+    }
+    const decimals = Math.abs(delta) >= 1 ? 1 : 2;
+    let rounded = Number(delta.toFixed(decimals));
+    if (Object.is(rounded, -0)) {
+      rounded = 0;
+    }
+    const sign = rounded > 0 ? '+' : '';
+    return `${sign}${rounded.toFixed(decimals)}%`;
+  }
+
+  function computeBatteryAverageDelta(series) {
+    if (!Array.isArray(series) || series.length < 2) {
+      return null;
+    }
+    const finiteSeries = series
+      .map((point) => Number(point?.value ?? point?.y))
+      .filter((value) => Number.isFinite(value));
+    if (finiteSeries.length < 2) {
+      return null;
+    }
+    const edgeCount = Math.max(1, Math.floor(finiteSeries.length * 0.2));
+    const headValues = finiteSeries.slice(0, edgeCount);
+    const tailValues = finiteSeries.slice(-edgeCount);
+    const avg = (values) => values.reduce((sum, value) => sum + value, 0) / values.length;
+    const startAvg = avg(headValues);
+    const endAvg = avg(tailValues);
+    return endAvg - startAvg;
   }
 
   function buildBatteryComboTooltipLines(chart, anchorX) {
