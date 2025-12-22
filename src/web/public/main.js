@@ -3943,10 +3943,13 @@ function ensureRelayGuessSuffix(label, summary) {
       const decimals = computeSeriesDecimals(meta.name, series);
       const points = series.map((point) => ({ x: point.time, y: point.value }));
       const styles = meta.styles || {};
+      const latestPoint = series[series.length - 1] || {};
+      const latestTimestamp = Number(latestPoint?.time);
       return {
         meta,
         decimals,
-        latestValue: series[series.length - 1]?.value ?? null,
+        latestValue: latestPoint?.value ?? null,
+        latestTimestamp: Number.isFinite(latestTimestamp) ? latestTimestamp : null,
         series,
         dataset: {
           label: def.label || meta.name,
@@ -4119,6 +4122,7 @@ function ensureRelayGuessSuffix(label, summary) {
 
   function formatBatteryComboStatusLabel(datasetEntries) {
     const parts = [];
+    let latestTimestamp = null;
     if (Array.isArray(datasetEntries)) {
       for (const entry of datasetEntries) {
         const metricName = entry?.meta?.name;
@@ -4130,9 +4134,18 @@ function ensureRelayGuessSuffix(label, summary) {
         const formatted =
           formatTelemetryFixed(metricName, entry?.latestValue, entry?.decimals) || '—';
         parts.push(`${label} ${formatted}`);
+        const entryTimestamp = Number(entry?.latestTimestamp);
+        if (
+          Number.isFinite(entryTimestamp) &&
+          (!Number.isFinite(latestTimestamp) || entryTimestamp > latestTimestamp)
+        ) {
+          latestTimestamp = entryTimestamp;
+        }
       }
     }
-    const statusText = `目前狀態：${parts.length ? parts.join(' ｜ ') : '—'}`;
+    const timestampLabel = formatTelemetryStatusTimestamp(latestTimestamp);
+    const statusPrefix = timestampLabel ? `目前狀態（${timestampLabel}）：` : '目前狀態：';
+    const statusText = `${statusPrefix}${parts.length ? parts.join(' ｜ ') : '—'}`;
     const trendText = formatBatteryComboTrendLabel(datasetEntries);
     return { statusText, trendText };
   }
@@ -4491,6 +4504,21 @@ function ensureRelayGuessSuffix(label, summary) {
     const hh = String(date.getHours()).padStart(2, '0');
     const mi = String(date.getMinutes()).padStart(2, '0');
     return `${mm}/${dd} ${hh}:${mi}`;
+  }
+
+  function formatTelemetryStatusTimestamp(timestamp) {
+    if (!Number.isFinite(timestamp)) {
+      return '';
+    }
+    const formatted = formatTelemetryAxisTick(timestamp);
+    if (formatted) {
+      return formatted;
+    }
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) {
+      return '';
+    }
+    return date.toLocaleString();
   }
 
   function computeSeriesDecimals(metricName, series) {

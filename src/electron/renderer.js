@@ -6631,10 +6631,13 @@ function renderBatteryComboChart(seriesMap, activeMetrics) {
     const def = TELEMETRY_METRIC_DEFINITIONS[meta.name] || { label: meta.name };
     const points = series.map((point) => ({ x: point.time, y: point.value }));
     const styles = meta.styles || {};
+    const latestPoint = series[series.length - 1] || {};
+    const latestTimestamp = Number(latestPoint?.time);
     return {
       meta,
       series,
-      latestValue: series[series.length - 1]?.value ?? null,
+      latestValue: latestPoint?.value ?? null,
+      latestTimestamp: Number.isFinite(latestTimestamp) ? latestTimestamp : null,
       dataset: {
         label: def.label || meta.name,
         data: points,
@@ -6801,6 +6804,7 @@ function buildBatteryComboChartConfig(datasets) {
 
 function formatBatteryComboStatus(entries) {
   const parts = [];
+  let latestTimestamp = null;
   if (Array.isArray(entries)) {
     for (const entry of entries) {
       const metricName = entry?.meta?.name;
@@ -6811,9 +6815,18 @@ function formatBatteryComboStatus(entries) {
       const label = def.label || metricName;
       const formatted = formatTelemetryValue(metricName, entry?.latestValue) || '—';
       parts.push(`${label} ${formatted}`);
+      const entryTimestamp = Number(entry?.latestTimestamp);
+      if (
+        Number.isFinite(entryTimestamp) &&
+        (!Number.isFinite(latestTimestamp) || entryTimestamp > latestTimestamp)
+      ) {
+        latestTimestamp = entryTimestamp;
+      }
     }
   }
-  const statusText = `目前狀態：${parts.length ? parts.join(' ｜ ') : '—'}`;
+  const timestampLabel = formatTelemetryStatusTimestamp(latestTimestamp);
+  const statusPrefix = timestampLabel ? `目前狀態（${timestampLabel}）：` : '目前狀態：';
+  const statusText = `${statusPrefix}${parts.length ? parts.join(' ｜ ') : '—'}`;
   const trendText = formatBatteryComboTrend(entries);
   return { statusText, trendText };
 }
@@ -6930,6 +6943,21 @@ function formatTelemetryAxisTick(value) {
   const hh = String(date.getHours()).padStart(2, '0');
   const mi = String(date.getMinutes()).padStart(2, '0');
   return `${mm}/${dd} ${hh}:${mi}`;
+}
+
+function formatTelemetryStatusTimestamp(timestamp) {
+  if (!Number.isFinite(timestamp)) {
+    return '';
+  }
+  const formatted = formatTelemetryAxisTick(timestamp);
+  if (formatted) {
+    return formatted;
+  }
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  return date.toLocaleString();
 }
 
 function clampMetricValue(value, def) {

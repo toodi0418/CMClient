@@ -44,8 +44,8 @@ const APRS_LOG_VERBOSE =
   ['1', 'true', 'yes', 'on'].includes(
     String(process.env.TMAG_APRS_LOG_VERBOSE || '').trim().toLowerCase()
   );
-const APRS_PACKET_CACHE_TTL_MS = 30 * 60_000;
-const APRS_PACKET_RECENT_WINDOW_MS = 30 * 60_000;
+const APRS_PACKET_CACHE_TTL_MS = 3 * 60 * 60_000;
+const APRS_PACKET_RECENT_WINDOW_MS = APRS_PACKET_CACHE_TTL_MS;
 const APRS_LOCAL_TX_WINDOW_MS = 30_000;
 const APRS_DELAY_SUPPRESS_DEFAULT_MS = 10_000;
 const APRS_CALLSIGN_RECENT_SUPPRESS_MS = (() => {

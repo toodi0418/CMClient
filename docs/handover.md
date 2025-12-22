@@ -21,8 +21,9 @@
 - **遙測統計**：Bridge 會回傳遙測筆數、節點數及 `telemetry-records.sqlite` 檔案大小。Electron Telemetry 頁與 Web Dashboard 均顯示最新統計。
 - **遙測 CSV 下載**：Electron 與 Web 遙測頁新增「下載 CSV」按鈕，依目前節點與範圍匯出遙測資料。
 - **遙測最後轉發與跳數**：Telemetry 紀錄同步保存最後轉發節點與跳數資訊，桌面／Web UI 及 CSV 皆可檢視（含推測提示）。
-- **遙測電量圖表整合**：Web Dashboard 與 Electron Telemetry 將電量、通道使用率與空中時間集中在同一張百分比圖（電量折線、其他為散點），Y 軸固定 0%~100%，方便快速比較趨勢。
+- **遙測電量圖表整合**：Web Dashboard 與 Electron Telemetry 將電量、通道使用率與空中時間集中在同一張百分比圖（電量折線、其他為散點），Y 軸固定 0%~100%，方便快速比較趨勢；卡片標題下方會顯示「目前狀態」以及依使用者選擇區間計算出的「電量成長」，以首尾 20% 樣本的平均值比較輸出 `+/-x%`，可以立即判斷該時段是在充電還是放電。建議解讀：24 小時區間 ±2~3% 屬於輕微波動，超過 ±5% 代表供電或負載異常；30 天區間若累積跌破 -5% 則應檢查充電策略或長期耗電來源。
 - **遙測電壓刻度固定**：考量現場節點皆為 18650 1S，電壓圖表 Y 軸固定 2.8~4.3 V，便於觀察充放電變化並自動裁切雜訊。
+- **行動裝置圖表刻度**：定義了固定範圍的圖表（電量、電壓）會強制顯示上下限並使用等距刻度，確保手機上不會因 Chart.js 自動省略而看不到 100% 與 4.3 V。
 - **GUI 訊息頻道持久化**：桌面版新增「訊息」分頁，將 CH0~CH3 文字封包以 `callmesh-data.sqlite` 的 `message_log` 表保存並自動復原，預設每頻道保留 200 筆，並顯示來源節點、跳數與最後轉發節點（升級時會自動匯入舊版 `message-log.jsonl`）。2025-11 之後改採欄位化結構，訊息主體寫入 `message_log`，節點快照同步落在 `message_nodes`，附註行寫入 `message_extra_lines`，不再持久化整筆 JSON。
 - **訊息來源名稱對齊節點資料庫**：儲存的文字訊息會帶入節點 Mesh ID，重新載入時會回查節點資料庫補齊長短名，避免僅顯示 Mesh ID。
 - **最後轉發推測升級**：`meshtasticClient` 會比對 `callmesh-data.sqlite` 中的 `relay_stats` 與節點資料庫，若韌體僅回傳尾碼則使用歷史 SNR/RSSI 推測完整節點並產生說明字串。
@@ -435,7 +436,7 @@ node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 - 若懷疑 APRS feed 沒回傳資料，可先查看 `/debug` → `aprsDedup.packetCache` 是否有任何條目，再檢查 `aprsDedup.aprsState.connected/loginVerified`、或查看 Log 分頁的 `[APRS] rx ...` 訊息（已解除靜音，會完整顯示 server 回傳內容）。
 - `TMAG_APRS_FEED_FILTER` 可覆寫預設範圍；若未設定，會依 CallMesh 下發的座標自動套用 `#filter r/<lat>/<lon>/300`（半徑 300 km）。若需要自訂，請直接填入完整 `#filter ...` 指令（或輸入 `none` 讓伺服器回到預設 m/2），調整後重啟流程並透過 `/debug` → `aprsDedup.packetCache` 驗證是否收到新呼號。
 - APRS Log 預設靜音（不再顯示大量 `rx/tx/keepalive` 行）。若需回復原本的詳細輸出，請設定 `TMAG_APRS_LOG_VERBOSE=1` 後重啟。
-- APRS 去重快取現在會同步寫入 `callmesh-data.sqlite`（`aprs_packet_cache` / `aprs_local_tx` / `aprs_callsign_summary` / `aprs_position_digest`），跨重啟仍會載回，但啟動時會重新套用 30 分鐘（`packetCache` / `callsignSummary`）與 30 秒（`localTxHistory`）的 TTL，舊資料會立即被修剪。清除資料或 `CALLMESH_ARTIFACTS_DIR` 時也會一併清空這些表。
+- APRS 去重快取現在會同步寫入 `callmesh-data.sqlite`（`aprs_packet_cache` / `aprs_local_tx` / `aprs_callsign_summary` / `aprs_position_digest`），跨重啟仍會載回，但啟動時會重新套用 3 小時（`packetCache` / `callsignSummary`）與 30 秒（`localTxHistory`）的 TTL，舊資料會立即被修剪。清除資料或 `CALLMESH_ARTIFACTS_DIR` 時也會一併清空這些表。
 
 ### 6.5 訊息頻道
 
