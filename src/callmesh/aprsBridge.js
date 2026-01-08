@@ -2639,7 +2639,6 @@ class CallMeshAprsBridge extends EventEmitter {
       type: 'meshtastic-summary',
       timestamp: Date.now(),
       appVersion: this.appVersion,
-      agent: this.callmeshState?.agent ?? null,
       summary
     };
     this.enqueueTmagRelay(payload);
@@ -2659,7 +2658,6 @@ class CallMeshAprsBridge extends EventEmitter {
       type: 'meshtastic-fromRadio',
       timestamp: Date.now(),
       appVersion: this.appVersion,
-      agent: this.callmeshState?.agent ?? buildAgentString({ product: this.agentProduct }),
       rawHex,
       rawLength,
       summary: event.summary ?? null
