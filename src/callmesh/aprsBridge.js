@@ -2639,6 +2639,16 @@ class CallMeshAprsBridge extends EventEmitter {
     this.enqueueTmagRelay(event.rawPayload);
   }
 
+  forwardTmagRelayToRadio(rawFrame) {
+    if (!this.isTmagRelayEnabled()) {
+      return;
+    }
+    if (!Buffer.isBuffer(rawFrame)) {
+      return;
+    }
+    this.enqueueTmagRelay(rawFrame);
+  }
+
   enqueueTenmanPublish(message, dedupeKey) {
     if (!message || !dedupeKey) {
       return false;

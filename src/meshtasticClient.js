@@ -2185,6 +2185,7 @@ class MeshtasticClient extends EventEmitter {
     });
     const encoded = this.toRadioType.encode(message).finish();
     const framed = framePacket(encoded);
+    this.emit('toRadioRaw', framed);
     return new Promise((resolve, reject) => {
       this._writeFrame(framed, (err) => {
         if (err) {
@@ -2210,6 +2211,7 @@ class MeshtasticClient extends EventEmitter {
     const message = this.toRadioType.create({ wantConfigId: nonce });
     const encoded = this.toRadioType.encode(message).finish();
     const framed = framePacket(encoded);
+    this.emit('toRadioRaw', framed);
     this._writeFrame(framed, (err) => {
       if (err) {
         this.emit('error', new Error(`want_config 傳送失敗: ${err.message}`));
@@ -2240,6 +2242,7 @@ class MeshtasticClient extends EventEmitter {
     const message = this.toRadioType.create({ heartbeat: {} });
     const encoded = this.toRadioType.encode(message).finish();
     const framed = framePacket(encoded);
+    this.emit('toRadioRaw', framed);
     this._writeFrame(framed, (err) => {
       if (err) {
         this.emit('error', new Error(`heartbeat 傳送失敗: ${err.message}`));

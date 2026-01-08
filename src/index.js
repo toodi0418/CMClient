@@ -887,6 +887,12 @@ async function startMonitor(argv) {
       bridge.forwardTmagRelayFromRadio({ message, rawPayload, summary });
     }
   });
+  if (typeof bridge.forwardTmagRelayToRadio === 'function') {
+    const emitOutbound = (payloadBuffer) => {
+      bridge.forwardTmagRelayToRadio(payloadBuffer);
+    };
+    client.on('toRadioRaw', emitOutbound);
+  }
 
   if (argv.format !== 'summary') {
     client.on('fromRadio', ({ message }) => {
