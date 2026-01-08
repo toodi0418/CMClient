@@ -2494,6 +2494,8 @@ class CallMeshAprsBridge extends EventEmitter {
       this.tenmanForwardState.disabledLogged = false;
       this.emitLog('TENMAN', 'TenManMap 轉發已停用');
       this.resetTenmanWebsocket();
+      this.tmagRelayState.queue = [];
+      this.resetTmagRelayWebsocket();
       return false;
     }
     this.tenmanForwardState.disabledLogged = false;
@@ -2502,11 +2504,13 @@ class CallMeshAprsBridge extends EventEmitter {
     this.requestTenmanNodeSnapshot('share-enabled');
     this.ensureTenmanWebsocket();
     this.flushTenmanQueue();
+    this.ensureTmagRelayWebsocket();
+    this.flushTmagRelayQueue();
     return true;
   }
 
   isTmagRelayEnabled() {
-    return !TMAG_RELAY_DISABLED;
+    return !TMAG_RELAY_DISABLED && this.isTenmanForwardEnabled();
   }
 
   ensureTmagRelayWebsocket() {
