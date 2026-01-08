@@ -36,7 +36,7 @@
 - **CLI 旗標**：預設關閉 Web UI；若需啟動可加上 `--web-ui`。Electron 亦可透過設定頁切換，或以 `TMAG_WEB_DASHBOARD` 強制指定。
 - **連線設定即時套用**：Electron 設定頁調整 TCP/Serial 模式、主機位址或 Serial 裝置後，會即時觸發重連並沿用更新後參數，無需手動點擊「連線」。
 - **Serial 自動重連對齊**：Serial 連線現在使用與 TCP 相同的自動重連、閒置檢測與錯誤回復流程；中斷時會進入同一套 `startReconnectLoop()` 機制。
-- **TenManMap 分享偏好持久化**：CLI (`--no-share-with-tenmanmap`)、環境變數 (`TENMAN_DISABLE=1`) 與 GUI 勾選會寫入偏好檔並呼叫 `setTenmanShareEnabled()`，即時控制資料是否同步至 TenManMap 與其合作夥伴。
+- **TenManMap 分享偏好持久化**：CLI (`--no-share-with-tenmanmap`)、環境變數 (`TENMAN_DISABLE=1`) 與 GUI 勾選會寫入偏好檔並呼叫 `setTenmanShareEnabled()`，即時控制資料是否同步至 TenManMap 與其合作夥伴；TMAG Relay 上傳（raw fromRadio/toRadio）也跟此開關綁定，關閉分享時 Relay 會同步關閉。
 - **TenManMap 訊息互通**：TenManMap WebSocket 現可接收 Meshtastic 文字封包（`message.publish`），並支援透過 `send_message` 命令回傳廣播文字；套用 5 秒節流與長度檢查，詳細規格見 `docs/tenmanmap-message-bridge.md`。
 - **TenManMap 回覆與自發訊息同步**：TenManMap 下行訊息可攜帶 `destination` / `reply_id`；橋接層會在廣播時保留 `reply_to`、在 Meshtastic 封包寫入 `reply_id`，並回報新的 `mesh_packet_id`。CLI / Electron / Web 會發出合成 summary 以顯示自身送出的訊息（含回覆箭頭資訊），iOS/Android App 亦可藉由 `reply_id` 顯示回覆符號。
 - **TenManMap WebSocket 容錯**：`resetTenmanWebsocket()` 會在呼叫 `terminate()` 前先註冊一次性 `error` 監聽，確保 5xx 或早期關閉導致的「WebSocket was closed before the connection was established」不再泡泡到頂層而讓橋接流程崩潰。
