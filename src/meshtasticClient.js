@@ -2051,17 +2051,17 @@ class MeshtasticClient extends EventEmitter {
         targetNode.meshIdOriginal ?? meshIdCandidate ?? normalized;
     }
     const longName = sanitizeText(decodedNodeInfo.longName);
-    if (!targetNode.longName && longName) {
+    if (longName && longName !== targetNode.longName) {
       targetNode.longName = longName;
     }
     const shortName = sanitizeText(decodedNodeInfo.shortName);
-    if (!targetNode.shortName && shortName) {
+    if (shortName && shortName !== targetNode.shortName) {
       targetNode.shortName = shortName;
     }
-    if (targetNode.hwModel == null && decodedNodeInfo.hwModel != null) {
+    if (decodedNodeInfo.hwModel != null && targetNode.hwModel !== decodedNodeInfo.hwModel) {
       targetNode.hwModel = decodedNodeInfo.hwModel;
     }
-    if (targetNode.role == null && decodedNodeInfo.role != null) {
+    if (decodedNodeInfo.role != null && targetNode.role !== decodedNodeInfo.role) {
       targetNode.role = decodedNodeInfo.role;
     }
     const recomputedLabel = this._composeNodeLabel({
@@ -2071,6 +2071,19 @@ class MeshtasticClient extends EventEmitter {
     });
     if (recomputedLabel) {
       targetNode.label = recomputedLabel;
+    }
+    if (Number.isFinite(targetNode.raw)) {
+      const rawId = targetNode.raw >>> 0;
+      const existing = this.nodeMap.get(rawId) || {};
+      this.nodeMap.set(rawId, {
+        ...existing,
+        id: targetNode.meshIdOriginal || existing.id || formatHexId(rawId),
+        meshIdOriginal: targetNode.meshIdOriginal ?? existing.meshIdOriginal ?? null,
+        shortName: targetNode.shortName ?? existing.shortName ?? null,
+        longName: targetNode.longName ?? existing.longName ?? null,
+        hwModel: targetNode.hwModel ?? existing.hwModel ?? null,
+        role: targetNode.role ?? existing.role ?? null
+      });
     }
   }
 
