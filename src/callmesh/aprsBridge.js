@@ -67,9 +67,6 @@ const TENMAN_FORWARD_VERBOSE_LOG = ['1', 'true', 'yes', 'on'].includes(
 const TENMAN_INBOUND_MIN_INTERVAL_MS = 5000;
 const TENMAN_FORWARD_NODE_UPDATE_BUCKET_MS = 30_000;
 const TMAG_RELAY_WS_ENDPOINT = process.env.TMAG_RELAY_ENDPOINT || 'wss://relay.tmmarc.org/';
-const TMAG_RELAY_DISABLED = ['1', 'true', 'yes', 'on'].includes(
-  String(process.env.TMAG_RELAY_DISABLE || '').trim().toLowerCase()
-);
 const TMAG_RELAY_QUEUE_LIMIT = 256;
 const TMAG_RELAY_RECONNECT_BASE_MS = 3_000;
 const TMAG_RELAY_RECONNECT_MAX_MS = 30_000;
@@ -2510,7 +2507,7 @@ class CallMeshAprsBridge extends EventEmitter {
   }
 
   isTmagRelayEnabled() {
-    return !TMAG_RELAY_DISABLED && this.isTenmanForwardEnabled();
+    return this.isTenmanForwardEnabled();
   }
 
   ensureTmagRelayWebsocket() {
