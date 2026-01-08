@@ -2529,6 +2529,7 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     state.connecting = true;
+    this.emitLog('TMAG-RELAY', `嘗試連線至 ${TMAG_RELAY_WS_ENDPOINT}`);
     try {
       const ws = new WebSocket(TMAG_RELAY_WS_ENDPOINT);
       state.websocket = ws;
@@ -2609,6 +2610,7 @@ class CallMeshAprsBridge extends EventEmitter {
       state.queue.shift();
     }
     state.queue.push(data);
+    this.emitLog('TMAG-RELAY', `佇列加入 ${data.length} bytes${state.websocket ? '' : '（尚未連線）'}`);
     this.flushTmagRelayQueue();
   }
 
