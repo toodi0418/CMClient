@@ -217,6 +217,7 @@ const TELEMETRY_METRIC_DEFINITIONS = {
   }
 };
 const BATTERY_COMBO_CHART_KEY = '__batteryComboChart__';
+const ENV_COMBO_CHART_KEY = '__envComboChart__';
 const BATTERY_COMBO_METRICS = [
   {
     name: 'batteryLevel',
@@ -268,6 +269,57 @@ const BATTERY_COMBO_METRICS = [
   }
 ];
 const BATTERY_COMBO_METRIC_SET = new Set(BATTERY_COMBO_METRICS.map((item) => item.name));
+const ENV_COMBO_METRICS = [
+  {
+    name: 'temperature',
+    axisId: 'temp',
+    styles: {
+      borderColor: '#f472b6',
+      backgroundColor: 'rgba(244, 114, 182, 0.15)',
+      pointBackgroundColor: '#f9a8d4',
+      pointBorderColor: '#f472b6',
+      pointRadius: 3,
+      pointHoverRadius: 4,
+      borderWidth: 2,
+      tension: 0.2,
+      fill: false,
+      order: 1
+    }
+  },
+  {
+    name: 'relativeHumidity',
+    axisId: 'humidity',
+    styles: {
+      borderColor: '#38bdf8',
+      backgroundColor: 'rgba(56, 189, 248, 0.18)',
+      pointBackgroundColor: '#7dd3fc',
+      pointBorderColor: '#38bdf8',
+      pointRadius: 3,
+      pointHoverRadius: 4,
+      borderWidth: 2,
+      tension: 0.2,
+      fill: false,
+      order: 2
+    }
+  },
+  {
+    name: 'barometricPressure',
+    axisId: 'pressure',
+    styles: {
+      borderColor: '#a78bfa',
+      backgroundColor: 'rgba(167, 139, 250, 0.15)',
+      pointBackgroundColor: '#c4b5fd',
+      pointBorderColor: '#a78bfa',
+      pointRadius: 3,
+      pointHoverRadius: 4,
+      borderWidth: 2,
+      tension: 0.2,
+      fill: false,
+      order: 3
+    }
+  }
+];
+const ENV_COMBO_METRIC_SET = new Set(ENV_COMBO_METRICS.map((item) => item.name));
 const BATTERY_COMBO_TOOLTIP_MAX_DELTA_MS = 5 * 60 * 1000;
 
 const telemetryStore = new Map();
@@ -618,8 +670,6 @@ function formatAprsRejectedLabel(summary) {
       return '本機冷卻時間內已上傳';
     case 'seen-on-feed':
       return 'APRS-IS 已有相同封包';
-    case 'recent-activity':
-      return '呼號冷卻中';
     default:
       return summary.aprsRejected ? '不符合 APRS 上傳條件' : null;
   }
@@ -655,7 +705,7 @@ function showPendingAprsReason(entry) {
   const { pendingReasonContext: context } = entry;
   if (context && Number.isFinite(context.remainingMs)) {
     const seconds = Math.max(1, Math.ceil(context.remainingMs / 1000));
-    lines.push(`冷卻剩餘：約 ${seconds} 秒`);
+    lines.push(`需等待：約 ${seconds} 秒`);
   }
   if (Array.isArray(entry.pendingReasonDetails)) {
     entry.pendingReasonDetails.forEach((line) => {
@@ -6406,8 +6456,16 @@ function renderTelemetryCharts(records) {
   let combinedChartRendered = false;
 
   if (telemetryChartMode === 'all') {
-    metricsList = metricsList.filter((metric) => !BATTERY_COMBO_METRIC_SET.has(metric));
-    combinedChartRendered = renderBatteryComboChart(seriesMap, activeMetrics);
+    const batteryRendered = renderBatteryComboChart(seriesMap, activeMetrics);
+    if (batteryRendered) {
+      metricsList = metricsList.filter((metric) => !BATTERY_COMBO_METRIC_SET.has(metric));
+      combinedChartRendered = true;
+    }
+    const environmentRendered = renderEnvironmentComboChart(seriesMap, activeMetrics);
+    if (environmentRendered) {
+      metricsList = metricsList.filter((metric) => !ENV_COMBO_METRIC_SET.has(metric));
+      combinedChartRendered = true;
+    }
   }
 
   let metricsToRender = [];
@@ -6719,6 +6777,117 @@ function renderBatteryComboChart(seriesMap, activeMetrics) {
   return true;
 }
 
+function renderEnvironmentComboChart(seriesMap, activeMetrics) {
+  if (!telemetryChartsContainer) {
+    return false;
+  }
+  const available = [];
+  for (const meta of ENV_COMBO_METRICS) {
+    const series = seriesMap.get(meta.name);
+    if (Array.isArray(series) && series.length) {
+      available.push({ meta, series });
+    }
+  }
+  if (!available.length) {
+    return false;
+  }
+  activeMetrics.add(ENV_COMBO_CHART_KEY);
+  const datasetEntries = available.map(({ meta, series }) => {
+    const def = TELEMETRY_METRIC_DEFINITIONS[meta.name] || { label: meta.name };
+    const points = series.map((point) => ({ x: point.time, y: point.value }));
+    const styles = meta.styles || {};
+    const latestPoint = series[series.length - 1] || {};
+    const latestTimestamp = Number(latestPoint?.time);
+    return {
+      meta,
+      series,
+      latestValue: latestPoint?.value ?? null,
+      latestTimestamp: Number.isFinite(latestTimestamp) ? latestTimestamp : null,
+      dataset: {
+        label: def.label || meta.name,
+        data: points,
+        telemetryMetric: meta.name,
+        yAxisID: meta.axisId || meta.name,
+        borderColor: styles.borderColor || '#38bdf8',
+        backgroundColor: styles.backgroundColor ?? 'rgba(56, 189, 248, 0.18)',
+        pointBackgroundColor: styles.pointBackgroundColor ?? styles.backgroundColor ?? '#7dd3fc',
+        pointBorderColor: styles.pointBorderColor ?? styles.borderColor ?? '#38bdf8',
+        pointRadius: styles.pointRadius ?? 3,
+        pointHoverRadius: styles.pointHoverRadius ?? styles.pointRadius ?? 4,
+        borderWidth: styles.borderWidth ?? 2,
+        tension: styles.tension ?? 0.2,
+        fill: styles.fill ?? false,
+        showLine: styles.showLine ?? true,
+        order: styles.order ?? 1
+      }
+    };
+  });
+  if (!datasetEntries.length) {
+    return false;
+  }
+  const datasets = datasetEntries.map((entry) => entry.dataset);
+  const primaryEntry =
+    datasetEntries.find((entry) => entry.meta.name === 'temperature') || datasetEntries[0];
+  const latestLabel =
+    primaryEntry && primaryEntry.meta?.name
+      ? formatTelemetryValue(primaryEntry.meta.name, primaryEntry.latestValue) || '—'
+      : '—';
+  const statusLabel =
+    datasetEntries
+      .map((entry) => {
+        const label = TELEMETRY_METRIC_DEFINITIONS[entry.meta.name]?.label || entry.meta.name;
+        const formatted = formatTelemetryValue(entry.meta.name, entry.latestValue);
+        if (!formatted) return null;
+        return `${label} ${formatted}`;
+      })
+      .filter(Boolean)
+      .join(' ｜ ') || '—';
+
+  let view = telemetryCharts.get(ENV_COMBO_CHART_KEY);
+  if (!view) {
+    const card = document.createElement('article');
+    card.className = 'telemetry-chart-card';
+    const header = document.createElement('div');
+    header.className = 'telemetry-chart-header';
+    const title = document.createElement('span');
+    title.className = 'telemetry-chart-title';
+    title.textContent = '環境指標（溫度 / 濕度 / 氣壓）';
+    const latest = document.createElement('span');
+    latest.className = 'telemetry-chart-latest';
+    latest.textContent = latestLabel;
+    header.append(title, latest);
+    const status = document.createElement('div');
+    status.className = 'telemetry-chart-status';
+    status.textContent = statusLabel;
+    const canvasWrap = document.createElement('div');
+    canvasWrap.className = 'telemetry-chart-canvas-wrap';
+    const canvas = document.createElement('canvas');
+    canvasWrap.appendChild(canvas);
+    card.append(header, status, canvasWrap);
+    const ctx = canvas.getContext('2d');
+    const chart = new window.Chart(ctx, buildEnvironmentComboChartConfig(datasets));
+    view = {
+      chart,
+      card,
+      titleEl: title,
+      latestEl: latest,
+      statusEl: status
+    };
+    telemetryCharts.set(ENV_COMBO_CHART_KEY, view);
+  } else {
+    view.chart.data.datasets = datasets;
+    view.chart.update('none');
+  }
+  if (view.latestEl) {
+    view.latestEl.textContent = latestLabel;
+  }
+  if (view.statusEl) {
+    view.statusEl.textContent = statusLabel;
+  }
+  telemetryChartsContainer.appendChild(view.card);
+  return true;
+}
+
 function buildBatteryComboChartConfig(datasets) {
   return {
     type: 'line',
@@ -6794,6 +6963,121 @@ function buildBatteryComboChartConfig(datasets) {
               }
               const dataset = ctx.dataset ?? {};
               return `${dataset.label || ''}: ${ctx.formattedValue ?? ctx.parsed?.y ?? ''}`;
+            }
+          }
+        }
+      }
+    }
+  };
+}
+
+function buildEnvironmentComboChartConfig(datasets) {
+  const axisConfig = {
+    temp: {
+      metric: 'temperature',
+      position: 'left',
+      min: -20,
+      max: 60,
+      ticks: { stepSize: 10 }
+    },
+    humidity: {
+      metric: 'relativeHumidity',
+      position: 'right',
+      min: 0,
+      max: 100,
+      ticks: { stepSize: 20 },
+      grid: { drawOnChartArea: false }
+    },
+    pressure: {
+      metric: 'barometricPressure',
+      position: 'right',
+      min: 900,
+      max: 1100,
+      ticks: { stepSize: 20 },
+      grid: { drawOnChartArea: false }
+    }
+  };
+  const axesInUse = new Set(datasets.map((entry) => entry.yAxisID || 'environment'));
+  const scales = {
+    x: {
+      type: 'linear',
+      ticks: {
+        color: '#cbd5f5',
+        callback: (value) => formatTelemetryAxisTick(value)
+      },
+      grid: {
+        color: 'rgba(148, 163, 184, 0.12)'
+      }
+    }
+  };
+  for (const axisId of axesInUse) {
+    const config = axisConfig[axisId] || {};
+    const metricForAxis = config.metric || null;
+    const tickCallback = (value) => {
+      if (metricForAxis) {
+        return formatTelemetryValue(metricForAxis, value) || value;
+      }
+      return value;
+    };
+    scales[axisId] = {
+      type: 'linear',
+      position: config.position || 'left',
+      grid: {
+        color: 'rgba(148, 163, 184, 0.12)',
+        drawOnChartArea: config.grid?.drawOnChartArea ?? true
+      },
+      ticks: {
+        color: '#cbd5f5',
+        callback: tickCallback
+      }
+    };
+    if (Number.isFinite(config.min)) {
+      scales[axisId].min = config.min;
+    }
+    if (Number.isFinite(config.max)) {
+      scales[axisId].max = config.max;
+    }
+    if (config.ticks?.stepSize != null) {
+      scales[axisId].ticks.stepSize = config.ticks.stepSize;
+    }
+  }
+
+  return {
+    type: 'line',
+    data: {
+      datasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      parsing: false,
+      animation: false,
+      interaction: {
+        mode: 'nearest',
+        intersect: false
+      },
+      scales,
+      plugins: {
+        legend: {
+          display: true,
+          labels: {
+            color: '#cbd5f5'
+          }
+        },
+        tooltip: {
+          callbacks: {
+            title: (ctx) => {
+              const timestamp = ctx?.[0]?.parsed?.x ?? ctx?.[0]?.raw?.x;
+              return formatTelemetryAxisTick(timestamp) || '';
+            },
+            label: (ctx) => {
+              const metricName = ctx.dataset?.telemetryMetric;
+              const labelText = ctx.dataset?.label || metricName || '';
+              const formatted =
+                metricName != null
+                  ? formatTelemetryValue(metricName, ctx.parsed?.y) || ctx.parsed?.y
+                  : ctx.parsed?.y;
+              return `${labelText}: ${formatted}`;
             }
           }
         }
