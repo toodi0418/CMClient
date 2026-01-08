@@ -1467,7 +1467,6 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     this.forwardTenmanPosition(summary);
     this.forwardTenmanMessage(summary);
-    this.forwardTmagRelaySummary(summary);
   }
 
   attachMeshtasticClient(client) {
@@ -2599,18 +2598,17 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     if (!payload) return;
-    const serialized = (() => {
-      try {
-        return JSON.stringify(payload);
-      } catch {
-        return null;
-      }
-    })();
-    if (!serialized) return;
+    const data =
+      Buffer.isBuffer(payload) || payload instanceof Uint8Array
+        ? Buffer.from(payload)
+        : typeof payload === 'string'
+          ? Buffer.from(payload)
+          : null;
+    if (!data) return;
     if (state.queue.length >= TMAG_RELAY_QUEUE_LIMIT) {
       state.queue.shift();
     }
-    state.queue.push(serialized);
+    state.queue.push(data);
     this.flushTmagRelayQueue();
   }
 
@@ -2631,38 +2629,14 @@ class CallMeshAprsBridge extends EventEmitter {
     }
   }
 
-  forwardTmagRelaySummary(summary) {
-    if (!summary || !this.isTmagRelayEnabled()) {
-      return;
-    }
-    const payload = {
-      type: 'meshtastic-summary',
-      timestamp: Date.now(),
-      appVersion: this.appVersion,
-      summary
-    };
-    this.enqueueTmagRelay(payload);
-  }
-
   forwardTmagRelayFromRadio(event = {}) {
     if (!this.isTmagRelayEnabled()) {
       return;
     }
-    const rawHex = Buffer.isBuffer(event.rawPayload)
-      ? event.rawPayload.toString('hex')
-      : event.summary?.rawHex ?? null;
-    const rawLength = Buffer.isBuffer(event.rawPayload)
-      ? event.rawPayload.length
-      : event.summary?.rawLength ?? null;
-    const payload = {
-      type: 'meshtastic-fromRadio',
-      timestamp: Date.now(),
-      appVersion: this.appVersion,
-      rawHex,
-      rawLength,
-      summary: event.summary ?? null
-    };
-    this.enqueueTmagRelay(payload);
+    if (!Buffer.isBuffer(event.rawPayload)) {
+      return;
+    }
+    this.enqueueTmagRelay(event.rawPayload);
   }
 
   enqueueTenmanPublish(message, dedupeKey) {
