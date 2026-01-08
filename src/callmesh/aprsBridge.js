@@ -2529,31 +2529,30 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     state.connecting = true;
-    this.emitLog('TMAG-RELAY', `嘗試連線至 ${TMAG_RELAY_WS_ENDPOINT}`);
+    this.emitTenmanLog(`[TMAG-RELAY] 嘗試連線至 ${TMAG_RELAY_WS_ENDPOINT}`);
     try {
       const ws = new WebSocket(TMAG_RELAY_WS_ENDPOINT);
       state.websocket = ws;
       ws.on('open', () => {
         state.connecting = false;
-        this.emitLog('TMAG-RELAY', 'WebSocket 已連線');
+        this.emitTenmanLog('[TMAG-RELAY] WebSocket 已連線');
         this.flushTmagRelayQueue();
       });
       ws.on('close', (code, reason) => {
         state.connecting = false;
-        this.emitLog(
-          'TMAG-RELAY',
-          `WebSocket 已關閉 code=${code}${reason ? ` reason=${reason.toString()}` : ''}`
+        this.emitTenmanLog(
+          `[TMAG-RELAY] WebSocket 已關閉 code=${code}${reason ? ` reason=${reason.toString()}` : ''}`
         );
         this.scheduleTmagRelayReconnect();
       });
       ws.on('error', (err) => {
         state.connecting = false;
-        this.emitLog('TMAG-RELAY', `WebSocket 錯誤: ${err.message}`);
+        this.emitTenmanLog(`[TMAG-RELAY] WebSocket 錯誤: ${err.message}`);
         this.scheduleTmagRelayReconnect();
       });
     } catch (err) {
       state.connecting = false;
-      this.emitLog('TMAG-RELAY', `WebSocket 建立失敗: ${err.message}`);
+      this.emitTenmanLog(`[TMAG-RELAY] WebSocket 建立失敗: ${err.message}`);
       this.scheduleTmagRelayReconnect();
     }
   }
@@ -2610,7 +2609,9 @@ class CallMeshAprsBridge extends EventEmitter {
       state.queue.shift();
     }
     state.queue.push(data);
-    this.emitLog('TMAG-RELAY', `佇列加入 ${data.length} bytes${state.websocket ? '' : '（尚未連線）'}`);
+    this.emitTenmanLog(
+      `[TMAG-RELAY] 佇列加入 ${data.length} bytes${state.websocket ? '' : '（尚未連線）'}`
+    );
     this.flushTmagRelayQueue();
   }
 
@@ -2625,7 +2626,7 @@ class CallMeshAprsBridge extends EventEmitter {
       try {
         state.websocket.send(next);
       } catch (err) {
-        this.emitLog('TMAG-RELAY', `送出失敗: ${err.message}`);
+        this.emitTenmanLog(`[TMAG-RELAY] 送出失敗: ${err.message}`);
         break;
       }
     }
@@ -2649,6 +2650,10 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     this.enqueueTmagRelay(rawFrame);
+  }
+
+  emitTenmanLog(message) {
+    this.emitLog('TENMAN', message);
   }
 
   enqueueTenmanPublish(message, dedupeKey) {
