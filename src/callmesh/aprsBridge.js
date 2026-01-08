@@ -47,18 +47,6 @@ const APRS_LOG_VERBOSE =
 const APRS_PACKET_CACHE_TTL_MS = 3 * 60 * 60_000;
 const APRS_PACKET_RECENT_WINDOW_MS = APRS_PACKET_CACHE_TTL_MS;
 const APRS_LOCAL_TX_WINDOW_MS = 30_000;
-const APRS_DELAY_SUPPRESS_DEFAULT_MS = 10_000;
-const APRS_CALLSIGN_RECENT_SUPPRESS_MS = (() => {
-  const raw = process.env.TMAG_APRS_DELAY_WINDOW_MS;
-  if (raw === undefined || raw === null || raw === '') {
-    return APRS_DELAY_SUPPRESS_DEFAULT_MS;
-  }
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) {
-    return APRS_DELAY_SUPPRESS_DEFAULT_MS;
-  }
-  return Math.max(0, Math.floor(parsed));
-})();
 const APRS_PACKET_KEY_SEPARATOR = '\u0001';
 
 const TENMAN_FORWARD_WS_ENDPOINT = 'wss://tenmanmap.yakumo.tw/ws';
@@ -78,6 +66,13 @@ const TENMAN_FORWARD_VERBOSE_LOG = ['1', 'true', 'yes', 'on'].includes(
 );
 const TENMAN_INBOUND_MIN_INTERVAL_MS = 5000;
 const TENMAN_FORWARD_NODE_UPDATE_BUCKET_MS = 30_000;
+const TMAG_RELAY_WS_ENDPOINT = process.env.TMAG_RELAY_ENDPOINT || 'wss://relay.tmmarc.org/';
+const TMAG_RELAY_DISABLED = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.TMAG_RELAY_DISABLE || '').trim().toLowerCase()
+);
+const TMAG_RELAY_QUEUE_LIMIT = 256;
+const TMAG_RELAY_RECONNECT_BASE_MS = 3_000;
+const TMAG_RELAY_RECONNECT_MAX_MS = 30_000;
 const MESHTASTIC_BROADCAST_ADDR = 0xffffffff;
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
@@ -312,6 +307,13 @@ class CallMeshAprsBridge extends EventEmitter {
     };
     this.tenmanInboundState = {
       lastAcceptedAt: 0
+    };
+    this.tmagRelayState = {
+      websocket: null,
+      connecting: false,
+      reconnectTimer: null,
+      queue: [],
+      disabledLogged: false
     };
 
     this.meshtasticClients = new Set();
@@ -1465,6 +1467,7 @@ class CallMeshAprsBridge extends EventEmitter {
     }
     this.forwardTenmanPosition(summary);
     this.forwardTenmanMessage(summary);
+    this.forwardTmagRelaySummary(summary);
   }
 
   attachMeshtasticClient(client) {
@@ -2503,6 +2506,145 @@ class CallMeshAprsBridge extends EventEmitter {
     return true;
   }
 
+  isTmagRelayEnabled() {
+    return !TMAG_RELAY_DISABLED;
+  }
+
+  ensureTmagRelayWebsocket() {
+    const state = this.tmagRelayState;
+    if (!state || !this.isTmagRelayEnabled()) {
+      if (state && !state.disabledLogged) {
+        state.disabledLogged = true;
+        this.emitLog('TMAG-RELAY', '官方收集器轉發已停用');
+      }
+      return;
+    }
+    state.disabledLogged = false;
+    if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+      return;
+    }
+    if (state.connecting) {
+      return;
+    }
+    if (state.reconnectTimer) {
+      return;
+    }
+    state.connecting = true;
+    try {
+      const ws = new WebSocket(TMAG_RELAY_WS_ENDPOINT);
+      state.websocket = ws;
+      ws.on('open', () => {
+        state.connecting = false;
+        this.emitLog('TMAG-RELAY', 'WebSocket 已連線');
+        this.flushTmagRelayQueue();
+      });
+      ws.on('close', (code, reason) => {
+        state.connecting = false;
+        this.emitLog(
+          'TMAG-RELAY',
+          `WebSocket 已關閉 code=${code}${reason ? ` reason=${reason.toString()}` : ''}`
+        );
+        this.scheduleTmagRelayReconnect();
+      });
+      ws.on('error', (err) => {
+        state.connecting = false;
+        this.emitLog('TMAG-RELAY', `WebSocket 錯誤: ${err.message}`);
+        this.scheduleTmagRelayReconnect();
+      });
+    } catch (err) {
+      state.connecting = false;
+      this.emitLog('TMAG-RELAY', `WebSocket 建立失敗: ${err.message}`);
+      this.scheduleTmagRelayReconnect();
+    }
+  }
+
+  resetTmagRelayWebsocket() {
+    const state = this.tmagRelayState;
+    if (!state) return;
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+    if (state.websocket) {
+      try {
+        state.websocket.terminate();
+      } catch {
+        // ignore
+      }
+      state.websocket = null;
+    }
+    state.connecting = false;
+  }
+
+  scheduleTmagRelayReconnect() {
+    const state = this.tmagRelayState;
+    if (!state || !this.isTmagRelayEnabled()) {
+      return;
+    }
+    if (state.reconnectTimer) {
+      return;
+    }
+    const jitter = Math.random() * TMAG_RELAY_RECONNECT_BASE_MS;
+    const delay = Math.min(TMAG_RELAY_RECONNECT_MAX_MS, TMAG_RELAY_RECONNECT_BASE_MS + jitter);
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      this.ensureTmagRelayWebsocket();
+    }, delay);
+    state.reconnectTimer.unref?.();
+  }
+
+  enqueueTmagRelay(payload) {
+    const state = this.tmagRelayState;
+    if (!state || !this.isTmagRelayEnabled()) {
+      return;
+    }
+    if (!payload) return;
+    const serialized = (() => {
+      try {
+        return JSON.stringify(payload);
+      } catch {
+        return null;
+      }
+    })();
+    if (!serialized) return;
+    if (state.queue.length >= TMAG_RELAY_QUEUE_LIMIT) {
+      state.queue.shift();
+    }
+    state.queue.push(serialized);
+    this.flushTmagRelayQueue();
+  }
+
+  flushTmagRelayQueue() {
+    const state = this.tmagRelayState;
+    if (!state || !state.websocket || state.websocket.readyState !== WebSocket.OPEN) {
+      this.ensureTmagRelayWebsocket();
+      return;
+    }
+    while (state.queue.length) {
+      const next = state.queue.shift();
+      try {
+        state.websocket.send(next);
+      } catch (err) {
+        this.emitLog('TMAG-RELAY', `送出失敗: ${err.message}`);
+        break;
+      }
+    }
+  }
+
+  forwardTmagRelaySummary(summary) {
+    if (!summary || !this.isTmagRelayEnabled()) {
+      return;
+    }
+    const payload = {
+      type: 'meshtastic-summary',
+      timestamp: Date.now(),
+      appVersion: this.appVersion,
+      agent: this.callmeshState?.agent ?? null,
+      summary
+    };
+    this.enqueueTmagRelay(payload);
+  }
+
   enqueueTenmanPublish(message, dedupeKey) {
     if (!message || !dedupeKey) {
       return false;
@@ -3149,6 +3291,7 @@ class CallMeshAprsBridge extends EventEmitter {
   destroy() {
     this.stopHeartbeatLoop();
     this.teardownAprsConnection();
+    this.resetTmagRelayWebsocket();
     this.flushNodeDatabasePersistSync();
     this.flushAprsCachePersistSync();
     this.meshtasticClients.clear();
@@ -3574,24 +3717,6 @@ class CallMeshAprsBridge extends EventEmitter {
     return false;
   }
 
-  shouldSuppressDueToRecentCallsignActivity(callsign, now = Date.now()) {
-    if (APRS_CALLSIGN_RECENT_SUPPRESS_MS <= 0) return false;
-    const normalized = normalizeAprsCallsign(callsign);
-    if (!normalized) return false;
-    const summary = this.aprsCallsignSummary.get(normalized);
-    if (!summary || !Number.isFinite(summary.lastSeen)) {
-      return false;
-    }
-    const elapsed = now - summary.lastSeen;
-    if (elapsed < APRS_CALLSIGN_RECENT_SUPPRESS_MS) {
-      return {
-        remainingMs: Math.max(0, APRS_CALLSIGN_RECENT_SUPPRESS_MS - elapsed),
-        elapsedMs: elapsed
-      };
-    }
-    return false;
-  }
-
   handleAprsConnected() {
     this.aprsBeaconPending = true;
     this.aprsLoginVerified = false;
@@ -3892,17 +4017,6 @@ class CallMeshAprsBridge extends EventEmitter {
         windowMs: APRS_PACKET_RECENT_WINDOW_MS
       });
       this.emitLog('APRS', `uplink skipped (seen on APRS-IS) callsign=${normalizedCallsign}`);
-      return;
-    }
-
-    const recentSuppression = this.shouldSuppressDueToRecentCallsignActivity(normalizedCallsign, now);
-    if (recentSuppression) {
-      this.markAprsSummaryRejected(summary, 'recent-activity', {
-        callsign: normalizedCallsign,
-        windowMs: APRS_CALLSIGN_RECENT_SUPPRESS_MS,
-        remainingMs: recentSuppression.remainingMs
-      });
-      this.emitLog('APRS', `uplink skipped (recent APRS activity) callsign=${normalizedCallsign}`);
       return;
     }
 
@@ -6354,11 +6468,6 @@ function formatAprsRejectionLabel(reason, context = {}) {
       return windowLabel ? `本機 ${windowLabel} 內已上傳` : '本機冷卻時間內已上傳';
     case 'seen-on-feed':
       return windowLabel ? `APRS-IS ${windowLabel} 內已有相同封包` : 'APRS-IS 已存在相同封包';
-    case 'recent-activity':
-      if (remainingLabel) {
-        return `呼號冷卻中（剩餘 ${remainingLabel}）`;
-      }
-      return windowLabel ? `呼號冷卻中（需等待 ${windowLabel}）` : '呼號冷卻中';
     default:
       return context.message || '不符合 APRS 上傳條件';
   }
