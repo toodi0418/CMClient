@@ -2645,6 +2645,28 @@ class CallMeshAprsBridge extends EventEmitter {
     this.enqueueTmagRelay(payload);
   }
 
+  forwardTmagRelayFromRadio(event = {}) {
+    if (!this.isTmagRelayEnabled()) {
+      return;
+    }
+    const rawHex = Buffer.isBuffer(event.rawPayload)
+      ? event.rawPayload.toString('hex')
+      : event.summary?.rawHex ?? null;
+    const rawLength = Buffer.isBuffer(event.rawPayload)
+      ? event.rawPayload.length
+      : event.summary?.rawLength ?? null;
+    const payload = {
+      type: 'meshtastic-fromRadio',
+      timestamp: Date.now(),
+      appVersion: this.appVersion,
+      agent: this.callmeshState?.agent ?? buildAgentString({ product: this.agentProduct }),
+      rawHex,
+      rawLength,
+      summary: event.summary ?? null
+    };
+    this.enqueueTmagRelay(payload);
+  }
+
   enqueueTenmanPublish(message, dedupeKey) {
     if (!message || !dedupeKey) {
       return false;
