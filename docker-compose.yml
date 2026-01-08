@@ -14,6 +14,12 @@ services:
       CALLMESH_VERIFICATION_FILE: "/data/callmesh/monitor.json"
       TMAG_WEB_DASHBOARD: "${TMAG_WEB_DASHBOARD:-1}"
       TENMAN_DISABLE: "${TENMAN_DISABLE:-0}"
+      AUTO_UPDATE: "${AUTO_UPDATE:-1}"
+      AUTO_UPDATE_BRANCH: "${AUTO_UPDATE_BRANCH:-main}"
+      AUTO_UPDATE_WORKDIR: "${AUTO_UPDATE_WORKDIR:-/data/callmesh/app-src}"
+      AUTO_UPDATE_POLL_SECONDS: "${AUTO_UPDATE_POLL_SECONDS:-300}"
+      MESHTASTIC_HOST: "${MESHTASTIC_HOST}"
+      MESHTASTIC_PORT: "${MESHTASTIC_PORT}"
     volumes:
       - callmesh-data:/data/callmesh
     ports:

@@ -618,7 +618,9 @@ async function startMonitor(argv) {
     };
   };
 
-  const hostInput = typeof argv.host === 'string' ? argv.host.trim() : '';
+  const envHost =
+    typeof process.env.MESHTASTIC_HOST === 'string' ? process.env.MESHTASTIC_HOST.trim() : '';
+  const hostInput = envHost || (argv.host ? String(argv.host).trim() : '');
   const normalizedConnectionArg =
     typeof argv.connection === 'string' ? argv.connection.trim().toLowerCase() : '';
   const serialSpec = parseSerialEndpoint(hostInput);
@@ -663,7 +665,14 @@ async function startMonitor(argv) {
   }
 
   const tcpHost = hostInput || '127.0.0.1';
-  const tcpPort = Number.isFinite(argv.port) ? argv.port : 4403;
+  const envPortRaw = typeof process.env.MESHTASTIC_PORT === 'string' ? process.env.MESHTASTIC_PORT : null;
+  const envPort = envPortRaw && envPortRaw.trim() ? Number(envPortRaw) : null;
+  const tcpPort =
+    Number.isFinite(argv.port) && argv.port > 0
+      ? argv.port
+      : Number.isFinite(envPort) && envPort > 0
+        ? envPort
+        : 4403;
   const connectionSummary =
     transport === 'serial'
       ? `Serial ${serialPath} @ ${serialBaudRate}`
