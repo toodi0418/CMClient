@@ -1158,7 +1158,10 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     processSummary(summary);
   });
 
-  client.on('fromRadio', ({ message }) => {
+  client.on('fromRadio', ({ message, rawPayload, summary }) => {
+    if (bridge && typeof bridge.forwardTmagRelayFromRadio === 'function') {
+      bridge.forwardTmagRelayFromRadio({ message, rawPayload, summary });
+    }
     if (!message) return;
     try {
       const plainObject = client.toObject(message, {
@@ -1169,6 +1172,12 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
       console.error('序列化 Meshtastic 訊息失敗:', err);
     }
   });
+
+  if (bridge && typeof bridge.forwardTmagRelayToRadio === 'function') {
+    client.on('toRadioRaw', (payloadBuffer) => {
+      bridge.forwardTmagRelayToRadio(payloadBuffer);
+    });
+  }
 
   client.on('myInfo', (info) => {
     bridge?.handleMeshtasticMyInfo(info);

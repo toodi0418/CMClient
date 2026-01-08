@@ -310,7 +310,8 @@ class CallMeshAprsBridge extends EventEmitter {
       connecting: false,
       reconnectTimer: null,
       queue: [],
-      disabledLogged: false
+      disabledLogged: false,
+      missingApiKeyLogged: false
     };
 
     this.meshtasticClients = new Set();
@@ -2520,6 +2521,16 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     state.disabledLogged = false;
+
+    if (!this.callmeshState?.apiKey || !this.callmeshState?.verified) {
+      if (!state.missingApiKeyLogged) {
+        state.missingApiKeyLogged = true;
+        this.emitLog('TMAG-RELAY', '缺少已驗證的 API Key，跳過連線');
+      }
+      return;
+    }
+    state.missingApiKeyLogged = false;
+
     if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
       return;
     }
@@ -2530,9 +2541,13 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
     state.connecting = true;
-    this.emitTenmanLog(`[TMAG-RELAY] 嘗試連線至 ${TMAG_RELAY_WS_ENDPOINT}`);
+    this.emitTenmanLog('[TMAG-RELAY] 嘗試連線');
     try {
-      const ws = new WebSocket(TMAG_RELAY_WS_ENDPOINT);
+      const ws = new WebSocket(TMAG_RELAY_WS_ENDPOINT, {
+        headers: {
+          Authorization: `Bearer ${this.callmeshState.apiKey}`
+        }
+      });
       state.websocket = ws;
       ws.on('open', () => {
         state.connecting = false;
@@ -2602,34 +2617,27 @@ class CallMeshAprsBridge extends EventEmitter {
     const data =
       Buffer.isBuffer(payload) || payload instanceof Uint8Array
         ? Buffer.from(payload)
-        : typeof payload === 'string'
+      : typeof payload === 'string'
           ? Buffer.from(payload)
           : null;
     if (!data) return;
-    if (state.queue.length >= TMAG_RELAY_QUEUE_LIMIT) {
-      state.queue.shift();
+    if (!state.websocket || state.websocket.readyState !== WebSocket.OPEN) {
+      // 無佇列策略：未連線直接丟棄
+      this.ensureTmagRelayWebsocket();
+      this.emitTenmanLog(`[TMAG-RELAY] 丟棄 ${data.length} bytes（未連線）`);
+      return;
     }
-    state.queue.push(data);
-    this.emitTenmanLog(
-      `[TMAG-RELAY] 佇列加入 ${data.length} bytes${state.websocket ? '' : '（尚未連線）'}`
-    );
-    this.flushTmagRelayQueue();
+    try {
+      state.websocket.send(data);
+    } catch (err) {
+      this.emitTenmanLog(`[TMAG-RELAY] 送出失敗: ${err.message}`);
+    }
   }
 
   flushTmagRelayQueue() {
     const state = this.tmagRelayState;
     if (!state || !state.websocket || state.websocket.readyState !== WebSocket.OPEN) {
       this.ensureTmagRelayWebsocket();
-      return;
-    }
-    while (state.queue.length) {
-      const next = state.queue.shift();
-      try {
-        state.websocket.send(next);
-      } catch (err) {
-        this.emitTenmanLog(`[TMAG-RELAY] 送出失敗: ${err.message}`);
-        break;
-      }
     }
   }
 
