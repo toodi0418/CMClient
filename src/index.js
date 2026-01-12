@@ -13,9 +13,11 @@ const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge')
 const { WebDashboardServer } = require('./web/server');
 const { CallMeshDataStore } = require('./storage/callmeshDataStore');
 const { sanitizeSummaryForDisplay } = require('./utils/summaryDisplay');
+const { getAppTimezone } = require('./timezone');
 const pkg = require('../package.json');
 
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
+const appTimezone = getAppTimezone();
 let bridgeSummaryListener = null;
 
 function getMessageLogPath() {
@@ -528,6 +530,7 @@ async function startMonitor(argv) {
     try {
       const webDashboardOptions = {
         appVersion: pkg.version || '0.0.0',
+        timezone: appTimezone,
         relayStatsPath,
         relayStatsStore: sharedDataStore,
         messageLogPath: getMessageLogPath(),
@@ -541,7 +544,7 @@ async function startMonitor(argv) {
       }
       webServer = new WebDashboardServer(webDashboardOptions);
       await webServer.start();
-      webServer.setAppVersion(pkg.version || '0.0.0');
+      webServer.setAppInfo({ version: pkg.version || '0.0.0', timezone: appTimezone });
       webServer.publishStatus({ status: 'disconnected' });
       const snapshot = toWebCallmeshState(bridge.getStateSnapshot());
       if (snapshot) {

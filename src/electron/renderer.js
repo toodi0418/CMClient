@@ -96,6 +96,8 @@ const METERS_PER_FOOT = 0.3048;
 const LOG_DOWNLOAD_PREFIX = 'tmag-log';
 const NODE_ONLINE_WINDOW_MS = 60 * 60 * 1000;
 const CONNECTION_APPLY_DEBOUNCE_MS = 600;
+const DEFAULT_TIMEZONE = 'Asia/Taipei';
+let appTimezone = DEFAULT_TIMEZONE;
 
 const infoCallsign = document.getElementById('info-callsign');
 const infoSymbol = document.getElementById('info-symbol');
@@ -434,6 +436,101 @@ if (telemetryPageSizeSelect) {
     localStorage.setItem(TELEMETRY_PAGE_SIZE_KEY, String(nextSize));
     telemetryTablePage = 1;
     renderTelemetryView();
+  });
+}
+
+function normalizeTimezone(value) {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return DEFAULT_TIMEZONE;
+}
+
+function setAppTimezone(value) {
+  appTimezone = normalizeTimezone(value ?? appTimezone);
+}
+
+function getAppTimezone() {
+  return appTimezone || DEFAULT_TIMEZONE;
+}
+
+function coerceDate(value) {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date;
+}
+
+function getDatePartsInTimezone(value, options = {}) {
+  const date = coerceDate(value);
+  if (!date) {
+    return null;
+  }
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: getAppTimezone(),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    ...options
+  });
+  const parts = formatter.formatToParts(date);
+  const map = {};
+  for (const part of parts) {
+    if (part.type !== 'literal' && !(part.type in map)) {
+      map[part.type] = part.value;
+    }
+  }
+  return map;
+}
+
+function getTimezoneOffsetMs(value) {
+  const date = coerceDate(value);
+  if (!date) {
+    return null;
+  }
+  const parts = getDatePartsInTimezone(date);
+  if (!parts) {
+    return null;
+  }
+  const asUtc = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second)
+  );
+  return asUtc - date.getTime();
+}
+
+function formatDateTime(value, options = {}) {
+  const { invalidFallback = '—', ...formatOptions } = options;
+  const date = coerceDate(value);
+  if (!date) return invalidFallback;
+  return date.toLocaleString(undefined, {
+    timeZone: getAppTimezone(),
+    ...formatOptions
+  });
+}
+
+function formatTime(value, options = {}) {
+  const { invalidFallback = '—', ...formatOptions } = options;
+  const date = coerceDate(value);
+  if (!date) return invalidFallback;
+  return date.toLocaleTimeString(undefined, {
+    timeZone: getAppTimezone(),
+    ...formatOptions
   });
 }
 
@@ -1650,10 +1747,18 @@ function markAprsUploaded(flowId) {
 }
 
 function formatLogTimestamp(date) {
-  const hh = `${date.getHours()}`.padStart(2, '0');
-  const mm = `${date.getMinutes()}`.padStart(2, '0');
-  const ss = `${date.getSeconds()}`.padStart(2, '0');
-  return `${hh}:${mm}:${ss}`;
+  const normalized = coerceDate(date);
+  if (!normalized) {
+    return '--:--:--';
+  }
+  const formatter = new Intl.DateTimeFormat('zh-TW', {
+    timeZone: getAppTimezone(),
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+  return formatter.format(normalized);
 }
 
 function shouldSuppressLog(tag, message) {
@@ -2434,6 +2539,9 @@ async function bootstrap() {
 
   try {
     const info = await window.meshtastic.getAppInfo?.();
+    if (info?.timezone) {
+      setAppTimezone(info.timezone);
+    }
     if (info?.version) {
       if (appVersionLabel) {
         appVersionLabel.textContent = `v${info.version}`;
@@ -3812,11 +3920,13 @@ function extractSummaryTimestamp(summary) {
 }
 
 function formatFlowTimestamp(ms) {
-  const date = new Date(ms);
-  const hh = `${date.getHours()}`.padStart(2, '0');
-  const mm = `${date.getMinutes()}`.padStart(2, '0');
-  const ss = `${date.getSeconds()}`.padStart(2, '0');
-  return `${hh}:${mm}:${ss}`;
+  return formatTime(ms, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    invalidFallback: '--:--:--'
+  });
 }
 
 function findMappingByMeshId(meshId) {
@@ -4615,7 +4725,7 @@ function formatNodeLastSeen(value) {
   if (Number.isNaN(date.getTime())) {
     return { display: '—', tooltip: '', timestamp: null };
   }
-  const display = date.toLocaleString();
+  const display = formatDateTime(date);
   const relative = formatRelativeTime(date.toISOString());
   const tooltip = display;
   return { display: relative, tooltip, timestamp };
@@ -6656,7 +6766,7 @@ function buildTelemetryChartConfig(metricName, def, series) {
           callbacks: {
             title: (items) => {
               if (!items || !items.length) return '';
-              return new Date(items[0].parsed.x).toLocaleString();
+              return formatDateTime(items[0].parsed.x);
             },
             label: (ctx) => {
               const value = ctx.parsed?.y;
@@ -6944,7 +7054,7 @@ function buildBatteryComboChartConfig(datasets) {
           callbacks: {
             title: (items) => {
               if (!items || !items.length) return '';
-              return new Date(items[0].parsed.x).toLocaleString();
+              return formatDateTime(items[0].parsed.x);
             },
             label: (ctx) => {
               const tooltip = ctx.chart?.tooltip;
@@ -7214,19 +7324,19 @@ function destroyAllTelemetryCharts() {
 }
 
 function formatTelemetryAxisTick(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
+  const date = coerceDate(value);
+  if (!date) {
     return '';
   }
-  const date = new Date(numeric);
-  if (Number.isNaN(date.getTime())) {
-    return '';
-  }
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mi = String(date.getMinutes()).padStart(2, '0');
-  return `${mm}/${dd} ${hh}:${mi}`;
+  const formatter = new Intl.DateTimeFormat('zh-TW', {
+    timeZone: getAppTimezone(),
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  });
+  return formatter.format(date);
 }
 
 function formatTelemetryStatusTimestamp(timestamp) {
@@ -7237,11 +7347,7 @@ function formatTelemetryStatusTimestamp(timestamp) {
   if (formatted) {
     return formatted;
   }
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) {
-    return '';
-  }
-  return date.toLocaleString();
+  return formatDateTime(timestamp, { invalidFallback: '' });
 }
 
 function clampMetricValue(value, def) {
@@ -7483,8 +7589,17 @@ function updateTelemetryUpdatedAtLabel() {
     telemetryUpdatedAtLabel.removeAttribute('title');
     return;
   }
-  telemetryUpdatedAtLabel.textContent = formatLogTimestamp(date);
-  telemetryUpdatedAtLabel.title = date.toLocaleString();
+  const labelFormatter = new Intl.DateTimeFormat('zh-TW', {
+    timeZone: getAppTimezone(),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  });
+  telemetryUpdatedAtLabel.textContent = labelFormatter.format(date);
+  telemetryUpdatedAtLabel.title = formatDateTime(date);
 }
 
 function ensureTelemetryCustomDefaults() {
@@ -7506,27 +7621,45 @@ function formatDatetimeLocal(ms) {
   if (!Number.isFinite(ms)) {
     return '';
   }
-  const date = new Date(ms);
-  if (Number.isNaN(date.getTime())) {
+  const parts = getDatePartsInTimezone(ms);
+  if (!parts || !parts.year || !parts.month || !parts.day || !parts.hour || !parts.minute) {
     return '';
   }
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mi = String(date.getMinutes()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
 }
 
 function parseDatetimeLocal(value) {
   if (!value) {
     return null;
   }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(value);
+  if (!match) {
     return null;
   }
-  return date.getTime();
+  const [, yearStr, monthStr, dayStr, hourStr, minuteStr] = match;
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  const hour = Number(hourStr);
+  const minute = Number(minuteStr);
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    !Number.isInteger(hour) ||
+    !Number.isInteger(minute)
+  ) {
+    return null;
+  }
+  const baseUtc = Date.UTC(year, month - 1, day, hour, minute);
+  if (!Number.isFinite(baseUtc)) {
+    return null;
+  }
+  const offset = getTimezoneOffsetMs(new Date(baseUtc));
+  if (!Number.isFinite(offset)) {
+    return null;
+  }
+  return baseUtc - offset;
 }
 
 function updateTelemetryRangeInputs() {
@@ -8537,7 +8670,9 @@ function updateProvisionInfo(provision, mappingSyncedAt) {
   if (infoPhgHeight) infoPhgHeight.textContent = phgInfo ? `${phgInfo.heightMeters.toFixed(1)} m` : '—';
   if (infoPhgGain) infoPhgGain.textContent = phgInfo ? `${phgInfo.gainDb} dB` : '—';
   infoComment.textContent = comment;
-  infoUpdatedAt.textContent = mappingSyncedAt ? formatRelativeTime(mappingSyncedAt) : new Date().toLocaleString();
+  infoUpdatedAt.textContent = mappingSyncedAt
+    ? formatRelativeTime(mappingSyncedAt)
+    : formatDateTime(Date.now());
 
   const signature = JSON.stringify({
     aprsCallsign,
@@ -8642,5 +8777,5 @@ function formatRelativeTime(isoString) {
   if (years >= 1) {
     return `${years} 年前`;
   }
-  return date.toLocaleString();
+  return formatDateTime(date);
 }

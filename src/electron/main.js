@@ -38,10 +38,12 @@ const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
 const { WebDashboardServer } = require('../web/server');
 const { sanitizeSummaryForDisplay } = require('../utils/summaryDisplay');
 const { SerialPort } = require('serialport');
+const { getAppTimezone } = require('../timezone');
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
 const MESSAGE_MAX_PER_CHANNEL = 200;
+const appTimezone = getAppTimezone();
 
 const messageStore = new Map();
 let messageWritePromise = Promise.resolve();
@@ -746,6 +748,7 @@ async function startWebDashboard() {
     try {
       const options = {
         appVersion,
+        timezone: appTimezone,
         relayStatsPath: path.join(getCallMeshDataDir(), 'relay-link-stats.json'),
         relayStatsStore: bridge?.getDataStore?.(),
         messageLogPath: getMessageLogPath(),
@@ -759,7 +762,7 @@ async function startWebDashboard() {
       }
       const server = new WebDashboardServer(options);
       await server.start();
-      server.setAppVersion(appVersion);
+      server.setAppInfo({ version: appVersion, timezone: appTimezone });
       webServer = server;
       return true;
     } catch (err) {
@@ -874,7 +877,8 @@ function waitForInitialMeshtasticConnection(nativeClient, { timeoutMs = 15_000 }
 }
 
 ipcMain.handle('app:get-info', async () => ({
-  version: appVersion
+  version: appVersion,
+  timezone: appTimezone
 }));
 
 ipcMain.handle('nodes:get-snapshot', async () => {

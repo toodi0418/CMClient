@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { URL } = require('url');
 const fsPromises = fs.promises;
+const { getAppTimezone, normalizeTimezone } = require('../timezone');
 
 const MAX_PORT_NUMBER = 65_535;
 const MAX_PORT_FALLBACK_ATTEMPTS = 50;
@@ -146,6 +147,11 @@ class WebDashboardServer {
     this.appVersion = typeof options.appVersion === 'string' && options.appVersion.trim()
       ? options.appVersion.trim()
       : FALLBACK_VERSION;
+    this.appTimezone = normalizeTimezone(
+      typeof options.timezone === 'string' && options.timezone.trim()
+        ? options.timezone
+        : getAppTimezone()
+    );
     this.relayStatsPath =
       typeof options.relayStatsPath === 'string' && options.relayStatsPath.trim()
         ? options.relayStatsPath.trim()
@@ -178,7 +184,9 @@ class WebDashboardServer {
     this.aprsFlowQueue = [];
     this.aprsFlowRecords = new Map();
     this.aprsRecordQueue = [];
-    this.lastAppInfo = this.appVersion ? { version: this.appVersion } : null;
+    this.lastAppInfo = this.appVersion
+      ? { version: this.appVersion, timezone: this.appTimezone }
+      : null;
     this.telemetryMaxPerNode =
       Number.isFinite(options.telemetryMaxPerNode) && options.telemetryMaxPerNode > 0
         ? Math.floor(options.telemetryMaxPerNode)
@@ -526,22 +534,39 @@ class WebDashboardServer {
     }
   }
 
+  setAppInfo(info) {
+    const rawVersion = typeof info === 'object' && info !== null ? info.version : info;
+    const rawTimezone =
+      typeof info === 'object' && info !== null ? info.timezone : undefined;
+
+    const nextVersion =
+      typeof rawVersion === 'string'
+        ? rawVersion.trim()
+        : this.appVersion || '';
+    const nextTimezone = normalizeTimezone(
+      typeof rawTimezone === 'string' && rawTimezone.trim()
+        ? rawTimezone
+        : this.appTimezone || getAppTimezone()
+    );
+
+    const changed =
+      nextVersion !== this.appVersion ||
+      nextTimezone !== this.appTimezone ||
+      !this.lastAppInfo ||
+      this.lastAppInfo.version !== nextVersion ||
+      this.lastAppInfo.timezone !== nextTimezone;
+
+    this.appVersion = nextVersion;
+    this.appTimezone = nextTimezone;
+    this.lastAppInfo = { version: this.appVersion, timezone: this.appTimezone };
+
+    if (changed) {
+      this._broadcast({ type: 'app-info', payload: this.lastAppInfo });
+    }
+  }
+
   setAppVersion(version) {
-    const normalized = typeof version === 'string' && version.trim() ? version.trim() : '';
-    if (!normalized) {
-      if (this.appVersion || this.lastAppInfo) {
-        this.appVersion = '';
-        this.lastAppInfo = { version: '' };
-        this._broadcast({ type: 'app-info', payload: this.lastAppInfo });
-      }
-      return;
-    }
-    if (normalized === this.appVersion) {
-      return;
-    }
-    this.appVersion = normalized;
-    this.lastAppInfo = { version: this.appVersion };
-    this._broadcast({ type: 'app-info', payload: this.lastAppInfo });
+    this.setAppInfo({ version });
   }
 
   publishLog(entry) {

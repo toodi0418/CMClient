@@ -368,6 +368,8 @@
     NeighborInfo: '🤝',
     Encrypted: '🔒'
   };
+  const DEFAULT_TIMEZONE = 'Asia/Taipei';
+  let appTimezone = DEFAULT_TIMEZONE;
   const channelConfigs = CHANNEL_CONFIG.map((item) => ({ ...item }));
   const channelConfigMap = new Map(channelConfigs.map((item) => [item.id, item]));
   const channelMessageStore = new Map();
@@ -547,6 +549,55 @@
     return fixed.replace(/0+$/, '').replace(/\.$/, '') || '0';
   }
 
+  function normalizeTimezone(value) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) {
+        return trimmed;
+      }
+    }
+    return DEFAULT_TIMEZONE;
+  }
+
+  function setAppTimezone(value) {
+    appTimezone = normalizeTimezone(value ?? appTimezone);
+  }
+
+  function getAppTimezone() {
+    return appTimezone || DEFAULT_TIMEZONE;
+  }
+
+  function coerceDate(value) {
+    if (value instanceof Date) {
+      return Number.isNaN(value.getTime()) ? null : value;
+    }
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+    return date;
+  }
+
+  function formatDateTime(value, options = {}) {
+    const { invalidFallback = '—', ...formatOptions } = options;
+    const date = coerceDate(value);
+    if (!date) return invalidFallback;
+    return date.toLocaleString(undefined, {
+      timeZone: getAppTimezone(),
+      ...formatOptions
+    });
+  }
+
+  function formatTime(value, options = {}) {
+    const { invalidFallback = '—', ...formatOptions } = options;
+    const date = coerceDate(value);
+    if (!date) return invalidFallback;
+    return date.toLocaleTimeString(undefined, {
+      timeZone: getAppTimezone(),
+      ...formatOptions
+    });
+  }
+
   function setCounter(element, value) {
     if (!element) return;
     element.textContent = Number.isFinite(value) ? value.toLocaleString() : '0';
@@ -559,9 +610,7 @@
 
   function formatTimestamp(ts) {
     if (!ts) return '—';
-    const date = new Date(ts);
-    if (Number.isNaN(date.getTime())) return '—';
-    return date.toLocaleTimeString();
+    return formatTime(ts);
   }
 
   function formatRelativeTime(isoString) {
@@ -576,7 +625,7 @@
     if (hours < 24) return `${hours} 小時前`;
     const days = Math.floor(hours / 24);
     if (days < 7) return `${days} 天前`;
-    return date.toLocaleString();
+    return formatDateTime(date);
   }
 
   function formatBytes(value) {
@@ -1459,7 +1508,7 @@
       return { display: '—', tooltip: '', timestamp: null };
     }
     const display = formatRelativeTime(date.toISOString());
-    const tooltip = date.toLocaleString();
+    const tooltip = formatDateTime(date);
     return { display, tooltip, timestamp };
   }
 
@@ -2718,9 +2767,17 @@ function ensureRelayGuessSuffix(label, summary) {
       telemetryUpdatedAtLabel.removeAttribute('title');
       return;
     }
-    const label = `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
-    telemetryUpdatedAtLabel.textContent = label;
-    telemetryUpdatedAtLabel.title = date.toLocaleString();
+    const labelFormatter = new Intl.DateTimeFormat('zh-TW', {
+      timeZone: getAppTimezone(),
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+    telemetryUpdatedAtLabel.textContent = labelFormatter.format(date);
+    telemetryUpdatedAtLabel.title = formatDateTime(date);
   }
 
   function ensureTelemetryCustomDefaults() {
@@ -3966,7 +4023,7 @@ function ensureRelayGuessSuffix(label, summary) {
             callbacks: {
               title: (items) => {
                 if (!items || !items.length) return '';
-                return new Date(items[0].parsed.x).toLocaleString();
+                return formatDateTime(items[0].parsed.x);
               },
               label: (ctx) => {
                 const value = ctx.parsed?.y;
@@ -4273,7 +4330,7 @@ function ensureRelayGuessSuffix(label, summary) {
             callbacks: {
               title: (items) => {
                 if (!items || !items.length) return '';
-                return new Date(items[0].parsed.x).toLocaleString();
+                return formatDateTime(items[0].parsed.x);
               },
               label: (ctx) => {
                 const tooltip = ctx.chart?.tooltip;
@@ -4788,19 +4845,19 @@ function ensureRelayGuessSuffix(label, summary) {
   }
 
   function formatTelemetryAxisTick(value) {
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric)) {
+    const date = coerceDate(value);
+    if (!date) {
       return '';
     }
-    const date = new Date(numeric);
-    if (Number.isNaN(date.getTime())) {
-      return '';
-    }
-    const mm = String(date.getMonth() + 1).padStart(2, '0');
-    const dd = String(date.getDate()).padStart(2, '0');
-    const hh = String(date.getHours()).padStart(2, '0');
-    const mi = String(date.getMinutes()).padStart(2, '0');
-    return `${mm}/${dd} ${hh}:${mi}`;
+    const formatter = new Intl.DateTimeFormat('zh-TW', {
+      timeZone: getAppTimezone(),
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+    return formatter.format(date);
   }
 
   function formatTelemetryStatusTimestamp(timestamp) {
@@ -4811,11 +4868,7 @@ function ensureRelayGuessSuffix(label, summary) {
     if (formatted) {
       return formatted;
     }
-    const date = new Date(timestamp);
-    if (Number.isNaN(date.getTime())) {
-      return '';
-    }
-    return date.toLocaleString();
+    return formatDateTime(timestamp, { invalidFallback: '' });
   }
 
   function computeSeriesDecimals(metricName, series) {
@@ -6862,6 +6915,9 @@ function ensureRelayGuessSuffix(label, summary) {
   }
 
   function updateAppInfo(info) {
+    if (info && typeof info.timezone === 'string') {
+      setAppTimezone(info.timezone);
+    }
     if (!appVersionLabel) return;
     const version =
       typeof info?.version === 'string' && info.version.trim()
