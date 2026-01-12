@@ -38,7 +38,7 @@ const { CallMeshAprsBridge } = require('../callmesh/aprsBridge');
 const { WebDashboardServer } = require('../web/server');
 const { sanitizeSummaryForDisplay } = require('../utils/summaryDisplay');
 const { SerialPort } = require('serialport');
-const { getAppTimezone } = require('../timezone');
+const { getAppTimezone, formatTimestampLabel } = require('../timezone');
 
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
@@ -124,7 +124,7 @@ function sanitizeMessageSummary(summary) {
     timestampLabel:
       typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
         ? summary.timestampLabel.trim()
-        : new Date(timestampMs).toISOString(),
+        : formatTimestampLabel(timestampMs, { timeZone: appTimezone }),
     flowId: flowIdRaw,
     meshPacketId: Number.isFinite(summary.meshPacketId) ? Number(summary.meshPacketId) : null,
     replyId: Number.isFinite(summary.replyId) ? Number(summary.replyId) : null,

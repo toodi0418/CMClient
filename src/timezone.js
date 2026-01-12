@@ -20,8 +20,26 @@ function getAppTimezone(env = process.env) {
   return DEFAULT_TIMEZONE;
 }
 
+function formatTimestampLabel(date, { timeZone = getAppTimezone(), locale = 'zh-TW', showSeconds = true } = {}) {
+  const dt = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(dt.getTime())) {
+    return '';
+  }
+  const formatter = new Intl.DateTimeFormat(locale, {
+    timeZone,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: showSeconds ? '2-digit' : undefined,
+    hour12: false
+  });
+  return formatter.format(dt);
+}
+
 module.exports = {
   DEFAULT_TIMEZONE,
   getAppTimezone,
-  normalizeTimezone
+  normalizeTimezone,
+  formatTimestampLabel
 };

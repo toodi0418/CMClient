@@ -1145,7 +1145,7 @@ function updateChannelNavMeta(channelId, { unread = false } = {}) {
   if (!navItem) return;
   const latest = channelMessageStore.get(channelId)?.[0];
   if (latest) {
-    const timeLabel = latest.timestampLabel || '—';
+    const timeLabel = formatFlowTimestamp(latest.timestampMs) || latest.timestampLabel || '—';
     const fromLabel = resolveStoredMessageFromLabel(latest);
     navItem.meta.textContent = `${timeLabel} · ${fromLabel}`;
   } else {
@@ -1488,10 +1488,7 @@ function recordChannelMessage(summary, { markUnread = true } = {}) {
 
   const { label: fromLabel, meshId: fromMeshId } = resolveMessageSource(summary);
   const timestampMs = Number.isFinite(Number(summary.timestampMs)) ? Number(summary.timestampMs) : Date.now();
-  const timestampLabel =
-    typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
-      ? summary.timestampLabel.trim()
-      : formatLogTimestamp(new Date(timestampMs));
+  const timestampLabel = formatFlowTimestamp(timestampMs);
   const flowIdRaw = summary.flowId || `${channelId}-${timestampMs}-${text}`;
   const flowId = String(flowIdRaw);
 

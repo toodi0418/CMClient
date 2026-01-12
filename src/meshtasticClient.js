@@ -8,6 +8,7 @@ const path = require('path');
 const crypto = require('crypto');
 const fsPromises = require('fs/promises');
 const protobuf = require('protobufjs');
+const { getAppTimezone, formatTimestampLabel } = require('./timezone');
 
 const { unishox2_decompress_simple } = require('unishox2.siara.cc');
 const { nodeDatabase } = require('./nodeDatabase');
@@ -20,6 +21,7 @@ const BROADCAST_ADDR = 0xffffffff;
 const RELAY_GUESS_EXPLANATION =
   '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
 const FORCED_OUTBOUND_HOP_LIMIT = 6;
+const APP_TIMEZONE = getAppTimezone();
 
 function normalizeMeshId(meshId) {
   if (meshId == null) return null;
@@ -2375,12 +2377,11 @@ function formatRelativeAge(ms) {
 }
 
 function formatTimestamp(date) {
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mi = String(date.getMinutes()).padStart(2, '0');
-  const ss = String(date.getSeconds()).padStart(2, '0');
-  return `${mm}/${dd} ${hh}:${mi}:${ss}`;
+  return (
+    formatTimestampLabel(date, { timeZone: APP_TIMEZONE }) ||
+    formatTimestampLabel(date, { timeZone: 'UTC' }) ||
+    ''
+  );
 }
 
 function formatHops(hopLimit, hopStart) {

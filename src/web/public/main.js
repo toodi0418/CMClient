@@ -1046,7 +1046,7 @@
     const store = ensureChannelStore(channelId);
     const latest = store[0];
     if (latest) {
-      const timeLabel = latest.timestampLabel || '—';
+      const timeLabel = formatFlowTimestamp(latest.timestampMs) || latest.timestampLabel || '—';
       const fromLabel = resolveStoredMessageFromLabel(latest);
       navItem.meta.textContent = `${timeLabel} · ${fromLabel}`;
     } else {
@@ -1353,10 +1353,13 @@
   }
 
   function resolveMessageTimestamp(summary, timestampMs) {
+    if (Number.isFinite(timestampMs)) {
+      return formatFlowTimestamp(timestampMs);
+    }
     if (typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()) {
       return summary.timestampLabel.trim();
     }
-    return formatFlowTimestamp(timestampMs);
+    return formatFlowTimestamp(Date.now());
   }
 
   function buildMessageRelayLabel(summary) {

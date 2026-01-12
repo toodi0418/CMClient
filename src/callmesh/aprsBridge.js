@@ -57,6 +57,7 @@ const TENMAN_FORWARD_DEFAULT_ENABLED =
 const TENMAN_FORWARD_TIMEZONE_OFFSET_MINUTES = 8 * 60;
 const TENMAN_FORWARD_QUEUE_LIMIT = 64;
 const TENMAN_FORWARD_RECONNECT_DELAY_MS = 5000;
+const { getAppTimezone, formatTimestampLabel: formatTimestampLabelWithTimezone } = require('../timezone');
 const TENMAN_FORWARD_AUTH_ACTION = 'authenticate';
 const TENMAN_FORWARD_SUPPRESS_ACK = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.TENMAN_SUPPRESS_ACK ?? 'true').trim().toLowerCase()
@@ -71,12 +72,16 @@ const TMAG_RELAY_QUEUE_LIMIT = 256;
 const TMAG_RELAY_RECONNECT_BASE_MS = 3_000;
 const TMAG_RELAY_RECONNECT_MAX_MS = 30_000;
 const MESHTASTIC_BROADCAST_ADDR = 0xffffffff;
+const APP_TIMEZONE = getAppTimezone();
 
 const PROTO_DIR = path.resolve(__dirname, '..', '..', 'proto');
 
 function formatTimestampLabel(date) {
-  const pad = (value) => String(value).padStart(2, '0');
-  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return (
+    formatTimestampLabelWithTimezone(date, { timeZone: APP_TIMEZONE }) ||
+    formatTimestampLabelWithTimezone(date, { timeZone: 'UTC' }) ||
+    ''
+  );
 }
 
 function extractEnumBlock(source, enumName) {

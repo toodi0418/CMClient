@@ -13,7 +13,7 @@ const { CallMeshAprsBridge, normalizeMeshId } = require('./callmesh/aprsBridge')
 const { WebDashboardServer } = require('./web/server');
 const { CallMeshDataStore } = require('./storage/callmeshDataStore');
 const { sanitizeSummaryForDisplay } = require('./utils/summaryDisplay');
-const { getAppTimezone } = require('./timezone');
+const { getAppTimezone, formatTimestampLabel } = require('./timezone');
 const pkg = require('../package.json');
 
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
@@ -140,7 +140,7 @@ function tryPublishWebMessage(webServer, summary) {
   const timestampLabel =
     typeof summary.timestampLabel === 'string' && summary.timestampLabel.trim()
       ? summary.timestampLabel.trim()
-      : new Date(timestampMs).toISOString();
+      : formatTimestampLabel(timestampMs, { timeZone: appTimezone });
   const flowId =
     typeof summary.flowId === 'string' && summary.flowId.trim()
       ? summary.flowId.trim()
