@@ -588,6 +588,52 @@
     });
   }
 
+  function getDatePartsInTimezone(value, options = {}) {
+    const date = coerceDate(value);
+    if (!date) {
+      return null;
+    }
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: getAppTimezone(),
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      ...options
+    });
+    const parts = formatter.formatToParts(date);
+    const map = {};
+    for (const part of parts) {
+      if (part.type !== 'literal' && !(part.type in map)) {
+        map[part.type] = part.value;
+      }
+    }
+    return map;
+  }
+
+  function getTimezoneOffsetMs(value) {
+    const date = coerceDate(value);
+    if (!date) {
+      return null;
+    }
+    const parts = getDatePartsInTimezone(date);
+    if (!parts) {
+      return null;
+    }
+    const asUtc = Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour),
+      Number(parts.minute),
+      Number(parts.second)
+    );
+    return asUtc - date.getTime();
+  }
+
   function formatTime(value, options = {}) {
     const { invalidFallback = '—', ...formatOptions } = options;
     const date = coerceDate(value);
@@ -2799,27 +2845,45 @@ function ensureRelayGuessSuffix(label, summary) {
     if (!Number.isFinite(ms)) {
       return '';
     }
-    const date = new Date(ms);
-    if (Number.isNaN(date.getTime())) {
+    const parts = getDatePartsInTimezone(ms);
+    if (!parts || !parts.year || !parts.month || !parts.day || !parts.hour || !parts.minute) {
       return '';
     }
-    const yyyy = date.getFullYear();
-    const mm = String(date.getMonth() + 1).padStart(2, '0');
-    const dd = String(date.getDate()).padStart(2, '0');
-    const hh = String(date.getHours()).padStart(2, '0');
-    const mi = String(date.getMinutes()).padStart(2, '0');
-    return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+    return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
   }
 
   function parseDatetimeLocal(value) {
     if (!value) {
       return null;
     }
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(value);
+    if (!match) {
       return null;
     }
-    return date.getTime();
+    const [, yearStr, monthStr, dayStr, hourStr, minuteStr] = match;
+    const year = Number(yearStr);
+    const month = Number(monthStr);
+    const day = Number(dayStr);
+    const hour = Number(hourStr);
+    const minute = Number(minuteStr);
+    if (
+      !Number.isInteger(year) ||
+      !Number.isInteger(month) ||
+      !Number.isInteger(day) ||
+      !Number.isInteger(hour) ||
+      !Number.isInteger(minute)
+    ) {
+      return null;
+    }
+    const baseUtc = Date.UTC(year, month - 1, day, hour, minute);
+    if (!Number.isFinite(baseUtc)) {
+      return null;
+    }
+    const offset = getTimezoneOffsetMs(new Date(baseUtc));
+    if (!Number.isFinite(offset)) {
+      return null;
+    }
+    return baseUtc - offset;
   }
 
   function updateTelemetryRangeInputs() {
@@ -4638,16 +4702,15 @@ function ensureRelayGuessSuffix(label, summary) {
     if (!Number.isFinite(ms)) {
       return '—';
     }
-    const date = new Date(ms);
-    if (Number.isNaN(date.getTime())) {
-      return '—';
-    }
-    const yyyy = date.getFullYear();
-    const mm = String(date.getMonth() + 1).padStart(2, '0');
-    const dd = String(date.getDate()).padStart(2, '0');
-    const hh = String(date.getHours()).padStart(2, '0');
-    const mi = String(date.getMinutes()).padStart(2, '0');
-    return `${yyyy}/${mm}/${dd} ${hh}:${mi}`;
+    return formatDateTime(ms, {
+      invalidFallback: '—',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
   }
 
   function flattenTelemetryMetrics(metrics, prefix = '', target = []) {
@@ -6563,12 +6626,13 @@ function ensureRelayGuessSuffix(label, summary) {
   }
 
   function formatFlowTimestamp(timestampMs) {
-    const date = new Date(timestampMs);
-    if (Number.isNaN(date.getTime())) return '—';
-    const hh = `${date.getHours()}`.padStart(2, '0');
-    const mm = `${date.getMinutes()}`.padStart(2, '0');
-    const ss = `${date.getSeconds()}`.padStart(2, '0');
-    return `${hh}:${mm}:${ss}`;
+    return formatTime(timestampMs, {
+      invalidFallback: '—',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    });
   }
 
   function resolveFlowIcon(type) {
