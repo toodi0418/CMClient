@@ -23,6 +23,9 @@
 - Mapping Flow 與 `toLocaleString()` 顯示改為固定台灣時區
 - 若需彈性，可新增 `TMAG_TIMEZONE` 設定供覆寫
 
+## 更新
+- PR #5 已補上 `TMAG_TIMEZONE` 覆寫與 UI 統一格式化（請確認是否符合需求）
+
 ## 驗收標準
 - 在 UTC 環境下顯示仍為台灣時間
 - Web / Electron 顯示時間一致

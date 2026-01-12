@@ -13,6 +13,7 @@ services:
       CALLMESH_ARTIFACTS_DIR: "/data/callmesh"
       CALLMESH_VERIFICATION_FILE: "/data/callmesh/monitor.json"
       TMAG_WEB_DASHBOARD: "${TMAG_WEB_DASHBOARD:-1}"
+      TMAG_TIMEZONE: "${TMAG_TIMEZONE:-Asia/Taipei}"
       TENMAN_DISABLE: "${TENMAN_DISABLE:-0}"
       AUTO_UPDATE: "${AUTO_UPDATE:-1}"
       AUTO_UPDATE_REPO: "${AUTO_UPDATE_REPO:-https://github.com/toodi0418/CMClient.git}"

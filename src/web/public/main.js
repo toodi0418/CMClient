@@ -119,10 +119,27 @@
   let telemetrySelectedMeshId = null;
   const telemetryNodeLookup = new Map();
   const DEFAULT_TIME_ZONE = 'Asia/Taipei';
+  let activeTimeZone = DEFAULT_TIME_ZONE;
   const DATE_TIME_FORMATTERS = new Map();
 
-  function getDateTimeFormatter(timeZone = DEFAULT_TIME_ZONE) {
-    const zone = timeZone || DEFAULT_TIME_ZONE;
+  function normalizeTimeZone(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : '';
+  }
+
+  function setActiveTimeZone(value) {
+    const normalized = normalizeTimeZone(value);
+    if (!normalized || normalized === activeTimeZone) {
+      return;
+    }
+    activeTimeZone = normalized;
+    DATE_TIME_FORMATTERS.clear();
+    renderFlowEntries();
+    updateTelemetryUpdatedAtLabel();
+    renderTelemetryView();
+  }
+
+  function getDateTimeFormatter(timeZone = activeTimeZone) {
+    const zone = timeZone || activeTimeZone;
     let formatter = DATE_TIME_FORMATTERS.get(zone);
     if (!formatter) {
       formatter = new Intl.DateTimeFormat('en-GB', {
@@ -140,7 +157,7 @@
     return formatter;
   }
 
-  function getDateTimeParts(value, timeZone = DEFAULT_TIME_ZONE) {
+  function getDateTimeParts(value, timeZone = activeTimeZone) {
     if (value == null) return null;
     const date = value instanceof Date ? value : new Date(value);
     if (Number.isNaN(date.getTime())) return null;
@@ -161,20 +178,20 @@
     };
   }
 
-  function formatTimeInZone(value, timeZone = DEFAULT_TIME_ZONE) {
+  function formatTimeInZone(value, timeZone = activeTimeZone) {
     const parts = getDateTimeParts(value, timeZone);
     if (!parts) return '—';
     return `${parts.hour}:${parts.minute}:${parts.second}`;
   }
 
-  function formatDateTimeInZone(value, { includeSeconds = true } = {}, timeZone = DEFAULT_TIME_ZONE) {
+  function formatDateTimeInZone(value, { includeSeconds = true } = {}, timeZone = activeTimeZone) {
     const parts = getDateTimeParts(value, timeZone);
     if (!parts) return '—';
     const time = includeSeconds ? `${parts.hour}:${parts.minute}:${parts.second}` : `${parts.hour}:${parts.minute}`;
     return `${parts.year}/${parts.month}/${parts.day} ${time}`;
   }
 
-  function formatMonthDayTimeInZone(value, timeZone = DEFAULT_TIME_ZONE) {
+  function formatMonthDayTimeInZone(value, timeZone = activeTimeZone) {
     const parts = getDateTimeParts(value, timeZone);
     if (!parts) return '';
     return `${parts.month}/${parts.day} ${parts.hour}:${parts.minute}`;
@@ -6038,6 +6055,9 @@ function ensureRelayGuessSuffix(label, summary) {
   }
 
   function updateAppInfo(info) {
+    if (info?.timeZone) {
+      setActiveTimeZone(info.timeZone);
+    }
     if (!appVersionLabel) return;
     const version =
       typeof info?.version === 'string' && info.version.trim()

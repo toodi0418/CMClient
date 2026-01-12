@@ -42,6 +42,10 @@ const { SerialPort } = require('serialport');
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
 const MESSAGE_MAX_PER_CHANNEL = 200;
+const DEFAULT_TIME_ZONE =
+  typeof process.env.TMAG_TIMEZONE === 'string' && process.env.TMAG_TIMEZONE.trim()
+    ? process.env.TMAG_TIMEZONE.trim()
+    : 'Asia/Taipei';
 
 const messageStore = new Map();
 let messageWritePromise = Promise.resolve();
@@ -874,7 +878,8 @@ function waitForInitialMeshtasticConnection(nativeClient, { timeoutMs = 15_000 }
 }
 
 ipcMain.handle('app:get-info', async () => ({
-  version: appVersion
+  version: appVersion,
+  timeZone: DEFAULT_TIME_ZONE
 }));
 
 ipcMain.handle('nodes:get-snapshot', async () => {

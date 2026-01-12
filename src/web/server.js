@@ -16,6 +16,10 @@ const RAW_ENV_PORT =
 const ENV_PORT_DEFINED = Boolean(RAW_ENV_PORT);
 const DEFAULT_PORT = normalizePortNumber(RAW_ENV_PORT, 7080);
 const DEFAULT_HOST = process.env.TMAG_WEB_HOST || '0.0.0.0';
+const DEFAULT_TIME_ZONE = (() => {
+  const raw = process.env.TMAG_TIMEZONE;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : 'Asia/Taipei';
+})();
 const PACKET_WINDOW_MS = 10 * 60 * 1000;
 const PACKET_BUCKET_MS = 60 * 1000;
 const MAX_SUMMARY_ROWS = 200;
@@ -146,6 +150,10 @@ class WebDashboardServer {
     this.appVersion = typeof options.appVersion === 'string' && options.appVersion.trim()
       ? options.appVersion.trim()
       : FALLBACK_VERSION;
+    this.appTimeZone =
+      typeof options.appTimeZone === 'string' && options.appTimeZone.trim()
+        ? options.appTimeZone.trim()
+        : DEFAULT_TIME_ZONE;
     this.relayStatsPath =
       typeof options.relayStatsPath === 'string' && options.relayStatsPath.trim()
         ? options.relayStatsPath.trim()
@@ -178,7 +186,9 @@ class WebDashboardServer {
     this.aprsFlowQueue = [];
     this.aprsFlowRecords = new Map();
     this.aprsRecordQueue = [];
-    this.lastAppInfo = this.appVersion ? { version: this.appVersion } : null;
+    this.lastAppInfo = this.appVersion
+      ? { version: this.appVersion, timeZone: this.appTimeZone }
+      : { version: '', timeZone: this.appTimeZone };
     this.telemetryMaxPerNode =
       Number.isFinite(options.telemetryMaxPerNode) && options.telemetryMaxPerNode > 0
         ? Math.floor(options.telemetryMaxPerNode)
@@ -531,7 +541,7 @@ class WebDashboardServer {
     if (!normalized) {
       if (this.appVersion || this.lastAppInfo) {
         this.appVersion = '';
-        this.lastAppInfo = { version: '' };
+        this.lastAppInfo = { version: '', timeZone: this.appTimeZone };
         this._broadcast({ type: 'app-info', payload: this.lastAppInfo });
       }
       return;
@@ -540,7 +550,7 @@ class WebDashboardServer {
       return;
     }
     this.appVersion = normalized;
-    this.lastAppInfo = { version: this.appVersion };
+    this.lastAppInfo = { version: this.appVersion, timeZone: this.appTimeZone };
     this._broadcast({ type: 'app-info', payload: this.lastAppInfo });
   }
 
