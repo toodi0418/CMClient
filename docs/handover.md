@@ -9,6 +9,7 @@
 - **Web Dashboard 事件精簡**：`callmesh` SSE payload 僅保留前端使用欄位（狀態、Mapping 摘要、Provision、APRS 狀態），敏感資訊如 `verifiedKey`、agent 字串已移除。
 - **/debug 新增 APRS 去重快照**：`http://<host>:7080/debug` 現在會回傳 `aprsDedup` 區段，包含目前連線狀態、`packetCache` / `localTxHistory` / `callsignSummary` 等快取內容，可直接驗證哪些呼號被伺服器下發或被節流。
 - **APRS 去重快取持久化**：`aprs_packet_cache`、`aprs_local_tx`、`aprs_callsign_summary`、`aprs_position_digest` 同步寫入 `callmesh-data.sqlite`，重啟後會自動載回並重新套用 TTL，避免服務重啟時短暫失去去重記憶。
+- **APRS 防回朔 Gate**：上傳前新增 anti-backtrack 兩階段門檻（速度上限 + 軌跡群距離 + pending 二次確認），狀態分離 `last/prev` 與 pending，並持久化至 `callmesh-data.sqlite` 的 `aprs_backtrack_state`；/debug 會顯示當前 pending 與模式，用來避免亂序或晚到封包造成位置倒退。
 - **CallMesh 狀態顯示調整**：GUI/Web 均以「正常／異常」兩態對外呈現；異常代表未驗證 Key 或處於 degraded。
 - **遙測圖表**：Chart.js Tooltip 會依實際最小差距動態套用小數位數，避免相同值因四捨五入看似變化；Y 軸／最新值同步採用此精度。
 - **Web Telemetry 初始同步**：Electron 啟動以及 API Key 驗證流程完成後，都會將最新遙測快照播送給 Web Server，確保頁面立即有資料。
@@ -41,6 +42,7 @@
 - **TenManMap 訊息互通**：TenManMap WebSocket 現可接收 Meshtastic 文字封包（`message.publish`），並支援透過 `send_message` 命令回傳廣播文字；套用 5 秒節流與長度檢查，詳細規格見 `docs/tenmanmap-message-bridge.md`。
 - **TenManMap 回覆與自發訊息同步**：TenManMap 下行訊息可攜帶 `destination` / `reply_id`；橋接層會在廣播時保留 `reply_to`、在 Meshtastic 封包寫入 `reply_id`，並回報新的 `mesh_packet_id`。CLI / Electron / Web 會發出合成 summary 以顯示自身送出的訊息（含回覆箭頭資訊），iOS/Android App 亦可藉由 `reply_id` 顯示回覆符號。
 - **TenManMap WebSocket 容錯**：`resetTenmanWebsocket()` 會在呼叫 `terminate()` 前先註冊一次性 `error` 監聽，確保 5xx 或早期關閉導致的「WebSocket was closed before the connection was established」不再泡泡到頂層而讓橋接流程崩潰。
+- **UI 時區固定**：Web Dashboard 與 Electron UI 的時間顯示預設鎖定 `Asia/Taipei`，可透過 `TMAG_TIMEZONE` 覆寫，所有 Flow/訊息/遙測時間戳與 datetime 輸入都會套用此設定。
 
 ## 1. 專案定位與核心價值
 
@@ -532,7 +534,7 @@ CallMeshAprsBridge ──► CallMesh API（Heartbeat / Provision / Mapping）
 
 - `CALLMESH_ARTIFACTS_DIR`（預設 `~/.config/callmesh/`）：
   - `monitor.json`：CallMesh API 驗證結果、心跳時間。
-  - `callmesh-data.sqlite`：集中儲存節點快照（`nodes` 表）、Mapping/Provision 快取（`kv_store`）、訊息紀錄（`message_log`）與 Relay 統計（`relay_stats`），同時新增 `aprs_packet_cache` / `aprs_local_tx` / `aprs_callsign_summary` / `aprs_position_digest` 表持久化 APRS 去重快取。升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl` 與 `relay-link-stats.json` 並移除備份。
+  - `callmesh-data.sqlite`：集中儲存節點快照（`nodes` 表）、Mapping/Provision 快取（`kv_store`）、訊息紀錄（`message_log`）與 Relay 統計（`relay_stats`），同時新增 `aprs_packet_cache` / `aprs_local_tx` / `aprs_callsign_summary` / `aprs_position_digest` 表持久化 APRS 去重快取，與 `aprs_backtrack_state` 持久化防回朔 Gate 的 last/prev/pending 狀態。升級時會自動匯入舊版 `node-database.json`、`message-log.jsonl` 與 `relay-link-stats.json` 並移除備份。
 - `telemetry-records.sqlite`：遙測資料。
 - WebDashboard Snapshots：啟動時會以 `seed*` 方法注入節點、遙測、訊息快照；重新整理頁面也會取得最新資料。
 
