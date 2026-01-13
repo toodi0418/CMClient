@@ -49,6 +49,19 @@ const APRS_PACKET_RECENT_WINDOW_MS = APRS_PACKET_CACHE_TTL_MS;
 const APRS_LOCAL_TX_WINDOW_MS = 30_000;
 const APRS_PACKET_KEY_SEPARATOR = '\u0001';
 
+const APRS_ANTI_BACKTRACK_MAX_SPEED_CAR_KMPH = 200;
+const APRS_ANTI_BACKTRACK_MAX_SPEED_HSR_KMPH = 380;
+const APRS_ANTI_BACKTRACK_ENTER_HSR_KMPH = 240;
+const APRS_ANTI_BACKTRACK_EXIT_HSR_KMPH = 180;
+const APRS_ANTI_BACKTRACK_CONFIRM_RADIUS_KM = 8;
+const APRS_ANTI_BACKTRACK_CONFIRM_WINDOW_MS = 5 * 60_000;
+const APRS_ANTI_BACKTRACK_PENDING_TIMEOUT_MS = 20 * 60_000;
+const APRS_ANTI_BACKTRACK_MIN_DT_MS = 10_000;
+const APRS_ANTI_BACKTRACK_CLUSTER_SIZE = 5;
+const APRS_ANTI_BACKTRACK_CLUSTER_RADIUS_KM = 12;
+const APRS_ANTI_BACKTRACK_LONG_GAP_RESET_MS = 2 * 60 * 60_000;
+const APRS_ANTI_BACKTRACK_STATE_LIMIT = 512;
+
 const TENMAN_FORWARD_WS_ENDPOINT = 'wss://tenmanmap.yakumo.tw/ws';
 const TENMAN_FORWARD_DEFAULT_ENABLED =
   !['1', 'true', 'yes', 'on'].includes(
@@ -250,6 +263,7 @@ class CallMeshAprsBridge extends EventEmitter {
     this.aprsPacketCache = new Map();
     this.aprsCallsignSummary = new Map();
     this.aprsLocalTxHistory = new Map();
+    this.aprsAntiBacktrackState = new Map();
     this.aprsCachePersistTimer = null;
     this.aprsCachePersistDelayMs = 1500;
     this.aprsFeedFilterCommand = this.computeAprsFeedFilterCommand();
@@ -733,8 +747,97 @@ class CallMeshAprsBridge extends EventEmitter {
         `restored aprs dedup snapshot packet=${restoredPackets} local_tx=${restoredLocalTx} callsign=${restoredCallsigns} digest=${restoredDigests}`
       );
     }
+    this.restoreAprsAntiBacktrackState(now);
     this.pruneAprsCachesByWhitelist('restore');
     this.scheduleAprsCachePersist();
+  }
+
+  restoreAprsAntiBacktrackState(now = Date.now()) {
+    const store = this.getDataStore();
+    if (!store) {
+      return;
+    }
+    let rows = null;
+    try {
+      rows = store.loadAprsBacktrackState();
+    } catch (err) {
+      this.emitLog('APRS', `restore aprs anti-backtrack state failed: ${err.message}`);
+      return;
+    }
+    if (!Array.isArray(rows) || !rows.length) {
+      return;
+    }
+    let restored = 0;
+    let pendingCount = 0;
+    for (const entry of rows) {
+      const callsign = normalizeAprsCallsign(entry?.callsign);
+      if (!callsign) continue;
+      const state = this.getAprsAntiBacktrackState(callsign, { allowCreate: true });
+      if (!state) continue;
+      state.mode = entry?.mode === 'hsr' ? 'hsr' : 'car';
+      state.modeUpdatedMs = Number.isFinite(entry?.modeUpdatedMs) ? entry.modeUpdatedMs : null;
+
+      const last = entry?.lastUploaded;
+      if (last && Number.isFinite(last.lat) && Number.isFinite(last.lon)) {
+        state.lastUploaded = {
+          lat: Number(last.lat),
+          lon: Number(last.lon),
+          timestampMs: Number.isFinite(last.timestampMs) ? Number(last.timestampMs) : null
+        };
+      }
+
+      const prev = entry?.prevUploaded;
+      if (prev && Number.isFinite(prev.lat) && Number.isFinite(prev.lon)) {
+        state.prevUploaded = {
+          lat: Number(prev.lat),
+          lon: Number(prev.lon),
+          timestampMs: Number.isFinite(prev.timestampMs) ? Number(prev.timestampMs) : null
+        };
+      }
+
+      const pending = entry?.pending;
+      if (pending && Number.isFinite(pending.lat) && Number.isFinite(pending.lon)) {
+        const firstSeen = Number.isFinite(entry?.pendingFirstSeenMs)
+          ? Number(entry.pendingFirstSeenMs)
+          : null;
+        const lastSeen = Number.isFinite(entry?.pendingLastSeenMs)
+          ? Number(entry.pendingLastSeenMs)
+          : null;
+        if (!firstSeen || now - firstSeen <= APRS_ANTI_BACKTRACK_PENDING_TIMEOUT_MS) {
+          state.pending = {
+            lat: Number(pending.lat),
+            lon: Number(pending.lon),
+            firstSeenMs: firstSeen,
+            lastSeenMs: lastSeen || firstSeen,
+            reason: entry?.pendingReason || null
+          };
+          pendingCount += 1;
+        }
+      }
+
+      const history = Array.isArray(entry?.history) ? entry.history : [];
+      state.history = history
+        .filter(
+          (pos) =>
+            pos &&
+            Number.isFinite(pos.lat) &&
+            Number.isFinite(pos.lon) &&
+            Number.isFinite(pos.timestampMs)
+        )
+        .slice(-APRS_ANTI_BACKTRACK_CLUSTER_SIZE)
+        .map((pos) => ({
+          lat: Number(pos.lat),
+          lon: Number(pos.lon),
+          timestampMs: Number(pos.timestampMs)
+        }));
+      restored += 1;
+    }
+    if (restored) {
+      this.emitLog(
+        'APRS',
+        `restored aprs anti-backtrack state count=${restored} pending=${pendingCount}`
+      );
+    }
   }
 
   scheduleNodeDatabasePersist() {
@@ -847,6 +950,8 @@ class CallMeshAprsBridge extends EventEmitter {
     try {
       const snapshot = this.buildAprsDedupSnapshot();
       store.saveAprsDedupSnapshot(snapshot);
+      const backtrackSnapshot = this.buildAprsAntiBacktrackSnapshot();
+      store.saveAprsBacktrackState(backtrackSnapshot);
     } catch (err) {
       this.emitLog('APRS', `寫入 APRS 去重快取失敗: ${err.message}`);
     }
@@ -922,6 +1027,334 @@ class CallMeshAprsBridge extends EventEmitter {
       callsignSummary,
       positionDigest
     };
+  }
+
+  buildAprsAntiBacktrackSnapshot() {
+    const entries = [];
+    for (const [callsign, state] of this.aprsAntiBacktrackState.entries()) {
+      if (!callsign || !state) continue;
+      entries.push({
+        callsign,
+        lastUploaded: state.lastUploaded
+          ? {
+              lat: state.lastUploaded.lat,
+              lon: state.lastUploaded.lon,
+              timestampMs: state.lastUploaded.timestampMs
+            }
+          : null,
+        prevUploaded: state.prevUploaded
+          ? {
+              lat: state.prevUploaded.lat,
+              lon: state.prevUploaded.lon,
+              timestampMs: state.prevUploaded.timestampMs
+            }
+          : null,
+        pending: state.pending
+          ? {
+              lat: state.pending.lat,
+              lon: state.pending.lon,
+              timestampMs: state.pending.lastSeenMs ?? state.pending.firstSeenMs
+            }
+          : null,
+        pendingFirstSeenMs: state.pending?.firstSeenMs ?? null,
+        pendingReason: state.pending?.reason ?? null,
+        pendingLastSeenMs: state.pending?.lastSeenMs ?? null,
+        mode: state.mode ?? null,
+        modeUpdatedMs: state.modeUpdatedMs ?? null,
+        history: Array.isArray(state.history) ? state.history.slice() : []
+      });
+    }
+    return entries;
+  }
+
+  getAprsAntiBacktrackState(callsign, { allowCreate = false } = {}) {
+    const normalized = normalizeAprsCallsign(callsign);
+    if (!normalized) return null;
+    let state = this.aprsAntiBacktrackState.get(normalized);
+    if (!state && allowCreate) {
+      let trimmed = false;
+      if (this.aprsAntiBacktrackState.size >= APRS_ANTI_BACKTRACK_STATE_LIMIT) {
+        const firstKey = this.aprsAntiBacktrackState.keys().next().value;
+        if (firstKey) {
+          this.aprsAntiBacktrackState.delete(firstKey);
+          trimmed = true;
+        }
+      }
+      state = {
+        mode: 'car',
+        modeUpdatedMs: null,
+        lastUploaded: null,
+        prevUploaded: null,
+        pending: null,
+        history: []
+      };
+      this.aprsAntiBacktrackState.set(normalized, state);
+      if (trimmed) {
+        this.scheduleAprsCachePersist();
+      }
+    }
+    return state;
+  }
+
+  pruneAprsAntiBacktrackPending(state, now) {
+    if (!state?.pending || !Number.isFinite(state.pending.firstSeenMs)) {
+      return false;
+    }
+    if (now - state.pending.firstSeenMs > APRS_ANTI_BACKTRACK_PENDING_TIMEOUT_MS) {
+      state.pending = null;
+      return true;
+    }
+    return false;
+  }
+
+  computeAprsAntiBacktrackClusterDistance(state, pos) {
+    if (!state || !Array.isArray(state.history) || !state.history.length) {
+      return null;
+    }
+    const recent = state.history
+      .filter(
+        (entry) =>
+          entry &&
+          Number.isFinite(entry.lat) &&
+          Number.isFinite(entry.lon) &&
+          Number.isFinite(entry.timestampMs)
+      )
+      .slice(-APRS_ANTI_BACKTRACK_CLUSTER_SIZE);
+    if (!recent.length) {
+      return null;
+    }
+    const sum = recent.reduce(
+      (acc, entry) => {
+        acc.lat += entry.lat;
+        acc.lon += entry.lon;
+        return acc;
+      },
+      { lat: 0, lon: 0 }
+    );
+    const center = {
+      lat: sum.lat / recent.length,
+      lon: sum.lon / recent.length
+    };
+    return haversineKm(center.lat, center.lon, pos.latitude, pos.longitude);
+  }
+
+  handleAprsAntiBacktrackPending(state, pos, now, context) {
+    const pending = state.pending;
+    const result = {
+      decision: 'hold',
+      reason: context?.reason ?? 'unknown',
+      distKm: context?.distKm ?? null,
+      dtMs: context?.dtMs ?? null,
+      speedKph: context?.speedKph ?? null,
+      clusterDistanceKm: context?.clusterDistanceKm ?? null,
+      mode: state.mode || 'car',
+      pendingReason: null,
+      pendingDistanceKm: null,
+      pendingAgeMs: null,
+      changed: false
+    };
+    if (pending) {
+      const pendingAge = Number.isFinite(pending.firstSeenMs) ? now - pending.firstSeenMs : null;
+      const distanceToPending = haversineKm(
+        pending.lat,
+        pending.lon,
+        pos.latitude,
+        pos.longitude
+      );
+      result.pendingDistanceKm = distanceToPending;
+      result.pendingAgeMs = pendingAge;
+      if (
+        Number.isFinite(distanceToPending) &&
+        distanceToPending <= APRS_ANTI_BACKTRACK_CONFIRM_RADIUS_KM &&
+        (!Number.isFinite(pendingAge) || pendingAge <= APRS_ANTI_BACKTRACK_CONFIRM_WINDOW_MS)
+      ) {
+        result.decision = 'upload';
+        result.reason = 'pending-confirmed';
+        result.pendingReason = pending.reason || context?.reason || null;
+        return result;
+      }
+      const expired =
+        Number.isFinite(pendingAge) && pendingAge > APRS_ANTI_BACKTRACK_CONFIRM_WINDOW_MS;
+      state.pending = {
+        lat: pos.latitude,
+        lon: pos.longitude,
+        firstSeenMs: expired || !Number.isFinite(pending.firstSeenMs)
+          ? now
+          : pending.firstSeenMs,
+        lastSeenMs: now,
+        reason: pending.reason || context?.reason || null
+      };
+      result.changed = true;
+      return result;
+    }
+    state.pending = {
+      lat: pos.latitude,
+      lon: pos.longitude,
+      firstSeenMs: now,
+      lastSeenMs: now,
+      reason: context?.reason || null
+    };
+    result.pendingAgeMs = 0;
+    result.changed = true;
+    return result;
+  }
+
+  evaluateAprsAntiBacktrackGate(callsign, pos, now = Date.now()) {
+    const label = normalizeAprsCallsign(callsign) || callsign;
+    const state = this.getAprsAntiBacktrackState(callsign, { allowCreate: true });
+    if (!state) {
+      return { decision: 'upload', reason: 'missing-state' };
+    }
+    let changed = this.pruneAprsAntiBacktrackPending(state, now);
+    if (changed) {
+      this.emitLog('APRS', `anti-backtrack pending timeout callsign=${label}`);
+    }
+    const last = state.lastUploaded;
+    if (!last || !Number.isFinite(last.lat) || !Number.isFinite(last.lon)) {
+      if (changed) {
+        this.scheduleAprsCachePersist();
+      }
+      return { decision: 'upload', reason: 'first-fix', mode: state.mode || 'car' };
+    }
+    const dtMs = now - (last.timestampMs ?? now);
+    if (dtMs >= APRS_ANTI_BACKTRACK_LONG_GAP_RESET_MS) {
+      if (state.pending) {
+        state.pending = null;
+        changed = true;
+      }
+      if (changed) {
+        this.scheduleAprsCachePersist();
+      }
+      return { decision: 'upload', reason: 'long-gap', mode: state.mode || 'car', dtMs };
+    }
+    const distKm = haversineKm(last.lat, last.lon, pos.latitude, pos.longitude);
+    const speedKph = dtMs > 0 ? distKm / (dtMs / 3_600_000) : Infinity;
+    const vmax =
+      state.mode === 'hsr'
+        ? APRS_ANTI_BACKTRACK_MAX_SPEED_HSR_KMPH
+        : APRS_ANTI_BACKTRACK_MAX_SPEED_CAR_KMPH;
+    const clusterDistanceKm = this.computeAprsAntiBacktrackClusterDistance(state, pos);
+    let outlierReason = null;
+    if (dtMs < APRS_ANTI_BACKTRACK_MIN_DT_MS) {
+      outlierReason = 'dt-too-small';
+    } else if (speedKph > vmax) {
+      outlierReason = 'speed-exceeded';
+    } else if (
+      Number.isFinite(clusterDistanceKm) &&
+      clusterDistanceKm > APRS_ANTI_BACKTRACK_CLUSTER_RADIUS_KM
+    ) {
+      outlierReason = 'far-from-cluster';
+    }
+
+    if (outlierReason) {
+      const pendingDecision = this.handleAprsAntiBacktrackPending(state, pos, now, {
+        reason: outlierReason,
+        distKm,
+        dtMs,
+        speedKph,
+        clusterDistanceKm
+      });
+      if (pendingDecision.changed) {
+        this.scheduleAprsCachePersist();
+      }
+      return pendingDecision;
+    }
+
+    if (state.pending) {
+      state.pending = null;
+      changed = true;
+    }
+    if (changed) {
+      this.scheduleAprsCachePersist();
+    }
+    return {
+      decision: 'upload',
+      reason: 'pass',
+      distKm,
+      dtMs,
+      speedKph,
+      clusterDistanceKm,
+      mode: state.mode || 'car'
+    };
+  }
+
+  appendAprsAntiBacktrackHistory(state, pos) {
+    if (!state || !pos) return;
+    if (!Array.isArray(state.history)) {
+      state.history = [];
+    }
+    state.history.push({
+      lat: pos.lat,
+      lon: pos.lon,
+      timestampMs: pos.timestampMs
+    });
+    if (state.history.length > APRS_ANTI_BACKTRACK_CLUSTER_SIZE) {
+      state.history = state.history.slice(-APRS_ANTI_BACKTRACK_CLUSTER_SIZE);
+    }
+  }
+
+  updateAprsAntiBacktrackMode(state, previousLast, currentLast, now) {
+    if (!state || !previousLast || !currentLast) {
+      return;
+    }
+    if (!Number.isFinite(previousLast.timestampMs)) {
+      return;
+    }
+    const dtMs = now - previousLast.timestampMs;
+    if (dtMs <= 0) {
+      return;
+    }
+    const distKm = haversineKm(previousLast.lat, previousLast.lon, currentLast.lat, currentLast.lon);
+    const speedKph = distKm / (dtMs / 3_600_000);
+    if (state.mode === 'hsr') {
+      if (speedKph < APRS_ANTI_BACKTRACK_EXIT_HSR_KMPH) {
+        state.mode = 'car';
+        state.modeUpdatedMs = now;
+      }
+    } else if (speedKph > APRS_ANTI_BACKTRACK_ENTER_HSR_KMPH) {
+      state.mode = 'hsr';
+      state.modeUpdatedMs = now;
+    }
+  }
+
+  applyAprsAntiBacktrackUpload(callsign, pos, now, _context = {}) {
+    const state = this.getAprsAntiBacktrackState(callsign, { allowCreate: true });
+    if (!state) return;
+    const previousLast = state.lastUploaded
+      ? { ...state.lastUploaded }
+      : null;
+    if (previousLast) {
+      state.prevUploaded = previousLast;
+    }
+    state.lastUploaded = {
+      lat: pos.latitude,
+      lon: pos.longitude,
+      timestampMs: now
+    };
+    state.pending = null;
+    this.appendAprsAntiBacktrackHistory(state, state.lastUploaded);
+    this.updateAprsAntiBacktrackMode(state, previousLast, state.lastUploaded, now);
+    this.scheduleAprsCachePersist();
+  }
+
+  formatAprsAntiBacktrackHoldMessage(decision) {
+    const mode = decision?.mode === 'hsr' ? 'hsr' : 'car';
+    const vmax =
+      mode === 'hsr'
+        ? APRS_ANTI_BACKTRACK_MAX_SPEED_HSR_KMPH
+        : APRS_ANTI_BACKTRACK_MAX_SPEED_CAR_KMPH;
+    switch (decision?.reason) {
+      case 'dt-too-small':
+        return `APRS 防回朔暫緩：與前一筆時間差過小（< ${Math.round(
+          APRS_ANTI_BACKTRACK_MIN_DT_MS / 1000
+        )} 秒），等待下一筆確認`;
+      case 'speed-exceeded':
+        return `APRS 防回朔暫緩：推算速度超過上限 ${vmax} km/h，需第二筆確認`;
+      case 'far-from-cluster':
+        return `APRS 防回朔暫緩：位置偏離近期軌跡超過 ${APRS_ANTI_BACKTRACK_CLUSTER_RADIUS_KM} km`;
+      default:
+        return 'APRS 防回朔暫緩：等待二次確認';
+    }
   }
 
   setSelfMeshId(meshId) {
@@ -4045,6 +4478,31 @@ class CallMeshAprsBridge extends EventEmitter {
       return;
     }
 
+    const antiDecision = this.evaluateAprsAntiBacktrackGate(normalizedCallsign, pos, now);
+    if (antiDecision?.decision === 'hold') {
+      const remainingMs =
+        Number.isFinite(antiDecision.pendingAgeMs) && antiDecision.pendingAgeMs >= 0
+          ? Math.max(0, APRS_ANTI_BACKTRACK_CONFIRM_WINDOW_MS - antiDecision.pendingAgeMs)
+          : APRS_ANTI_BACKTRACK_CONFIRM_WINDOW_MS;
+      const message = this.formatAprsAntiBacktrackHoldMessage(antiDecision);
+      this.markAprsSummaryRejected(summary, 'backtrack-pending', {
+        message,
+        windowMs: APRS_ANTI_BACKTRACK_CONFIRM_WINDOW_MS,
+        remainingMs
+      });
+      const parts = [
+        `anti-backtrack hold callsign=${normalizedCallsign}`,
+        `reason=${antiDecision.reason || 'unknown'}`,
+        Number.isFinite(antiDecision.speedKph) ? `speed=${antiDecision.speedKph.toFixed(1)}km/h` : null,
+        Number.isFinite(antiDecision.distKm) ? `dist=${antiDecision.distKm.toFixed(2)}km` : null,
+        Number.isFinite(antiDecision.pendingDistanceKm)
+          ? `pending_dist=${antiDecision.pendingDistanceKm.toFixed(2)}km`
+          : null
+      ].filter(Boolean);
+      this.emitLog('APRS', parts.join(' '));
+      return;
+    }
+
     const qCallsign = this.getProvisionAprsCallsign() || this.aprsState.callsign;
     const pathParts = [APRS_MESH_PATH, APRS_Q_CONSTRUCT];
     if (qCallsign) pathParts.push(qCallsign);
@@ -4053,6 +4511,17 @@ class CallMeshAprsBridge extends EventEmitter {
     if (sent) {
       this.recordTelemetryAprsForward(summary.timestampMs);
       this.recordLocalAprsTransmission(normalizedCallsign, payload, now);
+      this.applyAprsAntiBacktrackUpload(normalizedCallsign, pos, now, antiDecision);
+      if (antiDecision?.reason === 'pending-confirmed') {
+        if (!Array.isArray(summary.extraLines)) {
+          summary.extraLines = [];
+        }
+        const passLine = 'APRS 防回朔：已通過二次確認';
+        if (!summary.extraLines.includes(passLine)) {
+          summary.extraLines.push(passLine);
+        }
+        this.emitLog('APRS', `anti-backtrack accept (pending-confirmed) callsign=${normalizedCallsign}`);
+      }
       if (meshId) {
         this.rememberAprsPositionDigest(meshId, digest);
       }
@@ -4158,6 +4627,64 @@ class CallMeshAprsBridge extends EventEmitter {
     );
     lastPositionDigest.sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0));
 
+    const antiBacktrackState = Array.from(this.aprsAntiBacktrackState.entries()).map(
+      ([callsign, state]) => {
+        const pendingAge = Number.isFinite(state?.pending?.firstSeenMs)
+          ? now - state.pending.firstSeenMs
+          : null;
+        return {
+          callsign,
+          mode: state?.mode || 'car',
+          modeUpdatedMs: state?.modeUpdatedMs ?? null,
+          modeUpdatedIso:
+            Number.isFinite(state?.modeUpdatedMs) && state.modeUpdatedMs
+              ? new Date(state.modeUpdatedMs).toISOString()
+              : null,
+          lastUploaded: state?.lastUploaded
+            ? {
+                lat: state.lastUploaded.lat,
+                lon: state.lastUploaded.lon,
+                timestampMs: state.lastUploaded.timestampMs,
+                timestampIso: state.lastUploaded.timestampMs
+                  ? new Date(state.lastUploaded.timestampMs).toISOString()
+                  : null
+              }
+            : null,
+          prevUploaded: state?.prevUploaded
+            ? {
+                lat: state.prevUploaded.lat,
+                lon: state.prevUploaded.lon,
+                timestampMs: state.prevUploaded.timestampMs,
+                timestampIso: state.prevUploaded.timestampMs
+                  ? new Date(state.prevUploaded.timestampMs).toISOString()
+                  : null
+              }
+            : null,
+          pending: state?.pending
+            ? {
+                lat: state.pending.lat,
+                lon: state.pending.lon,
+                firstSeenMs: state.pending.firstSeenMs ?? null,
+                lastSeenMs: state.pending.lastSeenMs ?? null,
+                reason: state.pending.reason || null,
+                ageMs: pendingAge,
+                firstSeenIso:
+                  Number.isFinite(state.pending.firstSeenMs) && state.pending.firstSeenMs
+                    ? new Date(state.pending.firstSeenMs).toISOString()
+                    : null
+              }
+            : null,
+          historySize: Array.isArray(state?.history) ? state.history.length : 0
+        };
+      }
+    );
+    antiBacktrackState.sort((a, b) => {
+      const aTs = a.lastUploaded?.timestampMs ?? 0;
+      const bTs = b.lastUploaded?.timestampMs ?? 0;
+      return bTs - aTs;
+    });
+    const antiBacktrackPending = antiBacktrackState.filter((entry) => entry.pending).length;
+
     return {
       generatedAt: new Date(now).toISOString(),
       aprsState: {
@@ -4177,11 +4704,14 @@ class CallMeshAprsBridge extends EventEmitter {
       localTxHistory,
       callsignSummary,
       lastPositionDigest,
+      antiBacktrackState: antiBacktrackState.slice(0, 128),
       stats: {
         packetCacheSize: this.aprsPacketCache.size,
         localTxHistorySize: this.aprsLocalTxHistory.size,
         callsignSummarySize: this.aprsCallsignSummary.size,
-        lastPositionDigestSize: this.aprsLastPositionDigest.size
+        lastPositionDigestSize: this.aprsLastPositionDigest.size,
+        antiBacktrackSize: this.aprsAntiBacktrackState.size,
+        antiBacktrackPending
       }
     };
   }
@@ -4277,6 +4807,10 @@ class CallMeshAprsBridge extends EventEmitter {
         this.aprsLocalTxHistory.clear();
         modified = true;
       }
+      if (this.aprsAntiBacktrackState.size) {
+        this.aprsAntiBacktrackState.clear();
+        modified = true;
+      }
       if (modified) {
         this.scheduleAprsCachePersist();
       }
@@ -4299,6 +4833,12 @@ class CallMeshAprsBridge extends EventEmitter {
     for (const callsign of Array.from(this.aprsCallsignSummary.keys())) {
       if (!this.aprsAllowedCallsigns.has(callsign)) {
         this.aprsCallsignSummary.delete(callsign);
+        modified = true;
+      }
+    }
+    for (const callsign of Array.from(this.aprsAntiBacktrackState.keys())) {
+      if (!this.aprsAllowedCallsigns.has(callsign)) {
+        this.aprsAntiBacktrackState.delete(callsign);
         modified = true;
       }
     }
@@ -6460,6 +7000,26 @@ function splitAprsPacketKey(key) {
   const callsign = normalizeAprsCallsign(key.slice(0, separatorIndex));
   const infoString = key.slice(separatorIndex + 1);
   return { callsign, infoString };
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  if (
+    !Number.isFinite(lat1) ||
+    !Number.isFinite(lon1) ||
+    !Number.isFinite(lat2) ||
+    !Number.isFinite(lon2)
+  ) {
+    return NaN;
+  }
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
 }
 
 function isMappingEntryEnabled(mapping) {
