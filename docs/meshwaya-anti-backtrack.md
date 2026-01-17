@@ -4,6 +4,7 @@
 - 避免因 RF/mesh 亂序、晚到造成「最新位置回朔/瞬移」。
 - Meshwaya 支援補點（寫入歷史軌跡），可以同時「保護即時點」又「不漏掉晚到點」。
 - 以現行 anti-backtrack Gate 概念為基礎，增加「live 更新」與「歷史補點」雙通路。
+- 重點：**畫面上的即時軌跡線不可回朔**。晚到/亂序的點即使要保存，也走補點通路，不要挪動 live 端點或把線段拉回去。
 
 ## 核心概念
 - **Live Gate**：用 anti-backtrack 兩階段門檻（速度/cluster + pending 二次確認）判斷是否可以更新「最新位置」。
@@ -33,7 +34,7 @@
 ## Meshwaya 端建議
 - **Live API/Topic**：套用「最後一筆即時位置」邏輯，只吃 `is_live=1` 的點。  
 - **Backfill API/Topic**：允許按事件時間插入歷史，不覆寫 live。延遲點可寫入此通路。  
-- **前端呈現**：live 位置取最新 `is_live`；軌跡線可同時繪 live + backfill，並以時間排序。
+- **前端呈現**：live 位置取最新 `is_live`，live 軌跡線保持單調向前，不因晚到點回拉；backfill 可用淡色/虛線疊加在歷史軌跡，並以時間排序。
 
 ## 推薦參數（可微調）
 - `V_CAR=200 km/h`、`V_HSR=380 km/h`、`HSR_ENTER=240/HSR_EXIT=180 km/h`  
