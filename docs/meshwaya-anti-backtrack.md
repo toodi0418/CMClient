@@ -3,7 +3,7 @@
 ## 目的
 - 避免因 RF/mesh 亂序、晚到造成「最新位置回朔/瞬移」。
 - Meshwaya 支援補點（寫入歷史軌跡），可以同時「保護即時點」又「不漏掉晚到點」。
-- 以 `meshtastic_aprs_antibacktrack_spec.md` 的 Gate 概念為基礎，增加「live 更新」與「歷史補點」雙通路。
+- 以現行 anti-backtrack Gate 概念為基礎，增加「live 更新」與「歷史補點」雙通路。
 
 ## 核心概念
 - **Live Gate**：用 anti-backtrack 兩階段門檻（速度/cluster + pending 二次確認）判斷是否可以更新「最新位置」。
@@ -11,7 +11,7 @@
 - **兩套狀態**：`last_uploaded/prev_uploaded`（只在 live 上傳成功後更新）與 `pending`（暫存可疑點）。補點不會動到 `last/prev`。
 
 ## 資料欄位建議
-- `callsign`：APRS Callsign-SSID。
+- `track_id`：用來識別節點／裝置（Mesh ID、裝置序號或平台使用的唯一 ID）。
 - `lat/lon/alt`：座標。
 - `rx_time_ms`：Gateway 收到時間（必備，伺服器時間）。
 - `sample_time_ms`：若封包內有原始時間/序號，可填（沒有就與 `rx_time_ms` 相同）。
@@ -46,6 +46,6 @@
 - 真正移動到新區域：第一顆 P1 進 pending，P2 落在 8 km/5 分內 → live 更新至新區域，pending 清空；歷史軌跡包含 P1/P2。
 
 ## 實作重點
-- 狀態持久化：`aprs_backtrack_state` 已存放 last/prev/pending/history，重啟不會忘記基準。  
+- 狀態持久化：Gateway 端的 backtrack state（last/prev/pending/history）會寫入 SQLite，重啟不會忘記基準。  
 - 保持 `last/prev` 只在 live 成功上傳後更新；backfill 不改基準。  
 - Log/Debug：當前實作會在 /debug 顯示 anti-backtrack 狀態，並對 hold/confirm/timeout 打 log，便於追蹤。
