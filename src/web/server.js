@@ -160,6 +160,8 @@ class WebDashboardServer {
       options && typeof options.relayStatsStore === 'object' ? options.relayStatsStore : null;
     this.messageLogStore =
       options && typeof options.messageLogStore === 'object' ? options.messageLogStore : null;
+    this.messageSender =
+      options && typeof options.messageSender === 'function' ? options.messageSender : null;
     this.aprsDebugProvider =
       typeof options.aprsDebugProvider === 'function' ? options.aprsDebugProvider : null;
 
@@ -290,6 +292,10 @@ class WebDashboardServer {
     }
     if (pathname === '/api/telemetry') {
       this._handleTelemetryRequest(req, res);
+      return;
+    }
+    if (pathname === '/api/messages/send') {
+      this._handleMessageSendRequest(req, res);
       return;
     }
     if (pathname === '/debug') {
@@ -567,6 +573,10 @@ class WebDashboardServer {
 
   setAppVersion(version) {
     this.setAppInfo({ version });
+  }
+
+  setMessageSender(sender) {
+    this.messageSender = typeof sender === 'function' ? sender : null;
   }
 
   publishLog(entry) {
@@ -1171,6 +1181,104 @@ class WebDashboardServer {
       console.error(`處理遙測請求失敗：${err.message}`);
       respond(500, { error: 'internal error' });
     }
+  }
+
+  async _handleMessageSendRequest(req, res) {
+    const respond = (status, payload) => {
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(payload));
+    };
+
+    if (!req.method || req.method.toUpperCase() !== 'POST') {
+      respond(405, { error: 'Method Not Allowed', allowed: ['POST'] });
+      return;
+    }
+
+    if (!this.messageSender) {
+      respond(503, { error: 'message sender unavailable' });
+      return;
+    }
+
+    let payload;
+    try {
+      payload = await this._readJsonBody(req);
+    } catch (err) {
+      const message = err?.message || 'invalid body';
+      const status = message.toLowerCase().includes('payload too large') ? 413 : 400;
+      respond(status, { error: message });
+      return;
+    }
+
+    if (!payload || typeof payload !== 'object') {
+      respond(400, { error: 'invalid payload' });
+      return;
+    }
+
+    const rawText = typeof payload.text === 'string' ? payload.text.trim() : '';
+    if (!rawText) {
+      respond(400, { error: 'text is required' });
+      return;
+    }
+
+    const rawChannel = Number(payload.channel);
+    const channel = Number.isFinite(rawChannel) ? Math.max(0, Math.floor(rawChannel)) : 0;
+
+    try {
+      const result = await Promise.resolve(this.messageSender({ text: rawText, channel }));
+      const packetId = Number.isFinite(result?.packetId) ? Number(result.packetId) : null;
+      respond(200, { success: true, channel, packetId });
+    } catch (err) {
+      respond(500, { success: false, error: err?.message || 'failed to send message' });
+    }
+  }
+
+  async _readJsonBody(req, limit = 64 * 1024) {
+    return new Promise((resolve, reject) => {
+      let data = '';
+      let size = 0;
+      const onData = (chunk) => {
+        size += chunk.length;
+        if (size > limit) {
+          cleanup();
+          reject(new Error('payload too large'));
+          try {
+            req.destroy();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        data += chunk.toString('utf8');
+      };
+      const onEnd = () => {
+        cleanup();
+        if (!data) {
+          resolve(null);
+          return;
+        }
+        try {
+          resolve(JSON.parse(data));
+        } catch (err) {
+          reject(err);
+        }
+      };
+      const onError = (err) => {
+        cleanup();
+        reject(err || new Error('failed to read body'));
+      };
+      const cleanup = () => {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('error', onError);
+      };
+      req.on('data', onData);
+      req.on('end', onEnd);
+      req.on('error', onError);
+    });
   }
 
   _ingestTelemetryDetail(detail, options = {}) {

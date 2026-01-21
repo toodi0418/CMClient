@@ -445,6 +445,7 @@ node src/index.js --host serial:///dev/ttyUSB0 --web-ui
 ### 6.5 訊息頻道
 
 - Electron 「訊息」分頁會顯示 CH0~CH3 文字封包，並持久化於 `callmesh-data.sqlite`（`~/Library/Application Support/<app>/callmesh/`，Windows/Linux 依 OS 路徑）；舊版 JSONL 會於載入時自動匯入。
+- 訊息分頁提供送訊輸入區，可選擇頻道並輸入文字送出；送出的訊息會以本機節點合成摘要寫回訊息列表。
 - Web Dashboard 與 Electron 均提供分頁功能：預設每頁 25 筆，可切換至 50 / 100 筆；支援跳至第一／最後一頁與前一頁／下一頁。頁碼與每頁筆數會記錄於瀏覽器 `localStorage` 或 Electron `localStorage`，針對每個頻道獨立保存。
 - 每個頻道預設保留最近 200 筆（後端裁切），若需清空可在離線狀態下透過 UI 執行「清除訊息紀錄」，或刪除 `callmesh-data.sqlite` 後重新啟動（舊版 JSONL 亦可刪除）。
 - 支援未讀標記：切換頻道後會清除該頻道的未讀狀態；訊息清空或檔案刪除後會自動重建。

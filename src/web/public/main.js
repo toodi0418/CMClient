@@ -32,6 +32,9 @@
   const channelPageNextBtn = document.getElementById('channel-page-next');
   const channelPageLastBtn = document.getElementById('channel-page-last');
   const channelPageSizeSelect = document.getElementById('channel-page-size');
+  const messageInput = document.getElementById('message-input');
+  const messageSendBtn = document.getElementById('message-send-btn');
+  const messageSendStatus = document.getElementById('message-send-status');
   const flowPage = document.getElementById('flow-page');
   const flowList = document.getElementById('flow-list');
   const flowEmptyState = document.getElementById('flow-empty-state');
@@ -108,6 +111,11 @@
     '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
 
   let currentSelfMeshId = null;
+  let meshtasticStatus = 'unknown';
+  let messageSendPending = false;
+  let messageStatusTimer = null;
+  const MESSAGE_INPUT_PLACEHOLDER =
+    messageInput?.getAttribute('placeholder') || '輸入聊天文字';
   let selfProvisionCoords = null;
   const MAX_SUMMARY_ROWS = 200;
   const logEntries = [];
@@ -1264,6 +1272,7 @@
     }
     updateChannelNavMeta(numeric, { unread: false });
     renderChannelMessages(numeric);
+    updateMessageComposeState();
     if (!fromNavRender && isMessagesPageActive()) {
       const store = ensureChannelStore(numeric);
       if (store.length) {
@@ -1333,6 +1342,115 @@
   function initializeChannelMessages() {
     renderChannelNav({ force: true });
     channelNavButtons.forEach((_, channelId) => updateChannelNavMeta(channelId, { unread: false }));
+    initializeMessageComposer();
+  }
+
+  function initializeMessageComposer() {
+    messageSendBtn?.addEventListener('click', () => {
+      sendMessageFromComposer();
+    });
+    messageInput?.addEventListener('keydown', (event) => {
+      if (event.isComposing) {
+        return;
+      }
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendMessageFromComposer();
+      }
+    });
+    updateMessageComposeState();
+  }
+
+  function setMessageSendStatus(text, variant = '') {
+    if (!messageSendStatus) {
+      return;
+    }
+    if (messageStatusTimer) {
+      clearTimeout(messageStatusTimer);
+      messageStatusTimer = null;
+    }
+    const normalized = typeof text === 'string' ? text.trim() : '';
+    messageSendStatus.textContent = normalized;
+    messageSendStatus.classList.remove(
+      'channel-compose-status--success',
+      'channel-compose-status--error'
+    );
+    if (normalized && variant) {
+      messageSendStatus.classList.add(`channel-compose-status--${variant}`);
+    }
+    if (normalized && variant === 'success') {
+      messageStatusTimer = setTimeout(() => {
+        messageSendStatus.textContent = '';
+        messageSendStatus.classList.remove('channel-compose-status--success');
+        messageStatusTimer = null;
+      }, 2500);
+    }
+  }
+
+  function updateMessageComposeState() {
+    const hasChannel = Number.isFinite(Number(selectedChannelId));
+    const canSend = meshtasticStatus === 'connected' && !messageSendPending && hasChannel;
+    if (messageInput) {
+      messageInput.disabled = meshtasticStatus !== 'connected' || !hasChannel;
+      if (meshtasticStatus !== 'connected') {
+        messageInput.placeholder = '尚未連線，無法送出訊息';
+      } else if (!hasChannel) {
+        messageInput.placeholder = '請先選擇頻道';
+      } else {
+        messageInput.placeholder = MESSAGE_INPUT_PLACEHOLDER;
+      }
+    }
+    if (messageSendBtn) {
+      messageSendBtn.disabled = !canSend;
+    }
+  }
+
+  async function sendMessageFromComposer() {
+    if (messageSendPending) {
+      return;
+    }
+    if (!messageInput) {
+      return;
+    }
+    const text = messageInput.value.trim();
+    if (!text) {
+      setMessageSendStatus('請輸入文字訊息。', 'error');
+      return;
+    }
+    const channelValue = Number(selectedChannelId);
+    if (!Number.isFinite(channelValue)) {
+      setMessageSendStatus('請先選擇頻道。', 'error');
+      return;
+    }
+    const channel = channelValue;
+    messageSendPending = true;
+    updateMessageComposeState();
+    setMessageSendStatus('送出中...');
+    try {
+      const response = await fetch('/api/messages/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, channel })
+      });
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+      if (!response.ok || data?.success === false) {
+        const message = data?.error || `送出失敗 (${response.status})`;
+        throw new Error(message);
+      }
+      messageInput.value = '';
+      setMessageSendStatus('已送出', 'success');
+      messageInput.focus();
+    } catch (err) {
+      setMessageSendStatus(`送出失敗：${err?.message || '未知錯誤'}`, 'error');
+    } finally {
+      messageSendPending = false;
+      updateMessageComposeState();
+    }
   }
 
   function isTextSummary(summary) {
@@ -6972,6 +7090,8 @@ function ensureRelayGuessSuffix(label, summary) {
     const label = info.status || info.state || 'unknown';
     const message = info.message ? ` (${info.message})` : '';
     statusLabel.textContent = `${label}${message}`;
+    meshtasticStatus = label;
+    updateMessageComposeState();
   }
 
   function updateMetrics(metrics) {
