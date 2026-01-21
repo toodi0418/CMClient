@@ -266,6 +266,32 @@ async function loadMessageLog() {
   }
 }
 
+async function sendTextMessageFromClient({ text, channel } = {}) {
+  const rawText = typeof text === 'string' ? text.trim() : '';
+  if (!rawText) {
+    throw new Error('文字內容不可為空');
+  }
+  const numericChannel = Number.isFinite(Number(channel)) ? Math.max(0, Math.floor(Number(channel))) : 0;
+  if (!client || typeof client.sendTextMessage !== 'function') {
+    throw new Error('Meshtastic 客戶端尚未連線');
+  }
+  const packetId = await client.sendTextMessage({
+    text: rawText,
+    channel: numericChannel
+  });
+  if (bridge && typeof bridge.emitTenmanSyntheticSummary === 'function') {
+    const flowId = `local-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    bridge.emitTenmanSyntheticSummary({
+      text: rawText,
+      channel: numericChannel,
+      flowId,
+      meshPacketId: Number.isFinite(packetId) ? packetId : null,
+      scope: 'broadcast'
+    });
+  }
+  return { packetId, channel: numericChannel };
+}
+
 let mainWindow = null;
 let client = null;
 let bridge = null;
@@ -763,6 +789,7 @@ async function startWebDashboard() {
       const server = new WebDashboardServer(options);
       await server.start();
       server.setAppInfo({ version: appVersion, timezone: appTimezone });
+      server.setMessageSender(sendTextMessageFromClient);
       webServer = server;
       return true;
     } catch (err) {
@@ -1269,6 +1296,15 @@ ipcMain.handle('meshtastic:list-serial', async () => {
 
 ipcMain.handle('messages:get-snapshot', async () => {
   return { channels: getMessageSnapshot() };
+});
+
+ipcMain.handle('messages:send', async (_event, payload) => {
+  try {
+    const result = await sendTextMessageFromClient(payload);
+    return { success: true, ...result };
+  } catch (err) {
+    return { success: false, error: err?.message || 'failed to send message' };
+  }
 });
 
 ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {

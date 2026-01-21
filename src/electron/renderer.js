@@ -178,8 +178,16 @@ const channelPageLastBtn = document.getElementById('channel-page-last');
 const channelPageSizeSelect = document.getElementById('channel-page-size');
 const channelTitleLabel = document.getElementById('channel-title');
 const channelNoteLabel = document.getElementById('channel-note');
+const messageInput = document.getElementById('message-input');
+const messageSendBtn = document.getElementById('message-send-btn');
+const messageSendStatus = document.getElementById('message-send-status');
 const channelNavButtons = new Map();
 let selectedChannelId = CHANNEL_CONFIG[0]?.id ?? 0;
+let messageSendPending = false;
+let messageStatusTimer = null;
+let isConnected = false;
+const MESSAGE_INPUT_PLACEHOLDER =
+  messageInput?.getAttribute('placeholder') || '輸入聊天文字';
 
 const TELEMETRY_TABLE_LIMIT = 200;
 const TELEMETRY_CHART_LIMIT = 200;
@@ -573,7 +581,6 @@ let callmeshHasServerKey = false;
 let lastVerifiedKey = '';
 let callmeshDegraded = false;
 let isConnecting = false;
-let isConnected = false;
 let manualDisconnect = false;
 let autoConnectAttempts = 0;
 let autoConnectTimer = null;
@@ -1110,8 +1117,111 @@ function initializeChannelMessages() {
     selectedChannelId = CHANNEL_CONFIG[0]?.id ?? null;
   }
 
+  initializeMessageComposer();
+
   if (selectedChannelId != null) {
     selectChannel(selectedChannelId);
+  }
+}
+
+function initializeMessageComposer() {
+  messageSendBtn?.addEventListener('click', () => {
+    sendMessageFromComposer();
+  });
+  messageInput?.addEventListener('keydown', (event) => {
+    if (event.isComposing) {
+      return;
+    }
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      sendMessageFromComposer();
+    }
+  });
+  updateMessageComposeState();
+}
+
+function setMessageSendStatus(text, variant = '') {
+  if (!messageSendStatus) {
+    return;
+  }
+  if (messageStatusTimer) {
+    clearTimeout(messageStatusTimer);
+    messageStatusTimer = null;
+  }
+  const normalized = typeof text === 'string' ? text.trim() : '';
+  messageSendStatus.textContent = normalized;
+  messageSendStatus.classList.remove(
+    'channel-compose-status--success',
+    'channel-compose-status--error'
+  );
+  if (normalized && variant) {
+    messageSendStatus.classList.add(`channel-compose-status--${variant}`);
+  }
+  if (normalized && variant === 'success') {
+    messageStatusTimer = setTimeout(() => {
+      messageSendStatus.textContent = '';
+      messageSendStatus.classList.remove('channel-compose-status--success');
+      messageStatusTimer = null;
+    }, 2500);
+  }
+}
+
+function updateMessageComposeState() {
+  const hasChannel = Number.isFinite(Number(selectedChannelId));
+  const canSend = Boolean(isConnected) && !messageSendPending && hasChannel;
+  if (messageInput) {
+    messageInput.disabled = !isConnected || !hasChannel;
+    if (!isConnected) {
+      messageInput.placeholder = '尚未連線，無法送出訊息';
+    } else if (!hasChannel) {
+      messageInput.placeholder = '請先選擇頻道';
+    } else {
+      messageInput.placeholder = MESSAGE_INPUT_PLACEHOLDER;
+    }
+  }
+  if (messageSendBtn) {
+    messageSendBtn.disabled = !canSend;
+  }
+}
+
+async function sendMessageFromComposer() {
+  if (messageSendPending) {
+    return;
+  }
+  if (!messageInput) {
+    return;
+  }
+  const text = messageInput.value.trim();
+  if (!text) {
+    setMessageSendStatus('請輸入文字訊息。', 'error');
+    return;
+  }
+  const channelValue = Number(selectedChannelId);
+  if (!Number.isFinite(channelValue)) {
+    setMessageSendStatus('請先選擇頻道。', 'error');
+    return;
+  }
+  const channel = channelValue;
+  if (!window.meshtastic?.sendMessage) {
+    setMessageSendStatus('目前版本不支援送出訊息。', 'error');
+    return;
+  }
+  messageSendPending = true;
+  updateMessageComposeState();
+  setMessageSendStatus('送出中...');
+  try {
+    const result = await window.meshtastic.sendMessage({ text, channel });
+    if (result && result.success === false) {
+      throw new Error(result.error || '送出失敗');
+    }
+    messageInput.value = '';
+    setMessageSendStatus('已送出', 'success');
+    messageInput.focus();
+  } catch (err) {
+    setMessageSendStatus(`送出失敗：${err?.message || '未知錯誤'}`, 'error');
+  } finally {
+    messageSendPending = false;
+    updateMessageComposeState();
   }
 }
 
@@ -1138,6 +1248,7 @@ function selectChannel(channelId) {
 
   updateChannelNavMeta(channelId, { unread: false });
   renderChannelMessages(channelId);
+  updateMessageComposeState();
 }
 
 function updateChannelNavMeta(channelId, { unread = false } = {}) {
@@ -4345,6 +4456,7 @@ function setConnectedState(nextState) {
     flowCaptureEnabledAt = 0;
     stopInactivityMonitor();
   }
+  updateMessageComposeState();
   updateToggleButton();
 }
 

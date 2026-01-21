@@ -711,6 +711,35 @@ async function startMonitor(argv) {
   let headerPrinted = false;
   let stopRequested = false;
 
+  const sendTextMessage = async ({ text, channel } = {}) => {
+    const rawText = typeof text === 'string' ? text.trim() : '';
+    if (!rawText) {
+      throw new Error('文字內容不可為空');
+    }
+    const numericChannel = Number.isFinite(Number(channel)) ? Math.max(0, Math.floor(Number(channel))) : 0;
+    const activeClient = currentClient;
+    if (!activeClient || typeof activeClient.sendTextMessage !== 'function') {
+      throw new Error('沒有可用的 Meshtastic 客戶端');
+    }
+    const packetId = await activeClient.sendTextMessage({
+      text: rawText,
+      channel: numericChannel
+    });
+    if (bridge && typeof bridge.emitTenmanSyntheticSummary === 'function') {
+      const flowId = `local-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      bridge.emitTenmanSyntheticSummary({
+        text: rawText,
+        channel: numericChannel,
+        flowId,
+        meshPacketId: Number.isFinite(packetId) ? packetId : null,
+        scope: 'broadcast'
+      });
+    }
+    return { packetId };
+  };
+
+  webServer?.setMessageSender?.(sendTextMessage);
+
   const clearReconnectTimer = () => {
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
