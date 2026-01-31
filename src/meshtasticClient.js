@@ -77,7 +77,10 @@ class MeshtasticClient extends EventEmitter {
       initialBacklogSkewAllowanceMs: 5_000,
       ...options
     };
-    this.options.tracerouteEnabled = true;
+    this.options.tracerouteEnabled =
+      options && Object.prototype.hasOwnProperty.call(options, 'tracerouteEnabled')
+        ? Boolean(options.tracerouteEnabled)
+        : true;
     this.options.tracerouteRateMinutes = Math.max(
       15,
       Number(options.tracerouteRateMinutes) || 30
@@ -216,6 +219,7 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _considerAutoTraceroute(summary) {
+    if (!this.options.tracerouteEnabled) return;
     if (!summary || typeof summary !== 'object') return;
     const fromId = Number(summary.from?.raw);
     if (!Number.isFinite(fromId) || fromId === BROADCAST_ADDR) return;
@@ -238,6 +242,7 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _queueTraceroute(nodeId, reason = 'manual') {
+    if (!this.options.tracerouteEnabled) return;
     const destination = Number(nodeId);
     if (!Number.isFinite(destination) || destination <= 0 || destination === BROADCAST_ADDR) {
       return;
@@ -325,6 +330,7 @@ class MeshtasticClient extends EventEmitter {
     const encoded = this.toRadioType.encode(message).finish();
     const framed = framePacket(encoded);
     this.emit('toRadioRaw', framed);
+    this._emitTracerouteRequestSummary(destId);
     this.emit('traceroute-log', {
       tag: 'TRACEROUTE',
       message: `送出 traceroute 請求 ${formatHexId(destId)}`
@@ -338,6 +344,31 @@ class MeshtasticClient extends EventEmitter {
         }
       });
     });
+  }
+
+  _emitTracerouteRequestSummary(destId) {
+    const now = new Date();
+    const fromInfo =
+      this._selfNodeId != null
+        ? this._formatNode(this._selfNodeId)
+        : {
+            label: 'self',
+            meshId: this._selfNodeNormalized ?? null,
+            meshIdNormalized: this._selfNodeNormalized ?? null
+          };
+    const toInfo = this._formatNode(destId);
+    const detail = `to ${toInfo?.label || formatHexId(destId) || destId}`;
+    const summary = {
+      timestamp: now.toISOString(),
+      timestampLabel: formatTimestamp(now),
+      channel: 0,
+      type: 'RouteRequest',
+      detail,
+      from: fromInfo,
+      to: toInfo,
+      synthetic: true
+    };
+    this.emit('summary', summary);
   }
 
   _loadTracerouteCache() {

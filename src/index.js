@@ -325,6 +325,11 @@ async function main() {
             default: 60,
             describe: 'traceroute 佇列全域發送間隔（秒）'
           })
+          .option('auto-traceroute', {
+            type: 'boolean',
+            default: true,
+            describe: '自動對多跳節點送出 traceroute 並快取路徑（預設開啟）'
+          })
           .option('summary-log', {
             type: 'boolean',
             default: false,
@@ -375,7 +380,7 @@ async function startMonitor(argv) {
   const HEARTBEAT_INTERVAL_MS = 60_000;
   const HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_MS / 1000;
   const artifactsDir = getArtifactsDir();
-  const tracerouteEnabled = true;
+  const tracerouteEnabled = argv.autoTraceroute !== false;
   const tracerouteRateMinutes = Math.max(15, Number(argv.tracerouteRateMinutes) || 30);
   const tracerouteIntervalSeconds = Math.max(15, Number(argv.tracerouteIntervalSeconds) || 60);
   const tracerouteCachePath = path.join(artifactsDir, 'traceroute-cache.json');

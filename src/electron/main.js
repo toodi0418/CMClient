@@ -389,6 +389,9 @@ function normalizeClientPreferences(raw) {
         normalized.shareWithTenmanMap = Boolean(raw.shareWithTenmanMap);
       }
     }
+    if (Object.prototype.hasOwnProperty.call(raw, 'autoTracerouteEnabled')) {
+      normalized.autoTracerouteEnabled = Boolean(raw.autoTracerouteEnabled);
+    }
     if (Object.prototype.hasOwnProperty.call(raw, 'tracerouteRateMinutes')) {
       const value = Number(raw.tracerouteRateMinutes);
       if (Number.isFinite(value) && value > 0) {
@@ -489,6 +492,9 @@ async function updateClientPreferences(updates = {}) {
       existing.shareWithTenmanMap = desired;
       bridge?.setTenmanShareEnabled?.(desired);
     }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'autoTracerouteEnabled')) {
+    existing.autoTracerouteEnabled = Boolean(updates.autoTracerouteEnabled);
   }
   if (Object.prototype.hasOwnProperty.call(updates, 'tracerouteRateMinutes')) {
     const value = Number(updates.tracerouteRateMinutes);
@@ -1008,7 +1014,12 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   }
 
   const cachedPrefs = await getCachedClientPreferences().catch(() => ({}));
-  const tracerouteEnabled = true;
+  const tracerouteEnabled =
+    options && Object.prototype.hasOwnProperty.call(options, 'tracerouteEnabled')
+      ? Boolean(options.tracerouteEnabled)
+      : cachedPrefs.autoTracerouteEnabled === false
+        ? false
+        : true;
   const tracerouteRateMinutesRaw =
     options?.tracerouteRateMinutes ?? cachedPrefs.tracerouteRateMinutes ?? 30;
   const tracerouteIntervalSecondsRaw =

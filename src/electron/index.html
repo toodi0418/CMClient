@@ -20,6 +20,7 @@
         <button class="nav-btn" data-target="messages-page">訊息</button>
         <button class="nav-btn" data-target="telemetry-page">遙測數據</button>
         <button class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
+        <button class="nav-btn" data-target="traceroute-page">Traceroute</button>
         <button class="nav-btn" data-target="nodes-page">節點資料庫</button>
         <button class="nav-btn" data-target="settings-page">設定</button>
         <button class="nav-btn" data-target="info-page">資訊</button>
@@ -326,7 +327,10 @@
             <small class="callmesh-hint">預設關閉，啟用後會啟動內建 Web Dashboard</small>
           </div>
           <div class="fieldset">
-            <div class="callmesh-hint font-bold">自動 Traceroute（固定啟用，無須手動）</div>
+            <label class="toggle-row">
+              <input id="traceroute-enabled" type="checkbox" checked />
+              <span>自動發送 Traceroute 並快取路徑</span>
+            </label>
             <div class="callmesh-row">
               <label>
                 <div class="callmesh-hint">同一節點最小間隔（分鐘，至少 15）</div>
@@ -337,7 +341,7 @@
                 <input id="traceroute-interval-seconds" type="number" min="15" value="60" />
               </label>
             </div>
-            <small class="callmesh-hint">系統會自動對多跳節點送出 traceroute；直收時不會送出。</small>
+            <small class="callmesh-hint">直收時不會送出 traceroute，可自行關閉或調整間隔。</small>
           </div>
           <div class="fieldset tenman-privacy">
             <label class="toggle-row">
@@ -396,6 +400,17 @@
           </header>
           <div id="flow-empty-state" class="flow-empty-state">尚未收到封包。</div>
           <div id="flow-list" class="flow-items hidden"></div>
+        </section>
+      </section>
+
+      <section id="traceroute-page" class="page hidden">
+        <section class="flow-panel">
+          <header class="flow-header">
+            <h2>Traceroute 紀錄</h2>
+            <p class="flow-panel-hint">顯示最近收到的 traceroute 回應，包含去程與回程節點。</p>
+          </header>
+          <div id="traceroute-empty-state" class="flow-empty-state">尚未收到 traceroute 回應。</div>
+          <div id="traceroute-list" class="flow-items hidden"></div>
         </section>
       </section>
 

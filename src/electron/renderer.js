@@ -132,6 +132,9 @@ const flowEmptyState = document.getElementById('flow-empty-state');
 const flowSearchInput = document.getElementById('flow-search');
 const flowFilterStateSelect = document.getElementById('flow-filter-state');
 const flowDownloadBtn = document.getElementById('flow-download-btn');
+const traceroutePage = document.getElementById('traceroute-page');
+const tracerouteList = document.getElementById('traceroute-list');
+const tracerouteEmptyState = document.getElementById('traceroute-empty-state');
 const telemetryPage = document.getElementById('telemetry-page');
 const telemetryNodeInput = document.getElementById('telemetry-node-input');
 const telemetryNodeDropdown = document.getElementById('telemetry-node-dropdown');
@@ -164,6 +167,7 @@ const aprsServerInput = document.getElementById('aprs-server');
 const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
 const webUiEnabledCheckbox = document.getElementById('web-ui-enabled');
 const tenmanShareCheckbox = document.getElementById('tenman-share-enabled');
+const tracerouteEnabledCheckbox = document.getElementById('traceroute-enabled');
 const tracerouteRateMinutesInput = document.getElementById('traceroute-rate-minutes');
 const tracerouteIntervalSecondsInput = document.getElementById('traceroute-interval-seconds');
 const resetDataBtn = document.getElementById('reset-data-btn');
@@ -652,6 +656,8 @@ let flowCaptureEnabledAt = 0;
 let totalAprsUploaded = 0;
 const aprsCompletedFlowIds = new Set();
 const aprsCompletedQueue = [];
+const TRACEROUTE_MAX_ENTRIES = 200;
+const tracerouteEntries = [];
 
 const AUTO_CONNECT_MAX_ATTEMPTS = 3;
 const AUTO_CONNECT_DELAY_MS = 5000;
@@ -1903,6 +1909,9 @@ function loadPreferences() {
     if (tenmanShareCheckbox) {
       tenmanShareCheckbox.checked = saved.shareWithTenmanMap === false ? false : true;
     }
+    if (tracerouteEnabledCheckbox) {
+      tracerouteEnabledCheckbox.checked = saved.tracerouteEnabled === false ? false : true;
+    }
     if (tracerouteRateMinutesInput) {
       const minutes = Number(saved.tracerouteRateMinutes);
       const normalized =
@@ -1939,6 +1948,7 @@ function loadPreferences() {
     if (aprsServerInput) aprsServerInput.value = DEFAULT_APRS_SERVER;
     if (aprsBeaconIntervalInput) aprsBeaconIntervalInput.value = String(DEFAULT_APRS_BEACON_MINUTES);
     if (webUiEnabledCheckbox) webUiEnabledCheckbox.checked = false;
+    if (tracerouteEnabledCheckbox) tracerouteEnabledCheckbox.checked = true;
     if (tracerouteRateMinutesInput) tracerouteRateMinutesInput.value = String(DEFAULT_TRACEROUTE_RATE_MINUTES);
     if (tracerouteIntervalSecondsInput) tracerouteIntervalSecondsInput.value = String(DEFAULT_TRACEROUTE_INTERVAL_SECONDS);
   }
@@ -1984,6 +1994,7 @@ function savePreferences({ persist = true } = {}) {
     connectionMode,
     serialPath,
     shareWithTenmanMap: tenmanShareCheckbox ? Boolean(tenmanShareCheckbox.checked) : true,
+    tracerouteEnabled: tracerouteEnabledCheckbox ? Boolean(tracerouteEnabledCheckbox.checked) : true,
     tracerouteRateMinutes: getTracerouteRateMinutes(),
     tracerouteIntervalSeconds: getTracerouteIntervalSeconds()
   };
@@ -1995,6 +2006,7 @@ function savePreferences({ persist = true } = {}) {
       serialPath: data.serialPath,
       webDashboardEnabled: data.webDashboardEnabled,
       shareWithTenmanMap: data.shareWithTenmanMap,
+      autoTracerouteEnabled: data.tracerouteEnabled,
       tracerouteRateMinutes: data.tracerouteRateMinutes,
       tracerouteIntervalSeconds: data.tracerouteIntervalSeconds
     };
@@ -2060,6 +2072,13 @@ async function hydratePreferencesFromMain() {
       const desiredShare = preferences.shareWithTenmanMap === false ? false : true;
       if (tenmanShareCheckbox.checked !== desiredShare) {
         tenmanShareCheckbox.checked = desiredShare;
+        shouldPersist = true;
+      }
+    }
+    if (tracerouteEnabledCheckbox && Object.prototype.hasOwnProperty.call(preferences, 'autoTracerouteEnabled')) {
+      const desired = preferences.autoTracerouteEnabled === false ? false : true;
+      if (tracerouteEnabledCheckbox.checked !== desired) {
+        tracerouteEnabledCheckbox.checked = desired;
         shouldPersist = true;
       }
     }
@@ -2894,6 +2913,13 @@ aprsBeaconIntervalInput?.addEventListener('change', () => {
   appendLog('APRS', `beacon interval set to ${minutes} 分鐘`);
 });
 
+tracerouteEnabledCheckbox?.addEventListener('change', () => {
+  savePreferences();
+  const enabled = Boolean(tracerouteEnabledCheckbox.checked);
+  appendLog('TRACEROUTE', enabled ? '自動 traceroute 已啟用' : '自動 traceroute 已停用');
+  scheduleConnectionApply({ reason: 'traceroute-settings' });
+});
+
 tracerouteRateMinutesInput?.addEventListener('change', () => {
   const minutes = getTracerouteRateMinutes();
   tracerouteRateMinutesInput.value = String(minutes);
@@ -3506,6 +3532,7 @@ function appendSummaryRow(summary) {
   hydrateSummaryNodes(summary);
   registerPacketActivity(summary);
   maybeUpdateSelfNodeFromSummary(summary);
+  recordTracerouteEntry(summary);
   const nodesLabel = formatNodes(summary);
   const detailSnippet = summary.detail ? ` detail=${summary.detail}` : '';
   appendLog('SUMMARY', `${summary.timestampLabel || ''} ${nodesLabel} ${summary.type || ''}${detailSnippet}`.trim());
@@ -4393,6 +4420,79 @@ function formatNodeDisplay(node) {
     return meshId;
   }
   return 'unknown';
+}
+
+function formatMeshIdHex(raw) {
+  if (raw === undefined || raw === null) return null;
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric)) {
+    return `!${(numeric >>> 0).toString(16).padStart(8, '0')}`;
+  }
+  const normalized = normalizeMeshId(raw);
+  if (normalized) return normalized;
+  const text = String(raw).trim();
+  return text || null;
+}
+
+function renderTracerouteList() {
+  if (!tracerouteList) return;
+  if (!tracerouteEntries.length) {
+    tracerouteList.classList.add('hidden');
+    tracerouteEmptyState?.classList.remove('hidden');
+    tracerouteList.innerHTML = '';
+    return;
+  }
+  tracerouteEmptyState?.classList.add('hidden');
+  tracerouteList.classList.remove('hidden');
+  tracerouteList.innerHTML = tracerouteEntries
+    .map((entry) => {
+      const forward = entry.forward?.length ? entry.forward.join(' → ') : '(無)';
+      const backward = entry.backward?.length ? entry.backward.join(' → ') : '(無)';
+      return `
+        <div class="flow-item">
+          <div class="flow-header-row">
+            <div class="flow-title">${entry.target || '未知節點'}</div>
+            <div class="flow-subtitle">${entry.timestampLabel}</div>
+          </div>
+          <div class="flow-body">
+            <div>去程：${forward}</div>
+            <div>回程：${backward}</div>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+function recordTracerouteEntry(summary) {
+  if (!summary?.trace) return;
+  const route = Array.isArray(summary.trace.route) ? summary.trace.route : [];
+  const routeBack = Array.isArray(summary.trace.routeBack) ? summary.trace.routeBack : [];
+  if (!route.length && !routeBack.length) return;
+  const targetLabel =
+    summary.from?.label ||
+    summary.from?.longName ||
+    summary.from?.shortName ||
+    summary.from?.meshId ||
+    summary.from?.meshIdNormalized ||
+    formatMeshIdHex(summary.from?.raw) ||
+    '未知節點';
+  const tsMs =
+    Number(summary.timestampMs) ||
+    (summary.timestamp ? Date.parse(summary.timestamp) : null) ||
+    Date.now();
+  const tsLabel = summary.timestampLabel || new Date(tsMs).toLocaleString('zh-TW');
+  tracerouteEntries.unshift({
+    target: targetLabel,
+    forward: route.map((n) => formatMeshIdHex(n)).filter(Boolean),
+    backward: routeBack.map((n) => formatMeshIdHex(n)).filter(Boolean),
+    timestampMs: tsMs,
+    timestampLabel: tsLabel
+  });
+  if (tracerouteEntries.length > TRACEROUTE_MAX_ENTRIES) {
+    tracerouteEntries.length = TRACEROUTE_MAX_ENTRIES;
+  }
+  renderTracerouteList();
 }
 
 function formatNumber(value, digits) {
@@ -8424,7 +8524,7 @@ async function connectNow({ context = 'manual', overrideHost } = {}) {
     transport: target.transport,
     handshake: true,
     heartbeat: SOCKET_HEARTBEAT_SECONDS,
-    tracerouteEnabled: true,
+    tracerouteEnabled: tracerouteEnabledCheckbox ? Boolean(tracerouteEnabledCheckbox.checked) : true,
     tracerouteRateMinutes: getTracerouteRateMinutes(),
     tracerouteIntervalSeconds: getTracerouteIntervalSeconds()
   };
