@@ -315,6 +315,16 @@ async function main() {
             default: false,
             describe: '啟用內建 Web Dashboard（預設為關閉）'
           })
+          .option('traceroute-rate-minutes', {
+            type: 'number',
+            default: 30,
+            describe: '同一節點兩次 traceroute 的最小間隔（分鐘，至少 15）'
+          })
+          .option('traceroute-interval-seconds', {
+            type: 'number',
+            default: 60,
+            describe: 'traceroute 佇列全域發送間隔（秒）'
+          })
           .option('summary-log', {
             type: 'boolean',
             default: false,
@@ -365,6 +375,10 @@ async function startMonitor(argv) {
   const HEARTBEAT_INTERVAL_MS = 60_000;
   const HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_MS / 1000;
   const artifactsDir = getArtifactsDir();
+  const tracerouteEnabled = true;
+  const tracerouteRateMinutes = Math.max(15, Number(argv.tracerouteRateMinutes) || 30);
+  const tracerouteIntervalSeconds = Math.max(15, Number(argv.tracerouteIntervalSeconds) || 60);
+  const tracerouteCachePath = path.join(artifactsDir, 'traceroute-cache.json');
   const shareWithTenmanMapOverride =
     argv.noShareWithTenmanmap ? false : null;
   const summaryLogRequested = Boolean(argv.summaryLog || argv.summaryLogDir);
@@ -686,7 +700,11 @@ async function startMonitor(argv) {
     maxLength: argv.maxLength,
     handshake: true,
     heartbeat: HEARTBEAT_INTERVAL_SECONDS,
-    relayStatsPath
+    relayStatsPath,
+    tracerouteEnabled,
+    tracerouteRateMinutes,
+    tracerouteIntervalSeconds,
+    tracerouteCachePath
   });
   if (transport === 'serial') {
     Object.assign(connectionOptions, {
@@ -819,6 +837,13 @@ async function startMonitor(argv) {
 
       client.on('handshake', ({ nonce }) => {
         logWithTag('MESHTASTIC', `已送出 want_config 請求 (nonce=${nonce})`);
+      });
+
+      client.on('traceroute-log', (entry) => {
+        if (!entry) return;
+        const message = typeof entry.message === 'string' ? entry.message : JSON.stringify(entry);
+        logWithTag('TRACEROUTE', message);
+        bridge.emitLog?.('TRACEROUTE', message);
       });
 
       client.on('error', (err) => {

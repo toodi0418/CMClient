@@ -325,6 +325,20 @@
             </label>
             <small class="callmesh-hint">預設關閉，啟用後會啟動內建 Web Dashboard</small>
           </div>
+          <div class="fieldset">
+            <div class="callmesh-hint font-bold">自動 Traceroute（固定啟用，無須手動）</div>
+            <div class="callmesh-row">
+              <label>
+                <div class="callmesh-hint">同一節點最小間隔（分鐘，至少 15）</div>
+                <input id="traceroute-rate-minutes" type="number" min="15" value="30" />
+              </label>
+              <label>
+                <div class="callmesh-hint">佇列發送間隔（秒，至少 15）</div>
+                <input id="traceroute-interval-seconds" type="number" min="15" value="60" />
+              </label>
+            </div>
+            <small class="callmesh-hint">系統會自動對多跳節點送出 traceroute；直收時不會送出。</small>
+          </div>
           <div class="fieldset tenman-privacy">
             <label class="toggle-row">
               <input id="tenman-share-enabled" type="checkbox" checked />
@@ -356,6 +370,7 @@
               <option value="DISCOVER">DISCOVER</option>
               <option value="APP">APP</option>
               <option value="DISCONNECT">DISCONNECT</option>
+              <option value="TRACEROUTE">TRACEROUTE</option>
             </select>
           </div>
           <button type="button" id="copy-log-btn" class="copy-log-btn">複製全部日誌</button>

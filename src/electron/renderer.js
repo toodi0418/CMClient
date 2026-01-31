@@ -85,6 +85,8 @@ const aprsStatusLabel = document.getElementById('aprs-status');
 const aprsServerLabel = document.getElementById('aprs-server-label');
 const DEFAULT_APRS_SERVER = 'asia.aprs2.net';
 const DEFAULT_APRS_BEACON_MINUTES = 10;
+const DEFAULT_TRACEROUTE_RATE_MINUTES = 30;
+const DEFAULT_TRACEROUTE_INTERVAL_SECONDS = 60;
 const SOCKET_HEARTBEAT_SECONDS = 30;
 const SOCKET_IDLE_TIMEOUT_MS = 60 * 1000;
 const SOCKET_KEEPALIVE_DELAY_MS = 15 * 1000;
@@ -162,6 +164,8 @@ const aprsServerInput = document.getElementById('aprs-server');
 const aprsBeaconIntervalInput = document.getElementById('aprs-beacon-interval');
 const webUiEnabledCheckbox = document.getElementById('web-ui-enabled');
 const tenmanShareCheckbox = document.getElementById('tenman-share-enabled');
+const tracerouteRateMinutesInput = document.getElementById('traceroute-rate-minutes');
+const tracerouteIntervalSecondsInput = document.getElementById('traceroute-interval-seconds');
 const resetDataBtn = document.getElementById('reset-data-btn');
 const copyLogBtn = document.getElementById('copy-log-btn');
 const downloadLogBtn = document.getElementById('download-log-btn');
@@ -1899,6 +1903,22 @@ function loadPreferences() {
     if (tenmanShareCheckbox) {
       tenmanShareCheckbox.checked = saved.shareWithTenmanMap === false ? false : true;
     }
+    if (tracerouteRateMinutesInput) {
+      const minutes = Number(saved.tracerouteRateMinutes);
+      const normalized =
+        Number.isFinite(minutes) && minutes >= 1
+          ? Math.max(15, Math.round(minutes))
+          : DEFAULT_TRACEROUTE_RATE_MINUTES;
+      tracerouteRateMinutesInput.value = String(normalized);
+    }
+    if (tracerouteIntervalSecondsInput) {
+      const seconds = Number(saved.tracerouteIntervalSeconds);
+      const normalized =
+        Number.isFinite(seconds) && seconds >= 1
+          ? Math.max(15, Math.round(seconds))
+          : DEFAULT_TRACEROUTE_INTERVAL_SECONDS;
+      tracerouteIntervalSecondsInput.value = String(normalized);
+    }
     setConnectionMode(connectionMode, { persist: false });
     if (serialPathPreference) {
       applySerialSelection(serialPathPreference, { updateHost: false });
@@ -1919,6 +1939,8 @@ function loadPreferences() {
     if (aprsServerInput) aprsServerInput.value = DEFAULT_APRS_SERVER;
     if (aprsBeaconIntervalInput) aprsBeaconIntervalInput.value = String(DEFAULT_APRS_BEACON_MINUTES);
     if (webUiEnabledCheckbox) webUiEnabledCheckbox.checked = false;
+    if (tracerouteRateMinutesInput) tracerouteRateMinutesInput.value = String(DEFAULT_TRACEROUTE_RATE_MINUTES);
+    if (tracerouteIntervalSecondsInput) tracerouteIntervalSecondsInput.value = String(DEFAULT_TRACEROUTE_INTERVAL_SECONDS);
   }
 }
 
@@ -1961,7 +1983,9 @@ function savePreferences({ persist = true } = {}) {
     webDashboardEnabled: webUiEnabledCheckbox ? Boolean(webUiEnabledCheckbox.checked) : false,
     connectionMode,
     serialPath,
-    shareWithTenmanMap: tenmanShareCheckbox ? Boolean(tenmanShareCheckbox.checked) : true
+    shareWithTenmanMap: tenmanShareCheckbox ? Boolean(tenmanShareCheckbox.checked) : true,
+    tracerouteRateMinutes: getTracerouteRateMinutes(),
+    tracerouteIntervalSeconds: getTracerouteIntervalSeconds()
   };
   localStorage.setItem('meshtastic:preferences', JSON.stringify(data));
   if (persist) {
@@ -1970,7 +1994,9 @@ function savePreferences({ persist = true } = {}) {
       connectionMode: data.connectionMode,
       serialPath: data.serialPath,
       webDashboardEnabled: data.webDashboardEnabled,
-      shareWithTenmanMap: data.shareWithTenmanMap
+      shareWithTenmanMap: data.shareWithTenmanMap,
+      tracerouteRateMinutes: data.tracerouteRateMinutes,
+      tracerouteIntervalSeconds: data.tracerouteIntervalSeconds
     };
     window.meshtastic
       .updateClientPreferences?.(payload)
@@ -2034,6 +2060,28 @@ async function hydratePreferencesFromMain() {
       const desiredShare = preferences.shareWithTenmanMap === false ? false : true;
       if (tenmanShareCheckbox.checked !== desiredShare) {
         tenmanShareCheckbox.checked = desiredShare;
+        shouldPersist = true;
+      }
+    }
+    if (tracerouteRateMinutesInput && Object.prototype.hasOwnProperty.call(preferences, 'tracerouteRateMinutes')) {
+      const minutes = Number(preferences.tracerouteRateMinutes);
+      const normalized =
+        Number.isFinite(minutes) && minutes >= 1
+          ? Math.max(15, Math.round(minutes))
+          : DEFAULT_TRACEROUTE_RATE_MINUTES;
+      if (tracerouteRateMinutesInput.value !== String(normalized)) {
+        tracerouteRateMinutesInput.value = String(normalized);
+        shouldPersist = true;
+      }
+    }
+    if (tracerouteIntervalSecondsInput && Object.prototype.hasOwnProperty.call(preferences, 'tracerouteIntervalSeconds')) {
+      const seconds = Number(preferences.tracerouteIntervalSeconds);
+      const normalized =
+        Number.isFinite(seconds) && seconds >= 1
+          ? Math.max(15, Math.round(seconds))
+          : DEFAULT_TRACEROUTE_INTERVAL_SECONDS;
+      if (tracerouteIntervalSecondsInput.value !== String(normalized)) {
+        tracerouteIntervalSecondsInput.value = String(normalized);
         shouldPersist = true;
       }
     }
@@ -2510,6 +2558,22 @@ function getAprsBeaconMinutes() {
   return rounded;
 }
 
+function getTracerouteRateMinutes() {
+  if (!tracerouteRateMinutesInput) return DEFAULT_TRACEROUTE_RATE_MINUTES;
+  const value = Number(tracerouteRateMinutesInput.value);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_TRACEROUTE_RATE_MINUTES;
+  const rounded = Math.round(value);
+  return Math.max(15, rounded);
+}
+
+function getTracerouteIntervalSeconds() {
+  if (!tracerouteIntervalSecondsInput) return DEFAULT_TRACEROUTE_INTERVAL_SECONDS;
+  const value = Number(tracerouteIntervalSecondsInput.value);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_TRACEROUTE_INTERVAL_SECONDS;
+  const rounded = Math.round(value);
+  return Math.max(15, rounded);
+}
+
 async function bootstrap() {
   loadPreferences();
   await hydratePreferencesFromMain();
@@ -2828,6 +2892,22 @@ aprsBeaconIntervalInput?.addEventListener('change', () => {
   window.meshtastic.setAprsBeaconInterval?.(minutes);
   savePreferences();
   appendLog('APRS', `beacon interval set to ${minutes} 分鐘`);
+});
+
+tracerouteRateMinutesInput?.addEventListener('change', () => {
+  const minutes = getTracerouteRateMinutes();
+  tracerouteRateMinutesInput.value = String(minutes);
+  savePreferences();
+  appendLog('TRACEROUTE', `每節點最小間隔已設為 ${minutes} 分鐘`);
+  scheduleConnectionApply({ reason: 'traceroute-settings' });
+});
+
+tracerouteIntervalSecondsInput?.addEventListener('change', () => {
+  const seconds = getTracerouteIntervalSeconds();
+  tracerouteIntervalSecondsInput.value = String(seconds);
+  savePreferences();
+  appendLog('TRACEROUTE', `佇列發送間隔已設為 ${seconds} 秒`);
+  scheduleConnectionApply({ reason: 'traceroute-settings' });
 });
 
 webUiEnabledCheckbox?.addEventListener('change', async () => {
@@ -8340,11 +8420,14 @@ async function connectNow({ context = 'manual', overrideHost } = {}) {
   );
 
   try {
-    const connectPayload = {
-      transport: target.transport,
-      handshake: true,
-      heartbeat: SOCKET_HEARTBEAT_SECONDS
-    };
+  const connectPayload = {
+    transport: target.transport,
+    handshake: true,
+    heartbeat: SOCKET_HEARTBEAT_SECONDS,
+    tracerouteEnabled: true,
+    tracerouteRateMinutes: getTracerouteRateMinutes(),
+    tracerouteIntervalSeconds: getTracerouteIntervalSeconds()
+  };
     if (target.transport === 'serial') {
       connectPayload.serialPath = target.serialPath;
       if (Number.isFinite(target.serialBaudRate) && target.serialBaudRate > 0) {

@@ -77,6 +77,16 @@ class MeshtasticClient extends EventEmitter {
       initialBacklogSkewAllowanceMs: 5_000,
       ...options
     };
+    this.options.tracerouteEnabled = true;
+    this.options.tracerouteRateMinutes = Math.max(
+      15,
+      Number(options.tracerouteRateMinutes) || 30
+    );
+    this.options.tracerouteIntervalSeconds = Math.max(
+      15,
+      Number(options.tracerouteIntervalSeconds) || 60
+    );
+    this.options.tracerouteCachePath = options.tracerouteCachePath || null;
 
     if (typeof this.options.transport === 'string') {
       const mode = this.options.transport.toLowerCase();
@@ -148,8 +158,14 @@ class MeshtasticClient extends EventEmitter {
     this._serialConnectTimer = null;
     this._initialBacklogFilterActive = false;
     this._initialBacklogFilterDeadline = null;
+    this._tracerouteQueue = [];
+    this._tracerouteQueueTimer = null;
+    this._tracerouteLastSent = new Map();
+    this._tracerouteCache = new Map();
+    this._tracerouteCachePersistTimer = null;
 
     this._loadRelayStatsFromDisk();
+    this._loadTracerouteCache();
   }
 
   _resetInitialBacklogFilter() {
@@ -163,6 +179,222 @@ class MeshtasticClient extends EventEmitter {
       this._initialBacklogFilterActive = false;
       this._initialBacklogFilterDeadline = null;
     }
+  }
+
+  _clearTracerouteQueueTimer() {
+    if (this._tracerouteQueueTimer) {
+      clearTimeout(this._tracerouteQueueTimer);
+      this._tracerouteQueueTimer = null;
+    }
+  }
+
+  _recordTracerouteResult(nodeNum, trace, { via = 'decode' } = {}) {
+    if (!Number.isFinite(nodeNum) || !trace || typeof trace !== 'object') return;
+    const key = nodeNum >>> 0;
+    const normalized = this._normalizeRelayNode(key) || { nodeId: key, nodeIdNormalized: formatHexId(key) };
+    this._tracerouteCache.set(key, {
+      route: Array.isArray(trace.route) ? trace.route.map((n) => Number(n) >>> 0) : [],
+      routeBack: Array.isArray(trace.routeBack) ? trace.routeBack.map((n) => Number(n) >>> 0) : [],
+      snrTowards: Array.isArray(trace.snrTowards) ? trace.snrTowards.map((n) => Number(n)) : [],
+      snrBack: Array.isArray(trace.snrBack) ? trace.snrBack.map((n) => Number(n)) : [],
+      updatedAt: Date.now()
+    });
+    this._persistTracerouteCacheSoon();
+    const cached = this._tracerouteCache.get(key) || {};
+    const routeNodes = cached.route || [];
+    const returnNodes = cached.routeBack || [];
+    for (const num of routeNodes) {
+      if (!Number.isFinite(num)) continue;
+      const meshId = formatHexId(num >>> 0);
+      this._recordRelayLinkMetrics(num, {});
+      this._applyDecodedNodeInfo(this._formatNode(num), { meshIdOriginal: meshId });
+    }
+    this.emit('traceroute-log', {
+      tag: 'TRACEROUTE',
+      message: `Traceroute 回應 ${formatHexId(key)} via ${via} forward=${routeNodes.join(' -> ') || '(none)'} return=${returnNodes.join(' -> ') || '(none)'}`
+    });
+  }
+
+  _considerAutoTraceroute(summary) {
+    if (!summary || typeof summary !== 'object') return;
+    const fromId = Number(summary.from?.raw);
+    if (!Number.isFinite(fromId) || fromId === BROADCAST_ADDR) return;
+    const hopsStart = Number.isFinite(summary.hops?.start) ? summary.hops.start : null;
+    const hopsLimit = Number.isFinite(summary.hops?.limit) ? summary.hops.limit : null;
+    const hopCount =
+      hopsStart != null && hopsLimit != null ? Math.max(hopsStart - hopsLimit, 0) : null;
+    if (!Number.isFinite(hopCount) || hopCount <= 0) {
+      return;
+    }
+    // Skip if we already have a cached trace and hop count unchanged
+    const cached = this._tracerouteCache.get(fromId);
+    if (cached && Array.isArray(cached.route) && cached.route.length) {
+      const cachedHops = cached.route.length > 0 ? cached.route.length - 1 : null;
+      if (cachedHops !== null && cachedHops === hopCount) {
+        return;
+      }
+    }
+    this._queueTraceroute(fromId, 'auto');
+  }
+
+  _queueTraceroute(nodeId, reason = 'manual') {
+    const destination = Number(nodeId);
+    if (!Number.isFinite(destination) || destination <= 0 || destination === BROADCAST_ADDR) {
+      return;
+    }
+    const lastSent = this._tracerouteLastSent.get(destination) || 0;
+    const minIntervalMs = Math.max(15, this.options.tracerouteRateMinutes || 60) * 60_000;
+    if (Date.now() - lastSent < minIntervalMs) {
+      return;
+    }
+    if (this._tracerouteQueue.includes(destination)) {
+      return;
+    }
+    this._tracerouteQueue.push(destination);
+    this.emit('traceroute-log', {
+      tag: 'TRACEROUTE',
+      message: `排入 traceroute 佇列 ${formatHexId(destination)} reason=${reason}`
+    });
+    if (!this._tracerouteQueueTimer) {
+      this._processTracerouteQueue();
+    }
+  }
+
+  _processTracerouteQueue() {
+    this._clearTracerouteQueueTimer();
+    if (!this._tracerouteQueue.length) {
+      return;
+    }
+    const destination = this._tracerouteQueue.shift();
+    if (destination == null) {
+      return;
+    }
+    this.sendTraceroute(destination)
+      .catch((err) => {
+        this.emit('traceroute-log', {
+          tag: 'TRACEROUTE',
+          message: `Traceroute 發送失敗 ${formatHexId(destination)}: ${err.message}`
+        });
+      })
+      .finally(() => {
+        this._tracerouteLastSent.set(destination, Date.now());
+        const intervalMs = Math.max(
+          15,
+          Number(this.options.tracerouteIntervalSeconds) || 60
+        ) * 1000;
+        this._tracerouteQueueTimer = setTimeout(() => this._processTracerouteQueue(), intervalMs);
+      });
+  }
+
+  async sendTraceroute(destination) {
+    if (!this._connected) {
+      throw new Error('Meshtastic 尚未連線');
+    }
+    if (!this.toRadioType || !this.meshPacketType || !this.dataType || !this.portEnum) {
+      throw new Error('Meshtastic protobuf 尚未載入完成');
+    }
+    const destId = Number(destination);
+    if (!Number.isFinite(destId) || destId <= 0 || destId === BROADCAST_ADDR) {
+      throw new Error('目的節點不合法');
+    }
+    const portValue = this.portEnum?.values?.TRACEROUTE_APP;
+    if (!Number.isFinite(portValue)) {
+      throw new Error('無法取得 TRACEROUTE_APP portnum');
+    }
+    const tracePayload = this.types.routeDiscovery.create({});
+    const encodedTrace = this.types.routeDiscovery.encode(tracePayload).finish();
+    const packetId = this._generatePacketId();
+    const meshPacketPayload = {
+      to: destId >>> 0,
+      channel: 0,
+      decoded: {
+        portnum: portValue,
+        payload: encodedTrace
+      },
+      wantAck: true,
+      id: packetId >>> 0
+    };
+    const hopStart = this._resolveOutboundHopStart();
+    if (hopStart != null) {
+      meshPacketPayload.hopLimit = hopStart >>> 0;
+      meshPacketPayload.hopStart = hopStart >>> 0;
+    }
+    const message = this.toRadioType.create({
+      packet: meshPacketPayload
+    });
+    const encoded = this.toRadioType.encode(message).finish();
+    const framed = framePacket(encoded);
+    this.emit('toRadioRaw', framed);
+    this.emit('traceroute-log', {
+      tag: 'TRACEROUTE',
+      message: `送出 traceroute 請求 ${formatHexId(destId)}`
+    });
+    return new Promise((resolve, reject) => {
+      this._writeFrame(framed, (err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(meshPacketPayload.id >>> 0);
+        }
+      });
+    });
+  }
+
+  _loadTracerouteCache() {
+    const filePath = this.options.tracerouteCachePath;
+    if (!filePath) return;
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === 'object') {
+        for (const [key, value] of Object.entries(parsed)) {
+          const num = Number(key);
+          if (!Number.isFinite(num)) continue;
+          if (!value || typeof value !== 'object') continue;
+          const route = Array.isArray(value.route) ? value.route.map((v) => Number(v) >>> 0) : [];
+          const routeBack = Array.isArray(value.routeBack)
+            ? value.routeBack.map((v) => Number(v) >>> 0)
+            : [];
+          const snrTowards = Array.isArray(value.snrTowards)
+            ? value.snrTowards.map((v) => Number(v))
+            : [];
+          const snrBack = Array.isArray(value.snrBack) ? value.snrBack.map((v) => Number(v)) : [];
+          const updatedAt = Number.isFinite(value.updatedAt) ? Number(value.updatedAt) : Date.now();
+          this._tracerouteCache.set(num >>> 0, {
+            route,
+            routeBack,
+            snrTowards,
+            snrBack,
+            updatedAt
+          });
+        }
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        console.warn(`讀取 traceroute 快取失敗：${err.message}`);
+      }
+    }
+  }
+
+  _persistTracerouteCacheSoon() {
+    if (this._tracerouteCachePersistTimer) {
+      return;
+    }
+    const filePath = this.options.tracerouteCachePath;
+    if (!filePath) return;
+    this._tracerouteCachePersistTimer = setTimeout(() => {
+      this._tracerouteCachePersistTimer = null;
+      const payload = {};
+      for (const [key, value] of this._tracerouteCache.entries()) {
+        payload[key] = value;
+      }
+      try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+      } catch (err) {
+        console.warn(`寫入 traceroute 快取失敗：${err.message}`);
+      }
+    }, 200);
   }
 
   _shouldIgnoreMeshId(value) {
@@ -813,6 +1045,13 @@ class MeshtasticClient extends EventEmitter {
 
   stop() {
     this._clearHeartbeat();
+    this._clearTracerouteQueueTimer();
+    this._tracerouteQueue = [];
+    this._tracerouteLastSent.clear();
+    if (this._tracerouteCachePersistTimer) {
+      clearTimeout(this._tracerouteCachePersistTimer);
+      this._tracerouteCachePersistTimer = null;
+    }
     this._flushRelayStatsPersistSync();
     if (this._relayStatsStoreOwned && this._relayStatsStore && typeof this._relayStatsStore.close === 'function') {
       try {
@@ -1598,6 +1837,7 @@ class MeshtasticClient extends EventEmitter {
       nextHop: nextHopInfo,
       position: decodeInfo?.position || null,
       telemetry: decodeInfo?.telemetry || null,
+      trace: decodeInfo?.trace || null,
       meshPacketId,
       replyId,
       requestId,
@@ -1628,6 +1868,21 @@ class MeshtasticClient extends EventEmitter {
     }
     summary.relayInvalid = hopLimitOnly;
 
+    const cachedTraceFrom = Number(summary.from?.raw);
+    if (!summary.trace && Number.isFinite(cachedTraceFrom)) {
+      const cachedTrace = this._tracerouteCache.get(cachedTraceFrom);
+      if (cachedTrace && Array.isArray(cachedTrace.route) && cachedTrace.route.length) {
+        summary.trace = cachedTrace;
+        const cachedLabel = cachedTrace.updatedAt
+          ? new Date(cachedTrace.updatedAt).toISOString()
+          : '';
+        if (cachedLabel) {
+          summary.extraLines = Array.isArray(summary.extraLines) ? summary.extraLines : [];
+          summary.extraLines.push(`cached traceroute @ ${cachedLabel}`);
+        }
+      }
+    }
+
     const directRelayNodeId =
       relayResult && Number.isFinite(relayResult.nodeId) ? relayResult.nodeId : relayNodeId;
 
@@ -1646,6 +1901,11 @@ class MeshtasticClient extends EventEmitter {
         delete summary.relayGuessReason;
       }
     }
+
+    if (summary.trace && Number.isFinite(summary.from?.raw)) {
+      this._recordTracerouteResult(summary.from.raw, summary.trace, { via: 'decode' });
+    }
+    this._considerAutoTraceroute(summary);
 
     return summary;
   }
@@ -1918,7 +2178,21 @@ class MeshtasticClient extends EventEmitter {
           if (returnPath.length) extras.push(`return: ${returnPath.join(' -> ')}`);
           if (trace.snrTowards?.length) extras.push(`SNR→: ${trace.snrTowards.map(formatSnr).join(', ')}`);
           if (trace.snrBack?.length) extras.push(`SNR←: ${trace.snrBack.map(formatSnr).join(', ')}`);
-          return { type: 'Traceroute', details: detail, extraLines: extras };
+          return {
+            type: 'Traceroute',
+            details: detail,
+            extraLines: extras,
+            trace: {
+              route: Array.isArray(trace.route) ? trace.route.map((n) => Number(n) >>> 0) : [],
+              routeBack: Array.isArray(trace.routeBack)
+                ? trace.routeBack.map((n) => Number(n) >>> 0)
+                : [],
+              snrTowards: Array.isArray(trace.snrTowards)
+                ? trace.snrTowards.map((n) => Number(n))
+                : [],
+              snrBack: Array.isArray(trace.snrBack) ? trace.snrBack.map((n) => Number(n)) : []
+            }
+          };
         }
         case 'NEIGHBORINFO_APP': {
           const message = this.types.neighborInfo.decode(payload);

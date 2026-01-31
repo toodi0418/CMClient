@@ -19,3 +19,6 @@ dist/
 # Internal documentation (keep local only)
 docs/callmesh-client.md
 docs/handover.md
+
+# External clones (keep local only)
+MeshSense/

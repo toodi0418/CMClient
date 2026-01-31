@@ -389,6 +389,18 @@ function normalizeClientPreferences(raw) {
         normalized.shareWithTenmanMap = Boolean(raw.shareWithTenmanMap);
       }
     }
+    if (Object.prototype.hasOwnProperty.call(raw, 'tracerouteRateMinutes')) {
+      const value = Number(raw.tracerouteRateMinutes);
+      if (Number.isFinite(value) && value > 0) {
+        normalized.tracerouteRateMinutes = Math.max(15, Math.round(value));
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(raw, 'tracerouteIntervalSeconds')) {
+      const value = Number(raw.tracerouteIntervalSeconds);
+      if (Number.isFinite(value) && value > 0) {
+        normalized.tracerouteIntervalSeconds = Math.max(15, Math.round(value));
+      }
+    }
   }
   return normalized;
 }
@@ -476,6 +488,18 @@ async function updateClientPreferences(updates = {}) {
       const desired = Boolean(rawValue);
       existing.shareWithTenmanMap = desired;
       bridge?.setTenmanShareEnabled?.(desired);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'tracerouteRateMinutes')) {
+    const value = Number(updates.tracerouteRateMinutes);
+    if (Number.isFinite(value) && value > 0) {
+      existing.tracerouteRateMinutes = Math.max(15, Math.round(value));
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'tracerouteIntervalSeconds')) {
+    const value = Number(updates.tracerouteIntervalSeconds);
+    if (Number.isFinite(value) && value > 0) {
+      existing.tracerouteIntervalSeconds = Math.max(15, Math.round(value));
     }
   }
   return writeClientPreferences(existing);
@@ -983,6 +1007,18 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     throw new Error('主視窗尚未建立');
   }
 
+  const cachedPrefs = await getCachedClientPreferences().catch(() => ({}));
+  const tracerouteEnabled = true;
+  const tracerouteRateMinutesRaw =
+    options?.tracerouteRateMinutes ?? cachedPrefs.tracerouteRateMinutes ?? 30;
+  const tracerouteIntervalSecondsRaw =
+    options?.tracerouteIntervalSeconds ?? cachedPrefs.tracerouteIntervalSeconds ?? 60;
+  const tracerouteRateMinutes = Math.max(15, Math.round(Number(tracerouteRateMinutesRaw) || 30));
+  const tracerouteIntervalSeconds = Math.max(
+    15,
+    Math.round(Number(tracerouteIntervalSecondsRaw) || 60)
+  );
+
   cleanupMeshtasticClient();
 
   const connectingPayload = { status: 'connecting' };
@@ -1053,7 +1089,11 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     maxLength: options.maxLength ?? 512,
     handshake: options.handshake ?? true,
     heartbeat: options.heartbeat ?? 0,
-    relayStatsPath
+    relayStatsPath,
+    tracerouteEnabled,
+    tracerouteRateMinutes,
+    tracerouteIntervalSeconds,
+    tracerouteCachePath: path.join(getCallMeshDataDir(), 'traceroute-cache.json')
   };
   if (bridge?.getDataStore) {
     clientOptions.relayStatsStore = bridge.getDataStore();
@@ -1122,6 +1162,12 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     mainWindow?.webContents.send('meshtastic:status', payload);
     lastMeshtasticStatus = payload;
     webServer?.publishStatus(payload);
+  });
+
+  client.on('traceroute-log', (entry) => {
+    if (!entry) return;
+    const message = typeof entry.message === 'string' ? entry.message : JSON.stringify(entry);
+    sendCallmeshLog({ tag: 'TRACEROUTE', message });
   });
 
   const processSummary = (summary, { synthetic = false } = {}) => {
