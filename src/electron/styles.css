@@ -1586,10 +1586,6 @@ header {
   font-size: 12px;
 }
 
-.traceroute-snr-row .traceroute-path {
-  font-size: 12px;
-  color: var(--color-text-muted);
-}
 
 .chip-hops {
   background: rgba(129, 140, 248, 0.3);

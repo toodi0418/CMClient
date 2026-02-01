@@ -4478,16 +4478,19 @@ function renderTracerouteList() {
       const showRoutes = status && status !== 'pending';
       const forward = showRoutes
         ? renderTraceroutePath(entry.forward, {
-            unknownHint: Boolean(entry.forwardUnknown)
+            unknownHint: Boolean(entry.forwardUnknown),
+            snrValues: entry.snrTowards,
+            snrMode: 'routeOnly'
           })
         : '';
       const backward = showRoutes
         ? renderTraceroutePath(entry.backward, {
             unknownHint: Boolean(entry.backwardUnknown),
-            directLabel: '直回'
+            directLabel: '直回',
+            snrValues: entry.snrBack,
+            snrMode: 'routeOnly'
           })
         : '';
-      const snrMarkup = showRoutes ? renderTracerouteSnr(entry) : '';
       const routesMarkup = showRoutes
         ? `
           <div class="traceroute-route">
@@ -4498,7 +4501,6 @@ function renderTracerouteList() {
             <span class="traceroute-label">回程</span>
             <div class="traceroute-path">${backward}</div>
           </div>
-          ${snrMarkup}
         `
         : '';
       return `
@@ -4516,27 +4518,10 @@ function renderTracerouteList() {
     .join('');
 }
 
-function renderTracerouteSnr(entry) {
-  const towards = Array.isArray(entry.snrTowards) ? entry.snrTowards : [];
-  const back = Array.isArray(entry.snrBack) ? entry.snrBack : [];
-  if (!towards.length && !back.length) {
-    return '';
-  }
-  const towardsText = towards.map((value) => formatNumber(value, 2)).join(', ');
-  const backText = back.map((value) => formatNumber(value, 2)).join(', ');
-  return `
-    <div class="traceroute-route traceroute-snr-row">
-      <span class="traceroute-label">SNR→</span>
-      <div class="traceroute-path traceroute-snr">${towardsText || '—'}</div>
-    </div>
-    <div class="traceroute-route traceroute-snr-row">
-      <span class="traceroute-label">SNR←</span>
-      <div class="traceroute-path traceroute-snr">${backText || '—'}</div>
-    </div>
-  `;
-}
-
-function renderTraceroutePath(nodes, { unknownHint = false, directLabel = '直回' } = {}) {
+function renderTraceroutePath(
+  nodes,
+  { unknownHint = false, directLabel = '直回', snrValues = [], snrMode = 'routeOnly' } = {}
+) {
   if (!Array.isArray(nodes) || !nodes.length) {
     const label = unknownHint ? '未知' : directLabel;
     return `<span class="traceroute-empty">${label}</span>`;
@@ -4545,8 +4530,22 @@ function renderTraceroutePath(nodes, { unknownHint = false, directLabel = '直�
     .map((node, index) => {
       let label = resolveTracerouteNodeLabel(node);
       if (isUnknownMeshIdLabel(label)) label = '未知';
+      let snrLabel = '';
+      if (Array.isArray(snrValues) && snrValues.length) {
+        let snrIndex = null;
+        if (snrMode === 'routeOnly') {
+          if (index > 0 && index < nodes.length - 1) {
+            snrIndex = index - 1;
+          }
+        } else {
+          snrIndex = index;
+        }
+        if (snrIndex != null && Number.isFinite(snrValues[snrIndex])) {
+          snrLabel = ` ${formatNumber(snrValues[snrIndex], 2)}dB`;
+        }
+      }
       const arrow = index < nodes.length - 1 ? '<span class="traceroute-arrow">→</span>' : '';
-      return `<span class="traceroute-pill">${label}</span>${arrow}`;
+      return `<span class="traceroute-pill">${label}${snrLabel}</span>${arrow}`;
     })
     .join('');
 }
