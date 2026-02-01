@@ -7340,11 +7340,17 @@
     }
     return nodes
       .map((node, index) => {
-        const label = String(node || '').trim() || '未知';
+        let label = String(node || '').trim() || '未知';
+        if (isUnknownMeshIdLabel(label)) label = '未知';
         const arrow = index < nodes.length - 1 ? '<span class="traceroute-arrow">→</span>' : '';
         return `<span class="traceroute-pill">${label}</span>${arrow}`;
       })
       .join('');
+  }
+
+  function isUnknownMeshIdLabel(value) {
+    const text = String(value || '').trim().toLowerCase();
+    return text === '!ffffffff' || text === '0xffffffff' || text === 'ffffffff';
   }
 
   function resolveTracerouteTargetLabel(entry) {
