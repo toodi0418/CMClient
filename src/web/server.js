@@ -28,6 +28,7 @@ const DEFAULT_TELEMETRY_MAX_TOTAL_RECORDS = 20000;
 const MESSAGE_MAX_PER_CHANNEL = 200;
 const MESSAGE_PERSIST_INTERVAL_MS = 2000;
 const MAX_TRACEROUTE_ENTRIES = 200;
+const TRACEROUTE_PERSIST_INTERVAL_MS = 2000;
 const TELEMETRY_METRIC_DEFINITIONS = {
   batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150] },
   voltage: { label: '電壓', unit: 'V', decimals: 2 },
@@ -161,6 +162,8 @@ class WebDashboardServer {
       options && typeof options.relayStatsStore === 'object' ? options.relayStatsStore : null;
     this.messageLogStore =
       options && typeof options.messageLogStore === 'object' ? options.messageLogStore : null;
+    this.tracerouteLogStore =
+      options && typeof options.tracerouteLogStore === 'object' ? options.tracerouteLogStore : null;
     this.aprsDebugProvider =
       typeof options.aprsDebugProvider === 'function' ? options.aprsDebugProvider : null;
 
@@ -225,6 +228,8 @@ class WebDashboardServer {
     this._messageDirty = false;
     this._messagePersistTimer = null;
     this.tracerouteStore = [];
+    this._tracerouteDirty = false;
+    this._traceroutePersistTimer = null;
     this._ensureConfiguredChannels();
   }
 
@@ -234,6 +239,7 @@ class WebDashboardServer {
     }
 
     await this._loadMessageLog();
+    await this._loadTracerouteLog();
 
     const preferredPort = this._resolvePreferredPort();
     const candidatePorts = this._buildPortCandidates(preferredPort);
@@ -369,6 +375,7 @@ class WebDashboardServer {
   async stop() {
     this._stopPing();
     this._flushMessagePersistSync();
+    this._flushTraceroutePersistSync();
 
     for (const client of this.clients) {
       try {
@@ -621,6 +628,7 @@ class WebDashboardServer {
       this.tracerouteStore.pop();
     }
     this._broadcast({ type: 'traceroute-append', payload: cloned });
+    this._scheduleTraceroutePersist();
   }
 
   _cloneTracerouteEntry(entry) {
@@ -1966,6 +1974,25 @@ class WebDashboardServer {
     }
   }
 
+  async _loadTracerouteLog() {
+    const store = this.tracerouteLogStore;
+    if (!store) {
+      return;
+    }
+    try {
+      const entries = store.loadTracerouteLog();
+      if (Array.isArray(entries) && entries.length) {
+        this.tracerouteStore = entries
+          .map((entry) => this._cloneTracerouteEntry(entry))
+          .filter(Boolean)
+          .slice(0, MAX_TRACEROUTE_ENTRIES);
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`從 SQLite 載入 traceroute 紀錄失敗: ${err.message}`);
+    }
+  }
+
   _scheduleMessagePersist() {
     if (!this.messageLogStore && !this.messageLogPath) {
       return;
@@ -1982,6 +2009,24 @@ class WebDashboardServer {
       });
     }, MESSAGE_PERSIST_INTERVAL_MS);
     this._messagePersistTimer.unref?.();
+  }
+
+  _scheduleTraceroutePersist() {
+    if (!this.tracerouteLogStore) {
+      return;
+    }
+    this._tracerouteDirty = true;
+    if (this._traceroutePersistTimer) {
+      return;
+    }
+    this._traceroutePersistTimer = setTimeout(() => {
+      this._traceroutePersistTimer = null;
+      this._persistTracerouteLog().catch((err) => {
+        console.error(`寫入 traceroute 紀錄失敗: ${err.message}`);
+        this._scheduleTraceroutePersist();
+      });
+    }, TRACEROUTE_PERSIST_INTERVAL_MS);
+    this._traceroutePersistTimer.unref?.();
   }
 
   async _persistMessageLog() {
@@ -2018,6 +2063,22 @@ class WebDashboardServer {
       await fsPromises.writeFile(this.messageLogPath, lines.join('\n'), 'utf8');
     } catch (err) {
       this._messageDirty = true;
+      throw err;
+    }
+  }
+
+  async _persistTracerouteLog() {
+    if (!this._tracerouteDirty) {
+      return;
+    }
+    this._tracerouteDirty = false;
+    if (!this.tracerouteLogStore) {
+      return;
+    }
+    try {
+      this.tracerouteLogStore.saveTracerouteLog(this.tracerouteStore);
+    } catch (err) {
+      this._tracerouteDirty = true;
       throw err;
     }
   }
@@ -2067,6 +2128,24 @@ class WebDashboardServer {
       this._messageDirty = false;
     } catch (err) {
       console.error(`同步寫入訊息紀錄失敗: ${err.message}`);
+    }
+  }
+
+  _flushTraceroutePersistSync() {
+    if (this._traceroutePersistTimer) {
+      clearTimeout(this._traceroutePersistTimer);
+      this._traceroutePersistTimer = null;
+    }
+    if (!this._tracerouteDirty || !this.tracerouteLogStore) {
+      return;
+    }
+    try {
+      this.tracerouteLogStore.saveTracerouteLog(this.tracerouteStore);
+      this._tracerouteDirty = false;
+    } catch (err) {
+      this._tracerouteDirty = true;
+      // eslint-disable-next-line no-console
+      console.error(`同步寫入 traceroute 紀錄失敗 (SQLite): ${err.message}`);
     }
   }
 

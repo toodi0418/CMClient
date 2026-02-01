@@ -130,6 +130,53 @@ function sanitizeExtraLines(lines) {
   return result;
 }
 
+function sanitizeTracerouteEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const timestampMs = toFiniteInteger(entry.timestampMs ?? entry.timestamp) ?? Date.now();
+  const status = sanitizeText(entry.status ?? entry.variant);
+  const from = sanitizeText(entry.from);
+  const fromName = sanitizeText(entry.fromName);
+  const to = sanitizeText(entry.to);
+  const toName = sanitizeText(entry.toName);
+  const route = Array.isArray(entry.route)
+    ? entry.route.map((item) => sanitizeText(item)).filter(Boolean)
+    : [];
+  const routeBack = Array.isArray(entry.routeBack)
+    ? entry.routeBack.map((item) => sanitizeText(item)).filter(Boolean)
+    : [];
+  const snrTowards = Array.isArray(entry.snrTowards)
+    ? entry.snrTowards.map((item) => {
+        const value = toFiniteNumber(item);
+        return value == null ? null : value;
+      })
+    : [];
+  const snrBack = Array.isArray(entry.snrBack)
+    ? entry.snrBack.map((item) => {
+        const value = toFiniteNumber(item);
+        return value == null ? null : value;
+      })
+    : [];
+
+  if (!route.length && !routeBack.length && !snrTowards.length && !snrBack.length) {
+    return null;
+  }
+
+  return {
+    timestampMs,
+    status,
+    from,
+    fromName,
+    to,
+    toName,
+    route,
+    routeBack,
+    snrTowards,
+    snrBack
+  };
+}
+
 function sanitizeMessageEntry(entry, { fallbackFlowId, fallbackChannel, fallbackTimestampMs }) {
   if (!entry || typeof entry !== 'object') {
     return null;
@@ -489,6 +536,12 @@ class CallMeshDataStore {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS traceroute_log (
+        position INTEGER PRIMARY KEY,
+        timestamp_ms INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS aprs_packet_cache (
         packet_key TEXT PRIMARY KEY,
         callsign TEXT,
@@ -677,6 +730,17 @@ class CallMeshDataStore {
     this.statements.selectRelayStats = this.db.prepare(`
       SELECT mesh_key AS meshKey, snr, rssi, count, updated_at AS updatedAt
       FROM relay_stats
+    `);
+
+    this.statements.deleteTracerouteLog = this.db.prepare('DELETE FROM traceroute_log');
+    this.statements.insertTracerouteLog = this.db.prepare(`
+      INSERT INTO traceroute_log (position, timestamp_ms, payload_json)
+      VALUES (@position, @timestampMs, @payloadJson)
+    `);
+    this.statements.selectTracerouteLog = this.db.prepare(`
+      SELECT position, timestamp_ms AS timestampMs, payload_json AS payloadJson
+      FROM traceroute_log
+      ORDER BY position ASC
     `);
 
     this.statements.clearAprsPacketCache = this.db.prepare('DELETE FROM aprs_packet_cache');
@@ -1275,6 +1339,48 @@ class CallMeshDataStore {
       }
       return result;
     });
+  }
+
+  saveTracerouteLog(entries = []) {
+    if (!this.db) {
+      throw new Error('CallMeshDataStore 尚未初始化');
+    }
+    const insert = this.statements.insertTracerouteLog;
+    const exec = this._createTransaction((items) => {
+      this.statements.deleteTracerouteLog.run();
+      let position = 0;
+      for (const entry of items) {
+        const sanitized = sanitizeTracerouteEntry(entry);
+        if (!sanitized) continue;
+        insert.run({
+          position,
+          timestampMs: sanitized.timestampMs,
+          payloadJson: toJson(sanitized)
+        });
+        position += 1;
+      }
+    });
+    exec(entries);
+  }
+
+  loadTracerouteLog() {
+    if (!this.db) {
+      throw new Error('CallMeshDataStore 尚未初始化');
+    }
+    const rows = this.statements.selectTracerouteLog.all();
+    if (!rows.length) {
+      return [];
+    }
+    const result = [];
+    for (const row of rows) {
+      const payload = fromJson(row.payloadJson);
+      if (!payload || typeof payload !== 'object') continue;
+      if (!Number.isFinite(payload.timestampMs) && Number.isFinite(row.timestampMs)) {
+        payload.timestampMs = row.timestampMs;
+      }
+      result.push(payload);
+    }
+    return result;
   }
 
   replaceRelayStats(entries = []) {

@@ -411,8 +411,33 @@
           </header>
           <div class="traceroute-topology-panel">
             <div class="traceroute-topology-header">
-              <h3>拓樸圖</h3>
-              <span>去程 / 回程雙線，支援多路徑</span>
+              <div class="traceroute-topology-legend">
+                <span class="legend-item"><span class="legend-dot snr-good"></span> SNR &gt; -7 dB</span>
+                <span class="legend-item"><span class="legend-dot snr-mid"></span> -13 ~ -7 dB</span>
+                <span class="legend-item"><span class="legend-dot snr-bad"></span> SNR ≤ -13 dB</span>
+                <span class="legend-item"><span class="legend-dot snr-unknown"></span> Unknown</span>
+                <span class="legend-item"><span class="legend-line forward"></span> Forward</span>
+                <span class="legend-item"><span class="legend-line return"></span> Return</span>
+              </div>
+              <div class="traceroute-topology-controls">
+                <button id="traceroute-refresh" type="button" class="topology-btn">Refresh</button>
+                <label class="topology-select">
+                  Window:
+                  <select id="traceroute-window">
+                    <option value="1">Last 1 Hour</option>
+                    <option value="3" selected>Last 3 Hours</option>
+                    <option value="12">Last 12 Hours</option>
+                    <option value="24">Last 24 Hours</option>
+                  </select>
+                </label>
+                <label class="topology-select">
+                  Layout:
+                  <select id="traceroute-layout">
+                    <option value="pyramid" selected>Pyramid (Hubs Top)</option>
+                    <option value="circle">Circle</option>
+                  </select>
+                </label>
+              </div>
             </div>
             <div class="traceroute-topology-wrap">
               <svg id="traceroute-topology" class="traceroute-topology" role="img" aria-label="Traceroute topology"></svg>

@@ -555,6 +555,7 @@ async function startMonitor(argv) {
         relayStatsStore: sharedDataStore,
         messageLogPath: getMessageLogPath(),
         messageLogStore: sharedDataStore,
+        tracerouteLogStore: sharedDataStore,
         telemetryProvider: bridge,
         aprsDebugProvider: () => bridge.getAprsDebugSnapshot()
       };

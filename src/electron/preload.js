@@ -34,6 +34,7 @@ contextBridge.exposeInMainWorld('meshtastic', {
     ipcRenderer.on('meshtastic:traceroute', listener);
     return () => ipcRenderer.removeListener('meshtastic:traceroute', listener);
   },
+  getTracerouteSnapshot: () => ipcRenderer.invoke('traceroute:get-snapshot'),
   onCallMeshLog: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('callmesh:log', listener);

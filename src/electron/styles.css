@@ -1596,25 +1596,109 @@ header {
 
 .traceroute-topology-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
 }
 
-.traceroute-topology-header h3 {
-  margin: 0;
-  font-size: 0.95rem;
-}
-
-.traceroute-topology-header span {
+.traceroute-topology-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: center;
   font-size: 0.75rem;
   color: var(--color-text-muted);
 }
 
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.legend-dot.snr-good {
+  background: #22c55e;
+}
+
+.legend-dot.snr-mid {
+  background: #facc15;
+}
+
+.legend-dot.snr-bad {
+  background: #ef4444;
+}
+
+.legend-dot.snr-unknown {
+  background: #94a3b8;
+}
+
+.legend-line {
+  width: 22px;
+  height: 0;
+  border-top: 2px solid #e2e8f0;
+}
+
+.legend-line.forward {
+  border-top-style: solid;
+}
+
+.legend-line.return {
+  border-top-style: dashed;
+}
+
+.traceroute-topology-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.topology-btn {
+  border-radius: 999px;
+  padding: 6px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  background: rgba(15, 23, 42, 0.5);
+  color: #e2e8f0;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.topology-btn:hover {
+  border-color: rgba(148, 163, 184, 0.9);
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.35);
+}
+
+.topology-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.topology-select select {
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  color: #e2e8f0;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+}
+
 .traceroute-topology-wrap {
   width: 100%;
-  height: 360px;
+  height: 460px;
   border-radius: 14px;
   background: radial-gradient(circle at top, rgba(15, 23, 42, 0.35), transparent 55%);
   border: 1px dashed rgba(148, 163, 184, 0.25);
@@ -1624,6 +1708,10 @@ header {
 .traceroute-topology {
   width: 100%;
   height: 100%;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .traceroute-topology text {
@@ -1632,29 +1720,66 @@ header {
   font-weight: 600;
 }
 
+.traceroute-topology.is-panning {
+  cursor: grabbing;
+}
+
 .traceroute-topology .node-circle {
-  fill: rgba(15, 23, 42, 0.75);
-  stroke: rgba(148, 163, 184, 0.6);
-  stroke-width: 1;
+  fill: #60a5fa;
+  stroke: rgba(30, 64, 175, 0.9);
+  stroke-width: 1.2;
+  cursor: grab;
+}
+
+.traceroute-topology .edge-line {
+  stroke-width: 2;
+  fill: none;
+  opacity: 0.9;
 }
 
 .traceroute-topology .edge-forward {
-  stroke: #38bdf8;
-  stroke-width: 2;
-  fill: none;
-  opacity: 0.9;
+  stroke-dasharray: none;
 }
 
 .traceroute-topology .edge-return {
-  stroke: #f59e0b;
-  stroke-width: 2;
-  fill: none;
-  opacity: 0.9;
+  stroke-dasharray: 6 6;
+}
+
+.traceroute-topology .edge-snr-good {
+  stroke: #22c55e;
+}
+
+.traceroute-topology .edge-snr-mid {
+  stroke: #facc15;
+}
+
+.traceroute-topology .edge-snr-bad {
+  stroke: #ef4444;
+}
+
+.traceroute-topology .edge-snr-unknown {
+  stroke: #94a3b8;
 }
 
 .traceroute-topology .edge-label {
   font-size: 10px;
   fill: #f8fafc;
+}
+
+.traceroute-topology .edge-label.edge-snr-good {
+  fill: #22c55e;
+}
+
+.traceroute-topology .edge-label.edge-snr-mid {
+  fill: #facc15;
+}
+
+.traceroute-topology .edge-label.edge-snr-bad {
+  fill: #ef4444;
+}
+
+.traceroute-topology .edge-label.edge-snr-unknown {
+  fill: #94a3b8;
 }
 
 

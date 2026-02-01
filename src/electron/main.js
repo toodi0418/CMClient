@@ -43,10 +43,13 @@ const { getAppTimezone, formatTimestampLabel } = require('../timezone');
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const MESSAGE_LOG_FILENAME = 'message-log.jsonl';
 const MESSAGE_MAX_PER_CHANNEL = 200;
+const TRACEROUTE_MAX_ENTRIES = 200;
 const appTimezone = getAppTimezone();
 
 const messageStore = new Map();
 let messageWritePromise = Promise.resolve();
+const tracerouteStore = [];
+let tracerouteWritePromise = Promise.resolve();
 let bridgeSummaryListener = null;
 
 function getMessageLogPath() {
@@ -209,6 +212,91 @@ function getMessageSnapshot() {
   return snapshot;
 }
 
+function sanitizeTracerouteEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const timestampMsRaw = entry.timestampMs ?? entry.timestamp;
+  const timestampMs = Number.isFinite(Number(timestampMsRaw))
+    ? Math.trunc(Number(timestampMsRaw))
+    : Date.now();
+  const route = Array.isArray(entry.route) ? entry.route.filter(Boolean) : [];
+  const routeBack = Array.isArray(entry.routeBack) ? entry.routeBack.filter(Boolean) : [];
+  const snrTowards = Array.isArray(entry.snrTowards) ? entry.snrTowards.slice() : [];
+  const snrBack = Array.isArray(entry.snrBack) ? entry.snrBack.slice() : [];
+  if (!route.length && !routeBack.length && !snrTowards.length && !snrBack.length) {
+    return null;
+  }
+  return {
+    timestampMs,
+    status: entry.status ?? entry.variant ?? null,
+    from: entry.from ?? null,
+    fromName: entry.fromName ?? null,
+    to: entry.to ?? null,
+    toName: entry.toName ?? null,
+    route,
+    routeBack,
+    snrTowards,
+    snrBack
+  };
+}
+
+function cloneTracerouteEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  return {
+    timestampMs: entry.timestampMs,
+    status: entry.status ?? null,
+    from: entry.from ?? null,
+    fromName: entry.fromName ?? null,
+    to: entry.to ?? null,
+    toName: entry.toName ?? null,
+    route: Array.isArray(entry.route) ? entry.route.slice() : [],
+    routeBack: Array.isArray(entry.routeBack) ? entry.routeBack.slice() : [],
+    snrTowards: Array.isArray(entry.snrTowards) ? entry.snrTowards.slice() : [],
+    snrBack: Array.isArray(entry.snrBack) ? entry.snrBack.slice() : []
+  };
+}
+
+function addTracerouteEntry(entry) {
+  tracerouteStore.unshift(entry);
+  if (tracerouteStore.length > TRACEROUTE_MAX_ENTRIES) {
+    tracerouteStore.length = TRACEROUTE_MAX_ENTRIES;
+  }
+}
+
+async function flushTracerouteLog() {
+  const store = bridge?.getDataStore?.();
+  if (!store) {
+    return;
+  }
+  try {
+    store.saveTracerouteLog(tracerouteStore);
+  } catch (err) {
+    console.error('寫入 traceroute 紀錄失敗 (SQLite):', err);
+    throw err;
+  }
+}
+
+function persistTracerouteEntry(entry) {
+  const sanitized = sanitizeTracerouteEntry(entry);
+  if (!sanitized) {
+    return null;
+  }
+  addTracerouteEntry(sanitized);
+  tracerouteWritePromise = tracerouteWritePromise
+    .then(() => flushTracerouteLog())
+    .catch((err) => {
+      console.error('寫入 traceroute 紀錄失敗:', err);
+    });
+  return sanitized;
+}
+
+function getTracerouteSnapshot() {
+  return tracerouteStore.map((entry) => cloneTracerouteEntry(entry)).filter(Boolean);
+}
+
 async function loadMessageLog() {
   const filePath = getMessageLogPath();
   messageStore.clear();
@@ -263,6 +351,30 @@ async function loadMessageLog() {
     } catch (err) {
       console.warn('遷移訊息紀錄至 SQLite 失敗:', err.message);
     }
+  }
+}
+
+async function loadTracerouteLog() {
+  tracerouteStore.length = 0;
+  const store = bridge?.getDataStore?.();
+  if (!store) {
+    return;
+  }
+  try {
+    const entries = store.loadTracerouteLog();
+    if (Array.isArray(entries) && entries.length) {
+      for (const rawEntry of entries) {
+        const entry = sanitizeTracerouteEntry(rawEntry);
+        if (entry) {
+          tracerouteStore.push(entry);
+        }
+      }
+      if (tracerouteStore.length > TRACEROUTE_MAX_ENTRIES) {
+        tracerouteStore.length = TRACEROUTE_MAX_ENTRIES;
+      }
+    }
+  } catch (err) {
+    console.warn('從 SQLite 載入 traceroute 紀錄失敗:', err.message);
   }
 }
 
@@ -743,6 +855,7 @@ function buildCallmeshSummary() {
 async function initialiseApp() {
   await initialiseBridge();
   await loadMessageLog();
+  await loadTracerouteLog();
   await createWindow();
   await ensureWebDashboardState();
 
@@ -783,6 +896,7 @@ async function startWebDashboard() {
         relayStatsStore: bridge?.getDataStore?.(),
         messageLogPath: getMessageLogPath(),
         messageLogStore: bridge?.getDataStore?.(),
+        tracerouteLogStore: bridge?.getDataStore?.(),
         telemetryProvider: bridge,
         aprsDebugProvider: () => bridge.getAprsDebugSnapshot()
       };
@@ -1184,6 +1298,10 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
 
   client.on('traceroute', (entry) => {
     if (!entry) return;
+    const status = String(entry.status || entry.variant || '').toLowerCase();
+    if (status && status !== 'pending') {
+      persistTracerouteEntry(entry);
+    }
     mainWindow?.webContents.send('meshtastic:traceroute', entry);
     webServer?.publishTraceroute(entry);
   });
@@ -1333,6 +1451,10 @@ ipcMain.handle('meshtastic:list-serial', async () => {
 
 ipcMain.handle('messages:get-snapshot', async () => {
   return { channels: getMessageSnapshot() };
+});
+
+ipcMain.handle('traceroute:get-snapshot', async () => {
+  return { entries: getTracerouteSnapshot() };
 });
 
 ipcMain.handle('callmesh:save-key', async (_event, apiKey) => {

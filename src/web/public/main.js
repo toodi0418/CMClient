@@ -71,6 +71,9 @@
   const routingList = document.getElementById('routing-list');
   const routingEmptyState = document.getElementById('routing-empty-state');
   const tracerouteTopology = document.getElementById('traceroute-topology');
+  const tracerouteRefreshBtn = document.getElementById('traceroute-refresh');
+  const tracerouteWindowSelect = document.getElementById('traceroute-window');
+  const tracerouteLayoutSelect = document.getElementById('traceroute-layout');
   const nodesEmptyState = document.getElementById('nodes-empty-state');
   const nodesTotalCountLabel = document.getElementById('nodes-total-count');
   const nodesOnlineCountLabel = document.getElementById('nodes-online-count');
@@ -127,6 +130,10 @@
   let summaryReplayGuardActive = false;
   let summaryReplayGuardCutoffMs = 0;
   let topologyRenderTimer = null;
+  const TOPOLOGY_WINDOW_STORAGE_KEY = 'tmag:web:traceroute:window-hours';
+  const TOPOLOGY_LAYOUT_STORAGE_KEY = 'tmag:web:traceroute:layout';
+  let tracerouteTopologyWindowHours = Number(tracerouteWindowSelect?.value) || 3;
+  let tracerouteTopologyLayout = tracerouteLayoutSelect?.value || 'pyramid';
   const telemetryStore = new Map();
   const telemetryRecordIds = new Set();
   const telemetryRecordOrder = [];
@@ -197,6 +204,40 @@
         pendingRenderFlows = false;
       }
     }
+  });
+
+  const storedTopologyWindow = Number(localStorage.getItem(TOPOLOGY_WINDOW_STORAGE_KEY));
+  if (Number.isFinite(storedTopologyWindow) && storedTopologyWindow > 0) {
+    tracerouteTopologyWindowHours = storedTopologyWindow;
+    if (tracerouteWindowSelect) {
+      tracerouteWindowSelect.value = String(storedTopologyWindow);
+    }
+  }
+  const storedTopologyLayout = localStorage.getItem(TOPOLOGY_LAYOUT_STORAGE_KEY);
+  if (storedTopologyLayout) {
+    tracerouteTopologyLayout = storedTopologyLayout;
+    if (tracerouteLayoutSelect) {
+      tracerouteLayoutSelect.value = storedTopologyLayout;
+    }
+  }
+
+  tracerouteRefreshBtn?.addEventListener('click', () => {
+    renderTracerouteTopology();
+  });
+
+  tracerouteWindowSelect?.addEventListener('change', () => {
+    const hours = Number(tracerouteWindowSelect.value);
+    if (Number.isFinite(hours) && hours > 0) {
+      tracerouteTopologyWindowHours = hours;
+      localStorage.setItem(TOPOLOGY_WINDOW_STORAGE_KEY, String(hours));
+      renderTracerouteTopology();
+    }
+  });
+
+  tracerouteLayoutSelect?.addEventListener('change', () => {
+    tracerouteTopologyLayout = tracerouteLayoutSelect.value || 'pyramid';
+    localStorage.setItem(TOPOLOGY_LAYOUT_STORAGE_KEY, tracerouteTopologyLayout);
+    renderTracerouteTopology();
   });
 
   function isIgnoredMeshId(meshId) {
@@ -7419,12 +7460,39 @@
       const status = (entry?.status || entry?.variant || '').toString().toLowerCase();
       return status && status !== 'pending';
     });
-    if (!entries.length) {
+    const filteredEntries = filterTracerouteEntriesByWindow(entries, tracerouteTopologyWindowHours);
+    if (!filteredEntries.length) {
       tracerouteTopology.innerHTML = '';
       return;
     }
-    const graph = buildTracerouteTopologyGraph(entries.slice(0, 50));
-    drawTracerouteTopology(tracerouteTopology, graph);
+    const graph = buildTracerouteTopologyGraph(filteredEntries.slice(0, 80));
+    drawTracerouteTopology(tracerouteTopology, graph, { layout: tracerouteTopologyLayout });
+  }
+
+  function filterTracerouteEntriesByWindow(entries, hours) {
+    if (!Array.isArray(entries) || !entries.length) return [];
+    const windowHours = Number(hours);
+    if (!Number.isFinite(windowHours) || windowHours <= 0) return entries.slice();
+    const windowMs = windowHours * 60 * 60 * 1000;
+    const now = Date.now();
+    return entries.filter((entry) => {
+      const tsMs = resolveTracerouteEntryTimestamp(entry);
+      if (!Number.isFinite(tsMs)) return true;
+      const delta = now - tsMs;
+      if (!Number.isFinite(delta)) return true;
+      return delta >= 0 && delta <= windowMs;
+    });
+  }
+
+  function resolveTracerouteEntryTimestamp(entry) {
+    if (!entry) return null;
+    const ts = entry.timestampMs ?? entry.timestamp;
+    if (Number.isFinite(ts)) return Number(ts);
+    if (typeof ts === 'string' && ts.trim()) {
+      const parsed = Date.parse(ts);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
   }
 
   function scheduleTracerouteTopologyRender() {
@@ -7490,7 +7558,7 @@
     return normalized || `label:${String(label).trim()}`;
   }
 
-  function drawTracerouteTopology(svg, graph) {
+  function drawTracerouteTopology(svg, graph, { layout = 'pyramid' } = {}) {
     if (!graph || !graph.nodes.length) {
       svg.innerHTML = '';
       return;
@@ -7499,29 +7567,18 @@
     const height = svg.clientHeight || 360;
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     svg.innerHTML = '';
-
-    const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-    defs.innerHTML = `
-      <marker id="arrow-forward" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-        <path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdf8"></path>
-      </marker>
-      <marker id="arrow-return" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-        <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"></path>
-      </marker>
-    `;
-    svg.appendChild(defs);
-
-    const cx = width / 2;
-    const cy = height / 2;
-    const radius = Math.max(80, Math.min(width, height) / 2 - 40);
-    const positions = new Map();
-    graph.nodes.forEach((node, index) => {
-      const angle = (Math.PI * 2 * index) / graph.nodes.length;
-      positions.set(node.id, {
-        x: cx + radius * Math.cos(angle),
-        y: cy + radius * Math.sin(angle)
-      });
-    });
+    ensureTraceroutePanZoom(svg, width, height);
+    ensureTracerouteNodeDrag(svg, width, height);
+    const layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    layer.setAttribute('class', 'traceroute-topology-layer');
+    svg.appendChild(layer);
+    applyTraceroutePanZoom(svg);
+    const positions = layout === 'circle'
+      ? buildCircleTopologyLayout(graph.nodes, width, height)
+      : buildPyramidTopologyLayout(graph, width, height);
+    applyTracerouteNodeOverrides(svg, positions);
+    svg._tracerouteGraph = graph;
+    svg._tracerouteLayout = layout;
 
     const edgeGroups = new Map();
     graph.edges.forEach((edge) => {
@@ -7545,22 +7602,24 @@
         const offset = (idx - (edges.length - 1) / 2) * 10;
         const cx1 = (fromPos.x + toPos.x) / 2 + nx * offset;
         const cy1 = (fromPos.y + toPos.y) / 2 + ny * offset;
+        const category = resolveTracerouteSnrCategory(edge.snr);
         const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         path.setAttribute('d', `M ${fromPos.x} ${fromPos.y} Q ${cx1} ${cy1} ${toPos.x} ${toPos.y}`);
-        path.setAttribute('class', edge.direction === 'forward' ? 'edge-forward' : 'edge-return');
-        path.setAttribute('marker-end', edge.direction === 'forward' ? 'url(#arrow-forward)' : 'url(#arrow-return)');
-        svg.appendChild(path);
+        path.setAttribute(
+          'class',
+          `edge-line edge-${edge.direction === 'forward' ? 'forward' : 'return'} edge-snr-${category}`
+        );
+        layer.appendChild(path);
 
-        if (Number.isFinite(edge.snr)) {
+        const scaledSnr = resolveTracerouteSnrScaled(edge.snr);
+        if (Number.isFinite(scaledSnr)) {
           const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-          const snrValue = formatTracerouteSnrValue(edge.snr);
-          if (snrValue) {
-            label.setAttribute('class', 'edge-label');
-            label.setAttribute('x', cx1 + nx * 10);
-            label.setAttribute('y', cy1 + ny * 10);
-            label.textContent = `${snrValue}dB`;
-            svg.appendChild(label);
-          }
+          const snrValue = formatNumber(scaledSnr, 2);
+          label.setAttribute('class', `edge-label edge-snr-${category}`);
+          label.setAttribute('x', cx1 + nx * 10);
+          label.setAttribute('y', cy1 + ny * 10);
+          label.textContent = `${snrValue}dB`;
+          layer.appendChild(label);
         }
       });
     }
@@ -7570,17 +7629,315 @@
       if (!pos) return;
       const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
       circle.setAttribute('class', 'node-circle');
+      circle.setAttribute('data-node-id', node.id);
       circle.setAttribute('cx', pos.x);
       circle.setAttribute('cy', pos.y);
       circle.setAttribute('r', 10);
-      svg.appendChild(circle);
+      layer.appendChild(circle);
 
       const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      text.setAttribute('data-node-id', node.id);
       text.setAttribute('x', pos.x + 14);
       text.setAttribute('y', pos.y + 4);
       text.textContent = truncateLabel(node.label || node.id);
-      svg.appendChild(text);
+      layer.appendChild(text);
     });
+  }
+
+  function ensureTraceroutePanZoom(svg, viewWidth, viewHeight) {
+    if (!svg || svg._traceroutePanZoom) {
+      if (svg?._traceroutePanZoom) {
+        svg._traceroutePanZoom.viewWidth = viewWidth;
+        svg._traceroutePanZoom.viewHeight = viewHeight;
+      }
+      return;
+    }
+    const state = {
+      scale: 1,
+      tx: 0,
+      ty: 0,
+      viewWidth,
+      viewHeight,
+      isPanning: false,
+      startX: 0,
+      startY: 0,
+      startTx: 0,
+      startTy: 0
+    };
+    svg._traceroutePanZoom = state;
+
+    svg.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const px = ((event.clientX - rect.left) / rect.width) * state.viewWidth;
+      const py = ((event.clientY - rect.top) / rect.height) * state.viewHeight;
+      const speed = 0.001;
+      const factor = Math.exp(-event.deltaY * speed);
+      const nextScale = Math.min(2.5, Math.max(0.6, state.scale * factor));
+      if (nextScale === state.scale) return;
+      state.tx = state.tx + px * (state.scale - nextScale);
+      state.ty = state.ty + py * (state.scale - nextScale);
+      state.scale = nextScale;
+      applyTraceroutePanZoom(svg);
+    }, { passive: false });
+
+    svg.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      if (isTracerouteNodeTarget(event.target)) return;
+      state.isPanning = true;
+      state.startX = event.clientX;
+      state.startY = event.clientY;
+      state.startTx = state.tx;
+      state.startTy = state.ty;
+      svg.classList.add('is-panning');
+      svg.setPointerCapture?.(event.pointerId);
+    });
+
+    svg.addEventListener('pointermove', (event) => {
+      if (!state.isPanning) return;
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const dx = event.clientX - state.startX;
+      const dy = event.clientY - state.startY;
+      const dxSvg = (dx / rect.width) * state.viewWidth;
+      const dySvg = (dy / rect.height) * state.viewHeight;
+      state.tx = state.startTx + dxSvg;
+      state.ty = state.startTy + dySvg;
+      applyTraceroutePanZoom(svg);
+    });
+
+    const stopPan = (event) => {
+      if (!state.isPanning) return;
+      state.isPanning = false;
+      svg.classList.remove('is-panning');
+      try {
+        svg.releasePointerCapture?.(event.pointerId);
+      } catch {
+        // ignore
+      }
+    };
+    svg.addEventListener('pointerup', stopPan);
+    svg.addEventListener('pointercancel', stopPan);
+    svg.addEventListener('pointerleave', stopPan);
+  }
+
+  function applyTraceroutePanZoom(svg) {
+    const state = svg?._traceroutePanZoom;
+    if (!state) return;
+    const layer = svg.querySelector('.traceroute-topology-layer');
+    if (!layer) return;
+    layer.setAttribute('transform', `translate(${state.tx} ${state.ty}) scale(${state.scale})`);
+  }
+
+  function isTracerouteNodeTarget(target) {
+    if (!target) return false;
+    if (target.dataset && target.dataset.nodeId) return true;
+    return typeof target.closest === 'function' && Boolean(target.closest('[data-node-id]'));
+  }
+
+  function applyTracerouteNodeOverrides(svg, positions) {
+    const overrides = svg?._tracerouteNodeOverrides;
+    if (!overrides) return;
+    overrides.forEach((override, nodeId) => {
+      if (!override) return;
+      const target = positions.get(nodeId);
+      if (!target) return;
+      target.x = override.x;
+      target.y = override.y;
+    });
+  }
+
+  function ensureTracerouteNodeDrag(svg, viewWidth, viewHeight) {
+    if (!svg || svg._tracerouteNodeDrag) {
+      if (svg?._tracerouteNodeDrag) {
+        svg._tracerouteNodeDrag.viewWidth = viewWidth;
+        svg._tracerouteNodeDrag.viewHeight = viewHeight;
+      }
+      return;
+    }
+    const state = {
+      active: false,
+      nodeId: null,
+      startX: 0,
+      startY: 0,
+      baseX: 0,
+      baseY: 0,
+      viewWidth,
+      viewHeight
+    };
+    svg._tracerouteNodeDrag = state;
+
+    svg.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      const target = event.target;
+      const nodeId = target?.dataset?.nodeId || target?.closest?.('[data-node-id]')?.dataset?.nodeId;
+      if (!nodeId) return;
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const positions = svg._tracerouteNodeOverrides || new Map();
+      const graph = svg._tracerouteGraph;
+      const layout = svg._tracerouteLayout || 'pyramid';
+      if (!graph) return;
+      const basePos = resolveTracerouteNodePosition(nodeId, graph, layout, rect, svg, positions);
+      if (!basePos) return;
+      state.active = true;
+      state.nodeId = nodeId;
+      state.startX = event.clientX;
+      state.startY = event.clientY;
+      state.baseX = basePos.x;
+      state.baseY = basePos.y;
+      svg._tracerouteNodeOverrides = positions;
+      svg.classList.add('is-panning');
+      svg.setPointerCapture?.(event.pointerId);
+    });
+
+    svg.addEventListener('pointermove', (event) => {
+      if (!state.active) return;
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const dx = event.clientX - state.startX;
+      const dy = event.clientY - state.startY;
+      const dxSvg = (dx / rect.width) * state.viewWidth;
+      const dySvg = (dy / rect.height) * state.viewHeight;
+      const nextX = state.baseX + dxSvg;
+      const nextY = state.baseY + dySvg;
+      if (!svg._tracerouteNodeOverrides) {
+        svg._tracerouteNodeOverrides = new Map();
+      }
+      svg._tracerouteNodeOverrides.set(state.nodeId, { x: nextX, y: nextY });
+      const graph = svg._tracerouteGraph;
+      const layout = svg._tracerouteLayout || 'pyramid';
+      if (graph) {
+        drawTracerouteTopology(svg, graph, { layout });
+      }
+    });
+
+    const stopDrag = (event) => {
+      if (!state.active) return;
+      state.active = false;
+      state.nodeId = null;
+      svg.classList.remove('is-panning');
+      try {
+        svg.releasePointerCapture?.(event.pointerId);
+      } catch {
+        // ignore
+      }
+    };
+    svg.addEventListener('pointerup', stopDrag);
+    svg.addEventListener('pointercancel', stopDrag);
+    svg.addEventListener('pointerleave', stopDrag);
+  }
+
+  function resolveTracerouteNodePosition(nodeId, graph, layout, rect, svg, overrides) {
+    if (overrides && overrides.has(nodeId)) {
+      return overrides.get(nodeId);
+    }
+    const width = svg._traceroutePanZoom?.viewWidth || rect.width;
+    const height = svg._traceroutePanZoom?.viewHeight || rect.height;
+    const positions = layout === 'circle'
+      ? buildCircleTopologyLayout(graph.nodes, width, height)
+      : buildPyramidTopologyLayout(graph, width, height);
+    return positions.get(nodeId) || null;
+  }
+
+  function buildCircleTopologyLayout(nodes, width, height) {
+    const cx = width / 2;
+    const cy = height / 2;
+    const radius = Math.max(90, Math.min(width, height) / 2 - 50);
+    const positions = new Map();
+    nodes.forEach((node, index) => {
+      const angle = (Math.PI * 2 * index) / Math.max(nodes.length, 1);
+      positions.set(node.id, {
+        x: cx + radius * Math.cos(angle),
+        y: cy + radius * Math.sin(angle)
+      });
+    });
+    return positions;
+  }
+
+  function buildPyramidTopologyLayout(graph, width, height) {
+    const positions = new Map();
+    const adjacency = new Map();
+    graph.nodes.forEach((node) => {
+      adjacency.set(node.id, new Set());
+    });
+    graph.edges.forEach((edge) => {
+      if (adjacency.has(edge.from)) adjacency.get(edge.from).add(edge.to);
+      if (adjacency.has(edge.to)) adjacency.get(edge.to).add(edge.from);
+    });
+    let hubId = graph.nodes[0]?.id;
+    let maxDegree = -1;
+    adjacency.forEach((neighbors, nodeId) => {
+      const degree = neighbors.size;
+      if (degree > maxDegree) {
+        maxDegree = degree;
+        hubId = nodeId;
+      }
+    });
+    if (!hubId) {
+      return positions;
+    }
+    const layers = new Map();
+    const queue = [];
+    layers.set(hubId, 0);
+    queue.push(hubId);
+    while (queue.length) {
+      const current = queue.shift();
+      const layer = layers.get(current) ?? 0;
+      const neighbors = adjacency.get(current) || [];
+      neighbors.forEach((neighbor) => {
+        if (!layers.has(neighbor)) {
+          layers.set(neighbor, layer + 1);
+          queue.push(neighbor);
+        }
+      });
+    }
+    let maxLayer = 0;
+    layers.forEach((layer) => {
+      if (layer > maxLayer) maxLayer = layer;
+    });
+    const unassigned = graph.nodes.filter((node) => !layers.has(node.id)).map((node) => node.id);
+    if (unassigned.length) {
+      maxLayer += 1;
+      unassigned.forEach((nodeId) => layers.set(nodeId, maxLayer));
+    }
+    const layerBuckets = new Map();
+    layers.forEach((layer, nodeId) => {
+      if (!layerBuckets.has(layer)) layerBuckets.set(layer, []);
+      layerBuckets.get(layer).push(nodeId);
+    });
+    const paddingTop = 26;
+    const paddingBottom = 34;
+    const paddingX = 60;
+    const layerCount = Math.max(1, maxLayer + 1);
+    const yStep = layerCount > 1 ? (height - paddingTop - paddingBottom) / (layerCount - 1) : 0;
+    for (let layer = 0; layer <= maxLayer; layer += 1) {
+      const bucket = layerBuckets.get(layer) || [];
+      const y = paddingTop + yStep * layer;
+      const count = bucket.length || 1;
+      const span = Math.max(width - paddingX * 2, 0);
+      const xStep = count > 1 ? span / (count - 1) : 0;
+      bucket.forEach((nodeId, index) => {
+        const x = count > 1 ? paddingX + xStep * index : width / 2;
+        positions.set(nodeId, { x, y });
+      });
+    }
+    return positions;
+  }
+
+  function resolveTracerouteSnrScaled(value) {
+    if (!Number.isFinite(value)) return null;
+    if (value === -128) return null;
+    return value / 4;
+  }
+
+  function resolveTracerouteSnrCategory(value) {
+    const scaled = resolveTracerouteSnrScaled(value);
+    if (!Number.isFinite(scaled)) return 'unknown';
+    if (scaled > -7) return 'good';
+    if (scaled <= -13) return 'bad';
+    return 'mid';
   }
 
   function truncateLabel(label) {
