@@ -4479,7 +4479,7 @@ function renderTracerouteList() {
             directLabel: '直回'
           })
         : '';
-      const snrMarkup = renderTracerouteSnr(entry);
+      const snrMarkup = showRoutes ? renderTracerouteSnr(entry) : '';
       const routesMarkup = showRoutes
         ? `
           <div class="traceroute-route">
@@ -4492,9 +4492,7 @@ function renderTracerouteList() {
           </div>
           ${snrMarkup}
         `
-        : `
-          ${snrMarkup}
-        `;
+        : '';
       return `
         <div class="flow-item traceroute-item">
           <div class="flow-header-row traceroute-header">

@@ -7367,7 +7367,7 @@
       ((Array.isArray(entry.snrBack) && entry.snrBack.length > 0) ||
         (Array.isArray(entry.route) && entry.route.length > 0));
     const showRoutes = status && status !== 'pending';
-    const snrMarkup = renderTracerouteSnr(entry);
+    const snrMarkup = showRoutes ? renderTracerouteSnr(entry) : '';
     const routesMarkup = showRoutes
       ? `
         <div class="traceroute-route">
@@ -7380,9 +7380,7 @@
         </div>
         ${snrMarkup}
       `
-      : `
-        ${snrMarkup}
-      `;
+      : '';
     return `
       <div class="traceroute-card">
         <div class="traceroute-card-header">
