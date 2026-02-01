@@ -5623,6 +5623,7 @@ function applyNodeRegistrySnapshot(list) {
   renderNodeDatabase();
   renderTelemetryView();
   renderChannelMessages(selectedChannelId);
+  applySelfNodeDisplay();
   renderTracerouteList();
 }
 
@@ -5642,6 +5643,7 @@ function handleNodeEvent(payload) {
   refreshFlowEntryLabels();
   renderFlowEntries();
   renderChannelMessages(selectedChannelId);
+  applySelfNodeDisplay();
   renderTracerouteList();
 }
 
@@ -8664,7 +8666,7 @@ async function performDisconnect({ silent = false, preserveManual = false } = {}
   if (!silent) {
     updateStatus('disconnected');
   }
-  clearSelfNodeDisplay();
+  clearSelfNodeDisplay({ preserveIdentity: true });
   appendLog('DISCONNECT', 'completed');
 }
 
@@ -8861,9 +8863,26 @@ function maybeUpdateSelfNodeFromSummary(summary) {
   }
 }
 
+function getSelfNodeNameFromRegistry() {
+  const normalized = selfNodeState.normalizedMeshId || normalizeMeshId(selfNodeState.meshId);
+  if (!normalized) return null;
+  const node = nodeRegistry.get(normalized) || telemetryNodeLookup.get(normalized.toLowerCase());
+  if (!node) return null;
+  return (
+    sanitizeNodeName(node.longName) ||
+    sanitizeNodeName(node.shortName) ||
+    sanitizeNodeName(node.label) ||
+    null
+  );
+}
+
 function applySelfNodeDisplay() {
   if (!currentNodeDisplay || !currentNodeText) {
     return;
+  }
+  if (!selfNodeState.name && selfNodeState.meshId) {
+    const fallback = getSelfNodeNameFromRegistry();
+    if (fallback) selfNodeState.name = fallback;
   }
   if (!selfNodeState || (!selfNodeState.name && !selfNodeState.meshId)) {
     currentNodeDisplay.classList.add('hidden');
@@ -8877,7 +8896,13 @@ function applySelfNodeDisplay() {
   currentNodeDisplay.classList.remove('hidden');
 }
 
-function clearSelfNodeDisplay() {
+function clearSelfNodeDisplay({ preserveIdentity = false } = {}) {
+  if (preserveIdentity) {
+    selfNodeState.raw = null;
+    applySelfNodeDisplay();
+    appendLog('SELF', 'cleared self node runtime state');
+    return;
+  }
   selfNodeState.name = null;
   selfNodeState.meshId = null;
   selfNodeState.normalizedMeshId = null;
