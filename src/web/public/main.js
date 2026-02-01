@@ -7340,7 +7340,13 @@
         return Math.abs(Number(ts) - Number(itemTs)) <= TRACEROUTE_COALESCE_WINDOW_MS;
       });
       if (index >= 0) {
-        tracerouteRows[index] = { ...tracerouteRows[index], ...entry };
+        const existing = tracerouteRows[index] || {};
+        const merged = { ...existing, ...entry };
+        if (!merged.to && existing.to) merged.to = existing.to;
+        if (!merged.toName && existing.toName) merged.toName = existing.toName;
+        if (!merged.from && existing.from) merged.from = existing.from;
+        if (!merged.fromName && existing.fromName) merged.fromName = existing.fromName;
+        tracerouteRows[index] = merged;
         renderTracerouteView();
         return;
       }
@@ -7482,6 +7488,14 @@
     if (normalized) {
       const node = nodeRegistry.get(normalized) || telemetryNodeLookup.get(resolveTelemetryMeshKey(normalized));
       if (node) return formatNodeDisplayLabel(node);
+    }
+    if (!toLabel || toLabel === 'Unknown') {
+      if (entry.toName || entry.to) {
+        return entry.toName || entry.to;
+      }
+      if (entry.fromName || entry.from) {
+        return entry.fromName || entry.from;
+      }
     }
     if (!toLabel || toLabel === 'Unknown') {
       const forward = buildTracerouteForward(entry);

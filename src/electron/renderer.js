@@ -4509,7 +4509,12 @@ function renderTracerouteList() {
           </div>
         `
         : '';
-      const titleLabel = resolveTracerouteNodeLabel(entry.target || entry.targetKey || '');
+      const fallbackTarget =
+        entry.target ||
+        entry.targetKey ||
+        (entry.forward && entry.forward.length ? entry.forward[entry.forward.length - 1] : '') ||
+        (entry.backward && entry.backward.length ? entry.backward[0] : '');
+      const titleLabel = resolveTracerouteNodeLabel(fallbackTarget || '');
       return `
         <div class="flow-item traceroute-item">
           <div class="flow-header-row traceroute-header">
@@ -4686,7 +4691,11 @@ function upsertTracerouteEntry(next) {
       return Number.isFinite(ts) && Math.abs(now - ts) <= TRACEROUTE_COALESCE_WINDOW_MS;
     });
     if (index >= 0) {
-      tracerouteEntries[index] = { ...tracerouteEntries[index], ...next };
+      const existing = tracerouteEntries[index] || {};
+      const merged = { ...existing, ...next };
+      if (!merged.target && existing.target) merged.target = existing.target;
+      if (!merged.targetKey && existing.targetKey) merged.targetKey = existing.targetKey;
+      tracerouteEntries[index] = merged;
       return;
     }
   }
