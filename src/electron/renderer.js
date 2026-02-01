@@ -4654,7 +4654,7 @@ function scheduleTracerouteTopologyRender() {
 
 function buildTracerouteTopologyGraph(entries) {
   const nodes = new Map();
-  const edges = [];
+  const edgeMap = new Map();
   const addNode = (label) => {
     const nodeId = resolveTopologyNodeId(label);
     if (!nodeId) return null;
@@ -4676,7 +4676,7 @@ function buildTracerouteTopologyGraph(entries) {
       const toId = addNode(forward[i + 1]);
       if (!fromId || !toId) continue;
       const snrRaw = snrTowards[i];
-      edges.push({
+      aggregateTopologyEdge(edgeMap, {
         from: fromId,
         to: toId,
         direction: 'forward',
@@ -4688,7 +4688,7 @@ function buildTracerouteTopologyGraph(entries) {
       const toId = addNode(backward[i + 1]);
       if (!fromId || !toId) continue;
       const snrRaw = snrBack[i];
-      edges.push({
+      aggregateTopologyEdge(edgeMap, {
         from: fromId,
         to: toId,
         direction: 'return',
@@ -4696,13 +4696,31 @@ function buildTracerouteTopologyGraph(entries) {
       });
     }
   });
-  return { nodes: Array.from(nodes.values()), edges };
+  return { nodes: Array.from(nodes.values()), edges: Array.from(edgeMap.values()) };
 }
 
 function resolveTopologyNodeId(label) {
   if (!label) return null;
   const normalized = normalizeMeshId(label);
   return normalized || `label:${String(label).trim()}`;
+}
+
+function aggregateTopologyEdge(map, edge) {
+  const key = `${edge.from}|${edge.to}|${edge.direction}`;
+  if (!map.has(key)) {
+    map.set(key, {
+      from: edge.from,
+      to: edge.to,
+      direction: edge.direction,
+      snrSum: 0,
+      snrCount: 0
+    });
+  }
+  const target = map.get(key);
+  if (Number.isFinite(edge.snr)) {
+    target.snrSum += edge.snr;
+    target.snrCount += 1;
+  }
 }
 
 function drawTracerouteTopology(svg, graph, { layout = 'pyramid' } = {}) {
@@ -4727,49 +4745,38 @@ function drawTracerouteTopology(svg, graph, { layout = 'pyramid' } = {}) {
   svg._tracerouteGraph = graph;
   svg._tracerouteLayout = layout;
 
-  const edgeGroups = new Map();
   graph.edges.forEach((edge) => {
-    const key = `${edge.from}|${edge.to}|${edge.direction}`;
-    if (!edgeGroups.has(key)) {
-      edgeGroups.set(key, []);
+    const fromPos = positions.get(edge.from);
+    const toPos = positions.get(edge.to);
+    if (!fromPos || !toPos) return;
+    const dx = toPos.x - fromPos.x;
+    const dy = toPos.y - fromPos.y;
+    const length = Math.hypot(dx, dy) || 1;
+    const nx = -dy / length;
+    const ny = dx / length;
+    const cx1 = (fromPos.x + toPos.x) / 2;
+    const cy1 = (fromPos.y + toPos.y) / 2;
+    const snrValue = edge.snrCount > 0 ? edge.snrSum / edge.snrCount : null;
+    const category = resolveTracerouteSnrCategory(snrValue);
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', `M ${fromPos.x} ${fromPos.y} Q ${cx1} ${cy1} ${toPos.x} ${toPos.y}`);
+    path.setAttribute(
+      'class',
+      `edge-line edge-${edge.direction === 'forward' ? 'forward' : 'return'} edge-snr-${category}`
+    );
+    layer.appendChild(path);
+
+    const scaledSnr = resolveTracerouteSnrScaled(snrValue);
+    if (Number.isFinite(scaledSnr)) {
+      const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      const snrLabel = formatNumber(scaledSnr, 2);
+      label.setAttribute('class', `edge-label edge-snr-${category}`);
+      label.setAttribute('x', cx1 + nx * 10);
+      label.setAttribute('y', cy1 + ny * 10);
+      label.textContent = `${snrLabel}dB`;
+      layer.appendChild(label);
     }
-    edgeGroups.get(key).push(edge);
   });
-
-  for (const edges of edgeGroups.values()) {
-    edges.forEach((edge, idx) => {
-      const fromPos = positions.get(edge.from);
-      const toPos = positions.get(edge.to);
-      if (!fromPos || !toPos) return;
-      const dx = toPos.x - fromPos.x;
-      const dy = toPos.y - fromPos.y;
-      const length = Math.hypot(dx, dy) || 1;
-      const nx = -dy / length;
-      const ny = dx / length;
-      const offset = (idx - (edges.length - 1) / 2) * 10;
-      const cx1 = (fromPos.x + toPos.x) / 2 + nx * offset;
-      const cy1 = (fromPos.y + toPos.y) / 2 + ny * offset;
-      const category = resolveTracerouteSnrCategory(edge.snr);
-      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      path.setAttribute('d', `M ${fromPos.x} ${fromPos.y} Q ${cx1} ${cy1} ${toPos.x} ${toPos.y}`);
-      path.setAttribute(
-        'class',
-        `edge-line edge-${edge.direction === 'forward' ? 'forward' : 'return'} edge-snr-${category}`
-      );
-      layer.appendChild(path);
-
-      const scaledSnr = resolveTracerouteSnrScaled(edge.snr);
-      if (Number.isFinite(scaledSnr)) {
-        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        const snrValue = formatNumber(scaledSnr, 2);
-        label.setAttribute('class', `edge-label edge-snr-${category}`);
-        label.setAttribute('x', cx1 + nx * 10);
-        label.setAttribute('y', cy1 + ny * 10);
-        label.textContent = `${snrValue}dB`;
-        layer.appendChild(label);
-      }
-    });
-  }
 
   graph.nodes.forEach((node) => {
     const pos = positions.get(node.id);
