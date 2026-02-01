@@ -4576,7 +4576,10 @@ function recordTracerouteResult(entry) {
   if (!entry || typeof entry !== 'object') return;
   const route = Array.isArray(entry.route) ? entry.route : [];
   const routeBack = Array.isArray(entry.routeBack) ? entry.routeBack : [];
-  if (!route.length && !routeBack.length && String(entry.status || '').toLowerCase() !== 'pending') {
+  const hasSnr =
+    (Array.isArray(entry.snrTowards) && entry.snrTowards.length > 0) ||
+    (Array.isArray(entry.snrBack) && entry.snrBack.length > 0);
+  if (!route.length && !routeBack.length && !hasSnr && String(entry.status || '').toLowerCase() !== 'pending') {
     return;
   }
   const targetLabel =
