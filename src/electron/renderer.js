@@ -4477,6 +4477,9 @@ function renderTracerouteList() {
     .map((entry) => {
       const status = String(entry.status || '').toLowerCase();
       const showRoutes = status && status !== 'pending';
+      if (!showRoutes) {
+        return '';
+      }
       const forward = showRoutes
         ? renderTraceroutePath(entry.forward, {
             unknownHint: Boolean(entry.forwardUnknown),
@@ -4492,14 +4495,16 @@ function renderTracerouteList() {
             snrMode: 'excludeHead'
           })
         : '';
+      const forwardHops = Math.max((entry.forward?.length || 0) - 1, 0);
+      const backwardHops = Math.max((entry.backward?.length || 0) - 1, 0);
       const routesMarkup = showRoutes
         ? `
           <div class="traceroute-route">
-            <span class="traceroute-label">去程</span>
+            <span class="traceroute-label">去程 ${forwardHops} hop</span>
             <div class="traceroute-path">${forward}</div>
           </div>
           <div class="traceroute-route">
-            <span class="traceroute-label">回程</span>
+            <span class="traceroute-label">回程 ${backwardHops} hop</span>
             <div class="traceroute-path">${backward}</div>
           </div>
         `
@@ -4516,6 +4521,7 @@ function renderTracerouteList() {
         </div>
       `;
     })
+    .filter(Boolean)
     .join('');
 }
 

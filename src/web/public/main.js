@@ -7362,6 +7362,7 @@
     routingEmptyState?.classList.add('hidden');
     routingList.innerHTML = tracerouteRows
       .map((entry) => renderTracerouteCard(entry))
+      .filter(Boolean)
       .join('');
   }
 
@@ -7369,8 +7370,8 @@
     const ts = entry.timestamp || Date.now();
     const title = resolveTracerouteTargetLabel(entry);
     const status = (entry.status || entry.variant || 'pending').toString().toLowerCase();
-    const badgeClass = status === 'success' || status === 'routeReply'.toLowerCase() ? 'success' : 'pending';
-    const badgeText = status === 'success' || status === 'routereply' ? 'success' : status;
+    const showRoutes = status && status !== 'pending';
+    if (!showRoutes) return '';
     const forwardNodes = buildTracerouteForward(entry);
     const backwardNodes = buildTracerouteBackward(entry);
     const forwardUnknown =
@@ -7381,15 +7382,16 @@
       (!entry.routeBack || !entry.routeBack.length) &&
       ((Array.isArray(entry.snrBack) && entry.snrBack.length > 0) ||
         (Array.isArray(entry.route) && entry.route.length > 0));
-    const showRoutes = status && status !== 'pending';
+    const forwardHops = Math.max(forwardNodes.length - 1, 0);
+    const backwardHops = Math.max(backwardNodes.length - 1, 0);
     const routesMarkup = showRoutes
       ? `
         <div class="traceroute-route">
-          <span class="traceroute-label">去程</span>
+          <span class="traceroute-label">去程 ${forwardHops} hop</span>
           <div class="traceroute-path">${renderTraceroutePath(forwardNodes, { unknownHint: forwardUnknown, snrValues: entry.snrTowards, snrMode: 'excludeHead' })}</div>
         </div>
         <div class="traceroute-route">
-          <span class="traceroute-label">回程</span>
+          <span class="traceroute-label">回程 ${backwardHops} hop</span>
           <div class="traceroute-path">${renderTraceroutePath(backwardNodes, { directLabel: '直回', unknownHint: backwardUnknown, snrValues: entry.snrBack, snrMode: 'excludeHead' })}</div>
         </div>
       `
@@ -7401,7 +7403,6 @@
             <div class="traceroute-title">${title}</div>
             <div class="traceroute-meta">${formatDateTime(ts)}</div>
           </div>
-          <span class="traceroute-badge ${badgeClass}">${badgeText}</span>
         </div>
         <div class="traceroute-body">
           ${routesMarkup}
