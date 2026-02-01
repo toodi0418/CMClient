@@ -7483,7 +7483,13 @@
       const node = nodeRegistry.get(normalized) || telemetryNodeLookup.get(resolveTelemetryMeshKey(normalized));
       if (node) return formatNodeDisplayLabel(node);
     }
-    return toLabel;
+    if (!toLabel || toLabel === 'Unknown') {
+      const forward = buildTracerouteForward(entry);
+      if (forward.length) return resolveTracerouteNodeLabel(forward[forward.length - 1]);
+      const backward = buildTracerouteBackward(entry);
+      if (backward.length) return resolveTracerouteNodeLabel(backward[0]);
+    }
+    return toLabel || 'Unknown';
   }
 
   function resolveTracerouteEntryKey(entry) {

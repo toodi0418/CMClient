@@ -4509,10 +4509,11 @@ function renderTracerouteList() {
           </div>
         `
         : '';
+      const titleLabel = resolveTracerouteNodeLabel(entry.target || entry.targetKey || '');
       return `
         <div class="flow-item traceroute-item">
           <div class="flow-header-row traceroute-header">
-            <div class="flow-title traceroute-title">${entry.target || '未知節點'}</div>
+            <div class="flow-title traceroute-title">${titleLabel || '未知節點'}</div>
             <div class="flow-subtitle traceroute-time">${entry.timestampLabel}</div>
           </div>
           <div class="flow-body traceroute-body">
