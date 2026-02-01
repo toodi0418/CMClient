@@ -7385,12 +7385,19 @@
   function renderTracerouteCard(entry) {
     const ts = entry.timestamp || Date.now();
     const title = resolveTracerouteTargetLabel(entry);
-    const safeTitle = String(title || '').trim() ? title : '未知節點';
     const status = (entry.status || entry.variant || 'pending').toString().toLowerCase();
     const showRoutes = status && status !== 'pending';
     if (!showRoutes) return '';
     const forwardNodes = buildTracerouteForward(entry);
     const backwardNodes = buildTracerouteBackward(entry);
+    const fallbackTitleCandidate =
+      (forwardNodes.length ? forwardNodes[forwardNodes.length - 1] : '') ||
+      (backwardNodes.length ? backwardNodes[0] : '') ||
+      '';
+    const resolvedFallbackTitle = resolveTracerouteNodeLabel(fallbackTitleCandidate);
+    const safeTitle = String(title || '').trim()
+      ? title
+      : (String(resolvedFallbackTitle || '').trim() ? resolvedFallbackTitle : '未知節點');
     const forwardUnknown =
       (!entry.route || !entry.route.length) &&
       ((Array.isArray(entry.snrTowards) && entry.snrTowards.length > 0) ||
