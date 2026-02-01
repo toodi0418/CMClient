@@ -27,8 +27,8 @@ function getMessageLogPath() {
 function sanitizeStringArray(arr) {
   return Array.isArray(arr)
     ? arr
-        .map((line) => (typeof line === 'string' ? line.trim() : ''))
-        .filter(Boolean)
+      .map((line) => (typeof line === 'string' ? line.trim() : ''))
+      .filter(Boolean)
     : [];
 }
 
@@ -109,7 +109,7 @@ function createSummaryFileLogger(baseDir, { prefix = 'summary' } = {}) {
         ? Number(summary.timestampMs)
         : Date.now();
       writeChain = writeChain
-        .catch(() => {})
+        .catch(() => { })
         .then(async () => {
           const filePath = await ensureFilePath(timestampMs);
           const entry = buildEntry(summary, timestampMs);
@@ -489,6 +489,7 @@ async function startMonitor(argv) {
   const sharedDataStore = bridge.getDataStore?.();
   if (sharedDataStore) {
     connectionOptions.relayStatsStore = sharedDataStore;
+    connectionOptions.tracerouteStore = sharedDataStore;
   }
 
   try {
@@ -851,54 +852,67 @@ async function startMonitor(argv) {
         bridge.emitLog?.('TRACEROUTE', message);
       });
 
+      client.on('traceroute', (entry) => {
+        if (!entry) return;
+        webServer?.publishTraceroute(entry);
+      });
+
       client.on('error', (err) => {
         logWithTag('MESHTASTIC', `錯誤：${err.message}`);
         webServer?.publishStatus({ status: 'error', message: err.message });
       });
 
-  const handleSummary = (summary, { synthetic = false } = {}) => {
-    if (!summary) return;
-    if (!synthetic) {
-      bridge.handleMeshtasticSummary(summary);
-    }
-    const displaySummary = sanitizeSummaryForDisplay(summary) || summary;
-    webServer?.publishSummary(displaySummary);
-    tryPublishWebMessage(webServer, displaySummary);
-    summaryLogger?.log(displaySummary);
+      const handleSummary = (summary, { synthetic = false } = {}) => {
+        if (!summary) return;
 
-    if (argv.format !== 'summary') {
-      return;
-    }
+        // Safety filter: skip self-to-self summaries (echoes or discovery)
+        const fromId = summary.from?.meshId || summary.from?.meshIdNormalized;
+        const toId = summary.to?.meshId || summary.to?.meshIdNormalized;
+        if (selfMeshId && fromId === selfMeshId && toId === selfMeshId) {
+          return;
+        }
 
-    if (!headerPrinted) {
-      console.log('Date               | Nodes                      | Relay        | Ch |   SNR | RSSI | Type         | Hops   | Details');
-      console.log('-------------------+---------------------------+--------------+----+-------+------+--------------+--------+------------------------------');
-      headerPrinted = true;
-    }
+        if (!synthetic) {
+          bridge.handleMeshtasticSummary(summary);
+        }
+        const displaySummary = sanitizeSummaryForDisplay(summary) || summary;
+        webServer?.publishSummary(displaySummary);
+        tryPublishWebMessage(webServer, displaySummary);
+        summaryLogger?.log(displaySummary);
 
-    const nodesLabel = formatNodes(displaySummary);
-    const relayLabel = computeRelayLabel(displaySummary, { selfMeshId });
-    const relayCol = padEnd(relayLabel, 12);
-    const channelCol = padValue(displaySummary.channel ?? '', 2);
-    const snrCol = formatSignal(displaySummary.snr, 2, 6, displaySummary, { selfMeshId });
-    const rssiCol = formatSignal(displaySummary.rssi, 0, 5, displaySummary, { selfMeshId });
-    const typeCol = String(displaySummary.type || '').padEnd(12);
-    const hopsCol = (displaySummary.hops?.label || '').padEnd(7);
-    const detail = displaySummary.detail || '';
+        if (argv.format !== 'summary') {
+          return;
+        }
 
-    const line = `${(displaySummary.timestampLabel ?? '').padEnd(19)} | ${nodesLabel.padEnd(27)} | ${relayCol} | ${channelCol} | ${snrCol} | ${rssiCol} | ${typeCol} | ${hopsCol} | ${detail}`;
-    console.log(line.trimEnd());
+        if (!headerPrinted) {
+          console.log('Date               | Nodes                      | Relay        | Ch |   SNR | RSSI | Type         | Hops   | Details');
+          console.log('-------------------+---------------------------+--------------+----+-------+------+--------------+--------+------------------------------');
+          headerPrinted = true;
+        }
 
-    if (argv['show-raw'] && displaySummary.rawHex) {
-      console.log(`  raw: ${displaySummary.rawHex}`);
-    }
+        const nodesLabel = formatNodes(displaySummary);
+        const relayLabel = computeRelayLabel(displaySummary, { selfMeshId });
+        const relayCol = padEnd(relayLabel, 12);
+        const channelCol = padValue(displaySummary.channel ?? '', 2);
+        const snrCol = formatSignal(displaySummary.snr, 2, 6, displaySummary, { selfMeshId });
+        const rssiCol = formatSignal(displaySummary.rssi, 0, 5, displaySummary, { selfMeshId });
+        const typeCol = String(displaySummary.type || '').padEnd(12);
+        const hopsCol = (displaySummary.hops?.label || '').padEnd(7);
+        const detail = displaySummary.detail || '';
 
-    if (Array.isArray(displaySummary.extraLines)) {
-      for (const extra of displaySummary.extraLines) {
-        console.log(`  ${extra}`);
-      }
-    }
-  };
+        const line = `${(displaySummary.timestampLabel ?? '').padEnd(19)} | ${nodesLabel.padEnd(27)} | ${relayCol} | ${channelCol} | ${snrCol} | ${rssiCol} | ${typeCol} | ${hopsCol} | ${detail}`;
+        console.log(line.trimEnd());
+
+        if (argv['show-raw'] && displaySummary.rawHex) {
+          console.log(`  raw: ${displaySummary.rawHex}`);
+        }
+
+        if (Array.isArray(displaySummary.extraLines)) {
+          for (const extra of displaySummary.extraLines) {
+            console.log(`  ${extra}`);
+          }
+        }
+      };
 
       if (bridgeSummaryListener && typeof bridge.removeListener === 'function') {
         bridge.removeListener('summary', bridgeSummaryListener);
@@ -911,31 +925,31 @@ async function startMonitor(argv) {
         bridge.on('summary', bridgeSummaryListener);
       }
 
-  client.on('summary', (summary) => {
-    handleSummary(summary);
-  });
-
-  client.on('fromRadio', ({ message, rawPayload, summary }) => {
-    if (typeof bridge.forwardTmagRelayFromRadio === 'function') {
-      bridge.forwardTmagRelayFromRadio({ message, rawPayload, summary });
-    }
-  });
-  if (typeof bridge.forwardTmagRelayToRadio === 'function') {
-    const emitOutbound = (payloadBuffer) => {
-      bridge.forwardTmagRelayToRadio(payloadBuffer);
-    };
-    client.on('toRadioRaw', emitOutbound);
-  }
-
-  if (argv.format !== 'summary') {
-    client.on('fromRadio', ({ message }) => {
-      const object = client.toObject(message, {
-        bytes: String
+      client.on('summary', (summary) => {
+        handleSummary(summary);
       });
-      const spacing = argv.pretty ? 2 : 0;
-      console.log(JSON.stringify(object, null, spacing));
-    });
-  }
+
+      client.on('fromRadio', ({ message, rawPayload, summary }) => {
+        if (typeof bridge.forwardTmagRelayFromRadio === 'function') {
+          bridge.forwardTmagRelayFromRadio({ message, rawPayload, summary });
+        }
+      });
+      if (typeof bridge.forwardTmagRelayToRadio === 'function') {
+        const emitOutbound = (payloadBuffer) => {
+          bridge.forwardTmagRelayToRadio(payloadBuffer);
+        };
+        client.on('toRadioRaw', emitOutbound);
+      }
+
+      if (argv.format !== 'summary') {
+        client.on('fromRadio', ({ message }) => {
+          const object = client.toObject(message, {
+            bytes: String
+          });
+          const spacing = argv.pretty ? 2 : 0;
+          console.log(JSON.stringify(object, null, spacing));
+        });
+      }
 
       client.on('myInfo', (info) => {
         bridge.handleMeshtasticMyInfo(info);

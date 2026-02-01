@@ -22,6 +22,7 @@ const RELAY_GUESS_EXPLANATION =
   '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
 const FORCED_OUTBOUND_HOP_LIMIT = 6;
 const APP_TIMEZONE = getAppTimezone();
+const TRACEROUTE_LAST_SENT_KV_KEY = 'traceroute:last_sent';
 
 function normalizeMeshId(meshId) {
   if (meshId == null) return null;
@@ -90,6 +91,7 @@ class MeshtasticClient extends EventEmitter {
       Number(options.tracerouteIntervalSeconds) || 60
     );
     this.options.tracerouteCachePath = options.tracerouteCachePath || null;
+    this.options.tracerouteStorePath = options.tracerouteStorePath || null;
 
     if (typeof this.options.transport === 'string') {
       const mode = this.options.transport.toLowerCase();
@@ -164,12 +166,90 @@ class MeshtasticClient extends EventEmitter {
     this._tracerouteQueue = [];
     this._tracerouteQueueTimer = null;
     this._tracerouteLastSent = new Map();
+    this._tracerouteLastSentPersistTimer = null;
     this._tracerouteCache = new Map();
     this._tracerouteCachePersistTimer = null;
 
     this._loadRelayStatsFromDisk();
     this._loadTracerouteCache();
     this._traceroutePending = new Set();
+
+    this._tracerouteStore = null;
+    this._tracerouteStoreOwned = false;
+    this._initTracerouteStore(options);
+  }
+
+  _initTracerouteStore(options = {}) {
+    if (options.tracerouteStore && typeof options.tracerouteStore === 'object') {
+      this._tracerouteStore = options.tracerouteStore;
+    } else if (this.options.tracerouteStorePath) {
+      const storePath = path.resolve(this.options.tracerouteStorePath);
+      if (/\.sqlite$/i.test(storePath)) {
+        try {
+          this._tracerouteStore = new CallMeshDataStore(storePath);
+          this._tracerouteStoreOwned = true;
+        } catch (err) {
+          console.warn(`初始化 traceroute SQLite 失敗: ${err.message}`);
+        }
+      }
+    }
+    if (this._tracerouteStore && typeof this._tracerouteStore.init === 'function') {
+      try {
+        this._tracerouteStore.init();
+      } catch (err) {
+        console.warn(`初始化 traceroute 儲存失敗: ${err.message}`);
+      }
+    }
+    this._loadTracerouteLastSent();
+  }
+
+  _loadTracerouteLastSent() {
+    if (!this._tracerouteStore || typeof this._tracerouteStore.getKv !== 'function') {
+      return;
+    }
+    try {
+      const payload = this._tracerouteStore.getKv(TRACEROUTE_LAST_SENT_KV_KEY);
+      if (!payload || typeof payload !== 'object') return;
+      for (const [key, value] of Object.entries(payload)) {
+        const normalized = normalizeMeshId(key);
+        if (!normalized) continue;
+        const num = Number.parseInt(normalized.slice(1), 16);
+        const ts = Number(value);
+        if (!Number.isFinite(num) || !Number.isFinite(ts)) continue;
+        this._tracerouteLastSent.set(num >>> 0, ts);
+      }
+    } catch (err) {
+      console.warn(`讀取 traceroute 上次送出時間失敗: ${err.message}`);
+    }
+  }
+
+  _persistTracerouteLastSentSoon() {
+    if (!this._tracerouteStore || typeof this._tracerouteStore.setKv !== 'function') {
+      return;
+    }
+    if (this._tracerouteLastSentPersistTimer) {
+      clearTimeout(this._tracerouteLastSentPersistTimer);
+    }
+    this._tracerouteLastSentPersistTimer = setTimeout(() => {
+      this._tracerouteLastSentPersistTimer = null;
+      this._persistTracerouteLastSentSync();
+    }, 2000);
+  }
+
+  _persistTracerouteLastSentSync() {
+    if (!this._tracerouteStore || typeof this._tracerouteStore.setKv !== 'function') {
+      return;
+    }
+    const payload = {};
+    for (const [key, value] of this._tracerouteLastSent.entries()) {
+      if (!Number.isFinite(key) || !Number.isFinite(value)) continue;
+      payload[formatHexId(key >>> 0)] = value;
+    }
+    try {
+      this._tracerouteStore.setKv(TRACEROUTE_LAST_SENT_KV_KEY, payload);
+    } catch (err) {
+      console.warn(`寫入 traceroute 上次送出時間失敗: ${err.message}`);
+    }
   }
 
   _resetInitialBacklogFilter() {
@@ -318,6 +398,7 @@ class MeshtasticClient extends EventEmitter {
     this._traceroutePending.add(destination);
     // Update lastSent immediately to prevent re-queueing
     this._tracerouteLastSent.set(destination, Date.now());
+    this._persistTracerouteLastSentSoon();
 
     this.sendTraceroute(destination)
       .catch((err) => {
@@ -1153,6 +1234,11 @@ class MeshtasticClient extends EventEmitter {
     this._clearHeartbeat();
     this._clearTracerouteQueueTimer();
     this._tracerouteQueue = [];
+    if (this._tracerouteLastSentPersistTimer) {
+      clearTimeout(this._tracerouteLastSentPersistTimer);
+      this._tracerouteLastSentPersistTimer = null;
+    }
+    this._persistTracerouteLastSentSync();
     this._tracerouteLastSent.clear();
     if (this._tracerouteCachePersistTimer) {
       clearTimeout(this._tracerouteCachePersistTimer);
@@ -1167,6 +1253,15 @@ class MeshtasticClient extends EventEmitter {
       }
       this._relayStatsStore = null;
       this._relayStatsStoreOwned = false;
+    }
+    if (this._tracerouteStoreOwned && this._tracerouteStore && typeof this._tracerouteStore.close === 'function') {
+      try {
+        this._tracerouteStore.close();
+      } catch (err) {
+        console.warn(`關閉 traceroute SQLite 失敗: ${err.message}`);
+      }
+      this._tracerouteStore = null;
+      this._tracerouteStoreOwned = false;
     }
     if (this._serialConnectTimer) {
       clearTimeout(this._serialConnectTimer);

@@ -1108,6 +1108,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
   };
   if (bridge?.getDataStore) {
     clientOptions.relayStatsStore = bridge.getDataStore();
+    clientOptions.tracerouteStore = bridge.getDataStore();
   }
 
   if (Number.isFinite(options.connectTimeoutMs) && options.connectTimeoutMs > 0) {
