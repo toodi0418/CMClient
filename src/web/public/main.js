@@ -7382,8 +7382,8 @@
       (!entry.routeBack || !entry.routeBack.length) &&
       ((Array.isArray(entry.snrBack) && entry.snrBack.length > 0) ||
         (Array.isArray(entry.route) && entry.route.length > 0));
-    const forwardHops = Math.max(forwardNodes.length - 1, 0);
-    const backwardHops = Math.max(backwardNodes.length - 1, 0);
+    const forwardHops = Math.max(forwardNodes.length - 2, 0);
+    const backwardHops = Math.max(backwardNodes.length - 2, 0);
     const routesMarkup = showRoutes
       ? `
         <div class="traceroute-route">

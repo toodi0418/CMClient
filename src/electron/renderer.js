@@ -4495,8 +4495,8 @@ function renderTracerouteList() {
             snrMode: 'excludeHead'
           })
         : '';
-      const forwardHops = Math.max((entry.forward?.length || 0) - 1, 0);
-      const backwardHops = Math.max((entry.backward?.length || 0) - 1, 0);
+      const forwardHops = Math.max((entry.forward?.length || 0) - 2, 0);
+      const backwardHops = Math.max((entry.backward?.length || 0) - 2, 0);
       const routesMarkup = showRoutes
         ? `
           <div class="traceroute-route">
