@@ -113,6 +113,7 @@
 
   let currentSelfMeshId = null;
   let currentSelfName = null;
+  let lastSelfLabelText = '';
   let selfProvisionCoords = null;
   const MAX_SUMMARY_ROWS = 200;
   const MAX_TRACEROUTE_ROWS = 200;
@@ -7000,22 +7001,32 @@
     const name = sanitizeNodeName(currentSelfName);
     if (registryLabel) {
       selfLabel.textContent = registryLabel;
+      lastSelfLabelText = registryLabel;
       return;
     }
     if (!normalized && !name) {
-      selfLabel.textContent = '尚未取得';
+      const fallback = lastSelfLabelText || '尚未取得';
+      selfLabel.textContent = fallback;
+      if (fallback !== '尚未取得') {
+        return;
+      }
+      lastSelfLabelText = '尚未取得';
       return;
     }
     if (!normalized) {
       selfLabel.textContent = name;
+      lastSelfLabelText = name;
       return;
     }
     if (!name) {
       selfLabel.textContent = normalized;
+      lastSelfLabelText = normalized;
       return;
     }
     const meshDisplay = normalized.toLowerCase();
-    selfLabel.textContent = name.toLowerCase().includes(meshDisplay) ? name : `${name} (${normalized})`;
+    const label = name.toLowerCase().includes(meshDisplay) ? name : `${name} (${normalized})`;
+    selfLabel.textContent = label;
+    lastSelfLabelText = label;
   }
 
   function updateMetrics(metrics) {
@@ -7235,7 +7246,9 @@
             break;
           case 'self':
             currentSelfMeshId = normalizeMeshId(packet.payload?.meshId);
-            currentSelfName = sanitizeNodeName(packet.payload?.name);
+            if (packet.payload?.name) {
+              currentSelfName = sanitizeNodeName(packet.payload?.name);
+            }
             updateSelfLabel();
             refreshSummarySelfLabels();
             break;

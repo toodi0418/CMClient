@@ -4525,7 +4525,10 @@ function recordTracerouteEntry(summary) {
   if (!summary?.trace) return;
   const route = Array.isArray(summary.trace.route) ? summary.trace.route : [];
   const routeBack = Array.isArray(summary.trace.routeBack) ? summary.trace.routeBack : [];
-  if (!route.length && !routeBack.length) return;
+  const hasSnr =
+    (Array.isArray(summary.trace?.snrTowards) && summary.trace.snrTowards.length > 0) ||
+    (Array.isArray(summary.trace?.snrBack) && summary.trace.snrBack.length > 0);
+  if (!route.length && !routeBack.length && !hasSnr) return;
   const targetLabel =
     summary.from?.label ||
     summary.from?.longName ||
