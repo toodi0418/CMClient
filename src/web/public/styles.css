@@ -816,6 +816,114 @@ tbody tr:hover {
   padding-right: 4px;
 }
 
+.traceroute-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 520px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.traceroute-card {
+  border-radius: 14px;
+  padding: 16px 18px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: linear-gradient(135deg, rgba(148, 163, 184, 0.08), rgba(15, 23, 42, 0.02));
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+}
+
+.traceroute-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.traceroute-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.traceroute-meta {
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+}
+
+.traceroute-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(30, 64, 175, 0.18);
+  color: #dbeafe;
+}
+
+.traceroute-badge.success {
+  background: rgba(16, 185, 129, 0.18);
+  border-color: rgba(16, 185, 129, 0.4);
+  color: #d1fae5;
+}
+
+.traceroute-badge.pending {
+  background: rgba(148, 163, 184, 0.18);
+  border-color: rgba(148, 163, 184, 0.4);
+  color: #e2e8f0;
+}
+
+.traceroute-body {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.traceroute-route {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: 10px;
+  align-items: center;
+}
+
+.traceroute-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--color-text-muted);
+}
+
+.traceroute-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.traceroute-pill {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.12);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.traceroute-arrow {
+  color: rgba(148, 163, 184, 0.7);
+  font-size: 0.75rem;
+}
+
+.traceroute-empty {
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+}
+
 .flow-list.hidden {
   display: none;
 }

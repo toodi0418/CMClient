@@ -66,6 +66,9 @@
   const telemetryPageSizeSelect = document.getElementById('telemetry-page-size');
   const nodesTableWrapper = document.getElementById('nodes-table-wrapper');
   const nodesTableBody = document.getElementById('nodes-table-body');
+  const routingPage = document.getElementById('routing-page');
+  const routingList = document.getElementById('routing-list');
+  const routingEmptyState = document.getElementById('routing-empty-state');
   const nodesEmptyState = document.getElementById('nodes-empty-state');
   const nodesTotalCountLabel = document.getElementById('nodes-total-count');
   const nodesOnlineCountLabel = document.getElementById('nodes-online-count');
@@ -110,6 +113,8 @@
   let currentSelfMeshId = null;
   let selfProvisionCoords = null;
   const MAX_SUMMARY_ROWS = 200;
+  const MAX_TRACEROUTE_ROWS = 200;
+  const tracerouteRows = [];
   const logEntries = [];
   const MAX_LOG_ENTRIES = 200;
   const SUMMARY_REPLAY_GUARD_DRIFT_MS = 1000;
@@ -1345,9 +1350,9 @@
     const detail = typeof summary.detail === 'string' ? summary.detail.trim() : '';
     const extra = Array.isArray(summary.extraLines)
       ? summary.extraLines
-          .map((line) => (typeof line === 'string' ? line.trim() : ''))
-          .filter(Boolean)
-          .join('\n')
+        .map((line) => (typeof line === 'string' ? line.trim() : ''))
+        .filter(Boolean)
+        .join('\n')
       : '';
     return detail || extra || '（無內容）';
   }
@@ -1631,13 +1636,13 @@
       sanitizeNodeName(entry.label),
       entry.meshId,
       entry.meshIdOriginal,
-    entry.meshIdNormalized,
-    entry.hwModel,
-    entry.hwModelLabel,
-    entry.role,
-    entry.roleLabel,
-    formatNodeCoordinateValue(entry)
-  ];
+      entry.meshIdNormalized,
+      entry.hwModel,
+      entry.hwModelLabel,
+      entry.role,
+      entry.roleLabel,
+      formatNodeCoordinateValue(entry)
+    ];
     return fields.some((value) => {
       if (!value) return false;
       return String(value).toLowerCase().includes(lowerTerm);
@@ -2152,9 +2157,9 @@
     return Boolean(summary?.relay?.guessed || summary?.relayGuess);
   }
 
-function getRelayGuessReason(summary) {
-  return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
-}
+  function getRelayGuessReason(summary) {
+    return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
+  }
 
   function openRelayHintDialog({ reason, relayLabel, meshId } = {}) {
     const text = reason && reason.trim() ? reason.trim() : RELAY_GUESS_EXPLANATION;
@@ -2186,16 +2191,16 @@ function getRelayGuessReason(summary) {
     document.body.classList.remove('modal-open');
   }
 
-function ensureRelayGuessSuffix(label, summary) {
-  if (!isRelayGuessed(summary)) {
-    return label;
+  function ensureRelayGuessSuffix(label, summary) {
+    if (!isRelayGuessed(summary)) {
+      return label;
+    }
+    const value = (label || '').trim();
+    if (!value) {
+      return '未知';
+    }
+    return value;
   }
-  const value = (label || '').trim();
-  if (!value) {
-    return '未知';
-  }
-  return value;
-}
 
   function formatRelay(summary) {
     if (!summary) return '直收';
@@ -4277,7 +4282,7 @@ function ensureRelayGuessSuffix(label, summary) {
     const latestLabel =
       primaryEntry && primaryEntry.meta?.name
         ? formatTelemetryFixed(primaryEntry.meta.name, primaryEntry.latestValue, primaryEntry.decimals) ||
-          '—'
+        '—'
         : '—';
     const statusLabel =
       datasetEntries
@@ -4530,7 +4535,7 @@ function ensureRelayGuessSuffix(label, summary) {
                 const formatted =
                   metricName != null
                     ? formatTelemetryFixed(metricName, ctx.parsed?.y, decimals) ||
-                      ctx.parsed?.y
+                    ctx.parsed?.y
                     : ctx.parsed?.y;
                 return `${labelText}: ${formatted}`;
               }
@@ -5408,8 +5413,8 @@ function ensureRelayGuessSuffix(label, summary) {
     const detailText = typeof summary?.detail === 'string' ? summary.detail.trim() : '';
     const extras = Array.isArray(summary?.extraLines)
       ? summary.extraLines
-          .map((line) => (line === null || line === undefined ? '' : String(line).trim()))
-          .filter(Boolean)
+        .map((line) => (line === null || line === undefined ? '' : String(line).trim()))
+        .filter(Boolean)
       : [];
     const distanceLabel = formatDistance(summary);
 
@@ -5477,7 +5482,7 @@ function ensureRelayGuessSuffix(label, summary) {
     const a =
       Math.sin(dLat / 2) * Math.sin(dLat / 2) +
       Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
   }
@@ -5550,10 +5555,10 @@ function ensureRelayGuessSuffix(label, summary) {
     }
     const ssid = normalizeProvisionSsidValue(
       aprs.aprs_ssid ??
-        aprs.aprsSsid ??
-        aprs.callsign_ssid ??
-        aprs.callsignSsid ??
-        aprs.ssid
+      aprs.aprsSsid ??
+      aprs.callsign_ssid ??
+      aprs.callsignSsid ??
+      aprs.ssid
     );
     if (!ssid) {
       return base;
@@ -6488,11 +6493,11 @@ function ensureRelayGuessSuffix(label, summary) {
             hintBtn.setAttribute('aria-label', '顯示推測原因');
             hintBtn.addEventListener('click', (event) => {
               event.stopPropagation();
-            openRelayHintDialog({
-              reason: entry.relayGuessReason,
-              relayLabel: entry.relayLabel || '',
-              meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
-            });
+              openRelayHintDialog({
+                reason: entry.relayGuessReason,
+                relayLabel: entry.relayLabel || '',
+                meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
+              });
             });
             chipEl.appendChild(hintBtn);
           }
@@ -7226,6 +7231,12 @@ function ensureRelayGuessSuffix(label, summary) {
           case 'message-append':
             handleMessageAppend(packet.payload);
             break;
+          case 'traceroute-batch':
+            handleTracerouteBatch(packet.payload);
+            break;
+          case 'traceroute-append':
+            appendTracerouteRow(packet.payload);
+            break;
           default:
             break;
         }
@@ -7241,6 +7252,119 @@ function ensureRelayGuessSuffix(label, summary) {
       source.close();
       setTimeout(connectStream, 3000);
     };
+  }
+
+
+  function handleTracerouteBatch(batch) {
+    if (!Array.isArray(batch)) return;
+    tracerouteRows.length = 0;
+    if (routingList) routingList.innerHTML = '';
+    // Batch is typically newest to oldest because server.js unshifts.
+    // To preserve order locally and in DOM (where we insertBefore firstChild), we iterate reverse.
+    // wait, server.js sends [Newest, ..., Oldest]
+    // If we iterate Newest -> Oldest:
+    // 1. append(Newest) -> table: [Newest]
+    // 2. append(Oldest) -> table: [Oldest, Newest]
+    // Result: [Oldest, Newest] -> This is reversed. Use iterate reverse to get [Newest, Oldest].
+    for (let i = batch.length - 1; i >= 0; i--) {
+      appendTracerouteRow(batch[i]);
+    }
+  }
+
+  function appendTracerouteRow(entry) {
+    if (!entry) return;
+
+    // Ensure uniqueness if needed, or just push.
+    // Simple FIFO buffer on array
+    tracerouteRows.unshift(entry);
+    if (tracerouteRows.length > MAX_TRACEROUTE_ROWS) {
+      tracerouteRows.pop();
+    }
+    renderTracerouteView();
+  }
+
+  function renderTracerouteView() {
+    if (!routingList) return;
+    if (!tracerouteRows.length) {
+      routingList.innerHTML = '';
+      routingEmptyState?.classList.remove('hidden');
+      return;
+    }
+    routingEmptyState?.classList.add('hidden');
+    routingList.innerHTML = tracerouteRows
+      .map((entry) => renderTracerouteCard(entry))
+      .join('');
+  }
+
+  function renderTracerouteCard(entry) {
+    const ts = entry.timestamp || Date.now();
+    const title = resolveTracerouteTargetLabel(entry);
+    const status = (entry.status || entry.variant || 'pending').toString().toLowerCase();
+    const badgeClass = status === 'success' || status === 'routeReply'.toLowerCase() ? 'success' : 'pending';
+    const badgeText = status === 'success' || status === 'routereply' ? 'success' : status;
+    const forwardNodes = buildTracerouteForward(entry);
+    const backwardNodes = buildTracerouteBackward(entry);
+    return `
+      <div class="traceroute-card">
+        <div class="traceroute-card-header">
+          <div>
+            <div class="traceroute-title">${title}</div>
+            <div class="traceroute-meta">${formatDateTime(ts)}</div>
+          </div>
+          <span class="traceroute-badge ${badgeClass}">${badgeText}</span>
+        </div>
+        <div class="traceroute-body">
+          <div class="traceroute-route">
+            <span class="traceroute-label">去程</span>
+            <div class="traceroute-path">${renderTraceroutePath(forwardNodes)}</div>
+          </div>
+          <div class="traceroute-route">
+            <span class="traceroute-label">回程</span>
+            <div class="traceroute-path">${renderTraceroutePath(backwardNodes, { directLabel: '直回' })}</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderTraceroutePath(nodes, { directLabel = '直回' } = {}) {
+    if (!Array.isArray(nodes) || !nodes.length) {
+      return `<span class="traceroute-empty">${directLabel}</span>`;
+    }
+    return nodes
+      .map((node, index) => {
+        const label = String(node || '').trim() || '未知';
+        const arrow = index < nodes.length - 1 ? '<span class="traceroute-arrow">→</span>' : '';
+        return `<span class="traceroute-pill">${label}</span>${arrow}`;
+      })
+      .join('');
+  }
+
+  function resolveTracerouteTargetLabel(entry) {
+    let toLabel = entry.toName || (entry.to ? String(entry.to) : 'Unknown');
+    const normalized = normalizeMeshId(toLabel);
+    if (normalized) {
+      const node = nodeRegistry.get(normalized) || telemetryNodeLookup.get(resolveTelemetryMeshKey(normalized));
+      if (node) return formatNodeDisplayLabel(node);
+    }
+    return toLabel;
+  }
+
+  function buildTracerouteForward(entry) {
+    const fromLabel = entry.fromName || (entry.from ? String(entry.from) : null);
+    const toLabel = entry.toName || (entry.to ? String(entry.to) : null);
+    const route = Array.isArray(entry.route) ? entry.route : [];
+    return [fromLabel, ...route, toLabel].filter(Boolean);
+  }
+
+  function buildTracerouteBackward(entry) {
+    const fromLabel = entry.fromName || (entry.from ? String(entry.from) : null);
+    const toLabel = entry.toName || (entry.to ? String(entry.to) : null);
+    const routeBack = Array.isArray(entry.routeBack) ? entry.routeBack : [];
+    if (routeBack.length) {
+      return [toLabel, ...routeBack, fromLabel].filter(Boolean);
+    }
+    return [];
   }
 
   setTelemetryRangeMode(telemetryRangeMode, { skipRender: true });

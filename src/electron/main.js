@@ -1181,6 +1181,11 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
     sendCallmeshLog({ tag: 'TRACEROUTE', message });
   });
 
+  client.on('traceroute', (entry) => {
+    if (!entry) return;
+    webServer?.publishTraceroute(entry);
+  });
+
   const processSummary = (summary, { synthetic = false } = {}) => {
     if (!summary) return;
     let messageEntry = null;

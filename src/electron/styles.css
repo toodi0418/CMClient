@@ -1523,6 +1523,69 @@ header {
   color: #dbeafe;
 }
 
+.traceroute-item {
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: linear-gradient(135deg, rgba(148, 163, 184, 0.08), rgba(15, 23, 42, 0.02));
+}
+
+.traceroute-header {
+  align-items: center;
+}
+
+.traceroute-title {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.traceroute-time {
+  color: var(--color-text-muted);
+}
+
+.traceroute-body {
+  display: grid;
+  gap: 10px;
+}
+
+.traceroute-route {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.traceroute-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-muted);
+}
+
+.traceroute-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.traceroute-pill {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.12);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.traceroute-arrow {
+  color: rgba(148, 163, 184, 0.7);
+  font-size: 12px;
+}
+
+.traceroute-empty {
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
 .chip-hops {
   background: rgba(129, 140, 248, 0.3);
   color: #e0e7ff;

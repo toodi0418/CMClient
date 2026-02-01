@@ -4446,20 +4446,39 @@ function renderTracerouteList() {
   tracerouteList.classList.remove('hidden');
   tracerouteList.innerHTML = tracerouteEntries
     .map((entry) => {
-      const forward = entry.forward?.length ? entry.forward.join(' → ') : '(無)';
-      const backward = entry.backward?.length ? entry.backward.join(' → ') : '(無)';
+      const forward = renderTraceroutePath(entry.forward);
+      const backward = renderTraceroutePath(entry.backward);
       return `
-        <div class="flow-item">
-          <div class="flow-header-row">
-            <div class="flow-title">${entry.target || '未知節點'}</div>
-            <div class="flow-subtitle">${entry.timestampLabel}</div>
+        <div class="flow-item traceroute-item">
+          <div class="flow-header-row traceroute-header">
+            <div class="flow-title traceroute-title">${entry.target || '未知節點'}</div>
+            <div class="flow-subtitle traceroute-time">${entry.timestampLabel}</div>
           </div>
-          <div class="flow-body">
-            <div>去程：${forward}</div>
-            <div>回程：${backward}</div>
+          <div class="flow-body traceroute-body">
+            <div class="traceroute-route">
+              <span class="traceroute-label">去程</span>
+              <div class="traceroute-path">${forward}</div>
+            </div>
+            <div class="traceroute-route">
+              <span class="traceroute-label">回程</span>
+              <div class="traceroute-path">${backward}</div>
+            </div>
           </div>
         </div>
       `;
+    })
+    .join('');
+}
+
+function renderTraceroutePath(nodes) {
+  if (!Array.isArray(nodes) || !nodes.length) {
+    return '<span class="traceroute-empty">直回</span>';
+  }
+  return nodes
+    .map((node, index) => {
+      const label = String(node || '').trim() || '未知';
+      const arrow = index < nodes.length - 1 ? '<span class="traceroute-arrow">→</span>' : '';
+      return `<span class="traceroute-pill">${label}</span>${arrow}`;
     })
     .join('');
 }
@@ -4482,10 +4501,19 @@ function recordTracerouteEntry(summary) {
     (summary.timestamp ? Date.parse(summary.timestamp) : null) ||
     Date.now();
   const tsLabel = summary.timestampLabel || new Date(tsMs).toLocaleString('zh-TW');
+  const selfLabel = selfNodeState.name || selfNodeState.meshId || '本站節點';
+  const forwardNodes = [
+    selfLabel,
+    ...route.map((n) => formatMeshIdHex(n)).filter(Boolean),
+    targetLabel
+  ].filter(Boolean);
+  const backwardNodes = routeBack.length
+    ? [targetLabel, ...routeBack.map((n) => formatMeshIdHex(n)).filter(Boolean), selfLabel].filter(Boolean)
+    : [];
   tracerouteEntries.unshift({
     target: targetLabel,
-    forward: route.map((n) => formatMeshIdHex(n)).filter(Boolean),
-    backward: routeBack.map((n) => formatMeshIdHex(n)).filter(Boolean),
+    forward: forwardNodes,
+    backward: backwardNodes,
     timestampMs: tsMs,
     timestampLabel: tsLabel
   });

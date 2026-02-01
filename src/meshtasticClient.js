@@ -169,6 +169,7 @@ class MeshtasticClient extends EventEmitter {
 
     this._loadRelayStatsFromDisk();
     this._loadTracerouteCache();
+    this._traceroutePending = new Set();
   }
 
   _resetInitialBacklogFilter() {
@@ -192,8 +193,27 @@ class MeshtasticClient extends EventEmitter {
   }
 
   _recordTracerouteResult(nodeNum, trace, { via = 'decode' } = {}) {
-    if (!Number.isFinite(nodeNum) || !trace || typeof trace !== 'object') return;
+    this.emit('traceroute-log', {
+      tag: 'DEBUG',
+      message: `_recordTracerouteResult called: nodeNum=${nodeNum}, trace=${JSON.stringify(trace)}, via=${via}`
+    });
+
+    if (!Number.isFinite(nodeNum) || !trace || typeof trace !== 'object') {
+      this.emit('traceroute-log', {
+        tag: 'DEBUG',
+        message: `_recordTracerouteResult early return: nodeNum finite=${Number.isFinite(nodeNum)}, trace exists=${!!trace}, trace type=${typeof trace}`
+      });
+      return;
+    }
     const key = nodeNum >>> 0;
+    // Skip if it's us (echo or self-route)
+    if (this._selfNodeId != null && key === (this._selfNodeId >>> 0)) {
+      this.emit('traceroute-log', {
+        tag: 'DEBUG',
+        message: `_recordTracerouteResult skip self: key=${key}, selfNodeId=${this._selfNodeId}`
+      });
+      return;
+    }
     const normalized = this._normalizeRelayNode(key) || { nodeId: key, nodeIdNormalized: formatHexId(key) };
     this._tracerouteCache.set(key, {
       route: Array.isArray(trace.route) ? trace.route.map((n) => Number(n) >>> 0) : [],
@@ -216,6 +236,22 @@ class MeshtasticClient extends EventEmitter {
       tag: 'TRACEROUTE',
       message: `Traceroute 回應 ${formatHexId(key)} via ${via} forward=${routeNodes.join(' -> ') || '(none)'} return=${returnNodes.join(' -> ') || '(none)'}`
     });
+
+    const fromInfo = this._selfNodeId != null ? this._formatNode(this._selfNodeId) : null;
+    const toInfo = this._formatNode(key);
+
+    this.emit('traceroute', {
+      timestamp: Date.now(),
+      from: fromInfo?.meshId || fromInfo?.meshIdNormalized,
+      fromName: fromInfo?.label || fromInfo?.longName || fromInfo?.shortName,
+      to: toInfo?.meshId || toInfo?.meshIdNormalized,
+      toName: toInfo?.label || toInfo?.longName || toInfo?.shortName,
+      status: 'success',
+      hops: routeNodes.length,
+      rtt: null, // RTT is usually not in RouteDiscovery packets themselves but could be estimated
+      route: routeNodes.map((n) => formatHexId(n)),
+      routeBack: returnNodes.map((n) => formatHexId(n))
+    });
   }
 
   _considerAutoTraceroute(summary) {
@@ -228,6 +264,9 @@ class MeshtasticClient extends EventEmitter {
     const hopCount =
       hopsStart != null && hopsLimit != null ? Math.max(hopsStart - hopsLimit, 0) : null;
     if (!Number.isFinite(hopCount) || hopCount <= 0) {
+      return;
+    }
+    if (this._selfNodeId != null && fromId === (this._selfNodeId >>> 0)) {
       return;
     }
     // Skip if we already have a cached trace and hop count unchanged
@@ -252,7 +291,7 @@ class MeshtasticClient extends EventEmitter {
     if (Date.now() - lastSent < minIntervalMs) {
       return;
     }
-    if (this._tracerouteQueue.includes(destination)) {
+    if (this._tracerouteQueue.includes(destination) || this._traceroutePending.has(destination)) {
       return;
     }
     this._tracerouteQueue.push(destination);
@@ -274,6 +313,10 @@ class MeshtasticClient extends EventEmitter {
     if (destination == null) {
       return;
     }
+    this._traceroutePending.add(destination);
+    // Update lastSent immediately to prevent re-queueing
+    this._tracerouteLastSent.set(destination, Date.now());
+
     this.sendTraceroute(destination)
       .catch((err) => {
         this.emit('traceroute-log', {
@@ -282,7 +325,7 @@ class MeshtasticClient extends EventEmitter {
         });
       })
       .finally(() => {
-        this._tracerouteLastSent.set(destination, Date.now());
+        this._traceroutePending.delete(destination);
         const intervalMs = Math.max(
           15,
           Number(this.options.tracerouteIntervalSeconds) || 60
@@ -292,6 +335,9 @@ class MeshtasticClient extends EventEmitter {
   }
 
   async sendTraceroute(destination) {
+    if (!this._selfNodeId) {
+      throw new Error('Local Node ID not yet known, cannot send traceroute');
+    }
     if (!this._connected) {
       throw new Error('Meshtastic 尚未連線');
     }
@@ -302,39 +348,55 @@ class MeshtasticClient extends EventEmitter {
     if (!Number.isFinite(destId) || destId <= 0 || destId === BROADCAST_ADDR) {
       throw new Error('目的節點不合法');
     }
-    const portValue = this.portEnum?.values?.TRACEROUTE_APP;
-    if (!Number.isFinite(portValue)) {
+    const traceroutePort = this.portEnum?.values?.TRACEROUTE_APP;
+    if (!Number.isFinite(traceroutePort)) {
       throw new Error('無法取得 TRACEROUTE_APP portnum');
     }
-    const tracePayload = this.types.routeDiscovery.create({});
-    const encodedTrace = this.types.routeDiscovery.encode(tracePayload).finish();
+
+    // Create a RouteDiscovery message (empty payload as per firmware)
+    const routeDiscovery = this.types.routeDiscovery.create({});
+    const traceroutePayload = this.types.routeDiscovery.encode(routeDiscovery).finish();
+
+    console.log(`[DEBUG] Encoded RouteDiscovery payload length: ${traceroutePayload.length} bytes`);
+
     const packetId = this._generatePacketId();
     const meshPacketPayload = {
+      from: this._selfNodeId >>> 0,
       to: destId >>> 0,
       channel: 0,
       decoded: {
-        portnum: portValue,
-        payload: encodedTrace
+        portnum: traceroutePort,
+        payload: traceroutePayload,
+        wantResponse: true,
+        dest: 0,
+        requestId: 0,
+        source: 0
       },
       wantAck: true,
       id: packetId >>> 0
     };
-    const hopStart = this._resolveOutboundHopStart();
-    if (hopStart != null) {
-      meshPacketPayload.hopLimit = hopStart >>> 0;
-      meshPacketPayload.hopStart = hopStart >>> 0;
-    }
-    const message = this.toRadioType.create({
-      packet: meshPacketPayload
+
+    console.log('[DEBUG] Constructed Packet:', JSON.stringify({
+      ...meshPacketPayload,
+      decoded: { ...meshPacketPayload.decoded, payload: '[Encoded]' }
+    }, null, 2));
+
+    this.emit('traceroute-log', {
+      tag: 'DEBUG',
+      message: `Sending Traceroute: from=${meshPacketPayload.from}, to=${meshPacketPayload.to}, id=${meshPacketPayload.id}`
     });
+
+    const message = this.toRadioType.create({ packet: meshPacketPayload });
     const encoded = this.toRadioType.encode(message).finish();
     const framed = framePacket(encoded);
+
     this.emit('toRadioRaw', framed);
     this._emitTracerouteRequestSummary(destId);
     this.emit('traceroute-log', {
       tag: 'TRACEROUTE',
       message: `送出 traceroute 請求 ${formatHexId(destId)}`
     });
+
     return new Promise((resolve, reject) => {
       this._writeFrame(framed, (err) => {
         if (err) {
@@ -352,10 +414,10 @@ class MeshtasticClient extends EventEmitter {
       this._selfNodeId != null
         ? this._formatNode(this._selfNodeId)
         : {
-            label: 'self',
-            meshId: this._selfNodeNormalized ?? null,
-            meshIdNormalized: this._selfNodeNormalized ?? null
-          };
+          label: 'self',
+          meshId: this._selfNodeNormalized ?? null,
+          meshIdNormalized: this._selfNodeNormalized ?? null
+        };
     const toInfo = this._formatNode(destId);
     const detail = `to ${toInfo?.label || formatHexId(destId) || destId}`;
     const summary = {
@@ -369,6 +431,17 @@ class MeshtasticClient extends EventEmitter {
       synthetic: true
     };
     this.emit('summary', summary);
+    this.emit('traceroute', {
+      timestamp: Date.now(),
+      from: fromInfo?.meshId || fromInfo?.meshIdNormalized,
+      fromName: fromInfo?.label || fromInfo?.longName || fromInfo?.shortName,
+      to: toInfo?.meshId || toInfo?.meshIdNormalized,
+      toName: toInfo?.label || toInfo?.longName || toInfo?.shortName,
+      status: 'pending',
+      hops: 0,
+      rtt: null,
+      route: []
+    });
   }
 
   _loadTracerouteCache() {
@@ -515,26 +588,26 @@ class MeshtasticClient extends EventEmitter {
     }
     const candidates = Array.from(matches);
     const guessResult = this._guessRelayCandidate(candidates, { snr, rssi });
-      if (guessResult) {
-        if (guessResult.nodeId != null) {
-          this._recordRelayTailCandidate(guessResult.nodeId);
-        }
-        let forceTailLabel = Boolean(guessResult.forceTailLabel);
-        if (!forceTailLabel && guessResult.nodeId != null) {
-          const normalizedCandidate = formatHexId(guessResult.nodeId >>> 0);
-          const hasNodeRecord = Boolean(this._getNodeDatabaseRecord(normalizedCandidate));
-          if (isTruncatedId && !hasNodeRecord) {
-            forceTailLabel = true;
-          }
-        } else if (!forceTailLabel && isTruncatedId) {
+    if (guessResult) {
+      if (guessResult.nodeId != null) {
+        this._recordRelayTailCandidate(guessResult.nodeId);
+      }
+      let forceTailLabel = Boolean(guessResult.forceTailLabel);
+      if (!forceTailLabel && guessResult.nodeId != null) {
+        const normalizedCandidate = formatHexId(guessResult.nodeId >>> 0);
+        const hasNodeRecord = Boolean(this._getNodeDatabaseRecord(normalizedCandidate));
+        if (isTruncatedId && !hasNodeRecord) {
           forceTailLabel = true;
         }
-        return {
-          ...guessResult,
-          tailNodeId: guessResult.tailNodeId ?? raw >>> 0,
-          forceTailLabel
-        };
+      } else if (!forceTailLabel && isTruncatedId) {
+        forceTailLabel = true;
       }
+      return {
+        ...guessResult,
+        tailNodeId: guessResult.tailNodeId ?? raw >>> 0,
+        forceTailLabel
+      };
+    }
     if (matches.size > 1) {
       const suffix = raw.toString(16).padStart(2, '0').toUpperCase();
       const labels = this._describeRelayCandidates(candidates);
@@ -1587,35 +1660,35 @@ class MeshtasticClient extends EventEmitter {
           hwModel: user.hwModel || existing.hwModel,
           role: user.role || existing.role
         };
-    this.nodeMap.set(num, updated);
-    break;
-  }
-  case 'myInfo': {
-    const info = message.myInfo;
-    if (!info) break;
-    const num = info.myNodeNum >>> 0;
-    const existing = this.nodeMap.get(num) || {};
-    this.nodeMap.set(num, {
-      id: existing.id || formatHexId(num),
-      shortName: existing.shortName,
-      longName: existing.longName,
-      hwModel: existing.hwModel,
-      role: existing.role
-    });
-    const nodeInfo = this._formatNode(num);
-    this.emit('myInfo', {
-      raw: num,
-      node: nodeInfo
-    });
-    this._selfNodeId = num;
-    const normalizedSelf =
-      normalizeMeshId(
-        nodeInfo?.meshId ||
-          (typeof info?.myNodeId === 'string' ? info.myNodeId : null)
-      ) || formatHexId(num);
-    this._selfNodeNormalized = normalizedSelf;
-    break;
-  }
+        this.nodeMap.set(num, updated);
+        break;
+      }
+      case 'myInfo': {
+        const info = message.myInfo;
+        if (!info) break;
+        const num = info.myNodeNum >>> 0;
+        const existing = this.nodeMap.get(num) || {};
+        this.nodeMap.set(num, {
+          id: existing.id || formatHexId(num),
+          shortName: existing.shortName,
+          longName: existing.longName,
+          hwModel: existing.hwModel,
+          role: existing.role
+        });
+        const nodeInfo = this._formatNode(num);
+        this._selfNodeId = num;
+        this.emit('myInfo', {
+          raw: num,
+          node: nodeInfo
+        });
+        const normalizedSelf =
+          normalizeMeshId(
+            nodeInfo?.meshId ||
+            (typeof info?.myNodeId === 'string' ? info.myNodeId : null)
+          ) || formatHexId(num);
+        this._selfNodeNormalized = normalizedSelf;
+        break;
+      }
       default:
         break;
     }
@@ -1627,6 +1700,9 @@ class MeshtasticClient extends EventEmitter {
     }
 
     const packet = message.packet;
+
+
+
     if (!packet || packet.payloadVariant !== 'decoded') {
       return null;
     }
@@ -1657,6 +1733,17 @@ class MeshtasticClient extends EventEmitter {
     }
 
     const portInfo = this._resolvePortnum(packet.decoded.portnum);
+
+    // Debug: log ALL TRACEROUTE_APP packets
+    if (portInfo.name === 'TRACEROUTE_APP' || packet.decoded.portnum === 70) {
+      console.log(`[DEBUG] *** TRACEROUTE_APP packet received! from=${packet.from} (!${(packet.from >>> 0).toString(16).padStart(8, '0')}), to=${packet.to} (!${(packet.to >>> 0).toString(16).padStart(8, '0')}), portnum=${packet.decoded.portnum}`);
+    }
+
+    // Debug: log packets related to target node !03919375 (59872117)
+    if (packet && (packet.from === 59872117 || packet.to === 59872117)) {
+      console.log(`[DEBUG] Packet involving !03919375: from=${packet.from}, to=${packet.to}, portnum=${packet.decoded.portnum}, portName=${portInfo.name}, hasPayload=${!!packet.decoded.payload}`);
+    }
+
     const payload = packet.decoded.payload;
     const decodeInfo = this._decodePortPayload(portInfo.name, payload);
     const extraLines = Array.isArray(decodeInfo?.extraLines)
@@ -1666,6 +1753,13 @@ class MeshtasticClient extends EventEmitter {
     const nextHopId = packet.nextHop != null && packet.nextHop !== 0 ? packet.nextHop : null;
 
     if (!this._shouldEmitPacket(packet)) {
+      return null;
+    }
+
+    // Skip self-to-self packets (echoes or self-directed)
+    if (this._selfNodeId != null &&
+      (packet.from >>> 0) === (this._selfNodeId >>> 0) &&
+      (packet.to >>> 0) === (this._selfNodeId >>> 0)) {
       return null;
     }
 
@@ -1730,10 +1824,10 @@ class MeshtasticClient extends EventEmitter {
     const relayCandidate = resolveRelayCandidate(relayNodeId);
     let relayResult = relayCandidate
       ? {
-          nodeId: relayCandidate.nodeId,
-          guessed: relayCandidate.guessed,
-          reason: relayCandidate.reason
-        }
+        nodeId: relayCandidate.nodeId,
+        guessed: relayCandidate.guessed,
+        reason: relayCandidate.reason
+      }
       : null;
     let relayInfo = relayCandidate?.info ? { ...relayCandidate.info } : null;
 
@@ -2031,6 +2125,13 @@ class MeshtasticClient extends EventEmitter {
         case 'ROUTING_APP': {
           const message = this.types.routing.decode(payload);
           const routing = this.types.routing.toObject(message, TO_OBJECT_OPTIONS);
+
+          console.log('[DEBUG] ROUTING_APP received:', JSON.stringify({
+            hasRouteRequest: !!routing.routeRequest,
+            hasRouteReply: !!routing.routeReply,
+            hasError: !!routing.errorReason
+          }));
+
           const recordRouteNodes = (list) => {
             if (!Array.isArray(list)) return;
             for (const value of list) {
@@ -2046,16 +2147,46 @@ class MeshtasticClient extends EventEmitter {
             }
           };
           if (routing.routeRequest) {
+            console.log('[DEBUG] RouteRequest details:', JSON.stringify(routing.routeRequest));
             recordRouteNodes(routing.routeRequest.route);
           }
           if (routing.routeReply) {
+            console.log('[DEBUG] RouteReply details:', JSON.stringify(routing.routeReply));
             recordRouteNodes(routing.routeReply.route);
             recordRouteNodes(routing.routeReply.routeBack);
             recordRouteNodes(routing.routeReply.routeForward);
           }
           if (routing.routeDelete) {
+            console.log('[DEBUG] RouteDelete details:', JSON.stringify(routing.routeDelete));
             recordRouteNodes(routing.routeDelete.route);
           }
+
+          // Handle route reply as traceroute response
+          if (routing.routeReply) {
+            const path = (routing.routeReply.routeBack || routing.routeReply.route || []).map(
+              (n) => this._formatNode(n).label
+            );
+            const detail = path.length ? `reply: ${path.join(' -> ')}` : '';
+            return {
+              type: 'RouteReply',
+              details: detail,
+              trace: {  // Add trace field for traceroute processing!
+                route: Array.isArray(routing.routeReply.route)
+                  ? routing.routeReply.route.map((n) => Number(n) >>> 0)
+                  : [],
+                routeBack: Array.isArray(routing.routeReply.routeBack)
+                  ? routing.routeReply.routeBack.map((n) => Number(n) >>> 0)
+                  : [],
+                snrTowards: Array.isArray(routing.routeReply.snrTowards)
+                  ? routing.routeReply.snrTowards.map((n) => Number(n))
+                  : [],
+                snrBack: Array.isArray(routing.routeReply.snrBack)
+                  ? routing.routeReply.snrBack.map((n) => Number(n))
+                  : []
+              }
+            };
+          }
+
           if (routing.routeRequest) {
             const path = (routing.routeRequest.route || []).map((n) =>
               this._formatNode(n).label
@@ -2063,15 +2194,12 @@ class MeshtasticClient extends EventEmitter {
             const detail = path.length ? `path: ${path.join(' -> ')}` : '';
             return { type: 'RouteRequest', details: detail };
           }
-          if (routing.routeReply) {
-            const path = (routing.routeReply.routeBack || routing.routeReply.route || []).map(
-              (n) => this._formatNode(n).label
-            );
-            const detail = path.length ? `reply: ${path.join(' -> ')}` : '';
-            return { type: 'RouteReply', details: detail };
-          }
           if (routing.errorReason) {
-            const error = routing.errorReason.error || 'UNKNOWN';
+            // Suppress benign 'NONE' error (0)
+            if (routing.errorReason === 'NONE' || routing.errorReason === 0) {
+              return { type: 'Routing' };
+            }
+            const error = routing.errorReason.error || routing.errorReason || 'UNKNOWN';
             return { type: 'RouteError', details: `error=${error}` };
           }
           return { type: 'Routing' };
@@ -2202,6 +2330,10 @@ class MeshtasticClient extends EventEmitter {
         case 'TRACEROUTE_APP': {
           const message = this.types.routeDiscovery.decode(payload);
           const trace = this.types.routeDiscovery.toObject(message, TO_OBJECT_OPTIONS);
+
+          // Force full debug log
+          console.log('[DEBUG] TRACEROUTE_APP Payload:', JSON.stringify(trace, null, 2));
+
           const forwardPath = (trace.route || []).map((n) => this._formatNode(n).label);
           const returnPath = (trace.routeBack || []).map((n) => this._formatNode(n).label);
           const detail = forwardPath.length ? `forward: ${forwardPath.join(' -> ')}` : 'Traceroute';
