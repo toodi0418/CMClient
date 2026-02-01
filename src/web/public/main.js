@@ -7314,6 +7314,19 @@
       (!entry.routeBack || !entry.routeBack.length) &&
       ((Array.isArray(entry.snrBack) && entry.snrBack.length > 0) ||
         (Array.isArray(entry.route) && entry.route.length > 0));
+    const showRoutes = status && status !== 'pending';
+    const routesMarkup = showRoutes
+      ? `
+        <div class="traceroute-route">
+          <span class="traceroute-label">去程</span>
+          <div class="traceroute-path">${renderTraceroutePath(forwardNodes, { unknownHint: forwardUnknown })}</div>
+        </div>
+        <div class="traceroute-route">
+          <span class="traceroute-label">回程</span>
+          <div class="traceroute-path">${renderTraceroutePath(backwardNodes, { directLabel: '直回', unknownHint: backwardUnknown })}</div>
+        </div>
+      `
+      : '';
     return `
       <div class="traceroute-card">
         <div class="traceroute-card-header">
@@ -7324,14 +7337,7 @@
           <span class="traceroute-badge ${badgeClass}">${badgeText}</span>
         </div>
         <div class="traceroute-body">
-          <div class="traceroute-route">
-            <span class="traceroute-label">去程</span>
-            <div class="traceroute-path">${renderTraceroutePath(forwardNodes, { unknownHint: forwardUnknown })}</div>
-          </div>
-          <div class="traceroute-route">
-            <span class="traceroute-label">回程</span>
-            <div class="traceroute-path">${renderTraceroutePath(backwardNodes, { directLabel: '直回', unknownHint: backwardUnknown })}</div>
-          </div>
+          ${routesMarkup}
         </div>
       </div>
     `;

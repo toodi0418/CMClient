@@ -4461,13 +4461,31 @@ function renderTracerouteList() {
   tracerouteList.classList.remove('hidden');
   tracerouteList.innerHTML = tracerouteEntries
     .map((entry) => {
-      const forward = renderTraceroutePath(entry.forward, {
-        unknownHint: Boolean(entry.forwardUnknown)
-      });
-      const backward = renderTraceroutePath(entry.backward, {
-        unknownHint: Boolean(entry.backwardUnknown),
-        directLabel: '直回'
-      });
+      const status = String(entry.status || '').toLowerCase();
+      const showRoutes = status && status !== 'pending';
+      const forward = showRoutes
+        ? renderTraceroutePath(entry.forward, {
+            unknownHint: Boolean(entry.forwardUnknown)
+          })
+        : '';
+      const backward = showRoutes
+        ? renderTraceroutePath(entry.backward, {
+            unknownHint: Boolean(entry.backwardUnknown),
+            directLabel: '直回'
+          })
+        : '';
+      const routesMarkup = showRoutes
+        ? `
+          <div class="traceroute-route">
+            <span class="traceroute-label">去程</span>
+            <div class="traceroute-path">${forward}</div>
+          </div>
+          <div class="traceroute-route">
+            <span class="traceroute-label">回程</span>
+            <div class="traceroute-path">${backward}</div>
+          </div>
+        `
+        : '';
       return `
         <div class="flow-item traceroute-item">
           <div class="flow-header-row traceroute-header">
@@ -4475,14 +4493,7 @@ function renderTracerouteList() {
             <div class="flow-subtitle traceroute-time">${entry.timestampLabel}</div>
           </div>
           <div class="flow-body traceroute-body">
-            <div class="traceroute-route">
-              <span class="traceroute-label">去程</span>
-              <div class="traceroute-path">${forward}</div>
-            </div>
-            <div class="traceroute-route">
-              <span class="traceroute-label">回程</span>
-              <div class="traceroute-path">${backward}</div>
-            </div>
+            ${routesMarkup}
           </div>
         </div>
       `;
