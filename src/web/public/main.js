@@ -7245,7 +7245,9 @@
             updateAppInfo(packet.payload);
             break;
           case 'self':
-            currentSelfMeshId = normalizeMeshId(packet.payload?.meshId);
+            if (packet.payload?.meshId) {
+              currentSelfMeshId = normalizeMeshId(packet.payload.meshId);
+            }
             if (packet.payload?.name) {
               currentSelfName = sanitizeNodeName(packet.payload?.name);
             }
@@ -7437,12 +7439,20 @@
 
   function resolveTracerouteNodeLabel(value) {
     const text = String(value || '').trim();
+    if (!text) return '未知';
+    const lower = text.toLowerCase();
+    const isRawMeshId =
+      /^!?[0-9a-f]+$/.test(lower) ||
+      /^0x[0-9a-f]+$/.test(lower);
+    if (!isRawMeshId) {
+      return text;
+    }
     const normalized = normalizeMeshId(text);
     if (normalized) {
       const node = nodeRegistry.get(normalized) || telemetryNodeLookup.get(resolveTelemetryMeshKey(normalized));
       if (node) return formatNodeDisplayLabel(node);
     }
-    return text || '未知';
+    return text;
   }
 
   function resolveTracerouteTargetLabel(entry) {

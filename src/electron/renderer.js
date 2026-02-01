@@ -4446,12 +4446,20 @@ function isUnknownMeshIdLabel(value) {
 
 function resolveTracerouteNodeLabel(value) {
   const text = String(value || '').trim();
+  if (!text) return '未知';
+  const lower = text.toLowerCase();
+  const isRawMeshId =
+    /^!?[0-9a-f]+$/.test(lower) ||
+    /^0x[0-9a-f]+$/.test(lower);
+  if (!isRawMeshId) {
+    return text;
+  }
   const normalized = normalizeMeshId(text);
   if (normalized) {
     const node = nodeRegistry.get(normalized) || telemetryNodeLookup.get(normalized.toLowerCase());
     if (node) return formatNodeDisplay(node);
   }
-  return text || '未知';
+  return text;
 }
 
 function renderTracerouteList() {
@@ -8199,6 +8207,7 @@ function activatePage(targetId) {
     { id: 'messages-page', element: messagesPage },
     { id: 'telemetry-page', element: telemetryPage },
     { id: 'flow-page', element: flowPage },
+    { id: 'traceroute-page', element: traceroutePage },
     { id: 'nodes-page', element: nodesPage },
     { id: 'settings-page', element: settingsPage },
     { id: 'log-page', element: logPage },
@@ -8212,6 +8221,8 @@ function activatePage(targetId) {
   });
   if (targetId === 'telemetry-page') {
     renderTelemetryView();
+  } else if (targetId === 'traceroute-page') {
+    renderTracerouteList();
   } else if (targetId === 'nodes-page') {
     renderNodeDatabase();
   }
