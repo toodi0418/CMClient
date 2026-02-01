@@ -117,6 +117,7 @@
   let selfProvisionCoords = null;
   const MAX_SUMMARY_ROWS = 200;
   const MAX_TRACEROUTE_ROWS = 200;
+  const TRACEROUTE_COALESCE_WINDOW_MS = 3 * 60 * 1000;
   const tracerouteRows = [];
   const logEntries = [];
   const MAX_LOG_ENTRIES = 200;
@@ -7329,9 +7330,21 @@
 
   function appendTracerouteRow(entry) {
     if (!entry) return;
-
-    // Ensure uniqueness if needed, or just push.
-    // Simple FIFO buffer on array
+    const ts = entry.timestamp || entry.timestampMs || Date.now();
+    const key = resolveTracerouteEntryKey(entry);
+    if (key) {
+      const index = tracerouteRows.findIndex((item) => {
+        if (!item || resolveTracerouteEntryKey(item) !== key) return false;
+        const itemTs = item.timestamp || item.timestampMs || null;
+        if (!Number.isFinite(itemTs)) return false;
+        return Math.abs(Number(ts) - Number(itemTs)) <= TRACEROUTE_COALESCE_WINDOW_MS;
+      });
+      if (index >= 0) {
+        tracerouteRows[index] = { ...tracerouteRows[index], ...entry };
+        renderTracerouteView();
+        return;
+      }
+    }
     tracerouteRows.unshift(entry);
     if (tracerouteRows.length > MAX_TRACEROUTE_ROWS) {
       tracerouteRows.pop();
@@ -7470,6 +7483,16 @@
       if (node) return formatNodeDisplayLabel(node);
     }
     return toLabel;
+  }
+
+  function resolveTracerouteEntryKey(entry) {
+    const candidate =
+      entry.to ||
+      entry.toName ||
+      entry.from ||
+      entry.fromName ||
+      null;
+    return candidate ? normalizeMeshId(candidate) : null;
   }
 
   function buildTracerouteForward(entry) {

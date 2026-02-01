@@ -658,6 +658,7 @@ const aprsCompletedFlowIds = new Set();
 const aprsCompletedQueue = [];
 const TRACEROUTE_MAX_ENTRIES = 200;
 const tracerouteEntries = [];
+const TRACEROUTE_COALESCE_WINDOW_MS = 3 * 60 * 1000;
 
 const AUTO_CONNECT_MAX_ATTEMPTS = 3;
 const AUTO_CONNECT_DELAY_MS = 5000;
@@ -4576,6 +4577,7 @@ function recordTracerouteEntry(summary) {
     summary.from?.meshIdNormalized ||
     formatMeshIdHex(summary.from?.raw) ||
     '未知節點';
+  const targetKey = normalizeMeshId(summary.from?.meshId || summary.from?.meshIdNormalized || summary.from?.raw) || '';
   const tsMs =
     Number(summary.timestampMs) ||
     (summary.timestamp ? Date.parse(summary.timestamp) : null) ||
@@ -4598,8 +4600,9 @@ function recordTracerouteEntry(summary) {
     (Array.isArray(summary.trace?.snrBack) && summary.trace.snrBack.length > 0) ||
     route.length > 0
   );
-  tracerouteEntries.unshift({
+  upsertTracerouteEntry({
     target: targetLabel,
+    targetKey,
     forward: forwardNodes,
     backward: backwardNodes,
     forwardUnknown,
@@ -4610,9 +4613,6 @@ function recordTracerouteEntry(summary) {
     timestampMs: tsMs,
     timestampLabel: tsLabel
   });
-  if (tracerouteEntries.length > TRACEROUTE_MAX_ENTRIES) {
-    tracerouteEntries.length = TRACEROUTE_MAX_ENTRIES;
-  }
   renderTracerouteList();
 }
 
@@ -4632,6 +4632,7 @@ function recordTracerouteResult(entry) {
     entry.fromName ||
     entry.from ||
     '未知節點';
+  const targetKey = normalizeMeshId(entry.to || entry.toName || entry.from || entry.fromName) || '';
   const tsMs =
     Number(entry.timestamp) ||
     (entry.timestampMs ? Number(entry.timestampMs) : null) ||
@@ -4652,8 +4653,9 @@ function recordTracerouteResult(entry) {
     (Array.isArray(entry.snrBack) && entry.snrBack.length > 0) ||
     route.length > 0
   );
-  tracerouteEntries.unshift({
+  upsertTracerouteEntry({
     target: targetLabel,
+    targetKey,
     forward: forwardNodes,
     backward: backwardNodes,
     forwardUnknown,
@@ -4664,10 +4666,27 @@ function recordTracerouteResult(entry) {
     timestampMs: tsMs,
     timestampLabel: tsLabel
   });
+  renderTracerouteList();
+}
+
+function upsertTracerouteEntry(next) {
+  const now = Number(next?.timestampMs) || Date.now();
+  const key = next?.targetKey;
+  if (key) {
+    const index = tracerouteEntries.findIndex((item) => {
+      if (!item || item.targetKey !== key) return false;
+      const ts = Number(item.timestampMs);
+      return Number.isFinite(ts) && Math.abs(now - ts) <= TRACEROUTE_COALESCE_WINDOW_MS;
+    });
+    if (index >= 0) {
+      tracerouteEntries[index] = { ...tracerouteEntries[index], ...next };
+      return;
+    }
+  }
+  tracerouteEntries.unshift(next);
   if (tracerouteEntries.length > TRACEROUTE_MAX_ENTRIES) {
     tracerouteEntries.length = TRACEROUTE_MAX_ENTRIES;
   }
-  renderTracerouteList();
 }
 
 function formatNumber(value, digits) {
