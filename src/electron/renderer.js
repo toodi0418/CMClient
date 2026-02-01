@@ -4439,6 +4439,16 @@ function isUnknownMeshIdLabel(value) {
   return text === '!ffffffff' || text === '0xffffffff' || text === 'ffffffff';
 }
 
+function resolveTracerouteNodeLabel(value) {
+  const text = String(value || '').trim();
+  const normalized = normalizeMeshId(text);
+  if (normalized) {
+    const node = nodeRegistry.get(normalized) || telemetryNodeLookup.get(normalized.toLowerCase());
+    if (node) return formatNodeDisplay(node);
+  }
+  return text || '未知';
+}
+
 function renderTracerouteList() {
   if (!tracerouteList) return;
   if (!tracerouteEntries.length) {
@@ -4487,7 +4497,7 @@ function renderTraceroutePath(nodes, { unknownHint = false, directLabel = '直�
   }
   return nodes
     .map((node, index) => {
-      let label = String(node || '').trim() || '未知';
+      let label = resolveTracerouteNodeLabel(node);
       if (isUnknownMeshIdLabel(label)) label = '未知';
       const arrow = index < nodes.length - 1 ? '<span class="traceroute-arrow">→</span>' : '';
       return `<span class="traceroute-pill">${label}</span>${arrow}`;
