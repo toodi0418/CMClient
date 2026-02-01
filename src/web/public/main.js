@@ -7385,6 +7385,7 @@
   function renderTracerouteCard(entry) {
     const ts = entry.timestamp || Date.now();
     const title = resolveTracerouteTargetLabel(entry);
+    const safeTitle = String(title || '').trim() ? title : '未知節點';
     const status = (entry.status || entry.variant || 'pending').toString().toLowerCase();
     const showRoutes = status && status !== 'pending';
     if (!showRoutes) return '';
@@ -7416,7 +7417,7 @@
       <div class="traceroute-card">
         <div class="traceroute-card-header">
           <div>
-            <div class="traceroute-title">${title}</div>
+            <div class="traceroute-title">${safeTitle}</div>
             <div class="traceroute-meta">${formatDateTime(ts)}</div>
           </div>
         </div>
@@ -7494,6 +7495,9 @@
 
   function resolveTracerouteTargetLabel(entry) {
     let toLabel = entry.toName || (entry.to ? String(entry.to) : 'Unknown');
+    if (typeof toLabel === 'string' && !toLabel.trim()) {
+      toLabel = '';
+    }
     const normalized = normalizeMeshId(toLabel);
     if (normalized) {
       const node = nodeRegistry.get(normalized) || telemetryNodeLookup.get(resolveTelemetryMeshKey(normalized));
