@@ -4479,6 +4479,7 @@ function renderTracerouteList() {
             directLabel: '直回'
           })
         : '';
+      const snrMarkup = renderTracerouteSnr(entry);
       const routesMarkup = showRoutes
         ? `
           <div class="traceroute-route">
@@ -4489,8 +4490,11 @@ function renderTracerouteList() {
             <span class="traceroute-label">回程</span>
             <div class="traceroute-path">${backward}</div>
           </div>
+          ${snrMarkup}
         `
-        : '';
+        : `
+          ${snrMarkup}
+        `;
       return `
         <div class="flow-item traceroute-item">
           <div class="flow-header-row traceroute-header">
@@ -4504,6 +4508,26 @@ function renderTracerouteList() {
       `;
     })
     .join('');
+}
+
+function renderTracerouteSnr(entry) {
+  const towards = Array.isArray(entry.snrTowards) ? entry.snrTowards : [];
+  const back = Array.isArray(entry.snrBack) ? entry.snrBack : [];
+  if (!towards.length && !back.length) {
+    return '';
+  }
+  const towardsText = towards.map((value) => formatNumber(value, 2)).join(', ');
+  const backText = back.map((value) => formatNumber(value, 2)).join(', ');
+  return `
+    <div class="traceroute-route traceroute-snr-row">
+      <span class="traceroute-label">SNR→</span>
+      <div class="traceroute-path traceroute-snr">${towardsText || '—'}</div>
+    </div>
+    <div class="traceroute-route traceroute-snr-row">
+      <span class="traceroute-label">SNR←</span>
+      <div class="traceroute-path traceroute-snr">${backText || '—'}</div>
+    </div>
+  `;
 }
 
 function renderTraceroutePath(nodes, { unknownHint = false, directLabel = '直回' } = {}) {
@@ -4565,6 +4589,8 @@ function recordTracerouteEntry(summary) {
     backward: backwardNodes,
     forwardUnknown,
     backwardUnknown,
+    snrTowards: Array.isArray(summary.trace?.snrTowards) ? summary.trace.snrTowards.slice() : [],
+    snrBack: Array.isArray(summary.trace?.snrBack) ? summary.trace.snrBack.slice() : [],
     status: summary.status || summary.variant || 'success',
     timestampMs: tsMs,
     timestampLabel: tsLabel
@@ -4617,6 +4643,8 @@ function recordTracerouteResult(entry) {
     backward: backwardNodes,
     forwardUnknown,
     backwardUnknown,
+    snrTowards: Array.isArray(entry.snrTowards) ? entry.snrTowards.slice() : [],
+    snrBack: Array.isArray(entry.snrBack) ? entry.snrBack.slice() : [],
     status: entry.status || 'success',
     timestampMs: tsMs,
     timestampLabel: tsLabel

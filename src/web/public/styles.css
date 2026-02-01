@@ -924,6 +924,11 @@ tbody tr:hover {
   font-size: 0.8rem;
 }
 
+.traceroute-snr-row .traceroute-path {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
+
 .flow-list.hidden {
   display: none;
 }
