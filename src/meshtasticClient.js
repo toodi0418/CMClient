@@ -376,6 +376,9 @@ class MeshtasticClient extends EventEmitter {
     if (this._tracerouteQueue.includes(destination) || this._traceroutePending.has(destination)) {
       return;
     }
+    // Mark as sent at enqueue to enforce rate limit even if queue delays.
+    this._tracerouteLastSent.set(destination, Date.now());
+    this._persistTracerouteLastSentSoon();
     this._tracerouteQueue.push(destination);
     this.emit('traceroute-log', {
       tag: 'TRACEROUTE',
