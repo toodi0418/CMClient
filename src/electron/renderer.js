@@ -659,6 +659,7 @@ const aprsCompletedQueue = [];
 const TRACEROUTE_MAX_ENTRIES = 200;
 const tracerouteEntries = [];
 const TRACEROUTE_COALESCE_WINDOW_MS = 3 * 60 * 1000;
+const TRACEROUTE_DEDUPE_WINDOW_MS = 30 * 60 * 1000;
 
 const AUTO_CONNECT_MAX_ATTEMPTS = 3;
 const AUTO_CONNECT_DELAY_MS = 5000;
@@ -4683,6 +4684,9 @@ function recordTracerouteResult(entry) {
 
 function upsertTracerouteEntry(next) {
   const now = Number(next?.timestampMs) || Date.now();
+  if (isDuplicateTraceroute(next, now)) {
+    return;
+  }
   const key = next?.targetKey;
   if (key) {
     const index = tracerouteEntries.findIndex((item) => {
@@ -4700,6 +4704,29 @@ function upsertTracerouteEntry(next) {
   if (tracerouteEntries.length > TRACEROUTE_MAX_ENTRIES) {
     tracerouteEntries.length = TRACEROUTE_MAX_ENTRIES;
   }
+}
+
+function isDuplicateTraceroute(entry, ts) {
+  const signature = buildTracerouteSignature(entry);
+  if (!signature) return false;
+  const now = Number(ts) || Date.now();
+  return tracerouteEntries.some((item) => {
+    if (!item) return false;
+    const itemTs = Number(item.timestampMs) || 0;
+    if (!Number.isFinite(itemTs)) return false;
+    if (Math.abs(now - itemTs) > TRACEROUTE_DEDUPE_WINDOW_MS) return false;
+    return buildTracerouteSignature(item) === signature;
+  });
+}
+
+function buildTracerouteSignature(entry) {
+  if (!entry || typeof entry !== 'object') return '';
+  const route = Array.isArray(entry.route) ? entry.route.join(',') : '';
+  const routeBack = Array.isArray(entry.routeBack) ? entry.routeBack.join(',') : '';
+  const snrTowards = Array.isArray(entry.snrTowards) ? entry.snrTowards.join(',') : '';
+  const snrBack = Array.isArray(entry.snrBack) ? entry.snrBack.join(',') : '';
+  if (!route && !routeBack && !snrTowards && !snrBack) return '';
+  return `f:${route}|b:${routeBack}|st:${snrTowards}|sb:${snrBack}`;
 }
 
 function mergeTracerouteEntry(existing, next) {

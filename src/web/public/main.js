@@ -118,6 +118,7 @@
   const MAX_SUMMARY_ROWS = 200;
   const MAX_TRACEROUTE_ROWS = 200;
   const TRACEROUTE_COALESCE_WINDOW_MS = 3 * 60 * 1000;
+  const TRACEROUTE_DEDUPE_WINDOW_MS = 30 * 60 * 1000;
   const tracerouteRows = [];
   const logEntries = [];
   const MAX_LOG_ENTRIES = 200;
@@ -7332,6 +7333,9 @@
     if (!entry) return;
     const ts = entry.timestamp || entry.timestampMs || Date.now();
     const key = resolveTracerouteEntryKey(entry);
+    if (isDuplicateTraceroute(entry, ts)) {
+      return;
+    }
     if (key) {
       const index = tracerouteRows.findIndex((item) => {
         if (!item || resolveTracerouteEntryKey(item) !== key) return false;
@@ -7351,6 +7355,29 @@
       tracerouteRows.pop();
     }
     renderTracerouteView();
+  }
+
+  function isDuplicateTraceroute(entry, ts) {
+    const signature = buildTracerouteSignature(entry);
+    if (!signature) return false;
+    const now = Number(ts) || Date.now();
+    return tracerouteRows.some((item) => {
+      if (!item) return false;
+      const itemTs = item.timestamp || item.timestampMs || null;
+      if (!Number.isFinite(itemTs)) return false;
+      if (Math.abs(now - Number(itemTs)) > TRACEROUTE_DEDUPE_WINDOW_MS) return false;
+      return buildTracerouteSignature(item) === signature;
+    });
+  }
+
+  function buildTracerouteSignature(entry) {
+    if (!entry || typeof entry !== 'object') return '';
+    const route = Array.isArray(entry.route) ? entry.route.join(',') : '';
+    const routeBack = Array.isArray(entry.routeBack) ? entry.routeBack.join(',') : '';
+    const snrTowards = Array.isArray(entry.snrTowards) ? entry.snrTowards.join(',') : '';
+    const snrBack = Array.isArray(entry.snrBack) ? entry.snrBack.join(',') : '';
+    if (!route && !routeBack && !snrTowards && !snrBack) return '';
+    return `f:${route}|b:${routeBack}|st:${snrTowards}|sb:${snrBack}`;
   }
 
   function mergeTracerouteEntry(existing, next) {
