@@ -4480,7 +4480,7 @@ function renderTracerouteList() {
         ? renderTraceroutePath(entry.forward, {
             unknownHint: Boolean(entry.forwardUnknown),
             snrValues: entry.snrTowards,
-            snrMode: 'routeOnly'
+            snrMode: 'excludeHead'
           })
         : '';
       const backward = showRoutes
@@ -4488,7 +4488,7 @@ function renderTracerouteList() {
             unknownHint: Boolean(entry.backwardUnknown),
             directLabel: '直回',
             snrValues: entry.snrBack,
-            snrMode: 'routeOnly'
+            snrMode: 'excludeHead'
           })
         : '';
       const routesMarkup = showRoutes
@@ -4520,7 +4520,7 @@ function renderTracerouteList() {
 
 function renderTraceroutePath(
   nodes,
-  { unknownHint = false, directLabel = '直回', snrValues = [], snrMode = 'routeOnly' } = {}
+  { unknownHint = false, directLabel = '直回', snrValues = [], snrMode = 'excludeHead' } = {}
 ) {
   if (!Array.isArray(nodes) || !nodes.length) {
     const label = unknownHint ? '未知' : directLabel;
@@ -4533,8 +4533,8 @@ function renderTraceroutePath(
       let snrLabel = '';
       if (Array.isArray(snrValues) && snrValues.length) {
         let snrIndex = null;
-        if (snrMode === 'routeOnly') {
-          if (index > 0 && index < nodes.length - 1) {
+        if (snrMode === 'excludeHead') {
+          if (index > 0) {
             snrIndex = index - 1;
           }
         } else {

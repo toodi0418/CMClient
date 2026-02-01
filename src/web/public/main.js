@@ -7373,11 +7373,11 @@
       ? `
         <div class="traceroute-route">
           <span class="traceroute-label">去程</span>
-          <div class="traceroute-path">${renderTraceroutePath(forwardNodes, { unknownHint: forwardUnknown, snrValues: entry.snrTowards, snrMode: 'routeOnly' })}</div>
+          <div class="traceroute-path">${renderTraceroutePath(forwardNodes, { unknownHint: forwardUnknown, snrValues: entry.snrTowards, snrMode: 'excludeHead' })}</div>
         </div>
         <div class="traceroute-route">
           <span class="traceroute-label">回程</span>
-          <div class="traceroute-path">${renderTraceroutePath(backwardNodes, { directLabel: '直回', unknownHint: backwardUnknown, snrValues: entry.snrBack, snrMode: 'routeOnly' })}</div>
+          <div class="traceroute-path">${renderTraceroutePath(backwardNodes, { directLabel: '直回', unknownHint: backwardUnknown, snrValues: entry.snrBack, snrMode: 'excludeHead' })}</div>
         </div>
       `
       : '';
@@ -7399,7 +7399,7 @@
 
   function renderTraceroutePath(
     nodes,
-    { directLabel = '直回', unknownHint = false, snrValues = [], snrMode = 'routeOnly' } = {}
+    { directLabel = '直回', unknownHint = false, snrValues = [], snrMode = 'excludeHead' } = {}
   ) {
     if (!Array.isArray(nodes) || !nodes.length) {
       const label = unknownHint ? '未知' : directLabel;
@@ -7412,8 +7412,8 @@
         let snrLabel = '';
         if (Array.isArray(snrValues) && snrValues.length) {
           let snrIndex = null;
-          if (snrMode === 'routeOnly') {
-            if (index > 0 && index < nodes.length - 1) {
+          if (snrMode === 'excludeHead') {
+            if (index > 0) {
               snrIndex = index - 1;
             }
           } else {
