@@ -250,7 +250,9 @@ class MeshtasticClient extends EventEmitter {
       hops: routeNodes.length,
       rtt: null, // RTT is usually not in RouteDiscovery packets themselves but could be estimated
       route: routeNodes.map((n) => formatHexId(n)),
-      routeBack: returnNodes.map((n) => formatHexId(n))
+      routeBack: returnNodes.map((n) => formatHexId(n)),
+      snrTowards: cached.snrTowards || [],
+      snrBack: cached.snrBack || []
     });
   }
 

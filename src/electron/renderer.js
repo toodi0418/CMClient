@@ -4446,8 +4446,13 @@ function renderTracerouteList() {
   tracerouteList.classList.remove('hidden');
   tracerouteList.innerHTML = tracerouteEntries
     .map((entry) => {
-      const forward = renderTraceroutePath(entry.forward);
-      const backward = renderTraceroutePath(entry.backward);
+      const forward = renderTraceroutePath(entry.forward, {
+        unknownHint: Boolean(entry.forwardUnknown)
+      });
+      const backward = renderTraceroutePath(entry.backward, {
+        unknownHint: Boolean(entry.backwardUnknown),
+        directLabel: '直回'
+      });
       return `
         <div class="flow-item traceroute-item">
           <div class="flow-header-row traceroute-header">
@@ -4470,9 +4475,10 @@ function renderTracerouteList() {
     .join('');
 }
 
-function renderTraceroutePath(nodes) {
+function renderTraceroutePath(nodes, { unknownHint = false, directLabel = '直回' } = {}) {
   if (!Array.isArray(nodes) || !nodes.length) {
-    return '<span class="traceroute-empty">直回</span>';
+    const label = unknownHint ? '未知' : directLabel;
+    return `<span class="traceroute-empty">${label}</span>`;
   }
   return nodes
     .map((node, index) => {
@@ -4510,10 +4516,18 @@ function recordTracerouteEntry(summary) {
   const backwardNodes = routeBack.length
     ? [targetLabel, ...routeBack.map((n) => formatMeshIdHex(n)).filter(Boolean), selfLabel].filter(Boolean)
     : [];
+  const forwardUnknown = Array.isArray(summary.trace?.snrTowards)
+    ? summary.trace.snrTowards.length > 0 && !route.length
+    : false;
+  const backwardUnknown = Array.isArray(summary.trace?.snrBack)
+    ? summary.trace.snrBack.length > 0 && !routeBack.length
+    : false;
   tracerouteEntries.unshift({
     target: targetLabel,
     forward: forwardNodes,
     backward: backwardNodes,
+    forwardUnknown,
+    backwardUnknown,
     timestampMs: tsMs,
     timestampLabel: tsLabel
   });

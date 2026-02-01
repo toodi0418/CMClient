@@ -7304,6 +7304,12 @@
     const badgeText = status === 'success' || status === 'routereply' ? 'success' : status;
     const forwardNodes = buildTracerouteForward(entry);
     const backwardNodes = buildTracerouteBackward(entry);
+    const forwardUnknown = Array.isArray(entry.snrTowards)
+      ? entry.snrTowards.length > 0 && (!entry.route || !entry.route.length)
+      : false;
+    const backwardUnknown = Array.isArray(entry.snrBack)
+      ? entry.snrBack.length > 0 && (!entry.routeBack || !entry.routeBack.length)
+      : false;
     return `
       <div class="traceroute-card">
         <div class="traceroute-card-header">
@@ -7316,20 +7322,21 @@
         <div class="traceroute-body">
           <div class="traceroute-route">
             <span class="traceroute-label">去程</span>
-            <div class="traceroute-path">${renderTraceroutePath(forwardNodes)}</div>
+            <div class="traceroute-path">${renderTraceroutePath(forwardNodes, { unknownHint: forwardUnknown })}</div>
           </div>
           <div class="traceroute-route">
             <span class="traceroute-label">回程</span>
-            <div class="traceroute-path">${renderTraceroutePath(backwardNodes, { directLabel: '直回' })}</div>
+            <div class="traceroute-path">${renderTraceroutePath(backwardNodes, { directLabel: '直回', unknownHint: backwardUnknown })}</div>
           </div>
         </div>
       </div>
     `;
   }
 
-  function renderTraceroutePath(nodes, { directLabel = '直回' } = {}) {
+  function renderTraceroutePath(nodes, { directLabel = '直回', unknownHint = false } = {}) {
     if (!Array.isArray(nodes) || !nodes.length) {
-      return `<span class="traceroute-empty">${directLabel}</span>`;
+      const label = unknownHint ? '未知' : directLabel;
+      return `<span class="traceroute-empty">${label}</span>`;
     }
     return nodes
       .map((node, index) => {
