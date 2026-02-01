@@ -211,7 +211,16 @@ function toWebCallmeshState(state) {
 }
 
 async function main() {
-  await yargs(hideBin(process.argv))
+  const argv = hideBin(process.argv).filter((arg) => {
+    if (!arg) return false;
+    try {
+      return path.resolve(arg) !== path.resolve(__filename);
+    } catch {
+      return true;
+    }
+  });
+
+  await yargs(argv)
     .version(pkg.version || 'unknown')
     .command(
       'discover',
@@ -359,8 +368,12 @@ async function startMonitor(argv) {
     return;
   }
 
-  const apiKey = argv.apiKey || process.env.CALLMESH_API_KEY;
-  if (!apiKey) {
+  const allowNoApiKey =
+    String(process.env.TMAG_ALLOW_NO_API_KEY || '').trim() === '1';
+  const apiKeyRaw = argv.apiKey || process.env.CALLMESH_API_KEY;
+  const apiKey = typeof apiKeyRaw === 'string' ? apiKeyRaw.trim() : '';
+  const hasApiKey = Boolean(apiKey);
+  if (!hasApiKey && !allowNoApiKey) {
     console.error('未設定 CallMesh API Key，請先設定環境變數 CALLMESH_API_KEY 後再執行。');
     process.exitCode = 1;
     return;
@@ -380,6 +393,7 @@ async function startMonitor(argv) {
   const HEARTBEAT_INTERVAL_MS = 60_000;
   const HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_MS / 1000;
   const artifactsDir = getArtifactsDir();
+  const clientPreferences = await loadClientPreferences(artifactsDir);
   const tracerouteEnabled = argv.autoTraceroute !== false;
   const tracerouteRateMinutes = Math.max(15, Number(argv.tracerouteRateMinutes) || 30);
   const tracerouteIntervalSeconds = Math.max(15, Number(argv.tracerouteIntervalSeconds) || 60);
@@ -412,7 +426,9 @@ async function startMonitor(argv) {
   const bridge = new CallMeshAprsBridge(bridgeOptions);
 
   const verificationRecord = { ...(previousVerification || {}) };
-  verificationRecord.apiKey = apiKey;
+  if (hasApiKey) {
+    verificationRecord.apiKey = apiKey;
+  }
   let lastPersistedHeartbeat = verificationRecord.lastHeartbeatAt || null;
   let lastDegradedFlag = Boolean(verificationRecord.degraded);
   let selfMeshId = null;
@@ -442,6 +458,17 @@ async function startMonitor(argv) {
     const timeLabel = formatTimestampLabel(timestamp);
     console.log(`[${timeLabel}] [APRS] ${info.frame}`);
     webServer?.publishAprs(info);
+  });
+
+  bridge.on('aprs-downlink', (info) => {
+    if (!info) return;
+    webServer?.publishAprs({
+      direction: 'downlink',
+      callsign: info.callsign || null,
+      infoString: info.infoString ?? null,
+      timestamp: info.timestamp ?? Date.now(),
+      timestampMs: info.timestampMs ?? info.timestamp ?? Date.now()
+    });
   });
 
   bridge.on('state', (state) => {
@@ -486,63 +513,80 @@ async function startMonitor(argv) {
   const connectionOptions = {};
 
   await bridge.init({ allowRestore: true });
+  try {
+    const aprsServer =
+      typeof clientPreferences.aprsServer === 'string' ? clientPreferences.aprsServer.trim() : '';
+    if (aprsServer) {
+      bridge.updateAprsServer(aprsServer);
+    }
+    const beaconMinutes = Number(clientPreferences.aprsBeaconMinutes);
+    if (Number.isFinite(beaconMinutes) && beaconMinutes > 0) {
+      bridge.setAprsBeaconIntervalMs(Math.round(beaconMinutes * 60_000));
+    }
+  } catch (err) {
+    console.warn(`套用 APRS 設定失敗：${err.message}`);
+  }
   const sharedDataStore = bridge.getDataStore?.();
   if (sharedDataStore) {
     connectionOptions.relayStatsStore = sharedDataStore;
     connectionOptions.tracerouteStore = sharedDataStore;
   }
 
-  try {
-    const verifyResult = await bridge.verifyApiKey(apiKey, {
-      allowDegraded: previouslyVerified
-    });
+  if (!hasApiKey && allowNoApiKey) {
+    console.warn('未設定 CallMesh API Key，Web UI 已啟動（等待設定）。');
+  } else {
+    try {
+      const verifyResult = await bridge.verifyApiKey(apiKey, {
+        allowDegraded: previouslyVerified
+      });
 
-    if (!verifyResult.success) {
-      if (verifyResult.authError) {
-        console.error(`CallMesh API Key 驗證失敗：${verifyResult.error?.message ?? 'unauthorised'}`);
+      if (!verifyResult.success) {
+        if (verifyResult.authError) {
+          console.error(`CallMesh API Key 驗證失敗：${verifyResult.error?.message ?? 'unauthorised'}`);
+          process.exitCode = 1;
+          return;
+        }
+        throw verifyResult.error || new Error('CallMesh 驗證失敗');
+      }
+
+      const nowIso = new Date().toISOString();
+      verificationRecord.verified = true;
+      verificationRecord.verifiedAt = verificationRecord.verifiedAt || nowIso;
+      verificationRecord.degraded = Boolean(verifyResult.degraded);
+
+      if (verifyResult.degraded) {
+        console.warn(
+          `CallMesh 伺服器暫時無回應 (${verifyResult.error?.message ?? 'unknown'})，沿用先前驗證結果。`
+        );
+      } else {
+        verificationRecord.lastHeartbeatAt = nowIso;
+      }
+
+      await saveVerificationFile(verificationPath, verificationRecord);
+    } catch (err) {
+      if (isAuthError(err)) {
+        console.error(`CallMesh API Key 驗證失敗：${err.message}`);
         process.exitCode = 1;
         return;
       }
-      throw verifyResult.error || new Error('CallMesh 驗證失敗');
+
+      if (previouslyVerified) {
+        console.warn(`CallMesh 伺服器暫時無回應 (${err.message})，沿用先前驗證結果。`);
+        verificationRecord.verified = true;
+        verificationRecord.degraded = true;
+        await saveVerificationFile(verificationPath, verificationRecord);
+      } else {
+        console.error(`CallMesh 伺服器無法連線：${err.message}`);
+        process.exitCode = 1;
+        return;
+      }
     }
 
-    const nowIso = new Date().toISOString();
-    verificationRecord.verified = true;
-    verificationRecord.verifiedAt = verificationRecord.verifiedAt || nowIso;
-    verificationRecord.degraded = Boolean(verifyResult.degraded);
-
-    if (verifyResult.degraded) {
-      console.warn(
-        `CallMesh 伺服器暫時無回應 (${verifyResult.error?.message ?? 'unknown'})，沿用先前驗證結果。`
-      );
-    } else {
-      verificationRecord.lastHeartbeatAt = nowIso;
-    }
-
-    await saveVerificationFile(verificationPath, verificationRecord);
-  } catch (err) {
-    if (isAuthError(err)) {
-      console.error(`CallMesh API Key 驗證失敗：${err.message}`);
-      process.exitCode = 1;
-      return;
-    }
-
-    if (previouslyVerified) {
-      console.warn(`CallMesh 伺服器暫時無回應 (${err.message})，沿用先前驗證結果。`);
-      verificationRecord.verified = true;
-      verificationRecord.degraded = true;
-      await saveVerificationFile(verificationPath, verificationRecord);
-    } else {
-      console.error(`CallMesh 伺服器無法連線：${err.message}`);
-      process.exitCode = 1;
-      return;
-    }
+    bridge.startHeartbeatLoop();
+    bridge.performHeartbeatTick().catch((err) => {
+      console.error('CallMesh Heartbeat 失敗：', err);
+    });
   }
-
-  bridge.startHeartbeatLoop();
-  bridge.performHeartbeatTick().catch((err) => {
-    console.error('CallMesh Heartbeat 失敗：', err);
-  });
 
   const relayStatsPath = path.join(getArtifactsDir(), 'relay-link-stats.json');
 
@@ -1351,6 +1395,19 @@ function getArtifactsDir() {
   const custom = process.env.CALLMESH_ARTIFACTS_DIR;
   if (custom) return path.resolve(custom);
   return path.dirname(getVerificationPath());
+}
+
+async function loadClientPreferences(artifactsDir) {
+  if (!artifactsDir) return {};
+  const filePath = path.join(artifactsDir, 'client-preferences.json');
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 async function clearNodeDatabaseCli() {

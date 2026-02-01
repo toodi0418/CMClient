@@ -4009,6 +4009,12 @@ class CallMeshAprsBridge extends EventEmitter {
     const normalized = line.trim();
     if (!normalized) return;
 
+    this.emit('aprs-downlink', {
+      direction: 'downlink',
+      rawLine: normalized,
+      timestamp: Date.now()
+    });
+
     if (/logresp/i.test(normalized)) {
       const serverMatch = normalized.match(/\bserver\s+([A-Za-z0-9_-]+)/i);
       if (serverMatch) {

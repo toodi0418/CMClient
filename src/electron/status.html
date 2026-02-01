@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TMAG 狀態</title>
+    <link rel="stylesheet" href="status.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div>
+          <div class="eyebrow">TMAG</div>
+          <div class="title">狀態總覽</div>
+        </div>
+        <div class="header-actions">
+          <button id="open-settings" class="icon-button" aria-label="開啟設定">
+            <span>⚙</span>
+          </button>
+          <button id="open-about" class="icon-button" aria-label="關於 TMAG">
+            <span>ℹ️</span>
+          </button>
+          <div class="window-controls">
+            <button id="window-minimize" class="window-button" aria-label="縮小">—</button>
+            <button id="window-close" class="window-button close" aria-label="關閉">×</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="card">
+        <div class="row">
+          <span class="label"><span class="label-icon">🟢</span>狀態</span>
+          <span id="backend-status" class="value">-</span>
+        </div>
+        <div class="row node-row">
+          <span class="label"><span class="label-icon">🛰️</span>節點</span>
+          <div class="node-info">
+            <div id="node-long" class="value">-</div>
+            <div id="node-short" class="meta">-</div>
+          </div>
+        </div>
+        <div class="row">
+          <span class="label"><span class="label-icon">🌐</span>Web UI</span>
+          <span id="web-status" class="value">-</span>
+          <button id="open-web" class="link-button" type="button">開啟</button>
+        </div>
+        <div class="row compact">
+          <span class="label"><span class="label-icon">🔗</span>網址</span>
+          <span id="web-url" class="mono">-</span>
+        </div>
+        <div class="lights">
+          <div class="light-item">
+            <span class="dot" id="light-callmesh"></span>
+            <span>CallMesh</span>
+          </div>
+          <div class="light-item" id="light-aprs-wrap">
+            <span class="dot" id="light-aprs"></span>
+            <span>APRS</span>
+          </div>
+          <div class="light-item">
+            <span class="dot" id="light-web"></span>
+            <span>Web</span>
+          </div>
+          <div class="light-item">
+            <span class="dot" id="light-node"></span>
+            <span>Node</span>
+          </div>
+          <div class="light-item">
+            <span class="dot" id="light-rx"></span>
+            <span>RX</span>
+          </div>
+        </div>
+      </section>
+
+      <div id="status-message" class="message"></div>
+      <div id="app-version" class="version">v-</div>
+    </div>
+
+    <div id="about-modal" class="modal hidden">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h2>關於 TMAG</h2>
+          <button id="close-about" class="ghost-button" type="button">關閉</button>
+        </div>
+        <p class="modal-text">
+          TMAG 用來連線 Meshtastic 節點，橋接 CallMesh / APRS，並提供 Web UI 監控與資料整合。
+        </p>
+        <p class="modal-text">
+          專案 GitHub：<a href="https://github.com/toodi0418/CMClient" target="_blank" rel="noreferrer">https://github.com/toodi0418/CMClient</a>
+        </p>
+      </div>
+    </div>
+
+    <script src="status.js"></script>
+  </body>
+</html>
