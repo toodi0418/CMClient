@@ -4541,13 +4541,23 @@ function renderTraceroutePath(
           snrIndex = index;
         }
         if (snrIndex != null && Number.isFinite(snrValues[snrIndex])) {
-          snrLabel = ` ${formatNumber(snrValues[snrIndex], 2)}dB`;
+          const formatted = formatTracerouteSnrValue(snrValues[snrIndex]);
+          if (formatted) {
+            snrLabel = ` ${formatted}dB`;
+          }
         }
       }
       const arrow = index < nodes.length - 1 ? '<span class="traceroute-arrow">→</span>' : '';
       return `<span class="traceroute-pill">${label}${snrLabel}</span>${arrow}`;
     })
     .join('');
+}
+
+function formatTracerouteSnrValue(value) {
+  if (!Number.isFinite(value)) return '';
+  if (value === -128) return '';
+  const scaled = value / 4;
+  return formatNumber(scaled, 2);
 }
 
 function recordTracerouteEntry(summary) {
