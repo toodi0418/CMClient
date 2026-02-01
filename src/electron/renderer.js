@@ -135,6 +135,7 @@ const flowDownloadBtn = document.getElementById('flow-download-btn');
 const traceroutePage = document.getElementById('traceroute-page');
 const tracerouteList = document.getElementById('traceroute-list');
 const tracerouteEmptyState = document.getElementById('traceroute-empty-state');
+const tracerouteTopology = document.getElementById('traceroute-topology');
 const telemetryPage = document.getElementById('telemetry-page');
 const telemetryNodeInput = document.getElementById('telemetry-node-input');
 const telemetryNodeDropdown = document.getElementById('telemetry-node-dropdown');
@@ -354,6 +355,7 @@ let telemetryLoading = false;
 let telemetryLoadingMeshId = null;
 let telemetryFetchToken = 0;
 let telemetrySummaryUpdatedAt = null;
+let topologyRenderTimer = null;
 const nodeRegistry = new Map();
 let nodeSnapshotLoaded = false;
 
@@ -3340,6 +3342,10 @@ window.addEventListener('beforeunload', () => {
   unsubscribeNode?.();
 });
 
+window.addEventListener('resize', () => {
+  scheduleTracerouteTopologyRender();
+});
+
 function handleCallMeshStatus(info, { silent = false } = {}) {
   if (!info) return;
   const previousDegraded = callmeshDegraded;
@@ -4470,6 +4476,7 @@ function renderTracerouteList() {
     tracerouteList.classList.add('hidden');
     tracerouteEmptyState?.classList.remove('hidden');
     tracerouteList.innerHTML = '';
+    renderTracerouteTopology();
     return;
   }
   tracerouteEmptyState?.classList.add('hidden');
@@ -4530,6 +4537,183 @@ function renderTracerouteList() {
     })
     .filter(Boolean)
     .join('');
+  renderTracerouteTopology();
+}
+
+function renderTracerouteTopology() {
+  if (!tracerouteTopology) return;
+  const entries = tracerouteEntries.filter((entry) => {
+    const status = String(entry?.status || '').toLowerCase();
+    return status && status !== 'pending';
+  });
+  if (!entries.length) {
+    tracerouteTopology.innerHTML = '';
+    return;
+  }
+  const graph = buildTracerouteTopologyGraph(entries.slice(0, 50));
+  drawTracerouteTopology(tracerouteTopology, graph);
+}
+
+function scheduleTracerouteTopologyRender() {
+  if (topologyRenderTimer) {
+    clearTimeout(topologyRenderTimer);
+  }
+  topologyRenderTimer = setTimeout(() => {
+    topologyRenderTimer = null;
+    renderTracerouteTopology();
+  }, 200);
+}
+
+function buildTracerouteTopologyGraph(entries) {
+  const nodes = new Map();
+  const edges = [];
+  const addNode = (label) => {
+    const nodeId = resolveTopologyNodeId(label);
+    if (!nodeId) return null;
+    if (!nodes.has(nodeId)) {
+      nodes.set(nodeId, {
+        id: nodeId,
+        label: resolveTracerouteNodeLabel(label)
+      });
+    }
+    return nodeId;
+  };
+  entries.forEach((entry) => {
+    const forward = Array.isArray(entry.forward) ? entry.forward : [];
+    const backward = Array.isArray(entry.backward) ? entry.backward : [];
+    const snrTowards = Array.isArray(entry.snrTowards) ? entry.snrTowards : [];
+    const snrBack = Array.isArray(entry.snrBack) ? entry.snrBack : [];
+    for (let i = 0; i < forward.length - 1; i++) {
+      const fromId = addNode(forward[i]);
+      const toId = addNode(forward[i + 1]);
+      if (!fromId || !toId) continue;
+      const snrRaw = snrTowards[i];
+      edges.push({
+        from: fromId,
+        to: toId,
+        direction: 'forward',
+        snr: Number.isFinite(snrRaw) ? snrRaw : null
+      });
+    }
+    for (let i = 0; i < backward.length - 1; i++) {
+      const fromId = addNode(backward[i]);
+      const toId = addNode(backward[i + 1]);
+      if (!fromId || !toId) continue;
+      const snrRaw = snrBack[i];
+      edges.push({
+        from: fromId,
+        to: toId,
+        direction: 'return',
+        snr: Number.isFinite(snrRaw) ? snrRaw : null
+      });
+    }
+  });
+  return { nodes: Array.from(nodes.values()), edges };
+}
+
+function resolveTopologyNodeId(label) {
+  if (!label) return null;
+  const normalized = normalizeMeshId(label);
+  return normalized || `label:${String(label).trim()}`;
+}
+
+function drawTracerouteTopology(svg, graph) {
+  if (!graph || !graph.nodes.length) {
+    svg.innerHTML = '';
+    return;
+  }
+  const width = svg.clientWidth || 800;
+  const height = svg.clientHeight || 360;
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.innerHTML = '';
+
+  const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+  defs.innerHTML = `
+    <marker id="arrow-forward" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdf8"></path>
+    </marker>
+    <marker id="arrow-return" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"></path>
+    </marker>
+  `;
+  svg.appendChild(defs);
+
+  const cx = width / 2;
+  const cy = height / 2;
+  const radius = Math.max(80, Math.min(width, height) / 2 - 40);
+  const positions = new Map();
+  graph.nodes.forEach((node, index) => {
+    const angle = (Math.PI * 2 * index) / graph.nodes.length;
+    positions.set(node.id, {
+      x: cx + radius * Math.cos(angle),
+      y: cy + radius * Math.sin(angle)
+    });
+  });
+
+  const edgeGroups = new Map();
+  graph.edges.forEach((edge) => {
+    const key = `${edge.from}|${edge.to}|${edge.direction}`;
+    if (!edgeGroups.has(key)) {
+      edgeGroups.set(key, []);
+    }
+    edgeGroups.get(key).push(edge);
+  });
+
+  for (const edges of edgeGroups.values()) {
+    edges.forEach((edge, idx) => {
+      const fromPos = positions.get(edge.from);
+      const toPos = positions.get(edge.to);
+      if (!fromPos || !toPos) return;
+      const dx = toPos.x - fromPos.x;
+      const dy = toPos.y - fromPos.y;
+      const length = Math.hypot(dx, dy) || 1;
+      const nx = -dy / length;
+      const ny = dx / length;
+      const offset = (idx - (edges.length - 1) / 2) * 10;
+      const cx1 = (fromPos.x + toPos.x) / 2 + nx * offset;
+      const cy1 = (fromPos.y + toPos.y) / 2 + ny * offset;
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', `M ${fromPos.x} ${fromPos.y} Q ${cx1} ${cy1} ${toPos.x} ${toPos.y}`);
+      path.setAttribute('class', edge.direction === 'forward' ? 'edge-forward' : 'edge-return');
+      path.setAttribute('marker-end', edge.direction === 'forward' ? 'url(#arrow-forward)' : 'url(#arrow-return)');
+      svg.appendChild(path);
+
+      if (Number.isFinite(edge.snr)) {
+        const snrValue = formatTracerouteSnrValue(edge.snr);
+        if (snrValue) {
+          const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          label.setAttribute('class', 'edge-label');
+          label.setAttribute('x', cx1 + nx * 10);
+          label.setAttribute('y', cy1 + ny * 10);
+          label.textContent = `${snrValue}dB`;
+          svg.appendChild(label);
+        }
+      }
+    });
+  }
+
+  graph.nodes.forEach((node) => {
+    const pos = positions.get(node.id);
+    if (!pos) return;
+    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circle.setAttribute('class', 'node-circle');
+    circle.setAttribute('cx', pos.x);
+    circle.setAttribute('cy', pos.y);
+    circle.setAttribute('r', 10);
+    svg.appendChild(circle);
+
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('x', pos.x + 14);
+    text.setAttribute('y', pos.y + 4);
+    text.textContent = truncateTracerouteLabel(node.label || node.id);
+    svg.appendChild(text);
+  });
+}
+
+function truncateTracerouteLabel(label) {
+  const text = String(label || '').trim();
+  if (text.length <= 18) return text;
+  return `${text.slice(0, 16)}…`;
 }
 
 function renderTraceroutePath(

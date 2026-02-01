@@ -409,6 +409,15 @@
             <h2>Traceroute 紀錄</h2>
             <p class="flow-panel-hint">顯示最近收到的 traceroute 回應，包含去程與回程節點。</p>
           </header>
+          <div class="traceroute-topology-panel">
+            <div class="traceroute-topology-header">
+              <h3>拓樸圖</h3>
+              <span>去程 / 回程雙線，支援多路徑</span>
+            </div>
+            <div class="traceroute-topology-wrap">
+              <svg id="traceroute-topology" class="traceroute-topology" role="img" aria-label="Traceroute topology"></svg>
+            </div>
+          </div>
           <div id="traceroute-empty-state" class="flow-empty-state">尚未收到 traceroute 回應。</div>
           <div id="traceroute-list" class="flow-items hidden"></div>
         </section>

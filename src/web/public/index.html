@@ -173,6 +173,15 @@
           <h2>Traceroute</h2>
           <span class="panel-meta">顯示最近的 Traceroute 請求與結果 (最多 200 筆)</span>
         </header>
+        <div class="traceroute-topology-panel">
+          <div class="traceroute-topology-header">
+            <h3>拓樸圖</h3>
+            <span>去程 / 回程雙線，支援多路徑</span>
+          </div>
+          <div class="traceroute-topology-wrap">
+            <svg id="traceroute-topology" class="traceroute-topology" role="img" aria-label="Traceroute topology"></svg>
+          </div>
+        </div>
         <div id="routing-empty-state" class="flow-empty">尚未收到 traceroute 回應。</div>
         <div id="routing-list" class="traceroute-list"></div>
       </section>
