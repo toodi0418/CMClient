@@ -27,6 +27,7 @@ const DEFAULT_TELEMETRY_MAX_PER_NODE = 500;
 const DEFAULT_TELEMETRY_MAX_TOTAL_RECORDS = 20000;
 const MESSAGE_MAX_PER_CHANNEL = 200;
 const MESSAGE_PERSIST_INTERVAL_MS = 2000;
+const MAX_TRACEROUTE_ENTRIES = 200;
 const TELEMETRY_METRIC_DEFINITIONS = {
   batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150] },
   voltage: { label: '電壓', unit: 'V', decimals: 2 },
@@ -213,6 +214,7 @@ class WebDashboardServer {
       totalNodes: 0,
       diskBytes: 0
     };
+    this.selfInfo = null;
     this.nodeRegistry = new Map();
     this.channelConfig = CHANNEL_CONFIG;
     this.messageStore = new Map();
@@ -222,6 +224,7 @@ class WebDashboardServer {
         : null;
     this._messageDirty = false;
     this._messagePersistTimer = null;
+    this.tracerouteStore = [];
     this._ensureConfiguredChannels();
   }
 
@@ -530,7 +533,13 @@ class WebDashboardServer {
     const meshCandidate = info?.node?.meshId || info?.meshId || null;
     if (meshCandidate) {
       this.selfMeshId = meshCandidate;
-      this._broadcast({ type: 'self', payload: { meshId: meshCandidate } });
+      const name =
+        info?.node?.longName ||
+        info?.node?.shortName ||
+        (info?.node?.label && info.node.label !== 'unknown' ? info.node.label : null) ||
+        null;
+      this.selfInfo = { meshId: meshCandidate, name };
+      this._broadcast({ type: 'self', payload: this.selfInfo });
     }
   }
 
@@ -602,6 +611,21 @@ class WebDashboardServer {
       }
     });
     this._scheduleMessagePersist();
+  }
+
+  publishTraceroute(entry) {
+    const cloned = this._cloneTracerouteEntry(entry);
+    if (!cloned) return;
+    this.tracerouteStore.unshift(cloned);
+    while (this.tracerouteStore.length > MAX_TRACEROUTE_ENTRIES) {
+      this.tracerouteStore.pop();
+    }
+    this._broadcast({ type: 'traceroute-append', payload: cloned });
+  }
+
+  _cloneTracerouteEntry(entry) {
+    if (!entry || typeof entry !== 'object') return null;
+    return cloneJson(entry);
   }
 
   _handleDebugRequest(req, res) {
@@ -895,8 +919,9 @@ class WebDashboardServer {
     if (this.lastCallmesh) {
       this._write(res, { type: 'callmesh', payload: this.lastCallmesh });
     }
-    if (this.selfMeshId) {
-      this._write(res, { type: 'self', payload: { meshId: this.selfMeshId } });
+    if (this.selfInfo || this.selfMeshId) {
+      const payload = this.selfInfo || { meshId: this.selfMeshId };
+      this._write(res, { type: 'self', payload });
     }
     this._write(res, { type: 'metrics', payload: this.metrics });
     const nodeSnapshot = this._buildNodeSnapshot();
@@ -908,6 +933,9 @@ class WebDashboardServer {
     }
     if (this.logEntries.length) {
       this._write(res, { type: 'log-batch', payload: this.logEntries });
+    }
+    if (this.tracerouteStore.length) {
+      this._write(res, { type: 'traceroute-batch', payload: this.tracerouteStore });
     }
     if (this.aprsRecordQueue.length) {
       for (const flowId of this.aprsRecordQueue) {
@@ -1859,19 +1887,19 @@ class WebDashboardServer {
         const entries = store.loadMessageLog();
         if (Array.isArray(entries) && entries.length) {
           for (const rawEntry of entries) {
-          const entry = this._cloneMessageEntry(rawEntry);
-          if (!entry) continue;
-          const channelId = entry.channel;
-          const channelStore = this._getChannelStore(channelId);
-          const duplicateIndex = channelStore.findIndex((item) => item.flowId === entry.flowId);
-          if (duplicateIndex !== -1) {
-            channelStore.splice(duplicateIndex, 1);
+            const entry = this._cloneMessageEntry(rawEntry);
+            if (!entry) continue;
+            const channelId = entry.channel;
+            const channelStore = this._getChannelStore(channelId);
+            const duplicateIndex = channelStore.findIndex((item) => item.flowId === entry.flowId);
+            if (duplicateIndex !== -1) {
+              channelStore.splice(duplicateIndex, 1);
+            }
+            channelStore.push(entry);
+            if (channelStore.length > MESSAGE_MAX_PER_CHANNEL) {
+              channelStore.splice(0, channelStore.length - MESSAGE_MAX_PER_CHANNEL);
+            }
           }
-          channelStore.push(entry);
-          if (channelStore.length > MESSAGE_MAX_PER_CHANNEL) {
-            channelStore.splice(0, channelStore.length - MESSAGE_MAX_PER_CHANNEL);
-          }
-        }
           this._ensureConfiguredChannels();
           if (this.messageLogPath) {
             await fsPromises.rm(this.messageLogPath, { force: true });
@@ -2820,8 +2848,8 @@ function sanitizeCallmeshPayload(info) {
   }
   const mappingItems = Array.isArray(info.mappingItems)
     ? info.mappingItems
-        .map((item) => sanitizeCallmeshMappingItem(item))
-        .filter(Boolean)
+      .map((item) => sanitizeCallmeshMappingItem(item))
+      .filter(Boolean)
     : [];
   return {
     statusText: info.statusText ?? '',

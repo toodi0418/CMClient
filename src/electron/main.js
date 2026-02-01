@@ -1183,6 +1183,7 @@ ipcMain.handle('meshtastic:connect', async (_event, options) => {
 
   client.on('traceroute', (entry) => {
     if (!entry) return;
+    mainWindow?.webContents.send('meshtastic:traceroute', entry);
     webServer?.publishTraceroute(entry);
   });
 

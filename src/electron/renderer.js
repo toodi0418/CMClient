@@ -3305,6 +3305,10 @@ const unsubscribeMyInfo = window.meshtastic.onMyInfo?.((info) => {
   handleSelfInfoEvent(info);
 });
 
+const unsubscribeTraceroute = window.meshtastic.onTraceroute?.((entry) => {
+  recordTracerouteResult(entry);
+});
+
 const unsubscribeAprsUplink = window.meshtastic.onAprsUplink?.((info) => {
   handleAprsUplink(info);
 });
@@ -3327,6 +3331,7 @@ window.addEventListener('beforeunload', () => {
   unsubscribeCallMeshStatus?.();
   unsubscribeCallMeshLog?.();
   unsubscribeMyInfo?.();
+  unsubscribeTraceroute?.();
   unsubscribeAprsUplink?.();
   unsubscribeTelemetry?.();
   unsubscribeNodeSnapshot?.();
@@ -4557,6 +4562,56 @@ function recordTracerouteEntry(summary) {
     backward: backwardNodes,
     forwardUnknown,
     backwardUnknown,
+    status: summary.status || summary.variant || 'success',
+    timestampMs: tsMs,
+    timestampLabel: tsLabel
+  });
+  if (tracerouteEntries.length > TRACEROUTE_MAX_ENTRIES) {
+    tracerouteEntries.length = TRACEROUTE_MAX_ENTRIES;
+  }
+  renderTracerouteList();
+}
+
+function recordTracerouteResult(entry) {
+  if (!entry || typeof entry !== 'object') return;
+  const route = Array.isArray(entry.route) ? entry.route : [];
+  const routeBack = Array.isArray(entry.routeBack) ? entry.routeBack : [];
+  if (!route.length && !routeBack.length && String(entry.status || '').toLowerCase() !== 'pending') {
+    return;
+  }
+  const targetLabel =
+    entry.toName ||
+    entry.to ||
+    entry.fromName ||
+    entry.from ||
+    '未知節點';
+  const tsMs =
+    Number(entry.timestamp) ||
+    (entry.timestampMs ? Number(entry.timestampMs) : null) ||
+    Date.now();
+  const tsLabel = new Date(tsMs).toLocaleString('zh-TW');
+  const selfLabel = selfNodeState.name || selfNodeState.meshId || '本站節點';
+  const forwardNodes = route.length
+    ? [selfLabel, ...route, targetLabel].filter(Boolean)
+    : [];
+  const backwardNodes = routeBack.length
+    ? [targetLabel, ...routeBack, selfLabel].filter(Boolean)
+    : [];
+  const forwardUnknown = !route.length && (
+    (Array.isArray(entry.snrTowards) && entry.snrTowards.length > 0) ||
+    routeBack.length > 0
+  );
+  const backwardUnknown = !routeBack.length && (
+    (Array.isArray(entry.snrBack) && entry.snrBack.length > 0) ||
+    route.length > 0
+  );
+  tracerouteEntries.unshift({
+    target: targetLabel,
+    forward: forwardNodes,
+    backward: backwardNodes,
+    forwardUnknown,
+    backwardUnknown,
+    status: entry.status || 'success',
     timestampMs: tsMs,
     timestampLabel: tsLabel
   });

@@ -29,6 +29,11 @@ contextBridge.exposeInMainWorld('meshtastic', {
     ipcRenderer.on('meshtastic:myInfo', listener);
     return () => ipcRenderer.removeListener('meshtastic:myInfo', listener);
   },
+  onTraceroute: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('meshtastic:traceroute', listener);
+    return () => ipcRenderer.removeListener('meshtastic:traceroute', listener);
+  },
   onCallMeshLog: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('callmesh:log', listener);

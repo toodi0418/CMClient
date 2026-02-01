@@ -1,5 +1,6 @@
 (() => {
   const statusLabel = document.getElementById('status-label');
+  const selfLabel = document.getElementById('self-label');
   const callmeshLabel = document.getElementById('callmesh-label');
   const aprsStatusLabel = document.getElementById('aprs-status-label');
   const counterPackets = document.getElementById('counter-packets');
@@ -111,6 +112,7 @@
     '最後轉發節點由 SNR/RSSI 推測（韌體僅提供節點尾碼），結果可能不完全準確。';
 
   let currentSelfMeshId = null;
+  let currentSelfName = null;
   let selfProvisionCoords = null;
   const MAX_SUMMARY_ROWS = 200;
   const MAX_TRACEROUTE_ROWS = 200;
@@ -1850,6 +1852,7 @@
     if (selectedChannelId != null) {
       renderChannelMessages(selectedChannelId);
     }
+    updateSelfLabel();
     renderTracerouteView();
   }
 
@@ -1867,6 +1870,7 @@
     if (selectedChannelId != null) {
       renderChannelMessages(selectedChannelId);
     }
+    updateSelfLabel();
     renderTracerouteView();
   }
 
@@ -6981,6 +6985,39 @@
     statusLabel.textContent = `${label}${message}`;
   }
 
+  function resolveSelfLabelFromRegistry() {
+    const normalized = normalizeMeshId(currentSelfMeshId);
+    if (!normalized) return '';
+    const node = nodeRegistry.get(normalized);
+    if (node) return formatNodeDisplayLabel(node);
+    return '';
+  }
+
+  function updateSelfLabel() {
+    if (!selfLabel) return;
+    const normalized = normalizeMeshId(currentSelfMeshId);
+    const registryLabel = resolveSelfLabelFromRegistry();
+    const name = sanitizeNodeName(currentSelfName);
+    if (registryLabel) {
+      selfLabel.textContent = registryLabel;
+      return;
+    }
+    if (!normalized && !name) {
+      selfLabel.textContent = '尚未取得';
+      return;
+    }
+    if (!normalized) {
+      selfLabel.textContent = name;
+      return;
+    }
+    if (!name) {
+      selfLabel.textContent = normalized;
+      return;
+    }
+    const meshDisplay = normalized.toLowerCase();
+    selfLabel.textContent = name.toLowerCase().includes(meshDisplay) ? name : `${name} (${normalized})`;
+  }
+
   function updateMetrics(metrics) {
     if (!metrics) return;
     setCounter(counterPackets, metrics.packetLast10Min ?? 0);
@@ -7198,6 +7235,8 @@
             break;
           case 'self':
             currentSelfMeshId = normalizeMeshId(packet.payload?.meshId);
+            currentSelfName = sanitizeNodeName(packet.payload?.name);
+            updateSelfLabel();
             refreshSummarySelfLabels();
             break;
           case 'log':
