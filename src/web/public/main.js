@@ -7341,12 +7341,7 @@
       });
       if (index >= 0) {
         const existing = tracerouteRows[index] || {};
-        const merged = { ...existing, ...entry };
-        if (!merged.to && existing.to) merged.to = existing.to;
-        if (!merged.toName && existing.toName) merged.toName = existing.toName;
-        if (!merged.from && existing.from) merged.from = existing.from;
-        if (!merged.fromName && existing.fromName) merged.fromName = existing.fromName;
-        tracerouteRows[index] = merged;
+        tracerouteRows[index] = mergeTracerouteEntry(existing, entry);
         renderTracerouteView();
         return;
       }
@@ -7356,6 +7351,21 @@
       tracerouteRows.pop();
     }
     renderTracerouteView();
+  }
+
+  function mergeTracerouteEntry(existing, next) {
+    const merged = { ...existing, ...next };
+    const preferArray = (value, fallback) =>
+      Array.isArray(value) && value.length ? value : fallback;
+    merged.to = merged.to || existing.to;
+    merged.toName = merged.toName || existing.toName;
+    merged.from = merged.from || existing.from;
+    merged.fromName = merged.fromName || existing.fromName;
+    merged.route = preferArray(next.route, existing.route);
+    merged.routeBack = preferArray(next.routeBack, existing.routeBack);
+    merged.snrTowards = preferArray(next.snrTowards, existing.snrTowards);
+    merged.snrBack = preferArray(next.snrBack, existing.snrBack);
+    return merged;
   }
 
   function renderTracerouteView() {

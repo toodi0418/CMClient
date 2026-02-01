@@ -4692,10 +4692,7 @@ function upsertTracerouteEntry(next) {
     });
     if (index >= 0) {
       const existing = tracerouteEntries[index] || {};
-      const merged = { ...existing, ...next };
-      if (!merged.target && existing.target) merged.target = existing.target;
-      if (!merged.targetKey && existing.targetKey) merged.targetKey = existing.targetKey;
-      tracerouteEntries[index] = merged;
+      tracerouteEntries[index] = mergeTracerouteEntry(existing, next);
       return;
     }
   }
@@ -4703,6 +4700,21 @@ function upsertTracerouteEntry(next) {
   if (tracerouteEntries.length > TRACEROUTE_MAX_ENTRIES) {
     tracerouteEntries.length = TRACEROUTE_MAX_ENTRIES;
   }
+}
+
+function mergeTracerouteEntry(existing, next) {
+  const merged = { ...existing, ...next };
+  const preferArray = (value, fallback) =>
+    Array.isArray(value) && value.length ? value : fallback;
+  merged.target = merged.target || existing.target;
+  merged.targetKey = merged.targetKey || existing.targetKey;
+  merged.route = preferArray(next.route, existing.route);
+  merged.routeBack = preferArray(next.routeBack, existing.routeBack);
+  merged.forward = preferArray(next.forward, existing.forward);
+  merged.backward = preferArray(next.backward, existing.backward);
+  merged.snrTowards = preferArray(next.snrTowards, existing.snrTowards);
+  merged.snrBack = preferArray(next.snrBack, existing.snrBack);
+  return merged;
 }
 
 function formatNumber(value, digits) {
