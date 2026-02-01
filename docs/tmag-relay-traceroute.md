@@ -200,6 +200,98 @@ return:  !03919375, !06aa0416(11.00dB), !58e2b04d
 
 ---
 
+## 9. TMAG-RELAY 提問回覆（routeBack 解讀與拓樸建議）
+
+以下回覆對應 TMAG-RELAY 團隊 2026-02-01 的提問內容，說明 CMClient 目前的解讀方式與建議。
+
+### 9.1 routeBack 是否為完整回程路徑？
+
+**不保證**。實務觀察（CMClient 端與社群回報）顯示：
+
+- `routeBack` 可能比 forward 路徑短，甚至缺漏數個中繼節點。
+- `routeBack` 有時像是回程路徑的片段 / 抽樣，而不是完整 hop 序列。
+- `snr_back` 通常與 `route_back` 長度相符，但不代表回程 hop 全部可見。
+
+因此若強行假設 `routeBack` 等同完整回程路徑，會產生「不可能的直連」。
+
+### 9.2 CMClient 如何解讀 routeBack？
+
+CMClient 的做法（與 UI 顯示一致）是：
+
+- 去程完整路徑：  
+  `forward = [from, ...route, to]`
+
+- 回程完整路徑（僅依 routeBack）：  
+  `return = [to, ...routeBack, from]`
+
+- 若 `routeBack` 為空，回程視為未知（顯示「直回」或空白）。
+- 不會補齊 forward 中缺失的中途節點，也不會嘗試對齊 forward。
+
+### 9.3 你們信任 routeBack 來畫拓樸嗎？
+
+**有限度信任**。實際策略如下：
+
+- forward 路徑是主要結構（可信度較高）。
+- return 路徑僅作為「可見片段」繪製，不假設完整性。
+- 若 `routeBack` 造成不可能的直連，那是 `routeBack` 本身缺節點的結果，不是解碼錯誤。
+
+### 9.4 snrBack 如何對應到 edges？
+
+規則是按照 return 陣列的節點順序一一對應：
+
+```
+return nodes = [to, r1, r2, ..., from]
+snrBack[i] 對應 return nodes[i] → return nodes[i+1]
+```
+
+且 `snr_back` 需先除以 4 才是 dB。
+
+### 9.5 拓樸避免「不可能 edge」的建議
+
+若你們想降低錯誤邊的視覺干擾，可採用以下策略：
+
+**建議 A（保守、穩定）**
+- 拓樸只用 forward 畫結構。
+- 回程只顯示在卡片或線上標籤，不進圖。
+
+**建議 B（折衷）**
+- forward 畫結構。
+- return 僅在 `routeBack.length >= 2` 且 `snrBack.length` 足夠時才畫線。
+
+**建議 C（現況）**
+- forward + return 都畫，但標註為「回程片段」。
+- UI 文案提醒回程路徑可能不完整（避免誤解）。
+
+---
+
+### 9.6 與你們提供的例子對齊
+
+```
+from: !43396ec0
+to:   !0406c85c
+route:     [!58e2b04d, !03919375, !ac7f3e7c, !23b6043a]
+routeBack: [!23b6043a, !58e2b04d]
+```
+
+CMClient 會解讀為：
+
+```
+forward: !0406c85c → !58e2b04d → !03919375 → !ac7f3e7c → !23b6043a → !43396ec0
+return:  !43396ec0 → !23b6043a → !58e2b04d → !0406c85c
+```
+
+其中 `!23b6043a → !58e2b04d` 看起來跨跳，  
+但這是 `routeBack` 本身缺少中途節點所致。
+
+---
+
+## 10. 結論（給 TMAG-RELAY 的一句話）
+
+`routeBack` 在實務上常是「回程片段」，不可視為完整 hop；  
+建議以 forward 作拓樸骨幹，return 只當補充資訊或品質提示。
+
+---
+
 ## 9. Debug Checklist
 
 1. `portnum` 是否為 `ROUTING_APP`
