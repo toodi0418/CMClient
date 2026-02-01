@@ -1850,6 +1850,7 @@
     if (selectedChannelId != null) {
       renderChannelMessages(selectedChannelId);
     }
+    renderTracerouteView();
   }
 
   function handleNodeUpdate(payload) {
@@ -1866,6 +1867,7 @@
     if (selectedChannelId != null) {
       renderChannelMessages(selectedChannelId);
     }
+    renderTracerouteView();
   }
 
   function getRegistryNode(meshId) {
@@ -7304,12 +7306,14 @@
     const badgeText = status === 'success' || status === 'routereply' ? 'success' : status;
     const forwardNodes = buildTracerouteForward(entry);
     const backwardNodes = buildTracerouteBackward(entry);
-    const forwardUnknown = Array.isArray(entry.snrTowards)
-      ? entry.snrTowards.length > 0 && (!entry.route || !entry.route.length)
-      : false;
-    const backwardUnknown = Array.isArray(entry.snrBack)
-      ? entry.snrBack.length > 0 && (!entry.routeBack || !entry.routeBack.length)
-      : false;
+    const forwardUnknown =
+      (!entry.route || !entry.route.length) &&
+      ((Array.isArray(entry.snrTowards) && entry.snrTowards.length > 0) ||
+        (Array.isArray(entry.routeBack) && entry.routeBack.length > 0));
+    const backwardUnknown =
+      (!entry.routeBack || !entry.routeBack.length) &&
+      ((Array.isArray(entry.snrBack) && entry.snrBack.length > 0) ||
+        (Array.isArray(entry.route) && entry.route.length > 0));
     return `
       <div class="traceroute-card">
         <div class="traceroute-card-header">

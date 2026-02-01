@@ -4532,12 +4532,14 @@ function recordTracerouteEntry(summary) {
   const backwardNodes = routeBack.length
     ? [targetLabel, ...routeBack.map((n) => formatMeshIdHex(n)).filter(Boolean), selfLabel].filter(Boolean)
     : [];
-  const forwardUnknown = Array.isArray(summary.trace?.snrTowards)
-    ? summary.trace.snrTowards.length > 0 && !route.length
-    : false;
-  const backwardUnknown = Array.isArray(summary.trace?.snrBack)
-    ? summary.trace.snrBack.length > 0 && !routeBack.length
-    : false;
+  const forwardUnknown = !route.length && (
+    (Array.isArray(summary.trace?.snrTowards) && summary.trace.snrTowards.length > 0) ||
+    routeBack.length > 0
+  );
+  const backwardUnknown = !routeBack.length && (
+    (Array.isArray(summary.trace?.snrBack) && summary.trace.snrBack.length > 0) ||
+    route.length > 0
+  );
   tracerouteEntries.unshift({
     target: targetLabel,
     forward: forwardNodes,
@@ -5610,6 +5612,7 @@ function applyNodeRegistrySnapshot(list) {
   renderNodeDatabase();
   renderTelemetryView();
   renderChannelMessages(selectedChannelId);
+  renderTracerouteList();
 }
 
 function handleNodeEvent(payload) {
@@ -5628,6 +5631,7 @@ function handleNodeEvent(payload) {
   refreshFlowEntryLabels();
   renderFlowEntries();
   renderChannelMessages(selectedChannelId);
+  renderTracerouteList();
 }
 
 function refreshSummarySelfLabels() {
