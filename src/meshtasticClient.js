@@ -23,6 +23,7 @@ const RELAY_GUESS_EXPLANATION =
 const FORCED_OUTBOUND_HOP_LIMIT = 6;
 const APP_TIMEZONE = getAppTimezone();
 const TRACEROUTE_LAST_SENT_KV_KEY = 'traceroute:last_sent';
+const TRACEROUTE_OWN_REQUEST_TTL_MS = 10 * 60 * 1000;
 
 function normalizeMeshId(meshId) {
   if (meshId == null) return null;
@@ -92,6 +93,10 @@ class MeshtasticClient extends EventEmitter {
     );
     this.options.tracerouteCachePath = options.tracerouteCachePath || null;
     this.options.tracerouteStorePath = options.tracerouteStorePath || null;
+    this.options.tracerouteOwnOnly =
+      options && Object.prototype.hasOwnProperty.call(options, 'tracerouteOwnOnly')
+        ? Boolean(options.tracerouteOwnOnly)
+        : true;
 
     if (typeof this.options.transport === 'string') {
       const mode = this.options.transport.toLowerCase();
@@ -173,6 +178,7 @@ class MeshtasticClient extends EventEmitter {
     this._loadRelayStatsFromDisk();
     this._loadTracerouteCache();
     this._traceroutePending = new Set();
+    this._tracerouteOwnRequests = new Map();
 
     this._tracerouteStore = null;
     this._tracerouteStoreOwned = false;
@@ -286,6 +292,20 @@ class MeshtasticClient extends EventEmitter {
       return;
     }
     const key = nodeNum >>> 0;
+    if (this.options.tracerouteOwnOnly) {
+      const requestedAt = this._tracerouteOwnRequests.get(key) || 0;
+      if (!requestedAt || Date.now() - requestedAt > TRACEROUTE_OWN_REQUEST_TTL_MS) {
+        if (requestedAt) {
+          this._tracerouteOwnRequests.delete(key);
+        }
+        this.emit('traceroute-log', {
+          tag: 'TRACEROUTE',
+          message: `忽略非本機請求 traceroute 回應 ${formatHexId(key)} via=${via}`
+        });
+        return;
+      }
+      this._tracerouteOwnRequests.delete(key);
+    }
     // Skip if it's us (echo or self-route)
     if (this._selfNodeId != null && key === (this._selfNodeId >>> 0)) {
       this.emit('traceroute-log', {
@@ -433,6 +453,9 @@ class MeshtasticClient extends EventEmitter {
     const destId = Number(destination);
     if (!Number.isFinite(destId) || destId <= 0 || destId === BROADCAST_ADDR) {
       throw new Error('目的節點不合法');
+    }
+    if (this.options.tracerouteOwnOnly) {
+      this._tracerouteOwnRequests.set(destId >>> 0, Date.now());
     }
     const traceroutePort = this.portEnum?.values?.TRACEROUTE_APP;
     if (!Number.isFinite(traceroutePort)) {
