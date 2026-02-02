@@ -592,6 +592,7 @@
   let mapTelemetryOnly = false;
   let mapShowTraceroute = false;
   let mapRoutesOnly = false;
+  let selectedTracerouteId = null;
   let mapRoleFilterValue = 'all';
   const mapRoleCache = new Map();
   let tracerouteAnimationFrame = null;
@@ -1202,6 +1203,7 @@
         'text-allow-overlap': true,
         'text-ignore-placement': true,
         'text-keep-upright': false,
+        'text-rotation-alignment': 'map',
         'text-padding': 0,
         'text-offset': [0, -0.1]
       },
@@ -1233,6 +1235,8 @@
         'text-font': ['Noto Sans Regular'],
         'text-size': 11,
         'symbol-placement': 'line-center',
+        'text-rotation-alignment': 'map',
+        'text-keep-upright': true,
         'text-allow-overlap': true,
         'text-offset': [0, 0]
       },
@@ -9683,6 +9687,13 @@
         label.setAttribute('class', `edge-label edge-snr-${category}`);
         label.setAttribute('x', cx1);
         label.setAttribute('y', cy1);
+
+        // Calculate rotation to align with edge
+        const angleDeg = Math.atan2(dy, dx) * (180 / Math.PI);
+        // Correct text if it's upside down (more than 90 deg rotation)
+        const textRotation = (angleDeg > 90 || angleDeg < -90) ? angleDeg + 180 : angleDeg;
+        label.setAttribute('transform', `rotate(${textRotation}, ${cx1}, ${cy1})`);
+
         label.textContent = displayLabel;
         layer.appendChild(label);
       }
