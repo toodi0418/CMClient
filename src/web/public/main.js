@@ -593,6 +593,7 @@
   let mapShowTraceroute = false;
   let mapRoutesOnly = false;
   let selectedTracerouteId = null;
+  let selectedNodeMeshId = null;
   let mapRoleFilterValue = 'all';
   const mapRoleCache = new Map();
   let tracerouteAnimationFrame = null;
@@ -917,6 +918,78 @@
     });
 
     source.setData({ type: 'FeatureCollection', features });
+  }
+
+  function updateTracerouteFiltering() {
+    if (!mapInstance || !mapReady) return;
+
+    // If no node is selected, remove all extra filters
+    if (!selectedNodeMeshId) {
+      // Reset to default filters
+      mapInstance.setFilter('traceroute-layer-forward', ['==', ['get', 'direction'], 'forward']);
+      mapInstance.setFilter('traceroute-layer-return', ['==', ['get', 'direction'], 'return']);
+      mapInstance.setFilter('traceroute-layer-bidirectional', ['==', ['get', 'isBidirectional'], true]);
+      mapInstance.setFilter('traceroute-layer-arrows', ['==', ['get', 'isBidirectional'], false]);
+      mapInstance.setFilter('traceroute-bidir-forward-arrow', ['==', ['get', 'isBidirectional'], true]);
+      mapInstance.setFilter('traceroute-bidir-return-arrow', ['==', ['get', 'isBidirectional'], true]);
+      mapInstance.setFilter(MAP_TRACEROUTE_LABEL_LAYER_ID, ['all']);
+
+      // Reset node opacity
+      if (mapInstance.getLayer(`${MAP_LAYER_ID}-unclustered`)) {
+        mapInstance.setPaintProperty(`${MAP_LAYER_ID}-unclustered`, 'circle-opacity', 0.9);
+      }
+      return;
+    }
+
+    // Build filter for related traceroutes (where from or to matches selected node)
+    const relatedFilter = [
+      'any',
+      ['==', ['get', 'from'], selectedNodeMeshId],
+      ['==', ['get', 'to'], selectedNodeMeshId]
+    ];
+
+    // Update traceroute layer filters
+    mapInstance.setFilter('traceroute-layer-forward', [
+      'all',
+      ['==', ['get', 'direction'], 'forward'],
+      relatedFilter
+    ]);
+    mapInstance.setFilter('traceroute-layer-return', [
+      'all',
+      ['==', ['get', 'direction'], 'return'],
+      relatedFilter
+    ]);
+    mapInstance.setFilter('traceroute-layer-bidirectional', [
+      'all',
+      ['==', ['get', 'isBidirectional'], true],
+      relatedFilter
+    ]);
+    mapInstance.setFilter('traceroute-layer-arrows', [
+      'all',
+      ['==', ['get', 'isBidirectional'], false],
+      relatedFilter
+    ]);
+    mapInstance.setFilter('traceroute-bidir-forward-arrow', [
+      'all',
+      ['==', ['get', 'isBidirectional'], true],
+      relatedFilter
+    ]);
+    mapInstance.setFilter('traceroute-bidir-return-arrow', [
+      'all',
+      ['==', ['get', 'isBidirectional'], true],
+      relatedFilter
+    ]);
+    mapInstance.setFilter(MAP_TRACEROUTE_LABEL_LAYER_ID, relatedFilter);
+
+    // Dim unrelated nodes
+    if (mapInstance.getLayer(`${MAP_LAYER_ID}-unclustered`)) {
+      mapInstance.setPaintProperty(`${MAP_LAYER_ID}-unclustered`, 'circle-opacity', [
+        'case',
+        ['==', ['get', 'meshId'], selectedNodeMeshId],
+        1,
+        0.2
+      ]);
+    }
   }
 
   function startTracerouteAnimation() {
@@ -1524,6 +1597,10 @@
           mapInstance.setPaintProperty('traceroute-layer-bidirectional', 'line-opacity', 0.4);
           mapInstance.setPaintProperty('traceroute-layer-arrows', 'text-opacity', 0.8);
           mapInstance.setPaintProperty(MAP_TRACEROUTE_LABEL_LAYER_ID, 'text-opacity', 1);
+
+          // Clear node selection
+          selectedNodeMeshId = null;
+          updateTracerouteFiltering();
         }
       });
       mapInstance.on('click', `${MAP_LAYER_ID}-unclustered`, (event) => {
@@ -1605,6 +1682,10 @@
           .setLngLat(event.lngLat)
           .setHTML(html)
           .addTo(mapInstance);
+
+        // Set selected node and filter traceroutes
+        selectedNodeMeshId = meshId;
+        updateTracerouteFiltering();
       });
       updateMapClusterVisibility();
       mapInstance.on('moveend', () => {
