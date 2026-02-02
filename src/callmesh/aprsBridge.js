@@ -1931,6 +1931,40 @@ class CallMeshAprsBridge extends EventEmitter {
     return null;
   }
 
+  async sendWebTextMessage({ text, channel = 0, wantAck = false } = {}) {
+    const client = this._getWritableMeshtasticClient();
+    if (!client) {
+      throw new Error('Meshtastic 尚未連線');
+    }
+    const safeText = typeof text === 'string' ? text.trim() : '';
+    if (!safeText) {
+      throw new Error('訊息內容不可為空白');
+    }
+    const channelId = Number.isFinite(Number(channel)) ? Number(channel) : 0;
+    const maxPayloadLength =
+      client?.constantsEnum && client.constantsEnum.values
+        ? Number(client.constantsEnum.values.DATA_PAYLOAD_LEN)
+        : 233;
+    const textBytes = Buffer.byteLength(safeText, 'utf8');
+    if (Number.isFinite(maxPayloadLength) && textBytes > maxPayloadLength) {
+      throw new Error(`文字長度 ${textBytes} bytes 超過上限 ${maxPayloadLength}`);
+    }
+    const packetId = await client.sendTextMessage({
+      text: safeText,
+      channel: channelId,
+      wantAck: Boolean(wantAck)
+    });
+    const flowId = `web-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    this.emitTenmanSyntheticSummary({
+      text: safeText,
+      channel: channelId,
+      flowId,
+      meshPacketId: Number.isFinite(packetId) ? Number(packetId) >>> 0 : undefined,
+      scope: 'broadcast'
+    });
+    return { packetId, flowId };
+  }
+
   async forwardTenmanPosition(summary) {
     if (!summary) {
       return;
@@ -5279,6 +5313,7 @@ class CallMeshAprsBridge extends EventEmitter {
           earliestSampleMs: null,
           node: null,
           metricsSet: new Set(),
+          latestMetrics: null,
           hasDatabaseCount: false
         };
         summaryMap.set(entry.meshIdNormalized || entry.rawMeshId || key, entry);
@@ -5357,6 +5392,9 @@ class CallMeshAprsBridge extends EventEmitter {
             }
           }
         }
+        if (latestRecord?.telemetry?.metrics && typeof latestRecord.telemetry.metrics === 'object') {
+          entry.latestMetrics = cloneTelemetryMetrics(latestRecord.telemetry.metrics);
+        }
       }
       mergeNode(entry, bucket.node);
     }
@@ -5393,11 +5431,49 @@ class CallMeshAprsBridge extends EventEmitter {
             for (const key of Object.keys(row.telemetry.metrics)) {
               entry.metricsSet.add(key);
             }
+            if (!entry.latestMetrics) {
+              entry.latestMetrics = cloneTelemetryMetrics(row.telemetry.metrics);
+            }
           }
           mergeNode(entry, row.node);
         }
       } catch (err) {
         this.emitLog('CALLMESH', `load telemetry latest metrics failed: ${err.message}`);
+      }
+    }
+
+    if (this.telemetryDb && summaryMap.size) {
+      try {
+        const meshIds = new Set();
+        for (const entry of summaryMap.values()) {
+          if (entry.rawMeshId) {
+            meshIds.add(entry.rawMeshId);
+          }
+          if (entry.meshIdNormalized) {
+            meshIds.add(entry.meshIdNormalized);
+          }
+          const normalized = normalizeMeshId(entry.rawMeshId || entry.meshIdNormalized);
+          if (normalized) {
+            meshIds.add(normalized);
+          }
+        }
+        const meshIdList = Array.from(meshIds).filter(Boolean);
+        if (meshIdList.length) {
+          const latestRows = this.telemetryDb.fetchRecentSnapshot({
+            limitPerNode: 1,
+            meshIds: meshIdList
+          });
+          for (const row of latestRows) {
+            const normalized = normalizeMeshId(row.meshId);
+            const entry = ensureEntry(normalized, row.meshId);
+            if (!entry) continue;
+            if (row?.telemetry?.metrics && typeof row.telemetry.metrics === 'object') {
+              entry.latestMetrics = cloneTelemetryMetrics(row.telemetry.metrics);
+            }
+          }
+        }
+      } catch (err) {
+        this.emitLog('CALLMESH', `load telemetry latest metrics from db failed: ${err.message}`);
       }
     }
 
@@ -5416,7 +5492,8 @@ class CallMeshAprsBridge extends EventEmitter {
       totalRecords: Number.isFinite(entry.totalRecords) ? Number(entry.totalRecords) : 0,
       latestSampleMs: Number.isFinite(entry.latestSampleMs) ? Number(entry.latestSampleMs) : null,
       earliestSampleMs: Number.isFinite(entry.earliestSampleMs) ? Number(entry.earliestSampleMs) : null,
-      availableMetrics: Array.from(entry.metricsSet)
+      availableMetrics: Array.from(entry.metricsSet),
+      latestMetrics: entry.latestMetrics ? cloneTelemetryMetrics(entry.latestMetrics) : null
     }));
 
     nodes.sort((a, b) => {

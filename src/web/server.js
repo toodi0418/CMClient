@@ -239,6 +239,8 @@ class WebDashboardServer {
       options && typeof options.tracerouteLogStore === 'object' ? options.tracerouteLogStore : null;
     this.aprsDebugProvider =
       typeof options.aprsDebugProvider === 'function' ? options.aprsDebugProvider : null;
+    this.messageSender =
+      typeof options.messageSender === 'function' ? options.messageSender : null;
 
     this.server = null;
     this.clients = new Set();
@@ -394,6 +396,10 @@ class WebDashboardServer {
       this._handleTelemetryRequest(req, res);
       return;
     }
+    if (pathname === '/api/message') {
+      this._handleMessageSendRequest(req, res);
+      return;
+    }
     if (pathname === '/debug') {
       this._handleDebugRequest(req, res);
       return;
@@ -407,6 +413,64 @@ class WebDashboardServer {
       return;
     }
     this._serveStatic(req, res);
+  }
+
+  _handleMessageSendRequest(req, res) {
+    if (!req || !res) return;
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
+      return;
+    }
+    if (!this.messageSender) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'message_sender_unavailable' }));
+      return;
+    }
+    let raw = '';
+    let aborted = false;
+    req.on('data', (chunk) => {
+      if (aborted) return;
+      raw += chunk;
+      if (raw.length > 32 * 1024) {
+        aborted = true;
+        res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'payload_too_large' }));
+        req.destroy();
+      }
+    });
+    req.on('end', async () => {
+      if (aborted) return;
+      let payload = null;
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+        return;
+      }
+      const text = typeof payload?.text === 'string' ? payload.text.trim() : '';
+      const channel = Number.isFinite(Number(payload?.channel)) ? Number(payload.channel) : 0;
+      if (!text) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'empty_message' }));
+        return;
+      }
+      try {
+        const result = await this.messageSender({ text, channel });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, ...result }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: 'send_failed',
+            message: err?.message || 'failed to send message'
+          })
+        );
+      }
+    });
   }
 
   async _listenOnPort(port) {
@@ -1806,7 +1870,8 @@ class WebDashboardServer {
         totalRecords: Number.isFinite(entry?.totalRecords) ? Number(entry.totalRecords) : 0,
         latestSampleMs: latestSample,
         earliestSampleMs: earliestSample,
-        availableMetrics: new Set(availableMetrics)
+        availableMetrics: new Set(availableMetrics),
+        latestMetrics: entry?.latestMetrics ? cloneJson(entry.latestMetrics) : null
       });
     }
     const providedUpdatedAt =
@@ -1955,6 +2020,24 @@ class WebDashboardServer {
     const nodes = [];
     for (const entry of this.telemetrySummary.values()) {
       if (!entry) continue;
+      const key = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId;
+      const bucket = key ? this.telemetryStore.get(key) : null;
+      let latestMetrics = entry?.latestMetrics ? cloneJson(entry.latestMetrics) : null;
+      if (!latestMetrics && bucket && Array.isArray(bucket.records) && bucket.records.length) {
+        let latest = null;
+        let latestTs = -1;
+        for (const rec of bucket.records) {
+          const tsRaw = rec?.sampleTimeMs ?? rec?.timestampMs ?? rec?.timestamp;
+          const ts = Number.isFinite(tsRaw) ? Number(tsRaw) : -1;
+          if (ts > latestTs) {
+            latestTs = ts;
+            latest = rec;
+          }
+        }
+        if (latest?.telemetry?.metrics && typeof latest.telemetry.metrics === 'object') {
+          latestMetrics = cloneJson(latest.telemetry.metrics);
+        }
+      }
       nodes.push({
         meshId: entry.meshId,
         meshIdNormalized: entry.meshIdNormalized || normalizeMeshId(entry.meshId),
@@ -1963,7 +2046,8 @@ class WebDashboardServer {
         totalRecords: Number.isFinite(entry.totalRecords) ? Number(entry.totalRecords) : 0,
         latestSampleMs: Number.isFinite(entry.latestSampleMs) ? Number(entry.latestSampleMs) : null,
         earliestSampleMs: Number.isFinite(entry.earliestSampleMs) ? Number(entry.earliestSampleMs) : null,
-        availableMetrics: Array.from(entry.availableMetrics ?? [])
+        availableMetrics: Array.from(entry.availableMetrics ?? []),
+        latestMetrics
       });
     }
     nodes.sort((a, b) => {

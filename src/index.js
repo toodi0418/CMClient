@@ -601,7 +601,8 @@ async function startMonitor(argv) {
         messageLogStore: sharedDataStore,
         tracerouteLogStore: sharedDataStore,
         telemetryProvider: bridge,
-        aprsDebugProvider: () => bridge.getAprsDebugSnapshot()
+        aprsDebugProvider: () => bridge.getAprsDebugSnapshot(),
+        messageSender: (payload) => bridge.sendWebTextMessage(payload)
       };
       const telemetryMaxTotalOverride = resolveTelemetryMaxTotalRecords();
       if (telemetryMaxTotalOverride) {

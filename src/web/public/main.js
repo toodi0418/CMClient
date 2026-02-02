@@ -55,6 +55,8 @@
   const channelPageLastBtn = document.getElementById('channel-page-last');
   const channelPageSizeSelect = document.getElementById('channel-page-size');
   const quickMessageChannelSelect = document.getElementById('quick-message-channel');
+  const quickMessageInput = document.getElementById('quick-message-input');
+  const quickMessageSendBtn = document.getElementById('quick-message-send');
   const flowPage = document.getElementById('flow-page');
   const flowList = document.getElementById('flow-list');
   const flowEmptyState = document.getElementById('flow-empty-state');
@@ -866,6 +868,17 @@
     const delta = event.key === 'ArrowUp' ? -20 : 20;
     const current = mapPanel?.getBoundingClientRect().height || summarySplitLastHeight || 260;
     applySummaryMapHeight(current + delta);
+  });
+
+  quickMessageSendBtn?.addEventListener('click', () => {
+    sendQuickMessage();
+  });
+
+  quickMessageInput?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      sendQuickMessage();
+    }
   });
 
   let deckSplitDragging = false;
@@ -1905,6 +1918,40 @@
       if (!row || !row.__summaryData) continue;
       const visible = shouldShowSummaryRow(row.__summaryData, row, state);
       row.classList.toggle('hidden', !visible);
+    }
+  }
+
+  let quickMessageSending = false;
+
+  async function sendQuickMessage() {
+    if (quickMessageSending) return;
+    const text = typeof quickMessageInput?.value === 'string' ? quickMessageInput.value.trim() : '';
+    if (!text) return;
+    const channel = Number.isFinite(Number(quickMessageChannelSelect?.value))
+      ? Number(quickMessageChannelSelect.value)
+      : 0;
+    quickMessageSending = true;
+    if (quickMessageSendBtn) quickMessageSendBtn.disabled = true;
+    try {
+      const response = await fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, channel })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.ok === false) {
+        const message = payload?.message || payload?.error || '訊息傳送失敗';
+        appendLog({ tag: 'MESSAGE', message: `送出失敗：${message}` });
+        return;
+      }
+      if (quickMessageInput) {
+        quickMessageInput.value = '';
+      }
+    } catch (err) {
+      appendLog({ tag: 'MESSAGE', message: `送出失敗：${err?.message || '未知錯誤'}` });
+    } finally {
+      quickMessageSending = false;
+      if (quickMessageSendBtn) quickMessageSendBtn.disabled = false;
     }
   }
 
