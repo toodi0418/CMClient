@@ -941,6 +941,22 @@
       return;
     }
 
+    // Collect all related node IDs from traceroute data
+    const relatedNodeIds = new Set();
+    relatedNodeIds.add(selectedNodeMeshId);
+
+    const source = mapInstance.getSource(MAP_TRACEROUTE_SOURCE_ID);
+    if (source && source._data && source._data.features) {
+      source._data.features.forEach(feature => {
+        const from = feature.properties?.from;
+        const to = feature.properties?.to;
+        if (from === selectedNodeMeshId || to === selectedNodeMeshId) {
+          relatedNodeIds.add(from);
+          relatedNodeIds.add(to);
+        }
+      });
+    }
+
     // Build filter for related traceroutes (where from or to matches selected node)
     const relatedFilter = [
       'any',
@@ -981,11 +997,12 @@
     ]);
     mapInstance.setFilter(MAP_TRACEROUTE_LABEL_LAYER_ID, relatedFilter);
 
-    // Dim unrelated nodes
+    // Highlight selected node and all related nodes
     if (mapInstance.getLayer(`${MAP_LAYER_ID}-unclustered`)) {
+      const relatedArray = Array.from(relatedNodeIds);
       mapInstance.setPaintProperty(`${MAP_LAYER_ID}-unclustered`, 'circle-opacity', [
         'case',
-        ['==', ['get', 'meshId'], selectedNodeMeshId],
+        ['in', ['get', 'meshId'], ['literal', relatedArray]],
         1,
         0.2
       ]);
