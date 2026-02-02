@@ -1210,6 +1210,7 @@
         'text-ignore-placement': true,
         'text-keep-upright': false,
         'text-rotation-alignment': 'map',
+        'text-rotate': 90,
         'text-padding': 0,
         'text-offset': [0, 0]
       },
