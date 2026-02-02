@@ -599,6 +599,7 @@
   let mapRoutesOnly = false;
   let selectedTracerouteId = null;
   let selectedNodeMeshId = null;
+  let mapVisibleNodeIds = new Set();
   let mapRoleFilterValue = 'all';
   const mapRoleCache = new Map();
   let tracerouteAnimationFrame = null;
@@ -727,19 +728,10 @@
     const features = [];
     let total = 0;
     let withCoords = 0;
+    const visibleNodeIds = new Set();
 
     let routedNodeIds = null;
     if (mapRoutesOnly) {
-      const entries = tracerouteRows.filter((entry) => {
-        const status = (entry?.status || entry?.variant || '').toString().toLowerCase();
-        const timestamp = extractSummaryTimestampMs(entry);
-        const age = Date.now() - timestamp;
-        return status && status !== 'pending' && age <= tracerouteTopologyWindowHours * 3600000;
-      });
-      const graph = buildTracerouteTopologyGraph(entries.slice(0, 100));
-      routedNodeIds = new Set(graph.nodes.map((node) => node.id));
-    } else if (mapShowTraceroute) {
-      // Also collect routed nodes when traceroute is shown (even if not in routes-only mode)
       const entries = tracerouteRows.filter((entry) => {
         const status = (entry?.status || entry?.variant || '').toString().toLowerCase();
         const timestamp = extractSummaryTimestampMs(entry);
@@ -765,10 +757,7 @@
         return;
       }
       const age = Math.max(now - lastSeen, 0);
-      const isRoutedNode = routedNodeIds && routedNodeIds.has(meshKey);
-
-      // Skip time window filter for routed nodes when traceroute is shown
-      if (!isRoutedNode && age > mapWindowMs) {
+      if (age > mapWindowMs) {
         return;
       }
       withCoords += 1;
@@ -780,8 +769,7 @@
       } else {
         status = 'offline';
       }
-      // Skip offline filter for routed nodes when traceroute is shown
-      if (!mapShowOffline && status === 'offline' && !isRoutedNode) {
+      if (!mapShowOffline && status === 'offline') {
         return;
       }
       const resolvedRoleLabel = resolveRoleLabel(entry);
@@ -820,8 +808,9 @@
           totalHops: entry.totalHops
         }
       });
+      visibleNodeIds.add(meshKey);
     });
-    return { features, total, withCoords };
+    return { features, total, withCoords, visibleNodeIds };
   }
 
   function syncContentAreaHeight() {
@@ -848,8 +837,9 @@
 
   function updateMapNodes() {
     if (!mapInstance || !mapReady) return;
-    const { features, total, withCoords } = buildMapNodeFeatures();
+    const { features, total, withCoords, visibleNodeIds } = buildMapNodeFeatures();
     mapFeatureCache = features;
+    mapVisibleNodeIds = visibleNodeIds || new Set();
     const source = mapInstance.getSource(MAP_SOURCE_ID);
     if (source && typeof source.setData === 'function') {
       source.setData({ type: 'FeatureCollection', features });
@@ -885,6 +875,11 @@
     const features = [];
 
     graph.edges.forEach((edge) => {
+      // Skip edges where either endpoint node is not visible
+      if (!mapVisibleNodeIds.has(edge.from) || !mapVisibleNodeIds.has(edge.to)) {
+        return;
+      }
+
       const fromNode = nodeRegistry.get(edge.from);
       const toNode = nodeRegistry.get(edge.to);
       const fromCoords = resolveNodeCoordinates(fromNode);
