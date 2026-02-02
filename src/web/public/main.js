@@ -901,7 +901,8 @@
           id: featureId,
           geometry: {
             type: 'LineString',
-            coordinates: [fromCoords, toCoords]
+            // Reverse coordinates for return paths so arrows point correctly
+            coordinates: edge.direction === 'return' ? [toCoords, fromCoords] : [fromCoords, toCoords]
           },
           properties: {
             id: featureId,
@@ -1209,6 +1210,7 @@
         'text-ignore-placement': true,
         'text-keep-upright': false,
         'text-rotation-alignment': 'map',
+        'text-pitch-alignment': 'map',
         'text-padding': 0,
         'text-offset': [0, -0.1]
       },
