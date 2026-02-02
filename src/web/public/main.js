@@ -37,6 +37,7 @@
   const mapToggleOffline = document.getElementById('map-toggle-offline');
   const mapToggleTelemetry = document.getElementById('map-toggle-telemetry');
   const mapToggleTraceroute = document.getElementById('map-toggle-traceroute');
+  const mapToggleRoutesOnly = document.getElementById('map-toggle-routes-only');
   const mapPanel = document.getElementById('map-panel');
   const mapSlotSummary = document.querySelector('[data-map-slot="summary"]');
   const mapSlotFull = document.querySelector('[data-map-slot="map"]');
@@ -520,7 +521,8 @@
     mapZoom: 'tmag:web:map:zoom',
     mapCollapsed: 'tmag:web:map:collapsed',
     summaryCollapsed: 'tmag:web:summary:collapsed',
-    mapShowTraceroute: 'tmag:web:map:show-traceroute'
+    mapShowTraceroute: 'tmag:web:map:show-traceroute',
+    mapRoutesOnly: 'tmag:web:map:routes-only'
   };
 
   function isValidTelemetryRangeMode(mode) {
@@ -589,6 +591,7 @@
   let summaryCollapsed = false;
   let mapTelemetryOnly = false;
   let mapShowTraceroute = false;
+  let mapRoutesOnly = false;
   let mapRoleFilterValue = 'all';
   const mapRoleCache = new Map();
 
@@ -715,8 +718,27 @@
     const features = [];
     let total = 0;
     let withCoords = 0;
+
+    let routedNodeIds = null;
+    if (mapRoutesOnly) {
+      const entries = tracerouteRows.filter((entry) => {
+        const status = (entry?.status || entry?.variant || '').toString().toLowerCase();
+        const timestamp = extractSummaryTimestampMs(entry);
+        const age = Date.now() - timestamp;
+        return status && status !== 'pending' && age <= tracerouteTopologyWindowHours * 3600000;
+      });
+      const graph = buildTracerouteTopologyGraph(entries.slice(0, 100));
+      routedNodeIds = new Set(graph.nodes.map((node) => node.id));
+    }
+
     nodeRegistry.forEach((entry) => {
       total += 1;
+      const meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
+
+      if (mapRoutesOnly && routedNodeIds && !routedNodeIds.has(meshKey)) {
+        return;
+      }
+
       const coords = resolveNodeCoordinates(entry);
       if (!coords) return;
       const lastSeen = getNodeLastSeenTimestamp(entry);
@@ -739,7 +761,7 @@
       if (!mapShowOffline && status === 'offline') {
         return;
       }
-      const meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
+      meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
       const resolvedRoleLabel = resolveRoleLabel(entry);
       let roleKey = formatMapRole(entry);
       if (roleKey !== 'unknown') {
@@ -1087,6 +1109,15 @@
     }
   }
 
+  function loadMapRoutesOnlyState() {
+    const stored = safeStorageGet(STORAGE_KEYS.mapRoutesOnly);
+    if (stored == null) return;
+    mapRoutesOnly = stored === '1' || stored === 'true';
+    if (mapToggleRoutesOnly) {
+      mapToggleRoutesOnly.checked = mapRoutesOnly;
+    }
+  }
+
   function loadSummaryCollapseState() {
     const stored = safeStorageGet(STORAGE_KEYS.summaryCollapsed);
     if (stored == null || !summaryToggleBtn || !summaryStack) return;
@@ -1243,6 +1274,7 @@
       loadMapCollapseState();
       loadSummaryCollapseState();
       loadMapTracerouteState();
+      loadMapRoutesOnlyState();
       syncContentAreaHeight();
       syncSummaryStackHeight();
       updateMapNodes();
@@ -1306,6 +1338,12 @@
     mapShowTraceroute = Boolean(mapToggleTraceroute.checked);
     safeStorageSet(STORAGE_KEYS.mapShowTraceroute, mapShowTraceroute ? '1' : '0');
     updateMapTraceroutes();
+  });
+
+  mapToggleRoutesOnly?.addEventListener('change', () => {
+    mapRoutesOnly = Boolean(mapToggleRoutesOnly.checked);
+    safeStorageSet(STORAGE_KEYS.mapRoutesOnly, mapRoutesOnly ? '1' : '0');
+    scheduleMapUpdate();
   });
 
   summaryToggleBtn?.addEventListener('click', () => {
