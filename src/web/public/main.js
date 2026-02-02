@@ -1358,7 +1358,7 @@
         'icon-padding': 0,
         'icon-rotate': [
           'case',
-          ['==', ['get', 'direction'], 'return'],
+          ['==', ['get', 'direction'], 'forward'],
           180,
           0
         ]
