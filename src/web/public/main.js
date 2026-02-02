@@ -882,7 +882,7 @@
           const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
           const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
           const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
-          snrLabel = `${fStr} / ${rStr}`;
+          snrLabel = `→ ${fStr} / ← ${rStr}`;
         } else {
           snrLabel = Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : '';
         }
@@ -9685,7 +9685,7 @@
           const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
           const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
           const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
-          displayLabel = `${fStr} / ${rStr}`;
+          displayLabel = `→${fStr} / ←${rStr}`;
         } else {
           displayLabel = `${formatNumber(scaledSnr, 1)}dB`;
         }
