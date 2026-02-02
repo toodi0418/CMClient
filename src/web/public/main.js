@@ -1308,9 +1308,9 @@
       paint: {
         'icon-opacity': [
           'case',
-          ['==', selectedTracerouteId || 'none', 'none'], 1,
+          ['==', selectedTracerouteId || 'none', 'none'], 0.8,
           ['==', ['get', 'id'], selectedTracerouteId], 1,
-          0
+          0.2
         ]
       }
     });
@@ -1332,9 +1332,9 @@
       paint: {
         'icon-opacity': [
           'case',
-          ['==', selectedTracerouteId || 'none', 'none'], 1,
+          ['==', selectedTracerouteId || 'none', 'none'], 0.8,
           ['==', ['get', 'id'], selectedTracerouteId], 1,
-          0
+          0.2
         ]
       }
     });
