@@ -1204,15 +1204,14 @@
         'symbol-placement': 'line',
         'symbol-spacing': 100,
         'text-field': '➤',
-        'text-size': 12,
+        'text-size': 14,
         'text-font': ['Noto Sans Regular'],
         'text-allow-overlap': true,
         'text-ignore-placement': true,
         'text-keep-upright': false,
         'text-rotation-alignment': 'map',
-        'text-pitch-alignment': 'map',
         'text-padding': 0,
-        'text-offset': [0, -0.1]
+        'text-offset': [0, 0]
       },
       paint: {
         'text-color': [
