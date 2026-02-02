@@ -1860,6 +1860,18 @@ details[open]>.details-summary::after {
   color: #ff6b6b !important;
 }
 
+.edge-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  fill: #f7fbff;
+  stroke: rgba(8, 14, 24, 0.9);
+  stroke-width: 3px;
+  paint-order: stroke;
+  pointer-events: none;
+}
+
 .traceroute-list {
   margin-top: 14px;
   display: grid;

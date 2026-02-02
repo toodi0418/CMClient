@@ -1080,9 +1080,9 @@
         'text-field': ['get', 'snrLabel'],
         'text-font': ['Noto Sans Regular'],
         'text-size': 11,
-        'symbol-placement': 'point',
+        'symbol-placement': 'line-center',
         'text-allow-overlap': false,
-        'text-offset': [0, -1]
+        'text-offset': [0, 0]
       },
       paint: {
         'text-color': '#f7fbff',
@@ -9407,8 +9407,8 @@
         const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
         const snrLabel = formatNumber(scaledSnr, 2);
         label.setAttribute('class', `edge-label edge-snr-${category}`);
-        label.setAttribute('x', cx1 + nx * 10);
-        label.setAttribute('y', cy1 + ny * 10);
+        label.setAttribute('x', cx1);
+        label.setAttribute('y', cy1);
         label.textContent = `${snrLabel}dB`;
         layer.appendChild(label);
       }
