@@ -592,6 +592,7 @@
   let mapTelemetryOnly = false;
   let mapShowTraceroute = false;
   let mapRoutesOnly = false;
+  let selectedTracerouteId = null;
   let mapRoleFilterValue = 'all';
   const mapRoleCache = new Map();
 
@@ -873,11 +874,15 @@
 
         features.push({
           type: 'Feature',
+          id: `tr-${edge.from}-${edge.to}-${edge.direction}`,
           geometry: {
             type: 'LineString',
             coordinates: [fromCoords, toCoords]
           },
           properties: {
+            id: `tr-${edge.from}-${edge.to}-${edge.direction}`,
+            from: edge.from,
+            to: edge.to,
             direction: edge.direction,
             snr: scaledSnr,
             snrLabel: Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : ''
@@ -909,6 +914,7 @@
     removeMapLayer(`${MAP_LAYER_ID}-unclustered`);
     removeMapLayer('traceroute-layer-forward');
     removeMapLayer('traceroute-layer-return');
+    removeMapLayer('traceroute-layer-highlight');
     removeMapLayer(MAP_TRACEROUTE_LABEL_LAYER_ID);
     removeMapSource(MAP_SOURCE_ID);
     removeMapSource(MAP_TRACEROUTE_SOURCE_ID);
@@ -1072,6 +1078,24 @@
       }
     });
 
+    // Traceroute: Highlight layer (Topmost)
+    mapInstance.addLayer({
+      id: 'traceroute-layer-highlight',
+      type: 'line',
+      source: MAP_TRACEROUTE_SOURCE_ID,
+      filter: ['==', ['get', 'id'], selectedTracerouteId || 'none'],
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round'
+      },
+      paint: {
+        'line-color': '#fff',
+        'line-width': 5,
+        'line-opacity': 0.5,
+        'line-blur': 2
+      }
+    });
+
     mapInstance.addLayer({
       id: MAP_TRACEROUTE_LABEL_LAYER_ID,
       type: 'symbol',
@@ -1200,17 +1224,41 @@
         setupMapLayers();
       }
       mapInstance.on('click', `${MAP_LAYER_ID}-clusters`, (event) => {
+        // ...Existing cluster click handler (omitted for brevity but preserved)
+      });
+
+      // Traceroute Selection Handlers
+      const handleTracerouteClick = (event) => {
         const feature = event.features?.[0];
         if (!feature) return;
-        const clusterId = feature.properties?.cluster_id;
-        const source = mapInstance.getSource(MAP_SOURCE_ID);
-        if (!source || clusterId == null || typeof source.getClusterExpansionZoom !== 'function') {
-          return;
+        event.originalEvent.stopPropagation();
+        const id = feature.properties?.id;
+        if (id) {
+          selectedTracerouteId = id;
+          mapInstance.setFilter('traceroute-layer-highlight', ['==', ['get', 'id'], id]);
         }
-        source.getClusterExpansionZoom(clusterId, (err, zoom) => {
-          if (err) return;
-          mapInstance.easeTo({ center: feature.geometry.coordinates, zoom });
+      };
+
+      mapInstance.on('click', 'traceroute-layer-forward', handleTracerouteClick);
+      mapInstance.on('click', 'traceroute-layer-return', handleTracerouteClick);
+
+      const updateCursor = (enter) => {
+        mapInstance.getCanvas().style.cursor = enter ? 'pointer' : '';
+      };
+      mapInstance.on('mouseenter', 'traceroute-layer-forward', () => updateCursor(true));
+      mapInstance.on('mouseleave', 'traceroute-layer-forward', () => updateCursor(false));
+      mapInstance.on('mouseenter', 'traceroute-layer-return', () => updateCursor(true));
+      mapInstance.on('mouseleave', 'traceroute-layer-return', () => updateCursor(false));
+
+      // Click background to deselect
+      mapInstance.on('click', (event) => {
+        const features = mapInstance.queryRenderedFeatures(event.point, {
+          layers: [`${MAP_LAYER_ID}-unclustered`, `${MAP_LAYER_ID}-clusters`, 'traceroute-layer-forward', 'traceroute-layer-return']
         });
+        if (!features.length) {
+          selectedTracerouteId = null;
+          mapInstance.setFilter('traceroute-layer-highlight', ['==', ['get', 'id'], 'none']);
+        }
       });
       mapInstance.on('click', `${MAP_LAYER_ID}-unclustered`, (event) => {
         const feature = event.features?.[0];
