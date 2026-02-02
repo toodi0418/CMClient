@@ -1193,6 +1193,7 @@
       }
     });
     mapInstance.addControl(new window.maplibregl.NavigationControl({ visualizePitch: false }), 'top-right');
+    mapInstance.addControl(new window.maplibregl.FullscreenControl(), 'top-right');
     mapInstance.on('load', () => {
       mapReady = true;
       if (!mapInstance.getSource(MAP_SOURCE_ID)) {
