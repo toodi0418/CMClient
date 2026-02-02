@@ -882,10 +882,9 @@
           const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
           const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
           const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
-          snrLabel = `▲ ${fStr} / ▼ ${rStr}`;
+          snrLabel = `${fStr} / ${rStr}`;
         } else {
-          const icon = edge.direction === 'forward' ? '▲' : '▼';
-          snrLabel = Number.isFinite(scaledSnr) ? `${icon} ${formatNumber(scaledSnr, 1)}dB` : '';
+          snrLabel = Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : '';
         }
 
         let featureId = '';
@@ -9686,10 +9685,9 @@
           const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
           const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
           const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
-          displayLabel = `▲${fStr} / ▼${rStr}`; // Simplified with icons for SVG
+          displayLabel = `${fStr} / ${rStr}`;
         } else {
-          const icon = edge.direction === 'forward' ? '▲' : '▼';
-          displayLabel = `${icon}${formatNumber(scaledSnr, 1)}dB`;
+          displayLabel = `${formatNumber(scaledSnr, 1)}dB`;
         }
 
         const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
