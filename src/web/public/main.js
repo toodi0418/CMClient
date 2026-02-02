@@ -739,18 +739,17 @@
         return status && status !== 'pending' && age <= tracerouteTopologyWindowHours * 3600000;
       });
       const graph = buildTracerouteTopologyGraph(entries.slice(0, 100));
-      // Filter out broadcast addresses and label-prefixed IDs (like 'label:!ffffffff')
-      routedNodeIds = new Set(
-        graph.nodes
-          .map((node) => node.id)
-          .filter((id) => {
-            // Exclude IDs starting with 'label:' (these are not normalized mesh IDs)
-            if (id.startsWith('label:')) return false;
-            // Exclude broadcast addresses
-            if (id === '!ffffffff' || id === 'ffffffff') return false;
-            return true;
-          })
-      );
+      // Collect node IDs from edges (nodes that actually have line connections)
+      routedNodeIds = new Set();
+      graph.edges.forEach((edge) => {
+        // Exclude broadcast addresses and label-prefixed IDs
+        if (!edge.from.startsWith('label:') && edge.from !== '!ffffffff' && edge.from !== 'ffffffff') {
+          routedNodeIds.add(edge.from);
+        }
+        if (!edge.to.startsWith('label:') && edge.to !== '!ffffffff' && edge.to !== 'ffffffff') {
+          routedNodeIds.add(edge.to);
+        }
+      });
     }
 
     nodeRegistry.forEach((entry) => {
