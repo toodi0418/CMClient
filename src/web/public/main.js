@@ -1217,7 +1217,7 @@
         'symbol-placement': 'line',
         'symbol-spacing': 100,
         'icon-image': 'arrow-icon',
-        'icon-size': 0.6,
+        'icon-size': 1.0,
         'icon-allow-overlap': true,
         'icon-ignore-placement': true,
         'icon-keep-upright': false,
