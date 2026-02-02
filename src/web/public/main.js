@@ -788,7 +788,7 @@
         properties: {
           status,
           label,
-          meshId: entry.meshId || entry.meshIdNormalized || '',
+          meshId: entry.meshIdNormalized || entry.meshId || '',
           lastSeen: lastSeen || null,
           role: roleKey,
           roleLabel: resolvedRoleLabel || '',
