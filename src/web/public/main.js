@@ -1051,7 +1051,8 @@
         const role = feature.properties?.roleLabel || feature.properties?.role || 'unknown';
         const usedHops = feature.properties?.usedHops;
         const totalHops = feature.properties?.totalHops;
-        const hopsHtml = (usedHops != null && totalHops != null)
+        const isSelf = currentSelfMeshId && meshId === currentSelfMeshId;
+        const hopsHtml = (!isSelf && usedHops != null && totalHops != null)
           ? `<div class="map-popup-meta"><span>跳數</span><span>${usedHops}/${totalHops}</span></div>`
           : '';
 
