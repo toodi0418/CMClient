@@ -1831,17 +1831,13 @@
         selectedNodeMeshId = normalizedMeshId || meshId;
         updateTracerouteFiltering();
       });
-      updateMapClusterVisibility();
-      mapInstance.on('moveend', () => {
-        const view = mapInstance.getCenter();
-        safeStorageSet(STORAGE_KEYS.mapCenter, JSON.stringify([view.lng, view.lat]));
-        safeStorageSet(STORAGE_KEYS.mapZoom, String(mapInstance.getZoom()));
-      });
       loadMapCollapseState();
       loadSummaryCollapseState();
       loadMapTracerouteState();
       loadMapRoutesOnlyState();
       loadMapToolbarState();
+
+      updateMapClusterVisibility(); // Now mapUseCluster is correctly loaded
       syncContentAreaHeight();
       syncSummaryStackHeight();
       updateMapNodes();
