@@ -1038,7 +1038,7 @@
       paint: {
         'line-color': [
           'step',
-          ['get', 'snr'],
+          ['coalesce', ['get', 'snr'], -99],
           '#ff6b6b', // BAD: SNR <= -13
           -13, '#f0a04b', // MID: -13 < SNR <= -7
           -7, '#60d394' // GOOD: SNR > -7
@@ -1061,7 +1061,7 @@
       paint: {
         'line-color': [
           'step',
-          ['get', 'snr'],
+          ['coalesce', ['get', 'snr'], -99],
           '#ff6b6b',
           -13, '#f0a04b',
           -7, '#60d394'
