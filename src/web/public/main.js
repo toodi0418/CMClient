@@ -882,7 +882,7 @@
           const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
           const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
           const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
-          snrLabel = `→ ${fStr} / ← ${rStr}`;
+          snrLabel = `${fStr} / ${rStr}`;
         } else {
           snrLabel = Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : '';
         }
@@ -977,6 +977,8 @@
     removeMapLayer('traceroute-layer-highlight');
     removeMapLayer('traceroute-layer-bidirectional');
     removeMapLayer('traceroute-layer-arrows');
+    removeMapLayer('traceroute-bidir-forward-arrow');
+    removeMapLayer('traceroute-bidir-return-arrow');
     removeMapLayer(MAP_TRACEROUTE_LABEL_LAYER_ID);
     removeMapSource(MAP_SOURCE_ID);
     removeMapSource(MAP_TRACEROUTE_SOURCE_ID);
@@ -1098,6 +1100,34 @@
     arrowImage.onload = () => {
       if (!mapInstance.hasImage('arrow-icon')) {
         mapInstance.addImage('arrow-icon', arrowImage);
+      }
+    };
+
+    // Create small forward arrow for bidirectional SNR
+    const forwardArrowSvg = `
+      <svg width="12" height="12" viewBox="0 0 12 12" xmlns="http://www.w3.org/2000/svg">
+        <path d="M2 6 L10 6 M7 3 L10 6 L7 9" fill="none" stroke="#60d394" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    `;
+    const forwardArrowImage = new Image(12, 12);
+    forwardArrowImage.src = 'data:image/svg+xml;base64,' + btoa(forwardArrowSvg);
+    forwardArrowImage.onload = () => {
+      if (!mapInstance.hasImage('forward-arrow-small')) {
+        mapInstance.addImage('forward-arrow-small', forwardArrowImage);
+      }
+    };
+
+    // Create small return arrow for bidirectional SNR
+    const returnArrowSvg = `
+      <svg width="12" height="12" viewBox="0 0 12 12" xmlns="http://www.w3.org/2000/svg">
+        <path d="M10 6 L2 6 M5 3 L2 6 L5 9" fill="none" stroke="#f0a04b" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    `;
+    const returnArrowImage = new Image(12, 12);
+    returnArrowImage.src = 'data:image/svg+xml;base64,' + btoa(returnArrowSvg);
+    returnArrowImage.onload = () => {
+      if (!mapInstance.hasImage('return-arrow-small')) {
+        mapInstance.addImage('return-arrow-small', returnArrowImage);
       }
     };
 
@@ -1253,6 +1283,54 @@
         'text-halo-color': 'rgba(8, 19, 32, 0.85)',
         'text-halo-width': 1.5,
         'text-opacity': [
+          'case',
+          ['==', selectedTracerouteId || 'none', 'none'], 1,
+          ['==', ['get', 'id'], selectedTracerouteId], 1,
+          0
+        ]
+      }
+    });
+
+    // Bidirectional SNR: Forward arrow indicator
+    mapInstance.addLayer({
+      id: 'traceroute-bidir-forward-arrow',
+      type: 'symbol',
+      source: MAP_TRACEROUTE_SOURCE_ID,
+      filter: ['==', ['get', 'isBidirectional'], true],
+      layout: {
+        'icon-image': 'forward-arrow-small',
+        'icon-size': 1.2,
+        'symbol-placement': 'line-center',
+        'icon-offset': [-30, -10],
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true
+      },
+      paint: {
+        'icon-opacity': [
+          'case',
+          ['==', selectedTracerouteId || 'none', 'none'], 1,
+          ['==', ['get', 'id'], selectedTracerouteId], 1,
+          0
+        ]
+      }
+    });
+
+    // Bidirectional SNR: Return arrow indicator
+    mapInstance.addLayer({
+      id: 'traceroute-bidir-return-arrow',
+      type: 'symbol',
+      source: MAP_TRACEROUTE_SOURCE_ID,
+      filter: ['==', ['get', 'isBidirectional'], true],
+      layout: {
+        'icon-image': 'return-arrow-small',
+        'icon-size': 1.2,
+        'symbol-placement': 'line-center',
+        'icon-offset': [30, -10],
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true
+      },
+      paint: {
+        'icon-opacity': [
           'case',
           ['==', selectedTracerouteId || 'none', 'none'], 1,
           ['==', ['get', 'id'], selectedTracerouteId], 1,
