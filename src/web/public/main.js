@@ -64,11 +64,38 @@
   function playMessageSound() {
     try {
       const audio = new Audio(MESSAGE_SOUND_B64);
-      audio.play().catch(e => console.warn('無法播放音效 (可能需要使用者互動):', e));
+      audio.play().catch(e => {
+        // Suppress NotAllowedError (expected if user hasn't interacted yet)
+        if (e.name !== 'NotAllowedError') {
+          console.warn('無法播放音效:', e);
+        }
+      });
     } catch (e) {
       console.warn('建立音效失敗:', e);
     }
   }
+
+  // Unlock audio on first user interaction
+  function unlockAudio() {
+    try {
+      const audio = new Audio(MESSAGE_SOUND_B64);
+      audio.volume = 0;
+      audio.play().then(() => {
+        // Audio unlocked successfully
+        document.removeEventListener('click', unlockAudio);
+        document.removeEventListener('keydown', unlockAudio);
+        document.removeEventListener('touchstart', unlockAudio);
+      }).catch(() => {
+        // Ignore errors during unlock attempt
+      });
+    } catch (e) {
+      // Ignore errors
+    }
+  }
+
+  document.addEventListener('click', unlockAudio);
+  document.addEventListener('keydown', unlockAudio);
+  document.addEventListener('touchstart', unlockAudio);
   const channelPaginationCurrent = document.getElementById('channel-pagination-current');
   const channelPaginationTotal = document.getElementById('channel-pagination-total');
   const channelPageFirstBtn = document.getElementById('channel-page-first');
