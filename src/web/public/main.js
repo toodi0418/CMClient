@@ -1050,7 +1050,12 @@
           -7, '#60d394' // GOOD: SNR > -7
         ],
         'line-width': 2.5,
-        'line-opacity': 0.8
+        'line-opacity': [
+          'case',
+          ['==', selectedTracerouteId || 'none', 'none'], 0.8,
+          ['==', ['get', 'id'], selectedTracerouteId], 1,
+          0.15
+        ]
       }
     });
 
@@ -1073,7 +1078,12 @@
           -7, '#60d394'
         ],
         'line-width': 2,
-        'line-opacity': 0.7,
+        'line-opacity': [
+          'case',
+          ['==', selectedTracerouteId || 'none', 'none'], 0.7,
+          ['==', ['get', 'id'], selectedTracerouteId], 1,
+          0.15
+        ],
         'line-dasharray': [2, 2]
       }
     });
@@ -1236,6 +1246,21 @@
         if (id) {
           selectedTracerouteId = id;
           mapInstance.setFilter('traceroute-layer-highlight', ['==', ['get', 'id'], id]);
+          mapInstance.setPaintProperty('traceroute-layer-forward', 'line-opacity', [
+            'case',
+            ['==', ['get', 'id'], id], 1,
+            0.15
+          ]);
+          mapInstance.setPaintProperty('traceroute-layer-return', 'line-opacity', [
+            'case',
+            ['==', ['get', 'id'], id], 1,
+            0.15
+          ]);
+          mapInstance.setPaintProperty(MAP_TRACEROUTE_LABEL_LAYER_ID, 'text-opacity', [
+            'case',
+            ['==', ['get', 'id'], id], 1,
+            0
+          ]);
         }
       };
 
@@ -1258,6 +1283,9 @@
         if (!features.length) {
           selectedTracerouteId = null;
           mapInstance.setFilter('traceroute-layer-highlight', ['==', ['get', 'id'], 'none']);
+          mapInstance.setPaintProperty('traceroute-layer-forward', 'line-opacity', 0.8);
+          mapInstance.setPaintProperty('traceroute-layer-return', 'line-opacity', 0.7);
+          mapInstance.setPaintProperty(MAP_TRACEROUTE_LABEL_LAYER_ID, 'text-opacity', 1);
         }
       });
       mapInstance.on('click', `${MAP_LAYER_ID}-unclustered`, (event) => {
