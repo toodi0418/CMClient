@@ -758,7 +758,9 @@
 
       // Filter for routes-only mode: only show nodes in the route topology
       if (mapRoutesOnly) {
-        if (!routedNodeIds || routedNodeIds.size === 0 || !routedNodeIds.has(meshKey)) {
+        const hasRoutes = routedNodeIds && routedNodeIds.size > 0 && routedNodeIds.has(meshKey);
+        console.log(`[Routes-Only Check] meshKey: ${meshKey}, hasRoutes: ${hasRoutes}`);
+        if (!hasRoutes) {
           return;
         }
       }
