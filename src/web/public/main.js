@@ -916,6 +916,7 @@
     removeMapLayer('traceroute-layer-forward');
     removeMapLayer('traceroute-layer-return');
     removeMapLayer('traceroute-layer-highlight');
+    removeMapLayer('traceroute-layer-bidirectional');
     removeMapLayer(MAP_TRACEROUTE_LABEL_LAYER_ID);
     removeMapSource(MAP_SOURCE_ID);
     removeMapSource(MAP_TRACEROUTE_SOURCE_ID);
