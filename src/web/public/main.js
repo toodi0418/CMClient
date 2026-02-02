@@ -1192,17 +1192,17 @@
       }
     };
 
-    // Create return arrow icon (pointing left)
-    const returnArrowSvg = `
+    // Create return arrow icon for single-direction paths (pointing left)
+    const returnPathArrowSvg = `
       <svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
         <path d="M10 2 L2 10 L10 18 L10 12 L18 12 L18 8 L10 8 Z" fill="white" stroke="rgba(8, 19, 32, 0.6)" stroke-width="1"/>
       </svg>
     `;
-    const returnArrowImage = new Image(20, 20);
-    returnArrowImage.src = 'data:image/svg+xml;base64,' + btoa(returnArrowSvg);
-    returnArrowImage.onload = () => {
+    const returnPathArrowImage = new Image(20, 20);
+    returnPathArrowImage.src = 'data:image/svg+xml;base64,' + btoa(returnPathArrowSvg);
+    returnPathArrowImage.onload = () => {
       if (!mapInstance.hasImage('return-arrow-icon')) {
-        mapInstance.addImage('return-arrow-icon', returnArrowImage);
+        mapInstance.addImage('return-arrow-icon', returnPathArrowImage);
       }
     };
 
