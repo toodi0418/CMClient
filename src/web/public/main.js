@@ -17,6 +17,10 @@
   const callmeshProvisionDetails = document.getElementById('callmesh-provision-details');
   const summaryTable = document.getElementById('summary-table');
   const logList = document.getElementById('log-list');
+  const mapContainer = document.getElementById('mesh-map');
+  const mapStatusLabel = document.getElementById('map-status');
+  const mapFitBtn = document.getElementById('map-fit');
+  const mapRefreshBtn = document.getElementById('map-refresh');
   const navButtons = document.querySelectorAll('.nav-btn');
   const pages = document.querySelectorAll('.page');
   const messagesPage = document.getElementById('messages-page');
@@ -443,7 +447,9 @@
     callmeshProvisionOpen: 'tmag:web:callmeshProvision:open',
     telemetryRangeMode: 'tmag:web:telemetry:range-mode',
     telemetryPageSize: 'tmag:web:telemetry:page-size',
-    messagePageSize: 'tmag:web:messages:page-size'
+    messagePageSize: 'tmag:web:messages:page-size',
+    mapCenter: 'tmag:web:map:center',
+    mapZoom: 'tmag:web:map:zoom'
   };
 
   function isValidTelemetryRangeMode(mode) {
@@ -492,6 +498,249 @@
       safeStorageSet(STORAGE_KEYS.callmeshProvisionOpen, callmeshProvisionDetails.open ? '1' : '0');
     });
   }
+
+  const MAP_CENTER_FALLBACK = [120.5174, 23.66552];
+  const MAP_ZOOM_FALLBACK = 7;
+  const MAP_ONLINE_WINDOW_MS = 10 * 60 * 1000;
+  const MAP_SOURCE_ID = 'mesh-nodes';
+  const MAP_LAYER_ID = 'mesh-nodes-layer';
+  let mapInstance = null;
+  let mapReady = false;
+  let mapUpdateTimer = null;
+  let mapFeatureCache = [];
+
+  function showMapStatus(message) {
+    if (!mapStatusLabel) return;
+    mapStatusLabel.textContent = message || '';
+    if (message) {
+      mapStatusLabel.classList.add('show');
+    } else {
+      mapStatusLabel.classList.remove('show');
+    }
+  }
+
+  function resolveInitialMapView() {
+    const storedCenter = safeStorageGet(STORAGE_KEYS.mapCenter);
+    const storedZoom = safeStorageGet(STORAGE_KEYS.mapZoom);
+    if (storedCenter) {
+      try {
+        const parsed = JSON.parse(storedCenter);
+        if (Array.isArray(parsed) && parsed.length === 2) {
+          const lon = Number(parsed[0]);
+          const lat = Number(parsed[1]);
+          if (Number.isFinite(lon) && Number.isFinite(lat)) {
+            const zoom = Number(storedZoom);
+            return {
+              center: [lon, lat],
+              zoom: Number.isFinite(zoom) ? zoom : MAP_ZOOM_FALLBACK
+            };
+          }
+        }
+      } catch {
+        // ignore invalid cache
+      }
+    }
+    if (
+      selfProvisionCoords &&
+      Number.isFinite(selfProvisionCoords.lon) &&
+      Number.isFinite(selfProvisionCoords.lat)
+    ) {
+      return {
+        center: [selfProvisionCoords.lon, selfProvisionCoords.lat],
+        zoom: 10
+      };
+    }
+    return { center: MAP_CENTER_FALLBACK, zoom: MAP_ZOOM_FALLBACK };
+  }
+
+  function resolveNodeCoordinates(entry) {
+    const lat = Number(entry?.latitude);
+    const lon = Number(entry?.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    if (Math.abs(lat) < 1e-6 && Math.abs(lon) < 1e-6) return null;
+    return [lon, lat];
+  }
+
+  function buildMapNodeFeatures() {
+    const now = Date.now();
+    const features = [];
+    let total = 0;
+    let withCoords = 0;
+    nodeRegistry.forEach((entry) => {
+      total += 1;
+      const coords = resolveNodeCoordinates(entry);
+      if (!coords) return;
+      withCoords += 1;
+      const lastSeen = getNodeLastSeenTimestamp(entry);
+      let status = 'unknown';
+      if (Number.isFinite(lastSeen)) {
+        const age = Math.max(now - lastSeen, 0);
+        if (age <= MAP_ONLINE_WINDOW_MS) {
+          status = 'online';
+        } else if (age <= NODE_ONLINE_WINDOW_MS) {
+          status = 'recent';
+        } else {
+          status = 'offline';
+        }
+      }
+      const label = formatNodeDisplayLabel(entry) || entry.meshId || entry.meshIdNormalized || '未知節點';
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: coords },
+        properties: {
+          status,
+          label,
+          meshId: entry.meshId || entry.meshIdNormalized || '',
+          lastSeen: lastSeen || null
+        }
+      });
+    });
+    return { features, total, withCoords };
+  }
+
+  function updateMapNodes() {
+    if (!mapInstance || !mapReady) return;
+    const { features, total, withCoords } = buildMapNodeFeatures();
+    mapFeatureCache = features;
+    const source = mapInstance.getSource(MAP_SOURCE_ID);
+    if (source && typeof source.setData === 'function') {
+      source.setData({ type: 'FeatureCollection', features });
+    }
+    if (mapStatusLabel) {
+      if (withCoords === 0) {
+        showMapStatus(total > 0 ? `尚未收到有效座標（${total} 節點）` : '尚未收到節點座標');
+      } else {
+        showMapStatus(`顯示 ${withCoords} / ${total} 個節點`);
+      }
+    }
+  }
+
+  function scheduleMapUpdate() {
+    if (!mapInstance || !mapReady) return;
+    if (mapUpdateTimer) return;
+    mapUpdateTimer = setTimeout(() => {
+      mapUpdateTimer = null;
+      updateMapNodes();
+    }, 200);
+  }
+
+  function fitMapToNodes() {
+    if (!mapInstance || !mapReady || !mapFeatureCache.length) return;
+    const bounds = mapFeatureCache.reduce((acc, feature) => {
+      const coords = feature.geometry?.coordinates;
+      if (!Array.isArray(coords) || coords.length !== 2) return acc;
+      return acc.extend(coords);
+    }, new window.maplibregl.LngLatBounds(mapFeatureCache[0].geometry.coordinates, mapFeatureCache[0].geometry.coordinates));
+    mapInstance.fitBounds(bounds, { padding: 60, maxZoom: 12, duration: 600 });
+  }
+
+  function ensureMapReady() {
+    if (!mapContainer) return;
+    if (!window.maplibregl) {
+      showMapStatus('MapLibre 未載入，請確認本地資源。');
+      return;
+    }
+    if (!window.maplibregl.workerUrl) {
+      window.maplibregl.workerUrl = '/vendor/maplibre-gl-csp-worker.js';
+    }
+    if (mapInstance) {
+      mapInstance.resize();
+      updateMapNodes();
+      return;
+    }
+    showMapStatus('正在載入向量圖磚…');
+    const { center, zoom } = resolveInitialMapView();
+    mapInstance = new window.maplibregl.Map({
+      container: mapContainer,
+      style: '/map/style.json',
+      center,
+      zoom,
+      minZoom: 2,
+      maxZoom: 15,
+      attributionControl: true,
+      transformRequest: (url) => {
+        try {
+          const resolved = new URL(url, window.location.origin);
+          return { url: resolved.toString() };
+        } catch {
+          return { url };
+        }
+      }
+    });
+    mapInstance.addControl(new window.maplibregl.NavigationControl({ visualizePitch: false }), 'top-right');
+    mapInstance.on('load', () => {
+      mapReady = true;
+      if (!mapInstance.getSource(MAP_SOURCE_ID)) {
+        mapInstance.addSource(MAP_SOURCE_ID, {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] }
+        });
+        mapInstance.addLayer({
+          id: MAP_LAYER_ID,
+          type: 'circle',
+          source: MAP_SOURCE_ID,
+          paint: {
+            'circle-radius': 6,
+            'circle-color': [
+              'match',
+              ['get', 'status'],
+              'online',
+              '#40d9c6',
+              'recent',
+              '#f6c453',
+              'offline',
+              '#f97316',
+              '#94a3b8'
+            ],
+            'circle-stroke-color': '#0b1220',
+            'circle-stroke-width': 1
+          }
+        });
+      }
+      mapInstance.on('click', MAP_LAYER_ID, (event) => {
+        const feature = event.features?.[0];
+        if (!feature) return;
+        const label = feature.properties?.label || '未知節點';
+        const meshId = feature.properties?.meshId || '';
+        const lastSeen = feature.properties?.lastSeen
+          ? formatRelativeTime(new Date(Number(feature.properties.lastSeen)).toISOString())
+          : '—';
+        const html = `
+          <div class="map-popup">
+            <div class="map-popup-title">${escapeHtml(label)}</div>
+            <div class="map-popup-meta">${escapeHtml(meshId)}</div>
+            <div class="map-popup-meta">最後出現：${escapeHtml(lastSeen)}</div>
+          </div>
+        `;
+        new window.maplibregl.Popup({ offset: 12 })
+          .setLngLat(event.lngLat)
+          .setHTML(html)
+          .addTo(mapInstance);
+      });
+      mapInstance.on('moveend', () => {
+        const view = mapInstance.getCenter();
+        safeStorageSet(STORAGE_KEYS.mapCenter, JSON.stringify([view.lng, view.lat]));
+        safeStorageSet(STORAGE_KEYS.mapZoom, String(mapInstance.getZoom()));
+      });
+      updateMapNodes();
+    });
+    mapInstance.on('error', (event) => {
+      if (event?.error?.message) {
+        showMapStatus(`地圖載入失敗：${event.error.message}`);
+      } else {
+        showMapStatus('地圖載入失敗');
+      }
+    });
+  }
+
+  mapFitBtn?.addEventListener('click', () => {
+    fitMapToNodes();
+  });
+
+  mapRefreshBtn?.addEventListener('click', () => {
+    updateMapNodes();
+  });
 
   relayHintCloseBtn?.addEventListener('click', () => {
     closeRelayHintDialog();
@@ -1900,6 +2149,7 @@
     }
     updateSelfLabel();
     renderTracerouteView();
+    scheduleMapUpdate();
   }
 
   function handleNodeUpdate(payload) {
@@ -1918,6 +2168,7 @@
     }
     updateSelfLabel();
     renderTracerouteView();
+    scheduleMapUpdate();
   }
 
   function getRegistryNode(meshId) {
@@ -1993,6 +2244,8 @@
         renderTelemetryView();
       } else if (isActive && targetId === 'flow-page') {
         renderFlowEntries();
+      } else if (isActive && targetId === 'map-page') {
+        ensureMapReady();
       } else if (isActive && targetId === 'nodes-page') {
         renderNodeDatabase();
       } else if (isActive && targetId === 'messages-page') {

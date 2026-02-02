@@ -1,10 +1,19 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const { URL } = require('url');
 const fsPromises = fs.promises;
+const geojsonvt = require('geojson-vt');
+const vtpbf = require('vt-pbf');
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = require('node:sqlite'));
+} catch {
+  DatabaseSync = null;
+}
 const { getAppTimezone, normalizeTimezone } = require('../timezone');
 
 const MAX_PORT_NUMBER = 65_535;
@@ -17,6 +26,7 @@ const RAW_ENV_PORT =
 const ENV_PORT_DEFINED = Boolean(RAW_ENV_PORT);
 const DEFAULT_PORT = normalizePortNumber(RAW_ENV_PORT, 7080);
 const DEFAULT_HOST = process.env.TMAG_WEB_HOST || '0.0.0.0';
+const DEFAULT_VECTOR_MBTILES_URL = 'https://download.geofabrik.de/asia/taiwan-shortbread-1.0.mbtiles';
 const PACKET_WINDOW_MS = 10 * 60 * 1000;
 const PACKET_BUCKET_MS = 60 * 1000;
 const MAX_SUMMARY_ROWS = 200;
@@ -130,6 +140,69 @@ function normalizePortNumber(rawValue, fallback) {
   return port;
 }
 
+function resolveOptionalPath(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    return path.resolve(trimmed);
+  }
+  return null;
+}
+
+function isGzipBuffer(buffer) {
+  if (!buffer || buffer.length < 2) return false;
+  return buffer[0] === 0x1f && buffer[1] === 0x8b;
+}
+
+function ensureDirectory(filePath) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+function shouldAutoDownloadVectorTiles() {
+  const value = process.env.TMAG_VECTOR_AUTO_DOWNLOAD;
+  if (value === undefined || value === null || value === '') return true;
+  const normalized = String(value).trim().toLowerCase();
+  return !(normalized === '0' || normalized === 'false' || normalized === 'no');
+}
+
+function downloadFile(url, destination) {
+  return new Promise((resolve, reject) => {
+    const visited = new Set();
+    const download = (targetUrl) => {
+      if (!targetUrl || visited.has(targetUrl)) {
+        reject(new Error('download loop'));
+        return;
+      }
+      visited.add(targetUrl);
+      const client = targetUrl.startsWith('https:') ? https : http;
+      const request = client.get(targetUrl, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          const nextUrl = new URL(res.headers.location, targetUrl).toString();
+          res.resume();
+          download(nextUrl);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error(`download failed (${res.statusCode})`));
+          res.resume();
+          return;
+        }
+        const fileStream = fs.createWriteStream(destination);
+        res.pipe(fileStream);
+        fileStream.on('finish', () => {
+          fileStream.close(resolve);
+        });
+        fileStream.on('error', (err) => {
+          fileStream.close(() => reject(err));
+        });
+      });
+      request.on('error', reject);
+    };
+    download(url);
+  });
+}
+
 class WebDashboardServer {
   constructor(options = {}) {
     const preferredPort = normalizePortNumber(options.port, DEFAULT_PORT);
@@ -170,6 +243,25 @@ class WebDashboardServer {
     this.server = null;
     this.clients = new Set();
     this._publicDir = path.resolve(__dirname, 'public');
+    this._vendorDir = path.resolve(__dirname, '..', '..', 'node_modules', 'maplibre-gl', 'dist');
+    this._vectorTilesDir = resolveOptionalPath(
+      options.vectorTilesDir,
+      process.env.TMAG_VECTOR_TILES_DIR,
+      path.join(this._publicDir, 'map', 'tiles')
+    );
+    this._vectorMbtilesPath = resolveOptionalPath(
+      options.vectorMbtilesPath,
+      process.env.TMAG_VECTOR_MBTILES,
+      path.join(this._publicDir, 'map', 'tiles.mbtiles')
+    );
+    this._vectorGeojsonPath = resolveOptionalPath(
+      options.vectorGeojsonPath,
+      process.env.TMAG_VECTOR_GEOJSON,
+      path.join(this._publicDir, 'map', 'land.geojson')
+    );
+    this._vectorMbtiles = null;
+    this._vectorMbtilesStmt = null;
+    this._vectorTileIndex = null;
     this._pingTimer = null;
 
     this.summaryRows = [];
@@ -238,6 +330,7 @@ class WebDashboardServer {
       return;
     }
 
+    await this._ensureVectorMbtilesAvailable();
     await this._loadMessageLog();
     await this._loadTracerouteLog();
 
@@ -303,6 +396,14 @@ class WebDashboardServer {
     }
     if (pathname === '/debug') {
       this._handleDebugRequest(req, res);
+      return;
+    }
+    if (pathname && pathname.startsWith('/vendor/')) {
+      this._serveVendorAsset(pathname, res);
+      return;
+    }
+    if (pathname && pathname.startsWith('/map/tiles/')) {
+      this._handleVectorTileRequest(pathname, res);
       return;
     }
     this._serveStatic(req, res);
@@ -879,7 +980,14 @@ class WebDashboardServer {
 
   _serveStatic(req, res) {
     const urlPath = req.url === '/' ? '/index.html' : req.url;
-    const safePath = urlPath.split('?')[0].replace(/(\.\.(\/|\\))/g, '');
+    const rawPath = urlPath.split('?')[0];
+    let decodedPath = rawPath;
+    try {
+      decodedPath = decodeURIComponent(rawPath);
+    } catch {
+      decodedPath = rawPath;
+    }
+    const safePath = decodedPath.replace(/(\.\.(\/|\\))/g, '');
     const filePath = path.join(this._publicDir, safePath);
     if (!filePath.startsWith(this._publicDir)) {
       res.writeHead(403);
@@ -898,6 +1006,208 @@ class WebDashboardServer {
       });
       res.end(data);
     });
+  }
+
+  _serveVendorAsset(urlPath, res) {
+    const assetMap = {
+      '/vendor/maplibre-gl.js': 'maplibre-gl.js',
+      '/vendor/maplibre-gl.css': 'maplibre-gl.css',
+      '/vendor/maplibre-gl.js.map': 'maplibre-gl.js.map',
+      '/vendor/maplibre-gl.css.map': 'maplibre-gl.css.map',
+      '/vendor/maplibre-gl-csp-worker.js': 'maplibre-gl-csp-worker.js',
+      '/vendor/maplibre-gl-csp-worker.js.map': 'maplibre-gl-csp-worker.js.map'
+    };
+    const fileName = assetMap[urlPath];
+    if (!fileName) {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+    if (!this._vendorDir) {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+    const filePath = path.join(this._vendorDir, fileName);
+    if (!filePath.startsWith(this._vendorDir)) {
+      res.writeHead(403);
+      res.end('Forbidden');
+      return;
+    }
+    fs.readFile(filePath, (err, data) => {
+      if (err) {
+        res.writeHead(err.code === 'ENOENT' ? 404 : 500);
+        res.end(err.code === 'ENOENT' ? 'Not found' : 'Server error');
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': this._getMimeType(filePath)
+      });
+      res.end(data);
+    });
+  }
+
+  _handleVectorTileRequest(pathname, res) {
+    const match = pathname.match(/^\/map\/tiles\/(\d+)\/(\d+)\/(\d+)\.pbf$/);
+    if (!match) {
+      res.writeHead(400);
+      res.end('Bad request');
+      return;
+    }
+    const z = Number(match[1]);
+    const x = Number(match[2]);
+    const y = Number(match[3]);
+    if (!Number.isFinite(z) || !Number.isFinite(x) || !Number.isFinite(y)) {
+      res.writeHead(400);
+      res.end('Bad request');
+      return;
+    }
+    const respondWithBuffer = (buffer) => {
+      const data = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+      const headers = {
+        'Content-Type': 'application/x-protobuf',
+        'Cache-Control': 'public, max-age=3600'
+      };
+      if (isGzipBuffer(data)) {
+        headers['Content-Encoding'] = 'gzip';
+      }
+      res.writeHead(200, headers);
+      res.end(data);
+    };
+    const mbtileData = this._readVectorTileFromMbtiles(z, x, y);
+    if (mbtileData) {
+      respondWithBuffer(mbtileData);
+      return;
+    }
+    if (this._vectorTilesDir) {
+      const tilePath = path.join(this._vectorTilesDir, String(z), String(x), `${y}.pbf`);
+      if (tilePath.startsWith(this._vectorTilesDir)) {
+        fs.readFile(tilePath, (err, data) => {
+          if (!err && data) {
+            respondWithBuffer(data);
+            return;
+          }
+          const fallback = this._buildVectorTileFromGeojson(z, x, y);
+          if (fallback) {
+            respondWithBuffer(fallback);
+            return;
+          }
+          res.writeHead(204);
+          res.end();
+        });
+        return;
+      }
+    }
+    const fallback = this._buildVectorTileFromGeojson(z, x, y);
+    if (fallback) {
+      respondWithBuffer(fallback);
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  }
+
+  async _ensureVectorMbtilesAvailable() {
+    if (!this._vectorMbtilesPath) {
+      return;
+    }
+    if (fs.existsSync(this._vectorMbtilesPath)) {
+      return;
+    }
+    if (!shouldAutoDownloadVectorTiles()) {
+      return;
+    }
+    const url = (process.env.TMAG_VECTOR_MBTILES_URL || DEFAULT_VECTOR_MBTILES_URL || '').trim();
+    if (!url) {
+      return;
+    }
+    const tempPath = `${this._vectorMbtilesPath}.download`;
+    try {
+      ensureDirectory(this._vectorMbtilesPath);
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+      }
+      // eslint-disable-next-line no-console
+      console.log(`[WEB] 下載向量圖磚中：${url}`);
+      await downloadFile(url, tempPath);
+      fs.renameSync(tempPath, this._vectorMbtilesPath);
+      // eslint-disable-next-line no-console
+      console.log('[WEB] 向量圖磚下載完成');
+    } catch (err) {
+      try {
+        if (fs.existsSync(tempPath)) {
+          fs.unlinkSync(tempPath);
+        }
+      } catch {
+        // ignore cleanup
+      }
+      console.warn(`[WEB] 向量圖磚下載失敗: ${err.message}`);
+    }
+  }
+
+  _openVectorMbtiles() {
+    if (!this._vectorMbtilesPath || !DatabaseSync) {
+      return null;
+    }
+    if (this._vectorMbtiles) {
+      return this._vectorMbtiles;
+    }
+    try {
+      if (!fs.existsSync(this._vectorMbtilesPath)) {
+        return null;
+      }
+      this._vectorMbtiles = new DatabaseSync(this._vectorMbtilesPath, { readOnly: true });
+      this._vectorMbtilesStmt = this._vectorMbtiles.prepare(
+        'SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ? LIMIT 1'
+      );
+      return this._vectorMbtiles;
+    } catch (err) {
+      console.warn(`無法開啟 MBTiles: ${err.message}`);
+      this._vectorMbtiles = null;
+      this._vectorMbtilesStmt = null;
+      return null;
+    }
+  }
+
+  _readVectorTileFromMbtiles(z, x, y) {
+    const db = this._openVectorMbtiles();
+    if (!db || !this._vectorMbtilesStmt) return null;
+    const maxIndex = Math.pow(2, z);
+    const tmsY = maxIndex - 1 - y;
+    if (tmsY < 0) return null;
+    try {
+      const row = this._vectorMbtilesStmt.get(z, x, tmsY);
+      return row?.tile_data || null;
+    } catch (err) {
+      console.warn(`讀取 MBTiles 失敗: ${err.message}`);
+      return null;
+    }
+  }
+
+  _buildVectorTileFromGeojson(z, x, y) {
+    if (!this._vectorGeojsonPath) return null;
+    if (!this._vectorTileIndex) {
+      try {
+        const raw = fs.readFileSync(this._vectorGeojsonPath, 'utf8');
+        const data = JSON.parse(raw);
+        this._vectorTileIndex = geojsonvt(data, {
+          maxZoom: 6,
+          indexMaxZoom: 5,
+          indexMaxPoints: 20000,
+          buffer: 64
+        });
+      } catch {
+        this._vectorTileIndex = null;
+      }
+    }
+    if (!this._vectorTileIndex) return null;
+    try {
+      const tile = this._vectorTileIndex.getTile(z, x, y);
+      if (!tile) return null;
+      return vtpbf.fromGeojsonVt({ land: tile }, { version: 2 });
+    } catch {
+      return null;
+    }
   }
 
   _handleEventStream(_req, res) {
@@ -2192,6 +2502,9 @@ class WebDashboardServer {
     if (filePath.endsWith('.js')) return 'application/javascript; charset=utf-8';
     if (filePath.endsWith('.css')) return 'text/css; charset=utf-8';
     if (filePath.endsWith('.json')) return 'application/json; charset=utf-8';
+    if (filePath.endsWith('.map')) return 'application/json; charset=utf-8';
+    if (filePath.endsWith('.pbf')) return 'application/x-protobuf';
+    if (filePath.endsWith('.png')) return 'image/png';
     return 'text/plain; charset=utf-8';
   }
 

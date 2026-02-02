@@ -5,381 +5,416 @@
   <meta charset="utf-8" />
   <title>TMAG Web Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/vendor/maplibre-gl.css" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 
 <body>
-  <header>
-    <h1>
-      TMAG Web Dashboard
-      <span id="app-version" class="app-version">v—</span>
-    </h1>
-    <p>同步展示 Meshtastic 封包、CallMesh 狀態與 APRS 流程。</p>
-  </header>
+  <div class="app-shell">
+    <aside class="app-rail">
+      <header class="brand-header">
+        <div class="brand-title">
+          <h1>TMAG Monitor</h1>
+          <span id="app-version" class="app-version">v—</span>
+        </div>
+        <p class="brand-subtitle">同步展示 Meshtastic 封包、CallMesh 狀態與 APRS 流程。</p>
+      </header>
 
-  <main>
-    <section class="status-panel">
-      <div class="status-item">
-        <span class="label">Meshtastic：</span>
-        <span id="status-label" class="value status-value">尚未連線</span>
-      </div>
-      <div class="status-item">
-        <span class="label">本機節點：</span>
-        <span id="self-label" class="value">尚未取得</span>
-      </div>
-      <div class="status-item">
-        <span class="label">CallMesh：</span>
-        <span id="callmesh-label" class="value">尚未取得</span>
-      </div>
-      <div class="status-item">
-        <span class="label">APRS：</span>
-        <span id="aprs-status-label" class="value">尚未取得</span>
-      </div>
-    </section>
+      <section class="status-panel card">
+        <div class="status-item">
+          <span class="label">Meshtastic</span>
+          <span id="status-label" class="value status-value">尚未連線</span>
+        </div>
+        <div class="status-item">
+          <span class="label">本機節點</span>
+          <span id="self-label" class="value">尚未取得</span>
+        </div>
+        <div class="status-item">
+          <span class="label">CallMesh</span>
+          <span id="callmesh-label" class="value">尚未取得</span>
+        </div>
+        <div class="status-item">
+          <span class="label">APRS</span>
+          <span id="aprs-status-label" class="value">尚未取得</span>
+        </div>
+      </section>
 
-    <section class="counter-panel">
-      <article class="counter-card">
-        <span class="counter-label">10 分鐘封包</span>
-        <span id="counter-packets" class="counter-value">0</span>
-      </article>
-      <article class="counter-card">
-        <span class="counter-label">已上傳 APRS</span>
-        <span id="counter-aprs" class="counter-value">0</span>
-      </article>
-      <article class="counter-card">
-        <span class="counter-label">Mapping 節點</span>
-        <span id="counter-mapping" class="counter-value">0</span>
-      </article>
-    </section>
-
-    <nav class="main-nav">
-      <button type="button" class="nav-btn active" data-target="summary-page">封包摘要</button>
-      <button type="button" class="nav-btn" data-target="messages-page">訊息</button>
-      <button type="button" class="nav-btn" data-target="flow-page">Mapping 封包追蹤</button>
-      <button type="button" class="nav-btn" data-target="routing-page">Traceroute</button>
-      <button type="button" class="nav-btn" data-target="nodes-page">節點資料庫</button>
-      <button type="button" class="nav-btn" data-target="telemetry-page">遙測數據</button>
-      <button type="button" class="nav-btn" data-target="log-page">系統日誌</button>
-    </nav>
-
-    <section id="summary-page" class="page active">
-      <section class="info-layout">
-        <article class="info-card">
-          <details id="callmesh-provision-details" class="info-details" open>
-            <summary>CallMesh Provision</summary>
-            <div class="info-content">
-              <dl class="info-grid">
-                <div>
-                  <dt>呼號</dt>
-                  <dd id="callmesh-callsign">—</dd>
-                </div>
-                <div>
-                  <dt>符號</dt>
-                  <dd id="callmesh-symbol">—</dd>
-                </div>
-                <div>
-                  <dt>座標</dt>
-                  <dd id="callmesh-coords">—</dd>
-                </div>
-                <div>
-                  <dt>PHG 詳細</dt>
-                  <dd id="callmesh-phg">—</dd>
-                </div>
-                <div>
-                  <dt>備註</dt>
-                  <dd id="callmesh-comment" class="multiline">—</dd>
-                </div>
-                <div>
-                  <dt>最後更新</dt>
-                  <dd id="callmesh-updated">—</dd>
-                </div>
-              </dl>
-            </div>
-          </details>
+      <section class="counter-panel">
+        <article class="counter-card">
+          <span class="counter-label">10 分鐘封包</span>
+          <span id="counter-packets" class="counter-value">0</span>
+        </article>
+        <article class="counter-card">
+          <span class="counter-label">已上傳 APRS</span>
+          <span id="counter-aprs" class="counter-value">0</span>
+        </article>
+        <article class="counter-card">
+          <span class="counter-label">Mapping 節點</span>
+          <span id="counter-mapping" class="counter-value">0</span>
         </article>
       </section>
 
-      <section class="table-panel">
-        <header class="panel-header">
-          <h2>封包摘要</h2>
-          <span class="panel-meta">資料列最多保留 200 筆</span>
-        </header>
-        <div class="table-wrapper">
-          <table>
-            <thead>
-              <tr>
-                <th>時間</th>
-                <th>節點</th>
-                <th>最後轉發</th>
-                <th>Ch</th>
-                <th>SNR</th>
-                <th>RSSI</th>
-                <th>類型</th>
-                <th>Hops</th>
-                <th>資訊</th>
-              </tr>
-            </thead>
-            <tbody id="summary-table"></tbody>
-          </table>
-        </div>
-      </section>
-    </section>
+      <nav class="main-nav">
+        <button type="button" class="nav-btn active" data-target="summary-page">封包摘要</button>
+        <button type="button" class="nav-btn" data-target="map-page">地圖</button>
+        <button type="button" class="nav-btn" data-target="messages-page">訊息</button>
+        <button type="button" class="nav-btn" data-target="flow-page">Mapping 追蹤</button>
+        <button type="button" class="nav-btn" data-target="routing-page">Traceroute</button>
+        <button type="button" class="nav-btn" data-target="nodes-page">節點資料庫</button>
+        <button type="button" class="nav-btn" data-target="telemetry-page">遙測數據</button>
+        <button type="button" class="nav-btn" data-target="log-page">系統日誌</button>
+      </nav>
 
-    <section id="messages-page" class="page">
-      <article class="messages-panel">
-        <header class="messages-header">
-          <h2>訊息頻道</h2>
-          <p class="messages-subtitle">查看 TMAG 預設對講頻道與最近文字封包紀錄。</p>
-        </header>
-        <div class="messages-layout">
-          <aside id="channel-nav" class="channel-nav"></aside>
-          <section class="channel-content">
-            <header class="channel-content-header">
-              <h3 id="channel-title">Primary Channel (CH0)</h3>
-              <p id="channel-note">日常主要通訊頻道</p>
-            </header>
-            <div id="channel-message-list" class="channel-messages">
-              <div class="channel-message-empty">尚未收到訊息</div>
+      <div class="rail-footer">
+        <div class="rail-tip">資料顯示以伺服器時區為準</div>
+      </div>
+    </aside>
+
+    <main class="app-content">
+      <section id="summary-page" class="page active">
+        <section class="info-layout">
+          <article class="info-card card">
+            <details id="callmesh-provision-details" class="info-details" open>
+              <summary>CallMesh Provision</summary>
+              <div class="info-content">
+                <dl class="info-grid">
+                  <div>
+                    <dt>呼號</dt>
+                    <dd id="callmesh-callsign">—</dd>
+                  </div>
+                  <div>
+                    <dt>符號</dt>
+                    <dd id="callmesh-symbol">—</dd>
+                  </div>
+                  <div>
+                    <dt>座標</dt>
+                    <dd id="callmesh-coords">—</dd>
+                  </div>
+                  <div>
+                    <dt>PHG 詳細</dt>
+                    <dd id="callmesh-phg">—</dd>
+                  </div>
+                  <div>
+                    <dt>備註</dt>
+                    <dd id="callmesh-comment" class="multiline">—</dd>
+                  </div>
+                  <div>
+                    <dt>最後更新</dt>
+                    <dd id="callmesh-updated">—</dd>
+                  </div>
+                </dl>
+              </div>
+            </details>
+          </article>
+        </section>
+
+        <section class="table-panel card">
+          <header class="panel-header">
+            <h2>封包摘要</h2>
+            <span class="panel-meta">資料列最多保留 200 筆</span>
+          </header>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>時間</th>
+                  <th>節點</th>
+                  <th>最後轉發</th>
+                  <th>Ch</th>
+                  <th>SNR</th>
+                  <th>RSSI</th>
+                  <th>類型</th>
+                  <th>Hops</th>
+                  <th>資訊</th>
+                </tr>
+              </thead>
+              <tbody id="summary-table"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="map-page" class="page">
+        <section class="map-panel card">
+          <header class="panel-header">
+            <div>
+              <h2>節點地圖</h2>
+              <p class="panel-subtitle">使用本地向量圖磚顯示節點座標與活動狀態。</p>
             </div>
-            <footer id="channel-pagination" class="channel-pagination hidden">
-              <div id="channel-pagination-info" class="channel-pagination-info">顯示 0-0，共 0 筆訊息</div>
-              <div class="channel-pagination-controls">
-                <button id="channel-page-first" type="button" class="channel-page-btn" disabled>«</button>
-                <button id="channel-page-prev" type="button" class="channel-page-btn" disabled>‹</button>
-                <span class="channel-page-status">
-                  第 <span id="channel-pagination-current">1</span> / <span id="channel-pagination-total">1</span> 頁
-                </span>
-                <button id="channel-page-next" type="button" class="channel-page-btn" disabled>›</button>
-                <button id="channel-page-last" type="button" class="channel-page-btn" disabled>»</button>
-                <label class="channel-page-size">
-                  每頁
-                  <select id="channel-page-size">
-                    <option value="25" selected>25</option>
-                    <option value="50">50</option>
-                    <option value="100">100</option>
+            <div class="panel-actions">
+              <button id="map-fit" type="button" class="ghost-btn">對焦節點</button>
+              <button id="map-refresh" type="button" class="ghost-btn">更新</button>
+            </div>
+          </header>
+          <div class="map-shell">
+            <div id="mesh-map" class="map-canvas"></div>
+            <div id="map-status" class="map-status">正在載入向量圖磚…</div>
+            <div class="map-legend">
+              <div class="legend-row"><span class="legend-dot legend-online"></span>線上節點</div>
+              <div class="legend-row"><span class="legend-dot legend-recent"></span>最近 1 小時</div>
+              <div class="legend-row"><span class="legend-dot legend-offline"></span>超過 1 小時</div>
+              <div class="legend-row"><span class="legend-dot legend-unknown"></span>座標不足</div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section id="messages-page" class="page">
+        <article class="messages-panel card">
+          <header class="messages-header">
+            <h2>訊息頻道</h2>
+            <p class="messages-subtitle">查看 TMAG 預設對講頻道與最近文字封包紀錄。</p>
+          </header>
+          <div class="messages-layout">
+            <aside id="channel-nav" class="channel-nav"></aside>
+            <section class="channel-content">
+              <header class="channel-content-header">
+                <h3 id="channel-title">Primary Channel (CH0)</h3>
+                <p id="channel-note">日常主要通訊頻道</p>
+              </header>
+              <div id="channel-message-list" class="channel-messages">
+                <div class="channel-message-empty">尚未收到訊息</div>
+              </div>
+              <footer id="channel-pagination" class="channel-pagination hidden">
+                <div id="channel-pagination-info" class="channel-pagination-info">顯示 0-0，共 0 筆訊息</div>
+                <div class="channel-pagination-controls">
+                  <button id="channel-page-first" type="button" class="channel-page-btn" disabled>«</button>
+                  <button id="channel-page-prev" type="button" class="channel-page-btn" disabled>‹</button>
+                  <span class="channel-page-status">
+                    第 <span id="channel-pagination-current">1</span> / <span id="channel-pagination-total">1</span> 頁
+                  </span>
+                  <button id="channel-page-next" type="button" class="channel-page-btn" disabled>›</button>
+                  <button id="channel-page-last" type="button" class="channel-page-btn" disabled>»</button>
+                  <label class="channel-page-size">
+                    每頁
+                    <select id="channel-page-size">
+                      <option value="25" selected>25</option>
+                      <option value="50">50</option>
+                      <option value="100">100</option>
+                    </select>
+                    筆
+                  </label>
+                </div>
+              </footer>
+            </section>
+          </div>
+        </article>
+      </section>
+
+      <section id="flow-page" class="page">
+        <section class="flow-panel card">
+          <header class="flow-header">
+            <h2>Mapping 封包追蹤</h2>
+            <p class="flow-hint">僅列出具 Mapping 資訊的位置封包；若已上傳 APRS 會顯示對應訊息。</p>
+            <div class="flow-search-row">
+              <input id="flow-search" type="search" placeholder="搜尋節點、Mapping 或 CallSign" />
+              <select id="flow-filter-state">
+                <option value="all" selected>全部狀態</option>
+                <option value="aprs">已上傳 APRS</option>
+                <option value="pending">待處理</option>
+              </select>
+            </div>
+          </header>
+          <div id="flow-empty-state" class="flow-empty hidden">尚無 Mapping 封包。</div>
+          <div id="flow-list" class="flow-list hidden"></div>
+        </section>
+      </section>
+
+      <section id="routing-page" class="page">
+        <section class="table-panel card">
+          <header class="panel-header">
+            <h2>Traceroute</h2>
+            <span class="panel-meta">顯示最近的 Traceroute 請求與結果 (最多 200 筆)</span>
+          </header>
+          <div class="traceroute-topology-panel">
+            <div class="traceroute-topology-header">
+              <div class="traceroute-topology-legend">
+                <span class="legend-item"><span class="legend-dot snr-good"></span> SNR &gt; -7 dB</span>
+                <span class="legend-item"><span class="legend-dot snr-mid"></span> -13 ~ -7 dB</span>
+                <span class="legend-item"><span class="legend-dot snr-bad"></span> SNR ≤ -13 dB</span>
+                <span class="legend-item"><span class="legend-dot snr-unknown"></span> Unknown</span>
+                <span class="legend-item"><span class="legend-line forward"></span> Forward</span>
+                <span class="legend-item"><span class="legend-line return"></span> Return</span>
+              </div>
+              <div class="traceroute-topology-controls">
+                <button id="traceroute-refresh" type="button" class="topology-btn">Refresh</button>
+                <label class="topology-select">
+                  Window:
+                  <select id="traceroute-window">
+                    <option value="1">Last 1 Hour</option>
+                    <option value="3" selected>Last 3 Hours</option>
+                    <option value="12">Last 12 Hours</option>
+                    <option value="24">Last 24 Hours</option>
                   </select>
-                  筆
+                </label>
+                <label class="topology-select">
+                  Layout:
+                  <select id="traceroute-layout">
+                    <option value="pyramid" selected>Pyramid (Hubs Top)</option>
+                    <option value="radial">Radial (Origin Center)</option>
+                    <option value="grid">Grid</option>
+                  </select>
                 </label>
               </div>
-            </footer>
+            </div>
+            <div class="traceroute-topology-canvas">
+              <svg id="traceroute-topology" viewBox="0 0 960 520" preserveAspectRatio="xMidYMid meet"></svg>
+            </div>
+          </div>
+          <div id="routing-empty-state" class="flow-empty hidden">尚未收到 traceroute 回應。</div>
+          <div id="routing-list" class="traceroute-list"></div>
+        </section>
+      </section>
+
+      <section id="nodes-page" class="page">
+        <section class="nodes-panel">
+          <header class="nodes-header">
+            <div>
+              <h2>節點資料庫</h2>
+              <p class="nodes-subtitle">顯示目前快取的 Mesh 節點資訊。</p>
+            </div>
+            <div class="nodes-actions">
+              <span class="nodes-count">節點數：<strong id="nodes-total-count">0</strong></span>
+              <span class="nodes-online">線上 (1 小時內)：<strong id="nodes-online-count">0</strong><span id="nodes-online-total" class="nodes-online-total"></span></span>
+            </div>
+          </header>
+          <div class="nodes-search-row">
+            <input id="nodes-search" type="search" placeholder="搜尋節點名稱、Mesh ID 或角色" />
+          </div>
+          <small id="nodes-status" class="discover-status"></small>
+          <div id="nodes-empty-state" class="nodes-empty">目前沒有節點資料。</div>
+          <section id="nodes-table-wrapper" class="table-wrapper hidden">
+            <table class="nodes-table">
+              <thead>
+                <tr>
+                  <th>節點</th>
+                  <th>Mesh ID</th>
+                  <th>硬體</th>
+                  <th>角色</th>
+                  <th>座標</th>
+                  <th>距離</th>
+                  <th>最後出現</th>
+                </tr>
+              </thead>
+              <tbody id="nodes-table-body"></tbody>
+            </table>
           </section>
-        </div>
-      </article>
-    </section>
-
-    <section id="routing-page" class="page">
-      <section class="table-panel">
-        <header class="panel-header">
-          <h2>Traceroute</h2>
-          <span class="panel-meta">顯示最近的 Traceroute 請求與結果 (最多 200 筆)</span>
-        </header>
-        <div class="traceroute-topology-panel">
-          <div class="traceroute-topology-header">
-            <div class="traceroute-topology-legend">
-              <span class="legend-item"><span class="legend-dot snr-good"></span> SNR &gt; -7 dB</span>
-              <span class="legend-item"><span class="legend-dot snr-mid"></span> -13 ~ -7 dB</span>
-              <span class="legend-item"><span class="legend-dot snr-bad"></span> SNR ≤ -13 dB</span>
-              <span class="legend-item"><span class="legend-dot snr-unknown"></span> Unknown</span>
-              <span class="legend-item"><span class="legend-line forward"></span> Forward</span>
-              <span class="legend-item"><span class="legend-line return"></span> Return</span>
-            </div>
-            <div class="traceroute-topology-controls">
-              <button id="traceroute-refresh" type="button" class="topology-btn">Refresh</button>
-              <label class="topology-select">
-                Window:
-                <select id="traceroute-window">
-                  <option value="1">Last 1 Hour</option>
-                  <option value="3" selected>Last 3 Hours</option>
-                  <option value="12">Last 12 Hours</option>
-                  <option value="24">Last 24 Hours</option>
-                </select>
-              </label>
-              <label class="topology-select">
-                Layout:
-                <select id="traceroute-layout">
-                  <option value="pyramid" selected>Pyramid (Hubs Top)</option>
-                  <option value="circle">Circle</option>
-                </select>
-              </label>
-            </div>
-          </div>
-          <div class="traceroute-topology-wrap">
-            <svg id="traceroute-topology" class="traceroute-topology" role="img" aria-label="Traceroute topology"></svg>
-          </div>
-        </div>
-        <div id="routing-empty-state" class="flow-empty">尚未收到 traceroute 回應。</div>
-        <div id="routing-list" class="traceroute-list"></div>
+        </section>
       </section>
-    </section>
 
-    <section id="flow-page" class="page">
-      <section class="flow-panel">
-        <header class="flow-header">
-          <h2>Mapping 封包追蹤</h2>
-          <p class="flow-hint">僅列出具 Mapping 資訊的位置封包；若已上傳 APRS 會顯示對應訊息。</p>
-          <div class="flow-search-row">
-            <input id="flow-search" type="search" placeholder="搜尋節點、呼號或註記" />
-            <select id="flow-filter-state">
-              <option value="all">全部封包</option>
-              <option value="aprs">已上傳 APRS</option>
-              <option value="pending">待上傳</option>
-            </select>
-          </div>
-        </header>
-        <div id="flow-empty-state" class="flow-empty">尚未收到符合條件的封包。</div>
-        <div id="flow-list" class="flow-list"></div>
+      <section id="telemetry-page" class="page">
+        <section class="telemetry-panel card">
+          <header class="telemetry-header">
+            <div class="telemetry-controls">
+              <label for="telemetry-node-input">節點</label>
+              <input
+                id="telemetry-node-input"
+                type="search"
+                placeholder="輸入節點 Mesh ID 或搜尋關鍵字"
+                autocomplete="off"
+              />
+              <div id="telemetry-node-dropdown" class="telemetry-node-dropdown hidden"></div>
+            </div>
+            <div class="telemetry-chart-controls">
+              <label for="telemetry-chart-mode">圖表</label>
+              <select id="telemetry-chart-mode">
+                <option value="all">所有圖表</option>
+                <option value="single">單一圖表</option>
+              </select>
+              <select id="telemetry-chart-metric" class="hidden"></select>
+            </div>
+            <div class="telemetry-range-controls">
+              <label for="telemetry-range-select">範圍</label>
+              <select id="telemetry-range-select">
+                <option value="hour1">近 1 小時</option>
+                <option value="hour3">近 3 小時</option>
+                <option value="hour6">近 6 小時</option>
+                <option value="hour12">近 12 小時</option>
+                <option value="day">近 24 小時</option>
+                <option value="week">近 7 天</option>
+                <option value="month">近 30 天</option>
+                <option value="year">近 1 年</option>
+                <option value="custom">自訂區間</option>
+              </select>
+              <div id="telemetry-range-custom" class="telemetry-range-custom hidden">
+                <input type="datetime-local" id="telemetry-range-start" />
+                <span class="telemetry-range-separator">至</span>
+                <input type="datetime-local" id="telemetry-range-end" />
+              </div>
+            </div>
+            <div class="telemetry-updated">
+              <span class="label">更新：</span>
+              <span id="telemetry-updated-at">—</span>
+            </div>
+            <div class="telemetry-stats">
+              <div class="telemetry-stat">
+                <span class="label">筆數</span>
+                <span id="telemetry-stats-records" class="telemetry-stat-value">0</span>
+              </div>
+              <div class="telemetry-stat">
+                <span class="label">節點</span>
+                <span id="telemetry-stats-nodes" class="telemetry-stat-value">0</span>
+              </div>
+              <div class="telemetry-stat">
+                <span class="label">檔案</span>
+                <span id="telemetry-stats-disk" class="telemetry-stat-value">—</span>
+              </div>
+            </div>
+            <div class="telemetry-actions">
+              <button type="button" id="telemetry-download-btn" class="telemetry-download-btn">
+                下載 CSV
+              </button>
+            </div>
+          </header>
+          <div id="telemetry-empty-state" class="telemetry-empty">尚未收到遙測資料。</div>
+          <section id="telemetry-charts" class="telemetry-charts hidden"></section>
+          <section id="telemetry-table-wrapper" class="telemetry-table-wrapper hidden">
+            <table class="telemetry-table">
+              <thead>
+                <tr>
+                  <th>時間</th>
+                  <th>節點</th>
+                  <th>主要數據</th>
+                  <th>其他資訊</th>
+                </tr>
+              </thead>
+              <tbody id="telemetry-table-body"></tbody>
+            </table>
+            <div id="telemetry-pagination" class="telemetry-pagination hidden">
+              <div id="telemetry-pagination-info" class="telemetry-pagination-info">—</div>
+              <div class="telemetry-pagination-controls">
+                <button type="button" id="telemetry-page-first" class="telemetry-page-btn" aria-label="第一頁">«</button>
+                <button type="button" id="telemetry-page-prev" class="telemetry-page-btn" aria-label="上一頁">‹</button>
+                <span class="telemetry-page-status">
+                  第 <span id="telemetry-pagination-current">1</span> / <span id="telemetry-pagination-total">1</span> 頁
+                </span>
+                <button type="button" id="telemetry-page-next" class="telemetry-page-btn" aria-label="下一頁">›</button>
+                <button type="button" id="telemetry-page-last" class="telemetry-page-btn" aria-label="最後一頁">»</button>
+                <label class="telemetry-page-size">
+                  每頁
+                  <select id="telemetry-page-size" class="telemetry-page-size-select"></select>
+                </label>
+              </div>
+            </div>
+          </section>
+        </section>
       </section>
-    </section>
 
-    <section id="nodes-page" class="page">
-      <article class="nodes-panel">
-        <header class="nodes-header">
-          <div>
-            <h2>節點資料庫</h2>
-            <p class="nodes-subtitle">顯示目前快取的 Mesh 節點資訊。</p>
+      <section id="log-page" class="page">
+        <section class="log-panel card">
+          <header class="panel-header">
+            <h2>系統日誌</h2>
+            <span class="panel-meta">顯示最近 200 筆 Bridge / APRS / Mapping 事件</span>
+          </header>
+          <div class="panel-toolbar">
+            <input id="log-search" type="search" placeholder="篩選 tag 或關鍵字" />
+            <button id="log-clear" type="button">清除</button>
           </div>
-          <div class="nodes-actions">
-            <span class="nodes-count">節點數：<strong id="nodes-total-count">0</strong></span>
-            <span class="nodes-online">線上 (1 小時內)：<strong id="nodes-online-count">0</strong><span
-                id="nodes-online-total" class="nodes-online-total"></span></span>
-          </div>
-        </header>
-        <div class="nodes-search-row">
-          <input id="nodes-search" type="search" placeholder="搜尋節點名稱、Mesh ID 或角色" disabled />
-        </div>
-        <small id="nodes-status" class="nodes-status"></small>
-        <div id="nodes-empty-state" class="nodes-empty">目前沒有節點資料。</div>
-        <div id="nodes-table-wrapper" class="table-wrapper hidden">
-          <table class="nodes-table">
-            <thead>
-              <tr>
-                <th>節點</th>
-                <th>Mesh ID</th>
-                <th>型號</th>
-                <th>角色</th>
-                <th>座標</th>
-                <th>距離</th>
-                <th>最後出現</th>
-              </tr>
-            </thead>
-            <tbody id="nodes-table-body"></tbody>
-          </table>
-        </div>
-      </article>
-    </section>
-
-    <section id="telemetry-page" class="page">
-      <article class="telemetry-panel">
-        <header class="telemetry-header">
-          <div class="telemetry-controls">
-            <label for="telemetry-node-input">節點</label>
-            <input id="telemetry-node-input" type="search" placeholder="輸入節點 Mesh ID 或搜尋關鍵字" autocomplete="off"
-              disabled />
-            <div id="telemetry-node-dropdown" class="telemetry-node-dropdown hidden"></div>
-          </div>
-          <div class="telemetry-controls">
-            <label for="telemetry-range-select">區間</label>
-            <select id="telemetry-range-select">
-              <option value="hour1">1 小時</option>
-              <option value="hour3">3 小時</option>
-              <option value="hour6">6 小時</option>
-              <option value="hour12">12 小時</option>
-              <option value="day">24 小時</option>
-              <option value="week">7 天</option>
-              <option value="month">30 天</option>
-              <option value="year">1 年</option>
-              <option value="custom">自訂</option>
-            </select>
-          </div>
-          <div id="telemetry-range-custom" class="telemetry-range-custom hidden">
-            <label class="telemetry-custom-field">
-              <span>開始</span>
-              <input type="datetime-local" id="telemetry-range-start" />
-            </label>
-            <span class="telemetry-range-separator">~</span>
-            <label class="telemetry-custom-field">
-              <span>結束</span>
-              <input type="datetime-local" id="telemetry-range-end" />
-            </label>
-          </div>
-          <div class="telemetry-chart-controls">
-            <label for="telemetry-chart-mode">圖表</label>
-            <select id="telemetry-chart-mode">
-              <option value="all">全部</option>
-              <option value="single">單一指標</option>
-            </select>
-            <select id="telemetry-chart-metric" class="hidden"></select>
-          </div>
-          <div class="telemetry-updated">
-            <span class="label">更新</span>
-            <span id="telemetry-updated-at">—</span>
-          </div>
-          <div class="telemetry-stats">
-            <div class="telemetry-stat">
-              <span class="label">筆數</span>
-              <span id="telemetry-stats-records" class="telemetry-stat-value">0</span>
-            </div>
-            <div class="telemetry-stat">
-              <span class="label">節點</span>
-              <span id="telemetry-stats-nodes" class="telemetry-stat-value">0</span>
-            </div>
-            <div class="telemetry-stat">
-              <span class="label">檔案</span>
-              <span id="telemetry-stats-disk" class="telemetry-stat-value">—</span>
-            </div>
-          </div>
-          <div class="telemetry-actions">
-            <button type="button" id="telemetry-download-btn" class="telemetry-download-btn">
-              下載 CSV
-            </button>
-          </div>
-        </header>
-        <div id="telemetry-empty-state" class="telemetry-empty">
-          尚未收到遙測資料。
-        </div>
-        <section id="telemetry-charts" class="telemetry-charts hidden"></section>
-        <div id="telemetry-table-wrapper" class="telemetry-table-wrapper hidden">
-          <table class="telemetry-table">
-            <thead>
-              <tr>
-                <th>時間</th>
-                <th>節點</th>
-                <th>指標</th>
-                <th>額外資訊</th>
-              </tr>
-            </thead>
-            <tbody id="telemetry-table-body"></tbody>
-          </table>
-          <div id="telemetry-pagination" class="telemetry-pagination hidden">
-            <div id="telemetry-pagination-info" class="telemetry-pagination-info">—</div>
-            <div class="telemetry-pagination-controls">
-              <button type="button" id="telemetry-page-first" class="telemetry-page-btn" aria-label="第一頁">«</button>
-              <button type="button" id="telemetry-page-prev" class="telemetry-page-btn" aria-label="上一頁">‹</button>
-              <span class="telemetry-page-status">
-                第 <span id="telemetry-pagination-current">1</span> / <span id="telemetry-pagination-total">1</span> 頁
-              </span>
-              <button type="button" id="telemetry-page-next" class="telemetry-page-btn" aria-label="下一頁">›</button>
-              <button type="button" id="telemetry-page-last" class="telemetry-page-btn" aria-label="最後一頁">»</button>
-              <label class="telemetry-page-size">
-                每頁
-                <select id="telemetry-page-size" class="telemetry-page-size-select"></select>
-              </label>
-            </div>
-          </div>
-        </div>
-      </article>
-    </section>
-
-    <section id="log-page" class="page">
-      <section class="log-panel">
-        <header class="panel-header">
-          <h2>系統日誌</h2>
-          <span class="panel-meta">CallMesh / APRS / 連線事件</span>
-        </header>
-        <ul id="log-list" class="log-list"></ul>
+          <ul id="log-list" class="log-list"></ul>
+        </section>
       </section>
-    </section>
-  </main>
+    </main>
+  </div>
 
   <div id="relay-hint-modal" class="relay-hint-modal hidden">
     <div class="relay-hint-dialog">
@@ -411,7 +446,8 @@
   </div>
 
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
-  <script src="main.js"></script>
+  <script defer src="/vendor/maplibre-gl.js"></script>
+  <script defer src="main.js"></script>
 </body>
 
 </html>

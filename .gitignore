@@ -13,6 +13,9 @@ dist/
 *.tmp
 *.swp
 
+# Local map tiles
+src/web/public/map/tiles.mbtiles
+
 # macOS metadata
 .DS_Store
 
