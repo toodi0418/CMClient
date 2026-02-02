@@ -1241,7 +1241,7 @@
       layout: {
         'text-field': ['get', 'snrLabel'],
         'text-font': ['Noto Sans Regular'],
-        'text-size': 11,
+        'text-size': 13,
         'symbol-placement': 'line-center',
         'text-rotation-alignment': 'map',
         'text-keep-upright': true,
