@@ -1505,8 +1505,16 @@
 
       // Click background to deselect
       mapInstance.on('click', (event) => {
+        const layersToQuery = [
+          `${MAP_LAYER_ID}-unclustered`,
+          `${MAP_LAYER_ID}-clusters`,
+          'traceroute-layer-forward',
+          'traceroute-layer-return',
+          'traceroute-layer-bidirectional'
+        ].filter(layerId => mapInstance.getLayer(layerId));
+
         const features = mapInstance.queryRenderedFeatures(event.point, {
-          layers: [`${MAP_LAYER_ID}-unclustered`, `${MAP_LAYER_ID}-clusters`, 'traceroute-layer-forward', 'traceroute-layer-return', 'traceroute-layer-bidirectional']
+          layers: layersToQuery
         });
         if (!features.length) {
           selectedTracerouteId = null;
