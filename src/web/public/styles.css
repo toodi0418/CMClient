@@ -1872,6 +1872,17 @@ details[open]>.details-summary::after {
   pointer-events: none;
 }
 
+.edge-bidirectional-marker {
+  font-size: 12px;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
+.edge-bidirectional {
+  stroke-width: 3px !important;
+}
+
 .traceroute-list {
   margin-top: 14px;
   display: grid;

@@ -885,7 +885,8 @@
             to: edge.to,
             direction: edge.direction,
             snr: scaledSnr,
-            snrLabel: Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : ''
+            snrLabel: Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : '',
+            isBidirectional: edge.isBidirectional || false
           }
         });
       }
@@ -1106,6 +1107,29 @@
       }
     });
 
+    // Traceroute: Bidirectional highlight (Purple glow)
+    mapInstance.addLayer({
+      id: 'traceroute-layer-bidirectional',
+      type: 'line',
+      source: MAP_TRACEROUTE_SOURCE_ID,
+      filter: ['==', ['get', 'isBidirectional'], true],
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round'
+      },
+      paint: {
+        'line-color': '#a855f7',
+        'line-width': 4.5,
+        'line-opacity': [
+          'case',
+          ['==', selectedTracerouteId || 'none', 'none'], 0.4,
+          ['==', ['get', 'id'], selectedTracerouteId], 0.7,
+          0.05
+        ],
+        'line-blur': 3
+      }
+    });
+
     mapInstance.addLayer({
       id: MAP_TRACEROUTE_LABEL_LAYER_ID,
       type: 'symbol',
@@ -1262,6 +1286,11 @@
             ['==', ['get', 'id'], id], 1,
             0.15
           ]);
+          mapInstance.setPaintProperty('traceroute-layer-bidirectional', 'line-opacity', [
+            'case',
+            ['==', ['get', 'id'], id], 0.7,
+            0.05
+          ]);
           mapInstance.setPaintProperty(MAP_TRACEROUTE_LABEL_LAYER_ID, 'text-opacity', [
             'case',
             ['==', ['get', 'id'], id], 1,
@@ -1272,6 +1301,7 @@
 
       mapInstance.on('click', 'traceroute-layer-forward', handleTracerouteClick);
       mapInstance.on('click', 'traceroute-layer-return', handleTracerouteClick);
+      mapInstance.on('click', 'traceroute-layer-bidirectional', handleTracerouteClick);
 
       const updateCursor = (enter) => {
         mapInstance.getCanvas().style.cursor = enter ? 'pointer' : '';
@@ -1280,17 +1310,20 @@
       mapInstance.on('mouseleave', 'traceroute-layer-forward', () => updateCursor(false));
       mapInstance.on('mouseenter', 'traceroute-layer-return', () => updateCursor(true));
       mapInstance.on('mouseleave', 'traceroute-layer-return', () => updateCursor(false));
+      mapInstance.on('mouseenter', 'traceroute-layer-bidirectional', () => updateCursor(true));
+      mapInstance.on('mouseleave', 'traceroute-layer-bidirectional', () => updateCursor(false));
 
       // Click background to deselect
       mapInstance.on('click', (event) => {
         const features = mapInstance.queryRenderedFeatures(event.point, {
-          layers: [`${MAP_LAYER_ID}-unclustered`, `${MAP_LAYER_ID}-clusters`, 'traceroute-layer-forward', 'traceroute-layer-return']
+          layers: [`${MAP_LAYER_ID}-unclustered`, `${MAP_LAYER_ID}-clusters`, 'traceroute-layer-forward', 'traceroute-layer-return', 'traceroute-layer-bidirectional']
         });
         if (!features.length) {
           selectedTracerouteId = null;
           mapInstance.setFilter('traceroute-layer-highlight', ['==', ['get', 'id'], 'none']);
           mapInstance.setPaintProperty('traceroute-layer-forward', 'line-opacity', 0.8);
           mapInstance.setPaintProperty('traceroute-layer-return', 'line-opacity', 0.7);
+          mapInstance.setPaintProperty('traceroute-layer-bidirectional', 'line-opacity', 0.4);
           mapInstance.setPaintProperty(MAP_TRACEROUTE_LABEL_LAYER_ID, 'text-opacity', 1);
         }
       });
@@ -9415,7 +9448,16 @@
         });
       }
     });
-    return { nodes: Array.from(nodes.values()), edges: Array.from(edgeMap.values()) };
+
+    const edgeList = Array.from(edgeMap.values());
+    edgeList.forEach((edge) => {
+      const oppKey = `${edge.to}|${edge.from}|${edge.direction === 'forward' ? 'return' : 'forward'}`;
+      if (edgeMap.has(oppKey)) {
+        edge.isBidirectional = true;
+      }
+    });
+
+    return { nodes: Array.from(nodes.values()), edges: edgeList };
   }
 
   function resolveTopologyNodeId(label) {
@@ -9432,7 +9474,8 @@
         to: edge.to,
         direction: edge.direction,
         snrSum: 0,
-        snrCount: 0
+        snrCount: 0,
+        isBidirectional: false
       });
     }
     const target = map.get(key);
@@ -9481,9 +9524,19 @@
       path.setAttribute('d', `M ${fromPos.x} ${fromPos.y} Q ${cx1} ${cy1} ${toPos.x} ${toPos.y}`);
       path.setAttribute(
         'class',
-        `edge-line edge-${edge.direction === 'forward' ? 'forward' : 'return'} edge-snr-${category}`
+        `edge-line edge-${edge.direction === 'forward' ? 'forward' : 'return'} edge-snr-${category} ${edge.isBidirectional ? 'edge-bidirectional' : ''
+        }`
       );
       layer.appendChild(path);
+
+      if (edge.isBidirectional && edge.direction === 'forward') {
+        const marker = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        marker.setAttribute('class', 'edge-bidirectional-marker');
+        marker.setAttribute('x', cx1);
+        marker.setAttribute('y', cy1 - 8);
+        marker.textContent = '↔️';
+        layer.appendChild(marker);
+      }
 
       const scaledSnr = resolveTracerouteSnrScaled(snrValue);
       if (Number.isFinite(scaledSnr)) {
