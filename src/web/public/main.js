@@ -522,7 +522,12 @@
     mapCollapsed: 'tmag:web:map:collapsed',
     summaryCollapsed: 'tmag:web:summary:collapsed',
     mapShowTraceroute: 'tmag:web:map:show-traceroute',
-    mapRoutesOnly: 'tmag:web:map:routes-only'
+    mapRoutesOnly: 'tmag:web:map:routes-only',
+    mapTimeWindow: 'tmag:web:map:time-window',
+    mapRoleFilter: 'tmag:web:map:role-filter',
+    mapUseCluster: 'tmag:web:map:use-cluster',
+    mapShowOffline: 'tmag:web:map:show-offline',
+    mapTelemetryOnly: 'tmag:web:map:telemetry-only'
   };
 
   function isValidTelemetryRangeMode(mode) {
@@ -1502,6 +1507,48 @@
     }
   }
 
+  function loadMapToolbarState() {
+    // Load time window
+    const storedWindow = safeStorageGet(STORAGE_KEYS.mapTimeWindow);
+    if (storedWindow && !isNaN(storedWindow)) {
+      tracerouteTopologyWindowHours = Number(storedWindow);
+      document.querySelectorAll('[data-map-window]').forEach(btn => {
+        if (btn.getAttribute('data-map-window') === storedWindow) {
+          document.querySelectorAll('[data-map-window]').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+        }
+      });
+    }
+
+    // Load role filter
+    const storedRole = safeStorageGet(STORAGE_KEYS.mapRoleFilter);
+    if (storedRole && mapRoleFilter) {
+      mapRoleFilterValue = storedRole;
+      mapRoleFilter.value = storedRole;
+    }
+
+    // Load cluster toggle
+    const storedCluster = safeStorageGet(STORAGE_KEYS.mapUseCluster);
+    if (storedCluster != null && mapToggleCluster) {
+      mapUseCluster = storedCluster === '1' || storedCluster === 'true';
+      mapToggleCluster.checked = mapUseCluster;
+    }
+
+    // Load offline toggle
+    const storedOffline = safeStorageGet(STORAGE_KEYS.mapShowOffline);
+    if (storedOffline != null && mapToggleOffline) {
+      mapShowOffline = storedOffline === '1' || storedOffline === 'true';
+      mapToggleOffline.checked = mapShowOffline;
+    }
+
+    // Load telemetry-only toggle
+    const storedTelemetry = safeStorageGet(STORAGE_KEYS.mapTelemetryOnly);
+    if (storedTelemetry != null && mapToggleTelemetry) {
+      mapTelemetryOnly = storedTelemetry === '1' || storedTelemetry === 'true';
+      mapToggleTelemetry.checked = mapTelemetryOnly;
+    }
+  }
+
   function loadSummaryCollapseState() {
     const stored = safeStorageGet(STORAGE_KEYS.summaryCollapsed);
     if (stored == null || !summaryToggleBtn || !summaryStack) return;
@@ -1769,7 +1816,8 @@
     btn.addEventListener('click', () => {
       const value = Number(btn.getAttribute('data-map-window'));
       if (!Number.isFinite(value)) return;
-      mapWindowMs = MAP_WINDOW_OPTIONS.get(value) || mapWindowMs;
+      tracerouteTopologyWindowHours = value;
+      safeStorageSet(STORAGE_KEYS.mapTimeWindow, String(value));
       mapWindowButtons.forEach((el) => el.classList.toggle('active', el === btn));
       scheduleMapUpdate();
     });
@@ -1777,20 +1825,25 @@
 
   mapRoleFilter?.addEventListener('change', () => {
     mapRoleFilterValue = mapRoleFilter.value || 'all';
+    safeStorageSet(STORAGE_KEYS.mapRoleFilter, mapRoleFilterValue);
     scheduleMapUpdate();
   });
 
   mapToggleCluster?.addEventListener('change', () => {
     mapUseCluster = Boolean(mapToggleCluster.checked);
+    safeStorageSet(STORAGE_KEYS.mapUseCluster, mapUseCluster ? '1' : '0');
     updateMapClusterVisibility();
   });
 
   mapToggleOffline?.addEventListener('change', () => {
     mapShowOffline = Boolean(mapToggleOffline.checked);
+    safeStorageSet(STORAGE_KEYS.mapShowOffline, mapShowOffline ? '1' : '0');
     scheduleMapUpdate();
   });
 
   mapToggleTelemetry?.addEventListener('change', () => {
+    mapTelemetryOnly = Boolean(mapToggleTelemetry.checked);
+    safeStorageSet(STORAGE_KEYS.mapTelemetryOnly, mapTelemetryOnly ? '1' : '0');
     scheduleMapUpdate();
   });
 
