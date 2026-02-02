@@ -1782,6 +1782,7 @@
       loadSummaryCollapseState();
       loadMapTracerouteState();
       loadMapRoutesOnlyState();
+      loadMapToolbarState();
       syncContentAreaHeight();
       syncSummaryStackHeight();
       updateMapNodes();
