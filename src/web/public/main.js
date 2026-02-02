@@ -600,6 +600,7 @@
   let selectedTracerouteId = null;
   let selectedNodeMeshId = null;
   let mapVisibleNodeIds = new Set();
+  let mapNodesWithVisibleRoutes = new Set();
   let mapRoleFilterValue = 'all';
   const mapRoleCache = new Map();
   let tracerouteAnimationFrame = null;
@@ -735,6 +736,11 @@
       total += 1;
       const meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
 
+      // In routes-only mode, only show nodes that have visible route connections
+      if (mapRoutesOnly && !mapNodesWithVisibleRoutes.has(meshKey)) {
+        return;
+      }
+
       const coords = resolveNodeCoordinates(entry);
       if (!coords) return;
       const lastSeen = getNodeLastSeenTimestamp(entry);
@@ -858,12 +864,17 @@
 
     const graph = buildTracerouteTopologyGraph(entries.slice(0, 100));
     const features = [];
+    const nodesWithVisibleRoutes = new Set();
 
     graph.edges.forEach((edge) => {
       // Skip edges where either endpoint node is not visible
       if (!mapVisibleNodeIds.has(edge.from) || !mapVisibleNodeIds.has(edge.to)) {
         return;
       }
+
+      // Track nodes that have visible route connections
+      nodesWithVisibleRoutes.add(edge.from);
+      nodesWithVisibleRoutes.add(edge.to);
 
       const fromNode = nodeRegistry.get(edge.from);
       const toNode = nodeRegistry.get(edge.to);
@@ -1851,28 +1862,15 @@
   mapToggleRoutesOnly?.addEventListener('change', () => {
     mapRoutesOnly = Boolean(mapToggleRoutesOnly.checked);
     safeStorageSet(STORAGE_KEYS.mapRoutesOnly, mapRoutesOnly ? '1' : '0');
-    // Routes-only mode: hide node markers, show only traceroute lines
-    if (mapInstance && mapReady) {
-      const visibility = mapRoutesOnly ? 'none' : 'visible';
-      if (mapInstance.getLayer(MAP_NODE_LAYER)) {
-        mapInstance.setLayoutProperty(MAP_NODE_LAYER, 'visibility', visibility);
+    // Ensure traceroute is enabled in routes-only mode
+    if (mapRoutesOnly) {
+      mapShowTraceroute = true;
+      if (mapToggleTraceroute) {
+        mapToggleTraceroute.checked = true;
       }
-      if (mapInstance.getLayer(MAP_CLUSTER_LAYER)) {
-        mapInstance.setLayoutProperty(MAP_CLUSTER_LAYER, 'visibility', visibility);
-      }
-      if (mapInstance.getLayer(MAP_CLUSTER_COUNT_LAYER)) {
-        mapInstance.setLayoutProperty(MAP_CLUSTER_COUNT_LAYER, 'visibility', visibility);
-      }
-      // Ensure traceroute layers are visible in routes-only mode
-      if (mapRoutesOnly) {
-        mapShowTraceroute = true;
-        if (mapToggleTraceroute) {
-          mapToggleTraceroute.checked = true;
-        }
-        safeStorageSet(STORAGE_KEYS.mapShowTraceroute, '1');
-        updateMapTraceroutes();
-      }
+      safeStorageSet(STORAGE_KEYS.mapShowTraceroute, '1');
     }
+    scheduleMapUpdate();
   });
 
   summaryToggleBtn?.addEventListener('click', () => {
