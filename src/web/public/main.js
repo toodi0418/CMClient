@@ -926,18 +926,22 @@
         tracerouteAnimationFrame = null;
         return;
       }
-      tracerouteDashOffset = (tracerouteDashOffset - 0.2) % 40;
+      try {
+        tracerouteDashOffset = (tracerouteDashOffset - 0.2) % 40;
 
-      const layers = ['traceroute-layer-forward', 'traceroute-layer-return', 'traceroute-layer-bidirectional'];
-      layers.forEach(layerId => {
-        if (mapInstance.getLayer(layerId)) {
-          // Only animate if selected or if we want a general flow
-          // For now, let's animate all traceroute lines to show flow clearly
-          mapInstance.setPaintProperty(layerId, 'line-dasharray-offset', tracerouteDashOffset);
-        }
-      });
+        const layers = ['traceroute-layer-forward', 'traceroute-layer-return', 'traceroute-layer-bidirectional'];
+        layers.forEach(layerId => {
+          const layerState = mapInstance.getLayer(layerId);
+          if (layerState && layerState.type === 'line') {
+            mapInstance.setPaintProperty(layerId, 'line-dasharray-offset', tracerouteDashOffset);
+          }
+        });
 
-      tracerouteAnimationFrame = requestAnimationFrame(animate);
+        tracerouteAnimationFrame = requestAnimationFrame(animate);
+      } catch (err) {
+        // Silently skip if map is in an inconsistent state during re-layering
+        tracerouteAnimationFrame = requestAnimationFrame(animate);
+      }
     };
     tracerouteAnimationFrame = requestAnimationFrame(animate);
   }
@@ -963,6 +967,7 @@
 
   function setupMapLayers() {
     if (!mapInstance) return;
+    stopTracerouteAnimation();
     removeMapLayer(`${MAP_LAYER_ID}-labels`);
     removeMapLayer(`${MAP_LAYER_ID}-clusters`);
     removeMapLayer(`${MAP_LAYER_ID}-cluster-count`);
