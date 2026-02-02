@@ -36,6 +36,7 @@
   const mapToggleCluster = document.getElementById('map-toggle-cluster');
   const mapToggleOffline = document.getElementById('map-toggle-offline');
   const mapToggleTelemetry = document.getElementById('map-toggle-telemetry');
+  const mapToggleTraceroute = document.getElementById('map-toggle-traceroute');
   const mapPanel = document.getElementById('map-panel');
   const mapSlotSummary = document.querySelector('[data-map-slot="summary"]');
   const mapSlotFull = document.querySelector('[data-map-slot="map"]');
@@ -518,7 +519,8 @@
     mapCenter: 'tmag:web:map:center',
     mapZoom: 'tmag:web:map:zoom',
     mapCollapsed: 'tmag:web:map:collapsed',
-    summaryCollapsed: 'tmag:web:summary:collapsed'
+    summaryCollapsed: 'tmag:web:summary:collapsed',
+    mapShowTraceroute: 'tmag:web:map:show-traceroute'
   };
 
   function isValidTelemetryRangeMode(mode) {
@@ -573,6 +575,9 @@
   const MAP_ONLINE_WINDOW_MS = 3 * 60 * 60 * 1000;
   const MAP_SOURCE_ID = 'mesh-nodes';
   const MAP_LAYER_ID = 'mesh-nodes-layer';
+  const MAP_TRACEROUTE_SOURCE_ID = 'traceroute-source';
+  const MAP_TRACEROUTE_LAYER_ID = 'traceroute-layer';
+  const MAP_TRACEROUTE_LABEL_LAYER_ID = 'traceroute-label-layer';
   let mapInstance = null;
   let mapReady = false;
   let mapUpdateTimer = null;
@@ -583,6 +588,7 @@
   let mapCollapsed = false;
   let summaryCollapsed = false;
   let mapTelemetryOnly = false;
+  let mapShowTraceroute = false;
   let mapRoleFilterValue = 'all';
   const mapRoleCache = new Map();
 
@@ -800,10 +806,10 @@
     if (!mapInstance || !mapReady) return;
     const { features, total, withCoords } = buildMapNodeFeatures();
     mapFeatureCache = features;
-    const source = mapInstance.getSource(MAP_SOURCE_ID);
     if (source && typeof source.setData === 'function') {
       source.setData({ type: 'FeatureCollection', features });
     }
+    updateMapTraceroutes();
     if (mapStatusLabel) {
       if (withCoords === 0) {
         showMapStatus(total > 0 ? `尚未收到有效座標（${total} 節點）` : '尚未收到節點座標');
@@ -811,6 +817,54 @@
         showMapStatus(`顯示 ${withCoords} / ${total} 個節點`);
       }
     }
+  }
+
+  function updateMapTraceroutes() {
+    if (!mapInstance || !mapReady) return;
+    const source = mapInstance.getSource(MAP_TRACEROUTE_SOURCE_ID);
+    if (!source) return;
+
+    if (!mapShowTraceroute) {
+      source.setData({ type: 'FeatureCollection', features: [] });
+      return;
+    }
+
+    const entries = tracerouteRows.filter((entry) => {
+      const status = (entry?.status || entry?.variant || '').toString().toLowerCase();
+      const timestamp = extractSummaryTimestampMs(entry);
+      const age = Date.now() - timestamp;
+      return status && status !== 'pending' && age <= tracerouteTopologyWindowHours * 3600000;
+    });
+
+    const graph = buildTracerouteTopologyGraph(entries.slice(0, 100));
+    const features = [];
+
+    graph.edges.forEach((edge) => {
+      const fromNode = nodeRegistry.get(edge.from);
+      const toNode = nodeRegistry.get(edge.to);
+      const fromCoords = resolveNodeCoordinates(fromNode);
+      const toCoords = resolveNodeCoordinates(toNode);
+
+      if (fromCoords && toCoords) {
+        const snrValue = edge.snrCount > 0 ? edge.snrSum / edge.snrCount : null;
+        const scaledSnr = resolveTracerouteSnrScaled(snrValue);
+
+        features.push({
+          type: 'Feature',
+          geometry: {
+            type: 'LineString',
+            coordinates: [fromCoords, toCoords]
+          },
+          properties: {
+            direction: edge.direction,
+            snr: scaledSnr,
+            snrLabel: Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : ''
+          }
+        });
+      }
+    });
+
+    source.setData({ type: 'FeatureCollection', features });
   }
 
   function removeMapLayer(id) {
@@ -827,11 +881,14 @@
 
   function setupMapLayers() {
     if (!mapInstance) return;
+    removeMapLayer(`${MAP_LAYER_ID}-labels`);
     removeMapLayer(`${MAP_LAYER_ID}-clusters`);
     removeMapLayer(`${MAP_LAYER_ID}-cluster-count`);
     removeMapLayer(`${MAP_LAYER_ID}-unclustered`);
-    removeMapLayer(`${MAP_LAYER_ID}-labels`);
+    removeMapLayer(MAP_TRACEROUTE_LAYER_ID);
+    removeMapLayer(MAP_TRACEROUTE_LABEL_LAYER_ID);
     removeMapSource(MAP_SOURCE_ID);
+    removeMapSource(MAP_TRACEROUTE_SOURCE_ID);
 
     mapInstance.addSource(MAP_SOURCE_ID, {
       type: 'geojson',
@@ -938,6 +995,52 @@
       labelsLayer.filter = ['!', ['has', 'point_count']];
     }
     mapInstance.addLayer(labelsLayer);
+
+    // Traceroute source and layers
+    mapInstance.addSource(MAP_TRACEROUTE_SOURCE_ID, {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features: [] }
+    });
+
+    mapInstance.addLayer({
+      id: MAP_TRACEROUTE_LAYER_ID,
+      type: 'line',
+      source: MAP_TRACEROUTE_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round'
+      },
+      paint: {
+        'line-color': [
+          'match',
+          ['get', 'direction'],
+          'forward', '#4cc3ff',
+          'return', '#f0a04b',
+          '#ffffff'
+        ],
+        'line-width': 2,
+        'line-opacity': 0.6,
+        'line-dasharray': [2, 2]
+      }
+    });
+
+    mapInstance.addLayer({
+      id: MAP_TRACEROUTE_LABEL_LAYER_ID,
+      type: 'symbol',
+      source: MAP_TRACEROUTE_SOURCE_ID,
+      layout: {
+        'text-field': ['get', 'snrLabel'],
+        'text-font': ['Noto Sans Regular'],
+        'text-size': 10,
+        'symbol-placement': 'point',
+        'text-allow-overlap': false
+      },
+      paint: {
+        'text-color': '#f7fbff',
+        'text-halo-color': 'rgba(8, 19, 32, 0.85)',
+        'text-halo-width': 1
+      }
+    });
   }
 
   function updateMapClusterVisibility() {
@@ -971,6 +1074,15 @@
     mapCollapsed = stored === '1' || stored === 'true';
     if (mapCollapsed) {
       setSummaryMapCollapsed(true);
+    }
+  }
+
+  function loadMapTracerouteState() {
+    const stored = safeStorageGet(STORAGE_KEYS.mapShowTraceroute);
+    if (stored == null) return;
+    mapShowTraceroute = stored === '1' || stored === 'true';
+    if (mapToggleTraceroute) {
+      mapToggleTraceroute.checked = mapShowTraceroute;
     }
   }
 
@@ -1129,6 +1241,7 @@
       });
       loadMapCollapseState();
       loadSummaryCollapseState();
+      loadMapTracerouteState();
       syncContentAreaHeight();
       syncSummaryStackHeight();
       updateMapNodes();
@@ -1185,8 +1298,13 @@
   });
 
   mapToggleTelemetry?.addEventListener('change', () => {
-    mapTelemetryOnly = Boolean(mapToggleTelemetry.checked);
     scheduleMapUpdate();
+  });
+
+  mapToggleTraceroute?.addEventListener('change', () => {
+    mapShowTraceroute = Boolean(mapToggleTraceroute.checked);
+    safeStorageSet(STORAGE_KEYS.mapShowTraceroute, mapShowTraceroute ? '1' : '0');
+    updateMapTraceroutes();
   });
 
   summaryToggleBtn?.addEventListener('click', () => {
@@ -9061,10 +9179,12 @@
     const filteredEntries = filterTracerouteEntriesByWindow(entries, tracerouteTopologyWindowHours);
     if (!filteredEntries.length) {
       tracerouteTopology.innerHTML = '';
+      updateMapTraceroutes();
       return;
     }
     const graph = buildTracerouteTopologyGraph(filteredEntries.slice(0, 80));
     drawTracerouteTopology(tracerouteTopology, graph, { layout: tracerouteTopologyLayout });
+    updateMapTraceroutes();
   }
 
   function filterTracerouteEntriesByWindow(entries, hours) {

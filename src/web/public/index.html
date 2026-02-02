@@ -6,7 +6,8 @@
   <title>TMAG Relay Studio</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/tailwindcss@3.4.4/dist/tailwind.min.css" />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" />
+  <link rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" />
   <link rel="stylesheet" href="/vendor/maplibre-gl.css" />
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -45,7 +46,7 @@
             </span>
           </div>
         </div>
-        
+
       </section>
 
       <section class="sidebar-card provision-card hidden">
@@ -90,7 +91,8 @@
           </div>
           <div class="nodes-actions">
             <span class="nodes-count">節點數：<strong id="nodes-total-count">0</strong></span>
-            <span class="nodes-online">線上：<strong id="nodes-online-count">0</strong><span id="nodes-online-total" class="nodes-online-total"></span></span>
+            <span class="nodes-online">線上：<strong id="nodes-online-count">0</strong><span id="nodes-online-total"
+                class="nodes-online-total"></span></span>
           </div>
         </div>
         <div class="nodes-search-row">
@@ -132,7 +134,7 @@
           <button type="button" class="nav-btn" data-target="log-page">日誌</button>
           <button type="button" class="nav-btn" data-target="nodes-page">節點資料庫</button>
         </nav>
-          <div class="status-compact">
+        <div class="status-compact">
           <div class="callsign-badge">
             <span class="callsign-label">Callsign</span>
             <span id="callmesh-callsign-display" class="callsign-value">—</span>
@@ -200,6 +202,10 @@
                       <input id="map-toggle-telemetry" type="checkbox" />
                       <span>僅遙測</span>
                     </label>
+                    <label class="map-toggle">
+                      <input id="map-toggle-traceroute" type="checkbox" />
+                      <span>路由</span>
+                    </label>
                   </div>
                 </div>
                 <div class="map-shell">
@@ -214,7 +220,8 @@
                 </div>
               </div>
             </div>
-            <div id="summary-splitter" class="summary-splitter" role="separator" aria-orientation="horizontal" tabindex="0"></div>
+            <div id="summary-splitter" class="summary-splitter" role="separator" aria-orientation="horizontal"
+              tabindex="0"></div>
             <div class="panel summary-panel">
               <div class="table-wrapper">
                 <table class="table table-hover align-middle mb-0">
@@ -373,13 +380,8 @@
             <div class="telemetry-header">
               <div class="telemetry-controls">
                 <label for="telemetry-node-input" class="form-label">節點</label>
-                <input
-                  id="telemetry-node-input"
-                  type="search"
-                  class="form-control"
-                  placeholder="輸入節點 Mesh ID 或搜尋關鍵字"
-                  autocomplete="off"
-                />
+                <input id="telemetry-node-input" type="search" class="form-control" placeholder="輸入節點 Mesh ID 或搜尋關鍵字"
+                  autocomplete="off" />
                 <div id="telemetry-node-dropdown" class="telemetry-node-dropdown hidden"></div>
               </div>
               <div class="telemetry-chart-controls">
@@ -457,13 +459,15 @@
                   <button type="button" id="telemetry-page-first" class="ghost-btn" aria-label="第一頁">«</button>
                   <button type="button" id="telemetry-page-prev" class="ghost-btn" aria-label="上一頁">‹</button>
                   <span class="telemetry-page-status">
-                    第 <span id="telemetry-pagination-current">1</span> / <span id="telemetry-pagination-total">1</span> 頁
+                    第 <span id="telemetry-pagination-current">1</span> / <span id="telemetry-pagination-total">1</span>
+                    頁
                   </span>
                   <button type="button" id="telemetry-page-next" class="ghost-btn" aria-label="下一頁">›</button>
                   <button type="button" id="telemetry-page-last" class="ghost-btn" aria-label="最後一頁">»</button>
                   <label class="telemetry-page-size">
                     每頁
-                    <select id="telemetry-page-size" class="form-select form-select-sm d-inline-block w-auto telemetry-page-size-select"></select>
+                    <select id="telemetry-page-size"
+                      class="form-select form-select-sm d-inline-block w-auto telemetry-page-size-select"></select>
                   </label>
                 </div>
               </div>
