@@ -750,7 +750,7 @@
       if (mapTelemetryOnly && !telemetryFlags.hasTelemetry) {
         return;
       }
-      const label = formatNodeDisplayLabel(entry) || entry.meshId || entry.meshIdNormalized || '未知節點';
+      const label = formatNodeDisplayLabel(entry) || '未知節點';
       features.push({
         type: 'Feature',
         geometry: { type: 'Point', coordinates: coords },
@@ -827,6 +827,7 @@
     removeMapLayer(`${MAP_LAYER_ID}-clusters`);
     removeMapLayer(`${MAP_LAYER_ID}-cluster-count`);
     removeMapLayer(`${MAP_LAYER_ID}-unclustered`);
+    removeMapLayer(`${MAP_LAYER_ID}-labels`);
     removeMapSource(MAP_SOURCE_ID);
 
     mapInstance.addSource(MAP_SOURCE_ID, {
@@ -909,6 +910,31 @@
       unclusteredLayer.filter = ['!', ['has', 'point_count']];
     }
     mapInstance.addLayer(unclusteredLayer);
+
+    // Add labels layer for node names
+    const labelsLayer = {
+      id: `${MAP_LAYER_ID}-labels`,
+      type: 'symbol',
+      source: MAP_SOURCE_ID,
+      layout: {
+        'text-field': ['get', 'label'],
+        'text-font': ['Noto Sans Regular'],
+        'text-size': 11,
+        'text-offset': [0, 1.2],
+        'text-anchor': 'top',
+        'text-allow-overlap': false, // Hide if overlapping other labels
+        'text-ignore-placement': false // Respect other icons/labels
+      },
+      paint: {
+        'text-color': '#f7fbff',
+        'text-halo-color': 'rgba(8, 19, 32, 0.85)',
+        'text-halo-width': 1.5
+      }
+    };
+    if (mapUseCluster) {
+      labelsLayer.filter = ['!', ['has', 'point_count']];
+    }
+    mapInstance.addLayer(labelsLayer);
   }
 
   function updateMapClusterVisibility() {
@@ -1049,21 +1075,21 @@
         }
         const deviceHtml = deviceMetrics.length
           ? `<div class="map-popup-grid">${deviceMetrics
-              .slice(0, 4)
-              .map(
-                (item) =>
-                  `<div class="map-popup-row"><span class="map-popup-label">${escapeHtml(item.label)}</span><span>${escapeHtml(item.value)}</span></div>`
-              )
-              .join('')}</div>`
+            .slice(0, 4)
+            .map(
+              (item) =>
+                `<div class="map-popup-row"><span class="map-popup-label">${escapeHtml(item.label)}</span><span>${escapeHtml(item.value)}</span></div>`
+            )
+            .join('')}</div>`
           : '';
         const sensorHtml = sensorMetrics.length
           ? `<div class="map-popup-grid">${sensorMetrics
-              .slice(0, 4)
-              .map(
-                (item) =>
-                  `<div class="map-popup-row"><span class="map-popup-label">${escapeHtml(item.label)}</span><span>${escapeHtml(item.value)}</span></div>`
-              )
-              .join('')}</div>`
+            .slice(0, 4)
+            .map(
+              (item) =>
+                `<div class="map-popup-row"><span class="map-popup-label">${escapeHtml(item.label)}</span><span>${escapeHtml(item.value)}</span></div>`
+            )
+            .join('')}</div>`
           : '';
         const shortNameLabel = feature.properties?.shortName || '';
         const titleLine = shortNameLabel
@@ -1778,19 +1804,20 @@
 
   function formatNodeDisplayLabel(node) {
     if (!node || typeof node !== 'object') return '';
-    const name =
-      sanitizeNodeName(node.longName) ||
-      sanitizeNodeName(node.shortName) ||
-      sanitizeNodeName(node.label);
+    const longName = sanitizeNodeName(node.longName);
+    const shortName = sanitizeNodeName(node.shortName);
     const meshId = node.meshId || node.meshIdOriginal || node.meshIdNormalized || '';
-    if (!meshId) {
-      return name || '';
+
+    if (longName && shortName) {
+      if (longName.toLowerCase() === shortName.toLowerCase()) {
+        return longName;
+      }
+      return `${longName} (${shortName})`;
     }
-    if (!name) {
-      return meshId;
-    }
-    const meshDisplay = meshId.toLowerCase();
-    return name.toLowerCase().includes(meshDisplay) ? name : `${name} (${meshId})`;
+
+    if (longName) return longName;
+    if (shortName) return shortName;
+    return meshId || '未知節點';
   }
 
   function ensureChannelConfig(channelId) {
@@ -2857,8 +2884,8 @@
         if (lastSeenDisplay && lastSeenDisplay !== '—') {
           telemetryParts.push(
             `<span class="nodes-card-telemetry nodes-card-telemetry--seen" title="${escapeHtml(lastSeenDisplay)}">` +
-              `<span class="telemetry-icon telemetry-icon--seen" aria-hidden="true">⏱</span>` +
-              `<span class="telemetry-text">${escapeHtml(lastSeenDisplay)}</span>` +
+            `<span class="telemetry-icon telemetry-icon--seen" aria-hidden="true">⏱</span>` +
+            `<span class="telemetry-text">${escapeHtml(lastSeenDisplay)}</span>` +
             `</span>`
           );
         }
@@ -2867,8 +2894,8 @@
           if (hopEntry?.label) {
             telemetryParts.push(
               `<span class="nodes-card-telemetry nodes-card-telemetry--hops" title="跳數">` +
-                `<span class="telemetry-icon telemetry-icon--hops" aria-hidden="true">🧭</span>` +
-                `<span class="telemetry-text">${escapeHtml(hopEntry.label)}</span>` +
+              `<span class="telemetry-icon telemetry-icon--hops" aria-hidden="true">🧭</span>` +
+              `<span class="telemetry-text">${escapeHtml(hopEntry.label)}</span>` +
               `</span>`
             );
           }
@@ -2877,8 +2904,8 @@
           for (const item of telemetrySummary.items) {
             telemetryParts.push(
               `<span class="nodes-card-telemetry" title="${escapeHtml(item.label)}">` +
-                `<span class="telemetry-icon ${escapeHtml(item.className || '')}" aria-hidden="true">${escapeHtml(item.icon || '')}</span>` +
-                `<span class="telemetry-text">${escapeHtml(item.value)}</span>` +
+              `<span class="telemetry-icon ${escapeHtml(item.className || '')}" aria-hidden="true">${escapeHtml(item.icon || '')}</span>` +
+              `<span class="telemetry-text">${escapeHtml(item.value)}</span>` +
               `</span>`
             );
           }
@@ -2894,7 +2921,7 @@
           : '';
         const meshIdHtml = signalLabel
           ? `<span class="nodes-card-id-text">${escapeHtml(meshLabel)}</span>` +
-            `<span class="nodes-card-signal">${escapeHtml(signalLabel)}</span>`
+          `<span class="nodes-card-signal">${escapeHtml(signalLabel)}</span>`
           : `<span class="nodes-card-id-text">${escapeHtml(meshLabel)}</span>`;
         const telemetryBtn =
           normalizedMesh
