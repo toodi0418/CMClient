@@ -761,7 +761,6 @@
       if (!mapShowOffline && status === 'offline') {
         return;
       }
-      meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
       const resolvedRoleLabel = resolveRoleLabel(entry);
       let roleKey = formatMapRole(entry);
       if (roleKey !== 'unknown') {
