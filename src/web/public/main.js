@@ -885,15 +885,23 @@
           snrLabel = Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : '';
         }
 
+        let featureId = '';
+        if (edge.isBidirectional) {
+          const sorted = [edge.from, edge.to].sort();
+          featureId = `tr-bidir-${sorted[0]}-${sorted[1]}`;
+        } else {
+          featureId = `tr-uni-${edge.from}-${edge.to}-${edge.direction}`;
+        }
+
         features.push({
           type: 'Feature',
-          id: `tr-${edge.from}-${edge.to}-${edge.direction}`,
+          id: featureId,
           geometry: {
             type: 'LineString',
             coordinates: [fromCoords, toCoords]
           },
           properties: {
-            id: `tr-${edge.from}-${edge.to}-${edge.direction}`,
+            id: featureId,
             from: edge.from,
             to: edge.to,
             direction: edge.direction,
@@ -1191,7 +1199,7 @@
         'text-font': ['Noto Sans Regular'],
         'text-size': 11,
         'symbol-placement': 'line-center',
-        'text-allow-overlap': false,
+        'text-allow-overlap': true,
         'text-offset': [0, 0]
       },
       paint: {
