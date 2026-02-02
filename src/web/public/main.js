@@ -1701,7 +1701,9 @@
           .addTo(mapInstance);
 
         // Set selected node and filter traceroutes
-        selectedNodeMeshId = meshId;
+        // Normalize meshId to match traceroute edge format
+        const normalizedMeshId = normalizeMeshId(meshId);
+        selectedNodeMeshId = normalizedMeshId || meshId;
         updateTracerouteFiltering();
       });
       updateMapClusterVisibility();
