@@ -872,6 +872,19 @@
         const snrValue = edge.snrCount > 0 ? edge.snrSum / edge.snrCount : null;
         const scaledSnr = resolveTracerouteSnrScaled(snrValue);
 
+        let snrLabel = '';
+        if (edge.isBidirectional) {
+          const partnerSnr = edge.partnerSnrCount > 0 ? edge.partnerSnrSum / edge.partnerSnrCount : null;
+          const partnerScaled = resolveTracerouteSnrScaled(partnerSnr);
+          const fSnr = edge.direction === 'forward' ? scaledSnr : partnerScaled;
+          const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
+          const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
+          const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
+          snrLabel = `F:${fStr} / R:${rStr}`;
+        } else {
+          snrLabel = Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : '';
+        }
+
         features.push({
           type: 'Feature',
           id: `tr-${edge.from}-${edge.to}-${edge.direction}`,
@@ -885,7 +898,7 @@
             to: edge.to,
             direction: edge.direction,
             snr: scaledSnr,
-            snrLabel: Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : '',
+            snrLabel: snrLabel,
             isBidirectional: edge.isBidirectional || false
           }
         });
@@ -9453,8 +9466,11 @@
     const edgeList = Array.from(edgeMap.values());
     edgeList.forEach((edge) => {
       const oppKey = `${edge.to}|${edge.from}|${edge.direction === 'forward' ? 'return' : 'forward'}`;
-      if (edgeMap.has(oppKey)) {
+      const partner = edgeMap.get(oppKey);
+      if (partner) {
         edge.isBidirectional = true;
+        edge.partnerSnrSum = partner.snrSum;
+        edge.partnerSnrCount = partner.snrCount;
       }
     });
 
@@ -9534,19 +9550,31 @@
         const marker = document.createElementNS('http://www.w3.org/2000/svg', 'text');
         marker.setAttribute('class', 'edge-bidirectional-marker');
         marker.setAttribute('x', cx1);
-        marker.setAttribute('y', cy1 - 8);
+        marker.setAttribute('y', cy1 - 10);
         marker.textContent = '↔️';
         layer.appendChild(marker);
       }
 
       const scaledSnr = resolveTracerouteSnrScaled(snrValue);
-      if (Number.isFinite(scaledSnr)) {
+      const shouldDrawLabel = !edge.isBidirectional || edge.direction === 'forward';
+
+      if (Number.isFinite(scaledSnr) && shouldDrawLabel) {
+        let displayLabel = `${formatNumber(scaledSnr, 1)}dB`;
+        if (edge.isBidirectional) {
+          const partnerSnr = edge.partnerSnrCount > 0 ? edge.partnerSnrSum / edge.partnerSnrCount : null;
+          const partnerScaled = resolveTracerouteSnrScaled(partnerSnr);
+          const fSnr = edge.direction === 'forward' ? scaledSnr : partnerScaled;
+          const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
+          const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
+          const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
+          displayLabel = `${fStr} / ${rStr}`; // Simplified for SVG space
+        }
+
         const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        const snrLabel = formatNumber(scaledSnr, 2);
         label.setAttribute('class', `edge-label edge-snr-${category}`);
         label.setAttribute('x', cx1);
         label.setAttribute('y', cy1);
-        label.textContent = `${snrLabel}dB`;
+        label.textContent = displayLabel;
         layer.appendChild(label);
       }
     });
