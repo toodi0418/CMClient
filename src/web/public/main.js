@@ -731,13 +731,67 @@
     let withCoords = 0;
     const visibleNodeIds = new Set();
 
+    // Calculate which nodes have visible route connections for routes-only mode
+    const nodesWithVisibleRoutes = new Set();
+    if (mapRoutesOnly) {
+      const entries = tracerouteRows.filter((entry) => {
+        const status = (entry?.status || entry?.variant || '').toString().toLowerCase();
+        const timestamp = extractSummaryTimestampMs(entry);
+        const age = Date.now() - timestamp;
+        return status && status !== 'pending' && age <= tracerouteTopologyWindowHours * 3600000;
+      });
+      const graph = buildTracerouteTopologyGraph(entries.slice(0, 100));
+
+      // Collect nodes from edges - but we need to check if both endpoints would be visible
+      // So we do a pre-pass to find all potentially visible nodes
+      const potentiallyVisibleNodes = new Map();
+      nodeRegistry.forEach((entry) => {
+        const meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
+        const coords = resolveNodeCoordinates(entry);
+        if (!coords) return;
+        const lastSeen = getNodeLastSeenTimestamp(entry);
+        if (!Number.isFinite(lastSeen)) return;
+        const age = Math.max(Date.now() - lastSeen, 0);
+        if (age > mapWindowMs) return;
+
+        let status = 'unknown';
+        if (age <= MAP_ONLINE_WINDOW_MS) {
+          status = 'online';
+        } else if (age <= NODE_ONLINE_WINDOW_MS) {
+          status = 'recent';
+        } else {
+          status = 'offline';
+        }
+        if (!mapShowOffline && status === 'offline') return;
+
+        // Check role and telemetry filters
+        if (mapRoleFilterValue !== 'all') {
+          const roleKey = formatMapRole(entry);
+          if (roleKey !== mapRoleFilterValue) return;
+        }
+        if (mapTelemetryOnly) {
+          const flags = resolveNodeTelemetryFlags(entry);
+          if (!flags.hasTelemetry) return;
+        }
+
+        potentiallyVisibleNodes.set(meshKey, entry);
+      });
+
+      // Now collect nodes that have edges where both endpoints are potentially visible
+      graph.edges.forEach((edge) => {
+        if (potentiallyVisibleNodes.has(edge.from) && potentiallyVisibleNodes.has(edge.to)) {
+          nodesWithVisibleRoutes.add(edge.from);
+          nodesWithVisibleRoutes.add(edge.to);
+        }
+      });
+    }
 
     nodeRegistry.forEach((entry) => {
       total += 1;
       const meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
 
       // In routes-only mode, only show nodes that have visible route connections
-      if (mapRoutesOnly && !mapNodesWithVisibleRoutes.has(meshKey)) {
+      if (mapRoutesOnly && !nodesWithVisibleRoutes.has(meshKey)) {
         return;
       }
 
