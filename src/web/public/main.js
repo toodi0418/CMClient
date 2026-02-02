@@ -930,6 +930,7 @@
     removeMapLayer('traceroute-layer-return');
     removeMapLayer('traceroute-layer-highlight');
     removeMapLayer('traceroute-layer-bidirectional');
+    removeMapLayer('traceroute-layer-arrows');
     removeMapLayer(MAP_TRACEROUTE_LABEL_LAYER_ID);
     removeMapSource(MAP_SOURCE_ID);
     removeMapSource(MAP_TRACEROUTE_SOURCE_ID);
@@ -1144,6 +1145,43 @@
       }
     });
 
+    // Traceroute: Directional arrows (Along non-bidirectional lines)
+    mapInstance.addLayer({
+      id: 'traceroute-layer-arrows',
+      type: 'symbol',
+      source: MAP_TRACEROUTE_SOURCE_ID,
+      filter: ['==', ['get', 'isBidirectional'], false],
+      layout: {
+        'symbol-placement': 'line',
+        'symbol-spacing': 100,
+        'text-field': '➤',
+        'text-size': 12,
+        'text-font': ['Noto Sans Regular'],
+        'text-allow-overlap': true,
+        'text-ignore-placement': true,
+        'text-keep-upright': false,
+        'text-padding': 0,
+        'text-offset': [0, -0.1]
+      },
+      paint: {
+        'text-color': [
+          'step',
+          ['coalesce', ['get', 'snr'], -99],
+          '#ff6b6b',
+          -13, '#f0a04b',
+          -7, '#60d394'
+        ],
+        'text-opacity': [
+          'case',
+          ['==', selectedTracerouteId || 'none', 'none'], 0.8,
+          ['==', ['get', 'id'], selectedTracerouteId], 1,
+          0.1
+        ],
+        'text-halo-color': 'rgba(8, 19, 32, 0.6)',
+        'text-halo-width': 1
+      }
+    });
+
     mapInstance.addLayer({
       id: MAP_TRACEROUTE_LABEL_LAYER_ID,
       type: 'symbol',
@@ -1305,6 +1343,11 @@
             ['==', ['get', 'id'], id], 0.7,
             0.05
           ]);
+          mapInstance.setPaintProperty('traceroute-layer-arrows', 'text-opacity', [
+            'case',
+            ['==', ['get', 'id'], id], 1,
+            0.1
+          ]);
           mapInstance.setPaintProperty(MAP_TRACEROUTE_LABEL_LAYER_ID, 'text-opacity', [
             'case',
             ['==', ['get', 'id'], id], 1,
@@ -1338,6 +1381,7 @@
           mapInstance.setPaintProperty('traceroute-layer-forward', 'line-opacity', 0.8);
           mapInstance.setPaintProperty('traceroute-layer-return', 'line-opacity', 0.7);
           mapInstance.setPaintProperty('traceroute-layer-bidirectional', 'line-opacity', 0.4);
+          mapInstance.setPaintProperty('traceroute-layer-arrows', 'text-opacity', 0.8);
           mapInstance.setPaintProperty(MAP_TRACEROUTE_LABEL_LAYER_ID, 'text-opacity', 1);
         }
       });
@@ -9512,7 +9556,23 @@
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     svg.innerHTML = '';
     ensureTraceroutePanZoom(svg, width, height);
-    ensureTracerouteNodeDrag(svg, width, height);
+
+    // Add arrowhead marker definition
+    const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+    const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+    marker.setAttribute('id', 'arrowhead');
+    marker.setAttribute('markerWidth', '10');
+    marker.setAttribute('markerHeight', '7');
+    marker.setAttribute('refX', '9');
+    marker.setAttribute('refY', '3.5');
+    marker.setAttribute('orient', 'auto');
+    const polygon = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+    polygon.setAttribute('points', '0 0, 10 3.5, 0 7');
+    polygon.setAttribute('fill', 'currentColor');
+    marker.appendChild(polygon);
+    defs.appendChild(marker);
+    svg.appendChild(defs);
+
     const layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     layer.setAttribute('class', 'traceroute-topology-layer');
     svg.appendChild(layer);
@@ -9544,6 +9604,9 @@
         `edge-line edge-${edge.direction === 'forward' ? 'forward' : 'return'} edge-snr-${category} ${edge.isBidirectional ? 'edge-bidirectional' : ''
         }`
       );
+      if (!edge.isBidirectional) {
+        path.setAttribute('marker-end', 'url(#arrowhead)');
+      }
       layer.appendChild(path);
 
       if (edge.isBidirectional && edge.direction === 'forward') {
