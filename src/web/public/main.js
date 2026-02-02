@@ -746,8 +746,11 @@
       total += 1;
       const meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
 
-      if (mapRoutesOnly && routedNodeIds && !routedNodeIds.has(meshKey)) {
-        return;
+      // Filter for routes-only mode: only show nodes in the route topology
+      if (mapRoutesOnly) {
+        if (!routedNodeIds || routedNodeIds.size === 0 || !routedNodeIds.has(meshKey)) {
+          return;
+        }
       }
 
       const coords = resolveNodeCoordinates(entry);
