@@ -1203,11 +1203,13 @@
       layout: {
         'symbol-placement': 'line',
         'symbol-spacing': 100,
-        'text-field': '➤',
-        'text-size': 14,
+        'text-field': '▶',
+        'text-size': 10,
         'text-font': ['Noto Sans Regular'],
         'text-allow-overlap': true,
         'text-ignore-placement': true,
+        'text-keep-upright': false,
+        'text-rotation-alignment': 'map',
         'text-padding': 0,
         'text-offset': [0, 0]
       },
