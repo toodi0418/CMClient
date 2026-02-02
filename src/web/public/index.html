@@ -125,7 +125,6 @@
       <header class="main-header">
         <nav class="section-tabs">
           <button type="button" class="nav-btn active" data-target="summary-page">總覽</button>
-          <button type="button" class="nav-btn" data-target="map-page">地圖</button>
           <button type="button" class="nav-btn" data-target="messages-page">訊息</button>
           <button type="button" class="nav-btn" data-target="flow-page">Mapping</button>
           <button type="button" class="nav-btn" data-target="routing-page">Traceroute</button>
@@ -221,12 +220,11 @@
                   <span>只顯示 APRS</span>
                 </label>
               </div>
+              <div class="summary-actions summary-actions-bottom">
+                <button id="summary-toggle" type="button" class="ghost-btn" aria-pressed="false">折疊</button>
+              </div>
             </div>
           </div>
-        </section>
-
-        <section id="map-page" class="page">
-          <div class="map-slot map-slot-full" data-map-slot="map"></div>
         </section>
 
         <section id="nodes-page" class="page">
@@ -236,6 +234,9 @@
                 <h2>節點資料庫</h2>
                 <p>完整節點表格檢視</p>
               </div>
+            </div>
+            <div class="nodes-table-search-row">
+              <input id="nodes-table-search" type="search" class="form-control" placeholder="搜尋節點名稱、Mesh ID 或角色" />
             </div>
             <div id="nodes-empty-state" class="nodes-empty">目前沒有節點資料。</div>
             <section id="nodes-table-wrapper" class="table-wrapper hidden">
@@ -323,46 +324,11 @@
         </section>
 
         <section id="routing-page" class="page">
-          <div class="panel">
+          <div class="panel routing-panel">
             <div class="panel-title">
               <div>
                 <h2>Traceroute</h2>
                 <p>顯示最近的 Traceroute 請求與結果 (最多 200 筆)</p>
-              </div>
-            </div>
-            <div class="traceroute-topology-panel">
-              <div class="traceroute-topology-header">
-                <div class="traceroute-topology-legend">
-                  <span class="legend-item"><span class="legend-dot snr-good"></span> SNR &gt; -7 dB</span>
-                  <span class="legend-item"><span class="legend-dot snr-mid"></span> -13 ~ -7 dB</span>
-                  <span class="legend-item"><span class="legend-dot snr-bad"></span> SNR ≤ -13 dB</span>
-                  <span class="legend-item"><span class="legend-dot snr-unknown"></span> Unknown</span>
-                  <span class="legend-item"><span class="legend-line forward"></span> Forward</span>
-                  <span class="legend-item"><span class="legend-line return"></span> Return</span>
-                </div>
-                <div class="traceroute-topology-controls">
-                  <button id="traceroute-refresh" type="button" class="ghost-btn">Refresh</button>
-                  <label class="topology-select">
-                    Window:
-                    <select id="traceroute-window" class="form-select form-select-sm">
-                      <option value="1">Last 1 Hour</option>
-                      <option value="3" selected>Last 3 Hours</option>
-                      <option value="12">Last 12 Hours</option>
-                      <option value="24">Last 24 Hours</option>
-                    </select>
-                  </label>
-                  <label class="topology-select">
-                    Layout:
-                    <select id="traceroute-layout" class="form-select form-select-sm">
-                      <option value="pyramid" selected>Pyramid (Hubs Top)</option>
-                      <option value="radial">Radial (Origin Center)</option>
-                      <option value="grid">Grid</option>
-                    </select>
-                  </label>
-                </div>
-              </div>
-              <div class="traceroute-topology-canvas">
-                <svg id="traceroute-topology" viewBox="0 0 960 520" preserveAspectRatio="xMidYMid meet"></svg>
               </div>
             </div>
             <div id="routing-empty-state" class="flow-empty hidden">尚未收到 traceroute 回應。</div>
@@ -371,7 +337,7 @@
         </section>
 
         <section id="telemetry-page" class="page">
-          <div class="panel">
+          <div class="panel telemetry-panel">
             <div class="telemetry-header">
               <div class="telemetry-controls">
                 <label for="telemetry-node-input" class="form-label">節點</label>
@@ -436,6 +402,10 @@
               </div>
             </div>
             <div id="telemetry-empty-state" class="telemetry-empty">尚未收到遙測資料。</div>
+            <section id="telemetry-latest" class="telemetry-latest hidden">
+              <div class="telemetry-latest-title">最新遙測摘要</div>
+              <ul id="telemetry-latest-list" class="telemetry-latest-list"></ul>
+            </section>
             <section id="telemetry-charts" class="telemetry-charts hidden"></section>
             <section id="telemetry-table-wrapper" class="telemetry-table-wrapper hidden">
               <table class="telemetry-table">
@@ -470,7 +440,7 @@
         </section>
 
         <section id="log-page" class="page">
-          <div class="panel">
+          <div class="panel log-panel">
             <div class="panel-title">
               <div>
                 <h2>系統日誌</h2>

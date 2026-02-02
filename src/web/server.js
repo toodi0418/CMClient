@@ -52,6 +52,17 @@ const TELEMETRY_METRIC_DEFINITIONS = {
     formatter: (value) => formatSecondsAsDuration(value)
   }
 };
+const TELEMETRY_DEVICE_KEYS = ['batteryLevel', 'voltage', 'channelUtilization', 'airUtilTx'];
+const TELEMETRY_SENSOR_KEYS = [
+  'temperature',
+  '_temperature',
+  'relativeHumidity',
+  'humidity',
+  '_humidity',
+  'barometricPressure',
+  'pressure',
+  '_pressure'
+];
 const CHANNEL_CONFIG = [
   { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
   { id: 1, code: 'CH1', name: 'Mesh TW', note: '跨節點廣播與共通交換' },
@@ -110,6 +121,33 @@ function sanitizeTelemetryRecord(record) {
     return null;
   }
   return cloneJson(record);
+}
+
+function telemetryHasAny(metrics, keys) {
+  if (!metrics || typeof metrics !== 'object') {
+    return false;
+  }
+  for (const key of keys) {
+    if (metrics[key] != null) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function pickTelemetrySubset(metrics, keys) {
+  if (!metrics || typeof metrics !== 'object') {
+    return null;
+  }
+  const subset = {};
+  let found = false;
+  for (const key of keys) {
+    if (metrics[key] != null) {
+      subset[key] = metrics[key];
+      found = true;
+    }
+  }
+  return found ? subset : null;
 }
 
 const FALLBACK_VERSION = (() => {
@@ -1740,6 +1778,22 @@ class WebDashboardServer {
         entry.availableMetrics.add(metric);
       }
     }
+    if (updates.latestDeviceMetrics && typeof updates.latestDeviceMetrics === 'object') {
+      entry.latestDeviceMetrics = cloneJson(updates.latestDeviceMetrics);
+    }
+    if (updates.latestSensorMetrics && typeof updates.latestSensorMetrics === 'object') {
+      entry.latestSensorMetrics = cloneJson(updates.latestSensorMetrics);
+    }
+    if (Number.isFinite(updates.latestDeviceSampleMs)) {
+      const latest = Number(updates.latestDeviceSampleMs);
+      entry.latestDeviceSampleMs =
+        entry.latestDeviceSampleMs != null ? Math.max(entry.latestDeviceSampleMs, latest) : latest;
+    }
+    if (Number.isFinite(updates.latestSensorSampleMs)) {
+      const latest = Number(updates.latestSensorSampleMs);
+      entry.latestSensorSampleMs =
+        entry.latestSensorSampleMs != null ? Math.max(entry.latestSensorSampleMs, latest) : latest;
+    }
     this.telemetrySummaryUpdatedAt = Date.now();
     this.lastTelemetrySummary = null;
   }
@@ -1824,12 +1878,19 @@ class WebDashboardServer {
         metricKeys.push(metricKey);
       }
     }
+    const recordMetrics = record?.telemetry?.metrics || null;
+    const deviceSubset = pickTelemetrySubset(recordMetrics, TELEMETRY_DEVICE_KEYS);
+    const sensorSubset = pickTelemetrySubset(recordMetrics, TELEMETRY_SENSOR_KEYS);
     this._updateTelemetrySummaryEntry(key, {
       rawMeshId: bucket.rawMeshId || key,
       node: bucket.node,
       totalRecordsDelta: 1,
       latestSampleMs: record.sampleTimeMs,
-      availableMetrics: metricKeys
+      availableMetrics: metricKeys,
+      latestDeviceMetrics: deviceSubset,
+      latestSensorMetrics: sensorSubset,
+      latestDeviceSampleMs: deviceSubset ? record.sampleTimeMs : null,
+      latestSensorSampleMs: sensorSubset ? record.sampleTimeMs : null
     });
     this._computeTelemetryStats();
     this._enforceTelemetryGlobalLimit();
@@ -1871,7 +1932,9 @@ class WebDashboardServer {
         latestSampleMs: latestSample,
         earliestSampleMs: earliestSample,
         availableMetrics: new Set(availableMetrics),
-        latestMetrics: entry?.latestMetrics ? cloneJson(entry.latestMetrics) : null
+        latestMetrics: entry?.latestMetrics ? cloneJson(entry.latestMetrics) : null,
+        latestDeviceMetrics: entry?.latestDeviceMetrics ? cloneJson(entry.latestDeviceMetrics) : null,
+        latestSensorMetrics: entry?.latestSensorMetrics ? cloneJson(entry.latestSensorMetrics) : null
       });
     }
     const providedUpdatedAt =
@@ -2034,8 +2097,28 @@ class WebDashboardServer {
             latest = rec;
           }
         }
-        if (latest?.telemetry?.metrics && typeof latest.telemetry.metrics === 'object') {
-          latestMetrics = cloneJson(latest.telemetry.metrics);
+      if (latest?.telemetry?.metrics && typeof latest.telemetry.metrics === 'object') {
+        latestMetrics = cloneJson(latest.telemetry.metrics);
+      }
+    }
+      let latestDeviceMetrics = entry?.latestDeviceMetrics ? cloneJson(entry.latestDeviceMetrics) : null;
+      let latestSensorMetrics = entry?.latestSensorMetrics ? cloneJson(entry.latestSensorMetrics) : null;
+      if ((!latestDeviceMetrics || !latestSensorMetrics) && bucket && Array.isArray(bucket.records)) {
+        let deviceFound = Boolean(latestDeviceMetrics);
+        let sensorFound = Boolean(latestSensorMetrics);
+        for (let i = bucket.records.length - 1; i >= 0; i -= 1) {
+          const rec = bucket.records[i];
+          const metrics = rec?.telemetry?.metrics;
+          if (!metrics) continue;
+          if (!deviceFound && telemetryHasAny(metrics, TELEMETRY_DEVICE_KEYS)) {
+            latestDeviceMetrics = pickTelemetrySubset(metrics, TELEMETRY_DEVICE_KEYS);
+            deviceFound = true;
+          }
+          if (!sensorFound && telemetryHasAny(metrics, TELEMETRY_SENSOR_KEYS)) {
+            latestSensorMetrics = pickTelemetrySubset(metrics, TELEMETRY_SENSOR_KEYS);
+            sensorFound = true;
+          }
+          if (deviceFound && sensorFound) break;
         }
       }
       nodes.push({
@@ -2047,7 +2130,9 @@ class WebDashboardServer {
         latestSampleMs: Number.isFinite(entry.latestSampleMs) ? Number(entry.latestSampleMs) : null,
         earliestSampleMs: Number.isFinite(entry.earliestSampleMs) ? Number(entry.earliestSampleMs) : null,
         availableMetrics: Array.from(entry.availableMetrics ?? []),
-        latestMetrics
+        latestMetrics,
+        latestDeviceMetrics,
+        latestSensorMetrics
       });
     }
     nodes.sort((a, b) => {

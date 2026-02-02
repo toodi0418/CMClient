@@ -5314,6 +5314,10 @@ class CallMeshAprsBridge extends EventEmitter {
           node: null,
           metricsSet: new Set(),
           latestMetrics: null,
+          latestDeviceMetrics: null,
+          latestSensorMetrics: null,
+          latestDeviceSampleMs: null,
+          latestSensorSampleMs: null,
           hasDatabaseCount: false
         };
         summaryMap.set(entry.meshIdNormalized || entry.rawMeshId || key, entry);
@@ -5386,9 +5390,27 @@ class CallMeshAprsBridge extends EventEmitter {
         }
         for (const record of records) {
           const metrics = record?.telemetry?.metrics;
+          const kind = record?.telemetry?.kind;
+          const recordSample =
+            Number(record?.sampleTimeMs) ??
+            Number(record?.timestampMs) ??
+            Number(record?.telemetry?.timeMs);
           if (metrics && typeof metrics === 'object') {
             for (const key of Object.keys(metrics)) {
               entry.metricsSet.add(key);
+            }
+          }
+          if (metrics && typeof metrics === 'object' && Number.isFinite(recordSample)) {
+            if (kind === 'device') {
+              if (entry.latestDeviceSampleMs == null || recordSample > entry.latestDeviceSampleMs) {
+                entry.latestDeviceSampleMs = recordSample;
+                entry.latestDeviceMetrics = cloneTelemetryMetrics(metrics);
+              }
+            } else if (kind === 'environment') {
+              if (entry.latestSensorSampleMs == null || recordSample > entry.latestSensorSampleMs) {
+                entry.latestSensorSampleMs = recordSample;
+                entry.latestSensorMetrics = cloneTelemetryMetrics(metrics);
+              }
             }
           }
         }
@@ -5439,6 +5461,49 @@ class CallMeshAprsBridge extends EventEmitter {
         }
       } catch (err) {
         this.emitLog('CALLMESH', `load telemetry latest metrics failed: ${err.message}`);
+      }
+    }
+
+    const meshIdsNeedingKinds = new Set();
+    for (const entry of summaryMap.values()) {
+      if (!entry.latestDeviceMetrics || !entry.latestSensorMetrics) {
+        const candidate = entry.rawMeshId || entry.meshIdNormalized;
+        if (candidate) {
+          meshIdsNeedingKinds.add(candidate);
+        }
+      }
+    }
+
+    if (this.telemetryDb && meshIdsNeedingKinds.size) {
+      try {
+        const kindRows = this.telemetryDb.fetchRecentSnapshot({
+          limitPerNode: 6,
+          meshIds: Array.from(meshIdsNeedingKinds)
+        });
+        for (const row of kindRows) {
+          const normalized = normalizeMeshId(row.meshId);
+          const entry = ensureEntry(normalized, row.meshId);
+          if (!entry) continue;
+          const sample =
+            Number(row.sampleTimeMs) ?? Number(row.timestampMs) ?? Number(row.telemetry?.timeMs);
+          const metrics = row?.telemetry?.metrics;
+          if (!metrics || typeof metrics !== 'object' || !Number.isFinite(sample)) {
+            continue;
+          }
+          if (row.telemetry?.kind === 'device') {
+            if (entry.latestDeviceSampleMs == null || sample > entry.latestDeviceSampleMs) {
+              entry.latestDeviceSampleMs = sample;
+              entry.latestDeviceMetrics = cloneTelemetryMetrics(metrics);
+            }
+          } else if (row.telemetry?.kind === 'environment') {
+            if (entry.latestSensorSampleMs == null || sample > entry.latestSensorSampleMs) {
+              entry.latestSensorSampleMs = sample;
+              entry.latestSensorMetrics = cloneTelemetryMetrics(metrics);
+            }
+          }
+        }
+      } catch (err) {
+        this.emitLog('CALLMESH', `load telemetry kind latest failed: ${err.message}`);
       }
     }
 
@@ -5493,7 +5558,9 @@ class CallMeshAprsBridge extends EventEmitter {
       latestSampleMs: Number.isFinite(entry.latestSampleMs) ? Number(entry.latestSampleMs) : null,
       earliestSampleMs: Number.isFinite(entry.earliestSampleMs) ? Number(entry.earliestSampleMs) : null,
       availableMetrics: Array.from(entry.metricsSet),
-      latestMetrics: entry.latestMetrics ? cloneTelemetryMetrics(entry.latestMetrics) : null
+      latestMetrics: entry.latestMetrics ? cloneTelemetryMetrics(entry.latestMetrics) : null,
+      latestDeviceMetrics: entry.latestDeviceMetrics ? cloneTelemetryMetrics(entry.latestDeviceMetrics) : null,
+      latestSensorMetrics: entry.latestSensorMetrics ? cloneTelemetryMetrics(entry.latestSensorMetrics) : null
     }));
 
     nodes.sort((a, b) => {
