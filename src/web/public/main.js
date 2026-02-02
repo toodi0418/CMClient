@@ -901,8 +901,7 @@
           id: featureId,
           geometry: {
             type: 'LineString',
-            // Reverse coordinates for return paths so arrows point correctly
-            coordinates: edge.direction === 'return' ? [toCoords, fromCoords] : [fromCoords, toCoords]
+            coordinates: [fromCoords, toCoords]
           },
           properties: {
             id: featureId,
@@ -1179,7 +1178,7 @@
     }
     mapInstance.addLayer(labelsLayer);
 
-    // Create arrow icon as inline SVG
+    // Create arrow icon as inline SVG (pointing right)
     const arrowSvg = `
       <svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
         <path d="M10 2 L18 10 L10 18 L10 12 L2 12 L2 8 L10 8 Z" fill="white" stroke="rgba(8, 19, 32, 0.6)" stroke-width="1"/>
@@ -1190,6 +1189,20 @@
     arrowImage.onload = () => {
       if (!mapInstance.hasImage('arrow-icon')) {
         mapInstance.addImage('arrow-icon', arrowImage);
+      }
+    };
+
+    // Create return arrow icon (pointing left)
+    const returnArrowSvg = `
+      <svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+        <path d="M10 2 L2 10 L10 18 L10 12 L18 12 L18 8 L10 8 Z" fill="white" stroke="rgba(8, 19, 32, 0.6)" stroke-width="1"/>
+      </svg>
+    `;
+    const returnArrowImage = new Image(20, 20);
+    returnArrowImage.src = 'data:image/svg+xml;base64,' + btoa(returnArrowSvg);
+    returnArrowImage.onload = () => {
+      if (!mapInstance.hasImage('return-arrow-icon')) {
+        mapInstance.addImage('return-arrow-icon', returnArrowImage);
       }
     };
 
@@ -1336,7 +1349,12 @@
       layout: {
         'symbol-placement': 'line',
         'symbol-spacing': 100,
-        'icon-image': 'arrow-icon',
+        'icon-image': [
+          'case',
+          ['==', ['get', 'direction'], 'return'],
+          'return-arrow-icon',
+          'arrow-icon'
+        ],
         'icon-size': 1.0,
         'icon-allow-overlap': true,
         'icon-ignore-placement': true,
