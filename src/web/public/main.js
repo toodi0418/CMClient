@@ -1,14 +1,18 @@
 (() => {
   const statusLabel = document.getElementById('status-label');
+  const meshtasticStatusDot = document.getElementById('meshtastic-status-dot');
   const selfLabel = document.getElementById('self-label');
   const callmeshLabel = document.getElementById('callmesh-label');
   const aprsStatusLabel = document.getElementById('aprs-status-label');
+  const callmeshStatusDot = document.getElementById('callmesh-status-dot');
+  const aprsStatusDot = document.getElementById('aprs-status-dot');
   const counterPackets = document.getElementById('counter-packets');
   const counterAprs = document.getElementById('counter-aprs');
   const counterMapping = document.getElementById('counter-mapping');
   const appVersionLabel = document.getElementById('app-version');
 
   const callmeshCallsign = document.getElementById('callmesh-callsign');
+  const callmeshCallsignDisplay = document.getElementById('callmesh-callsign-display');
   const callmeshSymbol = document.getElementById('callmesh-symbol');
   const callmeshCoords = document.getElementById('callmesh-coords');
   const callmeshPhg = document.getElementById('callmesh-phg');
@@ -16,11 +20,24 @@
   const callmeshUpdated = document.getElementById('callmesh-updated');
   const callmeshProvisionDetails = document.getElementById('callmesh-provision-details');
   const summaryTable = document.getElementById('summary-table');
+  const summaryFilterSelfTelemetry = document.getElementById('summary-filter-self-telemetry');
+  const summaryFilterMessage = document.getElementById('summary-filter-message');
+  const summaryFilterPosition = document.getElementById('summary-filter-position');
+  const summaryFilterAprs = document.getElementById('summary-filter-aprs');
   const logList = document.getElementById('log-list');
   const mapContainer = document.getElementById('mesh-map');
   const mapStatusLabel = document.getElementById('map-status');
   const mapFitBtn = document.getElementById('map-fit');
   const mapRefreshBtn = document.getElementById('map-refresh');
+  const mapToggleBtn = document.getElementById('map-toggle');
+  const mapPanel = document.getElementById('map-panel');
+  const mapSlotSummary = document.querySelector('[data-map-slot="summary"]');
+  const mapSlotFull = document.querySelector('[data-map-slot="map"]');
+  const summaryStack = document.querySelector('.summary-stack');
+  const summarySplitter = document.getElementById('summary-splitter');
+  const deckShell = document.querySelector('.deck-shell');
+  const deckSidebar = document.querySelector('.deck-sidebar');
+  const deckSplitter = document.getElementById('deck-splitter');
   const navButtons = document.querySelectorAll('.nav-btn');
   const pages = document.querySelectorAll('.page');
   const messagesPage = document.getElementById('messages-page');
@@ -37,6 +54,7 @@
   const channelPageNextBtn = document.getElementById('channel-page-next');
   const channelPageLastBtn = document.getElementById('channel-page-last');
   const channelPageSizeSelect = document.getElementById('channel-page-size');
+  const quickMessageChannelSelect = document.getElementById('quick-message-channel');
   const flowPage = document.getElementById('flow-page');
   const flowList = document.getElementById('flow-list');
   const flowEmptyState = document.getElementById('flow-empty-state');
@@ -83,7 +101,8 @@
   const nodesOnlineCountLabel = document.getElementById('nodes-online-count');
   const nodesOnlineTotalLabel = document.getElementById('nodes-online-total');
   const nodesSearchInput = document.getElementById('nodes-search');
-  const nodesStatusLabel = document.getElementById('nodes-status');
+  const nodesList = document.getElementById('nodes-list');
+  const nodesListEmpty = document.getElementById('nodes-list-empty');
   const relayHintModal = document.getElementById('relay-hint-modal');
   const relayHintReasonEl = document.getElementById('relay-hint-reason');
   const relayHintNodeEl = document.getElementById('relay-hint-node');
@@ -96,6 +115,7 @@
   const SUMMARY_ROW_HOP_DIRECT_CLASS = 'summary-row-hop-direct';
   const SUMMARY_ROW_HOP_ONE_CLASS = 'summary-row-hop-one';
   const SUMMARY_ROW_HOP_MULTI_CLASS = 'summary-row-hop-multi';
+  const directLinkStats = new Map();
   const flowRowMap = new Map();
   const aprsHighlightedFlows = new Set();
   const mappingMeshIds = new Set();
@@ -153,7 +173,6 @@
   let telemetryDropdownVisible = false;
   let telemetryDropdownInteracting = false;
   let nodesSearchTerm = '';
-  let nodesStatusResetTimer = null;
   const TELEMETRY_RANGE_OPTIONS = ['hour1', 'hour3', 'hour6', 'hour12', 'day', 'week', 'month', 'year', 'custom'];
   let telemetryRangeMode = 'day';
   let telemetryCustomRange = { startMs: null, endMs: null };
@@ -300,10 +319,10 @@
     {
       name: 'batteryLevel',
       styles: {
-        borderColor: '#60a5fa',
-        backgroundColor: 'rgba(96, 165, 250, 0.15)',
-        pointBackgroundColor: '#93c5fd',
-        pointBorderColor: '#60a5fa',
+        borderColor: '#4cc3ff',
+        backgroundColor: 'rgba(15, 111, 122, 0.18)',
+        pointBackgroundColor: '#6faab0',
+        pointBorderColor: '#4cc3ff',
         pointRadius: 0,
         pointHoverRadius: 3,
         borderWidth: 2,
@@ -316,10 +335,10 @@
     {
       name: 'channelUtilization',
       styles: {
-        borderColor: '#34d399',
-        backgroundColor: 'rgba(16, 185, 129, 0.25)',
-        pointBackgroundColor: '#6ee7b7',
-        pointBorderColor: '#10b981',
+        borderColor: '#f0a04b',
+        backgroundColor: 'rgba(199, 154, 59, 0.25)',
+        pointBackgroundColor: '#e2c07a',
+        pointBorderColor: '#f0a04b',
         pointRadius: 4,
         pointHoverRadius: 6,
         borderWidth: 0,
@@ -332,10 +351,10 @@
     {
       name: 'airUtilTx',
       styles: {
-        borderColor: '#f97316',
-        backgroundColor: 'rgba(249, 115, 22, 0.25)',
-        pointBackgroundColor: '#fdba74',
-        pointBorderColor: '#f97316',
+        borderColor: '#ff6b6b',
+        backgroundColor: 'rgba(155, 75, 47, 0.25)',
+        pointBackgroundColor: '#c67a62',
+        pointBorderColor: '#ff6b6b',
         pointRadius: 4,
         pointHoverRadius: 6,
         borderWidth: 0,
@@ -352,10 +371,10 @@
       name: 'temperature',
       axisId: 'temp',
       styles: {
-        borderColor: '#f472b6',
-        backgroundColor: 'rgba(244, 114, 182, 0.15)',
-        pointBackgroundColor: '#f9a8d4',
-        pointBorderColor: '#f472b6',
+        borderColor: '#ff6b6b',
+        backgroundColor: 'rgba(155, 75, 47, 0.15)',
+        pointBackgroundColor: '#c67a62',
+        pointBorderColor: '#ff6b6b',
         pointRadius: 3,
         pointHoverRadius: 4,
         borderWidth: 2,
@@ -368,10 +387,10 @@
       name: 'relativeHumidity',
       axisId: 'humidity',
       styles: {
-        borderColor: '#38bdf8',
-        backgroundColor: 'rgba(56, 189, 248, 0.18)',
-        pointBackgroundColor: '#7dd3fc',
-        pointBorderColor: '#38bdf8',
+        borderColor: '#4cc3ff',
+        backgroundColor: 'rgba(15, 111, 122, 0.18)',
+        pointBackgroundColor: '#6faab0',
+        pointBorderColor: '#4cc3ff',
         pointRadius: 3,
         pointHoverRadius: 4,
         borderWidth: 2,
@@ -384,10 +403,10 @@
       name: 'barometricPressure',
       axisId: 'pressure',
       styles: {
-        borderColor: '#a78bfa',
-        backgroundColor: 'rgba(167, 139, 250, 0.15)',
-        pointBackgroundColor: '#c4b5fd',
-        pointBorderColor: '#a78bfa',
+        borderColor: '#f0a04b',
+        backgroundColor: 'rgba(199, 154, 59, 0.15)',
+        pointBackgroundColor: '#e2c07a',
+        pointBorderColor: '#f0a04b',
         pointRadius: 3,
         pointHoverRadius: 4,
         borderWidth: 2,
@@ -439,6 +458,27 @@
   let messagesNavNeedsRender = true;
   for (const channel of channelConfigs) {
     channelMessageStore.set(channel.id, []);
+  }
+  renderQuickMessageChannels();
+
+  function renderQuickMessageChannels() {
+    if (!quickMessageChannelSelect) return;
+    const previousValue = quickMessageChannelSelect.value;
+    const fragment = document.createDocumentFragment();
+    const sorted = channelConfigs.slice().sort((a, b) => a.id - b.id);
+    for (const channel of sorted) {
+      const option = document.createElement('option');
+      option.value = String(channel.id);
+      option.textContent = channel.name || channel.code;
+      fragment.appendChild(option);
+    }
+    quickMessageChannelSelect.innerHTML = '';
+    quickMessageChannelSelect.appendChild(fragment);
+    const fallback = sorted[0]?.id != null ? String(sorted[0].id) : '';
+    const nextValue = previousValue || fallback;
+    if (nextValue) {
+      quickMessageChannelSelect.value = nextValue;
+    }
   }
 
   const METERS_PER_FOOT = 0.3048;
@@ -686,14 +726,14 @@
               'match',
               ['get', 'status'],
               'online',
-              '#40d9c6',
+              '#4cc3ff',
               'recent',
-              '#f6c453',
+              '#f0a04b',
               'offline',
-              '#f97316',
-              '#94a3b8'
+              '#ff6b6b',
+              '#6b778c'
             ],
-            'circle-stroke-color': '#0b1220',
+            'circle-stroke-color': '#13202d',
             'circle-stroke-width': 1
           }
         });
@@ -734,12 +774,165 @@
     });
   }
 
+  function mountMapPanel(targetId) {
+    if (!mapPanel) return;
+    const targetSlot = targetId === 'map-page' ? mapSlotFull : mapSlotSummary;
+    if (!targetSlot) return;
+    if (mapPanel.parentElement !== targetSlot) {
+      targetSlot.appendChild(mapPanel);
+    }
+  }
+
   mapFitBtn?.addEventListener('click', () => {
     fitMapToNodes();
   });
 
   mapRefreshBtn?.addEventListener('click', () => {
     updateMapNodes();
+  });
+
+  let summarySplitDragging = false;
+  let summarySplitStartY = 0;
+  let summarySplitStartHeight = 0;
+  let summarySplitLastHeight = null;
+
+  function clampSummaryMapHeight(nextHeight) {
+    if (!summaryStack || !mapPanel) return nextHeight;
+    const totalHeight = summaryStack.getBoundingClientRect().height || 0;
+    const splitterHeight = summarySplitter?.getBoundingClientRect().height || 10;
+    const minMap = 180;
+    const minSummary = 200;
+    const maxMap = Math.max(minMap, totalHeight - minSummary - splitterHeight);
+    return Math.min(Math.max(nextHeight, minMap), maxMap);
+  }
+
+  function applySummaryMapHeight(nextHeight) {
+    if (!summaryStack || !Number.isFinite(nextHeight)) return;
+    const clamped = clampSummaryMapHeight(nextHeight);
+    summaryStack.style.setProperty('--summary-map-height', `${clamped}px`);
+    summarySplitLastHeight = clamped;
+  }
+
+  function setSummaryMapCollapsed(collapsed) {
+    if (!summaryStack || !mapToggleBtn) return;
+    summaryStack.classList.toggle('is-collapsed', collapsed);
+    mapToggleBtn.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+    mapToggleBtn.textContent = collapsed ? '展開' : '折疊';
+    if (!collapsed && summarySplitLastHeight) {
+      applySummaryMapHeight(summarySplitLastHeight);
+    }
+  }
+
+  mapToggleBtn?.addEventListener('click', () => {
+    if (!summaryStack) return;
+    const collapsed = summaryStack.classList.contains('is-collapsed');
+    if (!collapsed) {
+      const currentHeight = mapPanel?.getBoundingClientRect().height;
+      if (Number.isFinite(currentHeight)) {
+        summarySplitLastHeight = currentHeight;
+      }
+    }
+    setSummaryMapCollapsed(!collapsed);
+  });
+
+  summarySplitter?.addEventListener('pointerdown', (event) => {
+    if (!summaryStack || !mapPanel) return;
+    if (summaryStack.classList.contains('is-collapsed')) return;
+    summarySplitDragging = true;
+    summarySplitStartY = event.clientY;
+    summarySplitStartHeight = mapPanel.getBoundingClientRect().height;
+    summarySplitter.setPointerCapture(event.pointerId);
+    summarySplitter.classList.add('is-dragging');
+  });
+
+  summarySplitter?.addEventListener('pointermove', (event) => {
+    if (!summarySplitDragging) return;
+    const delta = event.clientY - summarySplitStartY;
+    applySummaryMapHeight(summarySplitStartHeight + delta);
+  });
+
+  function endSummarySplitDrag() {
+    if (!summarySplitDragging) return;
+    summarySplitDragging = false;
+    summarySplitter?.classList.remove('is-dragging');
+  }
+
+  summarySplitter?.addEventListener('pointerup', endSummarySplitDrag);
+  summarySplitter?.addEventListener('pointercancel', endSummarySplitDrag);
+  summarySplitter?.addEventListener('keydown', (event) => {
+    if (!summaryStack || summaryStack.classList.contains('is-collapsed')) return;
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    event.preventDefault();
+    const delta = event.key === 'ArrowUp' ? -20 : 20;
+    const current = mapPanel?.getBoundingClientRect().height || summarySplitLastHeight || 260;
+    applySummaryMapHeight(current + delta);
+  });
+
+  let deckSplitDragging = false;
+  let deckSplitStartX = 0;
+  let deckSplitStartWidth = 0;
+
+  function clampSidebarWidth(nextWidth) {
+    if (!deckShell || !deckSidebar) return nextWidth;
+    const shellRect = deckShell.getBoundingClientRect();
+    const splitterWidth = deckSplitter?.getBoundingClientRect().width || 10;
+    const computed = window.getComputedStyle(deckShell);
+    const gapValue = Number.parseFloat(computed.columnGap || computed.gap || '0') || 0;
+    const minSidebar = 240;
+    const minMain = 420;
+    const maxSidebar = Math.max(minSidebar, shellRect.width - splitterWidth - gapValue * 2 - minMain);
+    return Math.min(Math.max(nextWidth, minSidebar), maxSidebar);
+  }
+
+  function applySidebarWidth(nextWidth) {
+    if (!deckShell || !Number.isFinite(nextWidth)) return;
+    const clamped = clampSidebarWidth(nextWidth);
+    deckShell.style.setProperty('--sidebar-width', `${clamped}px`);
+  }
+
+  deckSplitter?.addEventListener('pointerdown', (event) => {
+    if (!deckShell || !deckSidebar) return;
+    deckSplitDragging = true;
+    deckSplitStartX = event.clientX;
+    deckSplitStartWidth = deckSidebar.getBoundingClientRect().width;
+    deckSplitter.setPointerCapture(event.pointerId);
+    deckSplitter.classList.add('is-dragging');
+  });
+
+  deckSplitter?.addEventListener('pointermove', (event) => {
+    if (!deckSplitDragging) return;
+    const delta = event.clientX - deckSplitStartX;
+    applySidebarWidth(deckSplitStartWidth + delta);
+  });
+
+  function endDeckSplitDrag() {
+    if (!deckSplitDragging) return;
+    deckSplitDragging = false;
+    deckSplitter?.classList.remove('is-dragging');
+  }
+
+  deckSplitter?.addEventListener('pointerup', endDeckSplitDrag);
+  deckSplitter?.addEventListener('pointercancel', endDeckSplitDrag);
+  deckSplitter?.addEventListener('keydown', (event) => {
+    if (!deckShell || !deckSidebar) return;
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const delta = event.key === 'ArrowLeft' ? -20 : 20;
+    const current = deckSidebar.getBoundingClientRect().width || 300;
+    applySidebarWidth(current + delta);
+  });
+
+  const summaryFilterInputs = [
+    summaryFilterSelfTelemetry,
+    summaryFilterMessage,
+    summaryFilterPosition,
+    summaryFilterAprs
+  ].filter(Boolean);
+
+  summaryFilterInputs.forEach((input) => {
+    input.addEventListener('change', () => {
+      applySummaryFilters();
+    });
   });
 
   relayHintCloseBtn?.addEventListener('click', () => {
@@ -1196,6 +1389,7 @@
     channelConfigs.sort((a, b) => a.id - b.id);
     channelConfigMap.set(numeric, fallback);
     messagesNavNeedsRender = true;
+    renderQuickMessageChannels();
     return fallback;
   }
 
@@ -1643,6 +1837,77 @@
     return type === 'text';
   }
 
+  function isTelemetrySummary(summary) {
+    if (!summary || typeof summary !== 'object') return false;
+    const type = typeof summary.type === 'string' ? summary.type.trim().toLowerCase() : '';
+    return type.includes('telemetry');
+  }
+
+  function isPositionSummary(summary) {
+    if (!summary || typeof summary !== 'object') return false;
+    return typeof summary.type === 'string' && summary.type.trim().toLowerCase() === 'position';
+  }
+
+  function isSelfTelemetrySummary(summary) {
+    if (!isTelemetrySummary(summary)) return false;
+    const meshId =
+      summary?.from?.meshId ||
+      summary?.from?.meshIdNormalized ||
+      summary?.fromMeshId ||
+      summary?.fromMeshIdNormalized;
+    return isSelfMesh(meshId, summary);
+  }
+
+  function isAprsSummary(summary, row) {
+    if (!summary || typeof summary !== 'object') return false;
+    if (summary.aprsRejected || summary.aprsRejectedReason || summary.aprsRejectedLabel) return true;
+    if (deriveSummaryAprsCallsign(summary)) return true;
+    if (row?.dataset?.aprsSuccess === '1' || row?.dataset?.aprsCallsign) return true;
+    return (
+      row?.classList?.contains('summary-row-aprs') ||
+      row?.classList?.contains('summary-row-aprs-rejected')
+    );
+  }
+
+  function getSummaryFilterState() {
+    return {
+      selfTelemetry: Boolean(summaryFilterSelfTelemetry?.checked),
+      messageOnly: Boolean(summaryFilterMessage?.checked),
+      positionOnly: Boolean(summaryFilterPosition?.checked),
+      aprsOnly: Boolean(summaryFilterAprs?.checked)
+    };
+  }
+
+  function shouldShowSummaryRow(summary, row, filters) {
+    const state = filters || getSummaryFilterState();
+    const isSelfTelemetry = isSelfTelemetrySummary(summary);
+    const baseFilterActive = state.messageOnly || state.positionOnly || state.aprsOnly;
+
+    if (!state.selfTelemetry && isSelfTelemetry) {
+      return false;
+    }
+
+    if (!baseFilterActive) {
+      return true;
+    }
+
+    if (state.messageOnly && isTextSummary(summary)) return true;
+    if (state.positionOnly && isPositionSummary(summary)) return true;
+    if (state.aprsOnly && isAprsSummary(summary, row) && isPositionSummary(summary)) return true;
+
+    return state.selfTelemetry && isSelfTelemetry;
+  }
+
+  function applySummaryFilters(filters) {
+    if (!Array.isArray(summaryRows) || !summaryRows.length) return;
+    const state = filters || getSummaryFilterState();
+    for (const row of summaryRows) {
+      if (!row || !row.__summaryData) continue;
+      const visible = shouldShowSummaryRow(row.__summaryData, row, state);
+      row.classList.toggle('hidden', !visible);
+    }
+  }
+
   function formatMessageText(summary) {
     const detail = typeof summary.detail === 'string' ? summary.detail.trim() : '';
     const extra = Array.isArray(summary.extraLines)
@@ -1965,29 +2230,6 @@
     return entries;
   }
 
-  function setNodeDatabaseStatus(message, variant = 'info') {
-    if (!nodesStatusLabel) {
-      return;
-    }
-    if (nodesStatusResetTimer) {
-      clearTimeout(nodesStatusResetTimer);
-      nodesStatusResetTimer = null;
-    }
-    nodesStatusLabel.textContent = message || '';
-    nodesStatusLabel.classList.remove('status-info', 'status-success', 'status-error');
-    if (message) {
-      const className =
-        variant === 'error' ? 'status-error' : variant === 'success' ? 'status-success' : 'status-info';
-      nodesStatusLabel.classList.add(className);
-      if (variant !== 'error') {
-        nodesStatusResetTimer = setTimeout(() => {
-          nodesStatusLabel.textContent = '';
-          nodesStatusLabel.classList.remove('status-info', 'status-success', 'status-error');
-          nodesStatusResetTimer = null;
-        }, 6000);
-      }
-    }
-  }
 
   function renderNodeDatabase() {
     if (!nodesTableBody || !nodesTotalCountLabel) {
@@ -2028,6 +2270,11 @@
       if (nodesEmptyState) {
         nodesEmptyState.textContent = hasFilter ? '沒有符合搜尋的節點。' : '目前沒有節點資料。';
       }
+      if (nodesList) {
+        nodesList.innerHTML = '';
+        nodesList.classList.add('hidden');
+      }
+      nodesListEmpty?.classList.remove('hidden');
       if (nodesOnlineCountLabel) {
         nodesOnlineCountLabel.textContent = '0';
       }
@@ -2039,6 +2286,8 @@
 
     nodesTableWrapper?.classList.remove('hidden');
     nodesEmptyState?.classList.add('hidden');
+    nodesList?.classList.remove('hidden');
+    nodesListEmpty?.classList.add('hidden');
     let onlineCount = 0;
 
     const rows = filteredEntries.map((entry) => {
@@ -2071,6 +2320,7 @@
       const meshLabel = meshIdOriginal || meshId || '—';
       const hwModelDisplay = entry.hwModelLabel || normalizeEnumLabel(entry.hwModel) || '—';
       const roleDisplay = entry.roleLabel || normalizeEnumLabel(entry.role) || '—';
+      const telemetrySummary = getTelemetrySummaryForMesh(meshIdOriginal || meshId);
       const coordinateDisplay = formatNodeCoordinateValue(entry);
       const distanceDisplay = formatNodeDistanceValue(entry);
 
@@ -2098,6 +2348,96 @@
     });
 
     nodesTableBody.innerHTML = rows.join('');
+    if (nodesList) {
+      const listCards = filteredEntries.map((entry) => {
+        const longName = sanitizeNodeName(entry.longName);
+        const shortName = sanitizeNodeName(entry.shortName);
+        const labelName = sanitizeNodeName(entry.label);
+        const meshIdOriginal = entry.meshIdOriginal || '';
+        const meshId = entry.meshId || '';
+        const primaryName =
+          longName ||
+          shortName ||
+          labelName ||
+          meshIdOriginal ||
+          meshId ||
+          '—';
+
+        const meshLabel = meshIdOriginal || meshId || '—';
+        const normalizedMesh = normalizeMeshId(meshIdOriginal || meshId);
+        const directStats = normalizedMesh ? directLinkStats.get(normalizedMesh) : null;
+        const signalLabel =
+          directStats && (Number.isFinite(directStats.snr) || Number.isFinite(directStats.rssi))
+            ? `SNR ${formatNumber(directStats.snr, 1)} / RSSI ${formatNumber(directStats.rssi, 0)}`
+            : '';
+        const roleValue = entry.role || '';
+        const roleDisplay = entry.roleLabel || normalizeEnumLabel(entry.role) || '—';
+        const roleKey = roleValue ? String(roleValue).toUpperCase() : '';
+        const roleBadgeMap = {
+          ROUTER: { text: 'R', className: 'role-badge role-badge--router' },
+          ROUTER_LATE: { text: 'RL', className: 'role-badge role-badge--router' },
+          CLIENT: { text: 'C', className: 'role-badge role-badge--client' },
+          CLIENT_MUTE: { text: 'CM', className: 'role-badge role-badge--client-mute' },
+          CLIENT_BASE: { text: 'CB', className: 'role-badge role-badge--client' },
+          TRACKER: { text: 'T', className: 'role-badge role-badge--tracker' }
+        };
+        const roleBadge = roleBadgeMap[roleKey] || null;
+        const telemetrySummary = getTelemetrySummaryForMesh(meshIdOriginal || meshId);
+        const { display: lastSeenDisplay, timestamp: lastSeenTimestamp } =
+          formatNodeLastSeen(entry.lastSeenAt);
+        const isOnline = lastSeenTimestamp != null && now - lastSeenTimestamp <= NODE_ONLINE_WINDOW_MS;
+        const statusClass = isOnline ? 'nodes-card-item--online' : 'nodes-card-item--offline';
+
+        const telemetryParts = [];
+        if (lastSeenDisplay && lastSeenDisplay !== '—') {
+          telemetryParts.push(
+            `<span class="nodes-card-telemetry nodes-card-telemetry--seen" title="${escapeHtml(lastSeenDisplay)}">` +
+              `<span class="telemetry-icon telemetry-icon--seen" aria-hidden="true">⏱</span>` +
+              `<span class="telemetry-text">${escapeHtml(lastSeenDisplay)}</span>` +
+            `</span>`
+          );
+        }
+        if (telemetrySummary?.items?.length) {
+          for (const item of telemetrySummary.items) {
+            telemetryParts.push(
+              `<span class="nodes-card-telemetry" title="${escapeHtml(item.label)}">` +
+                `<span class="telemetry-icon ${escapeHtml(item.className || '')}" aria-hidden="true">${escapeHtml(item.icon || '')}</span>` +
+                `<span class="telemetry-text">${escapeHtml(item.value)}</span>` +
+              `</span>`
+            );
+          }
+        }
+        if (telemetrySummary?.timeLabel) {
+          telemetryParts.push(
+            `<span class="nodes-card-telemetry nodes-card-telemetry--time" title="遙測時間">` +
+              `<span class="telemetry-icon telemetry-icon--time" aria-hidden="true">🕒</span>` +
+              `<span class="telemetry-text">${escapeHtml(telemetrySummary.timeLabel)}</span>` +
+            `</span>`
+          );
+        }
+        const telemetryHtml = telemetryParts.length ? telemetryParts.join('') : '';
+        const shortNameBadge =
+          shortName && shortName !== primaryName
+            ? `<span class="nodes-short-name">${escapeHtml(shortName)}</span>`
+            : '';
+        const roleBadgeHtml = roleBadge
+          ? `<span class="${roleBadge.className}" title="${escapeHtml(roleDisplay)}">${escapeHtml(roleBadge.text)}</span>`
+          : '';
+        const meshIdHtml = signalLabel
+          ? `${escapeHtml(meshLabel)}<span class="nodes-card-signal">${escapeHtml(signalLabel)}</span>`
+          : escapeHtml(meshLabel);
+        return (
+          `<div class="nodes-card-item ${statusClass}">` +
+          '<div class="nodes-card-head">' +
+          `<span class="nodes-card-name">${escapeHtml(primaryName)}${shortNameBadge}${roleBadgeHtml}</span>` +
+          `<span class="nodes-card-id">${meshIdHtml}</span>` +
+          '</div>' +
+          `<div class="nodes-card-meta">${telemetryHtml}</div>` +
+          '</div>'
+        );
+      });
+      nodesList.innerHTML = listCards.join('');
+    }
     if (nodesOnlineCountLabel) {
       nodesOnlineCountLabel.textContent = String(onlineCount);
     }
@@ -2244,7 +2584,12 @@
         renderTelemetryView();
       } else if (isActive && targetId === 'flow-page') {
         renderFlowEntries();
+      } else if (isActive && targetId === 'summary-page') {
+        renderNodeDatabase();
+        mountMapPanel(targetId);
+        ensureMapReady();
       } else if (isActive && targetId === 'map-page') {
+        mountMapPanel(targetId);
         ensureMapReady();
       } else if (isActive && targetId === 'nodes-page') {
         renderNodeDatabase();
@@ -2270,6 +2615,14 @@
   });
 
   initializeChannelMessages();
+  renderNodeDatabase();
+  if (
+    document.getElementById('summary-page')?.classList.contains('active') ||
+    document.getElementById('map-page')?.classList.contains('active')
+  ) {
+    mountMapPanel(document.getElementById('map-page')?.classList.contains('active') ? 'map-page' : 'summary-page');
+    ensureMapReady();
+  }
   if (channelPageSizeSelect) {
     if (!CHANNEL_PAGE_SIZES.includes(channelPageSize)) {
       channelPageSize = CHANNEL_PAGE_SIZES[0];
@@ -2656,6 +3009,21 @@
     } else {
       cell.removeAttribute('title');
     }
+
+    const shortRelayLabel = (() => {
+      const relayNode = summary?.relay || {};
+      const shortDisplay = sanitizeNodeName(relayNode.shortName);
+      const longDisplay = sanitizeNodeName(relayNode.longName) || sanitizeNodeName(relayNode.label);
+      return shortDisplay || longDisplay || relayDisplay;
+    })();
+
+    if (shortRelayLabel && shortRelayLabel !== relayDisplay) {
+      requestAnimationFrame(() => {
+        if (cell.scrollWidth > cell.clientWidth) {
+          labelSpan.textContent = shortRelayLabel;
+        }
+      });
+    }
   }
 
   function formatRelayLabel(relay) {
@@ -2751,7 +3119,7 @@
     if (!value) {
       return '__unknown__';
     }
-    return value;
+    return normalizeMeshId(value) || value;
   }
 
   function sanitizeTelemetryNodeData(node) {
@@ -4322,7 +4690,7 @@
     const labelText = def.label || metricName;
     const yScaleOptions = {
       ticks: {
-        color: '#cbd5f5',
+        color: '#5a647c',
         callback: (value, index, ticks) =>
           formatTelemetryAxisValue(metricName, value, ticks) || value
       },
@@ -4358,10 +4726,10 @@
             label: labelText,
             data: dataset,
             telemetryDecimals: seriesDecimals,
-            borderColor: '#60a5fa',
-            backgroundColor: 'rgba(96, 165, 250, 0.18)',
-            pointBackgroundColor: '#bfdbfe',
-            pointBorderColor: '#60a5fa',
+            borderColor: '#4cc3ff',
+            backgroundColor: 'rgba(15, 111, 122, 0.18)',
+            pointBackgroundColor: '#6faab0',
+            pointBorderColor: '#4cc3ff',
             pointRadius: 3,
             pointHoverRadius: 4,
             borderWidth: 2,
@@ -4383,7 +4751,7 @@
           x: {
             type: 'linear',
             ticks: {
-              color: '#cbd5f5',
+              color: '#5a647c',
               callback: (value) => formatTelemetryAxisTick(value)
             },
             grid: {
@@ -4450,10 +4818,10 @@
           data: points,
           telemetryDecimals: decimals,
           telemetryMetric: meta.name,
-          borderColor: styles.borderColor || '#60a5fa',
-          backgroundColor: styles.backgroundColor ?? 'rgba(96, 165, 250, 0.18)',
-          pointBackgroundColor: styles.pointBackgroundColor ?? styles.backgroundColor ?? '#bfdbfe',
-          pointBorderColor: styles.pointBorderColor ?? styles.borderColor ?? '#60a5fa',
+          borderColor: styles.borderColor || '#4cc3ff',
+          backgroundColor: styles.backgroundColor ?? 'rgba(15, 111, 122, 0.18)',
+          pointBackgroundColor: styles.pointBackgroundColor ?? styles.backgroundColor ?? '#6faab0',
+          pointBorderColor: styles.pointBorderColor ?? styles.borderColor ?? '#4cc3ff',
           pointRadius: styles.pointRadius ?? 3,
           pointHoverRadius: styles.pointHoverRadius ?? styles.pointRadius ?? 4,
           borderWidth: styles.borderWidth ?? 2,
@@ -4564,10 +4932,10 @@
           telemetryDecimals: decimals,
           telemetryMetric: meta.name,
           yAxisID: meta.axisId || meta.name,
-          borderColor: styles.borderColor || '#38bdf8',
-          backgroundColor: styles.backgroundColor ?? 'rgba(56, 189, 248, 0.18)',
-          pointBackgroundColor: styles.pointBackgroundColor ?? styles.backgroundColor ?? '#7dd3fc',
-          pointBorderColor: styles.pointBorderColor ?? styles.borderColor ?? '#38bdf8',
+          borderColor: styles.borderColor || '#4cc3ff',
+          backgroundColor: styles.backgroundColor ?? 'rgba(15, 111, 122, 0.18)',
+          pointBackgroundColor: styles.pointBackgroundColor ?? styles.backgroundColor ?? '#6faab0',
+          pointBorderColor: styles.pointBorderColor ?? styles.borderColor ?? '#4cc3ff',
           pointRadius: styles.pointRadius ?? 3,
           pointHoverRadius: styles.pointHoverRadius ?? styles.pointRadius ?? 4,
           borderWidth: styles.borderWidth ?? 2,
@@ -4669,7 +5037,7 @@
           x: {
             type: 'linear',
             ticks: {
-              color: '#cbd5f5',
+              color: '#5a647c',
               callback: (value) => formatTelemetryAxisTick(value)
             },
             grid: {
@@ -4680,7 +5048,7 @@
             min: 0,
             max: 100,
             ticks: {
-              color: '#cbd5f5',
+              color: '#5a647c',
               autoSkip: false,
               includeBounds: true,
               stepSize: 20,
@@ -4698,7 +5066,7 @@
             display: true,
             position: 'bottom',
             labels: {
-              color: '#cbd5f5',
+              color: '#5a647c',
               usePointStyle: true,
               padding: 12
             }
@@ -4765,7 +5133,7 @@
       x: {
         type: 'linear',
         ticks: {
-          color: '#cbd5f5',
+          color: '#5a647c',
           callback: (value) => formatTelemetryAxisTick(value)
         },
         grid: {
@@ -4790,7 +5158,7 @@
           drawOnChartArea: config.grid?.drawOnChartArea ?? true
         },
         ticks: {
-          color: '#cbd5f5',
+          color: '#5a647c',
           callback: tickCallback
         }
       };
@@ -4824,7 +5192,7 @@
           legend: {
             display: true,
             labels: {
-              color: '#cbd5f5'
+              color: '#5a647c'
             }
           },
           tooltip: {
@@ -5065,6 +5433,113 @@
       return parts.join(' · ');
     }
     return '—';
+  }
+
+  function getLatestTelemetryRecordForMesh(meshId) {
+    const meshKey = resolveTelemetryMeshKey(meshId);
+    const bucket = telemetryStore.get(meshKey);
+    if (!bucket || !Array.isArray(bucket.records) || !bucket.records.length) {
+      return null;
+    }
+    let latest = null;
+    let latestTs = -1;
+    for (const rec of bucket.records) {
+      const tsRaw = rec?.sampleTimeMs ?? rec?.timestampMs ?? rec?.timeMs ?? rec?.timestamp;
+      const ts = Number.isFinite(tsRaw) ? Number(tsRaw) : -1;
+      if (ts > latestTs) {
+        latestTs = ts;
+        latest = rec;
+      }
+    }
+    return latest;
+  }
+
+  function pickTelemetryMetric(metrics, keys) {
+    for (const key of keys) {
+      if (metrics[key] == null) continue;
+      return { key, value: metrics[key] };
+    }
+    return null;
+  }
+
+  function normalizeTelemetryMetricKey(key) {
+    const raw = String(key || '').trim();
+    switch (raw) {
+      case '_temperature':
+        return 'temperature';
+      case 'humidity':
+      case '_humidity':
+        return 'relativeHumidity';
+      case 'pressure':
+      case '_pressure':
+        return 'barometricPressure';
+      default:
+        return raw;
+    }
+  }
+
+  function buildTelemetryCompactSummary(metrics) {
+    if (!metrics || typeof metrics !== 'object') return [];
+    const items = [];
+
+    const deviceMetrics = [
+      { label: '電量', keys: ['batteryLevel'], icon: '🔋', className: 'telemetry-icon--battery' },
+      { label: '電壓', keys: ['voltage'], icon: '⚡', className: 'telemetry-icon--voltage' },
+      { label: '通道', keys: ['channelUtilization'], icon: '📶', className: 'telemetry-icon--channel' },
+      { label: '空中', keys: ['airUtilTx'], icon: '📡', className: 'telemetry-icon--air' }
+    ];
+    const sensorMetrics = [
+      { label: '溫度', keys: ['temperature', '_temperature'], icon: '🌡', className: 'telemetry-icon--temp' },
+      { label: '濕度', keys: ['relativeHumidity', 'humidity', '_humidity'], icon: '💧', className: 'telemetry-icon--humidity' },
+      { label: '氣壓', keys: ['barometricPressure', 'pressure', '_pressure'], icon: '🧭', className: 'telemetry-icon--pressure' }
+    ];
+
+    for (const item of deviceMetrics) {
+      const picked = pickTelemetryMetric(metrics, item.keys);
+      if (!picked) continue;
+      const formatted = formatTelemetryValue(normalizeTelemetryMetricKey(picked.key), picked.value);
+      if (!formatted) continue;
+      items.push({
+        label: item.label,
+        value: formatted,
+        icon: item.icon,
+        className: item.className
+      });
+    }
+
+    for (const item of sensorMetrics) {
+      const picked = pickTelemetryMetric(metrics, item.keys);
+      if (!picked) continue;
+      const formatted = formatTelemetryValue(normalizeTelemetryMetricKey(picked.key), picked.value);
+      if (!formatted) continue;
+      items.push({
+        label: item.label,
+        value: formatted,
+        icon: item.icon,
+        className: item.className
+      });
+    }
+
+    return items;
+  }
+
+  function getTelemetrySummaryForMesh(meshId) {
+    const meshKey = resolveTelemetryMeshKey(meshId);
+    const bucket = telemetryStore.get(meshKey);
+    const record = getLatestTelemetryRecordForMesh(meshId);
+    const metrics =
+      record?.telemetry?.metrics ||
+      (bucket && bucket.latestMetrics ? bucket.latestMetrics : null);
+    if (!metrics) return null;
+    const items = buildTelemetryCompactSummary(metrics);
+    if (!items.length) return null;
+    const timeMs =
+      record?.sampleTimeMs ??
+      record?.timestampMs ??
+      record?.telemetry?.timeMs ??
+      (record?.telemetry?.timeSeconds != null ? Number(record.telemetry.timeSeconds) * 1000 : null);
+    const timeLabel = Number.isFinite(timeMs) ? formatTelemetryTimestamp(timeMs) : null;
+    return { items, timeLabel };
   }
 
   function buildTelemetryRelayDescriptor(record) {
@@ -5467,6 +5942,7 @@
           loadedCount: 0,
           totalRecords: Number.isFinite(entry?.totalRecords) ? Number(entry.totalRecords) : 0,
           metrics: new Set(Array.isArray(entry?.availableMetrics) ? entry.availableMetrics : []),
+          latestMetrics: entry?.latestMetrics || null,
           latestSampleMs: Number.isFinite(entry?.latestSampleMs) ? Number(entry.latestSampleMs) : null,
           earliestSampleMs: null,
           partial: false,
@@ -5486,6 +5962,9 @@
           for (const metricKey of entry.availableMetrics) {
             bucket.metrics.add(metricKey);
           }
+        }
+        if (entry?.latestMetrics) {
+          bucket.latestMetrics = entry.latestMetrics;
         }
         if (Number.isFinite(entry?.totalRecords)) {
           bucket.totalRecords = Number(entry.totalRecords);
@@ -5719,7 +6198,7 @@
     const extras = Array.isArray(summary?.extraLines)
       ? summary.extraLines
         .map((line) => (line === null || line === undefined ? '' : String(line).trim()))
-        .filter(Boolean)
+        .filter((line) => Boolean(line) && !/^cached traceroute @/i.test(line))
       : [];
     const distanceLabel = formatDistance(summary);
 
@@ -6166,6 +6645,10 @@
       delete row.dataset.aprsSuccess;
     }
     updateAprsSuccessClass(row);
+    const filterState = getSummaryFilterState();
+    if (filterState.selfTelemetry || filterState.messageOnly || filterState.positionOnly || filterState.aprsOnly) {
+      applySummaryFilters(filterState);
+    }
   }
 
   function applyHopHighlight(row, summary) {
@@ -6265,6 +6748,8 @@
 
     applyHopHighlight(row, summary);
 
+    updateDirectLinkStats(summary);
+
     const flowId = summary?.flowId;
     if (flowId) {
       row.dataset.flowId = flowId;
@@ -6300,6 +6785,12 @@
 
     registerFlow(summary);
     applyAprsState(row, summary);
+    const filterState = getSummaryFilterState();
+    if (filterState.selfTelemetry || filterState.messageOnly || filterState.positionOnly || filterState.aprsOnly) {
+      row.classList.toggle('hidden', !shouldShowSummaryRow(summary, row, filterState));
+    } else {
+      row.classList.remove('hidden');
+    }
   }
 
   function refreshSummaryRows() {
@@ -6318,6 +6809,7 @@
       cells[1].textContent = formatNodes(summary);
       updateRelayCellDisplay(cells[2], summary);
     }
+    applySummaryFilters();
   }
 
   function unwrapPendingFlowSummary(entry) {
@@ -7277,11 +7769,53 @@
     };
   }
 
+  function isDirectSummary(summary) {
+    const hopInfo = extractHopInfo(summary);
+    if (hopInfo && !hopInfo.limitOnly && hopInfo.usedHops != null) {
+      return hopInfo.usedHops <= 0;
+    }
+    const relayLabel = formatRelay(summary);
+    return relayLabel === '直收' || relayLabel === 'Self';
+  }
+
+  function updateDirectLinkStats(summary) {
+    if (!summary || !isDirectSummary(summary)) return;
+    const meshId =
+      summary?.from?.meshId ||
+      summary?.from?.meshIdNormalized ||
+      summary?.fromMeshId ||
+      summary?.fromMeshIdNormalized ||
+      summary?.fromMeshIdOriginal ||
+      '';
+    const normalized = normalizeMeshId(meshId);
+    if (!normalized) return;
+    const snr = Number.isFinite(summary.snr) ? Number(summary.snr) : null;
+    const rssi = Number.isFinite(summary.rssi) ? Number(summary.rssi) : null;
+    if (snr == null && rssi == null) return;
+    if ((snr === 0 || snr === 0.0) && (rssi === 0 || rssi === 0.0)) {
+      return;
+    }
+    directLinkStats.set(normalized, {
+      snr,
+      rssi,
+      timestampMs: extractSummaryTimestampMs(summary)
+    });
+  }
+
   function updateStatus(info) {
     if (!info || !statusLabel) return;
     const label = info.status || info.state || 'unknown';
     const message = info.message ? ` (${info.message})` : '';
     statusLabel.textContent = `${label}${message}`;
+    if (meshtasticStatusDot) {
+      const normalized = String(label).toLowerCase();
+      const isOk =
+        normalized === 'connected' ||
+        normalized === 'online' ||
+        normalized === 'ready' ||
+        normalized.includes('已連線');
+      setStatusDot(meshtasticStatusDot, isOk ? 'ok' : 'bad');
+    }
   }
 
   function resolveSelfLabelFromRegistry() {
@@ -7352,6 +7886,9 @@
     if (callmeshLabel) {
       callmeshLabel.textContent = humanStatus;
     }
+    if (callmeshStatusDot) {
+      setStatusDot(callmeshStatusDot, humanStatus === '正常' ? 'ok' : 'bad');
+    }
 
     updateAprsStatus(info.aprs);
 
@@ -7378,6 +7915,9 @@
     if (callmeshCallsign) {
       const callsignLabel = formatProvisionCallsign(provision, info.aprs);
       callmeshCallsign.textContent = callsignLabel || '—';
+      if (callmeshCallsignDisplay) {
+        callmeshCallsignDisplay.textContent = callsignLabel || '—';
+      }
     }
     if (callmeshSymbol) callmeshSymbol.textContent = formatSymbol(provision);
     if (callmeshCoords) callmeshCoords.textContent = formatCoords(provision);
@@ -7419,11 +7959,29 @@
     if (!aprsStatusLabel) return;
     if (!aprs) {
       aprsStatusLabel.textContent = '尚未取得';
+      if (aprsStatusDot) {
+        setStatusDot(aprsStatusDot, 'idle');
+      }
       return;
     }
     const server = aprs.actualServer || aprs.server || '未知伺服器';
     const state = aprs.connected ? '已連線' : '未連線';
     aprsStatusLabel.textContent = `${state} (${server})`;
+    if (aprsStatusDot) {
+      setStatusDot(aprsStatusDot, aprs.connected ? 'ok' : 'bad');
+    }
+  }
+
+  function setStatusDot(dot, state) {
+    if (!dot) return;
+    dot.classList.remove('status-dot--ok', 'status-dot--bad', 'status-dot--idle');
+    if (state === 'ok') {
+      dot.classList.add('status-dot--ok');
+    } else if (state === 'bad') {
+      dot.classList.add('status-dot--bad');
+    } else {
+      dot.classList.add('status-dot--idle');
+    }
   }
 
   function handleSummaryBatch(list) {
@@ -7508,6 +8066,7 @@
       }
       applyAprsState(row, summary);
     }
+    applySummaryFilters();
   }
 
   function resetSummaryReplayGuard() {
