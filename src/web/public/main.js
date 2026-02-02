@@ -592,9 +592,10 @@
   let mapTelemetryOnly = false;
   let mapShowTraceroute = false;
   let mapRoutesOnly = false;
-  let selectedTracerouteId = null;
   let mapRoleFilterValue = 'all';
   const mapRoleCache = new Map();
+  let tracerouteAnimationFrame = null;
+  let tracerouteDashOffset = 0;
 
   function showMapStatus(message) {
     if (!mapStatusLabel) return;
@@ -880,9 +881,10 @@
           const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
           const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
           const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
-          snrLabel = `F:${fStr} / R:${rStr}`;
+          snrLabel = `▲ ${fStr} / ▼ ${rStr}`;
         } else {
-          snrLabel = Number.isFinite(scaledSnr) ? `${formatNumber(scaledSnr, 1)}dB` : '';
+          const icon = edge.direction === 'forward' ? '▲' : '▼';
+          snrLabel = Number.isFinite(scaledSnr) ? `${icon} ${formatNumber(scaledSnr, 1)}dB` : '';
         }
 
         let featureId = '';
@@ -914,6 +916,36 @@
     });
 
     source.setData({ type: 'FeatureCollection', features });
+  }
+
+  function startTracerouteAnimation() {
+    if (tracerouteAnimationFrame) return;
+    const animate = () => {
+      if (!mapInstance || !mapReady) {
+        tracerouteAnimationFrame = null;
+        return;
+      }
+      tracerouteDashOffset = (tracerouteDashOffset - 0.2) % 40;
+
+      const layers = ['traceroute-layer-forward', 'traceroute-layer-return', 'traceroute-layer-bidirectional'];
+      layers.forEach(layerId => {
+        if (mapInstance.getLayer(layerId)) {
+          // Only animate if selected or if we want a general flow
+          // For now, let's animate all traceroute lines to show flow clearly
+          mapInstance.setPaintProperty(layerId, 'line-dasharray-offset', tracerouteDashOffset);
+        }
+      });
+
+      tracerouteAnimationFrame = requestAnimationFrame(animate);
+    };
+    tracerouteAnimationFrame = requestAnimationFrame(animate);
+  }
+
+  function stopTracerouteAnimation() {
+    if (tracerouteAnimationFrame) {
+      cancelAnimationFrame(tracerouteAnimationFrame);
+      tracerouteAnimationFrame = null;
+    }
   }
 
   function removeMapLayer(id) {
@@ -1066,6 +1098,7 @@
         'line-cap': 'round'
       },
       paint: {
+        'line-dasharray': [2, 2],
         'line-color': [
           'step',
           ['coalesce', ['get', 'snr'], -99],
@@ -1141,6 +1174,7 @@
         'line-cap': 'round'
       },
       paint: {
+        'line-dasharray': [2, 2],
         'line-color': '#a855f7',
         'line-width': 4.5,
         'line-opacity': [
@@ -1220,6 +1254,7 @@
     if (!mapInstance || !mapReady) return;
     setupMapLayers();
     updateMapNodes();
+    startTracerouteAnimation();
   }
 
   function scheduleMapUpdate() {
@@ -9638,7 +9673,10 @@
           const rSnr = edge.direction === 'forward' ? partnerScaled : scaledSnr;
           const fStr = Number.isFinite(fSnr) ? formatNumber(fSnr, 1) : '--';
           const rStr = Number.isFinite(rSnr) ? formatNumber(rSnr, 1) : '--';
-          displayLabel = `${fStr} / ${rStr}`; // Simplified for SVG space
+          displayLabel = `▲${fStr} / ▼${rStr}`; // Simplified with icons for SVG
+        } else {
+          const icon = edge.direction === 'forward' ? '▲' : '▼';
+          displayLabel = `${icon}${formatNumber(scaledSnr, 1)}dB`;
         }
 
         const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
