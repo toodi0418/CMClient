@@ -165,19 +165,51 @@
           <div class="summary-stack">
             <div class="map-slot" data-map-slot="summary">
               <div id="map-panel" class="panel map-panel">
-                <div class="panel-actions panel-actions-inline">
-                  <button id="map-fit" type="button" class="ghost-btn">對焦節點</button>
-                  <button id="map-refresh" type="button" class="ghost-btn">更新</button>
-                  <button id="map-toggle" type="button" class="ghost-btn" aria-pressed="false">折疊</button>
+                <div class="map-toolbar">
+                  <div class="panel-actions panel-actions-inline map-panel-actions">
+                    <button id="map-fit" type="button" class="ghost-btn">對焦節點</button>
+                    <button id="map-refresh" type="button" class="ghost-btn">更新</button>
+                    <button id="map-toggle" type="button" class="ghost-btn" aria-pressed="false">折疊</button>
+                  </div>
+                  <div class="map-toolbar-group">
+                    <span class="map-toolbar-label">時間窗</span>
+                    <button type="button" class="map-chip" data-map-window="1">1h</button>
+                    <button type="button" class="map-chip active" data-map-window="3">3h</button>
+                    <button type="button" class="map-chip" data-map-window="6">6h</button>
+                    <button type="button" class="map-chip" data-map-window="24">24h</button>
+                  </div>
+                  <div class="map-toolbar-group">
+                    <span class="map-toolbar-label">角色</span>
+                    <select id="map-role-filter" class="form-select form-select-sm">
+                      <option value="all">全部</option>
+                      <option value="router">Router</option>
+                      <option value="client">Client</option>
+                      <option value="tracker">Tracker</option>
+                    </select>
+                  </div>
+                  <div class="map-toolbar-group">
+                    <label class="map-toggle">
+                      <input id="map-toggle-cluster" type="checkbox" checked />
+                      <span>群聚</span>
+                    </label>
+                    <label class="map-toggle">
+                      <input id="map-toggle-offline" type="checkbox" />
+                      <span>離線</span>
+                    </label>
+                    <label class="map-toggle">
+                      <input id="map-toggle-telemetry" type="checkbox" />
+                      <span>僅遙測</span>
+                    </label>
+                  </div>
                 </div>
                 <div class="map-shell">
                   <div id="mesh-map" class="map-canvas"></div>
                   <div id="map-status" class="map-status">正在載入向量圖磚…</div>
                   <div class="map-legend">
-                    <div class="legend-row"><span class="legend-dot legend-online"></span>線上節點</div>
-                    <div class="legend-row"><span class="legend-dot legend-recent"></span>最近 1 小時</div>
-                    <div class="legend-row"><span class="legend-dot legend-offline"></span>超過 1 小時</div>
-                    <div class="legend-row"><span class="legend-dot legend-unknown"></span>座標不足</div>
+                    <div class="legend-row"><span class="legend-dot legend-online"></span>線上</div>
+                    <div class="legend-row"><span class="legend-dot legend-recent"></span>近期</div>
+                    <div class="legend-row"><span class="legend-dot legend-offline"></span>離線</div>
+                    <div class="legend-row"><span class="legend-dot legend-telemetry"></span>有遙測</div>
                   </div>
                 </div>
               </div>

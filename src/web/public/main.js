@@ -31,6 +31,11 @@
   const mapFitBtn = document.getElementById('map-fit');
   const mapRefreshBtn = document.getElementById('map-refresh');
   const mapToggleBtn = document.getElementById('map-toggle');
+  const mapWindowButtons = document.querySelectorAll('[data-map-window]');
+  const mapRoleFilter = document.getElementById('map-role-filter');
+  const mapToggleCluster = document.getElementById('map-toggle-cluster');
+  const mapToggleOffline = document.getElementById('map-toggle-offline');
+  const mapToggleTelemetry = document.getElementById('map-toggle-telemetry');
   const mapPanel = document.getElementById('map-panel');
   const mapSlotSummary = document.querySelector('[data-map-slot="summary"]');
   const mapSlotFull = document.querySelector('[data-map-slot="map"]');
@@ -432,7 +437,12 @@
     }
   ];
   const ENV_COMBO_METRIC_SET = new Set(ENV_COMBO_METRICS.map((item) => item.name));
-  const MAP_VISIBLE_WINDOW_MS = 3 * 60 * 60 * 1000;
+  const MAP_WINDOW_OPTIONS = new Map([
+    [1, 1 * 60 * 60 * 1000],
+    [3, 3 * 60 * 60 * 1000],
+    [6, 6 * 60 * 60 * 1000],
+    [24, 24 * 60 * 60 * 1000]
+  ]);
   const BATTERY_COMBO_TOOLTIP_MAX_DELTA_MS = 5 * 60 * 1000;
   const CHANNEL_CONFIG = [
     { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
@@ -498,7 +508,7 @@
   }
 
   const METERS_PER_FOOT = 0.3048;
-  const NODE_ONLINE_WINDOW_MS = 60 * 60 * 1000;
+  const NODE_ONLINE_WINDOW_MS = 3 * 60 * 60 * 1000;
   const STORAGE_KEYS = {
     callmeshProvisionOpen: 'tmag:web:callmeshProvision:open',
     telemetryRangeMode: 'tmag:web:telemetry:range-mode',
@@ -506,7 +516,9 @@
     messagePageSize: 'tmag:web:messages:page-size',
     quickMessageChannel: 'tmag:web:quick-message:channel',
     mapCenter: 'tmag:web:map:center',
-    mapZoom: 'tmag:web:map:zoom'
+    mapZoom: 'tmag:web:map:zoom',
+    mapCollapsed: 'tmag:web:map:collapsed',
+    summaryCollapsed: 'tmag:web:summary:collapsed'
   };
 
   function isValidTelemetryRangeMode(mode) {
@@ -558,13 +570,21 @@
 
   const MAP_CENTER_FALLBACK = [120.5174, 23.66552];
   const MAP_ZOOM_FALLBACK = 7;
-  const MAP_ONLINE_WINDOW_MS = 10 * 60 * 1000;
+  const MAP_ONLINE_WINDOW_MS = 3 * 60 * 60 * 1000;
   const MAP_SOURCE_ID = 'mesh-nodes';
   const MAP_LAYER_ID = 'mesh-nodes-layer';
   let mapInstance = null;
   let mapReady = false;
   let mapUpdateTimer = null;
   let mapFeatureCache = [];
+  let mapWindowMs = MAP_WINDOW_OPTIONS.get(3) || 3 * 60 * 60 * 1000;
+  let mapShowOffline = false;
+  let mapUseCluster = true;
+  let mapCollapsed = false;
+  let summaryCollapsed = false;
+  let mapTelemetryOnly = false;
+  let mapRoleFilterValue = 'all';
+  const mapRoleCache = new Map();
 
   function showMapStatus(message) {
     if (!mapStatusLabel) return;
@@ -619,6 +639,71 @@
     return [lon, lat];
   }
 
+  function getTelemetryFlagsForNode(entry) {
+    const meshId = entry?.meshId || entry?.meshIdNormalized || entry?.meshIdOriginal;
+    if (!meshId) return { hasTelemetry: false, hasDevice: false, hasSensor: false };
+    const summary = getTelemetrySummaryForMesh(meshId);
+    if (!summary || !summary.items || !summary.items.length) {
+      return { hasTelemetry: false, hasDevice: false, hasSensor: false };
+    }
+    let hasDevice = false;
+    let hasSensor = false;
+    for (const item of summary.items) {
+      if (!item || !item.className) continue;
+      if (item.className.includes('battery') || item.className.includes('voltage') || item.className.includes('channel') || item.className.includes('air')) {
+        hasDevice = true;
+      }
+      if (item.className.includes('temp') || item.className.includes('humidity') || item.className.includes('pressure')) {
+        hasSensor = true;
+      }
+    }
+    return { hasTelemetry: hasDevice || hasSensor, hasDevice, hasSensor };
+  }
+
+  const ROLE_ENUM_MAP = new Map([
+    [0, 'CLIENT'],
+    [1, 'CLIENT_MUTE'],
+    [2, 'ROUTER'],
+    [3, 'ROUTER_CLIENT'],
+    [4, 'REPEATER'],
+    [5, 'TRACKER'],
+    [6, 'SENSOR'],
+    [7, 'TAK']
+  ]);
+
+  function resolveRoleLabel(entry) {
+    const candidates = [
+      entry?.roleLabel,
+      entry?.role,
+      entry?.node?.roleLabel,
+      entry?.node?.role
+    ];
+    for (const value of candidates) {
+      if (value == null) continue;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return ROLE_ENUM_MAP.get(value) || String(value);
+      }
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && String(value).trim() !== '') {
+        return ROLE_ENUM_MAP.get(numeric) || String(value);
+      }
+      if (typeof value === 'string' && value.trim()) {
+        return value.trim();
+      }
+    }
+    return '';
+  }
+
+  function formatMapRole(entry) {
+    const rawLabel = resolveRoleLabel(entry);
+    const role = String(rawLabel || '').toUpperCase().replace(/\s+/g, '_');
+    if (role.includes('ROUTER')) return 'router';
+    if (role.includes('TRACKER')) return 'tracker';
+    if (role.includes('CLIENT_MUTE')) return 'client-mute';
+    if (role.includes('CLIENT')) return 'client';
+    return 'unknown';
+  }
+
   function buildMapNodeFeatures() {
     const now = Date.now();
     const features = [];
@@ -633,7 +718,7 @@
         return;
       }
       const age = Math.max(now - lastSeen, 0);
-      if (age > MAP_VISIBLE_WINDOW_MS) {
+      if (age > mapWindowMs) {
         return;
       }
       withCoords += 1;
@@ -645,6 +730,26 @@
       } else {
         status = 'offline';
       }
+      if (!mapShowOffline && status === 'offline') {
+        return;
+      }
+      const meshKey = entry.meshIdNormalized || normalizeMeshId(entry.meshId) || entry.meshId || '';
+      const resolvedRoleLabel = resolveRoleLabel(entry);
+      let roleKey = formatMapRole(entry);
+      if (roleKey !== 'unknown') {
+        if (meshKey) {
+          mapRoleCache.set(meshKey, roleKey);
+        }
+      } else if (meshKey && mapRoleCache.has(meshKey)) {
+        roleKey = mapRoleCache.get(meshKey);
+      }
+      if (mapRoleFilterValue !== 'all' && mapRoleFilterValue !== roleKey) {
+        return;
+      }
+      const telemetryFlags = getTelemetryFlagsForNode(entry);
+      if (mapTelemetryOnly && !telemetryFlags.hasTelemetry) {
+        return;
+      }
       const label = formatNodeDisplayLabel(entry) || entry.meshId || entry.meshIdNormalized || '未知節點';
       features.push({
         type: 'Feature',
@@ -653,7 +758,13 @@
           status,
           label,
           meshId: entry.meshId || entry.meshIdNormalized || '',
-          lastSeen: lastSeen || null
+          lastSeen: lastSeen || null,
+          role: roleKey,
+          roleLabel: resolvedRoleLabel || '',
+          hasTelemetry: telemetryFlags.hasTelemetry ? 1 : 0,
+          hasDevice: telemetryFlags.hasDevice ? 1 : 0,
+          hasSensor: telemetryFlags.hasSensor ? 1 : 0,
+          shortName: entry.shortName || ''
         }
       });
     });
@@ -699,6 +810,113 @@
     }
   }
 
+  function removeMapLayer(id) {
+    if (mapInstance && mapInstance.getLayer(id)) {
+      mapInstance.removeLayer(id);
+    }
+  }
+
+  function removeMapSource(id) {
+    if (mapInstance && mapInstance.getSource(id)) {
+      mapInstance.removeSource(id);
+    }
+  }
+
+  function setupMapLayers() {
+    if (!mapInstance) return;
+    removeMapLayer(`${MAP_LAYER_ID}-clusters`);
+    removeMapLayer(`${MAP_LAYER_ID}-cluster-count`);
+    removeMapLayer(`${MAP_LAYER_ID}-unclustered`);
+    removeMapSource(MAP_SOURCE_ID);
+
+    mapInstance.addSource(MAP_SOURCE_ID, {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features: [] },
+      cluster: mapUseCluster,
+      clusterMaxZoom: 9,
+      clusterRadius: 50
+    });
+
+    if (mapUseCluster) {
+      mapInstance.addLayer({
+        id: `${MAP_LAYER_ID}-clusters`,
+        type: 'circle',
+        source: MAP_SOURCE_ID,
+        filter: ['has', 'point_count'],
+        paint: {
+          'circle-color': [
+            'step',
+            ['get', 'point_count'],
+            '#4cc3ff',
+            10,
+            '#f0a04b',
+            50,
+            '#ff6b6b'
+          ],
+          'circle-radius': [
+            'step',
+            ['get', 'point_count'],
+            11,
+            10,
+            14,
+            50,
+            18
+          ],
+          'circle-stroke-color': '#13202d',
+          'circle-stroke-width': 1.2
+        }
+      });
+      mapInstance.addLayer({
+        id: `${MAP_LAYER_ID}-cluster-count`,
+        type: 'symbol',
+        source: MAP_SOURCE_ID,
+        filter: ['has', 'point_count'],
+        layout: {
+          'text-field': '{point_count_abbreviated}',
+          'text-font': ['Noto Sans Regular'],
+          'text-size': 12
+        },
+        paint: {
+          'text-color': '#081320'
+        }
+      });
+    }
+
+    const unclusteredLayer = {
+      id: `${MAP_LAYER_ID}-unclustered`,
+      type: 'circle',
+      source: MAP_SOURCE_ID,
+      paint: {
+        'circle-radius': 6,
+        'circle-color': [
+          'match',
+          ['get', 'role'],
+          'router',
+          '#ff6b6b',
+          'client',
+          '#60d394',
+          'tracker',
+          '#4cc3ff',
+          'client-mute',
+          '#f7fbff',
+          '#7b4dff'
+        ],
+        'circle-stroke-color': '#13202d',
+        'circle-stroke-width': 1
+      }
+    };
+    if (mapUseCluster) {
+      unclusteredLayer.filter = ['!', ['has', 'point_count']];
+    }
+    mapInstance.addLayer(unclusteredLayer);
+  }
+
+  function updateMapClusterVisibility() {
+    if (!mapInstance || !mapReady) return;
+    setupMapLayers();
+    updateMapNodes();
+  }
+
   function scheduleMapUpdate() {
     if (!mapInstance || !mapReady) return;
     if (mapUpdateTimer) return;
@@ -716,6 +934,30 @@
       return acc.extend(coords);
     }, new window.maplibregl.LngLatBounds(mapFeatureCache[0].geometry.coordinates, mapFeatureCache[0].geometry.coordinates));
     mapInstance.fitBounds(bounds, { padding: 60, maxZoom: 12, duration: 600 });
+  }
+
+  function loadMapCollapseState() {
+    const stored = safeStorageGet(STORAGE_KEYS.mapCollapsed);
+    if (stored == null) return;
+    mapCollapsed = stored === '1' || stored === 'true';
+    if (mapCollapsed) {
+      setSummaryMapCollapsed(true);
+    }
+  }
+
+  function loadSummaryCollapseState() {
+    const stored = safeStorageGet(STORAGE_KEYS.summaryCollapsed);
+    if (stored == null || !summaryToggleBtn || !summaryStack) return;
+    summaryCollapsed = stored === '1' || stored === 'true';
+    if (summaryCollapsed) {
+      const panel = summaryToggleBtn.closest('.summary-panel');
+      if (panel) {
+        panel.classList.add('is-collapsed');
+      }
+      summaryStack.classList.add('is-summary-collapsed');
+      summaryToggleBtn.setAttribute('aria-pressed', 'true');
+      summaryToggleBtn.textContent = '展開';
+    }
   }
 
   function ensureMapReady() {
@@ -755,33 +997,22 @@
     mapInstance.on('load', () => {
       mapReady = true;
       if (!mapInstance.getSource(MAP_SOURCE_ID)) {
-        mapInstance.addSource(MAP_SOURCE_ID, {
-          type: 'geojson',
-          data: { type: 'FeatureCollection', features: [] }
-        });
-        mapInstance.addLayer({
-          id: MAP_LAYER_ID,
-          type: 'circle',
-          source: MAP_SOURCE_ID,
-          paint: {
-            'circle-radius': 6,
-            'circle-color': [
-              'match',
-              ['get', 'status'],
-              'online',
-              '#4cc3ff',
-              'recent',
-              '#f0a04b',
-              'offline',
-              '#ff6b6b',
-              '#6b778c'
-            ],
-            'circle-stroke-color': '#13202d',
-            'circle-stroke-width': 1
-          }
-        });
+        setupMapLayers();
       }
-      mapInstance.on('click', MAP_LAYER_ID, (event) => {
+      mapInstance.on('click', `${MAP_LAYER_ID}-clusters`, (event) => {
+        const feature = event.features?.[0];
+        if (!feature) return;
+        const clusterId = feature.properties?.cluster_id;
+        const source = mapInstance.getSource(MAP_SOURCE_ID);
+        if (!source || clusterId == null || typeof source.getClusterExpansionZoom !== 'function') {
+          return;
+        }
+        source.getClusterExpansionZoom(clusterId, (err, zoom) => {
+          if (err) return;
+          mapInstance.easeTo({ center: feature.geometry.coordinates, zoom });
+        });
+      });
+      mapInstance.on('click', `${MAP_LAYER_ID}-unclustered`, (event) => {
         const feature = event.features?.[0];
         if (!feature) return;
         const label = feature.properties?.label || '未知節點';
@@ -789,11 +1020,63 @@
         const lastSeen = feature.properties?.lastSeen
           ? formatRelativeTime(new Date(Number(feature.properties.lastSeen)).toISOString())
           : '—';
+        const role = feature.properties?.roleLabel || feature.properties?.role || 'unknown';
+        const telemetryLabel = feature.properties?.hasTelemetry ? '有' : '—';
+        const coords = feature.geometry?.coordinates || [];
+        const deviceMetrics = [];
+        const sensorMetrics = [];
+        const telemetrySummary = getTelemetrySummaryForMesh(meshId);
+        if (telemetrySummary?.items?.length) {
+          for (const item of telemetrySummary.items) {
+            if (!item || !item.className) continue;
+            const isDevice =
+              item.className.includes('battery') ||
+              item.className.includes('voltage') ||
+              item.className.includes('channel') ||
+              item.className.includes('air');
+            const isSensor =
+              item.className.includes('temp') ||
+              item.className.includes('humidity') ||
+              item.className.includes('pressure');
+            const labelText = item.label || '';
+            const valueText = item.value || '';
+            if (isDevice) {
+              deviceMetrics.push({ label: labelText, value: valueText });
+            } else if (isSensor) {
+              sensorMetrics.push({ label: labelText, value: valueText });
+            }
+          }
+        }
+        const deviceHtml = deviceMetrics.length
+          ? `<div class="map-popup-grid">${deviceMetrics
+              .slice(0, 4)
+              .map(
+                (item) =>
+                  `<div class="map-popup-row"><span class="map-popup-label">${escapeHtml(item.label)}</span><span>${escapeHtml(item.value)}</span></div>`
+              )
+              .join('')}</div>`
+          : '';
+        const sensorHtml = sensorMetrics.length
+          ? `<div class="map-popup-grid">${sensorMetrics
+              .slice(0, 4)
+              .map(
+                (item) =>
+                  `<div class="map-popup-row"><span class="map-popup-label">${escapeHtml(item.label)}</span><span>${escapeHtml(item.value)}</span></div>`
+              )
+              .join('')}</div>`
+          : '';
+        const shortNameLabel = feature.properties?.shortName || '';
+        const titleLine = shortNameLabel
+          ? `${escapeHtml(label)} <span class="map-popup-short">${escapeHtml(shortNameLabel)}</span>`
+          : escapeHtml(label);
         const html = `
           <div class="map-popup">
-            <div class="map-popup-title">${escapeHtml(label)}</div>
-            <div class="map-popup-meta">${escapeHtml(meshId)}</div>
-            <div class="map-popup-meta">最後出現：${escapeHtml(lastSeen)}</div>
+            <div class="map-popup-title">${titleLine}</div>
+            <div class="map-popup-meta"><span>Mesh</span><span>${escapeHtml(meshId)}</span></div>
+            <div class="map-popup-meta"><span>最後出現</span><span>${escapeHtml(lastSeen)}</span></div>
+            <div class="map-popup-meta"><span>角色</span><span>${escapeHtml(role)}</span></div>
+            ${deviceHtml}
+            ${sensorHtml}
           </div>
         `;
         new window.maplibregl.Popup({ offset: 12 })
@@ -801,11 +1084,14 @@
           .setHTML(html)
           .addTo(mapInstance);
       });
+      updateMapClusterVisibility();
       mapInstance.on('moveend', () => {
         const view = mapInstance.getCenter();
         safeStorageSet(STORAGE_KEYS.mapCenter, JSON.stringify([view.lng, view.lat]));
         safeStorageSet(STORAGE_KEYS.mapZoom, String(mapInstance.getZoom()));
       });
+      loadMapCollapseState();
+      loadSummaryCollapseState();
       syncContentAreaHeight();
       syncSummaryStackHeight();
       updateMapNodes();
@@ -836,6 +1122,36 @@
     updateMapNodes();
   });
 
+  mapWindowButtons?.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const value = Number(btn.getAttribute('data-map-window'));
+      if (!Number.isFinite(value)) return;
+      mapWindowMs = MAP_WINDOW_OPTIONS.get(value) || mapWindowMs;
+      mapWindowButtons.forEach((el) => el.classList.toggle('active', el === btn));
+      scheduleMapUpdate();
+    });
+  });
+
+  mapRoleFilter?.addEventListener('change', () => {
+    mapRoleFilterValue = mapRoleFilter.value || 'all';
+    scheduleMapUpdate();
+  });
+
+  mapToggleCluster?.addEventListener('change', () => {
+    mapUseCluster = Boolean(mapToggleCluster.checked);
+    updateMapClusterVisibility();
+  });
+
+  mapToggleOffline?.addEventListener('change', () => {
+    mapShowOffline = Boolean(mapToggleOffline.checked);
+    scheduleMapUpdate();
+  });
+
+  mapToggleTelemetry?.addEventListener('change', () => {
+    mapTelemetryOnly = Boolean(mapToggleTelemetry.checked);
+    scheduleMapUpdate();
+  });
+
   summaryToggleBtn?.addEventListener('click', () => {
     const panel = summaryToggleBtn.closest('.summary-panel');
     if (!panel) return;
@@ -845,6 +1161,8 @@
     if (summaryStack) {
       summaryStack.classList.toggle('is-summary-collapsed', collapsed);
     }
+    summaryCollapsed = collapsed;
+    safeStorageSet(STORAGE_KEYS.summaryCollapsed, collapsed ? '1' : '0');
   });
 
   let summarySplitDragging = false;
@@ -874,6 +1192,8 @@
     summaryStack.classList.toggle('is-collapsed', collapsed);
     mapToggleBtn.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
     mapToggleBtn.textContent = collapsed ? '展開' : '折疊';
+    mapCollapsed = collapsed;
+    safeStorageSet(STORAGE_KEYS.mapCollapsed, collapsed ? '1' : '0');
     if (!collapsed) {
       requestAnimationFrame(() => {
         syncSummaryStackHeight();

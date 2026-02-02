@@ -11,15 +11,6 @@
       "minzoom": 0,
       "maxzoom": 14,
       "attribution": "© OpenStreetMap contributors"
-    },
-    "terrain": {
-      "type": "raster-dem",
-      "tiles": ["/map/dem/{z}/{x}/{y}.png"],
-      "tileSize": 256,
-      "encoding": "terrarium",
-      "minzoom": 0,
-      "maxzoom": 10,
-      "attribution": "Terrain: Mapzen, SRTM"
     }
   },
   "layers": [
@@ -43,18 +34,6 @@
       "paint": {
         "fill-color": "#142233",
         "fill-outline-color": "#1f2f43"
-      }
-    },
-    {
-      "id": "hillshade",
-      "type": "hillshade",
-      "source": "terrain",
-      "minzoom": 5,
-      "paint": {
-        "hillshade-exaggeration": 0.5,
-        "hillshade-shadow-color": "#0b1220",
-        "hillshade-highlight-color": "#2a3b4f",
-        "hillshade-accent-color": "#1e2b3b"
       }
     },
     {
