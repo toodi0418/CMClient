@@ -1088,6 +1088,20 @@
     }
     mapInstance.addLayer(labelsLayer);
 
+    // Create arrow icon as inline SVG
+    const arrowSvg = `
+      <svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+        <path d="M10 2 L18 10 L10 18 L10 12 L2 12 L2 8 L10 8 Z" fill="white" stroke="rgba(8, 19, 32, 0.6)" stroke-width="1"/>
+      </svg>
+    `;
+    const arrowImage = new Image(20, 20);
+    arrowImage.src = 'data:image/svg+xml;base64,' + btoa(arrowSvg);
+    arrowImage.onload = () => {
+      if (!mapInstance.hasImage('arrow-icon')) {
+        mapInstance.addImage('arrow-icon', arrowImage);
+      }
+    };
+
     // Traceroute source and layers
     mapInstance.addSource(MAP_TRACEROUTE_SOURCE_ID, {
       type: 'geojson',
@@ -1203,32 +1217,21 @@
       layout: {
         'symbol-placement': 'line',
         'symbol-spacing': 100,
-        'text-field': '▶',
-        'text-size': 10,
-        'text-font': ['Noto Sans Regular'],
-        'text-allow-overlap': true,
-        'text-ignore-placement': true,
-        'text-keep-upright': false,
-        'text-rotation-alignment': 'map',
-        'text-padding': 0,
-        'text-offset': [0, 0]
+        'icon-image': 'arrow-icon',
+        'icon-size': 0.6,
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+        'icon-keep-upright': false,
+        'icon-rotation-alignment': 'map',
+        'icon-padding': 0
       },
       paint: {
-        'text-color': [
-          'step',
-          ['coalesce', ['get', 'snr'], -99],
-          '#ff6b6b',
-          -13, '#f0a04b',
-          -7, '#60d394'
-        ],
-        'text-opacity': [
+        'icon-opacity': [
           'case',
           ['==', selectedTracerouteId || 'none', 'none'], 0.8,
           ['==', ['get', 'id'], selectedTracerouteId], 1,
           0.1
-        ],
-        'text-halo-color': 'rgba(8, 19, 32, 0.6)',
-        'text-halo-width': 1
+        ]
       }
     });
 
