@@ -1121,7 +1121,13 @@
       paint: {
         'text-color': '#f7fbff',
         'text-halo-color': 'rgba(8, 19, 32, 0.85)',
-        'text-halo-width': 1.5
+        'text-halo-width': 1.5,
+        'text-opacity': [
+          'case',
+          ['==', selectedTracerouteId || 'none', 'none'], 1,
+          ['==', ['get', 'id'], selectedTracerouteId], 1,
+          0
+        ]
       }
     });
   }
