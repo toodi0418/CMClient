@@ -806,6 +806,7 @@
     if (!mapInstance || !mapReady) return;
     const { features, total, withCoords } = buildMapNodeFeatures();
     mapFeatureCache = features;
+    const source = mapInstance.getSource(MAP_SOURCE_ID);
     if (source && typeof source.setData === 'function') {
       source.setData({ type: 'FeatureCollection', features });
     }
