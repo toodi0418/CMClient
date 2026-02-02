@@ -765,7 +765,9 @@
           hasDevice: telemetryFlags.hasDevice ? 1 : 0,
           hasSensor: telemetryFlags.hasSensor ? 1 : 0,
           shortName: entry.shortName || '',
-          longName: sanitizeNodeName(entry.longName) || ''
+          longName: sanitizeNodeName(entry.longName) || '',
+          usedHops: entry.usedHops,
+          totalHops: entry.totalHops
         }
       });
     });
@@ -1047,6 +1049,12 @@
           ? formatRelativeTime(new Date(Number(feature.properties.lastSeen)).toISOString())
           : '—';
         const role = feature.properties?.roleLabel || feature.properties?.role || 'unknown';
+        const usedHops = feature.properties?.usedHops;
+        const totalHops = feature.properties?.totalHops;
+        const hopsHtml = (usedHops !== null && totalHops !== null)
+          ? `<div class="map-popup-meta"><span>跳數</span><span>${usedHops}/${totalHops}</span></div>`
+          : '';
+
         const telemetryLabel = feature.properties?.hasTelemetry ? '有' : '—';
         const coords = feature.geometry?.coordinates || [];
         const deviceMetrics = [];
@@ -1102,6 +1110,7 @@
             <div class="map-popup-meta"><span>Mesh</span><span>${escapeHtml(meshId)}</span></div>
             <div class="map-popup-meta"><span>最後出現</span><span>${escapeHtml(lastSeen)}</span></div>
             <div class="map-popup-meta"><span>角色</span><span>${escapeHtml(role)}</span></div>
+            ${hopsHtml}
             ${deviceHtml}
             ${sensorHtml}
           </div>
@@ -1653,7 +1662,9 @@
       latitude: null,
       longitude: null,
       altitude: null,
-      lastSeenAt: null
+      lastSeenAt: null,
+      usedHops: null,
+      totalHops: null
     };
     let hasValue = false;
     for (const source of sources) {
@@ -1661,6 +1672,14 @@
       const items = Array.isArray(source) ? source : [source];
       for (const item of items) {
         if (!item || typeof item !== 'object') continue;
+        if (item.usedHops != null) {
+          result.usedHops = item.usedHops;
+          hasValue = true;
+        }
+        if (item.totalHops != null) {
+          result.totalHops = item.totalHops;
+          hasValue = true;
+        }
         if (item.meshIdNormalized) {
           result.meshIdNormalized = item.meshIdNormalized;
           hasValue = true;
@@ -7394,6 +7413,19 @@
 
     hydrateSummaryNodes(summary);
 
+    // Update nodeRegistry with hop info for the sender
+    const meshId = normalizeMeshId(summary?.from?.meshId || summary?.from?.meshIdNormalized);
+    if (meshId) {
+      const hopInfo = extractHopInfo(summary);
+      if (hopInfo.usedHops !== null || hopInfo.totalHops !== null) {
+        upsertNodeRegistry({
+          meshIdNormalized: meshId,
+          usedHops: hopInfo.usedHops,
+          totalHops: hopInfo.totalHops
+        }, { allowCreate: false });
+      }
+    }
+
     if (shouldDiscardSummaryForReplay(summary, options)) {
       return;
     }
@@ -7401,7 +7433,6 @@
     const row = createSummaryRow(summary);
     row.__summaryData = summary;
     applySummaryTypeClass(row, summary);
-    const meshId = normalizeMeshId(summary?.from?.meshId || summary?.from?.meshIdNormalized);
     if (meshId) {
       row.dataset.meshId = meshId;
       if (mappingMeshIds.has(meshId)) {
