@@ -35,8 +35,11 @@
   const mapSlotSummary = document.querySelector('[data-map-slot="summary"]');
   const mapSlotFull = document.querySelector('[data-map-slot="map"]');
   const summaryStack = document.querySelector('.summary-stack');
+  const contentArea = document.querySelector('.content-area');
   const summarySplitter = document.getElementById('summary-splitter');
   const deckShell = document.querySelector('.deck-shell');
+  const deckMain = document.querySelector('.deck-main');
+  const mainHeader = document.querySelector('.main-header');
   const deckSidebar = document.querySelector('.deck-sidebar');
   const deckSplitter = document.getElementById('deck-splitter');
   const navButtons = document.querySelectorAll('.nav-btn');
@@ -429,6 +432,7 @@
     }
   ];
   const ENV_COMBO_METRIC_SET = new Set(ENV_COMBO_METRICS.map((item) => item.name));
+  const MAP_VISIBLE_WINDOW_MS = 3 * 60 * 60 * 1000;
   const BATTERY_COMBO_TOOLTIP_MAX_DELTA_MS = 5 * 60 * 1000;
   const CHANNEL_CONFIG = [
     { id: 0, code: 'CH0', name: 'Primary Channel', note: '日常主要通訊頻道' },
@@ -624,18 +628,22 @@
       total += 1;
       const coords = resolveNodeCoordinates(entry);
       if (!coords) return;
-      withCoords += 1;
       const lastSeen = getNodeLastSeenTimestamp(entry);
+      if (!Number.isFinite(lastSeen)) {
+        return;
+      }
+      const age = Math.max(now - lastSeen, 0);
+      if (age > MAP_VISIBLE_WINDOW_MS) {
+        return;
+      }
+      withCoords += 1;
       let status = 'unknown';
-      if (Number.isFinite(lastSeen)) {
-        const age = Math.max(now - lastSeen, 0);
-        if (age <= MAP_ONLINE_WINDOW_MS) {
-          status = 'online';
-        } else if (age <= NODE_ONLINE_WINDOW_MS) {
-          status = 'recent';
-        } else {
-          status = 'offline';
-        }
+      if (age <= MAP_ONLINE_WINDOW_MS) {
+        status = 'online';
+      } else if (age <= NODE_ONLINE_WINDOW_MS) {
+        status = 'recent';
+      } else {
+        status = 'offline';
       }
       const label = formatNodeDisplayLabel(entry) || entry.meshId || entry.meshIdNormalized || '未知節點';
       features.push({
@@ -650,6 +658,28 @@
       });
     });
     return { features, total, withCoords };
+  }
+
+  function syncContentAreaHeight() {
+    if (!contentArea || !deckShell) return;
+    const shellRect = deckShell.getBoundingClientRect();
+    const headerHeight = mainHeader ? mainHeader.getBoundingClientRect().height : 0;
+    const computed = deckMain ? window.getComputedStyle(deckMain) : null;
+    const gapValue = computed ? Number.parseFloat(computed.rowGap || computed.gap || '0') || 0 : 0;
+    const paddingTop = computed ? Number.parseFloat(computed.paddingTop || '0') || 0 : 0;
+    const paddingBottom = computed ? Number.parseFloat(computed.paddingBottom || '0') || 0 : 0;
+    const available = shellRect.height - headerHeight - gapValue - paddingTop - paddingBottom;
+    if (Number.isFinite(available) && available > 0) {
+      contentArea.style.height = `${available}px`;
+    }
+  }
+
+  function syncSummaryStackHeight() {
+    if (!summaryStack || !contentArea) return;
+    const height = contentArea.getBoundingClientRect().height;
+    if (Number.isFinite(height) && height > 0) {
+      summaryStack.style.height = `${height}px`;
+    }
   }
 
   function updateMapNodes() {
@@ -776,6 +806,8 @@
         safeStorageSet(STORAGE_KEYS.mapCenter, JSON.stringify([view.lng, view.lat]));
         safeStorageSet(STORAGE_KEYS.mapZoom, String(mapInstance.getZoom()));
       });
+      syncContentAreaHeight();
+      syncSummaryStackHeight();
       updateMapNodes();
     });
     mapInstance.on('error', (event) => {
@@ -842,8 +874,19 @@
     summaryStack.classList.toggle('is-collapsed', collapsed);
     mapToggleBtn.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
     mapToggleBtn.textContent = collapsed ? '展開' : '折疊';
-    if (!collapsed && summarySplitLastHeight) {
-      applySummaryMapHeight(summarySplitLastHeight);
+    if (!collapsed) {
+      requestAnimationFrame(() => {
+        syncSummaryStackHeight();
+        const totalHeight = summaryStack.getBoundingClientRect().height || 0;
+        const splitterHeight = summarySplitter?.getBoundingClientRect().height || 10;
+        const minSummary = 220;
+        const fallback = Math.max(180, totalHeight - splitterHeight - minSummary);
+        const targetHeight = Number.isFinite(summarySplitLastHeight) ? summarySplitLastHeight : fallback;
+        applySummaryMapHeight(targetHeight);
+        mapInstance?.resize();
+      });
+    } else {
+      syncSummaryStackHeight();
     }
   }
 
@@ -9304,6 +9347,8 @@
   renderNodeDatabase();
   connectStream();
   window.addEventListener('resize', () => {
+    syncContentAreaHeight();
+    syncSummaryStackHeight();
     scheduleTracerouteTopologyRender();
   });
 })();

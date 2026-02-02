@@ -970,10 +970,15 @@ details[open] > .details-summary::after {
   display: none;
   animation: pageReveal 0.35s ease both;
   height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .page.active {
-  display: block;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
 }
 
 @keyframes pageReveal {
@@ -990,8 +995,10 @@ details[open] > .details-summary::after {
 .summary-stack {
   display: grid;
   gap: 16px;
-  grid-template-rows: minmax(220px, var(--summary-map-height, 1fr)) 10px minmax(220px, 0.9fr);
+  grid-template-rows: minmax(220px, var(--summary-map-height, 1fr)) 10px minmax(220px, 1fr);
   height: 100%;
+  flex: 1;
+  min-height: 0;
 }
 
 .map-slot {
