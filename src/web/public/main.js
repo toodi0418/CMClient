@@ -738,6 +738,16 @@
       });
       const graph = buildTracerouteTopologyGraph(entries.slice(0, 100));
       routedNodeIds = new Set(graph.nodes.map((node) => node.id));
+    } else if (mapShowTraceroute) {
+      // Also collect routed nodes when traceroute is shown (even if not in routes-only mode)
+      const entries = tracerouteRows.filter((entry) => {
+        const status = (entry?.status || entry?.variant || '').toString().toLowerCase();
+        const timestamp = extractSummaryTimestampMs(entry);
+        const age = Date.now() - timestamp;
+        return status && status !== 'pending' && age <= tracerouteTopologyWindowHours * 3600000;
+      });
+      const graph = buildTracerouteTopologyGraph(entries.slice(0, 100));
+      routedNodeIds = new Set(graph.nodes.map((node) => node.id));
     }
 
     nodeRegistry.forEach((entry) => {
@@ -755,7 +765,10 @@
         return;
       }
       const age = Math.max(now - lastSeen, 0);
-      if (age > mapWindowMs) {
+      const isRoutedNode = routedNodeIds && routedNodeIds.has(meshKey);
+
+      // Skip time window filter for routed nodes when traceroute is shown
+      if (!isRoutedNode && age > mapWindowMs) {
         return;
       }
       withCoords += 1;
@@ -767,7 +780,8 @@
       } else {
         status = 'offline';
       }
-      if (!mapShowOffline && status === 'offline') {
+      // Skip offline filter for routed nodes when traceroute is shown
+      if (!mapShowOffline && status === 'offline' && !isRoutedNode) {
         return;
       }
       const resolvedRoleLabel = resolveRoleLabel(entry);
