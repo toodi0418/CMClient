@@ -764,7 +764,8 @@
           hasTelemetry: telemetryFlags.hasTelemetry ? 1 : 0,
           hasDevice: telemetryFlags.hasDevice ? 1 : 0,
           hasSensor: telemetryFlags.hasSensor ? 1 : 0,
-          shortName: entry.shortName || ''
+          shortName: entry.shortName || '',
+          longName: sanitizeNodeName(entry.longName) || ''
         }
       });
     });
@@ -1041,7 +1042,6 @@
       mapInstance.on('click', `${MAP_LAYER_ID}-unclustered`, (event) => {
         const feature = event.features?.[0];
         if (!feature) return;
-        const label = feature.properties?.label || '未知節點';
         const meshId = feature.properties?.meshId || '';
         const lastSeen = feature.properties?.lastSeen
           ? formatRelativeTime(new Date(Number(feature.properties.lastSeen)).toISOString())
@@ -1091,10 +1091,11 @@
             )
             .join('')}</div>`
           : '';
+        const longNameLabel = feature.properties?.longName || feature.properties?.meshId || '';
         const shortNameLabel = feature.properties?.shortName || '';
         const titleLine = shortNameLabel
-          ? `${escapeHtml(label)} <span class="map-popup-short">${escapeHtml(shortNameLabel)}</span>`
-          : escapeHtml(label);
+          ? `${escapeHtml(longNameLabel)} <span class="map-popup-short">${escapeHtml(shortNameLabel)}</span>`
+          : escapeHtml(longNameLabel || '未知節點');
         const html = `
           <div class="map-popup">
             <div class="map-popup-title">${titleLine}</div>
