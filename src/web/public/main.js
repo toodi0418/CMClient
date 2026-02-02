@@ -1349,18 +1349,19 @@
       layout: {
         'symbol-placement': 'line',
         'symbol-spacing': 100,
-        'icon-image': [
-          'case',
-          ['==', ['get', 'direction'], 'return'],
-          'return-arrow-icon',
-          'arrow-icon'
-        ],
+        'icon-image': 'arrow-icon',
         'icon-size': 1.0,
         'icon-allow-overlap': true,
         'icon-ignore-placement': true,
         'icon-keep-upright': false,
         'icon-rotation-alignment': 'map',
-        'icon-padding': 0
+        'icon-padding': 0,
+        'icon-rotate': [
+          'case',
+          ['==', ['get', 'direction'], 'return'],
+          180,
+          0
+        ]
       },
       paint: {
         'icon-opacity': [
