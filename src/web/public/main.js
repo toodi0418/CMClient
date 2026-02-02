@@ -907,7 +907,8 @@
     removeMapLayer(`${MAP_LAYER_ID}-clusters`);
     removeMapLayer(`${MAP_LAYER_ID}-cluster-count`);
     removeMapLayer(`${MAP_LAYER_ID}-unclustered`);
-    removeMapLayer(MAP_TRACEROUTE_LAYER_ID);
+    removeMapLayer('traceroute-layer-forward');
+    removeMapLayer('traceroute-layer-return');
     removeMapLayer(MAP_TRACEROUTE_LABEL_LAYER_ID);
     removeMapSource(MAP_SOURCE_ID);
     removeMapSource(MAP_TRACEROUTE_SOURCE_ID);
@@ -1024,24 +1025,49 @@
       data: { type: 'FeatureCollection', features: [] }
     });
 
+    // Traceroute: Forward paths (Solid)
     mapInstance.addLayer({
-      id: MAP_TRACEROUTE_LAYER_ID,
+      id: 'traceroute-layer-forward',
       type: 'line',
       source: MAP_TRACEROUTE_SOURCE_ID,
+      filter: ['==', ['get', 'direction'], 'forward'],
       layout: {
         'line-join': 'round',
         'line-cap': 'round'
       },
       paint: {
         'line-color': [
-          'match',
-          ['get', 'direction'],
-          'forward', '#4cc3ff',
-          'return', '#f0a04b',
-          '#ffffff'
+          'step',
+          ['get', 'snr'],
+          '#ff6b6b', // BAD: SNR <= -13
+          -13, '#f0a04b', // MID: -13 < SNR <= -7
+          -7, '#60d394' // GOOD: SNR > -7
+        ],
+        'line-width': 2.5,
+        'line-opacity': 0.8
+      }
+    });
+
+    // Traceroute: Return paths (Dashed)
+    mapInstance.addLayer({
+      id: 'traceroute-layer-return',
+      type: 'line',
+      source: MAP_TRACEROUTE_SOURCE_ID,
+      filter: ['==', ['get', 'direction'], 'return'],
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round'
+      },
+      paint: {
+        'line-color': [
+          'step',
+          ['get', 'snr'],
+          '#ff6b6b',
+          -13, '#f0a04b',
+          -7, '#60d394'
         ],
         'line-width': 2,
-        'line-opacity': 0.6,
+        'line-opacity': 0.7,
         'line-dasharray': [2, 2]
       }
     });
@@ -1053,14 +1079,15 @@
       layout: {
         'text-field': ['get', 'snrLabel'],
         'text-font': ['Noto Sans Regular'],
-        'text-size': 10,
+        'text-size': 11,
         'symbol-placement': 'point',
-        'text-allow-overlap': false
+        'text-allow-overlap': false,
+        'text-offset': [0, -1]
       },
       paint: {
         'text-color': '#f7fbff',
         'text-halo-color': 'rgba(8, 19, 32, 0.85)',
-        'text-halo-width': 1
+        'text-halo-width': 1.5
       }
     });
   }
