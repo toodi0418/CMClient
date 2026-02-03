@@ -338,12 +338,13 @@
     return lower === 'unknown' || lower === '__unknown__' || lower === 'null';
   }
   let nodeSnapshotLoaded = false;
-  const TELEMETRY_TABLE_LIMIT  // Telemetry
+  const TELEMETRY_TABLE_LIMIT = 200;
+  const TELEMETRY_CHART_LIMIT = 200;
   const TELEMETRY_PAGE_SIZES = [10, 25, 50, 100];
   const TELEMETRY_MAX_BACKGROUND_RECORDS = 50; // Low limit for background nodes
   const TELEMETRY_MAX_SELECTED_RECORDS = 2000; // High limit for the selected node
-  const TELEMETRY_DEVICE_KEYS = [25, 50, 100, 200];
-  let telemetryTablePageSize = 50;
+  const TELEMETRY_DEVICE_KEYS = [
+    let telemetryTablePageSize = 50;
   let telemetryTablePage = 1;
   let telemetryTableFilteredCount = 0;
   let telemetryMaxTotalRecords = 20000;
