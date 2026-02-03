@@ -338,10 +338,11 @@
     return lower === 'unknown' || lower === '__unknown__' || lower === 'null';
   }
   let nodeSnapshotLoaded = false;
-  const TELEMETRY_TABLE_LIMIT = 200;
-  const TELEMETRY_CHART_LIMIT = 200;
-  const TELEMETRY_MAX_LOCAL_RECORDS = 200; // Limit history per node to 200 records to prevent memory leak
-  const TELEMETRY_PAGE_SIZES = [25, 50, 100, 200];
+  const TELEMETRY_TABLE_LIMIT  // Telemetry
+  const TELEMETRY_PAGE_SIZES = [10, 25, 50, 100];
+  const TELEMETRY_MAX_BACKGROUND_RECORDS = 50; // Low limit for background nodes
+  const TELEMETRY_MAX_SELECTED_RECORDS = 2000; // High limit for the selected node
+  const TELEMETRY_DEVICE_KEYS = [25, 50, 100, 200];
   let telemetryTablePageSize = 50;
   let telemetryTablePage = 1;
   let telemetryTableFilteredCount = 0;
@@ -4751,7 +4752,15 @@
       bucket.recordIdSet.add(record.id);
       telemetryRecordIds.add(record.id);
     }
-    while (bucket.records.length > TELEMETRY_MAX_LOCAL_RECORDS) {
+
+    // Dynamic Limit: Higher for selected node, lower for others
+    const isSelected = telemetrySelectedMeshId && (
+      key === telemetrySelectedMeshId ||
+      normalizeMeshId(key) === normalizeMeshId(telemetrySelectedMeshId)
+    );
+    const limit = isSelected ? TELEMETRY_MAX_SELECTED_RECORDS : TELEMETRY_MAX_BACKGROUND_RECORDS;
+
+    while (bucket.records.length > limit) {
       const removed = bucket.records.shift();
       if (removed?.id) {
         bucket.recordIdSet?.delete(removed.id);
