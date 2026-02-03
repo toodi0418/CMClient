@@ -4771,17 +4771,26 @@
     }
 
     // Dynamic Limit: Higher for selected node, lower for others
-    // SAFETY: If the user has loaded a history range (Annual Playback), we MUST NOT prune aggressively.
-    // We allow up to 50k records in that case to support deep history analysis.
-    const isHistoryMode = bucket.loadedRange && (bucket.loadedRange.startMs != null || bucket.loadedRange.endMs != null);
     const isSelected = telemetrySelectedMeshId && (
       key === telemetrySelectedMeshId ||
       normalizeMeshId(key) === normalizeMeshId(telemetrySelectedMeshId)
     );
 
+    // SAFETY: Only the CURRENTLY SELECTED node is allowed to hold massive history (Annual Playback).
+    // If a node was previously selected (loaded history) but is now background,
+    // we must prune it to release memory.
+    const isHistoryMode = isSelected && bucket.loadedRange && (bucket.loadedRange.startMs != null || bucket.loadedRange.endMs != null);
+
     let limit = isSelected ? TELEMETRY_MAX_SELECTED_RECORDS : TELEMETRY_MAX_BACKGROUND_RECORDS;
     if (isHistoryMode) {
-      limit = 50000; // Allow large history if explicitly loaded
+      limit = 50000; // Allow large history if explicitly loaded AND currently selected
+    }
+
+    // If we are about to prune a bucket that THINKS it has a loaded range (because we switched away from it),
+    // we must invalidate that range so the UI knows to re-fetch if we switch back.
+    if (!isSelected && bucket.loadedRange && bucket.records.length > limit) {
+      bucket.loadedRange = null;
+      bucket.partial = true;
     }
 
     while (bucket.records.length > limit) {
