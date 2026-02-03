@@ -4761,11 +4761,18 @@
     }
 
     // Dynamic Limit: Higher for selected node, lower for others
+    // SAFETY: If the user has loaded a history range (Annual Playback), we MUST NOT prune aggressively.
+    // We allow up to 50k records in that case to support deep history analysis.
+    const isHistoryMode = bucket.loadedRange && (bucket.loadedRange.startMs != null || bucket.loadedRange.endMs != null);
     const isSelected = telemetrySelectedMeshId && (
       key === telemetrySelectedMeshId ||
       normalizeMeshId(key) === normalizeMeshId(telemetrySelectedMeshId)
     );
-    const limit = isSelected ? TELEMETRY_MAX_SELECTED_RECORDS : TELEMETRY_MAX_BACKGROUND_RECORDS;
+
+    let limit = isSelected ? TELEMETRY_MAX_SELECTED_RECORDS : TELEMETRY_MAX_BACKGROUND_RECORDS;
+    if (isHistoryMode) {
+      limit = 50000; // Allow large history if explicitly loaded
+    }
 
     while (bucket.records.length > limit) {
       const removed = bucket.records.shift();
