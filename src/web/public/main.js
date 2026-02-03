@@ -246,6 +246,7 @@
   const telemetryNodeInputDefaultPlaceholder =
     telemetryNodeInput?.getAttribute('placeholder') || '輸入節點 Mesh ID 或搜尋關鍵字';
   const nodeRegistry = new Map();
+  const MAX_CLIENT_NODES = 5000;
   const MESH_ID_PATTERN = /^![0-9a-f]{8}$/i;
 
   // Page Visibility State
@@ -3761,10 +3762,30 @@
     if (!existing && !allowCreate) {
       return null;
     }
+
+    // LRU: delete first so re-insertion puts it at the end
+    if (existing) {
+      nodeRegistry.delete(normalized);
+    }
+
     const base = existing || {};
     const merged = mergeNodeMetadata(existing, entry, { meshIdNormalized: normalized });
     if (merged) {
       nodeRegistry.set(normalized, merged);
+
+      // Enforce Limit
+      if (nodeRegistry.size > MAX_CLIENT_NODES) {
+        // Map keys are in insertion order. The first one is the oldest (Least Recently Used/Updated).
+        const oldestKey = nodeRegistry.keys().next().value;
+        if (oldestKey) {
+          nodeRegistry.delete(oldestKey);
+          // Also clean up telemetryStore to prevent detached leaks
+          if (telemetryStore.has(oldestKey)) {
+            telemetryStore.delete(oldestKey);
+          }
+        }
+      }
+
       updateTelemetryNodesWithRegistry(normalized, merged);
     }
     return merged;

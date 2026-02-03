@@ -39,6 +39,8 @@ const MESSAGE_MAX_PER_CHANNEL = 200;
 const MESSAGE_PERSIST_INTERVAL_MS = 2000;
 const MAX_TRACEROUTE_ENTRIES = 200;
 const TRACEROUTE_PERSIST_INTERVAL_MS = 2000;
+const DEFAULT_MAX_NODE_REGISTRY_SIZE = 5000;
+const DEFAULT_MAX_TELEMETRY_SUMMARY_SIZE = 5000;
 const TELEMETRY_METRIC_DEFINITIONS = {
   batteryLevel: { label: '電量', unit: '%', decimals: 0, clamp: [0, 150] },
   voltage: { label: '電壓', unit: 'V', decimals: 2 },
@@ -362,6 +364,16 @@ class WebDashboardServer {
     this.tracerouteStore = [];
     this._tracerouteDirty = false;
     this._traceroutePersistTimer = null;
+
+    this.maxNodeRegistrySize = this._resolvePositiveInteger(
+      process.env.TMAG_WEB_MAX_NODES,
+      DEFAULT_MAX_NODE_REGISTRY_SIZE
+    );
+    this.maxTelemetrySummarySize = this._resolvePositiveInteger(
+      process.env.TMAG_WEB_MAX_SUMMARY,
+      DEFAULT_MAX_TELEMETRY_SUMMARY_SIZE
+    );
+
     this._ensureConfiguredChannels();
   }
 
@@ -373,6 +385,11 @@ class WebDashboardServer {
     await this._ensureVectorMbtilesAvailable();
     await this._loadMessageLog();
     await this._loadTracerouteLog();
+
+    // Enforce limits on startup in case we loaded too many (though we don't persist nodeRegistry/summary to disk directly in this file, 
+    // but good practice if we did)
+    this._enforceNodeRegistryLimit();
+    this._enforceTelemetrySummaryLimit();
 
     const preferredPort = this._resolvePreferredPort();
     const candidatePorts = this._buildPortCandidates(preferredPort);
@@ -1796,6 +1813,7 @@ class WebDashboardServer {
     }
     this.telemetrySummaryUpdatedAt = Date.now();
     this.lastTelemetrySummary = null;
+    this._enforceTelemetrySummaryLimit();
   }
 
   _appendTelemetryRecord(meshId, node, record) {
@@ -2097,10 +2115,10 @@ class WebDashboardServer {
             latest = rec;
           }
         }
-      if (latest?.telemetry?.metrics && typeof latest.telemetry.metrics === 'object') {
-        latestMetrics = cloneJson(latest.telemetry.metrics);
+        if (latest?.telemetry?.metrics && typeof latest.telemetry.metrics === 'object') {
+          latestMetrics = cloneJson(latest.telemetry.metrics);
+        }
       }
-    }
       let latestDeviceMetrics = entry?.latestDeviceMetrics ? cloneJson(entry.latestDeviceMetrics) : null;
       let latestSensorMetrics = entry?.latestSensorMetrics ? cloneJson(entry.latestSensorMetrics) : null;
       if ((!latestDeviceMetrics || !latestSensorMetrics) && bucket && Array.isArray(bucket.records)) {
@@ -2268,6 +2286,7 @@ class WebDashboardServer {
       meshId: info.meshId || base.meshId || normalized
     });
     this.nodeRegistry.set(normalized, merged);
+    this._enforceNodeRegistryLimit();
     return cloneJson(merged);
   }
 
@@ -2850,6 +2869,55 @@ class WebDashboardServer {
       meshId: meshCandidate || registryNode?.meshId || null,
       meshIdNormalized: normalized || registryNode?.meshIdNormalized || null
     });
+  }
+
+  _resolvePositiveInteger(value, fallback) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+    return fallback;
+  }
+
+  _enforceNodeRegistryLimit() {
+    if (this.nodeRegistry.size <= this.maxNodeRegistrySize) {
+      return;
+    }
+    // Simple eviction: remove oldest entries (NodeRegistry is a Map, so keys are in insertion order)
+    // To be more precise we could sort by lastSeenAt, but simple FIFO is often enough and much faster.
+    // However, nodeRegistry updates might re-insert keys, keeping them fresh? 
+    // `_upsertNode` sets the value but doesn't delete/add if key exists which might NOT update insertion order in JS Map depending on impl,
+    // actually JS Map preserves insertion order of keys. Updating a value for existing key does NOT change position.
+    // So we might want to delete and re-set to mark as used, OR just evict the first one (oldest inserted).
+    // Let's rely on standard Map iteration order (insertion order).
+
+    const excess = this.nodeRegistry.size - this.maxNodeRegistrySize;
+    if (excess <= 0) return;
+
+    const keys = this.nodeRegistry.keys();
+    for (let i = 0; i < excess; i++) {
+      const key = keys.next().value;
+      if (key) {
+        this.nodeRegistry.delete(key);
+      }
+    }
+  }
+
+  _enforceTelemetrySummaryLimit() {
+    if (this.telemetrySummary.size <= this.maxTelemetrySummarySize) {
+      return;
+    }
+    const excess = this.telemetrySummary.size - this.maxTelemetrySummarySize;
+    if (excess <= 0) return;
+
+    // Similar FIFO eviction
+    const keys = this.telemetrySummary.keys();
+    for (let i = 0; i < excess; i++) {
+      const key = keys.next().value;
+      if (key) {
+        this.telemetrySummary.delete(key);
+      }
+    }
   }
 }
 
