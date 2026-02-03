@@ -340,7 +340,7 @@
   let nodeSnapshotLoaded = false;
   const TELEMETRY_TABLE_LIMIT = 200;
   const TELEMETRY_CHART_LIMIT = 200;
-  const TELEMETRY_MAX_LOCAL_RECORDS = Number.POSITIVE_INFINITY;
+  const TELEMETRY_MAX_LOCAL_RECORDS = 200; // Limit history per node to 200 records to prevent memory leak
   const TELEMETRY_PAGE_SIZES = [25, 50, 100, 200];
   let telemetryTablePageSize = 50;
   let telemetryTablePage = 1;
