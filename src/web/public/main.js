@@ -3367,8 +3367,7 @@
     };
     recordChannelMessage(hydrated, { markUnread: true });
 
-    // Play sound for new incoming messages
-    playMessageSound();
+
     renderChannelNav();
   }
 
