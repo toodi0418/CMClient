@@ -344,7 +344,13 @@
   const TELEMETRY_MAX_BACKGROUND_RECORDS = 50; // Low limit for background nodes
   const TELEMETRY_MAX_SELECTED_RECORDS = 2000; // High limit for the selected node
   const TELEMETRY_DEVICE_KEYS = [
-    let telemetryTablePageSize = 50;
+    'batteryLevel',
+    'voltage',
+    'channelUtilization',
+    'airTime',
+    'uptimeSeconds'
+  ];
+  let telemetryTablePageSize = 50;
   let telemetryTablePage = 1;
   let telemetryTableFilteredCount = 0;
   let telemetryMaxTotalRecords = 20000;
