@@ -350,6 +350,16 @@
     'airTime',
     'uptimeSeconds'
   ];
+  const TELEMETRY_SENSOR_KEYS = [
+    'temperature',
+    '_temperature',
+    'relativeHumidity',
+    'humidity',
+    '_humidity',
+    'barometricPressure',
+    'pressure',
+    '_pressure'
+  ];
   let telemetryTablePageSize = 50;
   let telemetryTablePage = 1;
   let telemetryTableFilteredCount = 0;
@@ -6946,17 +6956,6 @@
     return items;
   }
 
-  const TELEMETRY_DEVICE_KEYS = ['batteryLevel', 'voltage', 'channelUtilization', 'airUtilTx'];
-  const TELEMETRY_SENSOR_KEYS = [
-    'temperature',
-    '_temperature',
-    'relativeHumidity',
-    'humidity',
-    '_humidity',
-    'barometricPressure',
-    'pressure',
-    '_pressure'
-  ];
 
   function telemetryHasAny(metrics, keys) {
     if (!metrics) return false;
