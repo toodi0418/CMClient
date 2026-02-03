@@ -2656,8 +2656,23 @@ class WebDashboardServer {
 
   _write(stream, event) {
     if (!stream || !event) return;
+
+    // Safety check: specific to preventing 9.6GB memory leak
+    if (stream.writableLength > MAX_CLIENT_BUFFER_SIZE) {
+      // eslint-disable-next-line no-console
+      console.warn(`[WebDashboard] Client buffer exceeded limit (${(stream.writableLength / 1024 / 1024).toFixed(1)}MB). Disconnecting slow client.`);
+      stream.destroy();
+      this.clients.delete(stream);
+      return;
+    }
+
     try {
-      stream.write(`data: ${JSON.stringify(event)}\n\n`);
+      const success = stream.write(`data: ${JSON.stringify(event)}\n\n`);
+      if (!success) {
+        // Backpressure detected, but we don't have a queue mechanism here.
+        // Node will buffer it in memory up to highWaterMark then keep buffering until drain.
+        // The check above (writableLength) safeguards us if this keeps failing to drain.
+      }
     } catch {
       this.clients.delete(stream);
     }
