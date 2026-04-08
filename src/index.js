@@ -291,10 +291,16 @@ async function main() {
             default: 115200,
             describe: 'Serial 連線時的鮑率'
           })
+          .option('share-with-tenmanmap', {
+            type: 'boolean',
+            default: true,
+            describe: '啟用 TenManMap 分享（可用 --no-share-with-tenmanmap 停用）'
+          })
           .option('no-share-with-tenmanmap', {
             type: 'boolean',
             describe: '停用 TenManMap 分享（預設為啟用）'
           })
+          .hide('share-with-tenmanmap')
           .option('max-length', {
             alias: 'm',
             type: 'number',
@@ -399,7 +405,7 @@ async function startMonitor(argv) {
   const tracerouteIntervalSeconds = Math.max(15, Number(argv.tracerouteIntervalSeconds) || 60);
   const tracerouteCachePath = path.join(artifactsDir, 'traceroute-cache.json');
   const shareWithTenmanMapOverride =
-    argv.noShareWithTenmanmap ? false : null;
+    argv.shareWithTenmanmap === false ? false : null;
   const summaryLogRequested = Boolean(argv.summaryLog || argv.summaryLogDir);
   let summaryLogger = null;
   if (summaryLogRequested) {
