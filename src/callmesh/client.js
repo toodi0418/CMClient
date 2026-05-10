@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-const DEFAULT_BASE_URL = 'https://callmesh.tmmarc.org';
+const DEFAULT_BASE_URL = process.env.CALLMESH_BASE_URL || 'https://callmesh.tmmarc.org';
 const DEFAULT_PRODUCT = 'callmesh-client';
 
 class CallMeshClient {

@@ -173,8 +173,12 @@ EOF
             PROXY_HOST="0.0.0.0"
         fi
 
+        read -rp "CallMesh Server 位址 [留空使用預設 https://callmesh.tmmarc.org]: " base_url_input
+        BASE_URL_VAL="${base_url_input:-}"
+
         cat > .env <<EOL
 CALLMESH_API_KEY=${API_KEY}
+CALLMESH_BASE_URL=${BASE_URL_VAL}
 SERIAL_DEVICE=${SERIAL_VAL}
 MESHTASTIC_HOST=${HOST_VAL}
 MESHTASTIC_PORT=4403
