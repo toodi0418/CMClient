@@ -94,8 +94,16 @@
 
         <section class="table-panel">
           <header class="panel-header">
-            <h2>封包摘要</h2>
-            <span class="panel-meta">資料列最多保留 200 筆</span>
+            <div class="panel-title-group">
+              <h2>封包摘要</h2>
+              <span class="panel-meta">資料列最多保留 200 筆</span>
+            </div>
+            <div class="panel-filters">
+              <label class="filter-item">
+                <input type="checkbox" id="filter-hide-self" />
+                <span>隱藏本機節點 (!Self)</span>
+              </label>
+            </div>
           </header>
           <div class="table-wrapper">
             <table>
@@ -325,8 +333,16 @@
       <section id="log-page" class="page">
         <section class="log-panel">
           <header class="panel-header">
-            <h2>系統日誌</h2>
-            <span class="panel-meta">CallMesh / APRS / 連線事件</span>
+            <div class="panel-title-group">
+              <h2>系統日誌</h2>
+              <span class="panel-meta">CallMesh / APRS / 連線事件</span>
+            </div>
+            <div class="panel-filters">
+              <label class="filter-item">
+                <input type="checkbox" id="filter-hide-heartbeat" checked />
+                <span>隱藏心跳訊息</span>
+              </label>
+            </div>
           </header>
           <ul id="log-list" class="log-list"></ul>
         </section>

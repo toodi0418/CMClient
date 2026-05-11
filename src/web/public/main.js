@@ -79,6 +79,8 @@
   const relayHintSubtitleEl = document.getElementById('relay-hint-subtitle');
   const relayHintCloseBtn = document.getElementById('relay-hint-close');
   const relayHintOkBtn = document.getElementById('relay-hint-ok');
+  const filterHideSelf = document.getElementById('filter-hide-self');
+  const filterHideHeartbeat = document.getElementById('filter-hide-heartbeat');
 
   const summaryRows = [];
   const SUMMARY_ROW_HOP_DIRECT_CLASS = 'summary-row-hop-direct';
@@ -390,7 +392,9 @@
     callmeshProvisionOpen: 'tmag:web:callmeshProvision:open',
     telemetryRangeMode: 'tmag:web:telemetry:range-mode',
     telemetryPageSize: 'tmag:web:telemetry:page-size',
-    messagePageSize: 'tmag:web:messages:page-size'
+    messagePageSize: 'tmag:web:messages:page-size',
+    filterHideSelf: 'tmag:web:filter:hide-self',
+    filterHideHeartbeat: 'tmag:web:filter:hide-heartbeat'
   };
 
   function isValidTelemetryRangeMode(mode) {
@@ -437,6 +441,32 @@
     }
     callmeshProvisionDetails.addEventListener('toggle', () => {
       safeStorageSet(STORAGE_KEYS.callmeshProvisionOpen, callmeshProvisionDetails.open ? '1' : '0');
+    });
+  }
+
+  if (filterHideSelf) {
+    const stored = safeStorageGet(STORAGE_KEYS.filterHideSelf);
+    filterHideSelf.checked = stored === '1';
+    if (filterHideSelf.checked) {
+      document.body.classList.add('hide-self-activity');
+    }
+    filterHideSelf.addEventListener('change', () => {
+      const active = filterHideSelf.checked;
+      safeStorageSet(STORAGE_KEYS.filterHideSelf, active ? '1' : '0');
+      document.body.classList.toggle('hide-self-activity', active);
+    });
+  }
+
+  if (filterHideHeartbeat) {
+    const stored = safeStorageGet(STORAGE_KEYS.filterHideHeartbeat);
+    filterHideHeartbeat.checked = stored !== '0';
+    if (filterHideHeartbeat.checked) {
+      document.body.classList.add('hide-heartbeat-logs');
+    }
+    filterHideHeartbeat.addEventListener('change', () => {
+      const active = filterHideHeartbeat.checked;
+      safeStorageSet(STORAGE_KEYS.filterHideHeartbeat, active ? '1' : '0');
+      document.body.classList.toggle('hide-heartbeat-logs', active);
     });
   }
 
@@ -1345,9 +1375,9 @@
     const detail = typeof summary.detail === 'string' ? summary.detail.trim() : '';
     const extra = Array.isArray(summary.extraLines)
       ? summary.extraLines
-          .map((line) => (typeof line === 'string' ? line.trim() : ''))
-          .filter(Boolean)
-          .join('\n')
+        .map((line) => (typeof line === 'string' ? line.trim() : ''))
+        .filter(Boolean)
+        .join('\n')
       : '';
     return detail || extra || '（無內容）';
   }
@@ -1631,13 +1661,13 @@
       sanitizeNodeName(entry.label),
       entry.meshId,
       entry.meshIdOriginal,
-    entry.meshIdNormalized,
-    entry.hwModel,
-    entry.hwModelLabel,
-    entry.role,
-    entry.roleLabel,
-    formatNodeCoordinateValue(entry)
-  ];
+      entry.meshIdNormalized,
+      entry.hwModel,
+      entry.hwModelLabel,
+      entry.role,
+      entry.roleLabel,
+      formatNodeCoordinateValue(entry)
+    ];
     return fields.some((value) => {
       if (!value) return false;
       return String(value).toLowerCase().includes(lowerTerm);
@@ -2152,9 +2182,9 @@
     return Boolean(summary?.relay?.guessed || summary?.relayGuess);
   }
 
-function getRelayGuessReason(summary) {
-  return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
-}
+  function getRelayGuessReason(summary) {
+    return summary?.relayGuessReason || RELAY_GUESS_EXPLANATION;
+  }
 
   function openRelayHintDialog({ reason, relayLabel, meshId } = {}) {
     const text = reason && reason.trim() ? reason.trim() : RELAY_GUESS_EXPLANATION;
@@ -2186,16 +2216,16 @@ function getRelayGuessReason(summary) {
     document.body.classList.remove('modal-open');
   }
 
-function ensureRelayGuessSuffix(label, summary) {
-  if (!isRelayGuessed(summary)) {
-    return label;
+  function ensureRelayGuessSuffix(label, summary) {
+    if (!isRelayGuessed(summary)) {
+      return label;
+    }
+    const value = (label || '').trim();
+    if (!value) {
+      return '未知';
+    }
+    return value;
   }
-  const value = (label || '').trim();
-  if (!value) {
-    return '未知';
-  }
-  return value;
-}
 
   function formatRelay(summary) {
     if (!summary) return '直收';
@@ -4277,7 +4307,7 @@ function ensureRelayGuessSuffix(label, summary) {
     const latestLabel =
       primaryEntry && primaryEntry.meta?.name
         ? formatTelemetryFixed(primaryEntry.meta.name, primaryEntry.latestValue, primaryEntry.decimals) ||
-          '—'
+        '—'
         : '—';
     const statusLabel =
       datasetEntries
@@ -4530,7 +4560,7 @@ function ensureRelayGuessSuffix(label, summary) {
                 const formatted =
                   metricName != null
                     ? formatTelemetryFixed(metricName, ctx.parsed?.y, decimals) ||
-                      ctx.parsed?.y
+                    ctx.parsed?.y
                     : ctx.parsed?.y;
                 return `${labelText}: ${formatted}`;
               }
@@ -5408,8 +5438,8 @@ function ensureRelayGuessSuffix(label, summary) {
     const detailText = typeof summary?.detail === 'string' ? summary.detail.trim() : '';
     const extras = Array.isArray(summary?.extraLines)
       ? summary.extraLines
-          .map((line) => (line === null || line === undefined ? '' : String(line).trim()))
-          .filter(Boolean)
+        .map((line) => (line === null || line === undefined ? '' : String(line).trim()))
+        .filter(Boolean)
       : [];
     const distanceLabel = formatDistance(summary);
 
@@ -5477,7 +5507,7 @@ function ensureRelayGuessSuffix(label, summary) {
     const a =
       Math.sin(dLat / 2) * Math.sin(dLat / 2) +
       Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
   }
@@ -5550,10 +5580,10 @@ function ensureRelayGuessSuffix(label, summary) {
     }
     const ssid = normalizeProvisionSsidValue(
       aprs.aprs_ssid ??
-        aprs.aprsSsid ??
-        aprs.callsign_ssid ??
-        aprs.callsignSsid ??
-        aprs.ssid
+      aprs.aprsSsid ??
+      aprs.callsign_ssid ??
+      aprs.callsignSsid ??
+      aprs.ssid
     );
     if (!ssid) {
       return base;
@@ -5944,6 +5974,13 @@ function ensureRelayGuessSuffix(label, summary) {
 
     const row = createSummaryRow(summary);
     row.__summaryData = summary;
+
+    if (currentSelfMeshId) {
+      const fromMeshId = normalizeMeshId(summary?.from?.meshId || summary?.from?.meshIdNormalized);
+      if (fromMeshId === currentSelfMeshId && summary.type !== 'Text') {
+        row.classList.add('summary-row-self');
+      }
+    }
     applySummaryTypeClass(row, summary);
     const meshId = normalizeMeshId(summary?.from?.meshId || summary?.from?.meshIdNormalized);
     if (meshId) {
@@ -6488,11 +6525,11 @@ function ensureRelayGuessSuffix(label, summary) {
             hintBtn.setAttribute('aria-label', '顯示推測原因');
             hintBtn.addEventListener('click', (event) => {
               event.stopPropagation();
-            openRelayHintDialog({
-              reason: entry.relayGuessReason,
-              relayLabel: entry.relayLabel || '',
-              meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
-            });
+              openRelayHintDialog({
+                reason: entry.relayGuessReason,
+                relayLabel: entry.relayLabel || '',
+                meshId: entry.relayMeshIdNormalized || entry.relayMeshId || ''
+              });
             });
             chipEl.appendChild(hintBtn);
           }
@@ -6828,8 +6865,14 @@ function ensureRelayGuessSuffix(label, summary) {
       return;
     }
     if (!entry || !logList) return;
+
     const li = document.createElement('li');
     li.className = 'log-entry';
+
+    const msg = (entry.message || '').toLowerCase();
+    if (msg.includes('heartbeat ok')) {
+      li.classList.add('log-entry-heartbeat');
+    }
     const timestamp = entry.timestamp || new Date().toISOString();
     const formattedTime = formatTimestamp(timestamp);
     const tag = (entry.tag || 'LOG').toUpperCase();
