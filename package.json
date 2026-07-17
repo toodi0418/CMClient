@@ -11,7 +11,7 @@
     "format:check": "prettier --check .",
     "format:write": "prettier --write .",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "typecheck": "pnpm --recursive --if-present run typecheck",
     "test": "pnpm run test:fixtures && vitest run",
     "test:fixtures": "node --test test/fixtures/sanitized-packet-fixtures.test.js"
   },
