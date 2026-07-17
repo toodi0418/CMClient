@@ -12,6 +12,7 @@ import {
   MeshTelemetrySchema,
   NormalizedFromRadioSchema,
   SystemCapabilitiesSchema,
+  SanitizedPacketFixtureSetSchema,
   TransportConnectionStateSchema,
 } from "./index";
 
@@ -204,6 +205,38 @@ describe("mesh domain contracts", () => {
         metricKind: "deviceMetrics",
         metrics: { batteryLevel: 73, voltage: 3.9 },
         observedAt: "2026-07-18T00:00:02.000Z",
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("packet recording contract", () => {
+  it("only permits the fixture-safe recording representation", () => {
+    const check = TypeCompiler.Compile(SanitizedPacketFixtureSetSchema);
+    expect(
+      check.Check({
+        schemaVersion: 1,
+        dataset: "cmclient-sanitized-packet-recordings",
+        sanitized: true,
+        fixtures: [
+          {
+            id: "fixture-record-000001",
+            sanitized: true,
+            recording: {
+              rawFrameEncoding: "synthetic-hex",
+              rawFrameHex: "0123abcd",
+              gatewayId: "fixture-gateway-a",
+              meshNetworkId: "fixture-network-a",
+              transport: "tcp",
+              transportMetadata: { connectionStatus: "ready" },
+              sessionConnectedAt: "2030-01-02T00:00:00.000Z",
+              receivedAt: "2030-01-02T00:00:01.000Z",
+              ingestedAt: "2030-01-02T00:00:02.000Z",
+              serverIngestedAt: "2030-01-02T00:00:03.000Z",
+            },
+            normalizedFromRadio: { schemaVersion: 1, kind: "other" },
+          },
+        ],
       }),
     ).toBe(true);
   });

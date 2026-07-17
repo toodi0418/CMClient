@@ -26,6 +26,7 @@ test('sanitized packet fixtures have a valid minimal shape', () => {
     assert.equal(fixture.recording.rawFrameEncoding, 'synthetic-hex');
     assert.match(fixture.recording.rawFrameHex, /^[0-9a-f]+$/i);
     assert.match(fixture.recording.gatewayId, /^fixture-gateway-[a-z]+$/);
+    assert.match(fixture.recording.serverIngestedAt, /^\d{4}-\d{2}-\d{2}T/);
     assert.match(fixture.normalizedPacket.meshNetworkId, /^fixture-network-/);
     assert.match(fixture.normalizedPacket.nodeId, /^!f1c7a[0-9]{3}$/);
   }

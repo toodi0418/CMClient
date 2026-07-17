@@ -20,7 +20,8 @@
         "transport": "tcp",
         "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
         "receivedAt": "2030-01-02T03:04:06.000Z",
-        "ingestedAt": "2030-01-02T03:04:06.015Z"
+        "ingestedAt": "2030-01-02T03:04:06.015Z",
+        "serverIngestedAt": "2030-01-02T03:04:06.020Z"
       },
       "normalizedPacket": {
         "meshNetworkId": "fixture-network-alpha",
@@ -53,7 +54,8 @@
         "transport": "serial",
         "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
         "receivedAt": "2030-01-02T03:05:06.000Z",
-        "ingestedAt": "2030-01-02T03:05:06.010Z"
+        "ingestedAt": "2030-01-02T03:05:06.010Z",
+        "serverIngestedAt": "2030-01-02T03:05:06.015Z"
       },
       "normalizedPacket": {
         "meshNetworkId": "fixture-network-alpha",
@@ -83,7 +85,8 @@
         "transport": "tcp",
         "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
         "receivedAt": "2030-01-02T03:04:09.000Z",
-        "ingestedAt": "2030-01-02T03:04:09.020Z"
+        "ingestedAt": "2030-01-02T03:04:09.020Z",
+        "serverIngestedAt": "2030-01-02T03:04:09.025Z"
       },
       "normalizedPacket": {
         "meshNetworkId": "fixture-network-alpha",
@@ -114,7 +117,8 @@
         "sessionConnectedAt": "2030-01-02T03:10:00.000Z",
         "receivedAt": "2030-01-02T03:10:01.000Z",
         "ingestedAt": "2030-01-02T03:10:01.012Z",
-        "isBacklog": true
+        "isBacklog": true,
+        "serverIngestedAt": "2030-01-02T03:10:01.020Z"
       },
       "normalizedPacket": {
         "meshNetworkId": "fixture-network-alpha",
@@ -145,7 +149,8 @@
         "transport": "serial",
         "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
         "receivedAt": "2030-01-02T03:06:00.000Z",
-        "ingestedAt": "2030-01-02T03:06:00.010Z"
+        "ingestedAt": "2030-01-02T03:06:00.010Z",
+        "serverIngestedAt": "2030-01-02T03:06:00.015Z"
       },
       "normalizedPacket": {
         "meshNetworkId": "fixture-network-alpha",
@@ -169,7 +174,8 @@
         "transport": "tcp",
         "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
         "receivedAt": "2030-01-02T03:07:00.000Z",
-        "ingestedAt": "2030-01-02T03:07:00.014Z"
+        "ingestedAt": "2030-01-02T03:07:00.014Z",
+        "serverIngestedAt": "2030-01-02T03:07:00.020Z"
       },
       "normalizedPacket": {
         "meshNetworkId": "fixture-network-alpha",

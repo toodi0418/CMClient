@@ -20,12 +20,12 @@ npm run test:fixtures
   `fixture-network-*` network, and synthetic Mesh node ID.
 - Raw frames in this initial set are deliberately marked `synthetic-hex`; they
   are stable recorder/sanitizer inputs, not claims of a real protobuf capture.
-- A future recorder may add sanitized real frame fixtures only after it proves
-  that identifiers, text, paths, position, timestamps, credentials, and other
-  sensitive data have been removed or replaced deterministically.
+- `PacketFixtureSanitizer` is the only recorder export path. It replaces raw
+  frames and payload bytes with synthetic data, aliases identifiers, and shifts
+  the observation timeline together before a fixture can be retained.
 - A fixture must retain observation time, ingest time, session time, and
-  transport independently. No test may reinterpret local receive time as a
-  global source event time.
+  server ingest time, and transport independently. No test may reinterpret
+  local receive time as a global source event time.
 
 ## Characterization Matrix
 
