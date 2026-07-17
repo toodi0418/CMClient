@@ -1,5 +1,20 @@
 import Fastify, { type FastifyInstance } from "fastify";
 
+import {
+  ConsoleStructuredLogger,
+  type StructuredLogger,
+  createTraceId,
+  resolveCorrelationId,
+  resolveTraceId,
+} from "./observability.js";
+
+declare module "fastify" {
+  interface FastifyRequest {
+    correlationId?: string;
+    traceId: string;
+  }
+}
+
 export interface GatewayListenOptions {
   host: string;
   port: number;
@@ -28,10 +43,12 @@ export function parseGatewayListenOptions(
 
 export class GatewayRuntime {
   readonly app: FastifyInstance;
+  private readonly options: GatewayListenOptions;
   private started = false;
 
-  constructor(private readonly options: GatewayListenOptions) {
-    this.app = Fastify({ logger: false });
+  constructor(options: GatewayListenOptions, logger?: StructuredLogger) {
+    this.options = options;
+    this.app = createGatewayApp(logger);
   }
 
   async start(): Promise<GatewayListenOptions> {
@@ -58,6 +75,41 @@ export class GatewayRuntime {
     }
     return { host: this.options.host, port: address.port };
   }
+}
+
+export function createGatewayApp(
+  logger: StructuredLogger = new ConsoleStructuredLogger(),
+): FastifyInstance {
+  const app = Fastify({ logger: false });
+  app.decorateRequest("traceId", "");
+  app.addHook("onRequest", (request, reply, done) => {
+    request.traceId = resolveTraceId(request.headers["x-trace-id"]);
+    const correlationId = resolveCorrelationId(
+      request.headers["x-correlation-id"],
+    );
+    if (correlationId) {
+      request.correlationId = correlationId;
+    }
+    reply.header("x-trace-id", request.traceId);
+    done();
+  });
+  app.addHook("onResponse", (request, reply, done) => {
+    logger.log({
+      level: "info",
+      message: "gateway.request.complete",
+      traceId: request.traceId || createTraceId(),
+      ...(request.correlationId
+        ? { correlationId: request.correlationId }
+        : {}),
+      fields: {
+        method: request.method,
+        path: request.routeOptions.url ?? request.url,
+        statusCode: reply.statusCode,
+      },
+    });
+    done();
+  });
+  return app;
 }
 
 function isLoopbackHost(host: string): boolean {
