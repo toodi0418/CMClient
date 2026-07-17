@@ -18,10 +18,15 @@ authentication, sessions, CSRF/origin checks, rate limits, and audit logging.
 `apps/web` is the Vue 3/Vite management shell. It owns presentation-only
 navigation, responsive rail/drawer state, and route composition; it does not
 open SQLite, operate Meshtastic transports, or make privileged local calls.
-Gateway data and commands will enter through shared HTTP/SSE clients in the
-later P06 API client slice. The Vite development listener remains loopback-only
-and defaults to `127.0.0.1:5174`; the shipped static bundle is served by the
-Agent listener above.
+Gateway data and commands enter through `@cmclient/api-client` and
+`@cmclient/event-client`, never through page-specific transport code. The API
+client validates versioned Gateway responses and maps network, proxy, HTTP, and
+malformed-response failures to stable codes without surfacing backend prose.
+The event client reads the SSE fetch stream, validates each DomainEvent envelope,
+preserves `Last-Event-ID`, and reconnects with bounded exponential backoff. The
+Vite development listener remains loopback-only and defaults to
+`127.0.0.1:5174`; the shipped static bundle is served by the Agent listener
+above.
 
 The shell uses Tailwind 4 through the Vite integration and maps its `cm-*`
 utility names to semantic CSS variables in `apps/web/src/theme/tokens.css`.

@@ -29,6 +29,19 @@ export const BuildMetadataSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const SystemHealthSchema = Type.Object(
+  { status: Type.Literal("ok") },
+  { additionalProperties: false },
+);
+
+export const SystemStatusSchema = Type.Object(
+  {
+    health: Type.Literal("ok"),
+    build: BuildMetadataSchema,
+  },
+  { additionalProperties: false },
+);
+
 export const CapabilityStateSchema = Type.Union([
   Type.Object(
     { available: Type.Literal(true) },
@@ -68,5 +81,7 @@ export type BuildChannel = (typeof BUILD_CHANNELS)[number];
 export type PlatformId = (typeof PLATFORM_IDS)[number];
 export type CapabilityKey = (typeof CAPABILITY_KEYS)[number];
 export type BuildMetadata = Static<typeof BuildMetadataSchema>;
+export type SystemHealth = Static<typeof SystemHealthSchema>;
+export type SystemStatus = Static<typeof SystemStatusSchema>;
 export type CapabilityState = Static<typeof CapabilityStateSchema>;
 export type SystemCapabilities = Static<typeof SystemCapabilitiesSchema>;

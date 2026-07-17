@@ -9,6 +9,8 @@ import {
   BuildMetadataSchema,
   JobDetailSchema,
   SystemCapabilitiesSchema,
+  SystemHealthSchema,
+  SystemStatusSchema,
   type DomainEvent,
   type JobDetail,
 } from "@cmclient/contracts";
@@ -168,7 +170,7 @@ export function createGatewayApp(
     {
       schema: {
         response: {
-          200: Type.Object({ status: Type.Literal("ok") }),
+          200: SystemHealthSchema,
         },
       },
     },
@@ -192,12 +194,7 @@ export function createGatewayApp(
     "/api/v1/system/status",
     {
       schema: {
-        response: {
-          200: Type.Object({
-            health: Type.Literal("ok"),
-            build: BuildMetadataSchema,
-          }),
-        },
+        response: { 200: SystemStatusSchema },
       },
     },
     async () => ({ health: "ok", build: system.build }),

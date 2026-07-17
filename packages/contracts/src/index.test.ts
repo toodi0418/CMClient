@@ -16,6 +16,7 @@ import {
   PositionDecisionSchema,
   PositionObservationSchema,
   SystemCapabilitiesSchema,
+  SystemStatusSchema,
   SanitizedPacketFixtureSetSchema,
   TransportConnectionStateSchema,
 } from "./index";
@@ -65,6 +66,20 @@ describe("system capabilities contract", () => {
         },
       }),
     ).toBe(false);
+  });
+});
+
+describe("system status contract", () => {
+  it("keeps the API status projection schema-backed", () => {
+    const check = TypeCompiler.Compile(SystemStatusSchema);
+
+    expect(
+      check.Check({
+        health: "ok",
+        build: { version: "2.0.0-dev.0", commit: "abc123", channel: "dev" },
+      }),
+    ).toBe(true);
+    expect(check.Check({ health: "degraded" })).toBe(false);
   });
 });
 

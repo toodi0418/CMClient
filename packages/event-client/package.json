@@ -1,0 +1,17 @@
+{
+  "name": "@cmclient/event-client",
+  "version": "2.0.0-dev.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@cmclient/api-client": "workspace:*",
+    "@cmclient/contracts": "workspace:*",
+    "@sinclair/typebox": "^0.34.52"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit --project tsconfig.json"
+  }
+}

@@ -91,6 +91,15 @@ importers:
         specifier: ^3.3.7
         version: 3.3.7(typescript@5.9.3)
 
+  packages/api-client:
+    dependencies:
+      '@cmclient/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@sinclair/typebox':
+        specifier: ^0.34.52
+        version: 0.34.52
+
   packages/config:
     dependencies:
       '@cmclient/contracts':
@@ -99,6 +108,18 @@ importers:
 
   packages/contracts:
     dependencies:
+      '@sinclair/typebox':
+        specifier: ^0.34.52
+        version: 0.34.52
+
+  packages/event-client:
+    dependencies:
+      '@cmclient/api-client':
+        specifier: workspace:*
+        version: link:../api-client
+      '@cmclient/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@sinclair/typebox':
         specifier: ^0.34.52
         version: 0.34.52
