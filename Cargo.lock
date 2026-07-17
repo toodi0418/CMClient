@@ -117,8 +117,10 @@ name = "cmclient-cli"
 version = "2.0.0-dev.0"
 dependencies = [
  "clap",
+ "cmclient-agent-core",
  "cmclient-cli-client",
  "cmclient-control-api",
+ "serde_json",
 ]
 
 [[package]]

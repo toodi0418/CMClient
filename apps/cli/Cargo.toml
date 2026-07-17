@@ -7,8 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+cmclient-agent-core = { path = "../../crates/agent-core" }
 cmclient-cli-client = { path = "../../crates/cli-client" }
 cmclient-control-api = { path = "../../crates/control-api" }
+serde_json = "1.0"
 
 [lints]
 workspace = true

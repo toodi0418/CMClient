@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Display, Formatter},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// Stable workspace identity for the control API boundary.
@@ -42,6 +43,35 @@ pub enum GatewayControlStatus {
     Degraded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlCommand {
+    Status,
+    Start,
+    Stop,
+    Restart,
+}
+
+pub trait ControlHandler: Send + Sync {
+    fn handle(&self, command: ControlCommand) -> Result<ControlStatus, ControlError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticControlHandler {
+    status: ControlStatus,
+}
+
+impl StaticControlHandler {
+    pub fn new(status: ControlStatus) -> Self {
+        Self { status }
+    }
+}
+
+impl ControlHandler for StaticControlHandler {
+    fn handle(&self, _command: ControlCommand) -> Result<ControlStatus, ControlError> {
+        Ok(self.status.clone())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlError {
     EndpointAlreadyInUse,
@@ -49,6 +79,7 @@ pub enum ControlError {
     Io,
     InvalidHttp,
     ResponseTooLarge,
+    CommandFailed,
 }
 
 impl ControlError {
@@ -59,6 +90,7 @@ impl ControlError {
             Self::Io => "CONTROL_IO_FAILED",
             Self::InvalidHttp => "CONTROL_HTTP_INVALID",
             Self::ResponseTooLarge => "CONTROL_RESPONSE_TOO_LARGE",
+            Self::CommandFailed => "CONTROL_COMMAND_FAILED",
         }
     }
 }
@@ -71,36 +103,47 @@ impl Display for ControlError {
 
 impl std::error::Error for ControlError {}
 
-#[derive(Debug, Clone)]
 pub struct ControlRouter {
-    status: ControlStatus,
+    handler: Arc<dyn ControlHandler>,
 }
 
 impl ControlRouter {
-    pub fn new(status: ControlStatus) -> Self {
-        Self { status }
+    pub fn new(handler: Arc<dyn ControlHandler>) -> Self {
+        Self { handler }
     }
 
     fn route(&self, request: &str) -> Result<(u16, Vec<u8>), ControlError> {
         let request_line = request.lines().next().ok_or(ControlError::InvalidHttp)?;
-        match request_line
+        let command = match request_line
             .split_whitespace()
             .collect::<Vec<_>>()
             .as_slice()
         {
             ["GET", "/api/v1/control/status", "HTTP/1.1"]
-            | ["GET", "/api/v1/control/status", "HTTP/1.0"] => serde_json::to_vec(&self.status)
+            | ["GET", "/api/v1/control/status", "HTTP/1.0"] => ControlCommand::Status,
+            ["POST", "/api/v1/control/start", "HTTP/1.1"]
+            | ["POST", "/api/v1/control/start", "HTTP/1.0"] => ControlCommand::Start,
+            ["POST", "/api/v1/control/stop", "HTTP/1.1"]
+            | ["POST", "/api/v1/control/stop", "HTTP/1.0"] => ControlCommand::Stop,
+            ["POST", "/api/v1/control/restart", "HTTP/1.1"]
+            | ["POST", "/api/v1/control/restart", "HTTP/1.0"] => ControlCommand::Restart,
+            [_, _, _] => return Ok((404, br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#.to_vec())),
+            _ => return Err(ControlError::InvalidHttp),
+        };
+        match self.handler.handle(command) {
+            Ok(status) => serde_json::to_vec(&status)
                 .map(|body| (200, body))
                 .map_err(|_| ControlError::Io),
-            [_, _, _] => Ok((404, br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#.to_vec())),
-            _ => Err(ControlError::InvalidHttp),
+            Err(error) => serde_json::to_vec(&serde_json::json!({ "code": error.code() }))
+                .map(|body| (500, body))
+                .map_err(|_| ControlError::Io),
         }
     }
 }
 
 #[cfg(unix)]
 mod unix {
-    use super::{ControlEndpoint, ControlError, ControlRouter, ControlStatus};
+    use super::{ControlEndpoint, ControlError, ControlHandler, ControlRouter, ControlStatus};
     use std::{
         fs,
         io::{Read, Write},
@@ -118,7 +161,7 @@ mod unix {
     impl ControlServer {
         pub fn bind(
             endpoint: ControlEndpoint,
-            status: ControlStatus,
+            handler: std::sync::Arc<dyn ControlHandler>,
         ) -> Result<Self, ControlError> {
             let ControlEndpoint::UnixSocket(path) = endpoint else {
                 return Err(ControlError::UnsupportedEndpoint);
@@ -135,7 +178,7 @@ mod unix {
             Ok(Self {
                 endpoint: path,
                 listener,
-                router: ControlRouter::new(status),
+                router: ControlRouter::new(handler),
             })
         }
 
@@ -146,13 +189,18 @@ mod unix {
             let request =
                 std::str::from_utf8(&request[..bytes]).map_err(|_| ControlError::InvalidHttp)?;
             let (status, body) = self.router.route(request)?;
-            let status_text = if status == 200 { "OK" } else { "Not Found" };
-            write!(
-                stream,
+            let status_text = match status {
+                200 => "OK",
+                404 => "Not Found",
+                _ => "Internal Server Error",
+            };
+            let header = format!(
                 "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
-            )
-            .map_err(|_| ControlError::Io)?;
+            );
+            stream
+                .write_all(header.as_bytes())
+                .map_err(|_| ControlError::Io)?;
             stream.write_all(&body).map_err(|_| ControlError::Io)
         }
 
@@ -180,9 +228,27 @@ mod unix {
         }
 
         pub fn status(&self) -> Result<ControlStatus, ControlError> {
+            self.request("GET", "/api/v1/control/status")
+        }
+
+        pub fn start(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/start")
+        }
+
+        pub fn stop(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/stop")
+        }
+
+        pub fn restart(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/restart")
+        }
+
+        fn request(&self, method: &str, path: &str) -> Result<ControlStatus, ControlError> {
             let mut stream = UnixStream::connect(&self.endpoint).map_err(|_| ControlError::Io)?;
+            let request =
+                format!("{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n");
             stream
-                .write_all(b"GET /api/v1/control/status HTTP/1.1\r\nhost: localhost\r\n\r\n")
+                .write_all(request.as_bytes())
                 .map_err(|_| ControlError::Io)?;
             let mut response = Vec::new();
             stream
@@ -194,7 +260,7 @@ mod unix {
                 .ok_or(ControlError::InvalidHttp)?;
             let (head, body) = response.split_at(separator + 4);
             if !head.starts_with(b"HTTP/1.1 200") {
-                return Err(ControlError::InvalidHttp);
+                return Err(ControlError::CommandFailed);
             }
             serde_json::from_slice(body).map_err(|_| ControlError::InvalidHttp)
         }
@@ -209,7 +275,40 @@ pub struct ControlServer;
 
 #[cfg(not(unix))]
 impl ControlServer {
-    pub fn bind(_endpoint: ControlEndpoint, _status: ControlStatus) -> Result<Self, ControlError> {
+    pub fn bind(
+        _endpoint: ControlEndpoint,
+        _handler: std::sync::Arc<dyn ControlHandler>,
+    ) -> Result<Self, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
+    pub fn serve_once(&self) -> Result<(), ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+}
+
+#[cfg(not(unix))]
+pub struct ControlClient;
+
+#[cfg(not(unix))]
+impl ControlClient {
+    pub fn new(_endpoint: ControlEndpoint) -> Result<Self, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
+    pub fn status(&self) -> Result<ControlStatus, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
+    pub fn start(&self) -> Result<ControlStatus, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
+    pub fn stop(&self) -> Result<ControlStatus, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
+    pub fn restart(&self) -> Result<ControlStatus, ControlError> {
         Err(ControlError::UnsupportedEndpoint)
     }
 }
@@ -230,10 +329,11 @@ mod tests {
     #[cfg(unix)]
     use super::{ControlClient, ControlServer};
     use super::{
-        ControlEndpoint, ControlStatus, GatewayControlStatus, default_unix_socket,
-        is_local_endpoint,
+        ControlEndpoint, ControlStatus, GatewayControlStatus, StaticControlHandler,
+        default_unix_socket, is_local_endpoint,
     };
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn status() -> ControlStatus {
         ControlStatus {
@@ -260,10 +360,18 @@ mod tests {
             std::env::temp_dir().join(format!("cmclient-control-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("temporary directory should exist");
         let endpoint = default_unix_socket(&directory);
-        let server = ControlServer::bind(endpoint.clone(), status()).expect("server should bind");
-        let server_thread = std::thread::spawn(move || server.serve_once());
+        let server = ControlServer::bind(
+            endpoint.clone(),
+            Arc::new(StaticControlHandler::new(status())),
+        )
+        .expect("server should bind");
+        let server_thread = std::thread::spawn(move || {
+            server.serve_once()?;
+            server.serve_once()
+        });
         let client = ControlClient::new(endpoint).expect("client should initialize");
         assert_eq!(client.status().expect("status should load"), status());
+        assert_eq!(client.start().expect("start should load"), status());
         server_thread
             .join()
             .expect("server thread should join")
