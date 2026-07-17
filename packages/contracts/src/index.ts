@@ -25,4 +25,5 @@ export interface JobSummary {
   updatedAt: string;
 }
 
+export * from "./events.js";
 export * from "./system.js";

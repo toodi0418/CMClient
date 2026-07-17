@@ -16,8 +16,17 @@ import {
   defaultGatewaySystemState,
   type GatewaySystemState,
 } from "./system.js";
+import {
+  DomainEventBus,
+  formatSseEvent,
+  formatSseHeartbeat,
+} from "./events.js";
 
 declare module "fastify" {
+  interface FastifyInstance {
+    eventBus: DomainEventBus;
+  }
+
   interface FastifyRequest {
     correlationId?: string;
     traceId: string;
@@ -27,6 +36,10 @@ declare module "fastify" {
 export interface GatewayListenOptions {
   host: string;
   port: number;
+}
+
+export interface GatewaySseOptions {
+  heartbeatIntervalMs?: number;
 }
 
 export class GatewayConfigurationError extends Error {
@@ -93,8 +106,15 @@ export class GatewayRuntime {
 export function createGatewayApp(
   logger: StructuredLogger = new ConsoleStructuredLogger(),
   system: GatewaySystemState = defaultGatewaySystemState(),
+  eventBus: DomainEventBus = new DomainEventBus(),
+  sseOptions: GatewaySseOptions = {},
 ): FastifyInstance {
+  const heartbeatIntervalMs = sseOptions.heartbeatIntervalMs ?? 15_000;
+  if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
+    throw new GatewayConfigurationError();
+  }
   const app = Fastify({ logger: false });
+  app.decorate("eventBus", eventBus);
   app.decorateRequest("traceId", "");
   app.addHook("onRequest", (request, reply, done) => {
     request.traceId = resolveTraceId(request.headers["x-trace-id"]);
@@ -162,9 +182,87 @@ export function createGatewayApp(
     },
     async () => ({ health: "ok", build: system.build }),
   );
+  app.get("/api/v1/events", (request, reply) => {
+    reply.hijack();
+    const response = reply.raw;
+    const replay = eventBus.replayAfter(
+      parseLastEventId(request.headers["last-event-id"]),
+    );
+    let closed = false;
+    const session: {
+      heartbeat?: NodeJS.Timeout;
+      unsubscribe?: () => void;
+    } = {};
+
+    const close = (reason: string): void => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (session.heartbeat) {
+        clearInterval(session.heartbeat);
+      }
+      session.unsubscribe?.();
+      logger.log({
+        level: reason === "SSE_SLOW_CONSUMER" ? "warn" : "info",
+        message: "gateway.sse_client_closed",
+        traceId: request.traceId || createTraceId(),
+        ...(request.correlationId
+          ? { correlationId: request.correlationId }
+          : {}),
+        fields: { reason },
+      });
+      if (!response.destroyed && !response.writableEnded) {
+        response.end();
+      }
+    };
+    const send = (message: string): boolean => {
+      if (closed || response.destroyed || response.writableEnded) {
+        return false;
+      }
+      if (!response.write(message)) {
+        close("SSE_SLOW_CONSUMER");
+        return false;
+      }
+      return true;
+    };
+
+    response.once("close", () => close("SSE_CLIENT_DISCONNECTED"));
+    response.once("error", () => close("SSE_CLIENT_ERROR"));
+    response.writeHead(200, {
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "content-type": "text/event-stream; charset=utf-8",
+      "x-accel-buffering": "no",
+    });
+    response.flushHeaders();
+    session.unsubscribe = eventBus.subscribe((event) => {
+      send(formatSseEvent(event));
+    });
+    for (const event of replay) {
+      if (!send(formatSseEvent(event))) {
+        return;
+      }
+    }
+    if (!send(formatSseHeartbeat())) {
+      return;
+    }
+    session.heartbeat = setInterval(() => {
+      send(formatSseHeartbeat());
+    }, heartbeatIntervalMs);
+    session.heartbeat.unref();
+  });
   return app;
 }
 
 function isLoopbackHost(host: string): boolean {
   return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
+function parseLastEventId(
+  value: string | string[] | undefined,
+): string | undefined {
+  return typeof value === "string" && /^[a-zA-Z0-9-]{1,128}$/.test(value)
+    ? value
+    : undefined;
 }

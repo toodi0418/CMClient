@@ -1,3 +1,5 @@
+import { request, type IncomingMessage } from "node:http";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -7,6 +9,7 @@ import {
   parseGatewayListenOptions,
 } from "./app";
 import { MemoryLogger, redact } from "./observability";
+import { DomainEventBus } from "./events";
 
 describe("GatewayRuntime", () => {
   it("fails closed for a non-loopback bind", () => {
@@ -58,6 +61,42 @@ describe("GatewayRuntime", () => {
     await app.close();
   });
 
+  it("replays SSE events after Last-Event-ID and starts a heartbeat stream", async () => {
+    let sequence = 0;
+    const events = new DomainEventBus({
+      eventIdFactory: () => `event-${++sequence}`,
+    });
+    const first = events.publish({
+      type: "gateway.started",
+      source: "gateway",
+      payload: {},
+    });
+    const second = events.publish({
+      type: "gateway.ready",
+      source: "gateway",
+      payload: { port: 4810 },
+    });
+    const app = createGatewayApp(new MemoryLogger(), undefined, events);
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Gateway did not bind a TCP address");
+    }
+
+    const stream = await openSse(address.port, first.eventId);
+    try {
+      const body = await readUntil(stream.response, `id: ${second.eventId}`);
+      expect(body).toContain(": heartbeat\n\n");
+      expect(body).not.toContain(`id: ${first.eventId}`);
+      expect(body).toContain(`id: ${second.eventId}`);
+      expect(body).toContain("event: gateway.ready");
+    } finally {
+      stream.request.destroy();
+      stream.response.destroy();
+      await app.close();
+    }
+  });
+
   it("listens and closes gracefully", async () => {
     const runtime = new GatewayRuntime({ host: "127.0.0.1", port: 0 });
     let closed = false;
@@ -73,3 +112,36 @@ describe("GatewayRuntime", () => {
     expect(runtime.app.server.listening).toBe(false);
   });
 });
+
+function openSse(
+  port: number,
+  lastEventId: string,
+): Promise<{ request: ReturnType<typeof request>; response: IncomingMessage }> {
+  return new Promise((resolve, reject) => {
+    const client = request({
+      host: "127.0.0.1",
+      port,
+      path: "/api/v1/events",
+      headers: { "last-event-id": lastEventId },
+    });
+    client.once("response", (response) =>
+      resolve({ request: client, response }),
+    );
+    client.once("error", reject);
+    client.end();
+  });
+}
+
+function readUntil(response: IncomingMessage, needle: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    response.setEncoding("utf8");
+    response.on("data", (chunk: string) => {
+      body += chunk;
+      if (body.includes(needle)) {
+        resolve(body);
+      }
+    });
+    response.once("error", reject);
+  });
+}

@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import { TypeCompiler } from "@sinclair/typebox/compiler";
 
-import { JOB_STATUSES, SystemCapabilitiesSchema } from "./index";
+import {
+  DomainEventSchema,
+  JOB_STATUSES,
+  SystemCapabilitiesSchema,
+} from "./index";
 
 describe("job contracts", () => {
   it("includes terminal rollback states", () => {
@@ -47,6 +51,32 @@ describe("system capabilities contract", () => {
           autoStart: { available: true },
           docker: { available: true },
         },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("domain event contract", () => {
+  it("requires the versioned SSE envelope fields", () => {
+    const check = TypeCompiler.Compile(DomainEventSchema);
+    expect(
+      check.Check({
+        eventId: "event-1",
+        schemaVersion: 1,
+        type: "gateway.ready",
+        occurredAt: "2026-07-18T00:00:00.000Z",
+        source: "gateway",
+        payload: { port: 4810 },
+      }),
+    ).toBe(true);
+    expect(
+      check.Check({
+        eventId: "event-1",
+        schemaVersion: 1,
+        type: "invalid event",
+        occurredAt: "2026-07-18T00:00:00.000Z",
+        source: "gateway",
+        payload: {},
       }),
     ).toBe(false);
   });
