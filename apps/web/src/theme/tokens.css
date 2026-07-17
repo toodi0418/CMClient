@@ -1,0 +1,50 @@
+:root {
+  color-scheme: dark;
+  --cm-canvas: #151817;
+  --cm-surface: #1a1e1c;
+  --cm-surface-raised: #1d211f;
+  --cm-surface-interactive: #252b28;
+  --cm-surface-selected: #2a312d;
+  --cm-surface-panel: #1c211e;
+  --cm-surface-strip: #202622;
+  --cm-grid: #232a27;
+  --cm-border: #3a423e;
+  --cm-border-strong: #52605a;
+  --cm-border-panel: #49544d;
+  --cm-border-divider: #3b4640;
+  --cm-border-section: #4b5750;
+  --cm-text: #f2f3ee;
+  --cm-text-muted: #91a39a;
+  --cm-text-secondary: #acb8b0;
+  --cm-text-strong: #e7eee8;
+  --cm-text-panel: #a4b0a8;
+  --cm-text-metric: #d9e2da;
+  --cm-on-accent: #17201b;
+  --cm-accent: #8dd1a8;
+  --cm-accent-strong: #83c6a0;
+  --cm-warning: #e3ad64;
+  --cm-danger: #e68176;
+  --cm-focus-ring: #b7e9c9;
+  --cm-accent-ring: #254434;
+  --cm-warning-ring: #4a3925;
+  --cm-danger-ring: #4b2e2d;
+  --cm-control-radius: 0.375rem;
+}
+
+@theme inline {
+  --color-cm-canvas: var(--cm-canvas);
+  --color-cm-surface: var(--cm-surface);
+  --color-cm-surface-raised: var(--cm-surface-raised);
+  --color-cm-surface-interactive: var(--cm-surface-interactive);
+  --color-cm-surface-selected: var(--cm-surface-selected);
+  --color-cm-border: var(--cm-border);
+  --color-cm-border-strong: var(--cm-border-strong);
+  --color-cm-text: var(--cm-text);
+  --color-cm-text-muted: var(--cm-text-muted);
+  --color-cm-text-secondary: var(--cm-text-secondary);
+  --color-cm-accent: var(--cm-accent);
+  --color-cm-warning: var(--cm-warning);
+  --color-cm-danger: var(--cm-danger);
+  --font-sans: "Avenir Next", "Helvetica Neue", sans-serif;
+  --radius-control: var(--cm-control-radius);
+}

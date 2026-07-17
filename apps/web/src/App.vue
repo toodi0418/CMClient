@@ -1,5 +1,22 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import {
+  Gauge,
+  LayoutDashboard,
+  MapPinned,
+  Menu,
+  MessageSquareText,
+  Network,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Radio,
+  Satellite,
+  ScrollText,
+  Server,
+  Settings,
+  Stethoscope,
+} from "@lucide/vue";
+import Button from "primevue/button";
 import { RouterLink, RouterView, useRoute } from "vue-router";
 
 import { useShellStore } from "@/stores/shell";
@@ -8,44 +25,50 @@ const shell = useShellStore();
 const route = useRoute();
 
 const primaryNavigation = [
-  { label: "Overview", to: "/", mark: "OV" },
-  { label: "System", to: "/system", mark: "SY" },
-  { label: "Meshtastic", to: "/meshtastic", mark: "ME" },
-  { label: "Nodes", to: "/nodes", mark: "ND" },
-  { label: "Positions", to: "/positions", mark: "PO" },
-  { label: "Messages", to: "/messages", mark: "MS" },
-  { label: "Telemetry", to: "/telemetry", mark: "TE" },
-  { label: "APRS", to: "/aprs", mark: "AP" },
+  { label: "Overview", to: "/", icon: LayoutDashboard },
+  { label: "System", to: "/system", icon: Server },
+  { label: "Meshtastic", to: "/meshtastic", icon: Radio },
+  { label: "Nodes", to: "/nodes", icon: Network },
+  { label: "Positions", to: "/positions", icon: MapPinned },
+  { label: "Messages", to: "/messages", icon: MessageSquareText },
+  { label: "Telemetry", to: "/telemetry", icon: Gauge },
+  { label: "APRS", to: "/aprs", icon: Satellite },
 ];
 
 const supportNavigation = [
-  { label: "Logs", to: "/logs", mark: "LG" },
-  { label: "Settings", to: "/settings", mark: "ST" },
-  { label: "Diagnostics", to: "/diagnostics", mark: "DG" },
+  { label: "Logs", to: "/logs", icon: ScrollText },
+  { label: "Settings", to: "/settings", icon: Settings },
+  { label: "Diagnostics", to: "/diagnostics", icon: Stethoscope },
 ];
 
 const pageLabel = computed(
   () => (route.meta.label as string | undefined) ?? "CMClient",
 );
+
+const railToggleIcon = computed(() =>
+  shell.desktopRailCollapsed ? PanelLeftOpen : PanelLeftClose,
+);
 </script>
 
 <template>
   <div
-    class="console-shell"
+    class="console-shell min-h-screen font-sans"
     :class="{
       'is-rail-collapsed': shell.desktopRailCollapsed,
       'is-mobile-nav-open': shell.mobileNavigationOpen,
     }"
   >
     <header class="topbar">
-      <button
+      <Button
+        unstyled
         class="brand-mark"
         type="button"
         aria-label="切換導覽列"
+        title="切換導覽列"
         @click="shell.toggleDesktopRail"
       >
-        <span>CM</span>
-      </button>
+        <component :is="railToggleIcon" :size="18" aria-hidden="true" />
+      </Button>
       <div class="product-name">
         <span>CMCLIENT</span>
         <small>CONTROL PLANE</small>
@@ -55,14 +78,16 @@ const pageLabel = computed(
         <span class="status-pip" aria-hidden="true" />
         <span>{{ shell.gatewayAvailability }}</span>
       </div>
-      <button
+      <Button
+        unstyled
         class="mobile-menu"
         type="button"
         aria-label="開啟導覽"
+        title="開啟導覽"
         @click="shell.toggleMobileNavigation"
       >
-        <span class="mobile-menu__bars" aria-hidden="true" />
-      </button>
+        <Menu :size="19" aria-hidden="true" />
+      </Button>
     </header>
 
     <aside class="side-rail" aria-label="主要導覽">
@@ -74,9 +99,12 @@ const pageLabel = computed(
           class="navigation-link"
           @click="shell.closeMobileNavigation"
         >
-          <span class="navigation-mark" aria-hidden="true">{{
-            item.mark
-          }}</span>
+          <component
+            :is="item.icon"
+            class="navigation-icon"
+            :size="17"
+            aria-hidden="true"
+          />
           <span class="navigation-label">{{ item.label }}</span>
         </RouterLink>
       </nav>
@@ -92,9 +120,12 @@ const pageLabel = computed(
           class="navigation-link"
           @click="shell.closeMobileNavigation"
         >
-          <span class="navigation-mark" aria-hidden="true">{{
-            item.mark
-          }}</span>
+          <component
+            :is="item.icon"
+            class="navigation-icon"
+            :size="17"
+            aria-hidden="true"
+          />
           <span class="navigation-label">{{ item.label }}</span>
         </RouterLink>
       </nav>

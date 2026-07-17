@@ -22,3 +22,13 @@ Gateway data and commands will enter through shared HTTP/SSE clients in the
 later P06 API client slice. The Vite development listener remains loopback-only
 and defaults to `127.0.0.1:5174`; the shipped static bundle is served by the
 Agent listener above.
+
+The shell uses Tailwind 4 through the Vite integration and maps its `cm-*`
+utility names to semantic CSS variables in `apps/web/src/theme/tokens.css`.
+Those tokens identify canvas, surfaces, content, accent, warning, danger and
+focus states instead of binding components to raw colours. PrimeVue is
+registered with the Aura preset and a `.cm-dark` selector so the P06 theme
+controller can synchronise PrimeVue with the same token vocabulary. The shell
+uses PrimeVue's unstyled button primitive where custom control treatment is
+needed and Lucide icons for navigation; controls keep a 44px minimum target in
+desktop, collapsed-rail and mobile-drawer layouts.

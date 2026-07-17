@@ -3,3 +3,5 @@ packages:
   - packages/*
 allowBuilds:
   '@serialport/bindings-cpp': true
+minimumReleaseAgeExclude:
+  - '@lucide/vue@1.25.0'
