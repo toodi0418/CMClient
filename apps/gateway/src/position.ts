@@ -224,7 +224,11 @@ export class PositionHighWaterStore {
         event.nodeNum,
         target,
       );
-      const plan = decidePositionOrder(current, event);
+      const plan: PositionOrderPlan = this.isBacklogObservation(
+        event.sourceObservationId,
+      )
+        ? { advance: false, code: "POSITION_BACKLOG" as const }
+        : decidePositionOrder(current, event);
       const eventWithEpoch =
         plan.sequenceEpoch === undefined
           ? event
@@ -260,6 +264,22 @@ export class PositionHighWaterStore {
       )
       .get(meshNetworkId, nodeNum, target.callsign, target.mappingVersion);
     return row ? toNodePositionState(row) : undefined;
+  }
+
+  private isBacklogObservation(observationId: string): boolean {
+    const row = this.database
+      .prepare(
+        "SELECT backlog_classification FROM position_observations WHERE id = ?",
+      )
+      .get(observationId);
+    if (!row) {
+      throw new PositionPersistenceError();
+    }
+    const classification = String(row.backlog_classification);
+    if (!["backlog", "live", "unknown"].includes(classification)) {
+      throw new PositionPersistenceError();
+    }
+    return classification === "backlog";
   }
 
   private assignSequenceEpoch(
