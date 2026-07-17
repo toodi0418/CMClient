@@ -11,6 +11,10 @@ import {
   MeshObservationSchema,
   MeshTelemetrySchema,
   NormalizedFromRadioSchema,
+  NodePositionStateSchema,
+  PositionCanonicalEventSchema,
+  PositionDecisionSchema,
+  PositionObservationSchema,
   SystemCapabilitiesSchema,
   SanitizedPacketFixtureSetSchema,
   TransportConnectionStateSchema,
@@ -237,6 +241,83 @@ describe("packet recording contract", () => {
             normalizedFromRadio: { schemaVersion: 1, kind: "other" },
           },
         ],
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("position domain contracts", () => {
+  it("keeps local observations, canonical events, decisions, and high-water state separate", () => {
+    const observation = TypeCompiler.Compile(PositionObservationSchema);
+    const event = TypeCompiler.Compile(PositionCanonicalEventSchema);
+    const decision = TypeCompiler.Compile(PositionDecisionSchema);
+    const state = TypeCompiler.Compile(NodePositionStateSchema);
+    const position = {
+      latitudeI: 250000000,
+      longitudeI: 1215000000,
+      precisionBits: 32,
+      positionTimestampSeconds: 1784332800,
+      sequenceNumber: 9,
+    };
+    expect(
+      observation.Check({
+        schemaVersion: 1,
+        id: "position-observation-1",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        meshObservationId: "mesh-observation-1",
+        gatewayId: "fixture-gateway-a",
+        transport: "tcp",
+        sessionConnectedAt: "2026-07-18T00:00:00.000Z",
+        ingestedAt: "2026-07-18T00:00:01.000Z",
+        serverIngestedAt: "2026-07-18T00:00:01.005Z",
+        backlogClassification: "live",
+        payloadHash: "a".repeat(64),
+        position,
+      }),
+    ).toBe(true);
+    expect(
+      event.Check({
+        schemaVersion: 1,
+        id: "position-event-1",
+        canonicalKey: "canonical-key-1",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        sourceObservationId: "position-observation-1",
+        payloadHash: "a".repeat(64),
+        eventTime: "2026-07-18T00:00:00.000Z",
+        eventTimeSource: "position_timestamp",
+        sequenceEpoch: 1,
+        sequenceNumber: 9,
+        position,
+        createdAt: "2026-07-18T00:00:01.005Z",
+      }),
+    ).toBe(true);
+    expect(
+      decision.Check({
+        schemaVersion: 1,
+        id: "position-decision-1",
+        observationId: "position-observation-1",
+        canonicalEventId: "position-event-1",
+        code: "POSITION_ACCEPTED",
+        decidedAt: "2026-07-18T00:00:01.006Z",
+        parameters: { source: "position_timestamp" },
+      }),
+    ).toBe(true);
+    expect(
+      state.Check({
+        schemaVersion: 1,
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        callsign: "N0CALL-7",
+        mappingVersion: "mapping-v1",
+        latestCanonicalEventId: "position-event-1",
+        latestEventTime: "2026-07-18T00:00:00.000Z",
+        latestSequenceEpoch: 1,
+        latestSequenceNumber: 9,
+        latestLatitudeI: 250000000,
+        latestLongitudeI: 1215000000,
+        updatedAt: "2026-07-18T00:00:01.006Z",
       }),
     ).toBe(true);
   });

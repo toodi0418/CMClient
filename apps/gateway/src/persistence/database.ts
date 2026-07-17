@@ -727,4 +727,31 @@ const defaultMigrations: Migration[] = [
       );
     },
   },
+  {
+    version: 5,
+    name: "position_domain_records",
+    up(database) {
+      database.exec(
+        "CREATE TABLE position_observations (id TEXT PRIMARY KEY, mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), mesh_observation_id TEXT NOT NULL REFERENCES mesh_observations(id), gateway_id TEXT NOT NULL, transport TEXT NOT NULL CHECK (transport IN ('tcp', 'serial', 'simulator')), session_connected_at TEXT NOT NULL, ingested_at TEXT NOT NULL, server_ingested_at TEXT NOT NULL, device_rx_time_seconds INTEGER CHECK (device_rx_time_seconds IS NULL OR (device_rx_time_seconds >= 0 AND device_rx_time_seconds <= 4294967295)), backlog_classification TEXT NOT NULL CHECK (backlog_classification IN ('backlog', 'live', 'unknown')), packet_id INTEGER CHECK (packet_id IS NULL OR (packet_id >= 0 AND packet_id <= 4294967295)), payload_hash TEXT NOT NULL, via_mqtt INTEGER CHECK (via_mqtt IS NULL OR via_mqtt IN (0, 1)), rx_snr REAL, rx_rssi INTEGER, hop_limit INTEGER CHECK (hop_limit IS NULL OR hop_limit >= 0), hop_start INTEGER CHECK (hop_start IS NULL OR hop_start >= 0), position TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+      );
+      database.exec(
+        "CREATE INDEX position_observations_network_node_ingested_at_index ON position_observations (mesh_network_id, node_num, ingested_at DESC)",
+      );
+      database.exec(
+        "CREATE TABLE position_events (id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL UNIQUE, mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), source_observation_id TEXT NOT NULL REFERENCES position_observations(id), payload_hash TEXT NOT NULL, event_time TEXT, event_time_source TEXT CHECK (event_time_source IS NULL OR event_time_source IN ('position_timestamp', 'position_time', 'sequence')), sequence_epoch INTEGER CHECK (sequence_epoch IS NULL OR sequence_epoch >= 0), sequence_number INTEGER CHECK (sequence_number IS NULL OR (sequence_number >= 0 AND sequence_number <= 4294967295)), position TEXT NOT NULL, created_at TEXT NOT NULL)",
+      );
+      database.exec(
+        "CREATE INDEX position_events_network_node_event_time_index ON position_events (mesh_network_id, node_num, event_time DESC)",
+      );
+      database.exec(
+        "CREATE TABLE position_decisions (id TEXT PRIMARY KEY, observation_id TEXT NOT NULL REFERENCES position_observations(id), canonical_event_id TEXT REFERENCES position_events(id), code TEXT NOT NULL, decided_at TEXT NOT NULL, parameters TEXT NOT NULL)",
+      );
+      database.exec(
+        "CREATE INDEX position_decisions_observation_decided_at_index ON position_decisions (observation_id, decided_at DESC)",
+      );
+      database.exec(
+        "CREATE TABLE node_position_state (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, mapping_version TEXT NOT NULL, latest_canonical_event_id TEXT REFERENCES position_events(id), latest_event_time TEXT, latest_sequence_epoch INTEGER CHECK (latest_sequence_epoch IS NULL OR latest_sequence_epoch >= 0), latest_sequence_number INTEGER CHECK (latest_sequence_number IS NULL OR (latest_sequence_number >= 0 AND latest_sequence_number <= 4294967295)), latest_latitude_i INTEGER, latest_longitude_i INTEGER, updated_at TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num, callsign, mapping_version))",
+      );
+    },
+  },
 ];
