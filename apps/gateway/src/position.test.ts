@@ -1,0 +1,143 @@
+import { describe, expect, it } from "vitest";
+
+import type { PositionObservation } from "@cmclient/contracts";
+
+import { createMeshObservation } from "./observations";
+import {
+  PositionDuplicateDetector,
+  PositionRepository,
+  createCanonicalPositionEvent,
+} from "./position";
+import { GatewayDatabase } from "./persistence/database";
+
+describe("canonical position identity", () => {
+  it("excludes gateway observation metadata but includes payload hash", () => {
+    const first = positionObservation("position-observation-a");
+    const sameEventDifferentGateway: PositionObservation = {
+      ...first,
+      id: "position-observation-b",
+      meshObservationId: "mesh-observation-b",
+      gatewayId: "fixture-gateway-b",
+      ingestedAt: "2026-07-18T00:00:07.000Z",
+      serverIngestedAt: "2026-07-18T00:00:07.005Z",
+      packetId: 1002,
+      rxRssi: -95,
+    };
+    const reusedPacketIdDifferentPayload: PositionObservation = {
+      ...sameEventDifferentGateway,
+      id: "position-observation-c",
+      meshObservationId: "mesh-observation-c",
+      payloadHash: "b".repeat(64),
+    };
+
+    const firstEvent = createCanonicalPositionEvent(first).event;
+    expect(
+      createCanonicalPositionEvent(sameEventDifferentGateway).event,
+    ).toMatchObject({
+      id: firstEvent.id,
+      canonicalKey: firstEvent.canonicalKey,
+    });
+    expect(
+      createCanonicalPositionEvent(reusedPacketIdDifferentPayload).event,
+    ).not.toMatchObject({
+      canonicalKey: firstEvent.canonicalKey,
+    });
+  });
+});
+
+describe("PositionDuplicateDetector", () => {
+  it("persists one canonical event and records duplicate decisions against it", () => {
+    const database = new GatewayDatabase(":memory:");
+    const first = positionObservation("position-observation-a");
+    const duplicate: PositionObservation = {
+      ...first,
+      id: "position-observation-b",
+      meshObservationId: "mesh-observation-b",
+      gatewayId: "fixture-gateway-b",
+      ingestedAt: "2026-07-18T00:00:07.000Z",
+      serverIngestedAt: "2026-07-18T00:00:07.005Z",
+      packetId: 1002,
+    };
+    const packetReuse: PositionObservation = {
+      ...duplicate,
+      id: "position-observation-c",
+      meshObservationId: "mesh-observation-c",
+      payloadHash: "b".repeat(64),
+    };
+    for (const observation of [first, duplicate, packetReuse]) {
+      database.meshObservations.insert(
+        meshObservation(observation.meshObservationId),
+      );
+    }
+    const detector = new PositionDuplicateDetector(
+      new PositionRepository(database.connection),
+    );
+
+    const firstResult = detector.observe(first);
+    const duplicateResult = detector.observe(duplicate);
+    const reuseResult = detector.observe(packetReuse);
+
+    expect(firstResult).toMatchObject({
+      kind: "new",
+      event: { sourceObservationId: first.id },
+    });
+    expect(duplicateResult).toMatchObject({
+      kind: "duplicate",
+      event: { sourceObservationId: first.id },
+      decision: {
+        observationId: duplicate.id,
+        code: "POSITION_DUPLICATE",
+      },
+    });
+    expect(reuseResult).toMatchObject({
+      kind: "new",
+      event: { sourceObservationId: packetReuse.id },
+    });
+    expect(
+      database.connection.prepare("SELECT * FROM position_events").all(),
+    ).toHaveLength(2);
+    expect(
+      database.connection.prepare("SELECT * FROM position_decisions").all(),
+    ).toHaveLength(1);
+    database.close();
+  });
+});
+
+function positionObservation(id: string): PositionObservation {
+  return {
+    schemaVersion: 1,
+    id,
+    meshNetworkId: "fixture-network",
+    nodeNum: 42,
+    meshObservationId: `mesh-${id}`,
+    gatewayId: "fixture-gateway-a",
+    transport: "tcp",
+    sessionConnectedAt: "2026-07-18T00:00:00.000Z",
+    ingestedAt: "2026-07-18T00:00:01.000Z",
+    serverIngestedAt: "2026-07-18T00:00:01.005Z",
+    deviceRxTimeSeconds: 1784332800,
+    backlogClassification: "live",
+    packetId: 1001,
+    payloadHash: "a".repeat(64),
+    rxRssi: -70,
+    position: {
+      latitudeI: 250000000,
+      longitudeI: 1215000000,
+      altitudeMslMeters: 0,
+      positionTimestampSeconds: 1784332800,
+      sequenceNumber: 9,
+      precisionBits: 32,
+    },
+  };
+}
+
+function meshObservation(id: string) {
+  return createMeshObservation({
+    id,
+    transport: "tcp",
+    sessionConnectedAt: "2026-07-18T00:00:00.000Z",
+    ingestedAt: "2026-07-18T00:00:01.000Z",
+    serverIngestedAt: "2026-07-18T00:00:01.005Z",
+    normalizedFromRadio: { schemaVersion: 1, kind: "other" },
+  });
+}

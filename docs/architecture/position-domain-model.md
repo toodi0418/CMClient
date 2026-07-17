@@ -20,3 +20,12 @@ SQLite stores observations, events, decisions, and node state in independent
 tables. Later P05 slices fill canonical identity, sequence epochs, validation,
 and transactional high-water updates. An older event may remain historical but
 must not replace a state row's latest canonical event or drive APRS upload.
+
+Canonical identity is SHA-256 over an explicit version marker, Mesh network,
+node number, selected source-time representation, sequence, complete decoded
+position sample, and payload hash. It excludes packet ID, Gateway ID, RSSI,
+SNR, transport, and every local observation timestamp. Therefore the same RF
+event observed by multiple iGates converges to one canonical key, while packet
+ID reuse with changed payload content produces a separate event. SQLite's
+unique canonical key records the first event and writes `POSITION_DUPLICATE`
+for later local observations without replacing the source event.
