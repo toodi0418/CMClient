@@ -1,3 +1,4 @@
+use cmclient_agent_core::web::{ManagementWebConfig, ManagementWebListener};
 use cmclient_agent_core::{AgentConfig, AgentLease, ensure_runtime_directories};
 use cmclient_control_api::{
     ControlCommand, ControlEndpoint, ControlError, ControlHandler, ControlServer, ControlStatus,
@@ -113,6 +114,7 @@ fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
         Some("--serve") => serve(),
+        Some("--serve-web-once") => serve_web_once(),
         None | Some("--check-config") | Some("--check-instance") => match AgentConfig::load() {
             Ok(config) => {
                 if let Err(error) = ensure_runtime_directories(&config.paths) {
@@ -149,6 +151,34 @@ fn main() -> ExitCode {
             ExitCode::from(EX_USAGE)
         }
     }
+}
+
+fn serve_web_once() -> ExitCode {
+    let config = match AgentConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{}", error.code());
+            return ExitCode::from(EX_CONFIG);
+        }
+    };
+    let web_config = ManagementWebConfig {
+        enabled: config.management_web_enabled,
+        ..Default::default()
+    };
+    let listener = match ManagementWebListener::bind(&web_config) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("{}", error.code());
+            return ExitCode::from(EX_CONFIG);
+        }
+    };
+    listener.serve_once().map_or_else(
+        |error| {
+            eprintln!("{}", error.code());
+            ExitCode::from(EX_CONFIG)
+        },
+        |_| ExitCode::SUCCESS,
+    )
 }
 
 fn serve() -> ExitCode {

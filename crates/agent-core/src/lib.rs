@@ -1,5 +1,7 @@
 //! Shared Rust foundations for the CMClient Agent.
 
+pub mod web;
+
 use fs2::FileExt;
 use serde::Deserialize;
 use std::{
