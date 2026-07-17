@@ -3,6 +3,7 @@ version: "3.9"
 services:
   callmesh-client:
     container_name: callmesh-client
+    init: true
     image: callmesh-client:latest
     build:
       context: .
