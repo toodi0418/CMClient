@@ -7,12 +7,13 @@ import {
   SystemStatusSchema,
   type BuildMetadata,
   type ApiError,
+  type JobDetail,
   type SystemCapabilities,
   type SystemHealth,
   type SystemStatus,
 } from "@cmclient/contracts";
 import type { TSchema } from "@sinclair/typebox";
-import { TypeCompiler } from "@sinclair/typebox/compiler";
+import { Value } from "@sinclair/typebox/value";
 
 export const DEFAULT_GATEWAY_API_BASE_URL = "/api/v1";
 
@@ -110,16 +111,24 @@ export class GatewayApiClient {
   }
 
   readonly system = {
-    health: () => this.request("/system/health", SystemHealthSchema),
-    version: () => this.request("/system/version", BuildMetadataSchema),
+    health: () =>
+      this.request<SystemHealth>("/system/health", SystemHealthSchema),
+    version: () =>
+      this.request<BuildMetadata>("/system/version", BuildMetadataSchema),
     capabilities: () =>
-      this.request("/system/capabilities", SystemCapabilitiesSchema),
-    status: () => this.request("/system/status", SystemStatusSchema),
+      this.request<SystemCapabilities>(
+        "/system/capabilities",
+        SystemCapabilitiesSchema,
+      ),
+    status: () =>
+      this.request<SystemStatus>("/system/status", SystemStatusSchema),
   };
 
   readonly jobs = {
-    get: (jobId: string) => this.requestJob(jobId, "GET", JobDetailSchema),
-    cancel: (jobId: string) => this.requestJob(jobId, "POST", JobDetailSchema),
+    get: (jobId: string) =>
+      this.requestJob<JobDetail>(jobId, "GET", JobDetailSchema),
+    cancel: (jobId: string) =>
+      this.requestJob<JobDetail>(jobId, "POST", JobDetailSchema),
   };
 
   private async request<T>(
@@ -249,16 +258,6 @@ function isLooseStableError(payload: unknown): payload is {
   );
 }
 
-const schemaValidators = new WeakMap<
-  TSchema,
-  ReturnType<typeof TypeCompiler.Compile>
->();
-
 function checkSchema(schema: TSchema, value: unknown): boolean {
-  let validator = schemaValidators.get(schema);
-  if (!validator) {
-    validator = TypeCompiler.Compile(schema);
-    schemaValidators.set(schema, validator);
-  }
-  return validator.Check(value);
+  return Value.Check(schema, value);
 }

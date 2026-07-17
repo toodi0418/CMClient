@@ -10,6 +10,9 @@
     "typecheck": "vue-tsc --noEmit --project tsconfig.json"
   },
   "dependencies": {
+    "@cmclient/api-client": "workspace:*",
+    "@cmclient/contracts": "workspace:*",
+    "@cmclient/event-client": "workspace:*",
     "@lucide/vue": "^1.25.0",
     "@primeuix/themes": "^1.2.5",
     "@tailwindcss/vite": "^4.3.3",

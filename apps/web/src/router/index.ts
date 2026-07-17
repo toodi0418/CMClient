@@ -5,8 +5,6 @@ import {
 } from "vue-router";
 
 const sections = [
-  ["system", "navigation.system", "section.system"],
-  ["meshtastic", "navigation.meshtastic", "section.meshtastic"],
   ["nodes", "navigation.nodes", "section.nodes"],
   ["positions", "navigation.positions", "section.positions"],
   ["messages", "navigation.messages", "section.messages"],
@@ -26,6 +24,18 @@ export const router = createRouter({
       name: "overview",
       component: () => import("@/views/OverviewView.vue"),
       meta: { labelKey: "navigation.overview", group: "control" },
+    },
+    {
+      path: "/system",
+      name: "system",
+      component: () => import("@/views/SystemView.vue"),
+      meta: { labelKey: "navigation.system", group: "operations" },
+    },
+    {
+      path: "/meshtastic",
+      name: "meshtastic",
+      component: () => import("@/views/MeshtasticView.vue"),
+      meta: { labelKey: "navigation.meshtastic", group: "operations" },
     },
     ...sections.map(([name, labelKey, summaryKey]) => ({
       path: `/${name}`,

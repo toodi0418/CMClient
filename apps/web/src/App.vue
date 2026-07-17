@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, watch } from "vue";
 import {
   Gauge,
   LayoutDashboard,
@@ -25,10 +25,12 @@ import { RouterLink, RouterView, useRoute } from "vue-router";
 import { useI18n } from "vue-i18n";
 
 import { isSupportedLocale, type ThemePreference } from "@/preferences";
+import { useGatewayStore } from "@/stores/gateway";
 import { usePreferencesStore } from "@/stores/preferences";
 import { useShellStore } from "@/stores/shell";
 
 const shell = useShellStore();
+const gateway = useGatewayStore();
 const preferences = usePreferencesStore();
 const route = useRoute();
 const { t } = useI18n();
@@ -81,6 +83,12 @@ const gatewayLabel = computed(() => t(`gateway.${shell.gatewayAvailability}`));
 
 const railToggleIcon = computed(() =>
   shell.desktopRailCollapsed ? PanelLeftOpen : PanelLeftClose,
+);
+
+watch(
+  () => gateway.availability,
+  (availability) => shell.setGatewayAvailability(availability),
+  { immediate: true },
 );
 
 function setLocale(event: Event) {

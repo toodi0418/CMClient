@@ -5,10 +5,9 @@ import {
   mapGatewayResponseError,
 } from "@cmclient/api-client";
 import { DomainEventSchema, type DomainEvent } from "@cmclient/contracts";
-import { TypeCompiler } from "@sinclair/typebox/compiler";
+import { Value } from "@sinclair/typebox/value";
 
 export const DEFAULT_GATEWAY_EVENTS_URL = "/api/v1/events";
-const domainEventValidator = TypeCompiler.Compile(DomainEventSchema);
 
 export type SseConnectionState =
   "idle" | "connecting" | "open" | "reconnecting" | "stopped";
@@ -247,7 +246,7 @@ export class GatewayEventClient {
     } catch {
       throw new GatewayApiError({ code: "SSE_EVENT_INVALID" });
     }
-    if (!domainEventValidator.Check(payload)) {
+    if (!Value.Check(DomainEventSchema, payload)) {
       throw new GatewayApiError({ code: "SSE_EVENT_INVALID" });
     }
     const event = payload as DomainEvent;

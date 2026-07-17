@@ -28,6 +28,13 @@ Vite development listener remains loopback-only and defaults to
 `127.0.0.1:5174`; the shipped static bundle is served by the Agent listener
 above.
 
+The Web Gateway store owns the system status/capability projection and the SSE
+connection state. Dashboard, System, and Meshtastic consume that store instead
+of inventing local transport state. In particular, the Meshtastic page reports
+the Agent-provided serial capability and its stable reason code until a live
+transport status API exists; it does not fabricate a radio connection, node
+count, or telemetry value.
+
 The shell uses Tailwind 4 through the Vite integration and maps its `cm-*`
 utility names to semantic CSS variables in `apps/web/src/theme/tokens.css`.
 Those tokens identify canvas, surfaces, content, accent, warning, danger and

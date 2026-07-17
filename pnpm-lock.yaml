@@ -53,6 +53,15 @@ importers:
 
   apps/web:
     dependencies:
+      '@cmclient/api-client':
+        specifier: workspace:*
+        version: link:../../packages/api-client
+      '@cmclient/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@cmclient/event-client':
+        specifier: workspace:*
+        version: link:../../packages/event-client
       '@lucide/vue':
         specifier: ^1.25.0
         version: 1.25.0(vue@3.5.40(typescript@5.9.3))
