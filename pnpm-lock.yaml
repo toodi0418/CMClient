@@ -35,6 +35,9 @@ importers:
 
   apps/gateway:
     dependencies:
+      '@cmclient/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@sinclair/typebox':
         specifier: ^0.34.52
         version: 0.34.52

@@ -1,4 +1,9 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import { Type } from "@sinclair/typebox";
+import {
+  BuildMetadataSchema,
+  SystemCapabilitiesSchema,
+} from "@cmclient/contracts";
 
 import {
   ConsoleStructuredLogger,
@@ -7,6 +12,10 @@ import {
   resolveCorrelationId,
   resolveTraceId,
 } from "./observability.js";
+import {
+  defaultGatewaySystemState,
+  type GatewaySystemState,
+} from "./system.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -46,9 +55,13 @@ export class GatewayRuntime {
   private readonly options: GatewayListenOptions;
   private started = false;
 
-  constructor(options: GatewayListenOptions, logger?: StructuredLogger) {
+  constructor(
+    options: GatewayListenOptions,
+    logger?: StructuredLogger,
+    system?: GatewaySystemState,
+  ) {
     this.options = options;
-    this.app = createGatewayApp(logger);
+    this.app = createGatewayApp(logger, system);
   }
 
   async start(): Promise<GatewayListenOptions> {
@@ -79,6 +92,7 @@ export class GatewayRuntime {
 
 export function createGatewayApp(
   logger: StructuredLogger = new ConsoleStructuredLogger(),
+  system: GatewaySystemState = defaultGatewaySystemState(),
 ): FastifyInstance {
   const app = Fastify({ logger: false });
   app.decorateRequest("traceId", "");
@@ -109,6 +123,45 @@ export function createGatewayApp(
     });
     done();
   });
+  app.get(
+    "/api/v1/system/health",
+    {
+      schema: {
+        response: {
+          200: Type.Object({ status: Type.Literal("ok") }),
+        },
+      },
+    },
+    async () => ({ status: "ok" }),
+  );
+  app.get(
+    "/api/v1/system/version",
+    {
+      schema: { response: { 200: BuildMetadataSchema } },
+    },
+    async () => system.build,
+  );
+  app.get(
+    "/api/v1/system/capabilities",
+    {
+      schema: { response: { 200: SystemCapabilitiesSchema } },
+    },
+    async () => system.capabilities,
+  );
+  app.get(
+    "/api/v1/system/status",
+    {
+      schema: {
+        response: {
+          200: Type.Object({
+            health: Type.Literal("ok"),
+            build: BuildMetadataSchema,
+          }),
+        },
+      },
+    },
+    async () => ({ health: "ok", build: system.build }),
+  );
   return app;
 }
 

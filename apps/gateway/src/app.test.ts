@@ -37,6 +37,27 @@ describe("GatewayRuntime", () => {
     await app.close();
   });
 
+  it("serves schema-backed system endpoints", async () => {
+    const app = createGatewayApp(new MemoryLogger());
+    const [health, version, capabilities] = await Promise.all([
+      app.inject("/api/v1/system/health"),
+      app.inject("/api/v1/system/version"),
+      app.inject("/api/v1/system/capabilities"),
+    ]);
+    expect(health.json()).toEqual({ status: "ok" });
+    expect(version.json()).toMatchObject({
+      version: "2.0.0-dev.0",
+      channel: "dev",
+    });
+    expect(capabilities.json()).toMatchObject({
+      schemaVersion: 1,
+      capabilities: {
+        serial: { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
+      },
+    });
+    await app.close();
+  });
+
   it("listens and closes gracefully", async () => {
     const runtime = new GatewayRuntime({ host: "127.0.0.1", port: 0 });
     let closed = false;
