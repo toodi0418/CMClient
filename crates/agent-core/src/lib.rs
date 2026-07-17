@@ -1,14 +1,289 @@
 //! Shared Rust foundations for the CMClient Agent.
 
+use serde::Deserialize;
+use std::{
+    collections::BTreeMap,
+    env,
+    fmt::{Display, Formatter},
+    fs,
+    path::{Path, PathBuf},
+};
+
 /// Stable workspace identity for the Agent core boundary.
 pub const COMPONENT: &str = "agent-core";
 
+const APP_NAME: &str = "CMClient";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePaths {
+    pub data_dir: PathBuf,
+    pub config_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub log_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentConfig {
+    pub paths: RuntimePaths,
+    pub config_file: PathBuf,
+    pub gateway_command: Option<Vec<String>>,
+    pub management_web_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    HomeDirectoryUnavailable,
+    RelativePathOverride { name: &'static str },
+    ReadConfig { path: PathBuf },
+    InvalidConfig,
+    EmptyGatewayCommand,
+}
+
+impl ConfigError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::HomeDirectoryUnavailable => "AGENT_CONFIG_HOME_UNAVAILABLE",
+            Self::RelativePathOverride { .. } => "AGENT_CONFIG_PATH_NOT_ABSOLUTE",
+            Self::ReadConfig { .. } => "AGENT_CONFIG_READ_FAILED",
+            Self::InvalidConfig => "AGENT_CONFIG_INVALID",
+            Self::EmptyGatewayCommand => "AGENT_CONFIG_GATEWAY_COMMAND_EMPTY",
+        }
+    }
+}
+
+impl Display for ConfigError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    agent: Option<AgentSection>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSection {
+    gateway_command: Option<Vec<String>>,
+    management_web_enabled: Option<bool>,
+}
+
+impl AgentConfig {
+    pub fn load() -> Result<Self, ConfigError> {
+        let environment = env::vars().collect::<BTreeMap<_, _>>();
+        Self::from_environment(&environment)
+    }
+
+    pub fn from_environment(environment: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        let paths = RuntimePaths::from_environment(environment)?;
+        let config_file = path_override(
+            environment,
+            "CMCLIENT_AGENT_CONFIG",
+            paths.config_dir.join("agent.toml"),
+        )?;
+
+        let file_config = if config_file.exists() {
+            let contents =
+                fs::read_to_string(&config_file).map_err(|_| ConfigError::ReadConfig {
+                    path: config_file.clone(),
+                })?;
+            toml::from_str::<FileConfig>(&contents).map_err(|_| ConfigError::InvalidConfig)?
+        } else {
+            FileConfig::default()
+        };
+        let agent = file_config.agent.unwrap_or_default();
+        if agent.gateway_command.as_ref().is_some_and(|command| {
+            command.is_empty() || command.iter().any(|argument| argument.is_empty())
+        }) {
+            return Err(ConfigError::EmptyGatewayCommand);
+        }
+
+        Ok(Self {
+            paths,
+            config_file,
+            gateway_command: agent.gateway_command,
+            management_web_enabled: agent.management_web_enabled.unwrap_or(true),
+        })
+    }
+}
+
+impl RuntimePaths {
+    pub fn from_environment(environment: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        let home = home_directory(environment)?;
+        let (data_dir, config_dir, cache_dir) = if cfg!(target_os = "macos") {
+            let library = home.join("Library");
+            (
+                library.join("Application Support").join(APP_NAME),
+                library.join("Application Support").join(APP_NAME),
+                library.join("Caches").join(APP_NAME),
+            )
+        } else if cfg!(target_os = "windows") {
+            let app_data = environment
+                .get("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData").join("Roaming"));
+            let local_app_data = environment
+                .get("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData").join("Local"));
+            (
+                app_data.join(APP_NAME),
+                app_data.join(APP_NAME),
+                local_app_data.join(APP_NAME).join("cache"),
+            )
+        } else {
+            (
+                xdg_path(environment, "XDG_DATA_HOME", home.join(".local/share")).join("cmclient"),
+                xdg_path(environment, "XDG_CONFIG_HOME", home.join(".config")).join("cmclient"),
+                xdg_path(environment, "XDG_CACHE_HOME", home.join(".cache")).join("cmclient"),
+            )
+        };
+
+        let data_dir = path_override(environment, "CMCLIENT_DATA_DIR", data_dir)?;
+        let config_dir = path_override(environment, "CMCLIENT_CONFIG_DIR", config_dir)?;
+        let cache_dir = path_override(environment, "CMCLIENT_CACHE_DIR", cache_dir)?;
+        let log_dir = path_override(environment, "CMCLIENT_LOG_DIR", data_dir.join("logs"))?;
+
+        Ok(Self {
+            data_dir,
+            config_dir,
+            cache_dir,
+            log_dir,
+        })
+    }
+}
+
+fn home_directory(environment: &BTreeMap<String, String>) -> Result<PathBuf, ConfigError> {
+    environment
+        .get("HOME")
+        .or_else(|| environment.get("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or(ConfigError::HomeDirectoryUnavailable)
+}
+
+fn xdg_path(environment: &BTreeMap<String, String>, name: &str, fallback: PathBuf) -> PathBuf {
+    environment
+        .get(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or(fallback)
+}
+
+fn path_override(
+    environment: &BTreeMap<String, String>,
+    name: &'static str,
+    fallback: PathBuf,
+) -> Result<PathBuf, ConfigError> {
+    match environment.get(name) {
+        Some(value) if !value.trim().is_empty() => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(ConfigError::RelativePathOverride { name })
+            }
+        }
+        _ => Ok(fallback),
+    }
+}
+
+pub fn ensure_runtime_directories(paths: &RuntimePaths) -> Result<(), ConfigError> {
+    for path in [
+        &paths.data_dir,
+        &paths.config_dir,
+        &paths.cache_dir,
+        &paths.log_dir,
+    ] {
+        fs::create_dir_all(path).map_err(|_| ConfigError::ReadConfig { path: path.clone() })?;
+    }
+    Ok(())
+}
+
+pub fn is_config_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "agent.toml")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::COMPONENT;
+    use super::{AgentConfig, ConfigError, RuntimePaths, is_config_file};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
+
+    fn environment() -> BTreeMap<String, String> {
+        BTreeMap::from([(String::from("HOME"), String::from("/fixture/home"))])
+    }
 
     #[test]
-    fn exposes_its_component_identity() {
-        assert_eq!(COMPONENT, "agent-core");
+    fn uses_standard_platform_paths() {
+        let paths = RuntimePaths::from_environment(&environment()).expect("paths should load");
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                paths.data_dir,
+                PathBuf::from("/fixture/home/Library/Application Support/CMClient")
+            );
+            assert_eq!(
+                paths.config_dir,
+                PathBuf::from("/fixture/home/Library/Application Support/CMClient")
+            );
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(
+                paths.data_dir,
+                PathBuf::from("/fixture/home/AppData/Roaming/CMClient")
+            );
+        } else {
+            assert_eq!(
+                paths.data_dir,
+                PathBuf::from("/fixture/home/.local/share/cmclient")
+            );
+            assert_eq!(
+                paths.config_dir,
+                PathBuf::from("/fixture/home/.config/cmclient")
+            );
+        }
+        assert_eq!(paths.log_dir, paths.data_dir.join("logs"));
+    }
+
+    #[test]
+    fn rejects_relative_runtime_path_overrides() {
+        let mut environment = environment();
+        environment.insert(String::from("CMCLIENT_DATA_DIR"), String::from("relative"));
+        assert_eq!(
+            RuntimePaths::from_environment(&environment),
+            Err(ConfigError::RelativePathOverride {
+                name: "CMCLIENT_DATA_DIR"
+            })
+        );
+    }
+
+    #[test]
+    fn loads_a_strict_agent_file() {
+        let directory =
+            std::env::temp_dir().join(format!("cmclient-agent-core-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let config_file = directory.join("agent.toml");
+        fs::write(
+            &config_file,
+            "[agent]\ngateway_command = [\"gateway\", \"serve\"]\nmanagement_web_enabled = false\n",
+        )
+        .expect("configuration should be written");
+        let mut environment = environment();
+        environment.insert(
+            String::from("CMCLIENT_AGENT_CONFIG"),
+            config_file.display().to_string(),
+        );
+
+        let config =
+            AgentConfig::from_environment(&environment).expect("configuration should load");
+        assert_eq!(
+            config.gateway_command,
+            Some(vec![String::from("gateway"), String::from("serve")])
+        );
+        assert!(!config.management_web_enabled);
+        assert!(is_config_file(&config.config_file));
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 }
