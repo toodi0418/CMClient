@@ -8,7 +8,21 @@
     "pnpm": ">=11.0.0"
   },
   "scripts": {
-    "test": "pnpm run test:fixtures",
+    "format:check": "prettier --check .",
+    "format:write": "prettier --write .",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "test": "pnpm run test:fixtures && vitest run",
     "test:fixtures": "node --test test/fixtures/sanitized-packet-fixtures.test.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.1",
+    "eslint": "^10.7.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.5",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.64.0",
+    "vitest": "^4.1.10"
   }
 }
