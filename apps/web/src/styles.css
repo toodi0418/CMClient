@@ -29,6 +29,17 @@ button {
   cursor: pointer;
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .console-shell {
   min-height: 100vh;
   display: grid;
@@ -134,6 +145,7 @@ button {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow-y: auto;
   padding: 18px 12px 12px;
   border-right: 1px solid var(--cm-border);
   background: var(--cm-surface);
@@ -183,6 +195,78 @@ button {
 .rail-footer {
   margin-top: auto;
   padding: 16px 10px 0;
+}
+
+.preference-controls {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 14px 10px 0;
+  border-top: 1px solid var(--cm-border);
+}
+
+.preference-controls__label {
+  margin: 0;
+  color: var(--cm-text-muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.theme-selector {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--cm-border-strong);
+  border-radius: var(--cm-control-radius);
+}
+
+.theme-selector__button {
+  display: grid;
+  min-height: 44px;
+  place-items: center;
+  border: 0;
+  border-right: 1px solid var(--cm-border-strong);
+  color: var(--cm-text-secondary);
+  background: var(--cm-surface-interactive);
+}
+
+.theme-selector__button:last-child {
+  border-right: 0;
+}
+
+.theme-selector__button:hover,
+.theme-selector__button.is-selected {
+  color: var(--cm-on-accent);
+  background: var(--cm-accent);
+}
+
+.theme-selector__button:focus-visible,
+.locale-selector:focus-within {
+  outline: 2px solid var(--cm-focus-ring);
+  outline-offset: 2px;
+}
+
+.locale-selector {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 9px;
+  padding: 0 11px;
+  border: 1px solid var(--cm-border-strong);
+  border-radius: var(--cm-control-radius);
+  color: var(--cm-accent-strong);
+  background: var(--cm-surface-interactive);
+}
+
+.locale-selector select {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  color: var(--cm-text);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
 }
 
 .workspace {
@@ -311,7 +395,8 @@ h2 {
 
 .is-rail-collapsed .product-name,
 .is-rail-collapsed .navigation-label,
-.is-rail-collapsed .rail-footer {
+.is-rail-collapsed .rail-footer,
+.is-rail-collapsed .preference-controls {
   display: none;
 }
 
@@ -363,6 +448,10 @@ h2 {
 
   .is-mobile-nav-open .side-rail {
     transform: translateX(0);
+  }
+
+  .is-rail-collapsed .preference-controls {
+    display: grid;
   }
 
   .workspace {

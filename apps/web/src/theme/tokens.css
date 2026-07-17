@@ -31,6 +31,38 @@
   --cm-control-radius: 0.375rem;
 }
 
+:root[data-theme="light"] {
+  color-scheme: light;
+  --cm-canvas: #eef3ee;
+  --cm-surface: #f7faf6;
+  --cm-surface-raised: #ffffff;
+  --cm-surface-interactive: #e6eee7;
+  --cm-surface-selected: #d9e9dc;
+  --cm-surface-panel: #ffffff;
+  --cm-surface-strip: #f0f6f1;
+  --cm-grid: #d9e3db;
+  --cm-border: #c3d0c5;
+  --cm-border-strong: #9db1a1;
+  --cm-border-panel: #b8c9bb;
+  --cm-border-divider: #d0dcd2;
+  --cm-border-section: #b1c2b4;
+  --cm-text: #19231c;
+  --cm-text-muted: #58705d;
+  --cm-text-secondary: #405646;
+  --cm-text-strong: #102016;
+  --cm-text-panel: #3f5545;
+  --cm-text-metric: #213c29;
+  --cm-on-accent: #ffffff;
+  --cm-accent: #27734d;
+  --cm-accent-strong: #1f6944;
+  --cm-warning: #925908;
+  --cm-danger: #b23c35;
+  --cm-focus-ring: #0a7444;
+  --cm-accent-ring: #bde0c8;
+  --cm-warning-ring: #f2d6a8;
+  --cm-danger-ring: #f2c6c3;
+}
+
 @theme inline {
   --color-cm-canvas: var(--cm-canvas);
   --color-cm-surface: var(--cm-surface);

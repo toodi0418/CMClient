@@ -32,3 +32,13 @@ controller can synchronise PrimeVue with the same token vocabulary. The shell
 uses PrimeVue's unstyled button primitive where custom control treatment is
 needed and Lucide icons for navigation; controls keep a 44px minimum target in
 desktop, collapsed-rail and mobile-drawer layouts.
+
+At document head, a small bootstrap reads the versioned local preference record
+and applies the resolved `data-theme`, `.cm-dark`, `color-scheme`, and document
+language before the module entry loads. The Pinia preferences store then keeps
+`light`, `dark`, or `system` and `zh-TW` or `en-US` in sync with that document
+state, the theme-color meta tag, the system-colour media query, and vue-i18n.
+Invalid or unavailable storage values fall back to `system` and a browser
+locale match with `zh-TW` as the final fallback. Management routes carry
+translation keys rather than rendered text so section headings, navigation and
+the display controls switch immediately without changing their route identity.

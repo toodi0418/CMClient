@@ -21,4 +21,10 @@ describe("management web design tokens", () => {
       expect(tokens).toContain(token);
     }
   });
+
+  it("defines a semantic light palette alongside the dark default", () => {
+    expect(tokens).toContain(':root[data-theme="light"]');
+    expect(tokens).toContain("--cm-canvas: #eef3ee");
+    expect(tokens).toContain("--cm-accent: #27734d");
+  });
 });

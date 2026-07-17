@@ -3,9 +3,12 @@ import { computed } from "vue";
 import {
   Gauge,
   LayoutDashboard,
+  Languages,
   MapPinned,
   Menu,
   MessageSquareText,
+  Monitor,
+  Moon,
   Network,
   PanelLeftClose,
   PanelLeftOpen,
@@ -15,39 +18,78 @@ import {
   Server,
   Settings,
   Stethoscope,
+  Sun,
 } from "@lucide/vue";
 import Button from "primevue/button";
 import { RouterLink, RouterView, useRoute } from "vue-router";
+import { useI18n } from "vue-i18n";
 
+import { isSupportedLocale, type ThemePreference } from "@/preferences";
+import { usePreferencesStore } from "@/stores/preferences";
 import { useShellStore } from "@/stores/shell";
 
 const shell = useShellStore();
+const preferences = usePreferencesStore();
 const route = useRoute();
+const { t } = useI18n();
 
 const primaryNavigation = [
-  { label: "Overview", to: "/", icon: LayoutDashboard },
-  { label: "System", to: "/system", icon: Server },
-  { label: "Meshtastic", to: "/meshtastic", icon: Radio },
-  { label: "Nodes", to: "/nodes", icon: Network },
-  { label: "Positions", to: "/positions", icon: MapPinned },
-  { label: "Messages", to: "/messages", icon: MessageSquareText },
-  { label: "Telemetry", to: "/telemetry", icon: Gauge },
-  { label: "APRS", to: "/aprs", icon: Satellite },
+  { labelKey: "navigation.overview", to: "/", icon: LayoutDashboard },
+  { labelKey: "navigation.system", to: "/system", icon: Server },
+  { labelKey: "navigation.meshtastic", to: "/meshtastic", icon: Radio },
+  { labelKey: "navigation.nodes", to: "/nodes", icon: Network },
+  { labelKey: "navigation.positions", to: "/positions", icon: MapPinned },
+  { labelKey: "navigation.messages", to: "/messages", icon: MessageSquareText },
+  { labelKey: "navigation.telemetry", to: "/telemetry", icon: Gauge },
+  { labelKey: "navigation.aprs", to: "/aprs", icon: Satellite },
 ];
 
 const supportNavigation = [
-  { label: "Logs", to: "/logs", icon: ScrollText },
-  { label: "Settings", to: "/settings", icon: Settings },
-  { label: "Diagnostics", to: "/diagnostics", icon: Stethoscope },
+  { labelKey: "navigation.logs", to: "/logs", icon: ScrollText },
+  { labelKey: "navigation.settings", to: "/settings", icon: Settings },
+  { labelKey: "navigation.diagnostics", to: "/diagnostics", icon: Stethoscope },
 ];
 
-const pageLabel = computed(
-  () => (route.meta.label as string | undefined) ?? "CMClient",
+const themeOptions = [
+  {
+    value: "light" as ThemePreference,
+    labelKey: "preferences.light",
+    icon: Sun,
+  },
+  {
+    value: "dark" as ThemePreference,
+    labelKey: "preferences.dark",
+    icon: Moon,
+  },
+  {
+    value: "system" as ThemePreference,
+    labelKey: "preferences.system",
+    icon: Monitor,
+  },
+];
+
+const localeOptions = [
+  { value: "zh-TW", labelKey: "preferences.zhTW" },
+  { value: "en-US", labelKey: "preferences.enUS" },
+];
+
+const pageLabel = computed(() =>
+  t((route.meta.labelKey as string | undefined) ?? "navigation.overview"),
 );
+
+const gatewayLabel = computed(() => t(`gateway.${shell.gatewayAvailability}`));
 
 const railToggleIcon = computed(() =>
   shell.desktopRailCollapsed ? PanelLeftOpen : PanelLeftClose,
 );
+
+function setLocale(event: Event) {
+  const locale = (event.target as HTMLSelectElement).value;
+
+  if (isSupportedLocale(locale)) {
+    preferences.setLocale(locale);
+  }
+}
 </script>
 
 <template>
@@ -63,35 +105,35 @@ const railToggleIcon = computed(() =>
         unstyled
         class="brand-mark"
         type="button"
-        aria-label="切換導覽列"
-        title="切換導覽列"
+        :aria-label="t('shell.toggleNavigation')"
+        :title="t('shell.toggleNavigation')"
         @click="shell.toggleDesktopRail"
       >
         <component :is="railToggleIcon" :size="18" aria-hidden="true" />
       </Button>
       <div class="product-name">
         <span>CMCLIENT</span>
-        <small>CONTROL PLANE</small>
+        <small>{{ t("shell.controlPlane") }}</small>
       </div>
       <div class="topbar-spacer" />
       <div class="gateway-indicator" :data-state="shell.gatewayAvailability">
         <span class="status-pip" aria-hidden="true" />
-        <span>{{ shell.gatewayAvailability }}</span>
+        <span>{{ gatewayLabel }}</span>
       </div>
       <Button
         unstyled
         class="mobile-menu"
         type="button"
-        aria-label="開啟導覽"
-        title="開啟導覽"
+        :aria-label="t('shell.openNavigation')"
+        :title="t('shell.openNavigation')"
         @click="shell.toggleMobileNavigation"
       >
         <Menu :size="19" aria-hidden="true" />
       </Button>
     </header>
 
-    <aside class="side-rail" aria-label="主要導覽">
-      <nav class="navigation-list">
+    <aside class="side-rail" :aria-label="t('shell.primaryNavigation')">
+      <nav class="navigation-list" :aria-label="t('shell.primaryNavigation')">
         <RouterLink
           v-for="item in primaryNavigation"
           :key="item.to"
@@ -105,13 +147,13 @@ const railToggleIcon = computed(() =>
             :size="17"
             aria-hidden="true"
           />
-          <span class="navigation-label">{{ item.label }}</span>
+          <span class="navigation-label">{{ t(item.labelKey) }}</span>
         </RouterLink>
       </nav>
       <div class="rail-divider" />
       <nav
         class="navigation-list navigation-list--support"
-        aria-label="支援導覽"
+        :aria-label="t('shell.supportNavigation')"
       >
         <RouterLink
           v-for="item in supportNavigation"
@@ -126,15 +168,59 @@ const railToggleIcon = computed(() =>
             :size="17"
             aria-hidden="true"
           />
-          <span class="navigation-label">{{ item.label }}</span>
+          <span class="navigation-label">{{ t(item.labelKey) }}</span>
         </RouterLink>
       </nav>
+      <section
+        class="preference-controls"
+        :aria-label="t('preferences.display')"
+      >
+        <p class="preference-controls__label">{{ t("preferences.display") }}</p>
+        <div
+          class="theme-selector"
+          role="group"
+          :aria-label="t('preferences.theme')"
+        >
+          <Button
+            v-for="option in themeOptions"
+            :key="option.value"
+            unstyled
+            class="theme-selector__button"
+            :class="{ 'is-selected': preferences.theme === option.value }"
+            type="button"
+            :aria-label="t(option.labelKey)"
+            :aria-pressed="preferences.theme === option.value"
+            :title="t(option.labelKey)"
+            @click="preferences.setTheme(option.value)"
+          >
+            <component :is="option.icon" :size="16" aria-hidden="true" />
+            <span class="visually-hidden">{{ t(option.labelKey) }}</span>
+          </Button>
+        </div>
+        <label class="locale-selector">
+          <Languages :size="16" aria-hidden="true" />
+          <span class="visually-hidden">{{ t("preferences.language") }}</span>
+          <select
+            :value="preferences.locale"
+            :aria-label="t('preferences.language')"
+            @change="setLocale"
+          >
+            <option
+              v-for="option in localeOptions"
+              :key="option.value"
+              :value="option.value"
+            >
+              {{ t(option.labelKey) }}
+            </option>
+          </select>
+        </label>
+      </section>
       <div class="rail-footer">LOCAL / V2.0</div>
     </aside>
 
     <main class="workspace" @click="shell.closeMobileNavigation">
       <div class="workspace-heading">
-        <p>OPERATIONS</p>
+        <p>{{ t("shell.operations") }}</p>
         <h1>{{ pageLabel }}</h1>
       </div>
       <RouterView />

@@ -11,12 +11,13 @@
   },
   "dependencies": {
     "@lucide/vue": "^1.25.0",
-    "@primeuix/themes": "^3.0.0",
+    "@primeuix/themes": "^1.2.5",
     "@tailwindcss/vite": "^4.3.3",
     "pinia": "^4.0.2",
-    "primevue": "^5.0.0",
+    "primevue": "^4.5.5",
     "tailwindcss": "^4.3.3",
     "vue": "^3.5.40",
+    "vue-i18n": "^11.4.6",
     "vue-router": "^5.2.0"
   },
   "devDependencies": {
