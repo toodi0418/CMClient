@@ -1,18 +1,19 @@
-use cmclient_agent_core::web::{ManagementWebConfig, ManagementWebListener};
+use cmclient_agent_core::web::{ManagementWebConfig, ManagementWebListener, gateway_health};
 use cmclient_agent_core::{AgentConfig, AgentLease, ensure_runtime_directories};
 use cmclient_control_api::{
     ControlCommand, ControlEndpoint, ControlError, ControlHandler, ControlServer, ControlStatus,
     GatewayControlStatus, default_unix_socket,
 };
 use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor};
-use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::{collections::BTreeMap, net::SocketAddr, process::ExitCode, thread};
 
 const EX_USAGE: u8 = 2;
 const EX_CONFIG: u8 = 5;
 
 struct AgentController {
     supervisor: Mutex<Option<GatewaySupervisor>>,
+    gateway: SocketAddr,
 }
 
 impl AgentController {
@@ -21,18 +22,34 @@ impl AgentController {
             .gateway_command
             .as_ref()
             .map(|command| {
-                GatewaySupervisor::new(
+                let mut supervisor = GatewaySupervisor::new(
                     GatewayCommand {
                         program: command.first().cloned().unwrap_or_default(),
                         arguments: command.iter().skip(1).cloned().collect(),
                     },
                     BackoffPolicy::default(),
                 )
-                .map_err(|_| ControlError::CommandFailed)
+                .map_err(|_| ControlError::CommandFailed)?;
+                supervisor.set_environment(BTreeMap::from([
+                    (
+                        String::from("CMCLIENT_GATEWAY_HOST"),
+                        String::from("127.0.0.1"),
+                    ),
+                    (
+                        String::from("CMCLIENT_GATEWAY_PORT"),
+                        config.gateway_port.to_string(),
+                    ),
+                    (
+                        String::from("CMCLIENT_DATA_DIR"),
+                        config.paths.data_dir.to_string_lossy().into_owned(),
+                    ),
+                ]));
+                Ok(supervisor)
             })
             .transpose()?;
         Ok(Self {
             supervisor: Mutex::new(supervisor),
+            gateway: gateway_address(config.gateway_port),
         })
     }
 
@@ -41,7 +58,7 @@ impl AgentController {
             .supervisor
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
-        let gateway = match supervisor.as_mut() {
+        let lifecycle = match supervisor.as_mut() {
             Some(supervisor) => {
                 let _ = supervisor
                     .poll_heartbeat()
@@ -53,6 +70,14 @@ impl AgentController {
                 }
             }
             None => GatewayControlStatus::Stopped,
+        };
+        drop(supervisor);
+        let gateway = match lifecycle {
+            GatewayControlStatus::Running if gateway_health(self.gateway) => {
+                GatewayControlStatus::Running
+            }
+            GatewayControlStatus::Running => GatewayControlStatus::Degraded,
+            status => status,
         };
         Ok(ControlStatus {
             schema_version: 1,
@@ -163,6 +188,7 @@ fn serve_web_once() -> ExitCode {
     };
     let web_config = ManagementWebConfig {
         enabled: config.management_web_enabled,
+        gateway: gateway_address(config.gateway_port),
         ..Default::default()
     };
     let listener = match ManagementWebListener::bind(&web_config) {
@@ -207,6 +233,32 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
+    if config.management_web_enabled {
+        let web_config = ManagementWebConfig {
+            enabled: true,
+            gateway: gateway_address(config.gateway_port),
+            ..Default::default()
+        };
+        let listener = match ManagementWebListener::bind(&web_config) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("{}", error.code());
+                return ExitCode::from(EX_CONFIG);
+            }
+        };
+        if thread::Builder::new()
+            .name(String::from("cmclient-management-web"))
+            .spawn(move || {
+                if let Err(error) = listener.serve() {
+                    eprintln!("{}", error.code());
+                }
+            })
+            .is_err()
+        {
+            eprintln!("MANAGEMENT_WEB_THREAD_START_FAILED");
+            return ExitCode::from(EX_CONFIG);
+        }
+    }
     let endpoint = match default_unix_socket(&config.paths.data_dir) {
         ControlEndpoint::UnixSocket(path) => ControlEndpoint::unix(path),
         endpoint => endpoint,
@@ -223,5 +275,74 @@ fn serve() -> ExitCode {
             eprintln!("{}", error.code());
             return ExitCode::from(EX_CONFIG);
         }
+    }
+}
+
+fn gateway_address(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(target_os = "windows"))]
+    use super::{
+        AgentConfig, AgentController, ControlCommand, ControlHandler, GatewayControlStatus,
+    };
+    #[cfg(not(target_os = "windows"))]
+    use cmclient_agent_core::RuntimePaths;
+    #[cfg(not(target_os = "windows"))]
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        thread,
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn reports_running_only_after_gateway_health_succeeds() {
+        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
+        let port = gateway
+            .local_addr()
+            .expect("gateway address should load")
+            .port();
+        let gateway_thread = thread::spawn(move || {
+            let (mut stream, _) = gateway.accept().expect("gateway should accept");
+            let mut request = [0_u8; 4096];
+            let _ = stream
+                .read(&mut request)
+                .expect("health request should read");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\nconnection: close\r\n\r\n{\"status\":\"ok\"}",
+                )
+                .expect("health response should write");
+        });
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: PathBuf::from("/tmp/cmclient-agent-health"),
+                config_dir: PathBuf::from("/tmp/cmclient-agent-health"),
+                cache_dir: PathBuf::from("/tmp/cmclient-agent-health/cache"),
+                log_dir: PathBuf::from("/tmp/cmclient-agent-health/logs"),
+            },
+            config_file: PathBuf::from("/tmp/cmclient-agent-health/agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                String::from("sleep 30"),
+            ]),
+            gateway_port: port,
+            management_web_enabled: false,
+        };
+        let controller = AgentController::from_config(&config).expect("controller should build");
+
+        let status = controller
+            .handle(ControlCommand::Start)
+            .expect("gateway should start");
+        assert_eq!(status.gateway, GatewayControlStatus::Running);
+        controller
+            .handle(ControlCommand::Stop)
+            .expect("gateway should stop");
+        gateway_thread.join().expect("gateway should join");
     }
 }

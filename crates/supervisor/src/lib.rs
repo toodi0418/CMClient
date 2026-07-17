@@ -1,6 +1,7 @@
 //! Process supervision primitives owned by the Rust Agent.
 
 use std::{
+    collections::BTreeMap,
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -82,6 +83,7 @@ pub struct GatewaySupervisor {
     command: GatewayCommand,
     backoff_policy: BackoffPolicy,
     child: Option<Child>,
+    environment: BTreeMap<String, String>,
     failed_attempts: u32,
 }
 
@@ -97,6 +99,7 @@ impl GatewaySupervisor {
             command,
             backoff_policy,
             child: None,
+            environment: BTreeMap::new(),
             failed_attempts: 0,
         })
     }
@@ -112,12 +115,17 @@ impl GatewaySupervisor {
         }
     }
 
+    pub fn set_environment(&mut self, environment: BTreeMap<String, String>) {
+        self.environment = environment;
+    }
+
     pub fn start(&mut self) -> Result<SupervisorEvent, SupervisorError> {
         if let Some(child) = self.child.as_ref() {
             return Ok(SupervisorEvent::Heartbeat { pid: child.id() });
         }
         let child = Command::new(&self.command.program)
             .args(&self.command.arguments)
+            .envs(&self.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

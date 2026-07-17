@@ -17,3 +17,7 @@ POST /api/v1/control/restart
 Each route returns schema version, Agent state, and Gateway lifecycle state.
 The endpoint is intentionally small because its purpose is to support local
 Agent control, CLI, and Desktop operations while Gateway is unavailable.
+
+When the supervisor has a live child process, Agent additionally probes the
+Gateway loopback health endpoint. The control status is `running` only after a
+successful probe; otherwise it reports `degraded`.

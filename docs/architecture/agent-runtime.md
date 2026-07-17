@@ -17,9 +17,15 @@ settings:
 ```toml
 [agent]
 gateway_command = ["cmclient-gateway", "serve"]
+gateway_port = 4810
 management_web_enabled = true
 ```
 
 CallMesh keys, APRS passcodes, administrative tokens, and signing keys do not
 belong in this file or in Agent command arguments. Their storage and redaction
 are introduced by the security and updater phases.
+
+The Agent injects `CMCLIENT_GATEWAY_HOST=127.0.0.1`, the configured non-zero
+`CMCLIENT_GATEWAY_PORT`, and its own `CMCLIENT_DATA_DIR` into the supervised
+Gateway process. This keeps the Gateway data store and the Agent's health/proxy
+endpoint aligned without exposing a Gateway listener to the LAN.
