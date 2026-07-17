@@ -37,6 +37,10 @@ version = "2.0.0-dev.0"
 [[package]]
 name = "cmclient-control-api"
 version = "2.0.0-dev.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cmclient-supervisor"
