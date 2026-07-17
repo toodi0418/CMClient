@@ -754,4 +754,16 @@ const defaultMigrations: Migration[] = [
       );
     },
   },
+  {
+    version: 6,
+    name: "aprs_outbox",
+    up(database) {
+      database.exec(
+        "CREATE TABLE aprs_outbox (id TEXT PRIMARY KEY, callsign TEXT NOT NULL, canonical_event_id TEXT NOT NULL REFERENCES position_events(id), data TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('queued', 'sending', 'sent', 'failed')), attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0), next_attempt_at TEXT NOT NULL, last_error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, sent_at TEXT, UNIQUE (callsign, canonical_event_id))",
+      );
+      database.exec(
+        "CREATE INDEX aprs_outbox_due_index ON aprs_outbox (status, next_attempt_at)",
+      );
+    },
+  },
 ];
