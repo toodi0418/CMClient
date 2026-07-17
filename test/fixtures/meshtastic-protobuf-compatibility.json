@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "schemaVersionLabel": "meshtastic-proto-v1",
+  "fromRadioConfigCompleteHex": "080c3884868808",
+  "expectedConfigCompleteId": 16909060,
+  "fromRadioPacketHex": "080d12340d0190e6f015ffffffff22070803120301020335e90300003d76d9db704500009040480360baffffffffffffffff017805a80101",
+  "expectedPacket": {
+    "schemaVersion": 1,
+    "fromRadioId": 13,
+    "kind": "packet",
+    "packet": {
+      "sender": 4041641985,
+      "destination": 4294967295,
+      "packetId": 1001,
+      "portNum": "POSITION_APP",
+      "payloadBase64": "AQID",
+      "deviceRxTimeSeconds": 1893456246,
+      "rxSnr": 4.5,
+      "rxRssi": -70,
+      "hopLimit": 3,
+      "hopStart": 5,
+      "transportMechanism": "TRANSPORT_LORA"
+    }
+  }
+}

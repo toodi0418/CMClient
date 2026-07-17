@@ -6,6 +6,7 @@ import {
   DomainEventSchema,
   JobDetailSchema,
   JOB_STATUSES,
+  NormalizedFromRadioSchema,
   SystemCapabilitiesSchema,
   TransportConnectionStateSchema,
 } from "./index";
@@ -120,6 +121,23 @@ describe("transport contract", () => {
         changedAt: "2026-07-18T00:00:00.000Z",
         attempt: 2,
         reasonCode: "TCP_CONNECT_FAILED",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps device receive time distinct in normalized packets", () => {
+    const check = TypeCompiler.Compile(NormalizedFromRadioSchema);
+    expect(
+      check.Check({
+        schemaVersion: 1,
+        kind: "packet",
+        fromRadioId: 13,
+        packet: {
+          sender: 4041641985,
+          packetId: 1001,
+          portNum: "POSITION_APP",
+          deviceRxTimeSeconds: 1893456246,
+        },
       }),
     ).toBe(true);
   });

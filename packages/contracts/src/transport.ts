@@ -51,6 +51,39 @@ export const SerialDeviceSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+export const NormalizedMeshPacketSchema = Type.Object(
+  {
+    sender: Type.Optional(Type.Integer({ minimum: 0 })),
+    destination: Type.Optional(Type.Integer({ minimum: 0 })),
+    packetId: Type.Optional(Type.Integer({ minimum: 0 })),
+    channel: Type.Optional(Type.Integer({ minimum: 0 })),
+    portNum: Type.Optional(Type.String({ minLength: 1 })),
+    payloadBase64: Type.Optional(Type.String({ minLength: 1 })),
+    encryptedPayloadBase64: Type.Optional(Type.String({ minLength: 1 })),
+    deviceRxTimeSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+    rxSnr: Type.Optional(Type.Number()),
+    rxRssi: Type.Optional(Type.Integer()),
+    hopLimit: Type.Optional(Type.Integer({ minimum: 0 })),
+    hopStart: Type.Optional(Type.Integer({ minimum: 0 })),
+    viaMqtt: Type.Optional(Type.Boolean()),
+    transportMechanism: Type.Optional(Type.String({ minLength: 1 })),
+  },
+  { additionalProperties: false },
+);
+export const NormalizedFromRadioSchema = Type.Object(
+  {
+    schemaVersion: Type.Literal(1),
+    kind: Type.Union([
+      Type.Literal("packet"),
+      Type.Literal("config_complete"),
+      Type.Literal("other"),
+    ]),
+    fromRadioId: Type.Optional(Type.Integer({ minimum: 0 })),
+    configCompleteId: Type.Optional(Type.Integer({ minimum: 0 })),
+    packet: Type.Optional(NormalizedMeshPacketSchema),
+  },
+  { additionalProperties: false },
+);
 
 export type TransportKind = (typeof TRANSPORT_KINDS)[number];
 export type ConnectionStatus = (typeof CONNECTION_STATUSES)[number];
@@ -59,3 +92,5 @@ export type TransportConnectionState = Static<
 >;
 export type TransportMetrics = Static<typeof TransportMetricsSchema>;
 export type SerialDevice = Static<typeof SerialDeviceSchema>;
+export type NormalizedMeshPacket = Static<typeof NormalizedMeshPacketSchema>;
+export type NormalizedFromRadio = Static<typeof NormalizedFromRadioSchema>;
