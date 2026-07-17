@@ -12,7 +12,8 @@
     "desktop": "node scripts/run-electron.js src/electron/main.js",
     "build:win": "node scripts/build-win.js",
     "build:linux": "node scripts/build-linux.js",
-    "build:mac-cli": "pkg src/index.js --config package.json --targets node22-macos-x64 --compress Brotli --public --output dist/cli/tmag-cli"
+    "build:mac-cli": "pkg src/index.js --config package.json --targets node22-macos-x64 --compress Brotli --public --output dist/cli/tmag-cli",
+    "test:fixtures": "node --test test/fixtures/sanitized-packet-fixtures.test.js"
   },
   "dependencies": {
     "bonjour-service": "^1.2.1",

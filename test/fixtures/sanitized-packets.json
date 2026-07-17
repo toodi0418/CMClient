@@ -1,0 +1,190 @@
+{
+  "schemaVersion": 1,
+  "dataset": "cmclient-2-synthetic-packet-fixtures",
+  "sanitized": true,
+  "privacy": {
+    "source": "synthetic",
+    "containsProductionTraffic": false,
+    "containsSecrets": false,
+    "containsPersonalLocations": false
+  },
+  "fixtures": [
+    {
+      "id": "position-accepted-precision-32",
+      "category": "position",
+      "sanitized": true,
+      "recording": {
+        "rawFrameEncoding": "synthetic-hex",
+        "rawFrameHex": "0a0e666978747572652d7061636b65742d3031",
+        "gatewayId": "fixture-gateway-a",
+        "transport": "tcp",
+        "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
+        "receivedAt": "2030-01-02T03:04:06.000Z",
+        "ingestedAt": "2030-01-02T03:04:06.015Z"
+      },
+      "normalizedPacket": {
+        "meshNetworkId": "fixture-network-alpha",
+        "nodeId": "!f1c7a001",
+        "packetId": 1001,
+        "portNum": "POSITION_APP",
+        "position": {
+          "latitudeI": 1234567,
+          "longitudeI": -7654321,
+          "precisionBits": 32,
+          "timestamp": "2030-01-02T03:04:05.000Z",
+          "altitudeM": 0,
+          "groundTrackDegrees": 90,
+          "groundSpeedMps": 4.5
+        }
+      },
+      "expected": {
+        "decisionCode": "POSITION_ACCEPTED",
+        "aprsUploadEligible": true
+      }
+    },
+    {
+      "id": "position-rejected-insufficient-precision",
+      "category": "position",
+      "sanitized": true,
+      "recording": {
+        "rawFrameEncoding": "synthetic-hex",
+        "rawFrameHex": "0a0e666978747572652d7061636b65742d3032",
+        "gatewayId": "fixture-gateway-a",
+        "transport": "serial",
+        "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
+        "receivedAt": "2030-01-02T03:05:06.000Z",
+        "ingestedAt": "2030-01-02T03:05:06.010Z"
+      },
+      "normalizedPacket": {
+        "meshNetworkId": "fixture-network-alpha",
+        "nodeId": "!f1c7a002",
+        "packetId": 1002,
+        "portNum": "POSITION_APP",
+        "position": {
+          "latitudeI": 2234567,
+          "longitudeI": -8654321,
+          "precisionBits": 31,
+          "timestamp": "2030-01-02T03:05:05.000Z"
+        }
+      },
+      "expected": {
+        "decisionCode": "POSITION_PRECISION_INSUFFICIENT",
+        "aprsUploadEligible": false
+      }
+    },
+    {
+      "id": "position-duplicate-replay",
+      "category": "position",
+      "sanitized": true,
+      "recording": {
+        "rawFrameEncoding": "synthetic-hex",
+        "rawFrameHex": "0a0e666978747572652d7061636b65742d3033",
+        "gatewayId": "fixture-gateway-b",
+        "transport": "tcp",
+        "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
+        "receivedAt": "2030-01-02T03:04:09.000Z",
+        "ingestedAt": "2030-01-02T03:04:09.020Z"
+      },
+      "normalizedPacket": {
+        "meshNetworkId": "fixture-network-alpha",
+        "nodeId": "!f1c7a001",
+        "packetId": 1001,
+        "portNum": "POSITION_APP",
+        "position": {
+          "latitudeI": 1234567,
+          "longitudeI": -7654321,
+          "precisionBits": 32,
+          "timestamp": "2030-01-02T03:04:05.000Z"
+        }
+      },
+      "expected": {
+        "decisionCode": "POSITION_DUPLICATE",
+        "aprsUploadEligible": false
+      }
+    },
+    {
+      "id": "position-backlog-older-than-high-water",
+      "category": "position",
+      "sanitized": true,
+      "recording": {
+        "rawFrameEncoding": "synthetic-hex",
+        "rawFrameHex": "0a0e666978747572652d7061636b65742d3034",
+        "gatewayId": "fixture-gateway-a",
+        "transport": "tcp",
+        "sessionConnectedAt": "2030-01-02T03:10:00.000Z",
+        "receivedAt": "2030-01-02T03:10:01.000Z",
+        "ingestedAt": "2030-01-02T03:10:01.012Z",
+        "isBacklog": true
+      },
+      "normalizedPacket": {
+        "meshNetworkId": "fixture-network-alpha",
+        "nodeId": "!f1c7a001",
+        "packetId": 998,
+        "portNum": "POSITION_APP",
+        "position": {
+          "latitudeI": 1200000,
+          "longitudeI": -7600000,
+          "precisionBits": 32,
+          "timestamp": "2030-01-02T03:03:00.000Z",
+          "sequence": 8
+        }
+      },
+      "expected": {
+        "decisionCode": "POSITION_BACKLOG",
+        "aprsUploadEligible": false
+      }
+    },
+    {
+      "id": "text-message-normalized",
+      "category": "message",
+      "sanitized": true,
+      "recording": {
+        "rawFrameEncoding": "synthetic-hex",
+        "rawFrameHex": "0a0e666978747572652d7061636b65742d3035",
+        "gatewayId": "fixture-gateway-a",
+        "transport": "serial",
+        "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
+        "receivedAt": "2030-01-02T03:06:00.000Z",
+        "ingestedAt": "2030-01-02T03:06:00.010Z"
+      },
+      "normalizedPacket": {
+        "meshNetworkId": "fixture-network-alpha",
+        "nodeId": "!f1c7a003",
+        "packetId": 1003,
+        "portNum": "TEXT_MESSAGE_APP",
+        "text": "synthetic fixture message"
+      },
+      "expected": {
+        "domainEvent": "message.received"
+      }
+    },
+    {
+      "id": "telemetry-normalized",
+      "category": "telemetry",
+      "sanitized": true,
+      "recording": {
+        "rawFrameEncoding": "synthetic-hex",
+        "rawFrameHex": "0a0e666978747572652d7061636b65742d3036",
+        "gatewayId": "fixture-gateway-b",
+        "transport": "tcp",
+        "sessionConnectedAt": "2030-01-02T03:00:00.000Z",
+        "receivedAt": "2030-01-02T03:07:00.000Z",
+        "ingestedAt": "2030-01-02T03:07:00.014Z"
+      },
+      "normalizedPacket": {
+        "meshNetworkId": "fixture-network-alpha",
+        "nodeId": "!f1c7a004",
+        "packetId": 1004,
+        "portNum": "TELEMETRY_APP",
+        "telemetry": {
+          "batteryLevel": 73,
+          "voltage": 3.92,
+          "temperatureC": 21.5
+        }
+      },
+      "expected": {
+        "domainEvent": "telemetry.received"
+      }
+    }
+  ]
+}
