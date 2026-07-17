@@ -40,6 +40,17 @@ export const TransportMetricsSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+export const SerialDeviceSchema = Type.Object(
+  {
+    path: Type.String({ minLength: 1 }),
+    manufacturer: Type.Optional(Type.String({ minLength: 1 })),
+    serialNumber: Type.Optional(Type.String({ minLength: 1 })),
+    vendorId: Type.Optional(Type.String({ minLength: 1 })),
+    productId: Type.Optional(Type.String({ minLength: 1 })),
+    friendlyName: Type.Optional(Type.String({ minLength: 1 })),
+  },
+  { additionalProperties: false },
+);
 
 export type TransportKind = (typeof TRANSPORT_KINDS)[number];
 export type ConnectionStatus = (typeof CONNECTION_STATUSES)[number];
@@ -47,3 +58,4 @@ export type TransportConnectionState = Static<
   typeof TransportConnectionStateSchema
 >;
 export type TransportMetrics = Static<typeof TransportMetricsSchema>;
+export type SerialDevice = Static<typeof SerialDeviceSchema>;

@@ -26,3 +26,9 @@ Every failed attempt enters `backoff` with a stable reason and retry number;
 the first matching config-complete response promotes the connection to `ready`.
 A bounded config-session timeout fails as `TCP_CONFIG_TIMEOUT` and reconnects;
 retry escalation resets only after the configuration session reaches `ready`.
+
+Serial uses the same transport, frame, configuration, and reconnect contracts
+through a `SerialPortAdapter`. The native adapter is the only module that
+imports `serialport`; it exposes deterministic `listSerialDevices()` records
+and opens/drains a selected device. Device open and I/O failures enter the same
+bounded backoff lifecycle with `SERIAL_*` reason codes.

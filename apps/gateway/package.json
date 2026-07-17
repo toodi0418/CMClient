@@ -11,6 +11,7 @@
   "dependencies": {
     "@cmclient/contracts": "workspace:*",
     "@sinclair/typebox": "^0.34.52",
-    "fastify": "^5.10.0"
+    "fastify": "^5.10.0",
+    "serialport": "^13.0.0"
   }
 }
