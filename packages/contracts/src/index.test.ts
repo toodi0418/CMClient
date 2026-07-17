@@ -4,6 +4,7 @@ import { TypeCompiler } from "@sinclair/typebox/compiler";
 
 import {
   DomainEventSchema,
+  JobDetailSchema,
   JOB_STATUSES,
   SystemCapabilitiesSchema,
 } from "./index";
@@ -77,6 +78,32 @@ describe("domain event contract", () => {
         occurredAt: "2026-07-18T00:00:00.000Z",
         source: "gateway",
         payload: {},
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("job contract", () => {
+  it("keeps API job state free of execution input", () => {
+    const check = TypeCompiler.Compile(JobDetailSchema);
+    expect(
+      check.Check({
+        id: "job-1",
+        type: "diagnostics.integrity_check",
+        status: "succeeded",
+        createdAt: "2026-07-18T00:00:00.000Z",
+        updatedAt: "2026-07-18T00:00:01.000Z",
+        completedAt: "2026-07-18T00:00:01.000Z",
+      }),
+    ).toBe(true);
+    expect(
+      check.Check({
+        id: "job-1",
+        type: "diagnostics.integrity_check",
+        status: "succeeded",
+        createdAt: "2026-07-18T00:00:00.000Z",
+        updatedAt: "2026-07-18T00:00:01.000Z",
+        input: { secret: "must-not-leak" },
       }),
     ).toBe(false);
   });

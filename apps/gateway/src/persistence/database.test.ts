@@ -31,7 +31,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT version FROM schema_migrations")
         .all(),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
     database.close();
     expect(existsSync(path)).toBe(true);
     rmSync(path, { force: true });
@@ -41,8 +41,8 @@ describe("GatewayDatabase", () => {
     const database = new GatewayDatabase(":memory:");
     expect(() =>
       runMigrations(database.connection, [
-        { version: 2, name: "one", up: () => undefined },
-        { version: 2, name: "two", up: () => undefined },
+        { version: 3, name: "one", up: () => undefined },
+        { version: 3, name: "two", up: () => undefined },
       ]),
     ).toThrow(DatabaseMigrationError);
     database.close();
@@ -53,7 +53,7 @@ describe("GatewayDatabase", () => {
     expect(() =>
       runMigrations(database.connection, [
         {
-          version: 2,
+          version: 3,
           name: "broken",
           up(connection) {
             connection.exec(
@@ -66,7 +66,7 @@ describe("GatewayDatabase", () => {
     ).toThrow(DatabaseMigrationError);
     expect(
       database.connection
-        .prepare("SELECT version FROM schema_migrations WHERE version = 2")
+        .prepare("SELECT version FROM schema_migrations WHERE version = 3")
         .get(),
     ).toBeUndefined();
     expect(

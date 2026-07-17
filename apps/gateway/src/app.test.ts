@@ -10,6 +10,8 @@ import {
 } from "./app";
 import { MemoryLogger, redact } from "./observability";
 import { DomainEventBus } from "./events";
+import { JobEngine } from "./jobs";
+import { GatewayDatabase } from "./persistence/database";
 
 describe("GatewayRuntime", () => {
   it("fails closed for a non-loopback bind", () => {
@@ -83,7 +85,7 @@ describe("GatewayRuntime", () => {
       throw new Error("Gateway did not bind a TCP address");
     }
 
-    const stream = await openSse(address.port, first.eventId);
+    const stream = await openSse(address.port, "/api/v1/events", first.eventId);
     try {
       const body = await readUntil(stream.response, `id: ${second.eventId}`);
       expect(body).toContain(": heartbeat\n\n");
@@ -94,6 +96,71 @@ describe("GatewayRuntime", () => {
       stream.request.destroy();
       stream.response.destroy();
       await app.close();
+    }
+  });
+
+  it("serves persisted Job state and replays job-only SSE events", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let eventSequence = 0;
+    const events = new DomainEventBus({
+      eventIdFactory: () => `event-${++eventSequence}`,
+    });
+    const engine = new JobEngine(database.jobs, events, {
+      idFactory: () => "job-1",
+      handlers: [
+        {
+          type: "diagnostics.integrity_check",
+          handler: async () => ({ integrity: "ok" }),
+        },
+      ],
+    });
+    const checkpoint = events.publish({
+      type: "gateway.ready",
+      source: "gateway",
+      payload: {},
+    });
+    const accepted = engine.submit({
+      type: "diagnostics.integrity_check",
+      input: {},
+    });
+    await engine.waitFor(accepted.job.id);
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      events,
+      {},
+      engine,
+    );
+    const details = await app.inject(`/api/v1/jobs/${accepted.job.id}`);
+    expect(details.statusCode).toBe(200);
+    expect(details.json()).toMatchObject({
+      id: accepted.job.id,
+      status: "succeeded",
+    });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Gateway did not bind a TCP address");
+    }
+
+    const stream = await openSse(
+      address.port,
+      `/api/v1/jobs/${accepted.job.id}/events`,
+      checkpoint.eventId,
+    );
+    try {
+      const body = await readUntil(
+        stream.response,
+        "event: job.status_changed",
+      );
+      expect(body).toContain("event: job.created");
+      expect(body).toContain(`"jobId":"${accepted.job.id}"`);
+      expect(body).not.toContain("event: gateway.ready");
+    } finally {
+      stream.request.destroy();
+      stream.response.destroy();
+      await app.close();
+      database.close();
     }
   });
 
@@ -115,13 +182,14 @@ describe("GatewayRuntime", () => {
 
 function openSse(
   port: number,
+  path: string,
   lastEventId: string,
 ): Promise<{ request: ReturnType<typeof request>; response: IncomingMessage }> {
   return new Promise((resolve, reject) => {
     const client = request({
       host: "127.0.0.1",
       port,
-      path: "/api/v1/events",
+      path,
       headers: { "last-event-id": lastEventId },
     });
     client.once("response", (response) =>
