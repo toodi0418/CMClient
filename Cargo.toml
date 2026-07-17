@@ -1,0 +1,20 @@
+[workspace]
+members = [
+  "apps/agent",
+  "apps/cli",
+  "crates/agent-core",
+  "crates/cli-client",
+  "crates/control-api",
+  "crates/supervisor",
+  "crates/updater"
+]
+resolver = "2"
+
+[workspace.package]
+version = "2.0.0-dev.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

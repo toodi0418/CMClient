@@ -1,0 +1,15 @@
+[package]
+name = "cmclient-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cmclient-agent-core = { path = "../../crates/agent-core" }
+cmclient-control-api = { path = "../../crates/control-api" }
+cmclient-supervisor = { path = "../../crates/supervisor" }
+cmclient-updater = { path = "../../crates/updater" }
+
+[lints]
+workspace = true

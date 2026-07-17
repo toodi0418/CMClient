@@ -3,6 +3,7 @@ node_modules/
 
 # Build artifacts
 dist/
+target/
 *.zip
 *.asar
 *.exe
