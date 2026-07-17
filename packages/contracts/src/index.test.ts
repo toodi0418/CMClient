@@ -7,6 +7,7 @@ import {
   JobDetailSchema,
   JOB_STATUSES,
   SystemCapabilitiesSchema,
+  TransportConnectionStateSchema,
 } from "./index";
 
 describe("job contracts", () => {
@@ -106,5 +107,20 @@ describe("job contract", () => {
         input: { secret: "must-not-leak" },
       }),
     ).toBe(false);
+  });
+});
+
+describe("transport contract", () => {
+  it("represents backoff with its retry attempt and stable reason", () => {
+    const check = TypeCompiler.Compile(TransportConnectionStateSchema);
+    expect(
+      check.Check({
+        transport: "tcp",
+        status: "backoff",
+        changedAt: "2026-07-18T00:00:00.000Z",
+        attempt: 2,
+        reasonCode: "TCP_CONNECT_FAILED",
+      }),
+    ).toBe(true);
   });
 });
