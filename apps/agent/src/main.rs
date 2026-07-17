@@ -1,4 +1,4 @@
-use cmclient_agent_core::{AgentConfig, ensure_runtime_directories};
+use cmclient_agent_core::{AgentConfig, AgentLease, ensure_runtime_directories};
 use std::process::ExitCode;
 
 const EX_USAGE: u8 = 2;
@@ -7,13 +7,26 @@ const EX_CONFIG: u8 = 5;
 fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
-        None | Some("--check-config") => match AgentConfig::load() {
+        None | Some("--check-config") | Some("--check-instance") => match AgentConfig::load() {
             Ok(config) => {
                 if let Err(error) = ensure_runtime_directories(&config.paths) {
                     eprintln!("{}", error.code());
                     return ExitCode::from(EX_CONFIG);
                 }
-                println!("agent configuration valid");
+                if std::env::args()
+                    .skip(1)
+                    .any(|argument| argument == "--check-instance")
+                {
+                    match AgentLease::acquire(&config.paths) {
+                        Ok((_lease, _state)) => println!("agent instance lock valid"),
+                        Err(error) => {
+                            eprintln!("{}", error.code());
+                            return ExitCode::from(EX_CONFIG);
+                        }
+                    }
+                } else {
+                    println!("agent configuration valid");
+                }
                 ExitCode::SUCCESS
             }
             Err(error) => {

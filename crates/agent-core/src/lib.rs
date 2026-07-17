@@ -1,12 +1,15 @@
 //! Shared Rust foundations for the CMClient Agent.
 
+use fs2::FileExt;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     env,
     fmt::{Display, Formatter},
     fs,
+    fs::OpenOptions,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Stable workspace identity for the Agent core boundary.
@@ -30,6 +33,18 @@ pub struct AgentConfig {
     pub management_web_enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentState {
+    pub schema_version: u8,
+    pub pid: u32,
+    pub started_at_unix_seconds: u64,
+}
+
+pub struct AgentLease {
+    lock_file: fs::File,
+    state_file: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     HomeDirectoryUnavailable,
@@ -38,6 +53,29 @@ pub enum ConfigError {
     InvalidConfig,
     EmptyGatewayCommand,
 }
+
+#[derive(Debug)]
+pub enum InstanceError {
+    AlreadyRunning,
+    Io,
+}
+
+impl InstanceError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::AlreadyRunning => "AGENT_INSTANCE_ALREADY_RUNNING",
+            Self::Io => "AGENT_INSTANCE_IO_FAILED",
+        }
+    }
+}
+
+impl Display for InstanceError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for InstanceError {}
 
 impl ConfigError {
     pub const fn code(&self) -> &'static str {
@@ -204,13 +242,78 @@ pub fn ensure_runtime_directories(paths: &RuntimePaths) -> Result<(), ConfigErro
     Ok(())
 }
 
+impl AgentLease {
+    pub fn acquire(paths: &RuntimePaths) -> Result<(Self, AgentState), InstanceError> {
+        fs::create_dir_all(&paths.data_dir).map_err(|_| InstanceError::Io)?;
+        let lock_path = paths.data_dir.join("agent.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .map_err(|_| InstanceError::Io)?;
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(InstanceError::AlreadyRunning);
+            }
+            Err(_) => return Err(InstanceError::Io),
+        }
+
+        let state = AgentState {
+            schema_version: 1,
+            pid: std::process::id(),
+            started_at_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| InstanceError::Io)?
+                .as_secs(),
+        };
+        let state_file = paths.data_dir.join("agent-state.json");
+        write_state(&state_file, &state)?;
+        Ok((
+            Self {
+                lock_file,
+                state_file,
+            },
+            state,
+        ))
+    }
+
+    pub fn read_state(paths: &RuntimePaths) -> Result<Option<AgentState>, InstanceError> {
+        let state_file = paths.data_dir.join("agent-state.json");
+        if !state_file.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(state_file).map_err(|_| InstanceError::Io)?;
+        serde_json::from_str(&contents)
+            .map(Some)
+            .map_err(|_| InstanceError::Io)
+    }
+}
+
+impl Drop for AgentLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.state_file);
+        let _ = self.lock_file.unlock();
+    }
+}
+
+fn write_state(path: &Path, state: &AgentState) -> Result<(), InstanceError> {
+    let temporary_path = path.with_extension(format!("{}.tmp", std::process::id()));
+    let serialized = serde_json::to_vec(state).map_err(|_| InstanceError::Io)?;
+    fs::write(&temporary_path, serialized).map_err(|_| InstanceError::Io)?;
+    fs::rename(temporary_path, path).map_err(|_| InstanceError::Io)
+}
+
 pub fn is_config_file(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == "agent.toml")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentConfig, ConfigError, RuntimePaths, is_config_file};
+    use super::{
+        AgentConfig, AgentLease, ConfigError, InstanceError, RuntimePaths, is_config_file,
+    };
     use std::{collections::BTreeMap, fs, path::PathBuf};
 
     fn environment() -> BTreeMap<String, String> {
@@ -284,6 +387,33 @@ mod tests {
         );
         assert!(!config.management_web_enabled);
         assert!(is_config_file(&config.config_file));
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn writes_and_clears_diagnostic_state_with_the_lease() {
+        let directory =
+            std::env::temp_dir().join(format!("cmclient-agent-lease-{}", std::process::id()));
+        let paths = RuntimePaths {
+            data_dir: directory.clone(),
+            config_dir: directory.join("config"),
+            cache_dir: directory.join("cache"),
+            log_dir: directory.join("logs"),
+        };
+        let (lease, state) = AgentLease::acquire(&paths).expect("lease should be acquired");
+        assert_eq!(
+            AgentLease::read_state(&paths).expect("state should load"),
+            Some(state)
+        );
+        assert!(matches!(
+            AgentLease::acquire(&paths),
+            Err(InstanceError::AlreadyRunning)
+        ));
+        drop(lease);
+        assert_eq!(
+            AgentLease::read_state(&paths).expect("state should load"),
+            None
+        );
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 }
