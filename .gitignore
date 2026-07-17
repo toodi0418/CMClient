@@ -13,6 +13,26 @@ dist/
 *.tmp
 *.swp
 
+# Secrets and runtime state
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+nohup.out
+*.out
+
+# Release and local archive artifacts
+*.tar
+*.tgz
+
 # Local map tiles
 src/web/public/map/tiles.mbtiles
 
