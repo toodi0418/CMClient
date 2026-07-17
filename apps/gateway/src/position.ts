@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import type {
+  NodePositionState,
   PositionCanonicalEvent,
   PositionDecision,
+  PositionDecisionCode,
   PositionEventTimeSource,
   PositionObservation,
   PositionSample,
@@ -29,6 +31,23 @@ export type PositionDuplicateResult =
       event: PositionCanonicalEvent;
       decision: PositionDecision;
     };
+
+export interface PositionMappingTarget {
+  callsign: string;
+  mappingVersion: string;
+}
+
+export interface PositionOrderPlan {
+  advance: boolean;
+  code: PositionDecisionCode;
+  sequenceEpoch?: number;
+}
+
+export interface PositionHighWaterResult {
+  decision: PositionDecision;
+  event: PositionCanonicalEvent;
+  state?: NodePositionState;
+}
 
 export class PositionRepository {
   constructor(private readonly database: DatabaseSync) {}
@@ -183,6 +202,198 @@ export class PositionDuplicateDetector {
     });
     return { kind: "duplicate", event: result.event, decision };
   }
+}
+
+export class PositionHighWaterStore {
+  constructor(private readonly database: DatabaseSync) {}
+
+  apply(
+    event: PositionCanonicalEvent,
+    target: PositionMappingTarget,
+    decidedAt: string,
+  ): PositionHighWaterResult {
+    if (!target.callsign.trim() || !target.mappingVersion.trim()) {
+      throw new PositionPersistenceError();
+    }
+    let transactionOpen = false;
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const current = this.findState(
+        event.meshNetworkId,
+        event.nodeNum,
+        target,
+      );
+      const plan = decidePositionOrder(current, event);
+      const eventWithEpoch =
+        plan.sequenceEpoch === undefined
+          ? event
+          : this.assignSequenceEpoch(event, plan.sequenceEpoch);
+      const state = plan.advance
+        ? this.writeState(eventWithEpoch, target, decidedAt)
+        : current;
+      const decision = this.writeDecision(
+        eventWithEpoch,
+        target,
+        plan.code,
+        decidedAt,
+      );
+      this.database.exec("COMMIT");
+      transactionOpen = false;
+      return { event: eventWithEpoch, decision, ...(state ? { state } : {}) };
+    } catch {
+      if (transactionOpen) {
+        this.database.exec("ROLLBACK");
+      }
+      throw new PositionPersistenceError();
+    }
+  }
+
+  private findState(
+    meshNetworkId: string,
+    nodeNum: number,
+    target: PositionMappingTarget,
+  ): NodePositionState | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT * FROM node_position_state WHERE mesh_network_id = ? AND node_num = ? AND callsign = ? AND mapping_version = ?",
+      )
+      .get(meshNetworkId, nodeNum, target.callsign, target.mappingVersion);
+    return row ? toNodePositionState(row) : undefined;
+  }
+
+  private assignSequenceEpoch(
+    event: PositionCanonicalEvent,
+    sequenceEpoch: number,
+  ): PositionCanonicalEvent {
+    this.database
+      .prepare("UPDATE position_events SET sequence_epoch = ? WHERE id = ?")
+      .run(sequenceEpoch, event.id);
+    return { ...event, sequenceEpoch };
+  }
+
+  private writeState(
+    event: PositionCanonicalEvent,
+    target: PositionMappingTarget,
+    updatedAt: string,
+  ): NodePositionState {
+    this.database
+      .prepare(
+        "INSERT INTO node_position_state (mesh_network_id, node_num, callsign, mapping_version, latest_canonical_event_id, latest_event_time, latest_sequence_epoch, latest_sequence_number, latest_latitude_i, latest_longitude_i, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(mesh_network_id, node_num, callsign, mapping_version) DO UPDATE SET latest_canonical_event_id = excluded.latest_canonical_event_id, latest_event_time = excluded.latest_event_time, latest_sequence_epoch = excluded.latest_sequence_epoch, latest_sequence_number = excluded.latest_sequence_number, latest_latitude_i = excluded.latest_latitude_i, latest_longitude_i = excluded.latest_longitude_i, updated_at = excluded.updated_at",
+      )
+      .run(
+        event.meshNetworkId,
+        event.nodeNum,
+        target.callsign,
+        target.mappingVersion,
+        event.id,
+        event.eventTime ?? null,
+        event.sequenceEpoch ?? null,
+        event.sequenceNumber ?? null,
+        event.position.latitudeI ?? null,
+        event.position.longitudeI ?? null,
+        updatedAt,
+      );
+    const state = this.findState(event.meshNetworkId, event.nodeNum, target);
+    if (!state) {
+      throw new PositionPersistenceError();
+    }
+    return state;
+  }
+
+  private writeDecision(
+    event: PositionCanonicalEvent,
+    target: PositionMappingTarget,
+    code: PositionDecisionCode,
+    decidedAt: string,
+  ): PositionDecision {
+    const id = `position-order-${shortHash(
+      `${event.id}|${target.callsign}|${target.mappingVersion}|${code}`,
+    )}`;
+    this.database
+      .prepare(
+        "INSERT OR IGNORE INTO position_decisions (id, observation_id, canonical_event_id, code, decided_at, parameters) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        id,
+        event.sourceObservationId,
+        event.id,
+        code,
+        decidedAt,
+        JSON.stringify({
+          callsign: target.callsign,
+          mappingVersion: target.mappingVersion,
+        }),
+      );
+    const row = this.database
+      .prepare("SELECT * FROM position_decisions WHERE id = ?")
+      .get(id);
+    if (!row) {
+      throw new PositionPersistenceError();
+    }
+    return toPositionDecision(row);
+  }
+}
+
+export function decidePositionOrder(
+  current: NodePositionState | undefined,
+  event: PositionCanonicalEvent,
+): PositionOrderPlan {
+  if (!event.eventTime) {
+    return { advance: false, code: "APRS_SKIPPED_OUT_OF_ORDER" };
+  }
+  if (!current) {
+    return {
+      advance: true,
+      code: "POSITION_ACCEPTED",
+      ...(event.sequenceNumber === undefined ? {} : { sequenceEpoch: 0 }),
+    };
+  }
+  if (!current.latestEventTime) {
+    return {
+      advance: true,
+      code: "POSITION_ACCEPTED",
+      ...(event.sequenceNumber === undefined
+        ? {}
+        : { sequenceEpoch: current.latestSequenceEpoch ?? 0 }),
+    };
+  }
+  const timeOrder = event.eventTime.localeCompare(current.latestEventTime);
+  if (timeOrder < 0) {
+    return { advance: false, code: "POSITION_HISTORICAL" };
+  }
+  if (timeOrder > 0) {
+    return {
+      advance: true,
+      code: "POSITION_ACCEPTED",
+      ...(event.sequenceNumber === undefined
+        ? {}
+        : {
+            sequenceEpoch:
+              current.latestSequenceNumber !== undefined &&
+              event.sequenceNumber < current.latestSequenceNumber
+                ? (current.latestSequenceEpoch ?? 0) + 1
+                : (current.latestSequenceEpoch ?? 0),
+          }),
+    };
+  }
+  if (
+    event.sequenceNumber === undefined ||
+    current.latestSequenceNumber === undefined
+  ) {
+    return { advance: false, code: "POSITION_SEQUENCE_CONFLICT" };
+  }
+  if (event.sequenceNumber > current.latestSequenceNumber) {
+    return {
+      advance: true,
+      code: "POSITION_ACCEPTED",
+      sequenceEpoch: current.latestSequenceEpoch ?? 0,
+    };
+  }
+  if (event.sequenceNumber < current.latestSequenceNumber) {
+    return { advance: false, code: "POSITION_HISTORICAL" };
+  }
+  return { advance: false, code: "POSITION_SEQUENCE_CONFLICT" };
 }
 
 export function createCanonicalPositionEvent(
@@ -344,6 +555,39 @@ function toPositionDecision(row: Record<string, unknown>): PositionDecision {
   };
 }
 
+function toNodePositionState(row: Record<string, unknown>): NodePositionState {
+  const latestSequenceEpoch = optionalInteger(row.latest_sequence_epoch);
+  const latestSequenceNumber = optionalInteger(row.latest_sequence_number);
+  const latestLatitudeI = optionalSignedInteger(row.latest_latitude_i);
+  const latestLongitudeI = optionalSignedInteger(row.latest_longitude_i);
+  if (
+    latestSequenceEpoch === "invalid" ||
+    latestSequenceNumber === "invalid" ||
+    latestLatitudeI === "invalid" ||
+    latestLongitudeI === "invalid"
+  ) {
+    throw new PositionPersistenceError();
+  }
+  const latestCanonicalEventId = optionalString(row.latest_canonical_event_id);
+  const latestEventTime = optionalString(row.latest_event_time);
+  return {
+    schemaVersion: 1,
+    meshNetworkId: String(row.mesh_network_id),
+    nodeNum: requiredInteger(row.node_num),
+    callsign: String(row.callsign),
+    mappingVersion: String(row.mapping_version),
+    ...(latestCanonicalEventId ? { latestCanonicalEventId } : {}),
+    ...(latestEventTime ? { latestEventTime } : {}),
+    ...(typeof latestSequenceEpoch === "number" ? { latestSequenceEpoch } : {}),
+    ...(typeof latestSequenceNumber === "number"
+      ? { latestSequenceNumber }
+      : {}),
+    ...(typeof latestLatitudeI === "number" ? { latestLatitudeI } : {}),
+    ...(typeof latestLongitudeI === "number" ? { latestLongitudeI } : {}),
+    updatedAt: String(row.updated_at),
+  };
+}
+
 function parsePositionSample(value: unknown): PositionSample {
   try {
     const source = JSON.parse(String(value)) as unknown;
@@ -408,6 +652,15 @@ function optionalInteger(value: unknown): number | undefined | "invalid" {
     Number.isInteger(value) &&
     value >= 0 &&
     value <= 4_294_967_295
+    ? value
+    : "invalid";
+}
+
+function optionalSignedInteger(value: unknown): number | undefined | "invalid" {
+  if (value === null) {
+    return undefined;
+  }
+  return typeof value === "number" && Number.isInteger(value)
     ? value
     : "invalid";
 }

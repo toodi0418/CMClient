@@ -5,6 +5,7 @@ import type { PositionObservation } from "@cmclient/contracts";
 import { createMeshObservation } from "./observations";
 import {
   PositionDuplicateDetector,
+  PositionHighWaterStore,
   PositionRepository,
   createCanonicalPositionEvent,
 } from "./position";
@@ -103,7 +104,98 @@ describe("PositionDuplicateDetector", () => {
   });
 });
 
-function positionObservation(id: string): PositionObservation {
+describe("PositionHighWaterStore", () => {
+  it("advances trusted time, preserves historical events, and opens a sequence epoch after reset", () => {
+    const database = new GatewayDatabase(":memory:");
+    const observations = [
+      positionObservation("position-observation-a"),
+      positionObservation("position-observation-b", 101, 1784332801, "b"),
+      positionObservation("position-observation-c", 99, 1784332799, "c"),
+      positionObservation("position-observation-d", 1, 1784332802, "d"),
+    ];
+    for (const observation of observations) {
+      database.meshObservations.insert(
+        meshObservation(observation.meshObservationId),
+      );
+    }
+    const repository = new PositionRepository(database.connection);
+    const detector = new PositionDuplicateDetector(repository);
+    const events = observations.map((observation) => {
+      const result = detector.observe(observation);
+      if (result.kind !== "new") {
+        throw new Error("fixture position unexpectedly duplicated");
+      }
+      return result.event;
+    });
+    const state = new PositionHighWaterStore(database.connection);
+    const target = { callsign: "N0CALL-7", mappingVersion: "mapping-v1" };
+
+    const first = state.apply(events[0]!, target, "2026-07-18T00:00:02.000Z");
+    const second = state.apply(events[1]!, target, "2026-07-18T00:00:03.000Z");
+    const historical = state.apply(
+      events[2]!,
+      target,
+      "2026-07-18T00:00:04.000Z",
+    );
+    const reboot = state.apply(events[3]!, target, "2026-07-18T00:00:05.000Z");
+
+    expect(first).toMatchObject({
+      decision: { code: "POSITION_ACCEPTED" },
+      state: { latestSequenceEpoch: 0, latestSequenceNumber: 100 },
+    });
+    expect(second).toMatchObject({
+      decision: { code: "POSITION_ACCEPTED" },
+      state: { latestSequenceEpoch: 0, latestSequenceNumber: 101 },
+    });
+    expect(historical).toMatchObject({
+      decision: { code: "POSITION_HISTORICAL" },
+      state: { latestSequenceNumber: 101 },
+    });
+    expect(reboot).toMatchObject({
+      decision: { code: "POSITION_ACCEPTED" },
+      event: { sequenceEpoch: 1 },
+      state: { latestSequenceEpoch: 1, latestSequenceNumber: 1 },
+    });
+    database.close();
+  });
+
+  it("fails closed when a cold start provides sequence but no source time", () => {
+    const database = new GatewayDatabase(":memory:");
+    const observation = positionObservation(
+      "position-observation-sequence-only",
+      7,
+      0,
+      "e",
+    );
+    database.meshObservations.insert(
+      meshObservation(observation.meshObservationId),
+    );
+    const detected = new PositionDuplicateDetector(
+      new PositionRepository(database.connection),
+    ).observe(observation);
+    if (detected.kind !== "new") {
+      throw new Error("fixture position unexpectedly duplicated");
+    }
+
+    const result = new PositionHighWaterStore(database.connection).apply(
+      detected.event,
+      { callsign: "N0CALL-7", mappingVersion: "mapping-v1" },
+      "2026-07-18T00:00:02.000Z",
+    );
+    expect(result).toMatchObject({
+      decision: { code: "APRS_SKIPPED_OUT_OF_ORDER" },
+    });
+    expect(result.state).toBeUndefined();
+    database.close();
+  });
+});
+
+function positionObservation(
+  id: string,
+  sequenceNumber = 100,
+  positionTimestampSeconds: number | undefined = 1784332800,
+  payloadHashCharacter = "a",
+): PositionObservation {
   return {
     schemaVersion: 1,
     id,
@@ -118,14 +210,16 @@ function positionObservation(id: string): PositionObservation {
     deviceRxTimeSeconds: 1784332800,
     backlogClassification: "live",
     packetId: 1001,
-    payloadHash: "a".repeat(64),
+    payloadHash: payloadHashCharacter.repeat(64),
     rxRssi: -70,
     position: {
       latitudeI: 250000000,
       longitudeI: 1215000000,
       altitudeMslMeters: 0,
-      positionTimestampSeconds: 1784332800,
-      sequenceNumber: 9,
+      ...(positionTimestampSeconds === undefined
+        ? {}
+        : { positionTimestampSeconds }),
+      sequenceNumber,
       precisionBits: 32,
     },
   };

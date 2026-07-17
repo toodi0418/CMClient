@@ -29,3 +29,12 @@ event observed by multiple iGates converges to one canonical key, while packet
 ID reuse with changed payload content produces a separate event. SQLite's
 unique canonical key records the first event and writes `POSITION_DUPLICATE`
 for later local observations without replacing the source event.
+
+High-water updates run in a SQLite `BEGIN IMMEDIATE` transaction scoped by the
+state composite key. A later trusted event time advances the state; an earlier
+one is retained as `POSITION_HISTORICAL`. When time is equal, a greater sequence
+can advance the same epoch, while equal sequence is a conflict. A lower sequence
+only starts a new epoch when its trusted source time is later, which accounts
+for reboot or wrap without treating a late packet as live. A cold start with
+sequence but no reliable source time is `APRS_SKIPPED_OUT_OF_ORDER` and does
+not create a high-water row.
