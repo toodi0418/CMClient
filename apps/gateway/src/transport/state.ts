@@ -34,6 +34,16 @@ export class TransportConnectionStateMachine {
     options: ConnectionTransitionOptions = {},
   ): TransportConnectionState {
     if (next === this.current.status) {
+      validateTransition(next, options);
+      if (next === "backoff") {
+        this.current = {
+          transport: this.transport,
+          status: next,
+          changedAt: now(this.clock),
+          attempt: options.attempt,
+          reasonCode: options.reasonCode,
+        } as TransportConnectionState;
+      }
       return this.current;
     }
     if (!canTransition(this.current.status, next)) {
