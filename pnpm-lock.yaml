@@ -33,9 +33,17 @@ importers:
         specifier: ^4.1.10
         version: 4.1.10(@types/node@26.1.1)(vite@8.1.5(@types/node@26.1.1))
 
-  packages/config: {}
+  packages/config:
+    dependencies:
+      '@cmclient/contracts':
+        specifier: workspace:*
+        version: link:../contracts
 
-  packages/contracts: {}
+  packages/contracts:
+    dependencies:
+      '@sinclair/typebox':
+        specifier: ^0.34.52
+        version: 0.34.52
 
   packages/testing: {}
 
@@ -220,6 +228,9 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+
+  '@sinclair/typebox@0.34.52':
+    resolution: {integrity: sha512-XiMQh7qqVlxZzcVD+kkGMNGMzcTrDMLWI7S4x7z1MkCkbDPrekpZXEUK0eZqZFMuHQg2a2DZOcDIh9o5v3Gonw==}
 
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
@@ -983,6 +994,8 @@ snapshots:
     optional: true
 
   '@rolldown/pluginutils@1.0.1': {}
+
+  '@sinclair/typebox@0.34.52': {}
 
   '@standard-schema/spec@1.1.0': {}
 

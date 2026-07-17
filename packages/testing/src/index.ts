@@ -9,6 +9,6 @@ export function fixedClock(isoTimestamp: string): Clock {
   }
 
   return {
-    now: () => new Date(instant)
+    now: () => new Date(instant),
   };
 }

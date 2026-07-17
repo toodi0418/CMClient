@@ -6,6 +6,9 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "dependencies": {
+    "@cmclient/contracts": "workspace:*"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit --project tsconfig.json"
   }
