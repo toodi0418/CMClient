@@ -13,7 +13,9 @@ export interface MeshtasticSchema {
   fromRadio: Type;
   portNum: Enum;
   root: Root;
+  telemetry: Type;
   toRadio: Type;
+  user: Type;
 }
 
 export async function loadMeshtasticSchema(
@@ -31,6 +33,8 @@ export async function loadMeshtasticSchema(
     fromRadio: root.lookupType("meshtastic.FromRadio"),
     toRadio: root.lookupType("meshtastic.ToRadio"),
     portNum: root.lookupEnum("meshtastic.PortNum"),
+    telemetry: root.lookupType("meshtastic.Telemetry"),
+    user: root.lookupType("meshtastic.User"),
   };
 }
 

@@ -6,7 +6,10 @@ import {
   DomainEventSchema,
   JobDetailSchema,
   JOB_STATUSES,
+  MeshMessageSchema,
+  MeshNodeSchema,
   MeshObservationSchema,
+  MeshTelemetrySchema,
   NormalizedFromRadioSchema,
   SystemCapabilitiesSchema,
   TransportConnectionStateSchema,
@@ -160,6 +163,47 @@ describe("transport contract", () => {
           kind: "packet",
           packet: { portNum: "POSITION_APP" },
         },
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("mesh domain contracts", () => {
+  it("keeps network-scoped node, message, and telemetry records versioned", () => {
+    const node = TypeCompiler.Compile(MeshNodeSchema);
+    const message = TypeCompiler.Compile(MeshMessageSchema);
+    const telemetry = TypeCompiler.Compile(MeshTelemetrySchema);
+    expect(
+      node.Check({
+        schemaVersion: 1,
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        firstSeenAt: "2026-07-18T00:00:00.000Z",
+        lastSeenAt: "2026-07-18T00:00:01.000Z",
+        lastObservationId: "observation-1",
+      }),
+    ).toBe(true);
+    expect(
+      message.Check({
+        schemaVersion: 1,
+        id: "message-1",
+        observationId: "observation-2",
+        meshNetworkId: "fixture-network",
+        sender: 42,
+        text: "fixture message",
+        observedAt: "2026-07-18T00:00:01.000Z",
+      }),
+    ).toBe(true);
+    expect(
+      telemetry.Check({
+        schemaVersion: 1,
+        id: "telemetry-1",
+        observationId: "observation-3",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        metricKind: "deviceMetrics",
+        metrics: { batteryLevel: 73, voltage: 3.9 },
+        observedAt: "2026-07-18T00:00:02.000Z",
       }),
     ).toBe(true);
   });
