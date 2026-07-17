@@ -14,6 +14,8 @@ import {
   type MeshTelemetry,
 } from "@cmclient/contracts";
 
+import { PositionRepository } from "../position.js";
+
 export interface Migration {
   version: number;
   name: string;
@@ -31,6 +33,7 @@ export class GatewayDatabase {
   readonly meshNodes: MeshNodeRepository;
   readonly meshObservations: MeshObservationRepository;
   readonly meshTelemetry: MeshTelemetryRepository;
+  readonly positions: PositionRepository;
   readonly settings: SettingsRepository;
 
   constructor(path: string, migrations: Migration[] = defaultMigrations) {
@@ -47,6 +50,7 @@ export class GatewayDatabase {
     this.meshNodes = new MeshNodeRepository(this.connection);
     this.meshObservations = new MeshObservationRepository(this.connection);
     this.meshTelemetry = new MeshTelemetryRepository(this.connection);
+    this.positions = new PositionRepository(this.connection);
     this.settings = new SettingsRepository(this.connection);
   }
 
@@ -339,6 +343,15 @@ export class MeshNodeRepository {
       .get(meshNetworkId, nodeNum);
     return row ? toMeshNode(row) : undefined;
   }
+
+  list(limit: number): MeshNode[] {
+    return this.database
+      .prepare(
+        "SELECT * FROM nodes ORDER BY last_seen_at DESC, node_num ASC LIMIT ?",
+      )
+      .all(limit)
+      .map((row) => toMeshNode(row as Record<string, unknown>));
+  }
 }
 
 export class MeshMessageRepository {
@@ -384,6 +397,15 @@ export class MeshMessageRepository {
       .get(observationId);
     return row ? toMeshMessage(row) : undefined;
   }
+
+  list(limit: number): MeshMessage[] {
+    return this.database
+      .prepare(
+        "SELECT * FROM messages ORDER BY observed_at DESC, id ASC LIMIT ?",
+      )
+      .all(limit)
+      .map((row) => toMeshMessage(row as Record<string, unknown>));
+  }
 }
 
 export class MeshTelemetryRepository {
@@ -428,6 +450,15 @@ export class MeshTelemetryRepository {
       .prepare("SELECT * FROM telemetry WHERE observation_id = ?")
       .get(observationId);
     return row ? toMeshTelemetry(row) : undefined;
+  }
+
+  list(limit: number): MeshTelemetry[] {
+    return this.database
+      .prepare(
+        "SELECT * FROM telemetry ORDER BY observed_at DESC, id ASC LIMIT ?",
+      )
+      .all(limit)
+      .map((row) => toMeshTelemetry(row as Record<string, unknown>));
   }
 }
 

@@ -101,6 +101,11 @@ export const PositionCanonicalEventSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const PositionCanonicalEventListSchema = Type.Object(
+  { items: Type.Array(PositionCanonicalEventSchema, { maxItems: 200 }) },
+  { additionalProperties: false },
+);
+
 export const PositionDecisionCodeSchema = Type.Union(
   POSITION_DECISION_CODES.map((code) => Type.Literal(code)),
 );
@@ -157,6 +162,9 @@ export type PositionSample = Static<typeof PositionSampleSchema>;
 export type PositionObservation = Static<typeof PositionObservationSchema>;
 export type PositionCanonicalEvent = Static<
   typeof PositionCanonicalEventSchema
+>;
+export type PositionCanonicalEventList = Static<
+  typeof PositionCanonicalEventListSchema
 >;
 export type PositionDecision = Static<typeof PositionDecisionSchema>;
 export type NodePositionState = Static<typeof NodePositionStateSchema>;

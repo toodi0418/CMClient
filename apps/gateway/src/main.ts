@@ -16,6 +16,12 @@ const runtime = new GatewayRuntime(
   undefined,
   events,
   jobs,
+  {
+    listNodes: (limit) => database.meshNodes.list(limit),
+    listMessages: (limit) => database.meshMessages.list(limit),
+    listTelemetry: (limit) => database.meshTelemetry.list(limit),
+    listPositions: (limit) => database.positions.listCanonicalEvents(limit),
+  },
 );
 let shuttingDown = false;
 

@@ -35,6 +35,14 @@ the Agent-provided serial capability and its stable reason code until a live
 transport status API exists; it does not fabricate a radio connection, node
 count, or telemetry value.
 
+The Nodes, Messages, Telemetry, and Positions views consume bounded (maximum
+200 records) read projections from Gateway persistence. Nodes, messages, and
+telemetry are ordered by their persisted observation timestamps; positions are
+canonical events ordered by trusted event time with creation time only as the
+stable fallback. The Web position plot is local-only and uses the persisted
+coordinates directly, so opening the management interface does not disclose
+Mesh locations to an external map tile provider.
+
 The shell uses Tailwind 4 through the Vite integration and maps its `cm-*`
 utility names to semantic CSS variables in `apps/web/src/theme/tokens.css`.
 Those tokens identify canvas, surfaces, content, accent, warning, danger and

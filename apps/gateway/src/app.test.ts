@@ -63,6 +63,42 @@ describe("GatewayRuntime", () => {
     await app.close();
   });
 
+  it("serves bounded domain list projections and fails closed without persistence", async () => {
+    const limits: number[] = [];
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      undefined,
+      {},
+      undefined,
+      {
+        listNodes: (limit) => {
+          limits.push(limit);
+          return [];
+        },
+        listMessages: () => [],
+        listTelemetry: () => [],
+        listPositions: () => [],
+      },
+    );
+
+    const nodes = await app.inject("/api/v1/nodes?limit=2");
+    const positions = await app.inject("/api/v1/positions");
+    expect(nodes.statusCode).toBe(200);
+    expect(nodes.json()).toEqual({ items: [] });
+    expect(positions.json()).toEqual({ items: [] });
+    expect(limits).toEqual([2]);
+    await app.close();
+
+    const unavailable = createGatewayApp(new MemoryLogger());
+    const response = await unavailable.inject("/api/v1/messages");
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      code: "GATEWAY_DOMAIN_DATA_UNAVAILABLE",
+    });
+    await unavailable.close();
+  });
+
   it("replays SSE events after Last-Event-ID and starts a heartbeat stream", async () => {
     let sequence = 0;
     const events = new DomainEventBus({

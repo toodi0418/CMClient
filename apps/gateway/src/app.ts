@@ -8,11 +8,19 @@ import {
   ApiErrorSchema,
   BuildMetadataSchema,
   JobDetailSchema,
+  MeshMessageListSchema,
+  MeshNodeListSchema,
+  MeshTelemetryListSchema,
+  PositionCanonicalEventListSchema,
   SystemCapabilitiesSchema,
   SystemHealthSchema,
   SystemStatusSchema,
   type DomainEvent,
   type JobDetail,
+  type MeshMessage,
+  type MeshNode,
+  type MeshTelemetry,
+  type PositionCanonicalEvent,
 } from "@cmclient/contracts";
 
 import {
@@ -37,6 +45,13 @@ export interface GatewayJobApi {
   cancel(jobId: string, correlationId?: string): JobDetail | undefined;
 }
 
+export interface GatewayDomainReadApi {
+  listNodes(limit: number): MeshNode[];
+  listMessages(limit: number): MeshMessage[];
+  listTelemetry(limit: number): MeshTelemetry[];
+  listPositions(limit: number): PositionCanonicalEvent[];
+}
+
 declare module "fastify" {
   interface FastifyInstance {
     eventBus: DomainEventBus;
@@ -59,6 +74,10 @@ export interface GatewaySseOptions {
 
 interface JobIdParams {
   jobId: string;
+}
+
+interface ListQuery {
+  limit?: number;
 }
 
 export class GatewayConfigurationError extends Error {
@@ -93,9 +112,10 @@ export class GatewayRuntime {
     system?: GatewaySystemState,
     eventBus?: DomainEventBus,
     jobs?: GatewayJobApi,
+    domain?: GatewayDomainReadApi,
   ) {
     this.options = options;
-    this.app = createGatewayApp(logger, system, eventBus, {}, jobs);
+    this.app = createGatewayApp(logger, system, eventBus, {}, jobs, domain);
   }
 
   async start(): Promise<GatewayListenOptions> {
@@ -130,6 +150,7 @@ export function createGatewayApp(
   eventBus: DomainEventBus = new DomainEventBus(),
   sseOptions: GatewaySseOptions = {},
   jobs?: GatewayJobApi,
+  domain?: GatewayDomainReadApi,
 ): FastifyInstance {
   const heartbeatIntervalMs = sseOptions.heartbeatIntervalMs ?? 15_000;
   if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
@@ -198,6 +219,61 @@ export function createGatewayApp(
       },
     },
     async () => ({ health: "ok", build: system.build }),
+  );
+  app.get<{ Querystring: ListQuery }>(
+    "/api/v1/nodes",
+    {
+      schema: {
+        querystring: listQuerySchema(),
+        response: { 200: MeshNodeListSchema, 503: ApiErrorSchema },
+      },
+    },
+    (request, reply) =>
+      domain
+        ? { items: domain.listNodes(resolveListLimit(request.query.limit)) }
+        : sendDomainDataUnavailable(request, reply),
+  );
+  app.get<{ Querystring: ListQuery }>(
+    "/api/v1/messages",
+    {
+      schema: {
+        querystring: listQuerySchema(),
+        response: { 200: MeshMessageListSchema, 503: ApiErrorSchema },
+      },
+    },
+    (request, reply) =>
+      domain
+        ? { items: domain.listMessages(resolveListLimit(request.query.limit)) }
+        : sendDomainDataUnavailable(request, reply),
+  );
+  app.get<{ Querystring: ListQuery }>(
+    "/api/v1/telemetry",
+    {
+      schema: {
+        querystring: listQuerySchema(),
+        response: { 200: MeshTelemetryListSchema, 503: ApiErrorSchema },
+      },
+    },
+    (request, reply) =>
+      domain
+        ? { items: domain.listTelemetry(resolveListLimit(request.query.limit)) }
+        : sendDomainDataUnavailable(request, reply),
+  );
+  app.get<{ Querystring: ListQuery }>(
+    "/api/v1/positions",
+    {
+      schema: {
+        querystring: listQuerySchema(),
+        response: {
+          200: PositionCanonicalEventListSchema,
+          503: ApiErrorSchema,
+        },
+      },
+    },
+    (request, reply) =>
+      domain
+        ? { items: domain.listPositions(resolveListLimit(request.query.limit)) }
+        : sendDomainDataUnavailable(request, reply),
   );
   app.get("/api/v1/events", (request, reply) => {
     openSseStream(request, reply, eventBus, logger, heartbeatIntervalMs);
@@ -285,6 +361,16 @@ function jobIdParamsSchema() {
   return Type.Object({ jobId: Type.String({ minLength: 1, maxLength: 128 }) });
 }
 
+function listQuerySchema() {
+  return Type.Object({
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  });
+}
+
+function resolveListLimit(limit: number | undefined): number {
+  return limit ?? 100;
+}
+
 function sendJobNotFound(request: FastifyRequest, reply: FastifyReply) {
   return reply.code(404).send({
     code: "JOB_NOT_FOUND",
@@ -299,6 +385,17 @@ function sendJobEngineUnavailable(
 ) {
   return reply.code(503).send({
     code: "GATEWAY_JOB_ENGINE_UNAVAILABLE",
+    params: {},
+    traceId: request.traceId,
+  });
+}
+
+function sendDomainDataUnavailable(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  return reply.code(503).send({
+    code: "GATEWAY_DOMAIN_DATA_UNAVAILABLE",
     params: {},
     traceId: request.traceId,
   });

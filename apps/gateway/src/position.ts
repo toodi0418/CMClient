@@ -148,6 +148,15 @@ export class PositionRepository {
     return row ? toPositionCanonicalEvent(row) : undefined;
   }
 
+  listCanonicalEvents(limit: number): PositionCanonicalEvent[] {
+    return this.database
+      .prepare(
+        "SELECT * FROM position_events ORDER BY COALESCE(event_time, created_at) DESC, id ASC LIMIT ?",
+      )
+      .all(limit)
+      .map((row) => toPositionCanonicalEvent(row as Record<string, unknown>));
+  }
+
   insertOrFindDecision(decision: PositionDecision): PositionDecision {
     try {
       this.database

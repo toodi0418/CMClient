@@ -61,6 +61,24 @@ export const MeshTelemetrySchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const MeshNodeListSchema = Type.Object(
+  { items: Type.Array(MeshNodeSchema, { maxItems: 200 }) },
+  { additionalProperties: false },
+);
+
+export const MeshMessageListSchema = Type.Object(
+  { items: Type.Array(MeshMessageSchema, { maxItems: 200 }) },
+  { additionalProperties: false },
+);
+
+export const MeshTelemetryListSchema = Type.Object(
+  { items: Type.Array(MeshTelemetrySchema, { maxItems: 200 }) },
+  { additionalProperties: false },
+);
+
 export type MeshNode = Static<typeof MeshNodeSchema>;
 export type MeshMessage = Static<typeof MeshMessageSchema>;
 export type MeshTelemetry = Static<typeof MeshTelemetrySchema>;
+export type MeshNodeList = Static<typeof MeshNodeListSchema>;
+export type MeshMessageList = Static<typeof MeshMessageListSchema>;
+export type MeshTelemetryList = Static<typeof MeshTelemetryListSchema>;

@@ -5,10 +5,6 @@ import {
 } from "vue-router";
 
 const sections = [
-  ["nodes", "navigation.nodes", "section.nodes"],
-  ["positions", "navigation.positions", "section.positions"],
-  ["messages", "navigation.messages", "section.messages"],
-  ["telemetry", "navigation.telemetry", "section.telemetry"],
   ["aprs", "navigation.aprs", "section.aprs"],
   ["logs", "navigation.logs", "section.logs"],
   ["settings", "navigation.settings", "section.settings"],
@@ -36,6 +32,30 @@ export const router = createRouter({
       name: "meshtastic",
       component: () => import("@/views/MeshtasticView.vue"),
       meta: { labelKey: "navigation.meshtastic", group: "operations" },
+    },
+    {
+      path: "/nodes",
+      name: "nodes",
+      component: () => import("@/views/NodesView.vue"),
+      meta: { labelKey: "navigation.nodes", group: "operations" },
+    },
+    {
+      path: "/positions",
+      name: "positions",
+      component: () => import("@/views/PositionsView.vue"),
+      meta: { labelKey: "navigation.positions", group: "operations" },
+    },
+    {
+      path: "/messages",
+      name: "messages",
+      component: () => import("@/views/MessagesView.vue"),
+      meta: { labelKey: "navigation.messages", group: "operations" },
+    },
+    {
+      path: "/telemetry",
+      name: "telemetry",
+      component: () => import("@/views/TelemetryView.vue"),
+      meta: { labelKey: "navigation.telemetry", group: "operations" },
     },
     ...sections.map(([name, labelKey, summaryKey]) => ({
       path: `/${name}`,

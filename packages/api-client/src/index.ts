@@ -2,12 +2,20 @@ import {
   ApiErrorSchema,
   BuildMetadataSchema,
   JobDetailSchema,
+  MeshMessageListSchema,
+  MeshNodeListSchema,
+  MeshTelemetryListSchema,
+  PositionCanonicalEventListSchema,
   SystemCapabilitiesSchema,
   SystemHealthSchema,
   SystemStatusSchema,
   type BuildMetadata,
   type ApiError,
   type JobDetail,
+  type MeshMessageList,
+  type MeshNodeList,
+  type MeshTelemetryList,
+  type PositionCanonicalEventList,
   type SystemCapabilities,
   type SystemHealth,
   type SystemStatus,
@@ -129,6 +137,19 @@ export class GatewayApiClient {
       this.requestJob<JobDetail>(jobId, "GET", JobDetailSchema),
     cancel: (jobId: string) =>
       this.requestJob<JobDetail>(jobId, "POST", JobDetailSchema),
+  };
+
+  readonly domain = {
+    nodes: () => this.request<MeshNodeList>("/nodes", MeshNodeListSchema),
+    messages: () =>
+      this.request<MeshMessageList>("/messages", MeshMessageListSchema),
+    telemetry: () =>
+      this.request<MeshTelemetryList>("/telemetry", MeshTelemetryListSchema),
+    positions: () =>
+      this.request<PositionCanonicalEventList>(
+        "/positions",
+        PositionCanonicalEventListSchema,
+      ),
   };
 
   private async request<T>(
