@@ -766,4 +766,16 @@ const defaultMigrations: Migration[] = [
       );
     },
   },
+  {
+    version: 7,
+    name: "aprs_remote_high_water",
+    up(database) {
+      database.exec(
+        "CREATE TABLE aprs_remote_high_water (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, mapping_version TEXT NOT NULL, latest_event_time TEXT NOT NULL, latest_event_marker TEXT NOT NULL, received_at TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num, callsign, mapping_version))",
+      );
+      database.exec(
+        "CREATE INDEX aprs_remote_high_water_callsign_event_time_index ON aprs_remote_high_water (callsign, latest_event_time DESC)",
+      );
+    },
+  },
 ];

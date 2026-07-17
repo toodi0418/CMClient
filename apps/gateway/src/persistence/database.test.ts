@@ -31,7 +31,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT version FROM schema_migrations")
         .all(),
-    ).toHaveLength(6);
+    ).toHaveLength(7);
     database.close();
     expect(existsSync(path)).toBe(true);
     rmSync(path, { force: true });
@@ -53,7 +53,7 @@ describe("GatewayDatabase", () => {
     expect(() =>
       runMigrations(database.connection, [
         {
-          version: 7,
+          version: 8,
           name: "broken",
           up(connection) {
             connection.exec(
@@ -66,7 +66,7 @@ describe("GatewayDatabase", () => {
     ).toThrow(DatabaseMigrationError);
     expect(
       database.connection
-        .prepare("SELECT version FROM schema_migrations WHERE version = 7")
+        .prepare("SELECT version FROM schema_migrations WHERE version = 8")
         .get(),
     ).toBeUndefined();
     expect(
