@@ -79,7 +79,13 @@ describe("TcpMeshtasticTransport", () => {
       random: () => 0,
     });
     const events: string[] = [];
-    transport.subscribe((event) => events.push(event.kind));
+    const sessionConnectedAt: string[] = [];
+    transport.subscribe((event) => {
+      events.push(event.kind);
+      if (event.kind === "frame" && event.sessionConnectedAt) {
+        sessionConnectedAt.push(event.sessionConnectedAt);
+      }
+    });
 
     await transport.connect();
     expect(transport.state.status).toBe("ready");
@@ -87,6 +93,10 @@ describe("TcpMeshtasticTransport", () => {
     await payloadObserved;
     expect(observedPayload).toEqual(new Uint8Array([99]));
     expect(events).toContain("frame");
+    expect(sessionConnectedAt).toHaveLength(1);
+    expect(sessionConnectedAt[0]).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+    );
     expect(transport.metrics.framesSent).toBe(2);
 
     await transport.disconnect();

@@ -50,6 +50,7 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
   private resolveConnected: (() => void) | undefined;
   private rejectConnected: ((error: Error) => void) | undefined;
   private failureCode = "TCP_CONNECTION_CLOSED";
+  private sessionConnectedAt: string | undefined;
 
   constructor(private readonly options: TcpMeshtasticTransportOptions) {
     if (
@@ -116,6 +117,7 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     }
     this.clearConfigTimeout();
     this.configSession.reset();
+    this.sessionConnectedAt = undefined;
     const socket = this.socket;
     this.socket = undefined;
     socket?.destroy();
@@ -163,6 +165,7 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
       }
       this.failureCode = "TCP_CONNECTION_CLOSED";
       this.configSession.reset();
+      this.sessionConnectedAt = undefined;
       this.emitState(this.stateMachine.transition("configuring"));
       try {
         this.writeEncoded(
@@ -214,7 +217,9 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
           if (this.configSession.observe(frame)) {
             this.clearConfigTimeout();
             this.attempts = 0;
-            this.emitState(this.stateMachine.transition("ready"));
+            const readyState = this.stateMachine.transition("ready");
+            this.sessionConnectedAt = readyState.changedAt;
+            this.emitState(readyState);
             this.resolvePending();
           }
         } catch {
@@ -227,6 +232,9 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
         kind: "frame",
         frame,
         receivedAt: (this.options.clock ?? (() => new Date()))().toISOString(),
+        ...(this.sessionConnectedAt
+          ? { sessionConnectedAt: this.sessionConnectedAt }
+          : {}),
       });
     }
   }
@@ -237,6 +245,7 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     }
     this.socket = undefined;
     this.configSession.reset();
+    this.sessionConnectedAt = undefined;
     this.clearConfigTimeout();
     if (this.manualDisconnect) {
       return;

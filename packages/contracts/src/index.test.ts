@@ -6,6 +6,7 @@ import {
   DomainEventSchema,
   JobDetailSchema,
   JOB_STATUSES,
+  MeshObservationSchema,
   NormalizedFromRadioSchema,
   SystemCapabilitiesSchema,
   TransportConnectionStateSchema,
@@ -137,6 +138,27 @@ describe("transport contract", () => {
           packetId: 1001,
           portNum: "POSITION_APP",
           deviceRxTimeSeconds: 1893456246,
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps session, API ingest, and server ingest times distinct", () => {
+    const check = TypeCompiler.Compile(MeshObservationSchema);
+    expect(
+      check.Check({
+        schemaVersion: 1,
+        id: "observation-1",
+        transport: "tcp",
+        sessionConnectedAt: "2026-07-18T00:00:00.000Z",
+        ingestedAt: "2026-07-18T00:00:01.000Z",
+        serverIngestedAt: "2026-07-18T00:00:01.005Z",
+        deviceRxTimeSeconds: 1784332800,
+        backlogClassification: "backlog",
+        normalizedFromRadio: {
+          schemaVersion: 1,
+          kind: "packet",
+          packet: { portNum: "POSITION_APP" },
         },
       }),
     ).toBe(true);

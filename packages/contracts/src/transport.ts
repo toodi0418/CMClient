@@ -12,12 +12,16 @@ export const CONNECTION_STATUSES = [
   "degraded",
   "backoff",
 ] as const;
+export const BACKLOG_CLASSIFICATIONS = ["backlog", "live", "unknown"] as const;
 
 export const TransportKindSchema = Type.Union(
   TRANSPORT_KINDS.map((kind) => Type.Literal(kind)),
 );
 export const ConnectionStatusSchema = Type.Union(
   CONNECTION_STATUSES.map((status) => Type.Literal(status)),
+);
+export const BacklogClassificationSchema = Type.Union(
+  BACKLOG_CLASSIFICATIONS.map((classification) => Type.Literal(classification)),
 );
 export const TransportConnectionStateSchema = Type.Object(
   {
@@ -60,7 +64,9 @@ export const NormalizedMeshPacketSchema = Type.Object(
     portNum: Type.Optional(Type.String({ minLength: 1 })),
     payloadBase64: Type.Optional(Type.String({ minLength: 1 })),
     encryptedPayloadBase64: Type.Optional(Type.String({ minLength: 1 })),
-    deviceRxTimeSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+    deviceRxTimeSeconds: Type.Optional(
+      Type.Integer({ minimum: 0, maximum: 4_294_967_295 }),
+    ),
     rxSnr: Type.Optional(Type.Number()),
     rxRssi: Type.Optional(Type.Integer()),
     hopLimit: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -84,9 +90,26 @@ export const NormalizedFromRadioSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+export const MeshObservationSchema = Type.Object(
+  {
+    schemaVersion: Type.Literal(1),
+    id: Type.String({ minLength: 1, maxLength: 128 }),
+    transport: TransportKindSchema,
+    sessionConnectedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    ingestedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    serverIngestedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    deviceRxTimeSeconds: Type.Optional(
+      Type.Integer({ minimum: 0, maximum: 4_294_967_295 }),
+    ),
+    backlogClassification: BacklogClassificationSchema,
+    normalizedFromRadio: NormalizedFromRadioSchema,
+  },
+  { additionalProperties: false },
+);
 
 export type TransportKind = (typeof TRANSPORT_KINDS)[number];
 export type ConnectionStatus = (typeof CONNECTION_STATUSES)[number];
+export type BacklogClassification = (typeof BACKLOG_CLASSIFICATIONS)[number];
 export type TransportConnectionState = Static<
   typeof TransportConnectionStateSchema
 >;
@@ -94,3 +117,4 @@ export type TransportMetrics = Static<typeof TransportMetricsSchema>;
 export type SerialDevice = Static<typeof SerialDeviceSchema>;
 export type NormalizedMeshPacket = Static<typeof NormalizedMeshPacketSchema>;
 export type NormalizedFromRadio = Static<typeof NormalizedFromRadioSchema>;
+export type MeshObservation = Static<typeof MeshObservationSchema>;

@@ -2,7 +2,14 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import type { JobDetail, JobError, JobStatus } from "@cmclient/contracts";
+import {
+  BACKLOG_CLASSIFICATIONS,
+  TRANSPORT_KINDS,
+  type JobDetail,
+  type JobError,
+  type JobStatus,
+  type MeshObservation,
+} from "@cmclient/contracts";
 
 export interface Migration {
   version: number;
@@ -17,6 +24,7 @@ export class DatabaseMigrationError extends Error {
 export class GatewayDatabase {
   readonly connection: DatabaseSync;
   readonly jobs: JobRepository;
+  readonly meshObservations: MeshObservationRepository;
   readonly settings: SettingsRepository;
 
   constructor(path: string, migrations: Migration[] = defaultMigrations) {
@@ -29,6 +37,7 @@ export class GatewayDatabase {
     this.connection.exec("PRAGMA busy_timeout = 5000");
     runMigrations(this.connection, migrations);
     this.jobs = new JobRepository(this.connection);
+    this.meshObservations = new MeshObservationRepository(this.connection);
     this.settings = new SettingsRepository(this.connection);
   }
 
@@ -238,6 +247,48 @@ export class JobPersistenceError extends Error {
   readonly code = "JOB_PERSISTENCE_FAILED";
 }
 
+export class MeshObservationPersistenceError extends Error {
+  readonly code = "MESH_OBSERVATION_PERSISTENCE_FAILED";
+}
+
+export class MeshObservationRepository {
+  constructor(private readonly database: DatabaseSync) {}
+
+  insert(observation: MeshObservation): MeshObservation {
+    try {
+      this.database
+        .prepare(
+          "INSERT INTO mesh_observations (id, schema_version, transport, session_connected_at, ingested_at, server_ingested_at, device_rx_time_seconds, backlog_classification, normalized_from_radio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          observation.id,
+          observation.schemaVersion,
+          observation.transport,
+          observation.sessionConnectedAt,
+          observation.ingestedAt,
+          observation.serverIngestedAt,
+          observation.deviceRxTimeSeconds ?? null,
+          observation.backlogClassification,
+          JSON.stringify(observation.normalizedFromRadio),
+        );
+    } catch {
+      throw new MeshObservationPersistenceError();
+    }
+    const stored = this.find(observation.id);
+    if (!stored) {
+      throw new MeshObservationPersistenceError();
+    }
+    return stored;
+  }
+
+  find(id: string): MeshObservation | undefined {
+    const row = this.database
+      .prepare("SELECT * FROM mesh_observations WHERE id = ?")
+      .get(id);
+    return row ? toMeshObservation(row) : undefined;
+  }
+}
+
 function toStoredJob(row: Record<string, unknown>): StoredJob {
   const errorCode = optionalString(row.error_code);
   return {
@@ -300,6 +351,61 @@ function parseErrorParams(
   return params as Record<string, string | number | boolean | null>;
 }
 
+function toMeshObservation(row: Record<string, unknown>): MeshObservation {
+  const transport = String(row.transport);
+  const backlogClassification = String(row.backlog_classification);
+  const deviceRxTimeSeconds = optionalNonNegativeInteger(
+    row.device_rx_time_seconds,
+  );
+  if (
+    !TRANSPORT_KINDS.includes(transport as (typeof TRANSPORT_KINDS)[number]) ||
+    !BACKLOG_CLASSIFICATIONS.includes(
+      backlogClassification as (typeof BACKLOG_CLASSIFICATIONS)[number],
+    ) ||
+    (row.device_rx_time_seconds !== null && deviceRxTimeSeconds === undefined)
+  ) {
+    throw new MeshObservationPersistenceError();
+  }
+  return {
+    schemaVersion: 1,
+    id: String(row.id),
+    transport: transport as MeshObservation["transport"],
+    sessionConnectedAt: String(row.session_connected_at),
+    ingestedAt: String(row.ingested_at),
+    serverIngestedAt: String(row.server_ingested_at),
+    ...(deviceRxTimeSeconds !== undefined ? { deviceRxTimeSeconds } : {}),
+    backlogClassification:
+      backlogClassification as MeshObservation["backlogClassification"],
+    normalizedFromRadio: parseNormalizedFromRadio(row.normalized_from_radio),
+  };
+}
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= 4_294_967_295
+    ? value
+    : undefined;
+}
+
+function parseNormalizedFromRadio(
+  value: unknown,
+): MeshObservation["normalizedFromRadio"] {
+  try {
+    const parsed = JSON.parse(String(value)) as unknown;
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+      throw new MeshObservationPersistenceError();
+    }
+    return parsed as MeshObservation["normalizedFromRadio"];
+  } catch (error) {
+    if (error instanceof MeshObservationPersistenceError) {
+      throw error;
+    }
+    throw new MeshObservationPersistenceError();
+  }
+}
+
 const defaultMigrations: Migration[] = [
   {
     version: 1,
@@ -322,6 +428,18 @@ const defaultMigrations: Migration[] = [
       );
       database.exec(
         "CREATE INDEX jobs_status_updated_at_index ON jobs (status, updated_at)",
+      );
+    },
+  },
+  {
+    version: 3,
+    name: "mesh_observations",
+    up(database) {
+      database.exec(
+        "CREATE TABLE mesh_observations (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL CHECK (schema_version = 1), transport TEXT NOT NULL CHECK (transport IN ('tcp', 'serial', 'simulator')), session_connected_at TEXT NOT NULL, ingested_at TEXT NOT NULL, server_ingested_at TEXT NOT NULL, device_rx_time_seconds INTEGER CHECK (device_rx_time_seconds IS NULL OR (device_rx_time_seconds >= 0 AND device_rx_time_seconds <= 4294967295)), backlog_classification TEXT NOT NULL CHECK (backlog_classification IN ('backlog', 'live', 'unknown')), normalized_from_radio TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+      );
+      database.exec(
+        "CREATE INDEX mesh_observations_session_ingested_at_index ON mesh_observations (session_connected_at, ingested_at)",
       );
     },
   },

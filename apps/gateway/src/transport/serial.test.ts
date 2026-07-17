@@ -32,6 +32,12 @@ describe("SerialMeshtasticTransport", () => {
       configSession: codec,
       random: () => 0,
     });
+    const sessionConnectedAt: string[] = [];
+    transport.subscribe((event) => {
+      if (event.kind === "frame" && event.sessionConnectedAt) {
+        sessionConnectedAt.push(event.sessionConnectedAt);
+      }
+    });
     const connecting = transport.connect();
     await waitFor(() => connection.writes.length === 1);
     connection.emitData(encodeMeshtasticFrame(new Uint8Array([2, 0, 0, 0, 1])));
@@ -43,6 +49,10 @@ describe("SerialMeshtasticTransport", () => {
       new Uint8Array([1, 0, 0, 0, 1]),
       new Uint8Array([99]),
     ]);
+    expect(sessionConnectedAt).toHaveLength(1);
+    expect(sessionConnectedAt[0]).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+    );
     expect(await listSerialDevices(adapter)).toEqual([
       { path: "/dev/cu.fixture-b", vendorId: "b" },
       { path: "/dev/cu.fixture-a", vendorId: "a" },

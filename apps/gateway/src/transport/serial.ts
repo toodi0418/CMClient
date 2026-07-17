@@ -105,6 +105,7 @@ export class SerialMeshtasticTransport implements MeshtasticTransport {
   private resolveConnected: (() => void) | undefined;
   private rejectConnected: ((error: Error) => void) | undefined;
   private failureCode = "SERIAL_CONNECTION_CLOSED";
+  private sessionConnectedAt: string | undefined;
 
   constructor(private readonly options: SerialMeshtasticTransportOptions) {
     if (
@@ -170,6 +171,7 @@ export class SerialMeshtasticTransport implements MeshtasticTransport {
     }
     this.clearConfigTimeout();
     this.configSession.reset();
+    this.sessionConnectedAt = undefined;
     const connection = this.connection;
     this.connection = undefined;
     await connection?.close();
@@ -242,11 +244,13 @@ export class SerialMeshtasticTransport implements MeshtasticTransport {
       if (this.connection === connection) {
         this.connection = undefined;
         this.configSession.reset();
+        this.sessionConnectedAt = undefined;
         this.clearConfigTimeout();
         this.scheduleReconnect();
       }
     });
     this.configSession.reset();
+    this.sessionConnectedAt = undefined;
     this.emitState(this.stateMachine.transition("configuring"));
     try {
       await this.writeEncoded(
@@ -281,7 +285,9 @@ export class SerialMeshtasticTransport implements MeshtasticTransport {
           if (this.configSession.observe(frame)) {
             this.clearConfigTimeout();
             this.attempts = 0;
-            this.emitState(this.stateMachine.transition("ready"));
+            const readyState = this.stateMachine.transition("ready");
+            this.sessionConnectedAt = readyState.changedAt;
+            this.emitState(readyState);
             this.resolvePending();
           }
         } catch {
@@ -294,6 +300,9 @@ export class SerialMeshtasticTransport implements MeshtasticTransport {
         kind: "frame",
         frame,
         receivedAt: (this.options.clock ?? (() => new Date()))().toISOString(),
+        ...(this.sessionConnectedAt
+          ? { sessionConnectedAt: this.sessionConnectedAt }
+          : {}),
       });
     }
   }

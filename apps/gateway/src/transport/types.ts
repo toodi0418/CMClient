@@ -8,6 +8,7 @@ export interface TransportFrameEvent {
   kind: "frame";
   frame: Uint8Array;
   receivedAt: string;
+  sessionConnectedAt?: string;
 }
 
 export interface TransportStateEvent {
