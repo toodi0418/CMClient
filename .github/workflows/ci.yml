@@ -31,6 +31,7 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm build
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
       - run: cargo build --workspace --locked

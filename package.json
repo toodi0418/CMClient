@@ -12,6 +12,7 @@
     "format:write": "prettier --write .",
     "lint": "eslint .",
     "typecheck": "pnpm --recursive --if-present run typecheck",
+    "build": "pnpm --recursive --if-present run build",
     "test": "pnpm run test:fixtures && vitest run",
     "test:fixtures": "node --test test/fixtures/sanitized-packet-fixtures.test.js"
   },
