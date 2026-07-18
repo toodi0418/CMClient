@@ -13,7 +13,8 @@
     "lint": "eslint .",
     "typecheck": "pnpm --filter @cmclient/contracts run build && pnpm --recursive --if-present run typecheck",
     "build": "pnpm --recursive --if-present run build",
-    "test": "pnpm --filter @cmclient/contracts run build && pnpm run test:fixtures && vitest run",
+    "test": "pnpm --filter @cmclient/contracts run build && pnpm run test:fixtures && pnpm run test:release-artifacts && vitest run",
+    "test:release-artifacts": "node --test scripts/release-artifacts.test.mjs",
     "test:e2e:web": "playwright test",
     "test:fixtures": "node --test test/fixtures/sanitized-packet-fixtures.test.js"
   },

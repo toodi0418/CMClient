@@ -1,0 +1,200 @@
+name: Release Build Matrix
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  artifact-plan:
+    name: Verify artifact plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Generate canonical artifact plan
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          node scripts/release-artifacts.mjs plan --version "$version" --output release-build/artifact-plan.json
+          node scripts/release-artifacts.mjs check-plan --input release-build/artifact-plan.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cmclient-release-artifact-plan
+          path: release-build/artifact-plan.json
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.component }} ${{ matrix.target }}
+    needs: artifact-plan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: desktop
+            target: darwin-aarch64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            package: cmclient-desktop
+            binary: cmclient-desktop
+          - component: headless
+            target: darwin-aarch64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            package: cmclient-agent
+            binary: cmclient-agent
+          - component: cli
+            target: darwin-aarch64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            package: cmclient-cli
+            binary: cmclient
+          - component: desktop
+            target: darwin-x86_64
+            os: macos-13
+            rust_target: x86_64-apple-darwin
+            package: cmclient-desktop
+            binary: cmclient-desktop
+          - component: headless
+            target: darwin-x86_64
+            os: macos-13
+            rust_target: x86_64-apple-darwin
+            package: cmclient-agent
+            binary: cmclient-agent
+          - component: cli
+            target: darwin-x86_64
+            os: macos-13
+            rust_target: x86_64-apple-darwin
+            package: cmclient-cli
+            binary: cmclient
+          - component: desktop
+            target: linux-aarch64
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            package: cmclient-desktop
+            binary: cmclient-desktop
+          - component: headless
+            target: linux-aarch64
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            package: cmclient-agent
+            binary: cmclient-agent
+          - component: cli
+            target: linux-aarch64
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            package: cmclient-cli
+            binary: cmclient
+          - component: desktop
+            target: linux-x86_64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            package: cmclient-desktop
+            binary: cmclient-desktop
+          - component: headless
+            target: linux-x86_64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            package: cmclient-agent
+            binary: cmclient-agent
+          - component: cli
+            target: linux-x86_64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            package: cmclient-cli
+            binary: cmclient
+          - component: desktop
+            target: windows-x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            package: cmclient-desktop
+            binary: cmclient-desktop.exe
+          - component: headless
+            target: windows-x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            package: cmclient-agent
+            binary: cmclient-agent.exe
+          - component: cli
+            target: windows-x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            package: cmclient-cli
+            binary: cmclient.exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install Linux desktop and secret-store dependencies
+        if: startsWith(matrix.target, 'linux-')
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            libdbus-1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+      - name: Install exact Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.rust_target }}"
+      - run: pnpm install --frozen-lockfile
+      - name: Build frontend inputs
+        shell: bash
+        run: |
+          pnpm --filter @cmclient/contracts run build
+          if [ "${{ matrix.component }}" = "desktop" ]; then
+            pnpm --filter @cmclient/desktop run build
+          fi
+          if [ "${{ matrix.component }}" = "headless" ]; then
+            pnpm --filter @cmclient/gateway run build
+            pnpm --filter @cmclient/web run build
+          fi
+      - name: Build ${{ matrix.component }} executable
+        shell: bash
+        run: |
+          cargo build --release --locked \
+            --package "${{ matrix.package }}" \
+            --target "${{ matrix.rust_target }}"
+      - name: Stage build with canonical release metadata
+        id: stage
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          node scripts/release-artifacts.mjs stage \
+            --component "${{ matrix.component }}" \
+            --target "${{ matrix.target }}" \
+            --version "$version" \
+            --binary "target/${{ matrix.rust_target }}/release/${{ matrix.binary }}" \
+            --output release-build
+          echo "artifact=cmclient-build-${{ matrix.component }}-${{ matrix.target }}-$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.artifact }}
+          path: release-build/
+          if-no-files-found: error
