@@ -14,6 +14,8 @@ POST /api/v1/control/stop
 POST /api/v1/control/restart
 POST /api/v1/control/web/enable
 POST /api/v1/control/web/disable
+GET /api/v1/control/updates
+GET /api/v1/control/updates/events
 ```
 
 Each route returns the schema version, Agent version/state, Gateway lifecycle,
@@ -27,3 +29,16 @@ Gateway is unavailable.
 When the supervisor has a live child process, Agent additionally probes the
 Gateway loopback health endpoint. The control status is `running` only after a
 successful probe; otherwise it reports `degraded`.
+
+`GET /api/v1/control/updates` returns the Agent-owned persistent update job,
+or `job: null` when there is no job. Its safe projection includes phase, update
+time, optional bytes downloaded/total/speed, error code, and at most 64 stable
+log codes. It never returns manifest URLs, signing material, archive paths,
+server response text, or user configuration.
+
+`GET /api/v1/control/updates/events` is a local `text/event-stream` feed.
+Every connection receives an immediate `update.status_changed` snapshot, then
+future state transitions and a 15-second heartbeat. The Agent retains no
+unbounded per-client backlog: slow or disconnected subscribers are removed.
+The durable source of truth is the update journal, so clients reconnect by
+reading `/updates` before subscribing again.

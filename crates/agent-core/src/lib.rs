@@ -261,6 +261,7 @@ impl AgentLease {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(lock_path)
             .map_err(|_| InstanceError::Io)?;
         match lock_file.try_lock_exclusive() {
@@ -305,7 +306,7 @@ impl AgentLease {
 impl Drop for AgentLease {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.state_file);
-        let _ = self.lock_file.unlock();
+        let _ = FileExt::unlock(&self.lock_file);
     }
 }
 

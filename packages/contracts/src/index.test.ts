@@ -22,6 +22,7 @@ import {
   SanitizedPacketFixtureSetSchema,
   TransportConnectionStateSchema,
   SignedUpdateManifestSchema,
+  UpdateControlStatusSchema,
   UpdateManifestSchema,
 } from "./index";
 
@@ -81,6 +82,42 @@ describe("signed update manifest contract", () => {
             url: "http://releases.example.invalid/archive",
           },
         ],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("Agent update control contract", () => {
+  it("projects a persistent update phase without raw diagnostics", () => {
+    const check = TypeCompiler.Compile(UpdateControlStatusSchema);
+    expect(
+      check.Check({
+        schemaVersion: 1,
+        job: {
+          id: "update-1",
+          phase: "downloading",
+          updatedAt: "2026-07-18T03:00:00.000Z",
+          errorCode: null,
+          bytesDownloaded: 1024,
+          bytesTotal: 4096,
+          bytesPerSecond: 512,
+          recentLogCodes: ["UPDATE_DOWNLOAD_STARTED"],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      check.Check({
+        schemaVersion: 1,
+        job: {
+          id: "update-1",
+          phase: "downloading",
+          updatedAt: "2026-07-18T03:00:00.000Z",
+          errorCode: "https://must-not-leak.invalid",
+          bytesDownloaded: 1024,
+          bytesTotal: 4096,
+          bytesPerSecond: 512,
+          recentLogCodes: [],
+        },
       }),
     ).toBe(false);
   });

@@ -8,5 +8,7 @@ Desktop 的本機 Agent client 邊界見 `docs/architecture/desktop-supervisor.m
 `docs/api/update-manifest.md` 與 `docs/architecture/update-manifest.md`。
 安裝 transaction 的 backup、release slot、migration 與 health gate 見
 `docs/architecture/update-installation.md`。
+更新 journal、rollback 與 Agent-owned SSE 見
+`docs/architecture/update-recovery.md`。
 
 本文件是 Repository 內架構入口。詳細契約應隨實作逐步補充到 `docs/api`、`docs/events`、`docs/position-aprs`、`docs/update`、`docs/testing`。

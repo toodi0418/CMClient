@@ -1,23 +1,139 @@
+use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::web::{
     ManagementWebConfig, ManagementWebListener, ManagementWebService, gateway_health,
 };
 use cmclient_agent_core::{AgentConfig, AgentLease, ensure_runtime_directories};
 use cmclient_control_api::{
     ControlCommand, ControlEndpoint, ControlError, ControlHandler, ControlServer, ControlStatus,
-    GatewayControlStatus, ManagementWebControlStatus, default_unix_socket,
+    ControlUpdateEvent, GatewayControlStatus, ManagementWebControlStatus, UpdateControlJob,
+    UpdateControlStatus, default_unix_socket,
 };
 use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor};
-use std::sync::{Arc, Mutex};
-use std::{collections::BTreeMap, net::SocketAddr, process::ExitCode, time::Instant};
+use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+    mpsc::{self, SyncSender},
+};
+use std::{collections::BTreeMap, net::SocketAddr, path::Path, process::ExitCode, time::Instant};
 
 const EX_USAGE: u8 = 2;
 const EX_CONFIG: u8 = 5;
+const UPDATE_EVENT_BUFFER: usize = 64;
+
+struct AgentUpdateService {
+    journal: UpdateJournalStore,
+    subscribers: Mutex<Vec<SyncSender<ControlUpdateEvent>>>,
+    next_event_id: AtomicU64,
+}
+
+impl AgentUpdateService {
+    fn new(data_dir: &Path) -> Result<Self, ControlError> {
+        Ok(Self {
+            journal: UpdateJournalStore::new(data_dir).map_err(|_| ControlError::CommandFailed)?,
+            subscribers: Mutex::new(Vec::new()),
+            next_event_id: AtomicU64::new(1),
+        })
+    }
+
+    fn recover(&self) -> Result<(), ControlError> {
+        let recovered = recover_interrupted_update(&self.journal, utc_now())
+            .map_err(|_| ControlError::CommandFailed)?;
+        if let Some(job) = recovered {
+            self.persist(&job)?;
+        }
+        Ok(())
+    }
+
+    fn persist(&self, job: &PersistentUpdateJob) -> Result<(), ControlError> {
+        self.journal
+            .persist(job)
+            .map_err(|_| ControlError::CommandFailed)?;
+        self.publish(job)
+    }
+
+    fn status(&self) -> Result<UpdateControlStatus, ControlError> {
+        let job = self
+            .journal
+            .load()
+            .map_err(|_| ControlError::CommandFailed)?
+            .map(update_control_job);
+        Ok(UpdateControlStatus {
+            schema_version: 1,
+            job,
+        })
+    }
+
+    fn subscribe(&self) -> Result<mpsc::Receiver<ControlUpdateEvent>, ControlError> {
+        let (sender, receiver) = mpsc::sync_channel(UPDATE_EVENT_BUFFER);
+        sender
+            .try_send(self.event_for(&self.status()?)?)
+            .map_err(|_| ControlError::CommandFailed)?;
+        self.subscribers
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .push(sender);
+        Ok(receiver)
+    }
+
+    fn publish(&self, job: &PersistentUpdateJob) -> Result<(), ControlError> {
+        let status = UpdateControlStatus {
+            schema_version: 1,
+            job: Some(update_control_job(job.clone())),
+        };
+        let event = self.event_for(&status)?;
+        self.subscribers
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .retain(|sender| sender.try_send(event.clone()).is_ok());
+        Ok(())
+    }
+
+    fn event_for(&self, status: &UpdateControlStatus) -> Result<ControlUpdateEvent, ControlError> {
+        let sequence = self.next_event_id.fetch_add(1, Ordering::Relaxed);
+        Ok(ControlUpdateEvent {
+            id: format!("update-{sequence}"),
+            event: String::from("update.status_changed"),
+            data: serde_json::to_vec(status).map_err(|_| ControlError::CommandFailed)?,
+        })
+    }
+}
+
+fn update_control_job(job: PersistentUpdateJob) -> UpdateControlJob {
+    let (bytes_downloaded, bytes_total, bytes_per_second) =
+        job.progress.map_or((None, None, None), |progress| {
+            (
+                Some(progress.bytes_downloaded),
+                progress.bytes_total,
+                progress.bytes_per_second,
+            )
+        });
+    UpdateControlJob {
+        id: job.id,
+        phase: job.phase.as_str().to_owned(),
+        updated_at: job.updated_at,
+        error_code: job.error_code,
+        bytes_downloaded,
+        bytes_total,
+        bytes_per_second,
+        recent_log_codes: job
+            .recent_logs
+            .into_iter()
+            .map(|entry| entry.code)
+            .collect(),
+    }
+}
+
+fn utc_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
 
 struct AgentController {
     supervisor: Mutex<Option<GatewaySupervisor>>,
     gateway: SocketAddr,
     management_web: Mutex<Option<ManagementWebService>>,
     management_web_config: ManagementWebConfig,
+    updates: AgentUpdateService,
     started_at: Instant,
     latest_error_code: Mutex<Option<String>>,
 }
@@ -66,11 +182,14 @@ impl AgentController {
         } else {
             None
         };
+        let updates = AgentUpdateService::new(&config.paths.data_dir)?;
+        updates.recover()?;
         Ok(Self {
             supervisor: Mutex::new(supervisor),
             gateway: gateway_address(config.gateway_port),
             management_web: Mutex::new(management_web),
             management_web_config,
+            updates,
             started_at: Instant::now(),
             latest_error_code: Mutex::new(None),
         })
@@ -228,6 +347,14 @@ impl ControlHandler for AgentController {
         }
         result
     }
+
+    fn update_status(&self) -> Result<UpdateControlStatus, ControlError> {
+        self.updates.status()
+    }
+
+    fn subscribe_update_events(&self) -> Result<mpsc::Receiver<ControlUpdateEvent>, ControlError> {
+        self.updates.subscribe()
+    }
 }
 
 fn main() -> ExitCode {
@@ -355,11 +482,15 @@ fn gateway_address(port: u16) -> SocketAddr {
 mod tests {
     #[cfg(not(target_os = "windows"))]
     use super::{
-        AgentConfig, AgentController, ControlCommand, ControlHandler, GatewayControlStatus,
-        ManagementWebControlStatus,
+        AgentConfig, AgentController, AgentUpdateService, ControlCommand, ControlHandler,
+        GatewayControlStatus, ManagementWebControlStatus,
     };
     #[cfg(not(target_os = "windows"))]
     use cmclient_agent_core::RuntimePaths;
+    #[cfg(not(target_os = "windows"))]
+    use cmclient_control_api::UpdateControlStatus;
+    #[cfg(not(target_os = "windows"))]
+    use cmclient_updater::{PersistentUpdateJob, UpdatePhase};
     #[cfg(not(target_os = "windows"))]
     use std::{
         io::{Read, Write},
@@ -415,5 +546,46 @@ mod tests {
             .handle(ControlCommand::Stop)
             .expect("gateway should stop");
         gateway_thread.join().expect("gateway should join");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn persists_update_jobs_and_emits_follow_up_sse_status() {
+        let data_dir =
+            std::env::temp_dir().join(format!("cmclient-agent-updates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let service = AgentUpdateService::new(&data_dir).expect("update service should initialize");
+        let events = service.subscribe().expect("subscription should initialize");
+        let initial = events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("initial snapshot should arrive");
+        let initial: UpdateControlStatus =
+            serde_json::from_slice(&initial.data).expect("initial status should deserialize");
+        assert!(initial.job.is_none());
+        let job = PersistentUpdateJob {
+            schema_version: 1,
+            id: String::from("update-1"),
+            phase: UpdatePhase::Downloading,
+            created_at: String::from("2026-07-18T03:00:00.000Z"),
+            updated_at: String::from("2026-07-18T03:01:00.000Z"),
+            error_code: None,
+            progress: None,
+            recent_logs: Vec::new(),
+            rollback_plan: None,
+        };
+
+        service.persist(&job).expect("job should persist");
+
+        let event = events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("status transition should arrive");
+        let status: UpdateControlStatus =
+            serde_json::from_slice(&event.data).expect("status should deserialize");
+        assert_eq!(
+            status.job.as_ref().map(|job| job.phase.as_str()),
+            Some("downloading")
+        );
+        assert_eq!(service.status().expect("status should load"), status);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

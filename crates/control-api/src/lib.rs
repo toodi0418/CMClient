@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Display, Formatter},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc},
 };
 
 /// Stable workspace identity for the control API boundary.
@@ -55,6 +55,36 @@ pub enum ManagementWebControlStatus {
     Running,
 }
 
+/// Read-only projection of the Agent-owned persistent update job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateControlStatus {
+    pub schema_version: u8,
+    pub job: Option<UpdateControlJob>,
+}
+
+/// Safe update fields exposed through local control and SSE.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateControlJob {
+    pub id: String,
+    pub phase: String,
+    pub updated_at: String,
+    pub error_code: Option<String>,
+    pub bytes_downloaded: Option<u64>,
+    pub bytes_total: Option<u64>,
+    pub bytes_per_second: Option<u64>,
+    pub recent_log_codes: Vec<String>,
+}
+
+/// One Agent update state transition delivered through the local SSE stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlUpdateEvent {
+    pub id: String,
+    pub event: String,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlCommand {
     Status,
@@ -67,6 +97,14 @@ pub enum ControlCommand {
 
 pub trait ControlHandler: Send + Sync {
     fn handle(&self, command: ControlCommand) -> Result<ControlStatus, ControlError>;
+
+    fn update_status(&self) -> Result<UpdateControlStatus, ControlError> {
+        Err(ControlError::CommandFailed)
+    }
+
+    fn subscribe_update_events(&self) -> Result<mpsc::Receiver<ControlUpdateEvent>, ControlError> {
+        Err(ControlError::CommandFailed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,8 +155,14 @@ impl Display for ControlError {
 
 impl std::error::Error for ControlError {}
 
+#[derive(Clone)]
 pub struct ControlRouter {
     handler: Arc<dyn ControlHandler>,
+}
+
+enum ControlResponse {
+    Json { status: u16, body: Vec<u8> },
+    EventStream(mpsc::Receiver<ControlUpdateEvent>),
 }
 
 impl ControlRouter {
@@ -126,52 +170,94 @@ impl ControlRouter {
         Self { handler }
     }
 
-    fn route(&self, request: &str) -> Result<(u16, Vec<u8>), ControlError> {
+    fn route(&self, request: &str) -> Result<ControlResponse, ControlError> {
         let request_line = request.lines().next().ok_or(ControlError::InvalidHttp)?;
-        let command = match request_line
+        let route = match request_line
             .split_whitespace()
             .collect::<Vec<_>>()
             .as_slice()
         {
             ["GET", "/api/v1/control/status", "HTTP/1.1"]
-            | ["GET", "/api/v1/control/status", "HTTP/1.0"] => ControlCommand::Status,
+            | ["GET", "/api/v1/control/status", "HTTP/1.0"] => {
+                ControlRoute::Command(ControlCommand::Status)
+            }
             ["POST", "/api/v1/control/start", "HTTP/1.1"]
-            | ["POST", "/api/v1/control/start", "HTTP/1.0"] => ControlCommand::Start,
+            | ["POST", "/api/v1/control/start", "HTTP/1.0"] => {
+                ControlRoute::Command(ControlCommand::Start)
+            }
             ["POST", "/api/v1/control/stop", "HTTP/1.1"]
-            | ["POST", "/api/v1/control/stop", "HTTP/1.0"] => ControlCommand::Stop,
+            | ["POST", "/api/v1/control/stop", "HTTP/1.0"] => {
+                ControlRoute::Command(ControlCommand::Stop)
+            }
             ["POST", "/api/v1/control/restart", "HTTP/1.1"]
-            | ["POST", "/api/v1/control/restart", "HTTP/1.0"] => ControlCommand::Restart,
+            | ["POST", "/api/v1/control/restart", "HTTP/1.0"] => {
+                ControlRoute::Command(ControlCommand::Restart)
+            }
             ["POST", "/api/v1/control/web/enable", "HTTP/1.1"]
             | ["POST", "/api/v1/control/web/enable", "HTTP/1.0"] => {
-                ControlCommand::EnableManagementWeb
+                ControlRoute::Command(ControlCommand::EnableManagementWeb)
             }
             ["POST", "/api/v1/control/web/disable", "HTTP/1.1"]
             | ["POST", "/api/v1/control/web/disable", "HTTP/1.0"] => {
-                ControlCommand::DisableManagementWeb
+                ControlRoute::Command(ControlCommand::DisableManagementWeb)
             }
-            [_, _, _] => return Ok((404, br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#.to_vec())),
+            ["GET", "/api/v1/control/updates", "HTTP/1.1"]
+            | ["GET", "/api/v1/control/updates", "HTTP/1.0"] => ControlRoute::UpdateStatus,
+            ["GET", "/api/v1/control/updates/events", "HTTP/1.1"]
+            | ["GET", "/api/v1/control/updates/events", "HTTP/1.0"] => ControlRoute::UpdateEvents,
+            [_, _, _] => {
+                return Ok(ControlResponse::Json {
+                    status: 404,
+                    body: br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#.to_vec(),
+                });
+            }
             _ => return Err(ControlError::InvalidHttp),
         };
-        match self.handler.handle(command) {
-            Ok(status) => serde_json::to_vec(&status)
-                .map(|body| (200, body))
-                .map_err(|_| ControlError::Io),
-            Err(error) => serde_json::to_vec(&serde_json::json!({ "code": error.code() }))
-                .map(|body| (500, body))
-                .map_err(|_| ControlError::Io),
-        }
+        let response = match route {
+            ControlRoute::Command(command) => self.handler.handle(command).and_then(json_response),
+            ControlRoute::UpdateStatus => self.handler.update_status().and_then(json_response),
+            ControlRoute::UpdateEvents => self
+                .handler
+                .subscribe_update_events()
+                .map(ControlResponse::EventStream),
+        };
+        response.or_else(error_response)
     }
+}
+
+enum ControlRoute {
+    Command(ControlCommand),
+    UpdateStatus,
+    UpdateEvents,
+}
+
+fn json_response<T: Serialize>(value: T) -> Result<ControlResponse, ControlError> {
+    serde_json::to_vec(&value)
+        .map(|body| ControlResponse::Json { status: 200, body })
+        .map_err(|_| ControlError::Io)
+}
+
+fn error_response(error: ControlError) -> Result<ControlResponse, ControlError> {
+    serde_json::to_vec(&serde_json::json!({ "code": error.code() }))
+        .map(|body| ControlResponse::Json { status: 500, body })
+        .map_err(|_| ControlError::Io)
 }
 
 #[cfg(unix)]
 mod unix {
-    use super::{ControlEndpoint, ControlError, ControlHandler, ControlRouter, ControlStatus};
+    use super::{
+        ControlEndpoint, ControlError, ControlHandler, ControlResponse, ControlRouter,
+        ControlStatus, ControlUpdateEvent,
+    };
     use std::{
         fs,
         io::{Read, Write},
         os::unix::fs::PermissionsExt,
         os::unix::net::{UnixListener, UnixStream},
         path::PathBuf,
+        sync::mpsc::{Receiver, RecvTimeoutError},
+        thread,
+        time::Duration,
     };
 
     pub struct ControlServer {
@@ -205,30 +291,95 @@ mod unix {
         }
 
         pub fn serve_once(&self) -> Result<(), ControlError> {
-            let (mut stream, _) = self.listener.accept().map_err(|_| ControlError::Io)?;
-            let mut request = [0_u8; 8_192];
-            let bytes = stream.read(&mut request).map_err(|_| ControlError::Io)?;
-            let request =
-                std::str::from_utf8(&request[..bytes]).map_err(|_| ControlError::InvalidHttp)?;
-            let (status, body) = self.router.route(request)?;
-            let status_text = match status {
-                200 => "OK",
-                404 => "Not Found",
-                _ => "Internal Server Error",
-            };
-            let header = format!(
-                "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(header.as_bytes())
-                .map_err(|_| ControlError::Io)?;
-            stream.write_all(&body).map_err(|_| ControlError::Io)
+            let (stream, _) = self.listener.accept().map_err(|_| ControlError::Io)?;
+            let router = self.router.clone();
+            thread::spawn(move || {
+                let _ = serve_connection(stream, router);
+            });
+            Ok(())
         }
 
         pub fn endpoint(&self) -> &std::path::Path {
             &self.endpoint
         }
+    }
+
+    fn serve_connection(mut stream: UnixStream, router: ControlRouter) -> Result<(), ControlError> {
+        let mut request = [0_u8; 8_192];
+        let bytes = stream.read(&mut request).map_err(|_| ControlError::Io)?;
+        let request =
+            std::str::from_utf8(&request[..bytes]).map_err(|_| ControlError::InvalidHttp)?;
+        match router.route(request)? {
+            ControlResponse::Json { status, body } => {
+                write_json_response(&mut stream, status, &body)
+            }
+            ControlResponse::EventStream(events) => write_update_event_stream(&mut stream, events),
+        }
+    }
+
+    fn write_json_response(
+        stream: &mut UnixStream,
+        status: u16,
+        body: &[u8],
+    ) -> Result<(), ControlError> {
+        let status_text = match status {
+            200 => "OK",
+            404 => "Not Found",
+            _ => "Internal Server Error",
+        };
+        let header = format!(
+            "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(header.as_bytes())
+            .map_err(|_| ControlError::Io)?;
+        stream.write_all(body).map_err(|_| ControlError::Io)
+    }
+
+    fn write_update_event_stream(
+        stream: &mut UnixStream,
+        events: Receiver<ControlUpdateEvent>,
+    ) -> Result<(), ControlError> {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
+            )
+            .map_err(|_| ControlError::Io)?;
+        loop {
+            match events.recv_timeout(Duration::from_secs(15)) {
+                Ok(event) => write_sse_event(stream, &event)?,
+                Err(RecvTimeoutError::Timeout) => stream
+                    .write_all(b": heartbeat\n\n")
+                    .map_err(|_| ControlError::Io)?,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+
+    fn write_sse_event(
+        stream: &mut UnixStream,
+        event: &ControlUpdateEvent,
+    ) -> Result<(), ControlError> {
+        if !is_safe_sse_token(&event.id)
+            || !is_safe_sse_token(&event.event)
+            || event.data.contains(&b'\n')
+        {
+            return Err(ControlError::InvalidHttp);
+        }
+        stream
+            .write_all(format!("id: {}\nevent: {}\ndata: ", event.id, event.event).as_bytes())
+            .and_then(|_| stream.write_all(&event.data))
+            .and_then(|_| stream.write_all(b"\n\n"))
+            .map_err(|_| ControlError::Io)
+    }
+
+    fn is_safe_sse_token(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
     }
 
     impl Drop for ControlServer {
@@ -273,7 +424,27 @@ mod unix {
             self.request("POST", "/api/v1/control/web/disable")
         }
 
+        pub fn update_status(&self) -> Result<super::UpdateControlStatus, ControlError> {
+            self.request_update("GET", "/api/v1/control/updates")
+        }
+
         fn request(&self, method: &str, path: &str) -> Result<ControlStatus, ControlError> {
+            self.request_json(method, path)
+        }
+
+        fn request_update(
+            &self,
+            method: &str,
+            path: &str,
+        ) -> Result<super::UpdateControlStatus, ControlError> {
+            self.request_json(method, path)
+        }
+
+        fn request_json<T: serde::de::DeserializeOwned>(
+            &self,
+            method: &str,
+            path: &str,
+        ) -> Result<T, ControlError> {
             let mut stream = UnixStream::connect(&self.endpoint).map_err(|_| ControlError::Io)?;
             let request =
                 format!("{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n");
@@ -349,6 +520,10 @@ impl ControlClient {
     pub fn disable_management_web(&self) -> Result<ControlStatus, ControlError> {
         Err(ControlError::UnsupportedEndpoint)
     }
+
+    pub fn update_status(&self) -> Result<UpdateControlStatus, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
 }
 
 pub fn is_local_endpoint(endpoint: &ControlEndpoint) -> bool {
@@ -367,11 +542,14 @@ mod tests {
     #[cfg(unix)]
     use super::{ControlClient, ControlServer};
     use super::{
-        ControlEndpoint, ControlStatus, GatewayControlStatus, ManagementWebControlStatus,
-        StaticControlHandler, default_unix_socket, is_local_endpoint,
+        ControlEndpoint, ControlError, ControlHandler, ControlStatus, ControlUpdateEvent,
+        GatewayControlStatus, ManagementWebControlStatus, StaticControlHandler, UpdateControlJob,
+        UpdateControlStatus, default_unix_socket, is_local_endpoint,
     };
+    #[cfg(unix)]
+    use std::io::{Read, Write};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, mpsc};
 
     fn status() -> ControlStatus {
         ControlStatus {
@@ -383,6 +561,31 @@ mod tests {
             management_web_url: Some(String::from("http://127.0.0.1:7080")),
             uptime_seconds: 1,
             latest_error_code: None,
+        }
+    }
+
+    struct UpdateHandler {
+        update: UpdateControlStatus,
+        events: Mutex<Option<mpsc::Receiver<ControlUpdateEvent>>>,
+    }
+
+    impl ControlHandler for UpdateHandler {
+        fn handle(&self, _command: super::ControlCommand) -> Result<ControlStatus, ControlError> {
+            Ok(status())
+        }
+
+        fn update_status(&self) -> Result<UpdateControlStatus, ControlError> {
+            Ok(self.update.clone())
+        }
+
+        fn subscribe_update_events(
+            &self,
+        ) -> Result<mpsc::Receiver<ControlUpdateEvent>, ControlError> {
+            self.events
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?
+                .take()
+                .ok_or(ControlError::CommandFailed)
         }
     }
 
@@ -433,6 +636,80 @@ mod tests {
             .join()
             .expect("server thread should join")
             .expect("server should respond");
+        std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serves_update_status_and_a_bounded_sse_event_over_the_private_socket() {
+        let directory =
+            std::env::temp_dir().join(format!("cmclient-control-update-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let endpoint = default_unix_socket(&directory);
+        let update = UpdateControlStatus {
+            schema_version: 1,
+            job: Some(UpdateControlJob {
+                id: String::from("update-1"),
+                phase: String::from("health_checking"),
+                updated_at: String::from("2026-07-18T03:00:00.000Z"),
+                error_code: None,
+                bytes_downloaded: None,
+                bytes_total: None,
+                bytes_per_second: None,
+                recent_log_codes: Vec::new(),
+            }),
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(ControlUpdateEvent {
+                id: String::from("update-1"),
+                event: String::from("update.status_changed"),
+                data: serde_json::to_vec(&update).expect("event should serialize"),
+            })
+            .expect("event should queue");
+        drop(sender);
+        let server = ControlServer::bind(
+            endpoint.clone(),
+            Arc::new(UpdateHandler {
+                update: update.clone(),
+                events: Mutex::new(Some(receiver)),
+            }),
+        )
+        .expect("server should bind");
+        let server_thread = std::thread::spawn(move || {
+            server.serve_once()?;
+            server.serve_once()
+        });
+
+        let client = ControlClient::new(endpoint.clone()).expect("client should initialize");
+        assert_eq!(
+            client.update_status().expect("update status should load"),
+            update
+        );
+
+        let socket_path = match endpoint {
+            ControlEndpoint::UnixSocket(path) => path,
+            ControlEndpoint::NamedPipe(_) => panic!("unix test must use a unix socket"),
+        };
+        let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
+            .expect("SSE client should connect");
+        stream
+            .write_all(b"GET /api/v1/control/updates/events HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("SSE request should write");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("SSE response should read");
+        let response = String::from_utf8(response).expect("SSE response should be UTF-8");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream"));
+        assert!(
+            response
+                .contains("id: update-1\nevent: update.status_changed\ndata: {\"schemaVersion\":1")
+        );
+        server_thread
+            .join()
+            .expect("server thread should join")
+            .expect("server should accept requests");
         std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 }

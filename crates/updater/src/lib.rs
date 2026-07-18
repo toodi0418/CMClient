@@ -819,7 +819,7 @@ pub fn install_verified_release(
         release_id: release_id.clone(),
         bundle_sha256: release_id.clone(),
     };
-    write_active_release(request.installation_root, &active_release)?;
+    set_active_release(request.installation_root, &active_release)?;
     lifecycle.migrate(&release_path)?;
     lifecycle.start(&release_path)?;
     if !lifecycle.health_check()? {
@@ -1114,10 +1114,17 @@ fn copy_backup_file(source: &Path, destination: &Path) -> Result<(), UpdateInsta
         .map_err(|_| UpdateInstallError::BackupFailed)
 }
 
-fn write_active_release(
+/// Atomically selects a validated release slot without touching user data.
+pub fn set_active_release(
     installation_root: &Path,
     active_release: &ActiveRelease,
 ) -> Result<(), UpdateInstallError> {
+    if active_release.schema_version != 1
+        || !is_sha256_hex(&active_release.release_id)
+        || active_release.release_id != active_release.bundle_sha256
+    {
+        return Err(UpdateInstallError::ActiveReleaseInvalid);
+    }
     fs::create_dir_all(installation_root).map_err(|_| UpdateInstallError::ActivationFailed)?;
     let pointer_path = installation_root.join("active-release.json");
     let temporary = installation_root.join(format!(".active-release.part-{}", std::process::id()));
@@ -1139,6 +1146,467 @@ fn write_active_release(
         return Err(UpdateInstallError::ActivationFailed);
     }
     Ok(())
+}
+
+/// Removes the active release pointer for an interrupted first installation.
+pub fn clear_active_release(installation_root: &Path) -> Result<(), UpdateInstallError> {
+    let pointer_path = installation_root.join("active-release.json");
+    match fs::remove_file(pointer_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(UpdateInstallError::ActivationFailed),
+    }
+}
+
+/// Filesystem state required to restore the previous release after a failed update.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateRollbackPlan {
+    /// Root containing release slots and `active-release.json`.
+    pub installation_root: PathBuf,
+    /// User data directory backed up before migration.
+    pub data_dir: PathBuf,
+    /// User configuration directory backed up before migration.
+    pub config_dir: PathBuf,
+    /// Completed backup directory containing `data` and `config` copies.
+    pub backup_path: PathBuf,
+    /// Release that was selected before activation, if any.
+    pub previous_active_release: Option<ActiveRelease>,
+}
+
+/// Restores the durable backup and the previous active release pointer.
+pub fn rollback_update(plan: &UpdateRollbackPlan) -> Result<(), UpdateInstallError> {
+    if !plan.installation_root.is_absolute()
+        || !plan.data_dir.is_absolute()
+        || !plan.config_dir.is_absolute()
+        || !plan.backup_path.is_absolute()
+    {
+        return Err(UpdateInstallError::InvalidInstallLayout);
+    }
+    restore_backup_directory(&plan.backup_path.join("data"), &plan.data_dir)?;
+    if plan.config_dir != plan.data_dir {
+        restore_backup_directory(&plan.backup_path.join("config"), &plan.config_dir)?;
+    }
+    match &plan.previous_active_release {
+        Some(active_release) => set_active_release(&plan.installation_root, active_release),
+        None => clear_active_release(&plan.installation_root),
+    }
+}
+
+fn restore_backup_directory(source: &Path, destination: &Path) -> Result<(), UpdateInstallError> {
+    let parent = destination
+        .parent()
+        .ok_or(UpdateInstallError::BackupFailed)?;
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or(UpdateInstallError::BackupFailed)?;
+    fs::create_dir_all(parent).map_err(|_| UpdateInstallError::BackupFailed)?;
+    let temporary = parent.join(format!(".{name}.restore-{}", std::process::id()));
+    let previous = parent.join(format!(".{name}.previous-{}", std::process::id()));
+    if temporary.exists() || previous.exists() {
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    copy_directory(source, &temporary)?;
+
+    if destination.exists() && fs::rename(destination, &previous).is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    if fs::rename(&temporary, destination).is_err() {
+        if previous.exists() {
+            let _ = fs::rename(&previous, destination);
+        }
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    if previous.exists() && fs::remove_dir_all(previous).is_err() {
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    Ok(())
+}
+
+/// Durable Agent-owned update phases, independent of Gateway availability.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePhase {
+    /// No update job is currently executing.
+    Idle,
+    /// Fetching or evaluating a release manifest.
+    Checking,
+    /// A compatible release is ready to be downloaded.
+    Available,
+    /// Streaming the selected bundle.
+    Downloading,
+    /// Authenticating manifest or bundle bytes.
+    Verifying,
+    /// Writing the verified bundle to Agent cache.
+    Staging,
+    /// Preparing a durable data/configuration snapshot.
+    BackingUp,
+    /// Stopping the previous runtime.
+    Stopping,
+    /// Extracting and activating the new release slot.
+    Installing,
+    /// Running the new release migration journal.
+    Migrating,
+    /// Starting the new release runtime.
+    Starting,
+    /// Probing the new release health gate.
+    HealthChecking,
+    /// The update completed successfully.
+    Completed,
+    /// The update failed and may require rollback.
+    Failed,
+    /// Restoring backup and previous active release.
+    RollingBack,
+    /// Rollback restored the prior known-good state.
+    RollbackCompleted,
+}
+
+impl UpdatePhase {
+    /// Stable wire form shared by journal, control API, and SSE events.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Checking => "checking",
+            Self::Available => "available",
+            Self::Downloading => "downloading",
+            Self::Verifying => "verifying",
+            Self::Staging => "staging",
+            Self::BackingUp => "backing_up",
+            Self::Stopping => "stopping",
+            Self::Installing => "installing",
+            Self::Migrating => "migrating",
+            Self::Starting => "starting",
+            Self::HealthChecking => "health_checking",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::RollingBack => "rolling_back",
+            Self::RollbackCompleted => "rollback_completed",
+        }
+    }
+
+    /// True after the release may have changed data or active runtime state.
+    pub const fn requires_rollback(self) -> bool {
+        matches!(
+            self,
+            Self::BackingUp
+                | Self::Stopping
+                | Self::Installing
+                | Self::Migrating
+                | Self::Starting
+                | Self::HealthChecking
+                | Self::RollingBack
+        )
+    }
+
+    const fn is_final(self) -> bool {
+        matches!(self, Self::Completed | Self::RollbackCompleted)
+    }
+}
+
+/// Persistent record of an Agent update job and its recovery information.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PersistentUpdateJob {
+    /// Journal schema version.
+    pub schema_version: u8,
+    /// Stable local update job identifier.
+    pub id: String,
+    /// Last durable update phase.
+    pub phase: UpdatePhase,
+    /// UTC job creation time with milliseconds.
+    pub created_at: String,
+    /// UTC time for the last durable transition.
+    pub updated_at: String,
+    /// Stable terminal or recovery error code, without underlying error text.
+    pub error_code: Option<String>,
+    /// Latest byte progress safe to display to local clients.
+    #[serde(default)]
+    pub progress: Option<UpdateProgress>,
+    /// Bounded, code-only update phase history.
+    #[serde(default)]
+    pub recent_logs: Vec<UpdateLogEntry>,
+    /// Plan required to recover a partially mutating transaction.
+    pub rollback_plan: Option<UpdateRollbackPlan>,
+}
+
+/// Byte progress for a long-running Agent update phase.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateProgress {
+    /// Bytes received or processed so far.
+    pub bytes_downloaded: u64,
+    /// Signed total archive size when known.
+    pub bytes_total: Option<u64>,
+    /// Recent transfer rate, rounded to bytes per second when available.
+    pub bytes_per_second: Option<u64>,
+}
+
+/// A redaction-safe update log item for local status and SSE consumers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateLogEntry {
+    /// UTC event time with milliseconds.
+    pub occurred_at: String,
+    /// Phase that emitted this stable code.
+    pub phase: UpdatePhase,
+    /// Stable code only; never a URL, server body, path, token, or raw error.
+    pub code: String,
+}
+
+/// Durable storage for the only active Agent update job.
+#[derive(Clone, Debug)]
+pub struct UpdateJournalStore {
+    path: PathBuf,
+}
+
+/// Stable failures from the persistent update journal or automatic recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateJournalError {
+    /// Journal root or file I/O failed.
+    Io,
+    /// The journal document is malformed or violates its safety invariants.
+    InvalidRecord,
+    /// A caller attempted a state transition that the update state machine forbids.
+    InvalidTransition,
+}
+
+impl UpdateJournalError {
+    /// Stable machine-readable error code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Io => "UPDATE_JOURNAL_IO_FAILED",
+            Self::InvalidRecord => "UPDATE_JOURNAL_INVALID",
+            Self::InvalidTransition => "UPDATE_JOURNAL_TRANSITION_INVALID",
+        }
+    }
+}
+
+impl fmt::Display for UpdateJournalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl Error for UpdateJournalError {}
+
+impl UpdateJournalStore {
+    /// Creates a journal rooted in Agent-owned persistent data.
+    pub fn new(data_dir: &Path) -> Result<Self, UpdateJournalError> {
+        if !data_dir.is_absolute() {
+            return Err(UpdateJournalError::InvalidRecord);
+        }
+        let directory = data_dir.join("updates");
+        fs::create_dir_all(&directory).map_err(|_| UpdateJournalError::Io)?;
+        Ok(Self {
+            path: directory.join("update-job.json"),
+        })
+    }
+
+    /// Returns the current durable job, if the Agent has created one.
+    pub fn load(&self) -> Result<Option<PersistentUpdateJob>, UpdateJournalError> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&self.path).map_err(|_| UpdateJournalError::Io)?;
+        let job = serde_json::from_slice::<PersistentUpdateJob>(&bytes)
+            .map_err(|_| UpdateJournalError::InvalidRecord)?;
+        validate_persistent_job(&job)?;
+        Ok(Some(job))
+    }
+
+    /// Atomically persists the current job state before a side effect begins.
+    pub fn persist(&self, job: &PersistentUpdateJob) -> Result<(), UpdateJournalError> {
+        validate_persistent_job(job)?;
+        let parent = self.path.parent().ok_or(UpdateJournalError::Io)?;
+        fs::create_dir_all(parent).map_err(|_| UpdateJournalError::Io)?;
+        let temporary = parent.join(format!(".update-job.part-{}", std::process::id()));
+        let bytes = serde_json::to_vec(job).map_err(|_| UpdateJournalError::Io)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| UpdateJournalError::Io)?;
+        if output.write_all(&bytes).is_err() || output.sync_all().is_err() {
+            drop(output);
+            let _ = fs::remove_file(&temporary);
+            return Err(UpdateJournalError::Io);
+        }
+        drop(output);
+        if fs::rename(&temporary, &self.path).is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err(UpdateJournalError::Io);
+        }
+        Ok(())
+    }
+
+    /// Transitions and persists one job phase before the corresponding effect.
+    pub fn transition(
+        &self,
+        job: &mut PersistentUpdateJob,
+        next_phase: UpdatePhase,
+        updated_at: String,
+        error_code: Option<String>,
+    ) -> Result<(), UpdateJournalError> {
+        if !can_transition(job.phase, next_phase) || !is_utc_millisecond_timestamp(&updated_at) {
+            return Err(UpdateJournalError::InvalidTransition);
+        }
+        job.phase = next_phase;
+        job.updated_at = updated_at;
+        job.error_code = error_code;
+        self.persist(job)
+    }
+
+    /// Persists bounded transfer progress without changing the update phase.
+    pub fn set_progress(
+        &self,
+        job: &mut PersistentUpdateJob,
+        progress: Option<UpdateProgress>,
+        updated_at: String,
+    ) -> Result<(), UpdateJournalError> {
+        if !is_utc_millisecond_timestamp(&updated_at) {
+            return Err(UpdateJournalError::InvalidTransition);
+        }
+        job.progress = progress;
+        job.updated_at = updated_at;
+        self.persist(job)
+    }
+
+    /// Appends a stable update code while keeping the persistent log bounded.
+    pub fn append_log(
+        &self,
+        job: &mut PersistentUpdateJob,
+        entry: UpdateLogEntry,
+    ) -> Result<(), UpdateJournalError> {
+        if !is_utc_millisecond_timestamp(&entry.occurred_at) || !is_stable_error_code(&entry.code) {
+            return Err(UpdateJournalError::InvalidRecord);
+        }
+        job.recent_logs.push(entry);
+        if job.recent_logs.len() > 64 {
+            job.recent_logs.drain(..job.recent_logs.len() - 64);
+        }
+        self.persist(job)
+    }
+}
+
+/// Recovers a job left in progress by abrupt Agent or host termination.
+pub fn recover_interrupted_update(
+    store: &UpdateJournalStore,
+    updated_at: String,
+) -> Result<Option<PersistentUpdateJob>, UpdateJournalError> {
+    let Some(mut job) = store.load()? else {
+        return Ok(None);
+    };
+    if job.phase.is_final() || job.phase == UpdatePhase::Idle {
+        return Ok(Some(job));
+    }
+    if !is_utc_millisecond_timestamp(&updated_at) {
+        return Err(UpdateJournalError::InvalidTransition);
+    }
+    if !job.phase.requires_rollback() {
+        store.transition(
+            &mut job,
+            UpdatePhase::Failed,
+            updated_at,
+            Some(String::from("UPDATE_INTERRUPTED_BY_RESTART")),
+        )?;
+        return Ok(Some(job));
+    }
+
+    if job.phase != UpdatePhase::RollingBack {
+        store.transition(&mut job, UpdatePhase::RollingBack, updated_at.clone(), None)?;
+    }
+    let rollback_result = job
+        .rollback_plan
+        .as_ref()
+        .ok_or(UpdateJournalError::InvalidRecord)
+        .and_then(|plan| rollback_update(plan).map_err(|_| UpdateJournalError::Io));
+    match rollback_result {
+        Ok(()) => {
+            store.transition(
+                &mut job,
+                UpdatePhase::RollbackCompleted,
+                updated_at,
+                Some(String::from("UPDATE_INTERRUPTED_BY_RESTART")),
+            )?;
+        }
+        Err(_) => {
+            store.transition(
+                &mut job,
+                UpdatePhase::Failed,
+                updated_at,
+                Some(String::from("UPDATE_ROLLBACK_FAILED")),
+            )?;
+        }
+    }
+    Ok(Some(job))
+}
+
+fn validate_persistent_job(job: &PersistentUpdateJob) -> Result<(), UpdateJournalError> {
+    if job.schema_version != 1
+        || !is_safe_backup_id(&job.id)
+        || !is_utc_millisecond_timestamp(&job.created_at)
+        || !is_utc_millisecond_timestamp(&job.updated_at)
+        || job
+            .error_code
+            .as_deref()
+            .is_some_and(|code| !is_stable_error_code(code))
+        || job.progress.as_ref().is_some_and(|progress| {
+            progress
+                .bytes_total
+                .is_some_and(|total| progress.bytes_downloaded > total)
+        })
+        || job.recent_logs.len() > 64
+        || job.recent_logs.iter().any(|entry| {
+            !is_utc_millisecond_timestamp(&entry.occurred_at) || !is_stable_error_code(&entry.code)
+        })
+        || (job.phase.requires_rollback() && job.rollback_plan.is_none())
+    {
+        return Err(UpdateJournalError::InvalidRecord);
+    }
+    Ok(())
+}
+
+fn can_transition(current: UpdatePhase, next: UpdatePhase) -> bool {
+    if current == next {
+        return true;
+    }
+    if current.is_final() {
+        return false;
+    }
+    if next == UpdatePhase::RollingBack {
+        return current.requires_rollback() || current == UpdatePhase::Failed;
+    }
+    if next == UpdatePhase::Failed {
+        return true;
+    }
+    matches!(
+        (current, next),
+        (UpdatePhase::Idle, UpdatePhase::Checking)
+            | (UpdatePhase::Checking, UpdatePhase::Available)
+            | (UpdatePhase::Available, UpdatePhase::Downloading)
+            | (UpdatePhase::Downloading, UpdatePhase::Verifying)
+            | (UpdatePhase::Verifying, UpdatePhase::Staging)
+            | (UpdatePhase::Staging, UpdatePhase::BackingUp)
+            | (UpdatePhase::BackingUp, UpdatePhase::Stopping)
+            | (UpdatePhase::Stopping, UpdatePhase::Installing)
+            | (UpdatePhase::Installing, UpdatePhase::Migrating)
+            | (UpdatePhase::Migrating, UpdatePhase::Starting)
+            | (UpdatePhase::Starting, UpdatePhase::HealthChecking)
+            | (UpdatePhase::HealthChecking, UpdatePhase::Completed)
+            | (UpdatePhase::RollingBack, UpdatePhase::RollbackCompleted)
+    )
+}
+
+fn is_stable_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn digest_reader(reader: &mut dyn Read) -> io::Result<String> {
@@ -1218,9 +1686,11 @@ mod tests {
         ActiveRelease, BundleResponse, BundleTransport, DEFAULT_MAX_UNPACKED_BYTES,
         MANIFEST_SCHEMA_VERSION, SignatureAlgorithm, SignedUpdateManifest, StagedBundle,
         UpdateArchive, UpdateBundle, UpdateChannel, UpdateComponent, UpdateInstallError,
-        UpdateInstallRequest, UpdateLifecycle, UpdateManifest, UpdateManifestError,
-        UpdateStageError, UpdateStageRequest, UpdateTarget, install_verified_release,
-        read_active_release, sha256_hex, stage_verified_bundle,
+        UpdateInstallRequest, UpdateJournalStore, UpdateLifecycle, UpdateLogEntry, UpdateManifest,
+        UpdateManifestError, UpdatePhase, UpdateProgress, UpdateRollbackPlan, UpdateStageError,
+        UpdateStageRequest, UpdateTarget, install_verified_release, read_active_release,
+        recover_interrupted_update, rollback_update, set_active_release, sha256_hex,
+        stage_verified_bundle,
     };
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use std::{
@@ -1417,6 +1887,42 @@ mod tests {
             backup_root,
             backup_id: "backup-2.0.0-dev.1",
             maximum_unpacked_bytes: DEFAULT_MAX_UNPACKED_BYTES,
+        }
+    }
+
+    fn rollback_plan(root: &Path) -> UpdateRollbackPlan {
+        let installation_root = root.join("install");
+        let data_dir = root.join("data");
+        let config_dir = root.join("config");
+        let backup_path = root.join("backups/backup-1");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(backup_path.join("data")).unwrap();
+        fs::create_dir_all(backup_path.join("config")).unwrap();
+        fs::write(data_dir.join("gateway.sqlite"), b"new database").unwrap();
+        fs::write(config_dir.join("agent.toml"), b"new config").unwrap();
+        fs::write(backup_path.join("data/gateway.sqlite"), b"old database").unwrap();
+        fs::write(backup_path.join("config/agent.toml"), b"old config").unwrap();
+        set_active_release(
+            &installation_root,
+            &ActiveRelease {
+                schema_version: 1,
+                release_id: "a".repeat(64),
+                bundle_sha256: "a".repeat(64),
+            },
+        )
+        .unwrap();
+
+        UpdateRollbackPlan {
+            installation_root,
+            data_dir,
+            config_dir,
+            backup_path,
+            previous_active_release: Some(ActiveRelease {
+                schema_version: 1,
+                release_id: "b".repeat(64),
+                bundle_sha256: "b".repeat(64),
+            }),
         }
     }
 
@@ -1823,6 +2329,148 @@ mod tests {
         );
         assert_eq!(lifecycle.events, vec!["stop", "migrate", "start", "health"]);
         assert!(read_active_release(&installation_root).unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_restores_data_config_and_the_previous_active_release() {
+        let root = stage_directory("rollback");
+        fs::create_dir_all(&root).unwrap();
+        let plan = rollback_plan(&root);
+
+        rollback_update(&plan).unwrap();
+
+        assert_eq!(
+            fs::read(plan.data_dir.join("gateway.sqlite")).unwrap(),
+            b"old database"
+        );
+        assert_eq!(
+            fs::read(plan.config_dir.join("agent.toml")).unwrap(),
+            b"old config"
+        );
+        assert_eq!(
+            read_active_release(&plan.installation_root).unwrap(),
+            plan.previous_active_release
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovers_an_interrupted_mutation_by_rolling_back_durably() {
+        let root = stage_directory("journal-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let plan = rollback_plan(&root);
+        let store = UpdateJournalStore::new(&root).unwrap();
+        let job = super::PersistentUpdateJob {
+            schema_version: 1,
+            id: "update-1".to_owned(),
+            phase: UpdatePhase::HealthChecking,
+            created_at: "2026-07-18T03:00:00.000Z".to_owned(),
+            updated_at: "2026-07-18T03:01:00.000Z".to_owned(),
+            error_code: None,
+            progress: None,
+            recent_logs: Vec::new(),
+            rollback_plan: Some(plan.clone()),
+        };
+        store.persist(&job).unwrap();
+
+        let recovered = recover_interrupted_update(&store, "2026-07-18T03:02:00.000Z".to_owned())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recovered.phase, UpdatePhase::RollbackCompleted);
+        assert_eq!(
+            recovered.error_code.as_deref(),
+            Some("UPDATE_INTERRUPTED_BY_RESTART")
+        );
+        assert_eq!(store.load().unwrap(), Some(recovered));
+        assert_eq!(
+            fs::read(plan.data_dir.join("gateway.sqlite")).unwrap(),
+            b"old database"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn marks_an_interrupted_download_as_failed_without_rollback() {
+        let root = stage_directory("journal-download");
+        fs::create_dir_all(&root).unwrap();
+        let store = UpdateJournalStore::new(&root).unwrap();
+        let job = super::PersistentUpdateJob {
+            schema_version: 1,
+            id: "update-1".to_owned(),
+            phase: UpdatePhase::Downloading,
+            created_at: "2026-07-18T03:00:00.000Z".to_owned(),
+            updated_at: "2026-07-18T03:01:00.000Z".to_owned(),
+            error_code: None,
+            progress: None,
+            recent_logs: Vec::new(),
+            rollback_plan: None,
+        };
+        store.persist(&job).unwrap();
+
+        let recovered = recover_interrupted_update(&store, "2026-07-18T03:02:00.000Z".to_owned())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recovered.phase, UpdatePhase::Failed);
+        assert_eq!(
+            recovered.error_code.as_deref(),
+            Some("UPDATE_INTERRUPTED_BY_RESTART")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persists_bounded_progress_and_code_only_update_logs() {
+        let root = stage_directory("journal-progress");
+        fs::create_dir_all(&root).unwrap();
+        let store = UpdateJournalStore::new(&root).unwrap();
+        let mut job = super::PersistentUpdateJob {
+            schema_version: 1,
+            id: "update-1".to_owned(),
+            phase: UpdatePhase::Downloading,
+            created_at: "2026-07-18T03:00:00.000Z".to_owned(),
+            updated_at: "2026-07-18T03:01:00.000Z".to_owned(),
+            error_code: None,
+            progress: None,
+            recent_logs: Vec::new(),
+            rollback_plan: None,
+        };
+        store.persist(&job).unwrap();
+        store
+            .set_progress(
+                &mut job,
+                Some(UpdateProgress {
+                    bytes_downloaded: 2048,
+                    bytes_total: Some(4096),
+                    bytes_per_second: Some(512),
+                }),
+                "2026-07-18T03:01:01.000Z".to_owned(),
+            )
+            .unwrap();
+        for index in 0..65 {
+            store
+                .append_log(
+                    &mut job,
+                    UpdateLogEntry {
+                        occurred_at: "2026-07-18T03:01:02.000Z".to_owned(),
+                        phase: UpdatePhase::Downloading,
+                        code: format!("UPDATE_DOWNLOAD_{index}"),
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            job.progress
+                .as_ref()
+                .map(|progress| progress.bytes_downloaded),
+            Some(2048)
+        );
+        assert_eq!(job.recent_logs.len(), 64);
+        assert_eq!(job.recent_logs[0].code, "UPDATE_DOWNLOAD_1");
+        assert_eq!(store.load().unwrap(), Some(job));
         let _ = fs::remove_dir_all(root);
     }
 

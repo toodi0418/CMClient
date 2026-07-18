@@ -6,10 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cmclient-agent-core = { path = "../../crates/agent-core" }
 cmclient-control-api = { path = "../../crates/control-api" }
 cmclient-supervisor = { path = "../../crates/supervisor" }
 cmclient-updater = { path = "../../crates/updater" }
+serde_json = "1"
 
 [lints]
 workspace = true

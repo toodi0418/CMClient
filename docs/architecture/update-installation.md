@@ -18,11 +18,11 @@ The transaction follows this order:
    database, WAL, and configuration files without recursive self-backup.
 5. Atomically replace `<installation_root>/active-release.json` with the new
    digest slot, invoke the new release's forward-only migration journal, start
-   it, then require a passing health check.
+it, then require a passing health check.
 
 `active-release.json` records only a schema version and verified release digest;
 it contains no URLs, signing keys, tokens, or user configuration. A failed
 migration, start, or health check returns a stable error without reporting a
-completed update. P09-T04 records the transaction durably and restores the
-previous active pointer plus backup when failure or power loss requires
-rollback.
+completed update. The Agent's durable update journal records the transaction
+before each side effect and restores the previous active pointer plus backup
+after failure or power loss; see `docs/architecture/update-recovery.md`.

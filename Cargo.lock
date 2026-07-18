@@ -628,10 +628,12 @@ dependencies = [
 name = "cmclient-agent"
 version = "2.0.0-dev.0"
 dependencies = [
+ "chrono",
  "cmclient-agent-core",
  "cmclient-control-api",
  "cmclient-supervisor",
  "cmclient-updater",
+ "serde_json",
 ]
 
 [[package]]
