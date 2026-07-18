@@ -5,11 +5,22 @@ import { GatewayRuntime, parseGatewayListenOptions } from "./app.js";
 import { DomainEventBus } from "./events.js";
 import { JobEngine } from "./jobs.js";
 import { GatewayDatabase } from "./persistence/database.js";
+import { CallMeshClient } from "./callmesh.js";
 
 const database = new GatewayDatabase(gatewayDatabasePath(process.env));
 const events = new DomainEventBus();
 const jobs = new JobEngine(database.jobs, events);
 jobs.recover();
+const callmeshUrl = process.env.CMCLIENT_CALLMESH_URL?.trim();
+const callmeshApiKey = process.env.CMCLIENT_CALLMESH_API_KEY;
+const callmesh = new CallMeshClient(
+  {
+    baseUrl: callmeshUrl || "http://127.0.0.1:9",
+    ...(callmeshUrl && callmeshApiKey ? { apiKey: callmeshApiKey } : {}),
+  },
+  database.callmeshMappings,
+);
+void callmesh.synchronize();
 const runtime = new GatewayRuntime(
   parseGatewayListenOptions(process.env),
   undefined,
@@ -21,7 +32,9 @@ const runtime = new GatewayRuntime(
     listMessages: (limit) => database.meshMessages.list(limit),
     listTelemetry: (limit) => database.meshTelemetry.list(limit),
     listPositions: (limit) => database.positions.listCanonicalEvents(limit),
+    listAprsOutbox: (limit) => database.aprsOutbox.list(limit),
   },
+  callmesh,
 );
 let shuttingDown = false;
 

@@ -43,6 +43,17 @@ stable fallback. The Web position plot is local-only and uses the persisted
 coordinates directly, so opening the management interface does not disclose
 Mesh locations to an external map tile provider.
 
+The APRS page consumes the bounded `GET /api/v1/aprs/outbox` projection. It
+shows delivery state, retry count, event identity, and stable error codes, but
+the deterministic APRS Data line is deliberately excluded from the contract.
+The CallMesh page consumes `GET /api/v1/callmesh`; Gateway starts its isolated
+client independently of the global runtime and exposes only synchronization
+status plus validated mappings. Missing configuration never initiates an
+upstream request. Invalid credentials, schema failures, and mapping conflicts
+fail closed, clear persisted mappings, and surface only stable reason codes.
+The Logs page is a bounded, in-memory view of the current SSE session, not a
+claim of persisted audit history.
+
 The shell uses Tailwind 4 through the Vite integration and maps its `cm-*`
 utility names to semantic CSS variables in `apps/web/src/theme/tokens.css`.
 Those tokens identify canvas, surfaces, content, accent, warning, danger and

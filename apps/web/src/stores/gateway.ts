@@ -43,6 +43,7 @@ export function createGatewayStore(clients: GatewayClients = defaultClients()) {
       capabilities: undefined as SystemCapabilities | undefined,
       eventConnection: "idle" as SseConnectionState,
       lastEventType: undefined as string | undefined,
+      recentEvents: [] as DomainEvent[],
       errorCode: undefined as string | undefined,
       initialized: false,
       unsubscribers: [] as Array<() => void>,
@@ -62,6 +63,12 @@ export function createGatewayStore(clients: GatewayClients = defaultClients()) {
             }),
             clients.events.onEvent((event) => {
               this.lastEventType = event.type;
+              this.recentEvents = [
+                event,
+                ...this.recentEvents.filter(
+                  (current) => current.eventId !== event.eventId,
+                ),
+              ].slice(0, 50);
               if (
                 event.type.startsWith("gateway.") ||
                 event.type.startsWith("system.")

@@ -5,8 +5,6 @@ import {
 } from "vue-router";
 
 const sections = [
-  ["aprs", "navigation.aprs", "section.aprs"],
-  ["logs", "navigation.logs", "section.logs"],
   ["settings", "navigation.settings", "section.settings"],
   ["diagnostics", "navigation.diagnostics", "section.diagnostics"],
 ] as const;
@@ -32,6 +30,24 @@ export const router = createRouter({
       name: "meshtastic",
       component: () => import("@/views/MeshtasticView.vue"),
       meta: { labelKey: "navigation.meshtastic", group: "operations" },
+    },
+    {
+      path: "/aprs",
+      name: "aprs",
+      component: () => import("@/views/AprsView.vue"),
+      meta: { labelKey: "navigation.aprs", group: "operations" },
+    },
+    {
+      path: "/callmesh",
+      name: "callmesh",
+      component: () => import("@/views/CallMeshView.vue"),
+      meta: { labelKey: "navigation.callmesh", group: "operations" },
+    },
+    {
+      path: "/logs",
+      name: "logs",
+      component: () => import("@/views/LogsView.vue"),
+      meta: { labelKey: "navigation.logs", group: "operations" },
     },
     {
       path: "/nodes",

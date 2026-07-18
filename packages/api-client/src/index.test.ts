@@ -55,6 +55,28 @@ describe("gateway API client", () => {
       true,
     );
   });
+
+  it("reads the CallMesh overview through the versioned API", async () => {
+    let url: string | undefined;
+    const client = new GatewayApiClient({
+      fetch: async (input) => {
+        url = String(input);
+        return jsonResponse({
+          status: {
+            state: "ready",
+            updatedAt: "2026-07-18T00:00:00.000Z",
+            activeMappingCount: 0,
+          },
+          mappings: [],
+        });
+      },
+    });
+
+    await expect(client.callmesh.overview()).resolves.toMatchObject({
+      status: { state: "ready" },
+    });
+    expect(url).toBe("/api/v1/callmesh");
+  });
 });
 
 function jsonResponse(payload: unknown, status = 200): Response {

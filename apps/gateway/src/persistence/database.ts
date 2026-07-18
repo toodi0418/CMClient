@@ -15,6 +15,8 @@ import {
 } from "@cmclient/contracts";
 
 import { PositionRepository } from "../position.js";
+import { AprsOutboxRepository } from "../aprs-outbox.js";
+import { CallMeshMappingRepository } from "../callmesh.js";
 
 export interface Migration {
   version: number;
@@ -34,6 +36,8 @@ export class GatewayDatabase {
   readonly meshObservations: MeshObservationRepository;
   readonly meshTelemetry: MeshTelemetryRepository;
   readonly positions: PositionRepository;
+  readonly aprsOutbox: AprsOutboxRepository;
+  readonly callmeshMappings: CallMeshMappingRepository;
   readonly settings: SettingsRepository;
 
   constructor(path: string, migrations: Migration[] = defaultMigrations) {
@@ -51,6 +55,8 @@ export class GatewayDatabase {
     this.meshObservations = new MeshObservationRepository(this.connection);
     this.meshTelemetry = new MeshTelemetryRepository(this.connection);
     this.positions = new PositionRepository(this.connection);
+    this.aprsOutbox = new AprsOutboxRepository(this.connection);
+    this.callmeshMappings = new CallMeshMappingRepository(this.connection);
     this.settings = new SettingsRepository(this.connection);
   }
 
@@ -806,6 +812,18 @@ const defaultMigrations: Migration[] = [
       );
       database.exec(
         "CREATE INDEX aprs_remote_high_water_callsign_event_time_index ON aprs_remote_high_water (callsign, latest_event_time DESC)",
+      );
+    },
+  },
+  {
+    version: 8,
+    name: "callmesh_mappings",
+    up(database) {
+      database.exec(
+        "CREATE TABLE callmesh_mappings (version TEXT NOT NULL, effective_at TEXT NOT NULL, mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, PRIMARY KEY (version, effective_at, mesh_network_id, node_num, callsign))",
+      );
+      database.exec(
+        "CREATE INDEX callmesh_mappings_target_index ON callmesh_mappings (mesh_network_id, node_num, effective_at DESC)",
       );
     },
   },

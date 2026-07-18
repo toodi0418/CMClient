@@ -79,6 +79,7 @@ describe("GatewayRuntime", () => {
         listMessages: () => [],
         listTelemetry: () => [],
         listPositions: () => [],
+        listAprsOutbox: () => [],
       },
     );
 
@@ -95,6 +96,43 @@ describe("GatewayRuntime", () => {
     expect(response.statusCode).toBe(503);
     expect(response.json()).toMatchObject({
       code: "GATEWAY_DOMAIN_DATA_UNAVAILABLE",
+    });
+    await unavailable.close();
+  });
+
+  it("projects CallMesh state without exposing upstream credentials", async () => {
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      undefined,
+      {},
+      undefined,
+      undefined,
+      {
+        getOverview: () => ({
+          status: {
+            state: "degraded",
+            updatedAt: "2026-07-18T00:00:00.000Z",
+            reasonCode: "CALLMESH_AUTH_INVALID",
+            activeMappingCount: 0,
+          },
+          mappings: [],
+        }),
+      },
+    );
+    const response = await app.inject("/api/v1/callmesh");
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      status: expect.objectContaining({ reasonCode: "CALLMESH_AUTH_INVALID" }),
+      mappings: [],
+    });
+    await app.close();
+
+    const unavailable = createGatewayApp(new MemoryLogger());
+    const unavailableResponse = await unavailable.inject("/api/v1/callmesh");
+    expect(unavailableResponse.statusCode).toBe(503);
+    expect(unavailableResponse.json()).toMatchObject({
+      code: "CALLMESH_CLIENT_UNAVAILABLE",
     });
     await unavailable.close();
   });

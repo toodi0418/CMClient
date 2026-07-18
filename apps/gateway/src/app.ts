@@ -6,7 +6,9 @@ import Fastify, {
 import { Type } from "@sinclair/typebox";
 import {
   ApiErrorSchema,
+  AprsOutboxEntryListSchema,
   BuildMetadataSchema,
+  CallMeshOverviewSchema,
   JobDetailSchema,
   MeshMessageListSchema,
   MeshNodeListSchema,
@@ -16,6 +18,8 @@ import {
   SystemHealthSchema,
   SystemStatusSchema,
   type DomainEvent,
+  type AprsOutboxEntry,
+  type CallMeshOverview,
   type JobDetail,
   type MeshMessage,
   type MeshNode,
@@ -50,6 +54,11 @@ export interface GatewayDomainReadApi {
   listMessages(limit: number): MeshMessage[];
   listTelemetry(limit: number): MeshTelemetry[];
   listPositions(limit: number): PositionCanonicalEvent[];
+  listAprsOutbox(limit: number): AprsOutboxEntry[];
+}
+
+export interface GatewayCallMeshReadApi {
+  getOverview(): CallMeshOverview;
 }
 
 declare module "fastify" {
@@ -113,9 +122,18 @@ export class GatewayRuntime {
     eventBus?: DomainEventBus,
     jobs?: GatewayJobApi,
     domain?: GatewayDomainReadApi,
+    callmesh?: GatewayCallMeshReadApi,
   ) {
     this.options = options;
-    this.app = createGatewayApp(logger, system, eventBus, {}, jobs, domain);
+    this.app = createGatewayApp(
+      logger,
+      system,
+      eventBus,
+      {},
+      jobs,
+      domain,
+      callmesh,
+    );
   }
 
   async start(): Promise<GatewayListenOptions> {
@@ -151,6 +169,7 @@ export function createGatewayApp(
   sseOptions: GatewaySseOptions = {},
   jobs?: GatewayJobApi,
   domain?: GatewayDomainReadApi,
+  callmesh?: GatewayCallMeshReadApi,
 ): FastifyInstance {
   const heartbeatIntervalMs = sseOptions.heartbeatIntervalMs ?? 15_000;
   if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
@@ -231,6 +250,33 @@ export function createGatewayApp(
     (request, reply) =>
       domain
         ? { items: domain.listNodes(resolveListLimit(request.query.limit)) }
+        : sendDomainDataUnavailable(request, reply),
+  );
+  app.get(
+    "/api/v1/callmesh",
+    {
+      schema: {
+        response: { 200: CallMeshOverviewSchema, 503: ApiErrorSchema },
+      },
+    },
+    (request, reply) =>
+      callmesh
+        ? callmesh.getOverview()
+        : sendCallMeshUnavailable(request, reply),
+  );
+  app.get<{ Querystring: ListQuery }>(
+    "/api/v1/aprs/outbox",
+    {
+      schema: {
+        querystring: listQuerySchema(),
+        response: { 200: AprsOutboxEntryListSchema, 503: ApiErrorSchema },
+      },
+    },
+    (request, reply) =>
+      domain
+        ? {
+            items: domain.listAprsOutbox(resolveListLimit(request.query.limit)),
+          }
         : sendDomainDataUnavailable(request, reply),
   );
   app.get<{ Querystring: ListQuery }>(
@@ -396,6 +442,14 @@ function sendDomainDataUnavailable(
 ) {
   return reply.code(503).send({
     code: "GATEWAY_DOMAIN_DATA_UNAVAILABLE",
+    params: {},
+    traceId: request.traceId,
+  });
+}
+
+function sendCallMeshUnavailable(request: FastifyRequest, reply: FastifyReply) {
+  return reply.code(503).send({
+    code: "CALLMESH_CLIENT_UNAVAILABLE",
     params: {},
     traceId: request.traceId,
   });

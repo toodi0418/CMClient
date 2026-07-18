@@ -2,6 +2,7 @@
 import { computed, watch } from "vue";
 import {
   Gauge,
+  Cloud,
   LayoutDashboard,
   Languages,
   MapPinned,
@@ -44,6 +45,7 @@ const primaryNavigation = [
   { labelKey: "navigation.messages", to: "/messages", icon: MessageSquareText },
   { labelKey: "navigation.telemetry", to: "/telemetry", icon: Gauge },
   { labelKey: "navigation.aprs", to: "/aprs", icon: Satellite },
+  { labelKey: "navigation.callmesh", to: "/callmesh", icon: Cloud },
 ];
 
 const supportNavigation = [

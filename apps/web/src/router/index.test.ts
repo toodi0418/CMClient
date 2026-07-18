@@ -7,6 +7,8 @@ describe("management web router", () => {
     expect(router.resolve("/").name).toBe("overview");
     expect(router.resolve("/meshtastic").name).toBe("meshtastic");
     expect(router.resolve("/aprs").name).toBe("aprs");
+    expect(router.resolve("/callmesh").name).toBe("callmesh");
+    expect(router.resolve("/logs").name).toBe("logs");
     expect(router.resolve("/missing").matched.at(-1)?.redirect).toBe("/");
   });
 });

@@ -50,6 +50,9 @@ describe("gateway store", () => {
     });
     expect(gateway.eventConnection).toBe("open");
     expect(gateway.lastEventType).toBe("gateway.ready");
+    expect(gateway.recentEvents).toMatchObject([
+      { eventId: "event-fixture", type: "gateway.ready" },
+    ]);
   });
 
   it("keeps a stable error code when Gateway projections are unavailable", async () => {

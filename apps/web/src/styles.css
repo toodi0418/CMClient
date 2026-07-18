@@ -551,6 +551,26 @@ h2 {
   background: var(--cm-accent);
 }
 
+.status-badge[data-state="ready"],
+.status-badge[data-state="sent"] {
+  color: var(--cm-on-accent);
+  border-color: var(--cm-accent);
+  background: var(--cm-accent);
+}
+
+.status-badge[data-state="checking"],
+.status-badge[data-state="queued"],
+.status-badge[data-state="sending"] {
+  color: var(--cm-warning);
+}
+
+.status-badge[data-state="degraded"],
+.status-badge[data-state="failed"],
+.status-badge[data-state="unavailable"] {
+  color: var(--cm-danger);
+  border-color: var(--cm-danger);
+}
+
 .connection-summary {
   min-height: 78px;
   border-bottom: 0;

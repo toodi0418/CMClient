@@ -2,20 +2,12 @@ import { randomUUID } from "node:crypto";
 import net, { type Socket } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 
+import type { AprsOutboxEntry as PublicAprsOutboxEntry } from "@cmclient/contracts";
+
 export type AprsOutboxStatus = "queued" | "sending" | "sent" | "failed";
 
-export interface AprsOutboxEntry {
-  id: string;
-  callsign: string;
-  canonicalEventId: string;
+export interface AprsOutboxEntry extends PublicAprsOutboxEntry {
   data: string;
-  status: AprsOutboxStatus;
-  attempts: number;
-  nextAttemptAt: string;
-  createdAt: string;
-  updatedAt: string;
-  lastErrorCode?: string;
-  sentAt?: string;
 }
 
 export interface EnqueueAprsInput {
@@ -201,6 +193,18 @@ export class AprsOutboxRepository {
     return row ? toEntry(row) : undefined;
   }
 
+  list(limit: number): PublicAprsOutboxEntry[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw new AprsOutboxError();
+    }
+    return this.database
+      .prepare(
+        "SELECT * FROM aprs_outbox ORDER BY updated_at DESC, id ASC LIMIT ?",
+      )
+      .all(limit)
+      .map((row) => publicEntry(toEntry(row as Record<string, unknown>)));
+  }
+
   private required(id: string): AprsOutboxEntry {
     const entry = this.find(id);
     if (!entry) {
@@ -208,6 +212,21 @@ export class AprsOutboxRepository {
     }
     return entry;
   }
+}
+
+function publicEntry(entry: AprsOutboxEntry): PublicAprsOutboxEntry {
+  return {
+    id: entry.id,
+    callsign: entry.callsign,
+    canonicalEventId: entry.canonicalEventId,
+    status: entry.status,
+    attempts: entry.attempts,
+    nextAttemptAt: entry.nextAttemptAt,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+    ...(entry.lastErrorCode ? { lastErrorCode: entry.lastErrorCode } : {}),
+    ...(entry.sentAt ? { sentAt: entry.sentAt } : {}),
+  };
 }
 
 export class AprsOutboxWorker {

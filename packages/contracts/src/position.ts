@@ -106,6 +106,31 @@ export const PositionCanonicalEventListSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const AprsOutboxStatusSchema = Type.Union(
+  ["queued", "sending", "sent", "failed"].map((status) => Type.Literal(status)),
+);
+
+export const AprsOutboxEntrySchema = Type.Object(
+  {
+    id: Type.String({ minLength: 1, maxLength: 128 }),
+    callsign: Type.String({ minLength: 1, maxLength: 16 }),
+    canonicalEventId: Type.String({ minLength: 1, maxLength: 128 }),
+    status: AprsOutboxStatusSchema,
+    attempts: Type.Integer({ minimum: 0 }),
+    nextAttemptAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    createdAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    updatedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    lastErrorCode: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    sentAt: Type.Optional(Type.String({ pattern: UTC_ISO_TIMESTAMP })),
+  },
+  { additionalProperties: false },
+);
+
+export const AprsOutboxEntryListSchema = Type.Object(
+  { items: Type.Array(AprsOutboxEntrySchema, { maxItems: 200 }) },
+  { additionalProperties: false },
+);
+
 export const PositionDecisionCodeSchema = Type.Union(
   POSITION_DECISION_CODES.map((code) => Type.Literal(code)),
 );
@@ -166,5 +191,7 @@ export type PositionCanonicalEvent = Static<
 export type PositionCanonicalEventList = Static<
   typeof PositionCanonicalEventListSchema
 >;
+export type AprsOutboxEntry = Static<typeof AprsOutboxEntrySchema>;
+export type AprsOutboxEntryList = Static<typeof AprsOutboxEntryListSchema>;
 export type PositionDecision = Static<typeof PositionDecisionSchema>;
 export type NodePositionState = Static<typeof NodePositionStateSchema>;

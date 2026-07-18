@@ -13,6 +13,28 @@ import { GatewayDatabase } from "./persistence/database";
 import { PositionRepository, createCanonicalPositionEvent } from "./position";
 
 describe("APRS outbox", () => {
+  it("lists a bounded public projection without exposing APRS Data", () => {
+    const database = new GatewayDatabase(":memory:");
+    const event = persistedPositionEvent(database);
+    const repository = new AprsOutboxRepository(database.connection);
+    repository.enqueue({
+      callsign: "N0CALL-7",
+      canonicalEventId: event.id,
+      data: "N0CALL-7>APCM20:private deterministic data",
+      now: "2026-07-18T00:00:00.000Z",
+    });
+
+    expect(repository.list(1)).toEqual([
+      expect.objectContaining({
+        callsign: "N0CALL-7",
+        status: "queued",
+      }),
+    ]);
+    expect(repository.list(1)[0]).not.toHaveProperty("data");
+    expect(() => repository.list(201)).toThrow("APRS_OUTBOX_FAILED");
+    database.close();
+  });
+
   it("enforces callsign/event idempotency and retries a failed send", async () => {
     const database = new GatewayDatabase(":memory:");
     const event = persistedPositionEvent(database);

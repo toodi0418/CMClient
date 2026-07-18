@@ -1,6 +1,8 @@
 import {
   ApiErrorSchema,
+  AprsOutboxEntryListSchema,
   BuildMetadataSchema,
+  CallMeshOverviewSchema,
   JobDetailSchema,
   MeshMessageListSchema,
   MeshNodeListSchema,
@@ -10,7 +12,9 @@ import {
   SystemHealthSchema,
   SystemStatusSchema,
   type BuildMetadata,
+  type CallMeshOverview,
   type ApiError,
+  type AprsOutboxEntryList,
   type JobDetail,
   type MeshMessageList,
   type MeshNodeList,
@@ -150,6 +154,19 @@ export class GatewayApiClient {
         "/positions",
         PositionCanonicalEventListSchema,
       ),
+  };
+
+  readonly aprs = {
+    outbox: () =>
+      this.request<AprsOutboxEntryList>(
+        "/aprs/outbox",
+        AprsOutboxEntryListSchema,
+      ),
+  };
+
+  readonly callmesh = {
+    overview: () =>
+      this.request<CallMeshOverview>("/callmesh", CallMeshOverviewSchema),
   };
 
   private async request<T>(

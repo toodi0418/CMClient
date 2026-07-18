@@ -4,6 +4,7 @@ import { TypeCompiler } from "@sinclair/typebox/compiler";
 
 import {
   DomainEventSchema,
+  CallMeshOverviewSchema,
   JobDetailSchema,
   JOB_STATUSES,
   MeshMessageSchema,
@@ -80,6 +81,42 @@ describe("system status contract", () => {
       }),
     ).toBe(true);
     expect(check.Check({ health: "degraded" })).toBe(false);
+  });
+});
+
+describe("CallMesh contract", () => {
+  it("exposes only synchronized mappings and stable status metadata", () => {
+    const check = TypeCompiler.Compile(CallMeshOverviewSchema);
+    expect(
+      check.Check({
+        status: {
+          state: "ready",
+          updatedAt: "2026-07-18T00:00:00.000Z",
+          activeMappingVersion: "mapping-1",
+          activeMappingCount: 1,
+        },
+        mappings: [
+          {
+            version: "mapping-1",
+            effectiveAt: "2026-07-18T00:00:00.000Z",
+            meshNetworkId: "fixture",
+            nodeNum: 42,
+            callsign: "N0CALL-7",
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      check.Check({
+        status: {
+          state: "ready",
+          updatedAt: "2026-07-18T00:00:00.000Z",
+          activeMappingCount: 0,
+          apiKey: "must-not-be-public",
+        },
+        mappings: [],
+      }),
+    ).toBe(false);
   });
 });
 
