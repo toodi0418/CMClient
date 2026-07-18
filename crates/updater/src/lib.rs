@@ -29,6 +29,9 @@ pub const MANIFEST_SCHEMA_VERSION: u8 = 1;
 
 const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Conservative extraction ceiling for one signed update archive.
+pub const DEFAULT_MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Release channels supported by the updater.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -643,6 +646,521 @@ fn verify_staged_bundle(path: &Path, bundle: &UpdateBundle) -> Result<(), Update
     Ok(())
 }
 
+/// Inputs for one install transaction after a bundle has entered staging.
+pub struct UpdateInstallRequest<'a> {
+    /// Archive that has already passed manifest and byte verification.
+    pub staged_bundle: &'a StagedBundle,
+    /// Product-owned root that contains release slots and the active pointer.
+    pub installation_root: &'a Path,
+    /// Agent data directory to preserve before migration.
+    pub data_dir: &'a Path,
+    /// Agent configuration directory to preserve before migration.
+    pub config_dir: &'a Path,
+    /// Durable backup root outside data and configuration directories.
+    pub backup_root: &'a Path,
+    /// Safe, caller-assigned identity for this backup snapshot.
+    pub backup_id: &'a str,
+    /// Maximum extracted byte count accepted from the archive.
+    pub maximum_unpacked_bytes: u64,
+}
+
+/// Active release selection persisted separately from user data.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActiveRelease {
+    /// Pointer file schema version.
+    pub schema_version: u8,
+    /// Digest-named release slot selected by the transaction.
+    pub release_id: String,
+    /// Digest of the archive that created this release slot.
+    pub bundle_sha256: String,
+}
+
+/// Result of a successful update install transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledRelease {
+    /// Release slot containing the safely extracted bundle.
+    pub release_path: PathBuf,
+    /// Durable data/config snapshot created after the prior release stopped.
+    pub backup_path: PathBuf,
+    /// Active pointer that now selects `release_path`.
+    pub active_release: ActiveRelease,
+    /// Pointer selected before this transaction, when one existed.
+    pub previous_active_release: Option<ActiveRelease>,
+}
+
+/// Agent-owned runtime boundary used by the install transaction.
+pub trait UpdateLifecycle {
+    /// Stops processes that may write user data before a filesystem snapshot.
+    fn stop(&mut self) -> Result<(), UpdateInstallError>;
+    /// Runs the new release's forward-only migration journal.
+    fn migrate(&mut self, release_path: &Path) -> Result<(), UpdateInstallError>;
+    /// Starts services from the newly selected release.
+    fn start(&mut self, release_path: &Path) -> Result<(), UpdateInstallError>;
+    /// Returns true only when the new release passes its health gate.
+    fn health_check(&mut self) -> Result<bool, UpdateInstallError>;
+}
+
+/// Stable failures from backup, archive extraction, installation, or health gating.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateInstallError {
+    /// The staged archive was changed or is not a regular file.
+    StagedBundleInvalid,
+    /// Caller-provided update paths or backup identity are unsafe.
+    InvalidInstallLayout,
+    /// The archive could not be decoded.
+    ArchiveReadFailed,
+    /// An archive path is absolute, empty, or escapes the release slot.
+    ArchivePathInvalid,
+    /// An archive contains a symlink, special file, or other unsupported entry.
+    ArchiveEntryUnsupported,
+    /// The archive expands beyond the configured safety limit.
+    ArchiveTooLarge,
+    /// The archive contains no installable files.
+    ArchiveEmpty,
+    /// Filesystem preparation, copying, or release extraction failed.
+    InstallIoFailed,
+    /// The digest-named release slot already exists.
+    ReleaseSlotExists,
+    /// A prepared release slot could not be published.
+    ReleasePublishFailed,
+    /// A backup with this identity already exists.
+    BackupExists,
+    /// Backup copying or publication failed.
+    BackupFailed,
+    /// The persisted active-release pointer is malformed.
+    ActiveReleaseInvalid,
+    /// The active-release pointer could not be atomically written.
+    ActivationFailed,
+    /// The Agent failed while stopping the previous runtime.
+    LifecycleStopFailed,
+    /// The new release's migration journal failed.
+    MigrationFailed,
+    /// The new release failed to start.
+    LifecycleStartFailed,
+    /// The new release did not pass its health check.
+    HealthCheckFailed,
+}
+
+impl UpdateInstallError {
+    /// Stable machine-readable code for update state and rollback decisions.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::StagedBundleInvalid => "UPDATE_INSTALL_STAGED_BUNDLE_INVALID",
+            Self::InvalidInstallLayout => "UPDATE_INSTALL_LAYOUT_INVALID",
+            Self::ArchiveReadFailed => "UPDATE_INSTALL_ARCHIVE_READ_FAILED",
+            Self::ArchivePathInvalid => "UPDATE_INSTALL_ARCHIVE_PATH_INVALID",
+            Self::ArchiveEntryUnsupported => "UPDATE_INSTALL_ARCHIVE_ENTRY_UNSUPPORTED",
+            Self::ArchiveTooLarge => "UPDATE_INSTALL_ARCHIVE_TOO_LARGE",
+            Self::ArchiveEmpty => "UPDATE_INSTALL_ARCHIVE_EMPTY",
+            Self::InstallIoFailed => "UPDATE_INSTALL_IO_FAILED",
+            Self::ReleaseSlotExists => "UPDATE_INSTALL_RELEASE_SLOT_EXISTS",
+            Self::ReleasePublishFailed => "UPDATE_INSTALL_RELEASE_PUBLISH_FAILED",
+            Self::BackupExists => "UPDATE_BACKUP_ALREADY_EXISTS",
+            Self::BackupFailed => "UPDATE_BACKUP_FAILED",
+            Self::ActiveReleaseInvalid => "UPDATE_ACTIVE_RELEASE_INVALID",
+            Self::ActivationFailed => "UPDATE_ACTIVATION_FAILED",
+            Self::LifecycleStopFailed => "UPDATE_LIFECYCLE_STOP_FAILED",
+            Self::MigrationFailed => "UPDATE_MIGRATION_FAILED",
+            Self::LifecycleStartFailed => "UPDATE_LIFECYCLE_START_FAILED",
+            Self::HealthCheckFailed => "UPDATE_HEALTH_CHECK_FAILED",
+        }
+    }
+}
+
+impl fmt::Display for UpdateInstallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl Error for UpdateInstallError {}
+
+/// Performs an update transaction through backup, activation, migration, and health.
+pub fn install_verified_release(
+    request: &UpdateInstallRequest<'_>,
+    lifecycle: &mut impl UpdateLifecycle,
+) -> Result<InstalledRelease, UpdateInstallError> {
+    validate_install_request(request)?;
+    verify_staged_archive(request.staged_bundle)?;
+
+    let releases_dir = request.installation_root.join("releases");
+    fs::create_dir_all(&releases_dir).map_err(|_| UpdateInstallError::InstallIoFailed)?;
+    let release_id = &request.staged_bundle.sha256;
+    let release_path = releases_dir.join(release_id);
+    if release_path.exists() {
+        return Err(UpdateInstallError::ReleaseSlotExists);
+    }
+    let temporary_release = releases_dir.join(format!(".{release_id}.part-{}", std::process::id()));
+    if temporary_release.exists() {
+        return Err(UpdateInstallError::InstallIoFailed);
+    }
+    fs::create_dir(&temporary_release).map_err(|_| UpdateInstallError::InstallIoFailed)?;
+
+    let extraction_result = extract_archive(
+        request.staged_bundle,
+        &temporary_release,
+        request.maximum_unpacked_bytes,
+    );
+    if let Err(error) = extraction_result {
+        let _ = fs::remove_dir_all(&temporary_release);
+        return Err(error);
+    }
+    if fs::rename(&temporary_release, &release_path).is_err() {
+        let _ = fs::remove_dir_all(&temporary_release);
+        return Err(UpdateInstallError::ReleasePublishFailed);
+    }
+
+    lifecycle.stop()?;
+    let backup_path = create_backup(request)?;
+    let previous_active_release = read_active_release(request.installation_root)?;
+    let active_release = ActiveRelease {
+        schema_version: 1,
+        release_id: release_id.clone(),
+        bundle_sha256: release_id.clone(),
+    };
+    write_active_release(request.installation_root, &active_release)?;
+    lifecycle.migrate(&release_path)?;
+    lifecycle.start(&release_path)?;
+    if !lifecycle.health_check()? {
+        return Err(UpdateInstallError::HealthCheckFailed);
+    }
+
+    Ok(InstalledRelease {
+        release_path,
+        backup_path,
+        active_release,
+        previous_active_release,
+    })
+}
+
+/// Reads the selected release pointer without touching user data.
+pub fn read_active_release(
+    installation_root: &Path,
+) -> Result<Option<ActiveRelease>, UpdateInstallError> {
+    let pointer_path = installation_root.join("active-release.json");
+    if !pointer_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(pointer_path).map_err(|_| UpdateInstallError::ActiveReleaseInvalid)?;
+    let release = serde_json::from_slice::<ActiveRelease>(&bytes)
+        .map_err(|_| UpdateInstallError::ActiveReleaseInvalid)?;
+    if release.schema_version != 1
+        || !is_sha256_hex(&release.release_id)
+        || release.release_id != release.bundle_sha256
+    {
+        return Err(UpdateInstallError::ActiveReleaseInvalid);
+    }
+    Ok(Some(release))
+}
+
+fn validate_install_request(request: &UpdateInstallRequest<'_>) -> Result<(), UpdateInstallError> {
+    if request.maximum_unpacked_bytes == 0
+        || !request.installation_root.is_absolute()
+        || !request.data_dir.is_absolute()
+        || !request.config_dir.is_absolute()
+        || !request.backup_root.is_absolute()
+        || !is_safe_backup_id(request.backup_id)
+        || request.backup_root.starts_with(request.data_dir)
+        || request.backup_root.starts_with(request.config_dir)
+    {
+        return Err(UpdateInstallError::InvalidInstallLayout);
+    }
+    Ok(())
+}
+
+fn verify_staged_archive(staged_bundle: &StagedBundle) -> Result<(), UpdateInstallError> {
+    if !is_sha256_hex(&staged_bundle.sha256) || staged_bundle.size_bytes == 0 {
+        return Err(UpdateInstallError::StagedBundleInvalid);
+    }
+    let metadata = fs::symlink_metadata(&staged_bundle.path)
+        .map_err(|_| UpdateInstallError::StagedBundleInvalid)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != staged_bundle.size_bytes
+    {
+        return Err(UpdateInstallError::StagedBundleInvalid);
+    }
+    let mut file =
+        File::open(&staged_bundle.path).map_err(|_| UpdateInstallError::StagedBundleInvalid)?;
+    let digest = digest_reader(&mut file).map_err(|_| UpdateInstallError::StagedBundleInvalid)?;
+    if digest != staged_bundle.sha256 {
+        return Err(UpdateInstallError::StagedBundleInvalid);
+    }
+    Ok(())
+}
+
+fn extract_archive(
+    staged_bundle: &StagedBundle,
+    destination: &Path,
+    maximum_unpacked_bytes: u64,
+) -> Result<(), UpdateInstallError> {
+    match staged_bundle.archive {
+        UpdateArchive::TarZst => {
+            extract_tar_zst(&staged_bundle.path, destination, maximum_unpacked_bytes)
+        }
+        UpdateArchive::Zip => extract_zip(&staged_bundle.path, destination, maximum_unpacked_bytes),
+    }
+}
+
+fn extract_tar_zst(
+    archive_path: &Path,
+    destination: &Path,
+    maximum_unpacked_bytes: u64,
+) -> Result<(), UpdateInstallError> {
+    let file = File::open(archive_path).map_err(|_| UpdateInstallError::ArchiveReadFailed)?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|_| UpdateInstallError::ArchiveReadFailed)?;
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|_| UpdateInstallError::ArchiveReadFailed)?;
+    let mut extracted_files = 0_u64;
+    let mut total_bytes = 0_u64;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|_| UpdateInstallError::ArchiveReadFailed)?;
+        let path = entry
+            .path()
+            .map_err(|_| UpdateInstallError::ArchivePathInvalid)?;
+        let output_path = archive_output_path(destination, &path)?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            fs::create_dir_all(output_path).map_err(|_| UpdateInstallError::InstallIoFailed)?;
+            continue;
+        }
+        if !entry_type.is_file() {
+            return Err(UpdateInstallError::ArchiveEntryUnsupported);
+        }
+        let size = entry.size();
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= maximum_unpacked_bytes)
+            .ok_or(UpdateInstallError::ArchiveTooLarge)?;
+        write_archive_entry(&mut entry, &output_path, size)?;
+        set_safe_archive_permissions(&output_path, entry.header().mode().unwrap_or(0o644))?;
+        extracted_files += 1;
+    }
+
+    if extracted_files == 0 {
+        return Err(UpdateInstallError::ArchiveEmpty);
+    }
+    Ok(())
+}
+
+fn extract_zip(
+    archive_path: &Path,
+    destination: &Path,
+    maximum_unpacked_bytes: u64,
+) -> Result<(), UpdateInstallError> {
+    let file = File::open(archive_path).map_err(|_| UpdateInstallError::ArchiveReadFailed)?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|_| UpdateInstallError::ArchiveReadFailed)?;
+    let mut extracted_files = 0_u64;
+    let mut total_bytes = 0_u64;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|_| UpdateInstallError::ArchiveReadFailed)?;
+        let raw_name = entry.name().to_owned();
+        let output_path = archive_output_path(destination, Path::new(&raw_name))?;
+        if entry.enclosed_name().is_none() {
+            return Err(UpdateInstallError::ArchivePathInvalid);
+        }
+        if entry.is_dir() {
+            fs::create_dir_all(output_path).map_err(|_| UpdateInstallError::InstallIoFailed)?;
+            continue;
+        }
+        if entry.is_symlink() {
+            return Err(UpdateInstallError::ArchiveEntryUnsupported);
+        }
+        let size = entry.size();
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= maximum_unpacked_bytes)
+            .ok_or(UpdateInstallError::ArchiveTooLarge)?;
+        write_archive_entry(&mut entry, &output_path, size)?;
+        set_safe_archive_permissions(&output_path, entry.unix_mode().unwrap_or(0o644))?;
+        extracted_files += 1;
+    }
+
+    if extracted_files == 0 {
+        return Err(UpdateInstallError::ArchiveEmpty);
+    }
+    Ok(())
+}
+
+fn archive_output_path(
+    destination: &Path,
+    archive_path: &Path,
+) -> Result<PathBuf, UpdateInstallError> {
+    use std::path::Component;
+
+    if archive_path.as_os_str().is_empty()
+        || archive_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(UpdateInstallError::ArchivePathInvalid);
+    }
+    Ok(destination.join(archive_path))
+}
+
+fn write_archive_entry(
+    input: &mut dyn Read,
+    output_path: &Path,
+    expected_size: u64,
+) -> Result<(), UpdateInstallError> {
+    let parent = output_path
+        .parent()
+        .ok_or(UpdateInstallError::ArchivePathInvalid)?;
+    fs::create_dir_all(parent).map_err(|_| UpdateInstallError::InstallIoFailed)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)
+        .map_err(|_| UpdateInstallError::InstallIoFailed)?;
+    let copied = io::copy(input, &mut output).map_err(|_| UpdateInstallError::ArchiveReadFailed)?;
+    if copied != expected_size {
+        return Err(UpdateInstallError::ArchiveReadFailed);
+    }
+    output
+        .sync_all()
+        .map_err(|_| UpdateInstallError::InstallIoFailed)
+}
+
+#[cfg(unix)]
+fn set_safe_archive_permissions(path: &Path, mode: u32) -> Result<(), UpdateInstallError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
+        .map_err(|_| UpdateInstallError::InstallIoFailed)
+}
+
+#[cfg(not(unix))]
+fn set_safe_archive_permissions(_path: &Path, _mode: u32) -> Result<(), UpdateInstallError> {
+    Ok(())
+}
+
+fn create_backup(request: &UpdateInstallRequest<'_>) -> Result<PathBuf, UpdateInstallError> {
+    if request.backup_root.join(request.backup_id).exists() {
+        return Err(UpdateInstallError::BackupExists);
+    }
+    fs::create_dir_all(request.backup_root).map_err(|_| UpdateInstallError::BackupFailed)?;
+    let temporary = request.backup_root.join(format!(
+        ".{}.part-{}",
+        request.backup_id,
+        std::process::id()
+    ));
+    if temporary.exists() {
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    fs::create_dir(&temporary).map_err(|_| UpdateInstallError::BackupFailed)?;
+    let copy_result = (|| {
+        copy_directory(request.data_dir, &temporary.join("data"))?;
+        copy_directory(request.config_dir, &temporary.join("config"))?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+
+    let backup_path = request.backup_root.join(request.backup_id);
+    if fs::rename(&temporary, &backup_path).is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    Ok(backup_path)
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), UpdateInstallError> {
+    let metadata = fs::symlink_metadata(source).map_err(|_| UpdateInstallError::BackupFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    fs::create_dir_all(destination).map_err(|_| UpdateInstallError::BackupFailed)?;
+    for entry in fs::read_dir(source).map_err(|_| UpdateInstallError::BackupFailed)? {
+        let entry = entry.map_err(|_| UpdateInstallError::BackupFailed)?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata =
+            fs::symlink_metadata(&source_path).map_err(|_| UpdateInstallError::BackupFailed)?;
+        if metadata.file_type().is_symlink() {
+            return Err(UpdateInstallError::BackupFailed);
+        }
+        if metadata.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            copy_backup_file(&source_path, &destination_path)?;
+        } else {
+            return Err(UpdateInstallError::BackupFailed);
+        }
+    }
+    Ok(())
+}
+
+fn copy_backup_file(source: &Path, destination: &Path) -> Result<(), UpdateInstallError> {
+    let mut input = File::open(source).map_err(|_| UpdateInstallError::BackupFailed)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|_| UpdateInstallError::BackupFailed)?;
+    io::copy(&mut input, &mut output).map_err(|_| UpdateInstallError::BackupFailed)?;
+    output
+        .sync_all()
+        .map_err(|_| UpdateInstallError::BackupFailed)
+}
+
+fn write_active_release(
+    installation_root: &Path,
+    active_release: &ActiveRelease,
+) -> Result<(), UpdateInstallError> {
+    fs::create_dir_all(installation_root).map_err(|_| UpdateInstallError::ActivationFailed)?;
+    let pointer_path = installation_root.join("active-release.json");
+    let temporary = installation_root.join(format!(".active-release.part-{}", std::process::id()));
+    let bytes =
+        serde_json::to_vec(active_release).map_err(|_| UpdateInstallError::ActivationFailed)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| UpdateInstallError::ActivationFailed)?;
+    if output.write_all(&bytes).is_err() || output.sync_all().is_err() {
+        drop(output);
+        let _ = fs::remove_file(&temporary);
+        return Err(UpdateInstallError::ActivationFailed);
+    }
+    drop(output);
+    if fs::rename(&temporary, &pointer_path).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(UpdateInstallError::ActivationFailed);
+    }
+    Ok(())
+}
+
+fn digest_reader(reader: &mut dyn Read) -> io::Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; DOWNLOAD_BUFFER_SIZE];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(format_sha256_digest(&digest.finalize()));
+        }
+        digest.update(&buffer[..read]);
+    }
+}
+
+fn is_safe_backup_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
 fn validate_signing_key_id(value: &str) -> Result<(), UpdateManifestError> {
     if value.is_empty()
         || value.len() > 128
@@ -697,15 +1215,18 @@ fn is_utc_millisecond_timestamp(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BundleResponse, BundleTransport, MANIFEST_SCHEMA_VERSION, SignatureAlgorithm,
-        SignedUpdateManifest, UpdateArchive, UpdateBundle, UpdateChannel, UpdateComponent,
-        UpdateManifest, UpdateManifestError, UpdateStageError, UpdateStageRequest, UpdateTarget,
-        sha256_hex, stage_verified_bundle,
+        ActiveRelease, BundleResponse, BundleTransport, DEFAULT_MAX_UNPACKED_BYTES,
+        MANIFEST_SCHEMA_VERSION, SignatureAlgorithm, SignedUpdateManifest, StagedBundle,
+        UpdateArchive, UpdateBundle, UpdateChannel, UpdateComponent, UpdateInstallError,
+        UpdateInstallRequest, UpdateLifecycle, UpdateManifest, UpdateManifestError,
+        UpdateStageError, UpdateStageRequest, UpdateTarget, install_verified_release,
+        read_active_release, sha256_hex, stage_verified_bundle,
     };
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use std::{
         fs,
-        io::Cursor,
+        fs::File,
+        io::{Cursor, Write},
         path::{Path, PathBuf},
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -802,6 +1323,100 @@ mod tests {
             component: UpdateComponent::Desktop,
             target: UpdateTarget::DarwinAarch64,
             cache_dir,
+        }
+    }
+
+    fn staged_archive(path: &Path, archive: UpdateArchive) -> StagedBundle {
+        let bytes = fs::read(path).unwrap();
+        StagedBundle {
+            path: path.to_path_buf(),
+            component: UpdateComponent::Desktop,
+            target: UpdateTarget::DarwinAarch64,
+            archive,
+            sha256: sha256_hex(&bytes),
+            size_bytes: bytes.len() as u64,
+            reused: false,
+        }
+    }
+
+    fn write_tar_zst(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let encoder = zstd::stream::write::Encoder::new(file, 0).unwrap();
+        let mut archive = tar::Builder::new(encoder);
+        for (name, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive.append_data(&mut header, name, *contents).unwrap();
+        }
+        archive.finish().unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, contents) in entries {
+            archive.start_file(*name, options).unwrap();
+            archive.write_all(contents).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    struct RecordingLifecycle {
+        events: Vec<&'static str>,
+        healthy: bool,
+    }
+
+    impl RecordingLifecycle {
+        fn healthy() -> Self {
+            Self {
+                events: Vec::new(),
+                healthy: true,
+            }
+        }
+    }
+
+    impl UpdateLifecycle for RecordingLifecycle {
+        fn stop(&mut self) -> Result<(), UpdateInstallError> {
+            self.events.push("stop");
+            Ok(())
+        }
+
+        fn migrate(&mut self, _release_path: &Path) -> Result<(), UpdateInstallError> {
+            self.events.push("migrate");
+            Ok(())
+        }
+
+        fn start(&mut self, _release_path: &Path) -> Result<(), UpdateInstallError> {
+            self.events.push("start");
+            Ok(())
+        }
+
+        fn health_check(&mut self) -> Result<bool, UpdateInstallError> {
+            self.events.push("health");
+            Ok(self.healthy)
+        }
+    }
+
+    fn install_request<'a>(
+        staged_bundle: &'a StagedBundle,
+        installation_root: &'a Path,
+        data_dir: &'a Path,
+        config_dir: &'a Path,
+        backup_root: &'a Path,
+    ) -> UpdateInstallRequest<'a> {
+        UpdateInstallRequest {
+            staged_bundle,
+            installation_root,
+            data_dir,
+            config_dir,
+            backup_root,
+            backup_id: "backup-2.0.0-dev.1",
+            maximum_unpacked_bytes: DEFAULT_MAX_UNPACKED_BYTES,
         }
     }
 
@@ -1047,6 +1662,168 @@ mod tests {
         );
         assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
         let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn installs_a_release_after_backup_and_health_gate() {
+        let root = stage_directory("install-transaction");
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("release.tar.zst");
+        write_tar_zst(
+            &archive_path,
+            &[
+                ("bin/cmclient-agent", b"new agent"),
+                ("web/index.html", b"new web"),
+            ],
+        );
+        let staged = staged_archive(&archive_path, UpdateArchive::TarZst);
+        let installation_root = root.join("install");
+        let data_dir = root.join("data");
+        let config_dir = root.join("config");
+        let backup_root = root.join("backups");
+        fs::create_dir_all(data_dir.join("sqlite")).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(data_dir.join("sqlite/gateway.sqlite"), b"database").unwrap();
+        fs::write(config_dir.join("agent.toml"), b"[agent]\n").unwrap();
+        let mut lifecycle = RecordingLifecycle::healthy();
+
+        let installed = install_verified_release(
+            &install_request(
+                &staged,
+                &installation_root,
+                &data_dir,
+                &config_dir,
+                &backup_root,
+            ),
+            &mut lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.events, vec!["stop", "migrate", "start", "health"]);
+        assert_eq!(
+            fs::read(installed.release_path.join("bin/cmclient-agent")).unwrap(),
+            b"new agent"
+        );
+        assert_eq!(
+            fs::read(installed.backup_path.join("data/sqlite/gateway.sqlite")).unwrap(),
+            b"database"
+        );
+        assert_eq!(
+            fs::read(installed.backup_path.join("config/agent.toml")).unwrap(),
+            b"[agent]\n"
+        );
+        assert_eq!(
+            read_active_release(&installation_root).unwrap(),
+            Some(ActiveRelease {
+                schema_version: 1,
+                release_id: staged.sha256.clone(),
+                bundle_sha256: staged.sha256.clone(),
+            })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_zip_path_traversal_before_stopping_the_runtime() {
+        let root = stage_directory("zip-path-traversal");
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("release.zip");
+        write_zip(&archive_path, &[("../outside", b"escape")]);
+        let staged = staged_archive(&archive_path, UpdateArchive::Zip);
+        let installation_root = root.join("install");
+        let data_dir = root.join("data");
+        let config_dir = root.join("config");
+        let backup_root = root.join("backups");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let mut lifecycle = RecordingLifecycle::healthy();
+
+        assert_eq!(
+            install_verified_release(
+                &install_request(
+                    &staged,
+                    &installation_root,
+                    &data_dir,
+                    &config_dir,
+                    &backup_root,
+                ),
+                &mut lifecycle,
+            ),
+            Err(UpdateInstallError::ArchivePathInvalid)
+        );
+        assert!(lifecycle.events.is_empty());
+        assert!(!root.join("outside").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installs_a_verified_zip_release() {
+        let root = stage_directory("zip-install");
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("release.zip");
+        write_zip(&archive_path, &[("bin/cmclient.exe", b"windows agent")]);
+        let staged = staged_archive(&archive_path, UpdateArchive::Zip);
+        let installation_root = root.join("install");
+        let data_dir = root.join("data");
+        let config_dir = root.join("config");
+        let backup_root = root.join("backups");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let mut lifecycle = RecordingLifecycle::healthy();
+
+        let installed = install_verified_release(
+            &install_request(
+                &staged,
+                &installation_root,
+                &data_dir,
+                &config_dir,
+                &backup_root,
+            ),
+            &mut lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(installed.release_path.join("bin/cmclient.exe")).unwrap(),
+            b"windows agent"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fails_the_health_gate_after_start_without_reporting_success() {
+        let root = stage_directory("health-gate");
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("release.tar.zst");
+        write_tar_zst(&archive_path, &[("bin/cmclient-agent", b"new agent")]);
+        let staged = staged_archive(&archive_path, UpdateArchive::TarZst);
+        let installation_root = root.join("install");
+        let data_dir = root.join("data");
+        let config_dir = root.join("config");
+        let backup_root = root.join("backups");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let mut lifecycle = RecordingLifecycle {
+            events: Vec::new(),
+            healthy: false,
+        };
+
+        assert_eq!(
+            install_verified_release(
+                &install_request(
+                    &staged,
+                    &installation_root,
+                    &data_dir,
+                    &config_dir,
+                    &backup_root,
+                ),
+                &mut lifecycle,
+            ),
+            Err(UpdateInstallError::HealthCheckFailed)
+        );
+        assert_eq!(lifecycle.events, vec!["stop", "migrate", "start", "health"]);
+        assert!(read_active_release(&installation_root).unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
