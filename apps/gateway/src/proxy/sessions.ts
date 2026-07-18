@@ -17,6 +17,8 @@ export interface ProxySessionManagerOptions {
   maxQueuedFrames?: number;
 }
 
+export type ProxyUpstreamEventRouter = (event: ProxyUpstreamEvent) => boolean;
+
 export interface ProxyBroadcastResult {
   accepted: number;
   dropped: number;
@@ -63,9 +65,12 @@ export class ProxySessionManager {
     }
   }
 
-  start(): void {
+  start(routeEvent?: ProxyUpstreamEventRouter): void {
     if (!this.unsubscribe) {
       this.unsubscribe = this.upstream.subscribe((event) => {
+        if (routeEvent?.(event)) {
+          return;
+        }
         if (event.kind === "frame") {
           this.broadcast(event.frame);
         }
@@ -126,6 +131,10 @@ export class ProxySessionManager {
       }
     }
     return { accepted, dropped };
+  }
+
+  deliver(id: string, frame: Uint8Array): boolean {
+    return this.sessions.get(id)?.enqueue(frame) ?? false;
   }
 
   get snapshot(): ProxySessionSnapshot[] {

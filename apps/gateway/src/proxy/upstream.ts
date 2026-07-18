@@ -175,6 +175,10 @@ export class ProxyUpstreamManager {
     return () => this.listeners.delete(listener);
   }
 
+  writeFrame(frame: Uint8Array): Promise<void> {
+    return this.transport.writeFrame(new Uint8Array(frame));
+  }
+
   private onTransport(event: TransportEvent): void {
     if (event.kind === "state") {
       if (event.state.status === "configuring") {
