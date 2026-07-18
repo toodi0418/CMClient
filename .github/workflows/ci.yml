@@ -26,6 +26,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
       - run: pnpm install --frozen-lockfile
       - run: pnpm format:check
       - run: pnpm lint
@@ -37,3 +47,49 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
       - run: cargo build --workspace --locked
+
+  desktop-smoke:
+    name: Desktop smoke (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            install_tauri_dependencies: true
+          - name: macOS
+            os: macos-latest
+            install_tauri_dependencies: false
+          - name: Windows
+            os: windows-latest
+            install_tauri_dependencies: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt
+      - name: Install Tauri system dependencies
+        if: matrix.install_tauri_dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @cmclient/desktop run build
+      - run: cargo test -p cmclient-desktop --locked
+      - run: cargo build -p cmclient-desktop --locked

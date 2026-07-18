@@ -26,3 +26,6 @@ Control API. When the listener reports its loopback URL as running, Desktop
 opens only that Agent-provided URL through the official Tauri opener plugin.
 Gateway restart remains an Agent command, so the Desktop process never spawns,
 kills, or probes Gateway directly.
+
+Desktop runtime and CI smoke coverage is documented in
+`docs/testing/desktop-smoke.md`.
