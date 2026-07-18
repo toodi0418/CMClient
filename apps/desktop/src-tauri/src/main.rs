@@ -5,6 +5,7 @@ use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_opener::OpenerExt;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_OPEN_ID: &str = "open";
@@ -21,6 +22,17 @@ fn agent_command(command: String) -> Result<ControlStatus, String> {
 }
 
 #[tauri::command]
+fn open_management_web(app: AppHandle) -> Result<(), String> {
+    let status = control(ControlCommand::Status)?;
+    let url = status
+        .management_web_url
+        .ok_or_else(|| String::from("DESKTOP_MANAGEMENT_WEB_DISABLED"))?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|_| String::from("DESKTOP_MANAGEMENT_WEB_OPEN_FAILED"))
+}
+
+#[tauri::command]
 fn exit_desktop(app: AppHandle) {
     app.exit(0);
 }
@@ -30,6 +42,8 @@ fn parse_command(command: &str) -> Result<ControlCommand, String> {
         "start" => Ok(ControlCommand::Start),
         "stop" => Ok(ControlCommand::Stop),
         "restart" => Ok(ControlCommand::Restart),
+        "enable_web" => Ok(ControlCommand::EnableManagementWeb),
+        "disable_web" => Ok(ControlCommand::DisableManagementWeb),
         _ => Err(String::from("DESKTOP_AGENT_COMMAND_INVALID")),
     }
 }
@@ -44,6 +58,8 @@ fn control(command: ControlCommand) -> Result<ControlStatus, String> {
         ControlCommand::Start => client.start(),
         ControlCommand::Stop => client.stop(),
         ControlCommand::Restart => client.restart(),
+        ControlCommand::EnableManagementWeb => client.enable_management_web(),
+        ControlCommand::DisableManagementWeb => client.disable_management_web(),
     }
     .map_err(|error| error.code().to_owned())
 }
@@ -110,6 +126,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             let _ = show_main_window(app);
         }))
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             setup_tray(&app.handle())?;
             Ok(())
@@ -125,6 +142,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             agent_status,
             agent_command,
+            open_management_web,
             exit_desktop
         ])
         .run(tauri::generate_context!())
@@ -141,6 +159,14 @@ mod tests {
         assert_eq!(parse_command("start"), Ok(ControlCommand::Start));
         assert_eq!(parse_command("stop"), Ok(ControlCommand::Stop));
         assert_eq!(parse_command("restart"), Ok(ControlCommand::Restart));
+        assert_eq!(
+            parse_command("enable_web"),
+            Ok(ControlCommand::EnableManagementWeb)
+        );
+        assert_eq!(
+            parse_command("disable_web"),
+            Ok(ControlCommand::DisableManagementWeb)
+        );
         assert_eq!(
             parse_command("delete"),
             Err(String::from("DESKTOP_AGENT_COMMAND_INVALID"))

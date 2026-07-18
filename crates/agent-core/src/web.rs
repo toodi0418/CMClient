@@ -1,12 +1,17 @@
 use std::{
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
-    thread,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const GATEWAY_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagementWebConfig {
@@ -53,6 +58,51 @@ pub struct ManagementWebListener {
     gateway: SocketAddr,
 }
 
+pub struct ManagementWebService {
+    address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Result<(), ManagementWebError>>>,
+}
+
+impl ManagementWebService {
+    pub fn start(config: &ManagementWebConfig) -> Result<Self, ManagementWebError> {
+        let listener = ManagementWebListener::bind(config)?;
+        let address = listener.local_addr()?;
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::Builder::new()
+            .name(String::from("cmclient-management-web"))
+            .spawn(move || listener.serve_until(&worker_shutdown))
+            .map_err(|_| ManagementWebError::Io)?;
+        Ok(Self {
+            address,
+            shutdown,
+            worker: Some(worker),
+        })
+    }
+
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn stop(mut self) -> Result<(), ManagementWebError> {
+        self.shutdown.store(false, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| ManagementWebError::Io)??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ManagementWebService {
+    fn drop(&mut self) {
+        self.shutdown.store(false, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl ManagementWebListener {
     pub fn bind(config: &ManagementWebConfig) -> Result<Self, ManagementWebError> {
         if !config.enabled {
@@ -88,6 +138,27 @@ impl ManagementWebListener {
     pub fn serve_once(&self) -> Result<(), ManagementWebError> {
         let (stream, _) = self.listener.accept().map_err(|_| ManagementWebError::Io)?;
         serve_connection(stream, self.gateway)
+    }
+
+    fn serve_until(self, shutdown: &AtomicBool) -> Result<(), ManagementWebError> {
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|_| ManagementWebError::Io)?;
+        while shutdown.load(Ordering::Acquire) {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    let gateway = self.gateway;
+                    thread::spawn(move || {
+                        let _ = serve_connection(stream, gateway);
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(SERVICE_POLL_INTERVAL);
+                }
+                Err(_) => return Err(ManagementWebError::Io),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -290,7 +361,10 @@ fn write_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{ManagementWebConfig, ManagementWebError, ManagementWebListener, gateway_health};
+    use super::{
+        ManagementWebConfig, ManagementWebError, ManagementWebListener, ManagementWebService,
+        gateway_health,
+    };
     use std::{
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
@@ -389,5 +463,20 @@ mod tests {
             .join()
             .expect("server should join")
             .expect("server should respond");
+    }
+
+    #[test]
+    fn service_stops_and_releases_its_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("port should bind");
+        let gateway = listener.local_addr().expect("gateway address should load");
+        let service = ManagementWebService::start(&ManagementWebConfig {
+            port: 0,
+            gateway,
+            ..Default::default()
+        })
+        .expect("service should start");
+        let address = service.local_addr();
+        service.stop().expect("service should stop");
+        TcpListener::bind(address).expect("service should release listener");
     }
 }

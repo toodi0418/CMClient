@@ -30,7 +30,12 @@ impl ControlEndpoint {
 pub struct ControlStatus {
     pub schema_version: u8,
     pub agent: String,
+    pub agent_version: String,
     pub gateway: GatewayControlStatus,
+    pub management_web: ManagementWebControlStatus,
+    pub management_web_url: Option<String>,
+    pub uptime_seconds: u64,
+    pub latest_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,12 +48,21 @@ pub enum GatewayControlStatus {
     Degraded,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementWebControlStatus {
+    Disabled,
+    Running,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlCommand {
     Status,
     Start,
     Stop,
     Restart,
+    EnableManagementWeb,
+    DisableManagementWeb,
 }
 
 pub trait ControlHandler: Send + Sync {
@@ -127,6 +141,14 @@ impl ControlRouter {
             | ["POST", "/api/v1/control/stop", "HTTP/1.0"] => ControlCommand::Stop,
             ["POST", "/api/v1/control/restart", "HTTP/1.1"]
             | ["POST", "/api/v1/control/restart", "HTTP/1.0"] => ControlCommand::Restart,
+            ["POST", "/api/v1/control/web/enable", "HTTP/1.1"]
+            | ["POST", "/api/v1/control/web/enable", "HTTP/1.0"] => {
+                ControlCommand::EnableManagementWeb
+            }
+            ["POST", "/api/v1/control/web/disable", "HTTP/1.1"]
+            | ["POST", "/api/v1/control/web/disable", "HTTP/1.0"] => {
+                ControlCommand::DisableManagementWeb
+            }
             [_, _, _] => return Ok((404, br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#.to_vec())),
             _ => return Err(ControlError::InvalidHttp),
         };
@@ -243,6 +265,14 @@ mod unix {
             self.request("POST", "/api/v1/control/restart")
         }
 
+        pub fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/web/enable")
+        }
+
+        pub fn disable_management_web(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/web/disable")
+        }
+
         fn request(&self, method: &str, path: &str) -> Result<ControlStatus, ControlError> {
             let mut stream = UnixStream::connect(&self.endpoint).map_err(|_| ControlError::Io)?;
             let request =
@@ -311,6 +341,14 @@ impl ControlClient {
     pub fn restart(&self) -> Result<ControlStatus, ControlError> {
         Err(ControlError::UnsupportedEndpoint)
     }
+
+    pub fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
+    pub fn disable_management_web(&self) -> Result<ControlStatus, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
 }
 
 pub fn is_local_endpoint(endpoint: &ControlEndpoint) -> bool {
@@ -329,17 +367,22 @@ mod tests {
     #[cfg(unix)]
     use super::{ControlClient, ControlServer};
     use super::{
-        ControlEndpoint, ControlStatus, GatewayControlStatus, StaticControlHandler,
-        default_unix_socket, is_local_endpoint,
+        ControlEndpoint, ControlStatus, GatewayControlStatus, ManagementWebControlStatus,
+        StaticControlHandler, default_unix_socket, is_local_endpoint,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
 
     fn status() -> ControlStatus {
         ControlStatus {
-            schema_version: 1,
+            schema_version: 2,
             agent: String::from("running"),
+            agent_version: String::from("2.0.0-dev.0"),
             gateway: GatewayControlStatus::Running,
+            management_web: ManagementWebControlStatus::Running,
+            management_web_url: Some(String::from("http://127.0.0.1:7080")),
+            uptime_seconds: 1,
+            latest_error_code: None,
         }
     }
 
@@ -367,11 +410,25 @@ mod tests {
         .expect("server should bind");
         let server_thread = std::thread::spawn(move || {
             server.serve_once()?;
+            server.serve_once()?;
+            server.serve_once()?;
             server.serve_once()
         });
         let client = ControlClient::new(endpoint).expect("client should initialize");
         assert_eq!(client.status().expect("status should load"), status());
         assert_eq!(client.start().expect("start should load"), status());
+        assert_eq!(
+            client
+                .enable_management_web()
+                .expect("web enable should load"),
+            status()
+        );
+        assert_eq!(
+            client
+                .disable_management_web()
+                .expect("web disable should load"),
+            status()
+        );
         server_thread
             .join()
             .expect("server thread should join")

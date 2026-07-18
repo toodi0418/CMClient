@@ -99,11 +99,17 @@ button {
 }
 .status-surface {
   width: min(100% - 40px, 520px);
-  margin: 56px auto;
+  margin: 20px auto;
   padding: 30px;
   border: 1px solid #b8ccbb;
   background: #fafffa;
   box-shadow: 0 18px 40px #4f6c5430;
+}
+.status-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
 }
 .eyebrow {
   margin: 0;
@@ -115,6 +121,56 @@ button {
 .status-surface h1 {
   margin: 8px 0 28px;
   font-size: 32px;
+}
+.agent-version {
+  margin-top: 4px;
+  color: #59705f;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+.status-lights {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin-bottom: 24px;
+  border: 1px solid #d7e2d8;
+  background: #d7e2d8;
+}
+.status-light {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 7px;
+  padding: 12px;
+  background: #fafffa;
+  color: #59705f;
+  font-size: 12px;
+}
+.status-light strong {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  color: #18251e;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+.status-light__pip {
+  width: 8px;
+  height: 8px;
+  margin-top: 3px;
+  border-radius: 50%;
+  background: #8c9d91;
+}
+.status-light[data-state="running"] .status-light__pip {
+  background: #287b52;
+}
+.status-light[data-state="degraded"] .status-light__pip,
+.status-light[data-state="backoff"] .status-light__pip {
+  background: #b85b37;
+}
+.status-light[data-state="stopped"] .status-light__pip,
+.status-light[data-state="disabled"] .status-light__pip {
+  background: #75827a;
 }
 dl {
   margin: 0;
@@ -134,33 +190,88 @@ dd {
   font-weight: 700;
   text-transform: capitalize;
 }
-dd[data-state="running"] {
-  color: #247b4e;
-}
-dd[data-state="degraded"] {
-  color: #b85b37;
-}
 code {
   display: block;
   margin-top: 18px;
   color: #b04c3c;
   font-size: 12px;
 }
-.commands {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
+.management-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
   margin-top: 24px;
 }
-.commands button {
-  min-height: 40px;
+.web-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #36503d;
+  font-size: 13px;
+  font-weight: 700;
+}
+.web-switch {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  padding: 2px;
   border: 1px solid #a7c0ac;
+  border-radius: 11px;
+  background: #dfe9e0;
+  transition:
+    background 140ms ease-out,
+    border-color 140ms ease-out;
+}
+.web-switch[aria-checked="true"] {
+  border-color: #287b52;
+  background: #287b52;
+}
+.web-switch__thumb {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fafffa;
+  box-shadow: 0 1px 2px #16261933;
+  transform: translateX(0);
+  transition: transform 140ms ease-out;
+}
+.web-switch[aria-checked="true"] .web-switch__thumb {
+  transform: translateX(16px);
+}
+.command-toolbar {
+  display: flex;
+  gap: 8px;
+}
+.command-toolbar button {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid #a7c0ac;
+  place-items: center;
   background: #e8f1e9;
   color: #1c3f2a;
 }
-.commands button:hover:not(:disabled) {
+.command-toolbar button:hover:not(:disabled) {
   background: #cfe3d3;
 }
-.commands button:disabled {
+.command-toolbar button:disabled,
+.web-switch:disabled {
   opacity: 0.55;
+}
+@media (max-width: 500px) {
+  .status-surface {
+    width: min(100% - 24px, 520px);
+    margin: 28px auto;
+    padding: 22px;
+  }
+  .status-lights {
+    grid-template-columns: 1fr;
+  }
+  .management-controls {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }

@@ -1,12 +1,14 @@
-use cmclient_agent_core::web::{ManagementWebConfig, ManagementWebListener, gateway_health};
+use cmclient_agent_core::web::{
+    ManagementWebConfig, ManagementWebListener, ManagementWebService, gateway_health,
+};
 use cmclient_agent_core::{AgentConfig, AgentLease, ensure_runtime_directories};
 use cmclient_control_api::{
     ControlCommand, ControlEndpoint, ControlError, ControlHandler, ControlServer, ControlStatus,
-    GatewayControlStatus, default_unix_socket,
+    GatewayControlStatus, ManagementWebControlStatus, default_unix_socket,
 };
 use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor};
 use std::sync::{Arc, Mutex};
-use std::{collections::BTreeMap, net::SocketAddr, process::ExitCode, thread};
+use std::{collections::BTreeMap, net::SocketAddr, process::ExitCode, time::Instant};
 
 const EX_USAGE: u8 = 2;
 const EX_CONFIG: u8 = 5;
@@ -14,6 +16,10 @@ const EX_CONFIG: u8 = 5;
 struct AgentController {
     supervisor: Mutex<Option<GatewaySupervisor>>,
     gateway: SocketAddr,
+    management_web: Mutex<Option<ManagementWebService>>,
+    management_web_config: ManagementWebConfig,
+    started_at: Instant,
+    latest_error_code: Mutex<Option<String>>,
 }
 
 impl AgentController {
@@ -47,9 +53,26 @@ impl AgentController {
                 Ok(supervisor)
             })
             .transpose()?;
+        let management_web_config = ManagementWebConfig {
+            enabled: true,
+            gateway: gateway_address(config.gateway_port),
+            ..Default::default()
+        };
+        let management_web = if config.management_web_enabled {
+            Some(
+                ManagementWebService::start(&management_web_config)
+                    .map_err(|_| ControlError::CommandFailed)?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             supervisor: Mutex::new(supervisor),
             gateway: gateway_address(config.gateway_port),
+            management_web: Mutex::new(management_web),
+            management_web_config,
+            started_at: Instant::now(),
+            latest_error_code: Mutex::new(None),
         })
     }
 
@@ -79,17 +102,81 @@ impl AgentController {
             GatewayControlStatus::Running => GatewayControlStatus::Degraded,
             status => status,
         };
+        let (management_web, management_web_url) = self
+            .management_web
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .as_ref()
+            .map_or((ManagementWebControlStatus::Disabled, None), |service| {
+                (
+                    ManagementWebControlStatus::Running,
+                    Some(format!("http://{}", service.local_addr())),
+                )
+            });
+        let latest_error_code = match gateway {
+            GatewayControlStatus::Backoff => Some(String::from("GATEWAY_RESTART_BACKOFF")),
+            GatewayControlStatus::Degraded => Some(String::from("GATEWAY_HEALTH_DEGRADED")),
+            _ => self
+                .latest_error_code
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?
+                .clone(),
+        };
         Ok(ControlStatus {
-            schema_version: 1,
+            schema_version: 2,
             agent: String::from("running"),
+            agent_version: String::from(env!("CARGO_PKG_VERSION")),
             gateway,
+            management_web,
+            management_web_url,
+            uptime_seconds: self.started_at.elapsed().as_secs(),
+            latest_error_code,
         })
+    }
+
+    fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
+        let mut management_web = self
+            .management_web
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?;
+        if management_web.is_none() {
+            *management_web = Some(
+                ManagementWebService::start(&self.management_web_config)
+                    .map_err(|_| ControlError::CommandFailed)?,
+            );
+        }
+        drop(management_web);
+        self.status()
+    }
+
+    fn disable_management_web(&self) -> Result<ControlStatus, ControlError> {
+        let service = self
+            .management_web
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .take();
+        if let Some(service) = service {
+            service.stop().map_err(|_| ControlError::CommandFailed)?;
+        }
+        self.status()
+    }
+
+    fn remember_error(&self, error: &ControlError) {
+        if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
+            *latest_error_code = Some(String::from(error.code()));
+        }
+    }
+
+    fn clear_error(&self) {
+        if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
+            *latest_error_code = None;
+        }
     }
 }
 
 impl ControlHandler for AgentController {
     fn handle(&self, command: ControlCommand) -> Result<ControlStatus, ControlError> {
-        match command {
+        let result = match command {
             ControlCommand::Status => self.status(),
             ControlCommand::Start => {
                 let mut supervisor = self
@@ -131,7 +218,15 @@ impl ControlHandler for AgentController {
                 }
                 self.status()
             }
+            ControlCommand::EnableManagementWeb => self.enable_management_web(),
+            ControlCommand::DisableManagementWeb => self.disable_management_web(),
+        };
+        match &result {
+            Ok(_) if !matches!(command, ControlCommand::Status) => self.clear_error(),
+            Ok(_) => {}
+            Err(error) => self.remember_error(error),
         }
+        result
     }
 }
 
@@ -233,32 +328,6 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
-    if config.management_web_enabled {
-        let web_config = ManagementWebConfig {
-            enabled: true,
-            gateway: gateway_address(config.gateway_port),
-            ..Default::default()
-        };
-        let listener = match ManagementWebListener::bind(&web_config) {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!("{}", error.code());
-                return ExitCode::from(EX_CONFIG);
-            }
-        };
-        if thread::Builder::new()
-            .name(String::from("cmclient-management-web"))
-            .spawn(move || {
-                if let Err(error) = listener.serve() {
-                    eprintln!("{}", error.code());
-                }
-            })
-            .is_err()
-        {
-            eprintln!("MANAGEMENT_WEB_THREAD_START_FAILED");
-            return ExitCode::from(EX_CONFIG);
-        }
-    }
     let endpoint = match default_unix_socket(&config.paths.data_dir) {
         ControlEndpoint::UnixSocket(path) => ControlEndpoint::unix(path),
         endpoint => endpoint,
@@ -287,6 +356,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     use super::{
         AgentConfig, AgentController, ControlCommand, ControlHandler, GatewayControlStatus,
+        ManagementWebControlStatus,
     };
     #[cfg(not(target_os = "windows"))]
     use cmclient_agent_core::RuntimePaths;
@@ -340,6 +410,7 @@ mod tests {
             .handle(ControlCommand::Start)
             .expect("gateway should start");
         assert_eq!(status.gateway, GatewayControlStatus::Running);
+        assert_eq!(status.management_web, ManagementWebControlStatus::Disabled);
         controller
             .handle(ControlCommand::Stop)
             .expect("gateway should stop");
