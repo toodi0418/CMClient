@@ -80,6 +80,40 @@ trait SecretBackend: Send + Sync {
 
 struct PlatformSecretBackend;
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+struct MemorySecretBackend(std::sync::Mutex<std::collections::BTreeMap<SecretKind, String>>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl SecretBackend for MemorySecretBackend {
+    fn set(&self, kind: SecretKind, value: &str) -> Result<(), SecretStoreError> {
+        self.0
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?
+            .insert(kind, value.to_owned());
+        Ok(())
+    }
+
+    fn get(&self, kind: SecretKind) -> Result<Option<SecretValue>, SecretStoreError> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?
+            .get(&kind)
+            .cloned()
+            .map(SecretValue))
+    }
+
+    fn delete(&self, kind: SecretKind) -> Result<bool, SecretStoreError> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?
+            .remove(&kind)
+            .is_some())
+    }
+}
+
 impl PlatformSecretBackend {
     fn entry(kind: SecretKind) -> Result<Entry, SecretStoreError> {
         Entry::new(SERVICE_NAME, kind.identifier()).map_err(|_| SecretStoreError::Unavailable)
@@ -136,9 +170,14 @@ impl AgentSecretStore {
         self.backend.delete(kind)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn with_backend(backend: Arc<dyn SecretBackend>) -> Self {
         Self { backend }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn memory() -> Self {
+        Self::with_backend(Arc::new(MemorySecretBackend::default()))
     }
 }
 
@@ -154,47 +193,11 @@ fn validate_secret(value: &str) -> Result<(), SecretStoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentSecretStore, SecretBackend, SecretKind, SecretStoreError, SecretValue};
-    use std::{
-        collections::BTreeMap,
-        sync::{Arc, Mutex},
-    };
-
-    #[derive(Default)]
-    struct MemoryBackend(Mutex<BTreeMap<SecretKind, String>>);
-
-    impl SecretBackend for MemoryBackend {
-        fn set(&self, kind: SecretKind, value: &str) -> Result<(), SecretStoreError> {
-            self.0
-                .lock()
-                .map_err(|_| SecretStoreError::Unavailable)?
-                .insert(kind, value.to_owned());
-            Ok(())
-        }
-
-        fn get(&self, kind: SecretKind) -> Result<Option<SecretValue>, SecretStoreError> {
-            Ok(self
-                .0
-                .lock()
-                .map_err(|_| SecretStoreError::Unavailable)?
-                .get(&kind)
-                .cloned()
-                .map(SecretValue))
-        }
-
-        fn delete(&self, kind: SecretKind) -> Result<bool, SecretStoreError> {
-            Ok(self
-                .0
-                .lock()
-                .map_err(|_| SecretStoreError::Unavailable)?
-                .remove(&kind)
-                .is_some())
-        }
-    }
+    use super::{AgentSecretStore, SecretKind, SecretStoreError};
 
     #[test]
     fn stores_reads_and_removes_values_without_printable_secret_types() {
-        let store = AgentSecretStore::with_backend(Arc::new(MemoryBackend::default()));
+        let store = AgentSecretStore::memory();
         store
             .store(SecretKind::CallMeshApiKey, "callmesh-value")
             .expect("secret should store");
@@ -218,7 +221,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_control_and_oversized_values() {
-        let store = AgentSecretStore::with_backend(Arc::new(MemoryBackend::default()));
+        let store = AgentSecretStore::memory();
         for invalid in [String::new(), String::from("line\nfeed"), "a".repeat(4_097)] {
             assert_eq!(
                 store.store(SecretKind::AprsPasscode, &invalid),

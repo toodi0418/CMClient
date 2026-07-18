@@ -1,16 +1,18 @@
 import { GatewayApiClient, isGatewayApiError } from "@cmclient/api-client";
-import type { AprsOutboxEntry } from "@cmclient/contracts";
+import type { AprsOutboxEntry, AprsRuntimeStatus } from "@cmclient/contracts";
 import { defineStore } from "pinia";
 
 export interface AprsClient {
-  aprs: Pick<GatewayApiClient["aprs"], "outbox">;
+  aprs: Pick<GatewayApiClient["aprs"], "outbox" | "status">;
 }
 
 export function createAprsStore(client: AprsClient = new GatewayApiClient()) {
   return defineStore("aprs", {
     state: () => ({
       loading: false,
-      errorCode: undefined as string | undefined,
+      runtimeErrorCode: undefined as string | undefined,
+      outboxErrorCode: undefined as string | undefined,
+      status: undefined as AprsRuntimeStatus | undefined,
       entries: [] as AprsOutboxEntry[],
     }),
     actions: {
@@ -20,18 +22,32 @@ export function createAprsStore(client: AprsClient = new GatewayApiClient()) {
         }
         this.loading = true;
         try {
-          this.entries = (await client.aprs.outbox()).items;
-          this.errorCode = undefined;
-        } catch (error) {
-          this.errorCode = isGatewayApiError(error)
-            ? error.code
-            : "GATEWAY_NETWORK_UNAVAILABLE";
+          const [runtime, outbox] = await Promise.allSettled([
+            client.aprs.status(),
+            client.aprs.outbox(),
+          ]);
+          if (runtime.status === "fulfilled") {
+            this.status = runtime.value;
+            this.runtimeErrorCode = undefined;
+          } else {
+            this.runtimeErrorCode = stableClientError(runtime.reason);
+          }
+          if (outbox.status === "fulfilled") {
+            this.entries = outbox.value.items;
+            this.outboxErrorCode = undefined;
+          } else {
+            this.outboxErrorCode = stableClientError(outbox.reason);
+          }
         } finally {
           this.loading = false;
         }
       },
     },
   });
+}
+
+function stableClientError(error: unknown): string {
+  return isGatewayApiError(error) ? error.code : "GATEWAY_NETWORK_UNAVAILABLE";
 }
 
 export const useAprsStore = createAprsStore();

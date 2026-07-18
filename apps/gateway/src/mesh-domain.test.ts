@@ -76,6 +76,31 @@ describe("MeshDomainStore", () => {
       throw new Error("Telemetry fixture was not persisted");
     }
     expect(storedTelemetry.telemetry.metrics.voltage).toBeCloseTo(3.9, 6);
+    expect(
+      database.meshTelemetry.query({
+        limit: 10,
+        meshNetworkId: "fixture-network-a",
+        nodeNum: 42,
+        metricKind: "deviceMetrics",
+        from: "2026-07-18T00:00:01.000Z",
+        to: "2026-07-18T00:00:03.000Z",
+      }),
+    ).toEqual([storedTelemetry.telemetry]);
+    expect(
+      database.meshTelemetry.query({
+        limit: 10,
+        from: "2026-07-18T00:00:02Z",
+        to: "2026-07-18T00:00:02.500Z",
+      }),
+    ).toEqual([storedTelemetry.telemetry]);
+    expect(
+      database.meshTelemetry.query({
+        limit: 10,
+        meshNetworkId: "fixture-network-a",
+        nodeNum: 42,
+        from: "2026-07-18T00:00:03.000Z",
+      }),
+    ).toEqual([]);
     expect(store.persist("fixture-network-a", message)).toMatchObject({
       kind: "message",
       message: { id: "message-1" },

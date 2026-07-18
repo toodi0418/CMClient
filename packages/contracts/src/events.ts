@@ -24,4 +24,10 @@ export const DomainEventSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const DomainEventListSchema = Type.Object(
+  { items: Type.Array(DomainEventSchema, { maxItems: 200 }) },
+  { additionalProperties: false },
+);
+
 export type DomainEvent = Static<typeof DomainEventSchema>;
+export type DomainEventList = Static<typeof DomainEventListSchema>;

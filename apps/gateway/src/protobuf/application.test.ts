@@ -67,12 +67,12 @@ describe("Meshtastic application payload decoder", () => {
       kind: "ignored",
       reasonCode: "MESH_APPLICATION_PAYLOAD_DECODE_FAILED",
     });
-    expect(decoder.decode(packet("POSITION_APP", new Uint8Array([1])))).toEqual(
-      {
-        kind: "ignored",
-        reasonCode: "MESH_APPLICATION_PORT_UNSUPPORTED",
-      },
-    );
+    expect(
+      decoder.decode(packet("POSITION_APP", new Uint8Array([0x80]))),
+    ).toEqual({
+      kind: "ignored",
+      reasonCode: "MESH_APPLICATION_PAYLOAD_DECODE_FAILED",
+    });
     expect(
       decoder.decode({
         ...packet("TEXT_MESSAGE_APP", Buffer.from("fixture text")),
@@ -81,6 +81,49 @@ describe("Meshtastic application payload decoder", () => {
     ).toEqual({
       kind: "ignored",
       reasonCode: "MESH_MESSAGE_CHANNEL_INVALID",
+    });
+  });
+
+  it("decodes POSITION_APP with schema-defined units and a payload identity", async () => {
+    const schema = await loadMeshtasticSchema();
+    const decoder = new MeshtasticApplicationDecoder(schema);
+    const payload = schema.position
+      .encode({
+        latitudeI: 250_475_000,
+        longitudeI: 1_215_175_000,
+        altitude: 12,
+        altitudeHae: 31,
+        altitudeGeoidalSeparation: 19,
+        timestamp: 1_784_332_800,
+        timestampMillisAdjust: 250,
+        time: 1_784_332_799,
+        groundSpeed: 4,
+        groundTrack: 12_345,
+        seqNumber: 9,
+        precisionBits: 32,
+      })
+      .finish();
+
+    expect(decoder.decode(packet("POSITION_APP", payload))).toEqual({
+      kind: "position",
+      position: {
+        nodeNum: 42,
+        payloadHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        sample: {
+          latitudeI: 250_475_000,
+          longitudeI: 1_215_175_000,
+          altitudeMslMeters: 12,
+          altitudeHaeMeters: 31,
+          altitudeGeoidalSeparationMeters: 19,
+          positionTimestampSeconds: 1_784_332_800,
+          positionTimestampMillisAdjust: 250,
+          positionTimeSeconds: 1_784_332_799,
+          sequenceNumber: 9,
+          precisionBits: 32,
+          groundSpeedMetersPerSecond: 4,
+          groundTrackDegrees: 123.45,
+        },
+      },
     });
   });
 });

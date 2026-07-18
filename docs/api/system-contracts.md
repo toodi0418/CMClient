@@ -13,3 +13,9 @@ must include a stable `reasonCode`, such as
 `CAPABILITY_UNAVAILABLE_PLATFORM` or `CAPABILITY_UNAVAILABLE_DOCKER`. Clients
 use these fields to hide or explain unavailable controls rather than guessing
 from the operating system.
+
+`remoteDispatch` is a required capability key even though its first-phase
+contract is intentionally disabled. Gateway returns `available: false` with
+`REMOTE_DISPATCH_NOT_ENABLED`; clients must not infer availability from the
+presence of a route or task schema. The shared dispatch task/status schema does
+not create a TENMAN, TENMAP, or old Bot compatibility path.

@@ -30,6 +30,7 @@ RUN groupadd --gid 10001 cmclient \
 WORKDIR /app
 COPY --from=build --chown=cmclient:cmclient /opt/cmclient/gateway /app/gateway
 COPY --from=build --chown=cmclient:cmclient /workspace/apps/web/dist /app/web
+COPY --from=build --chown=cmclient:cmclient /workspace/proto /app/proto
 COPY --from=build --chown=cmclient:cmclient /workspace/scripts/container-entrypoint.mjs /app/container-entrypoint.mjs
 COPY --from=build --chown=cmclient:cmclient /workspace/scripts/container-runtime.mjs /app/container-runtime.mjs
 RUN chown --recursive cmclient:cmclient /var/lib/cmclient

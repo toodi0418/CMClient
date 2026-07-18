@@ -17,6 +17,7 @@ import {
   PositionDecisionSchema,
   PositionObservationSchema,
   ProxyStatusSchema,
+  RemoteDispatchTaskSchema,
   SystemCapabilitiesSchema,
   SystemStatusSchema,
   SanitizedPacketFixtureSetSchema,
@@ -25,6 +26,40 @@ import {
   UpdateControlStatusSchema,
   UpdateManifestSchema,
 } from "./index";
+
+describe("remote dispatch contract", () => {
+  it("defines the later feature without a legacy bot compatibility shape", () => {
+    const check = TypeCompiler.Compile(RemoteDispatchTaskSchema);
+    expect(
+      check.Check({
+        schemaVersion: 1,
+        jobId: "dispatch-1",
+        gatewayTarget: "gateway-a",
+        meshNetworkId: "mesh-a",
+        nodeTarget: 42,
+        channel: 0,
+        message: "fixture message",
+        expiresAt: "2026-07-18T01:00:00.000Z",
+        dedupKey: "dedup-1",
+        status: "queued",
+      }),
+    ).toBe(true);
+    expect(
+      check.Check({
+        schemaVersion: 1,
+        jobId: "dispatch-1",
+        gatewayTarget: "gateway-a",
+        meshNetworkId: "mesh-a",
+        nodeTarget: 42,
+        channel: 0,
+        message: "fixture message",
+        expiresAt: "2026-07-18T01:00:00.000Z",
+        dedupKey: "dedup-1",
+        status: "legacy_bot",
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("signed update manifest contract", () => {
   const manifest = {
@@ -149,6 +184,10 @@ describe("system capabilities contract", () => {
           service: { available: true },
           autoStart: { available: true },
           docker: { available: true },
+          remoteDispatch: {
+            available: false,
+            reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
+          },
         },
       }),
     ).toBe(true);
@@ -165,6 +204,10 @@ describe("system capabilities contract", () => {
           service: { available: true },
           autoStart: { available: true },
           docker: { available: true },
+          remoteDispatch: {
+            available: false,
+            reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
+          },
         },
       }),
     ).toBe(false);

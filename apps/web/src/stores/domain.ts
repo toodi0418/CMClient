@@ -20,6 +20,7 @@ export function createDomainStore(
   return defineStore("domain", {
     state: () => ({
       loading: false,
+      refreshPending: false,
       errorCode: undefined as string | undefined,
       nodes: [] as MeshNode[],
       messages: [] as MeshMessage[],
@@ -29,6 +30,7 @@ export function createDomainStore(
     actions: {
       async refresh() {
         if (this.loading) {
+          this.refreshPending = true;
           return;
         }
         this.loading = true;
@@ -50,6 +52,10 @@ export function createDomainStore(
             : "GATEWAY_NETWORK_UNAVAILABLE";
         } finally {
           this.loading = false;
+          if (this.refreshPending) {
+            this.refreshPending = false;
+            void this.refresh();
+          }
         }
       },
     },

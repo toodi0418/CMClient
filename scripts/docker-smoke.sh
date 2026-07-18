@@ -46,6 +46,11 @@ wait_for_application() {
 
 wait_for_application
 "${compose[@]}" exec --no-TTY gateway node --input-type=module --eval '
+  const schema = await import("/app/gateway/dist/protobuf/schema.js");
+  const loaded = await schema.loadMeshtasticSchema();
+  if (!loaded.fromRadio || !loaded.position) process.exit(1);
+'
+"${compose[@]}" exec --no-TTY gateway node --input-type=module --eval '
   import { writeFileSync } from "node:fs";
   writeFileSync("/var/lib/cmclient/packaging-lifecycle-sentinel", "must survive recreate");
 '

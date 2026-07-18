@@ -87,6 +87,16 @@ export class DomainEventBus {
     return index === -1 ? [...this.events] : this.events.slice(index + 1);
   }
 
+  recent(limit = 100): DomainEvent[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw new RangeError("Event projection limit is invalid");
+    }
+    return this.events
+      .slice(-limit)
+      .reverse()
+      .map((event) => structuredClone(event));
+  }
+
   subscribe(listener: DomainEventListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

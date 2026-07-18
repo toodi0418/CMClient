@@ -27,6 +27,15 @@ opens only that Agent-provided URL through the official Tauri opener plugin.
 Gateway restart remains an Agent command, so the Desktop process never spawns,
 kills, or probes Gateway directly.
 
+In addition to Core, Web, and Gateway lifecycle state, Desktop loads four
+bounded Gateway projections through Agent in parallel with a three-second
+timeout. They produce Meshtastic transport/frame state, combined APRS monitor
+and CallMesh mapping health, and TCP Proxy mode/client capacity. Invalid,
+partial, or timed-out projections become stable unavailable/degraded states;
+raw Gateway identifiers, mappings, APRS Data, and credentials do not cross the
+Tauri command boundary. The view refreshes this service matrix periodically and
+also supports an explicit refresh.
+
 The Desktop update panel first reads the Agent-owned update journal through
 `GET /api/v1/control/updates`. Its Tauri backend then follows the local update
 SSE and forwards only the validated status payload to the webview. It reports

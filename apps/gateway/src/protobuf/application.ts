@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
+
 import type {
   MeshMessage,
   MeshNode,
   MeshTelemetry,
   NormalizedMeshPacket,
+  PositionSample,
 } from "@cmclient/contracts";
 
 import type { MeshtasticSchema } from "./schema.js";
@@ -46,6 +49,14 @@ export type DecodedApplicationPayload =
         | "telemetryTimeSeconds"
       >;
     }
+  | {
+      kind: "position";
+      position: {
+        nodeNum: number;
+        payloadHash: string;
+        sample: PositionSample;
+      };
+    }
   | { kind: "ignored"; reasonCode: string };
 
 export class MeshtasticApplicationDecoder {
@@ -67,6 +78,8 @@ export class MeshtasticApplicationDecoder {
           return this.decodeTextMessage(packet, payload);
         case "TELEMETRY_APP":
           return this.decodeTelemetry(packet, payload);
+        case "POSITION_APP":
+          return this.decodePosition(packet, payload);
         default:
           return {
             kind: "ignored",
@@ -174,6 +187,64 @@ export class MeshtasticApplicationDecoder {
       },
     };
   }
+
+  private decodePosition(
+    packet: NormalizedMeshPacket,
+    payload: Uint8Array,
+  ): DecodedApplicationPayload {
+    if (packet.sender === undefined) {
+      return { kind: "ignored", reasonCode: "MESH_POSITION_NODE_ID_MISSING" };
+    }
+    const source = toRecord(
+      this.schema.position.toObject(
+        this.schema.position.decode(payload),
+        TO_OBJECT_OPTIONS,
+      ),
+    );
+    if (!source) {
+      return {
+        kind: "ignored",
+        reasonCode: "MESH_APPLICATION_PAYLOAD_DECODE_FAILED",
+      };
+    }
+    const sample: PositionSample = {
+      ...optionalSignedIntegerProperty("latitudeI", source.latitudeI),
+      ...optionalSignedIntegerProperty("longitudeI", source.longitudeI),
+      ...optionalSignedIntegerProperty("altitudeMslMeters", source.altitude),
+      ...optionalSignedIntegerProperty("altitudeHaeMeters", source.altitudeHae),
+      ...optionalSignedIntegerProperty(
+        "altitudeGeoidalSeparationMeters",
+        source.altitudeGeoidalSeparation,
+      ),
+      ...optionalUnsignedIntegerProperty(
+        "positionTimestampSeconds",
+        source.timestamp,
+      ),
+      ...optionalSignedIntegerProperty(
+        "positionTimestampMillisAdjust",
+        source.timestampMillisAdjust,
+      ),
+      ...optionalUnsignedIntegerProperty("positionTimeSeconds", source.time),
+      ...optionalUnsignedIntegerProperty("sequenceNumber", source.seqNumber),
+      ...optionalUnsignedIntegerProperty("precisionBits", source.precisionBits),
+      ...optionalUnsignedNumberProperty(
+        "groundSpeedMetersPerSecond",
+        source.groundSpeed,
+      ),
+      ...optionalTrackProperty(source.groundTrack),
+    };
+    if (Object.keys(sample).length === 0) {
+      return { kind: "ignored", reasonCode: "MESH_POSITION_FIELDS_MISSING" };
+    }
+    return {
+      kind: "position",
+      position: {
+        nodeNum: packet.sender,
+        payloadHash: createHash("sha256").update(payload).digest("hex"),
+        sample,
+      },
+    };
+  }
 }
 
 function toRecord(value: unknown): Record<string, unknown> | undefined {
@@ -199,6 +270,44 @@ function optionalNumberProperty<Key extends string>(
   value: number | undefined,
 ): Record<Key, number> | Record<never, never> {
   return value === undefined ? {} : ({ [key]: value } as Record<Key, number>);
+}
+
+function optionalSignedIntegerProperty<Key extends string>(
+  key: Key,
+  value: unknown,
+): Record<Key, number> | Record<never, never> {
+  return typeof value === "number" && Number.isInteger(value)
+    ? ({ [key]: value } as Record<Key, number>)
+    : {};
+}
+
+function optionalUnsignedIntegerProperty<Key extends string>(
+  key: Key,
+  value: unknown,
+): Record<Key, number> | Record<never, never> {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= 4_294_967_295
+    ? ({ [key]: value } as Record<Key, number>)
+    : {};
+}
+
+function optionalUnsignedNumberProperty<Key extends string>(
+  key: Key,
+  value: unknown,
+): Record<Key, number> | Record<never, never> {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? ({ [key]: value } as Record<Key, number>)
+    : {};
+}
+
+function optionalTrackProperty(
+  value: unknown,
+): { groundTrackDegrees: number } | Record<never, never> {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? { groundTrackDegrees: value / 100 }
+    : {};
 }
 
 function optionalTimestamp(value: unknown): number | undefined {

@@ -18,6 +18,7 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
     /pnpm --filter @cmclient\/gateway deploy --legacy --prod/,
   );
   assert.match(dockerfile, /USER cmclient:cmclient/);
+  assert.match(dockerfile, /workspace\/proto \/app\/proto/);
   assert.match(dockerfile, /CMD \["gateway"\]/);
   assert.match(entrypoint, /env: gatewayEnvironment\(\)/);
   assert.match(runtime, /CMCLIENT_DEPLOYMENT_MODE: "docker"/);

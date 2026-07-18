@@ -38,6 +38,9 @@ pub struct AgentConfig {
     pub gateway_command: Option<Vec<String>>,
     pub gateway_port: u16,
     pub callmesh: Option<CallMeshConfig>,
+    pub meshtastic: Option<MeshtasticConfig>,
+    pub aprs: Option<AprsConfig>,
+    pub proxy: Option<ProxyConfig>,
     pub management_web_enabled: bool,
     pub management_lan: Option<ManagementLanConfig>,
 }
@@ -45,6 +48,41 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallMeshConfig {
     pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshtasticConfig {
+    pub mesh_network_id: String,
+    pub gateway_id: String,
+    pub connection: MeshtasticConnectionConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshtasticConnectionConfig {
+    Tcp { host: String, port: u16 },
+    Serial { path: String, baud_rate: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AprsConfig {
+    pub login_callsign: String,
+    pub host: String,
+    pub port: u16,
+    pub destination: String,
+    pub symbol_table: char,
+    pub symbol_code: char,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyConfig {
+    pub host: String,
+    pub port: u16,
+    pub upstream_host: String,
+    pub upstream_port: u16,
+    pub mode: String,
+    pub allow_lan: bool,
+    pub allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +115,9 @@ pub enum ConfigError {
     EmptyGatewayCommand,
     InvalidGatewayPort,
     InvalidCallMesh,
+    InvalidMeshtastic,
+    InvalidAprs,
+    InvalidProxy,
     InvalidManagementLan,
 }
 
@@ -113,6 +154,9 @@ impl ConfigError {
             Self::EmptyGatewayCommand => "AGENT_CONFIG_GATEWAY_COMMAND_EMPTY",
             Self::InvalidGatewayPort => "AGENT_CONFIG_GATEWAY_PORT_INVALID",
             Self::InvalidCallMesh => "AGENT_CONFIG_CALLMESH_INVALID",
+            Self::InvalidMeshtastic => "AGENT_CONFIG_MESHTASTIC_INVALID",
+            Self::InvalidAprs => "AGENT_CONFIG_APRS_INVALID",
+            Self::InvalidProxy => "AGENT_CONFIG_PROXY_INVALID",
             Self::InvalidManagementLan => "AGENT_CONFIG_MANAGEMENT_LAN_INVALID",
         }
     }
@@ -131,6 +175,9 @@ impl std::error::Error for ConfigError {}
 struct FileConfig {
     agent: Option<AgentSection>,
     callmesh: Option<CallMeshSection>,
+    meshtastic: Option<MeshtasticSection>,
+    aprs: Option<AprsSection>,
+    proxy: Option<ProxySection>,
     management_lan: Option<ManagementLanSection>,
 }
 
@@ -138,6 +185,42 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct CallMeshSection {
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeshtasticSection {
+    transport: String,
+    mesh_network_id: String,
+    gateway_id: String,
+    tcp_host: Option<String>,
+    tcp_port: Option<u16>,
+    serial_path: Option<String>,
+    serial_baud_rate: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AprsSection {
+    login_callsign: String,
+    host: Option<String>,
+    port: Option<u16>,
+    destination: Option<String>,
+    symbol_table: Option<String>,
+    symbol_code: Option<String>,
+    comment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxySection {
+    upstream_host: String,
+    upstream_port: u16,
+    host: Option<String>,
+    port: Option<u16>,
+    mode: Option<String>,
+    allow_lan: Option<bool>,
+    allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -233,6 +316,12 @@ impl AgentConfig {
                 })
             })
             .transpose()?;
+        let meshtastic = file_config
+            .meshtastic
+            .map(parse_meshtastic_config)
+            .transpose()?;
+        let aprs = file_config.aprs.map(parse_aprs_config).transpose()?;
+        let proxy = file_config.proxy.map(parse_proxy_config).transpose()?;
 
         Ok(Self {
             paths,
@@ -240,10 +329,159 @@ impl AgentConfig {
             gateway_command: agent.gateway_command,
             gateway_port,
             callmesh,
+            meshtastic,
+            aprs,
+            proxy,
             management_web_enabled: agent.management_web_enabled.unwrap_or(true),
             management_lan,
         })
     }
+}
+
+fn parse_meshtastic_config(section: MeshtasticSection) -> Result<MeshtasticConfig, ConfigError> {
+    if !is_bounded_text(&section.mesh_network_id, 128) || !is_bounded_text(&section.gateway_id, 128)
+    {
+        return Err(ConfigError::InvalidMeshtastic);
+    }
+    let connection = match section.transport.as_str() {
+        "tcp"
+            if section.serial_path.is_none()
+                && section.serial_baud_rate.is_none()
+                && section.tcp_port.unwrap_or(4_403) != 0 =>
+        {
+            let host = section
+                .tcp_host
+                .unwrap_or_else(|| String::from("127.0.0.1"));
+            if !is_endpoint_host(&host) {
+                return Err(ConfigError::InvalidMeshtastic);
+            }
+            MeshtasticConnectionConfig::Tcp {
+                host,
+                port: section.tcp_port.unwrap_or(4_403),
+            }
+        }
+        "serial"
+            if section.tcp_host.is_none()
+                && section.tcp_port.is_none()
+                && section.serial_baud_rate.unwrap_or(115_200) > 0 =>
+        {
+            let path = section.serial_path.unwrap_or_default();
+            if !is_bounded_text(&path, 4_096) {
+                return Err(ConfigError::InvalidMeshtastic);
+            }
+            MeshtasticConnectionConfig::Serial {
+                path,
+                baud_rate: section.serial_baud_rate.unwrap_or(115_200),
+            }
+        }
+        _ => return Err(ConfigError::InvalidMeshtastic),
+    };
+    Ok(MeshtasticConfig {
+        mesh_network_id: section.mesh_network_id,
+        gateway_id: section.gateway_id,
+        connection,
+    })
+}
+
+fn parse_aprs_config(section: AprsSection) -> Result<AprsConfig, ConfigError> {
+    let host = section
+        .host
+        .unwrap_or_else(|| String::from("rotate.aprs2.net"));
+    let port = section.port.unwrap_or(14_580);
+    let destination = section
+        .destination
+        .unwrap_or_else(|| String::from("APCM20"));
+    let symbol_table = single_printable_ascii(section.symbol_table.as_deref().unwrap_or("/"))
+        .ok_or(ConfigError::InvalidAprs)?;
+    let symbol_code = single_printable_ascii(section.symbol_code.as_deref().unwrap_or(">"))
+        .ok_or(ConfigError::InvalidAprs)?;
+    if !is_aprs_callsign(&section.login_callsign)
+        || !is_endpoint_host(&host)
+        || port == 0
+        || !is_aprs_destination(&destination)
+        || section
+            .comment
+            .as_ref()
+            .is_some_and(|comment| comment.is_empty() || !is_bounded_text(comment, 80))
+    {
+        return Err(ConfigError::InvalidAprs);
+    }
+    Ok(AprsConfig {
+        login_callsign: section.login_callsign,
+        host,
+        port,
+        destination,
+        symbol_table,
+        symbol_code,
+        comment: section.comment,
+    })
+}
+
+fn parse_proxy_config(section: ProxySection) -> Result<ProxyConfig, ConfigError> {
+    let host = section.host.unwrap_or_else(|| String::from("127.0.0.1"));
+    let port = section.port.unwrap_or(4_403);
+    let mode = section.mode.unwrap_or_else(|| String::from("monitor"));
+    let allow_lan = section.allow_lan.unwrap_or(false);
+    let allowlist = section.allowlist.unwrap_or_default();
+    if !is_endpoint_host(&host)
+        || port == 0
+        || !is_endpoint_host(&section.upstream_host)
+        || section.upstream_port == 0
+        || !matches!(mode.as_str(), "monitor" | "message" | "full")
+        || (!allow_lan && !allowlist.is_empty())
+        || allowlist.iter().any(|address| {
+            address.parse::<IpAddr>().is_err()
+                || address.len() > 64
+                || address.contains(char::is_whitespace)
+        })
+    {
+        return Err(ConfigError::InvalidProxy);
+    }
+    Ok(ProxyConfig {
+        host,
+        port,
+        upstream_host: section.upstream_host,
+        upstream_port: section.upstream_port,
+        mode,
+        allow_lan,
+        allowlist,
+    })
+}
+
+fn is_bounded_text(value: &str, maximum_length: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum_length && !value.chars().any(char::is_control)
+}
+
+fn is_endpoint_host(value: &str) -> bool {
+    is_bounded_text(value, 255) && !value.contains(char::is_whitespace)
+}
+
+fn is_aprs_callsign(value: &str) -> bool {
+    let (base, ssid) = value
+        .split_once('-')
+        .map_or((value, None), |(base, ssid)| (base, Some(ssid)));
+    (1..=6).contains(&base.len())
+        && base
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+        && ssid.is_none_or(|ssid| {
+            (1..=2).contains(&ssid.len())
+                && ssid.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
+fn is_aprs_destination(value: &str) -> bool {
+    (1..=6).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+}
+
+fn single_printable_ascii(value: &str) -> Option<char> {
+    let mut characters = value.chars();
+    let character = characters.next()?;
+    (characters.next().is_none() && character.is_ascii() && !character.is_ascii_control())
+        .then_some(character)
 }
 
 fn is_https_url(value: &str) -> bool {
@@ -418,7 +656,8 @@ pub fn is_config_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, AgentLease, ConfigError, InstanceError, RuntimePaths, is_config_file,
+        AgentConfig, AgentLease, AprsConfig, ConfigError, InstanceError, MeshtasticConfig,
+        MeshtasticConnectionConfig, ProxyConfig, RuntimePaths, is_config_file,
     };
     use std::{collections::BTreeMap, fs, path::PathBuf};
 
@@ -552,6 +791,133 @@ mod tests {
         assert_eq!(
             AgentConfig::from_environment(&environment),
             Err(ConfigError::InvalidCallMesh)
+        );
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn loads_gateway_transport_aprs_and_proxy_without_inline_secrets() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-gateway-runtime-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let config_file = directory.join("agent.toml");
+        fs::write(
+            &config_file,
+            r#"[meshtastic]
+transport = "tcp"
+mesh_network_id = "fixture-network"
+gateway_id = "fixture-gateway"
+tcp_host = "192.0.2.10"
+tcp_port = 4403
+
+[aprs]
+login_callsign = "N0CALL-7"
+host = "rotate.aprs2.net"
+port = 14580
+destination = "APCM20"
+symbol_table = "/"
+symbol_code = ">"
+comment = "CMClient"
+
+[proxy]
+upstream_host = "192.0.2.10"
+upstream_port = 4403
+host = "127.0.0.1"
+port = 4404
+mode = "message"
+allow_lan = true
+allowlist = ["192.0.2.20"]
+"#,
+        )
+        .expect("configuration should be written");
+        let mut environment = environment();
+        environment.insert(
+            String::from("CMCLIENT_AGENT_CONFIG"),
+            config_file.display().to_string(),
+        );
+
+        let config = AgentConfig::from_environment(&environment)
+            .expect("gateway runtime configuration should load");
+        assert_eq!(
+            config.meshtastic,
+            Some(MeshtasticConfig {
+                mesh_network_id: String::from("fixture-network"),
+                gateway_id: String::from("fixture-gateway"),
+                connection: MeshtasticConnectionConfig::Tcp {
+                    host: String::from("192.0.2.10"),
+                    port: 4_403,
+                },
+            })
+        );
+        assert_eq!(
+            config.aprs,
+            Some(AprsConfig {
+                login_callsign: String::from("N0CALL-7"),
+                host: String::from("rotate.aprs2.net"),
+                port: 14_580,
+                destination: String::from("APCM20"),
+                symbol_table: '/',
+                symbol_code: '>',
+                comment: Some(String::from("CMClient")),
+            })
+        );
+        assert_eq!(
+            config.proxy,
+            Some(ProxyConfig {
+                host: String::from("127.0.0.1"),
+                port: 4_404,
+                upstream_host: String::from("192.0.2.10"),
+                upstream_port: 4_403,
+                mode: String::from("message"),
+                allow_lan: true,
+                allowlist: vec![String::from("192.0.2.20")],
+            })
+        );
+
+        fs::write(
+            &config_file,
+            "[aprs]\nlogin_callsign = \"N0CALL-7\"\npasscode = \"12345\"\n",
+        )
+        .expect("invalid configuration should be written");
+        assert_eq!(
+            AgentConfig::from_environment(&environment),
+            Err(ConfigError::InvalidConfig)
+        );
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn rejects_ambiguous_meshtastic_and_unsafe_proxy_configuration() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-runtime-invalid-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let config_file = directory.join("agent.toml");
+        let mut environment = environment();
+        environment.insert(
+            String::from("CMCLIENT_AGENT_CONFIG"),
+            config_file.display().to_string(),
+        );
+        fs::write(
+            &config_file,
+            "[meshtastic]\ntransport = \"tcp\"\nmesh_network_id = \"mesh\"\ngateway_id = \"gateway\"\nserial_path = \"/dev/ttyUSB0\"\n",
+        )
+        .expect("invalid configuration should be written");
+        assert_eq!(
+            AgentConfig::from_environment(&environment),
+            Err(ConfigError::InvalidMeshtastic)
+        );
+        fs::write(
+            &config_file,
+            "[proxy]\nupstream_host = \"192.0.2.10\"\nupstream_port = 4403\nallowlist = [\"192.0.2.20\"]\n",
+        )
+        .expect("invalid configuration should be written");
+        assert_eq!(
+            AgentConfig::from_environment(&environment),
+            Err(ConfigError::InvalidProxy)
         );
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }

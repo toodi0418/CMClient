@@ -7,7 +7,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { releaseArtifactPlan } from "./release-artifacts.mjs";
+import {
+  releaseArtifactPlan,
+  releaseComposition,
+  stageBuild,
+} from "./release-artifacts.mjs";
 import {
   assembleReleaseArtifacts,
   canonicalUpdateManifest,
@@ -35,12 +39,51 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
     assert.match(artifact.sha256, /^[a-f0-9]{64}$/);
     assert.ok(artifact.sizeBytes > 0);
   }
-  const firstArchive = plan.find((artifact) => artifact.archive === "tar.zst");
-  assert.ok(firstArchive);
-  const firstBinary = `cmclient-${firstArchive.component}`;
-  const { stdout } = await runFile("tar", ["-tf", join(output, firstArchive.fileName)]);
-  assert.deepEqual(stdout.trim().split("\n").sort(), [
-    `bin/${firstBinary}`,
+  const repeated = await assembleReleaseArtifacts({
+    input,
+    output: join(root, "output-repeat"),
+    version,
+  });
+  assert.deepEqual(
+    repeated.artifacts.map(({ fileName, sha256, sizeBytes }) => ({ fileName, sha256, sizeBytes })),
+    index.artifacts.map(({ fileName, sha256, sizeBytes }) => ({ fileName, sha256, sizeBytes })),
+  );
+  const desktopArchive = plan.find(
+    ({ component, target }) => component === "desktop" && target === "darwin-aarch64",
+  );
+  assert.ok(desktopArchive);
+  const { stdout: desktopListing } = await runFile("tar", [
+    "-tf",
+    join(output, desktopArchive.fileName),
+  ]);
+  const desktopEntries = new Set(desktopListing.trim().split("\n"));
+  for (const expected of [
+    "bin/cmclient-desktop",
+    "bin/cmclient-agent",
+    "bin/cmclient",
+    "bin/cmclient-migrate",
+    "gateway/dist/main.js",
+    "gateway/node_modules/runtime-package/index.js",
+    "proto/meshtastic/mesh.proto",
+    "web/index.html",
+    "scripts/cmclient-launchd.sh",
+    "packaging/launchd/io.cmclient.agent.plist.in",
+    "metadata/build-manifest.json",
+  ]) {
+    assert.ok(desktopEntries.has(expected), `desktop archive must contain ${expected}`);
+  }
+
+  const portableArchive = plan.find(
+    ({ component, target }) => component === "cli" && target === "linux-x86_64",
+  );
+  assert.ok(portableArchive);
+  const portableIndex = plan.indexOf(portableArchive);
+  const { stdout: portableListing } = await runFile("tar", [
+    "-tf",
+    join(output, portableArchive.fileName),
+  ]);
+  assert.deepEqual(portableListing.trim().split("\n").sort(), [
+    "bin/cmclient",
     "metadata/build-manifest.json",
   ]);
 
@@ -48,8 +91,11 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   const portableV2 = join(root, "portable-v2");
   const retainedData = join(root, "user-data", "retained-state");
   await mkdir(portableV1, { recursive: true });
-  await runFile("tar", ["-xf", join(output, firstArchive.fileName), "-C", portableV1]);
-  assert.equal(await readFile(join(portableV1, `bin/${firstBinary}`), "utf8"), "fixture-0");
+  await runFile("tar", ["-xf", join(output, portableArchive.fileName), "-C", portableV1]);
+  assert.equal(
+    await readFile(join(portableV1, "bin/cmclient"), "utf8"),
+    `fixture-${portableIndex}-cli`,
+  );
   await mkdir(join(root, "user-data"), { recursive: true });
   await writeFile(retainedData, "must survive portable refresh");
 
@@ -65,13 +111,16 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   });
   const upgradeArchive = upgradePlan.find(
     (artifact) =>
-      artifact.component === firstArchive.component && artifact.target === firstArchive.target,
+      artifact.component === portableArchive.component && artifact.target === portableArchive.target,
   );
   assert.ok(upgradeArchive);
   await mkdir(portableV2, { recursive: true });
   await runFile("tar", ["-xf", join(upgradeOutput, upgradeArchive.fileName), "-C", portableV2]);
   await rm(portableV1, { force: true, recursive: true });
-  assert.equal(await readFile(join(portableV2, `bin/${firstBinary}`), "utf8"), "upgrade-0");
+  assert.equal(
+    await readFile(join(portableV2, "bin/cmclient"), "utf8"),
+    `upgrade-${portableIndex}-cli`,
+  );
   assert.equal(await readFile(retainedData, "utf8"), "must survive portable refresh");
 
   await writeFile(join(output, "cmclient-2.0.0-dev.0.spdx.json"), "{\"spdxVersion\":\"SPDX-2.3\"}\n");
@@ -81,32 +130,61 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
 
 async function stageFixture(input, plan, version, prefix) {
   for (const [index, artifact] of plan.entries()) {
-    const directory = join(input, artifact.component, artifact.target);
-    const binary = artifact.target.startsWith("windows-")
-      ? `cmclient-${artifact.component}.exe`
-      : `cmclient-${artifact.component}`;
-    await mkdir(directory, { recursive: true });
-    await writeFile(join(directory, binary), `${prefix}-${index}`);
-    await writeFile(
-      join(directory, "build-manifest.json"),
-      `${JSON.stringify(
-        {
-          schemaVersion: 1,
-          component: artifact.component,
-          target: artifact.target,
-          version,
-          releaseAsset: {
-            archive: artifact.archive,
-            fileName: artifact.fileName,
-          },
-          binary,
-        },
-        null,
-        2,
-      )}\n`,
-    );
+    const sourceRoot = join(input, "..", "sources", `${artifact.component}-${artifact.target}`);
+    const inputs = {};
+    for (const content of releaseComposition(artifact.component, artifact.target)) {
+      const source = join(sourceRoot, content.role);
+      if (content.kind === "file") {
+        await mkdir(sourceRoot, { recursive: true });
+        await writeFile(source, `${prefix}-${index}-${content.role}`);
+      } else if (content.role === "gateway") {
+        await mkdir(join(source, "dist"), { recursive: true });
+        await mkdir(join(source, "node_modules", "runtime-package"), { recursive: true });
+        await writeFile(join(source, "dist/main.js"), `${prefix}-${index}-gateway`);
+        await writeFile(
+          join(source, "package.json"),
+          '{"type":"module","dependencies":{"runtime-package":"1.0.0"}}\n',
+        );
+        await writeFile(join(source, "node_modules/runtime-package/index.js"), "runtime-package");
+        await writeFile(
+          join(source, "node_modules/runtime-package/package.json"),
+          '{"name":"runtime-package","version":"1.0.0"}\n',
+        );
+      } else if (content.role === "web") {
+        await mkdir(source, { recursive: true });
+        await writeFile(join(source, "index.html"), `${prefix}-${index}-web`);
+      } else if (content.role === "proto") {
+        await mkdir(join(source, "meshtastic"), { recursive: true });
+        await writeFile(join(source, "meshtastic/mesh.proto"), 'syntax = "proto3";');
+      }
+      inputs[content.role] = source;
+    }
+    await stageBuild({
+      component: artifact.component,
+      target: artifact.target,
+      version,
+      inputs,
+      output: input,
+    });
   }
 }
+
+test("assembler rejects files outside the canonical staged composition", async (t) => {
+  const version = "2.0.0-dev.0";
+  const root = await mkdtemp(join(tmpdir(), "cmclient-release-unexpected-"));
+  const input = join(root, "input");
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await stageFixture(input, releaseArtifactPlan(version), version, "fixture");
+  await writeFile(
+    join(input, "desktop/darwin-aarch64/gateway/dist/not-in-build-manifest.js"),
+    "unexpected",
+  );
+
+  await assert.rejects(
+    () => assembleReleaseArtifacts({ input, output: join(root, "output"), version }),
+    /RELEASE_BUILD_CONTENT_UNEXPECTED/,
+  );
+});
 
 test("supply-chain checksums cover every archive and generated SBOM", async (t) => {
   const version = "2.0.0-dev.0";
@@ -217,6 +295,7 @@ test("manifest creation rejects invalid publication inputs before signing", () =
 
 test("release workflow keeps provenance and signing outside ordinary CI permissions", async () => {
   const workflow = await readFile(".github/workflows/release-build.yml", "utf8");
+  const signingJob = workflow.slice(workflow.indexOf("  sign-update-manifest:"));
 
   assert.match(workflow, /anchore\/sbom-action@e22c389904149dbc22b58101806040fa8d37a610/);
   assert.match(workflow, /sigstore\/cosign-installer@b4da77ecad80ff9afe572690e3ce4a55a58e629c/);
@@ -229,6 +308,22 @@ test("release workflow keeps provenance and signing outside ordinary CI permissi
   assert.match(workflow, /github\.event_name == 'workflow_dispatch' && inputs\.attest/);
   assert.match(workflow, /RELEASE_BASE_URL: \$\{\{ inputs\.release_base_url \}\}/);
   assert.match(workflow, /--release-base-url "\$RELEASE_BASE_URL"/);
+  assert.match(signingJob, /actions\/checkout@v4/);
+  assert.match(signingJob, /actions\/setup-node@v4/);
+  assert.match(signingJob, /RELEASE_SIGNING_KEY_MISSING/);
+  assert.match(signingJob, /release-supply-chain\.mjs verify/);
+  assert.match(
+    signingJob,
+    /Sign canonical Agent manifest[\s\S]*CMCLIENT_UPDATE_SIGNING_KEY: \$\{\{ secrets\.CMCLIENT_UPDATE_SIGNING_KEY \}\}/,
+  );
+  assert.doesNotMatch(
+    signingJob,
+    /if:.*secrets\.CMCLIENT_UPDATE_SIGNING_KEY/,
+  );
+  assert.doesNotMatch(
+    signingJob.slice(0, signingJob.indexOf("      - name: Sign canonical Agent manifest")),
+    /CMCLIENT_UPDATE_SIGNING_KEY:/,
+  );
   assert.doesNotMatch(workflow, /--release-base-url "\$\{\{ inputs\.release_base_url \}\}"/);
   assert.doesNotMatch(workflow, /CMCLIENT_UPDATE_SIGNING_KEY:\s+['"][A-Za-z0-9+/=]+/);
 });

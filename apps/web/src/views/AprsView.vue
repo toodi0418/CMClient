@@ -1,13 +1,24 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { onMounted, watch } from "vue";
 import { RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
 import { useAprsStore } from "@/stores/aprs";
+import { useGatewayStore } from "@/stores/gateway";
 
 const aprs = useAprsStore();
+const gateway = useGatewayStore();
 const { t } = useI18n();
+
+watch(
+  () => gateway.lastEventType,
+  (eventType) => {
+    if (eventType?.startsWith("aprs.")) {
+      void aprs.refresh();
+    }
+  },
+);
 
 onMounted(() => void aprs.refresh());
 </script>
@@ -18,7 +29,7 @@ onMounted(() => void aprs.refresh());
       <div class="panel-heading">
         <div>
           <p class="section-placeholder__eyebrow">{{ t("navigation.aprs") }}</p>
-          <h2>{{ t("aprs.outbox") }}</h2>
+          <h2>{{ t("aprs.runtime") }}</h2>
         </div>
         <Button
           unstyled
@@ -31,12 +42,94 @@ onMounted(() => void aprs.refresh());
           ><RefreshCw :size="17" aria-hidden="true"
         /></Button>
       </div>
-      <p v-if="aprs.loading" class="status-message">
+      <p v-if="aprs.loading && !aprs.status" class="status-message">
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="aprs.errorCode" class="status-message">
+      <p
+        v-else-if="aprs.runtimeErrorCode && !aprs.status"
+        class="status-message"
+      >
         {{ t("common.unavailable") }}
-        <code class="stable-code">{{ aprs.errorCode }}</code>
+        <code class="stable-code">{{ aprs.runtimeErrorCode }}</code>
+      </p>
+      <template v-else-if="aprs.status">
+        <dl class="facts-grid">
+          <div>
+            <dt>{{ t("aprs.state") }}</dt>
+            <dd>
+              <span
+                class="status-badge"
+                :data-state="aprs.status.running ? 'available' : 'unavailable'"
+              >
+                {{
+                  aprs.status.running
+                    ? t("aprs.running")
+                    : aprs.status.configured
+                      ? t("aprs.stopped")
+                      : t("common.notConfigured")
+                }}
+              </span>
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("aprs.monitor") }}</dt>
+            <dd>
+              <span
+                class="status-badge"
+                :data-state="aprs.status.monitorStatus"
+              >
+                {{ t(`aprs.monitorStatus.${aprs.status.monitorStatus}`) }}
+              </span>
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("aprs.mappedCallsigns") }}</dt>
+            <dd>{{ aprs.status.mappedCallsigns }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("aprs.pending") }}</dt>
+            <dd>{{ aprs.status.pendingOutbox }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("aprs.failed") }}</dt>
+            <dd>{{ aprs.status.failedOutbox }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("aprs.configured") }}</dt>
+            <dd>
+              {{
+                aprs.status.configured
+                  ? t("common.available")
+                  : t("common.notConfigured")
+              }}
+            </dd>
+          </div>
+        </dl>
+        <code v-if="aprs.status.lastErrorCode" class="stable-code">{{
+          aprs.status.lastErrorCode
+        }}</code>
+        <code v-if="aprs.runtimeErrorCode" class="stable-code">{{
+          aprs.runtimeErrorCode
+        }}</code>
+      </template>
+    </div>
+
+    <div class="status-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-placeholder__eyebrow">{{ t("navigation.aprs") }}</p>
+          <h2>{{ t("aprs.outbox") }}</h2>
+        </div>
+      </div>
+      <p v-if="aprs.loading && !aprs.entries.length" class="status-message">
+        {{ t("common.loading") }}
+      </p>
+      <p
+        v-else-if="aprs.outboxErrorCode && !aprs.entries.length"
+        class="status-message"
+      >
+        {{ t("common.unavailable") }}
+        <code class="stable-code">{{ aprs.outboxErrorCode }}</code>
       </p>
       <p v-else-if="!aprs.entries.length" class="status-message">
         {{ t("aprs.empty") }}
@@ -69,6 +162,9 @@ onMounted(() => void aprs.refresh());
           </div>
         </article>
       </div>
+      <code v-if="aprs.outboxErrorCode" class="stable-code">{{
+        aprs.outboxErrorCode
+      }}</code>
     </div>
   </section>
 </template>

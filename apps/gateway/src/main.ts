@@ -2,18 +2,28 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { GatewayRuntime, parseGatewayListenOptions } from "./app.js";
+import { createVerifiedGatewayBackup } from "./backup.js";
 import { DomainEventBus } from "./events.js";
 import { JobEngine } from "./jobs.js";
 import { GatewayDatabase } from "./persistence/database.js";
 import { CallMeshClient } from "./callmesh.js";
+import type { AprsGatewayRuntime } from "./aprs-runtime.js";
+import type { MeshGatewayRuntime } from "./mesh-runtime.js";
+import type { GatewayMaintenanceRuntime } from "./maintenance.js";
 import { MeshtasticProtobufCodec } from "./protobuf/protobuf.js";
 import { loadMeshtasticSchema } from "./protobuf/schema.js";
 import { ProxyAccessController } from "./proxy/policy.js";
 import { ProxyRuntime, ProxyRuntimeError } from "./proxy/runtime.js";
 import { ProxyConfigCache, ProxyUpstreamManager } from "./proxy/upstream.js";
+import {
+  createConfiguredAprsGatewayRuntime,
+  createConfiguredGatewayMaintenanceRuntime,
+  createConfiguredMeshGatewayRuntime,
+} from "./runtime-config.js";
 import { TcpMeshtasticTransport } from "./transport/tcp.js";
 
-const database = new GatewayDatabase(gatewayDatabasePath(process.env));
+const dataDirectory = gatewayDataDirectory(process.env);
+const database = new GatewayDatabase(join(dataDirectory, "gateway.sqlite"));
 const events = new DomainEventBus();
 const jobs = new JobEngine(database.jobs, events, {
   handlers: [
@@ -22,6 +32,19 @@ const jobs = new JobEngine(database.jobs, events, {
       handler: async (context) => {
         context.throwIfCancellationRequested();
         return { integrity: database.integrityCheck() };
+      },
+    },
+    {
+      type: "backup.create",
+      handler: async (context) => {
+        context.throwIfCancellationRequested();
+        const result = await createVerifiedGatewayBackup(
+          database.connection,
+          join(dataDirectory, "backups"),
+          context.job.id,
+        );
+        context.throwIfCancellationRequested();
+        return { ...result };
       },
     },
   ],
@@ -36,17 +59,53 @@ const callmesh = new CallMeshClient(
   },
   database.callmeshMappings,
 );
-void callmesh.synchronize();
 let proxy: ProxyRuntime | undefined;
+let mesh: MeshGatewayRuntime | undefined;
+let aprs: AprsGatewayRuntime | undefined;
+let maintenance: GatewayMaintenanceRuntime | undefined;
+let callmeshTimer: NodeJS.Timeout | undefined;
 try {
+  await synchronizeCallMesh(callmesh, events);
+  const verifiedMappings = () => {
+    const overview = callmesh.getOverview();
+    return overview.status.state === "ready" ? overview.mappings : [];
+  };
   proxy = await createConfiguredProxyRuntime(process.env, events);
   await proxy?.start();
+  maintenance = createConfiguredGatewayMaintenanceRuntime(
+    process.env,
+    database,
+    events,
+  );
+  maintenance.start();
+  aprs = createConfiguredAprsGatewayRuntime(
+    process.env,
+    database,
+    events,
+    verifiedMappings,
+  );
+  aprs?.start();
+  mesh = await createConfiguredMeshGatewayRuntime(
+    process.env,
+    database,
+    events,
+    verifiedMappings,
+  );
+  mesh?.start();
+  callmeshTimer = setInterval(() => {
+    void synchronizeCallMesh(callmesh, events).then(() =>
+      aprs?.refreshMonitor(),
+    );
+  }, 60_000);
+  callmeshTimer.unref();
 } catch (error) {
-  const code =
-    error instanceof Error && "code" in error
-      ? String(error.code)
-      : "PROXY_START_FAILED";
-  process.stderr.write(`${code}\n`);
+  process.stderr.write(
+    `${runtimeErrorCode(error, "GATEWAY_RUNTIME_START_FAILED")}\n`,
+  );
+  await mesh?.stop();
+  await aprs?.stop();
+  maintenance?.stop();
+  await proxy?.stop();
   database.close();
   process.exit(1);
 }
@@ -65,16 +124,38 @@ const runtime = new GatewayRuntime(
         ...(correlationId ? { correlationId } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
       }),
+    submitBackup: (correlationId, idempotencyKey) =>
+      jobs.submit({
+        type: "backup.create",
+        input: {},
+        ...(correlationId ? { correlationId } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      }),
   },
   {
     listNodes: (limit) => database.meshNodes.list(limit),
     listMessages: (limit) => database.meshMessages.list(limit),
     listTelemetry: (limit) => database.meshTelemetry.list(limit),
+    queryTelemetry: (query) => database.meshTelemetry.query(query),
     listPositions: (limit) => database.positions.listCanonicalEvents(limit),
     listAprsOutbox: (limit) => database.aprsOutbox.list(limit),
   },
   callmesh,
   proxy,
+  {
+    status: () => mesh?.status() ?? { configured: false },
+  },
+  {
+    status: () =>
+      aprs?.status() ?? {
+        configured: false,
+        running: false,
+        monitorStatus: "stopped",
+        mappedCallsigns: 0,
+        pendingOutbox: 0,
+        failedOutbox: 0,
+      },
+  },
 );
 let shuttingDown = false;
 
@@ -83,6 +164,13 @@ async function shutdown(): Promise<void> {
     return;
   }
   shuttingDown = true;
+  if (callmeshTimer) {
+    clearInterval(callmeshTimer);
+    callmeshTimer = undefined;
+  }
+  await mesh?.stop();
+  await aprs?.stop();
+  maintenance?.stop();
   await runtime.close();
   await proxy?.stop();
   database.close();
@@ -92,21 +180,36 @@ process.once("SIGINT", () => void shutdown().then(() => process.exit(0)));
 process.once("SIGTERM", () => void shutdown().then(() => process.exit(0)));
 
 runtime.start().catch((error: unknown) => {
-  const code =
-    error instanceof Error && "code" in error
-      ? String(error.code)
-      : "GATEWAY_START_FAILED";
-  process.stderr.write(`${code}\n`);
-  database.close();
-  process.exitCode = 1;
+  process.stderr.write(`${runtimeErrorCode(error, "GATEWAY_START_FAILED")}\n`);
+  void shutdown().then(() => {
+    process.exitCode = 1;
+  });
 });
 
-function gatewayDatabasePath(
+async function synchronizeCallMesh(
+  client: CallMeshClient,
+  eventBus: DomainEventBus,
+): Promise<void> {
+  try {
+    const overview = await client.synchronize();
+    eventBus.publish({
+      type: "callmesh.status",
+      source: "gateway",
+      payload: overview.status,
+    });
+  } catch (error) {
+    eventBus.publish({
+      type: "callmesh.error",
+      source: "gateway",
+      payload: { code: runtimeErrorCode(error, "CALLMESH_SYNC_FAILED") },
+    });
+  }
+}
+
+function gatewayDataDirectory(
   environment: Record<string, string | undefined>,
 ): string {
-  const dataDirectory =
-    environment.CMCLIENT_DATA_DIR?.trim() || join(homedir(), ".cmclient");
-  return join(dataDirectory, "gateway.sqlite");
+  return environment.CMCLIENT_DATA_DIR?.trim() || join(homedir(), ".cmclient");
 }
 
 async function createConfiguredProxyRuntime(
@@ -187,4 +290,16 @@ function parseRequiredPort(value: string | undefined): number | undefined {
   return Number.isInteger(port) && port >= 1 && port <= 65_535
     ? port
     : undefined;
+}
+
+function runtimeErrorCode(error: unknown, fallback: string): string {
+  if (
+    error instanceof Error &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    /^[A-Z][A-Z0-9_]{0,127}$/.test(error.code)
+  ) {
+    return error.code;
+  }
+  return fallback;
 }

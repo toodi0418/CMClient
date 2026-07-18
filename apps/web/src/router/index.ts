@@ -87,6 +87,12 @@ export const router = createRouter({
       meta: { labelKey: "navigation.messages", group: "operations" },
     },
     {
+      path: "/remote-dispatch",
+      name: "remote-dispatch",
+      component: () => import("@/views/RemoteDispatchView.vue"),
+      meta: { labelKey: "navigation.remoteDispatch", group: "operations" },
+    },
+    {
       path: "/telemetry",
       name: "telemetry",
       component: () => import("@/views/TelemetryView.vue"),

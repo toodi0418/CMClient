@@ -27,6 +27,10 @@ const capabilities: SystemCapabilities = {
     service: { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
     autoStart: { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
     docker: { available: true },
+    remoteDispatch: {
+      available: false,
+      reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
+    },
   },
 };
 

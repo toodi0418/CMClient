@@ -15,10 +15,18 @@ The optional `agent.toml` accepts loopback operational settings by default:
 
 ```toml
 [agent]
-gateway_command = ["cmclient-gateway", "serve"]
 gateway_port = 4810
 management_web_enabled = true
 ```
+
+In a staged Headless, Desktop, or Service layout, Agent locates the adjacent
+`gateway/dist/main.js` and `web/` production outputs relative to its own
+executable. An explicit `agent.gateway_command` remains an operator override;
+an absolute `CMCLIENT_GATEWAY_ENTRYPOINT` and `CMCLIENT_WEB_ROOT` are available
+for controlled development or packaging layouts. A missing/invalid Web root
+fails listener startup instead of falling back to a placeholder page. The
+current packaged Gateway command invokes `node`, so Node.js 22 or newer must be
+present; release portability is verified separately from this config contract.
 
 CallMesh keys, APRS passcodes, and administrative tokens do not belong in this
 file or in Agent command arguments. The Agent stores them in the operating
@@ -29,8 +37,15 @@ contains the value. Supported kinds are `callmesh-api-key`, `aprs-passcode`, and
 `management-admin-token`. Update signing private keys are deliberately not a
 runtime secret kind: release signing remains outside the product runtime.
 
+`management-admin-token` is the shared secret for remote CLI HMAC control, not
+the browser login password or session. Provision at least 32 random printable
+characters through local CLI standard input before using the HTTPS Control
+bridge; the remote CLI reads the same value from `CMCLIENT_CONTROL_TOKEN` in its
+own process environment. Neither side accepts it as a command argument.
+
 CallMesh's non-secret endpoint is optional Agent configuration. Its URL must be
-HTTPS; at Gateway launch the Agent clears inherited environment variables and
+HTTPS; at Gateway launch Agent drops inherited application configuration,
+retaining only launcher variables such as `PATH`/Windows runtime paths, and
 passes this URL plus a CallMesh API key only when that key is present in the OS
 credential store. Gateway therefore cannot inherit a legacy API key from the
 parent shell.
@@ -39,6 +54,46 @@ parent shell.
 [callmesh]
 url = "https://api.callmesh.example/v1"
 ```
+
+Meshtastic, APRS, and Proxy operational settings are also strict non-secret
+Agent configuration. TCP and Serial are mutually exclusive. APRS configuration
+does not contain the passcode: store that separately with
+`cmclient secret set aprs-passcode`. Without a stored passcode Agent starts the
+Gateway with APRS disabled rather than passing an empty credential.
+
+```toml
+[meshtastic]
+transport = "tcp"
+mesh_network_id = "local-mesh"
+gateway_id = "gateway-1"
+tcp_host = "127.0.0.1"
+tcp_port = 4403
+
+[aprs]
+login_callsign = "N0CALL-7"
+host = "rotate.aprs2.net"
+port = 14580
+destination = "APCM20"
+symbol_table = "/"
+symbol_code = ">"
+comment = "CMClient"
+
+[proxy]
+upstream_host = "127.0.0.1"
+upstream_port = 4403
+host = "127.0.0.1"
+port = 4404
+mode = "monitor"
+allow_lan = false
+```
+
+Agent clears inherited application configuration before it passes this
+validated configuration, the data path, and only the required OS-stored secrets
+to Gateway. The small launcher allowlist retains `PATH` and required Windows
+runtime paths so the configured process can start. Gateway then owns transport,
+protobuf/domain persistence, Position and APRS processing, CallMesh, Proxy,
+retention, Jobs, and domain SSE. See
+[Gateway Production Runtime](./gateway-runtime.md).
 
 LAN Management Web is opt-in through a separate strict section. It requires a
 non-loopback bind, absolute paths to a PEM certificate and private key, an

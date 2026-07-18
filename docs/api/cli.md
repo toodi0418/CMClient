@@ -9,9 +9,13 @@ pipe) or explicitly remote `https://` endpoints. Tokens are not accepted as
 CLI arguments.
 
 Exit codes are stable: 0 success, 2 usage, 3 connection, 4 authentication, 5
-validation, 6 operation failure, 7 partial/degraded, and 8 timeout. `status`,
-`start`, `stop`, and `restart` invoke the local Control API; `version` has no
-Agent dependency and supports stable JSON output.
+validation, 6 operation failure, 7 partial/degraded, and 8 timeout. The command
+surface is `status`, `start`, `stop`, `restart`, `version`, `logs`, `events`,
+`doctor`, `web`, `meshtastic`, `nodes`, `positions`, `aprs`, `proxy`, `update`,
+`backup`, `diagnostics`, `secret`, and `database`. `version` has no Agent
+dependency; all other runtime commands use the Control API. `doctor` returns 7
+when the combined status/diagnostic projection is degraded. Backup and database
+commands return persistent Job acceptance rather than touching SQLite.
 
 `update` reads the Agent-owned persistent update projection and reports the
 current phase, transfer, speed, and stable failure code without contacting
@@ -24,3 +28,25 @@ projection. With `--json`, each line is one stable
 Control API. `secret set <kind>` reads one value from standard input and stores
 it through the Agent; `secret remove <kind>` removes it. Secret values are never
 accepted as command arguments, printed, or returned as JSON.
+
+`logs --follow`, `events --follow`, and `update --follow` use bounded SSE
+parsing, reconnect after transient disconnects, and exit cleanly on Ctrl+C.
+`--timeout` applies to setup and bounded requests; timeout maps to exit 8 rather
+than an ordinary connection failure. Human output, JSON, quiet mode, and colour
+suppression are handled by the CLI after a shared projection is returned.
+
+For a remote endpoint, configure the Agent's Management LAN HTTPS listener and
+place the same OS-stored management admin token in the calling process's
+`CMCLIENT_CONTROL_TOKEN` environment variable:
+
+```bash
+CMCLIENT_CONTROL_TOKEN='replace-with-at-least-32-random-characters' \
+  cmclient --endpoint https://cmclient.example --timeout 30 status
+```
+
+The token is never accepted by a CLI option. The client rejects non-HTTPS URLs,
+URL credentials/query/fragment, and tokens outside the bounded format, then
+signs each request with the shared `control:admin` HMAC contract. It does not
+follow redirects. Agent rejects expired or replayed signatures.
+Missing/malformed tokens and remote 401/403 responses map to authentication
+exit 4.

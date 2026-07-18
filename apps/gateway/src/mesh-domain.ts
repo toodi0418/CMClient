@@ -5,6 +5,7 @@ import type {
   MeshNode,
   MeshObservation,
   MeshTelemetry,
+  PositionSample,
 } from "@cmclient/contracts";
 
 import {
@@ -21,6 +22,14 @@ export type StoredApplicationPayload =
   | { kind: "node"; node: MeshNode }
   | { kind: "message"; message: MeshMessage }
   | { kind: "telemetry"; telemetry: MeshTelemetry }
+  | {
+      kind: "position";
+      position: {
+        nodeNum: number;
+        payloadHash: string;
+        sample: PositionSample;
+      };
+    }
   | { kind: "ignored"; reasonCode: string };
 
 export class MeshDomainStoreError extends Error {
@@ -95,6 +104,12 @@ export class MeshDomainStore {
           observedAt: observation.ingestedAt,
         }),
       };
+    }
+    if (decoded.kind === "position") {
+      this.upsertNode(meshNetworkId, observation, {
+        nodeNum: decoded.position.nodeNum,
+      });
+      return decoded;
     }
     const existing = this.database.meshTelemetry.findByObservation(
       observation.id,

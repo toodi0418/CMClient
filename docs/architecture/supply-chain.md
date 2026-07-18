@@ -1,12 +1,18 @@
 # Release Supply Chain
 
 `scripts/release-supply-chain.mjs` is the executable release boundary after
-the platform matrix has staged one binary per canonical component/target pair.
-It copies each binary to `bin/<binary>` with a normalized timestamp and mode,
-adds the build metadata under `metadata/`, then creates a `tar.zst` or ZIP
-archive with the stable artifact name. The Agent installer accepts this safe
-`bin/` layout and independently rejects traversal, symlinks, special files,
-digest changes, and oversized extraction.
+the platform matrix has staged a complete canonical composition for every
+component/target pair. It verifies the schema-v2 role/path list against
+`scripts/release-artifacts.mjs`, rejects undeclared files, symlinks, and special
+files against the staged file inventory, normalizes modes and timestamps, adds
+build metadata under `metadata/`, then creates a `tar.zst` or ZIP archive with
+the stable artifact name. The
+result therefore preserves the full Desktop, Headless, CLI, or Service layout
+instead of reducing every product surface to one executable. Deployable
+layouts include `cmclient-migrate` and the locked `proto/meshtastic` corpus;
+the standalone CLI archive remains CLI-only. The Agent
+installer independently rejects traversal, symlinks, special files, digest
+changes, and oversized extraction.
 
 The release workflow always builds an unsigned artifact bundle containing:
 
@@ -38,6 +44,9 @@ immutable HTTPS release directory, repository variable
 The secret is a base64-encoded PKCS#8 Ed25519 private key. It is passed only as
 an environment value to the signing process; it is never an action input,
 command argument, artifact, log field, application setting, or runtime secret.
+The signing job checks out the exact workflow commit, re-verifies every
+downloaded archive, SBOM, checksum, digest, and size against that commit's
+canonical matrix, and fails closed when either signing value is absent.
 
 The script reconstructs the Rust Agent's compact JSON field order before
 calling Ed25519 and emits unpadded standard Base64. The Agent already treats

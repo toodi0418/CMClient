@@ -12,6 +12,7 @@ export const MESHTASTIC_PROTO_SHA256 =
 export interface MeshtasticSchema {
   fromRadio: Type;
   portNum: Enum;
+  position: Type;
   root: Root;
   telemetry: Type;
   toRadio: Type;
@@ -33,6 +34,7 @@ export async function loadMeshtasticSchema(
     fromRadio: root.lookupType("meshtastic.FromRadio"),
     toRadio: root.lookupType("meshtastic.ToRadio"),
     portNum: root.lookupEnum("meshtastic.PortNum"),
+    position: root.lookupType("meshtastic.Position"),
     telemetry: root.lookupType("meshtastic.Telemetry"),
     user: root.lookupType("meshtastic.User"),
   };
@@ -55,5 +57,18 @@ export function fingerprintMeshtasticProtoDirectory(
 }
 
 export function defaultProtoDirectory(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "../../../../proto");
+  const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+  const configured = process.env.CMCLIENT_PROTO_ROOT?.trim();
+  const candidates = [
+    ...(configured ? [resolve(configured)] : []),
+    resolve(moduleDirectory, "../../../../proto"),
+    resolve(moduleDirectory, "../../../proto"),
+  ];
+  return (
+    candidates.find((candidate) =>
+      existsSync(resolve(candidate, "meshtastic/mesh.proto")),
+    ) ??
+    candidates[0] ??
+    resolve(moduleDirectory, "../../../../proto")
+  );
 }

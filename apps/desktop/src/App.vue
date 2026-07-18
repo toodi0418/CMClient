@@ -14,6 +14,12 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { runWindowControl, type WindowControlAction } from "./window-controls";
+import {
+  aprsCallmeshDetail,
+  type DesktopServiceStatus,
+  meshtasticDetail,
+  proxyDetail,
+} from "./service-status";
 
 type GatewayStatus =
   "stopped" | "starting" | "running" | "backoff" | "degraded";
@@ -50,7 +56,11 @@ const busy = ref(false);
 const updateStatus = ref<UpdateControlStatus>();
 const updateErrorCode = ref<string>();
 const updateBusy = ref(false);
+const serviceStatus = ref<DesktopServiceStatus>();
+const serviceErrorCode = ref<string>();
+const serviceBusy = ref(false);
 let unlistenUpdateEvents: UnlistenFn | undefined;
+let statusRefreshTimer: ReturnType<typeof setInterval> | undefined;
 const appWindow = isTauri() ? getCurrentWindow() : undefined;
 const windowControlTarget = appWindow
   ? {
@@ -70,6 +80,33 @@ const activeErrorCode = computed(
   () => errorCode.value ?? status.value?.latest_error_code,
 );
 const uptimeLabel = computed(() => formatUptime(status.value?.uptime_seconds));
+const meshtasticState = computed(
+  () => serviceStatus.value?.meshtastic.state ?? "starting",
+);
+const meshtasticStateLabel = computed(
+  () => serviceStatus.value?.meshtastic.state ?? "checking",
+);
+const meshtasticStatusDetail = computed(() =>
+  meshtasticDetail(serviceStatus.value?.meshtastic),
+);
+const aprsCallmeshState = computed(
+  () => serviceStatus.value?.aprsCallmesh.state ?? "starting",
+);
+const aprsCallmeshStateLabel = computed(
+  () => serviceStatus.value?.aprsCallmesh.state ?? "checking",
+);
+const aprsCallmeshStatusDetail = computed(() =>
+  aprsCallmeshDetail(serviceStatus.value?.aprsCallmesh),
+);
+const proxyState = computed(
+  () => serviceStatus.value?.proxy.state ?? "starting",
+);
+const proxyStateLabel = computed(
+  () => serviceStatus.value?.proxy.state ?? "checking",
+);
+const proxyStatusDetail = computed(() =>
+  proxyDetail(serviceStatus.value?.proxy),
+);
 const updateJob = computed(() => updateStatus.value?.job);
 const updatePhase = computed(() => updateJob.value?.phase ?? "idle");
 const updatePhaseLabel = computed(() =>
@@ -111,14 +148,25 @@ async function controlWindow(action: WindowControlAction): Promise<void> {
 
 async function refresh(): Promise<void> {
   busy.value = true;
-  try {
-    status.value = await invoke<ControlStatus>("agent_status");
+  serviceBusy.value = true;
+  const [agentResult, serviceResult] = await Promise.allSettled([
+    invoke<ControlStatus>("agent_status"),
+    invoke<DesktopServiceStatus>("agent_service_status"),
+  ]);
+  if (agentResult.status === "fulfilled") {
+    status.value = agentResult.value;
     errorCode.value = undefined;
-  } catch {
+  } else {
     errorCode.value = "DESKTOP_AGENT_UNAVAILABLE";
-  } finally {
-    busy.value = false;
   }
+  if (serviceResult.status === "fulfilled") {
+    serviceStatus.value = serviceResult.value;
+    serviceErrorCode.value = undefined;
+  } else {
+    serviceErrorCode.value = "DESKTOP_SERVICE_STATUS_UNAVAILABLE";
+  }
+  busy.value = false;
+  serviceBusy.value = false;
 }
 
 async function command(command: AgentCommand): Promise<void> {
@@ -131,7 +179,19 @@ async function command(command: AgentCommand): Promise<void> {
       command === "enable_web" || command === "disable_web"
         ? "DESKTOP_MANAGEMENT_WEB_CONTROL_FAILED"
         : "DESKTOP_AGENT_COMMAND_FAILED";
+    busy.value = false;
+    return;
+  }
+  serviceBusy.value = true;
+  try {
+    serviceStatus.value = await invoke<DesktopServiceStatus>(
+      "agent_service_status",
+    );
+    serviceErrorCode.value = undefined;
+  } catch {
+    serviceErrorCode.value = "DESKTOP_SERVICE_STATUS_UNAVAILABLE";
   } finally {
+    serviceBusy.value = false;
     busy.value = false;
   }
 }
@@ -225,11 +285,21 @@ function formatBytes(bytes: number): string {
 onMounted(() => {
   void refresh();
   void refreshUpdate();
+  statusRefreshTimer = setInterval(() => {
+    if (!busy.value && !serviceBusy.value) {
+      void refresh();
+    }
+  }, 10_000);
   if (isTauri()) {
     void subscribeToUpdateEvents();
   }
 });
-onUnmounted(() => unlistenUpdateEvents?.());
+onUnmounted(() => {
+  unlistenUpdateEvents?.();
+  if (statusRefreshTimer !== undefined) {
+    clearInterval(statusRefreshTimer);
+  }
+});
 </script>
 
 <template>
@@ -301,6 +371,28 @@ onUnmounted(() => unlistenUpdateEvents?.());
           <span>Gateway</span>
           <strong>{{ gatewayLabel }}</strong>
         </div>
+        <div class="status-light" :data-state="meshtasticState">
+          <span class="status-light__pip" aria-hidden="true" />
+          <span>Meshtastic</span>
+          <strong>{{ meshtasticStateLabel }}</strong>
+          <small :title="meshtasticStatusDetail">{{
+            meshtasticStatusDetail
+          }}</small>
+        </div>
+        <div class="status-light" :data-state="aprsCallmeshState">
+          <span class="status-light__pip" aria-hidden="true" />
+          <span>APRS / CallMesh</span>
+          <strong>{{ aprsCallmeshStateLabel }}</strong>
+          <small :title="aprsCallmeshStatusDetail">{{
+            aprsCallmeshStatusDetail
+          }}</small>
+        </div>
+        <div class="status-light" :data-state="proxyState">
+          <span class="status-light__pip" aria-hidden="true" />
+          <span>TCP Proxy</span>
+          <strong>{{ proxyStateLabel }}</strong>
+          <small :title="proxyStatusDetail">{{ proxyStatusDetail }}</small>
+        </div>
       </div>
       <dl>
         <div>
@@ -354,6 +446,7 @@ onUnmounted(() => unlistenUpdateEvents?.());
         }}</code>
       </section>
       <code v-if="activeErrorCode">{{ activeErrorCode }}</code>
+      <code v-if="serviceErrorCode">{{ serviceErrorCode }}</code>
       <div class="management-controls">
         <div class="web-toggle-row">
           <span>Management Web</span>
@@ -372,7 +465,7 @@ onUnmounted(() => unlistenUpdateEvents?.());
                 ? 'Disable Management Web'
                 : 'Enable Management Web'
             "
-            :disabled="busy"
+            :disabled="busy || serviceBusy"
             @click="toggleManagementWeb"
           >
             <span class="web-switch__thumb" />
@@ -383,7 +476,7 @@ onUnmounted(() => unlistenUpdateEvents?.());
             type="button"
             aria-label="Open Management Web"
             title="Open Management Web"
-            :disabled="busy || managementWebLabel !== 'running'"
+            :disabled="busy || serviceBusy || managementWebLabel !== 'running'"
             @click="openManagementWeb"
           >
             <ExternalLink :size="17" aria-hidden="true" />
@@ -392,7 +485,7 @@ onUnmounted(() => unlistenUpdateEvents?.());
             type="button"
             aria-label="Restart Gateway"
             title="Restart Gateway"
-            :disabled="busy"
+            :disabled="busy || serviceBusy"
             @click="command('restart')"
           >
             <RefreshCw :size="17" aria-hidden="true" />
@@ -401,7 +494,7 @@ onUnmounted(() => unlistenUpdateEvents?.());
             type="button"
             aria-label="Refresh status"
             title="Refresh status"
-            :disabled="busy"
+            :disabled="busy || serviceBusy"
             @click="refresh"
           >
             <RefreshCw :size="17" aria-hidden="true" />
@@ -410,7 +503,7 @@ onUnmounted(() => unlistenUpdateEvents?.());
             type="button"
             aria-label="Start Gateway"
             title="Start Gateway"
-            :disabled="busy"
+            :disabled="busy || serviceBusy"
             @click="command('start')"
           >
             <Play :size="17" aria-hidden="true" />
@@ -419,7 +512,7 @@ onUnmounted(() => unlistenUpdateEvents?.());
             type="button"
             aria-label="Stop Gateway"
             title="Stop Gateway"
-            :disabled="busy"
+            :disabled="busy || serviceBusy"
             @click="command('stop')"
           >
             <Square :size="15" aria-hidden="true" />

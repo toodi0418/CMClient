@@ -73,10 +73,11 @@ describe("GatewayRuntime", () => {
 
   it("serves schema-backed system endpoints", async () => {
     const app = createGatewayApp(new MemoryLogger());
-    const [health, version, capabilities] = await Promise.all([
+    const [health, version, capabilities, aprs] = await Promise.all([
       app.inject("/api/v1/system/health"),
       app.inject("/api/v1/system/version"),
       app.inject("/api/v1/system/capabilities"),
+      app.inject("/api/v1/aprs"),
     ]);
     expect(health.json()).toEqual({ status: "ok" });
     expect(version.json()).toMatchObject({
@@ -89,11 +90,20 @@ describe("GatewayRuntime", () => {
         serial: { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
       },
     });
+    expect(aprs.json()).toEqual({
+      configured: false,
+      running: false,
+      monitorStatus: "stopped",
+      mappedCallsigns: 0,
+      pendingOutbox: 0,
+      failedOutbox: 0,
+    });
     await app.close();
   });
 
   it("serves bounded domain list projections and fails closed without persistence", async () => {
     const limits: number[] = [];
+    const telemetryQueries: unknown[] = [];
     const app = createGatewayApp(
       new MemoryLogger(),
       undefined,
@@ -107,6 +117,10 @@ describe("GatewayRuntime", () => {
         },
         listMessages: () => [],
         listTelemetry: () => [],
+        queryTelemetry: (query) => {
+          telemetryQueries.push(query);
+          return [];
+        },
         listPositions: () => [],
         listAprsOutbox: () => [],
       },
@@ -114,9 +128,37 @@ describe("GatewayRuntime", () => {
 
     const nodes = await app.inject("/api/v1/nodes?limit=2");
     const positions = await app.inject("/api/v1/positions");
+    const telemetry = await app.inject(
+      "/api/v1/telemetry?meshNetworkId=mesh-a&nodeNum=42&metricKind=deviceMetrics&from=2026-07-18T00%3A00%3A00.000Z&to=2026-07-18T01%3A00%3A00.000Z&limit=25",
+    );
+    const invalidTelemetry = await app.inject("/api/v1/telemetry?nodeNum=42");
+    const mixedPrecisionTelemetry = await app.inject(
+      "/api/v1/telemetry?from=2026-07-18T00%3A00%3A00Z&to=2026-07-18T00%3A00%3A00.500Z",
+    );
     expect(nodes.statusCode).toBe(200);
     expect(nodes.json()).toEqual({ items: [] });
     expect(positions.json()).toEqual({ items: [] });
+    expect(telemetry.json()).toEqual({ items: [] });
+    expect(mixedPrecisionTelemetry.statusCode).toBe(200);
+    expect(telemetryQueries).toEqual([
+      {
+        limit: 25,
+        meshNetworkId: "mesh-a",
+        nodeNum: 42,
+        metricKind: "deviceMetrics",
+        from: "2026-07-18T00:00:00.000Z",
+        to: "2026-07-18T01:00:00.000Z",
+      },
+      {
+        limit: 100,
+        from: "2026-07-18T00:00:00.000Z",
+        to: "2026-07-18T00:00:00.500Z",
+      },
+    ]);
+    expect(invalidTelemetry.statusCode).toBe(400);
+    expect(invalidTelemetry.json()).toMatchObject({
+      code: "TELEMETRY_RANGE_INVALID",
+    });
     expect(limits).toEqual([2]);
     await app.close();
 

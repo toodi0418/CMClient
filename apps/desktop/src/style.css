@@ -144,6 +144,17 @@ button {
   background: #fafffa;
   color: #59705f;
   font-size: 12px;
+  min-height: 74px;
+}
+.status-light small {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  min-width: 0;
+  color: #687b6d;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .status-light strong {
   grid-column: 1 / -1;
@@ -168,9 +179,16 @@ button {
 .status-light[data-state="backoff"] .status-light__pip {
   background: #b85b37;
 }
+.status-light[data-state="starting"] .status-light__pip {
+  background: #b98a2e;
+  box-shadow: 0 0 0 3px #e8d7aa;
+}
 .status-light[data-state="stopped"] .status-light__pip,
 .status-light[data-state="disabled"] .status-light__pip {
   background: #75827a;
+}
+.status-light[data-state="unavailable"] .status-light__pip {
+  background: #b04c3c;
 }
 dl {
   margin: 0;

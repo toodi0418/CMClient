@@ -15,7 +15,7 @@
         "label": "main",
         "title": "CMClient",
         "width": 640,
-        "height": 560,
+        "height": 680,
         "minWidth": 420,
         "minHeight": 500,
         "decorations": false,

@@ -10,6 +10,7 @@ export const CAPABILITY_KEYS = [
   "service",
   "autoStart",
   "docker",
+  "remoteDispatch",
 ] as const;
 
 const BuildChannelSchema = Type.Union(
@@ -70,6 +71,7 @@ export const SystemCapabilitiesSchema = Type.Object(
         service: CapabilityStateSchema,
         autoStart: CapabilityStateSchema,
         docker: CapabilityStateSchema,
+        remoteDispatch: CapabilityStateSchema,
       },
       { additionalProperties: false },
     ),

@@ -131,6 +131,81 @@ describe("gateway API client", () => {
     });
     expect(url).toBe("/api/v1/proxy");
   });
+
+  it("validates the Meshtastic and APRS runtime projections", async () => {
+    const requested: string[] = [];
+    const client = new GatewayApiClient({
+      fetch: async (input) => {
+        const url = String(input);
+        requested.push(url);
+        return url.endsWith("/meshtastic")
+          ? jsonResponse({
+              configured: true,
+              meshNetworkId: "mesh-a",
+              gatewayId: "gateway-a",
+              connection: {
+                transport: "serial",
+                status: "ready",
+                changedAt: "2026-07-18T00:00:00.000Z",
+              },
+              metrics: {
+                bytesReceived: 10,
+                bytesSent: 4,
+                framesReceived: 2,
+                framesSent: 1,
+                malformedFrames: 0,
+                reconnects: 0,
+              },
+            })
+          : jsonResponse({
+              configured: true,
+              running: true,
+              monitorStatus: "connected",
+              mappedCallsigns: 2,
+              pendingOutbox: 1,
+              failedOutbox: 0,
+            });
+      },
+    });
+
+    await expect(client.meshtastic.status()).resolves.toMatchObject({
+      connection: { status: "ready" },
+    });
+    await expect(client.aprs.status()).resolves.toMatchObject({
+      monitorStatus: "connected",
+      mappedCallsigns: 2,
+    });
+    expect(requested).toEqual(["/api/v1/meshtastic", "/api/v1/aprs"]);
+  });
+
+  it("encodes bounded telemetry range queries and rejects ambiguous nodes", async () => {
+    let url: string | undefined;
+    const client = new GatewayApiClient({
+      fetch: async (input) => {
+        url = String(input);
+        return jsonResponse({ items: [] });
+      },
+    });
+
+    await expect(
+      client.domain.telemetry({
+        meshNetworkId: "mesh-a",
+        nodeNum: 42,
+        metricKind: "deviceMetrics",
+        from: "2026-07-18T00:00:00Z",
+        to: "2026-07-18T00:00:00.500Z",
+        limit: 25,
+      }),
+    ).resolves.toEqual({ items: [] });
+    expect(url).toContain("/api/v1/telemetry?");
+    expect(url).toContain("meshNetworkId=mesh-a");
+    expect(url).toContain("nodeNum=42");
+    expect(url).toContain("from=2026-07-18T00%3A00%3A00.000Z");
+    expect(url).toContain("to=2026-07-18T00%3A00%3A00.500Z");
+    expect(() => client.domain.telemetry({ nodeNum: 42 })).toThrow(
+      expect.objectContaining({ code: "CLIENT_INPUT_INVALID" }),
+    );
+  });
 });
 
 function jsonResponse(payload: unknown, status = 200): Response {

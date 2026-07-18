@@ -10,6 +10,10 @@ use tauri::{
 };
 use tauri_plugin_opener::OpenerExt;
 
+mod service_status;
+
+use service_status::DesktopServiceStatus;
+
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_OPEN_ID: &str = "open";
 const TRAY_EXIT_ID: &str = "exit";
@@ -30,6 +34,15 @@ fn agent_update_status() -> Result<UpdateControlStatus, String> {
     control_client()?
         .update_status()
         .map_err(|error| error.code().to_owned())
+}
+
+#[tauri::command]
+fn agent_service_status() -> Result<DesktopServiceStatus, String> {
+    let config =
+        AgentConfig::load().map_err(|_| String::from("DESKTOP_AGENT_CONFIG_UNAVAILABLE"))?;
+    Ok(service_status::load(default_local_endpoint(
+        &config.paths.data_dir,
+    )))
 }
 
 #[tauri::command]
@@ -182,6 +195,7 @@ fn main() {
             agent_status,
             agent_command,
             agent_update_status,
+            agent_service_status,
             open_management_web,
             exit_desktop
         ])

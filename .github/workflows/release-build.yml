@@ -68,100 +68,68 @@ jobs:
         include:
           - component: desktop
             target: darwin-aarch64
-            os: macos-14
+            os: macos-15
             rust_target: aarch64-apple-darwin
-            package: cmclient-desktop
-            binary: cmclient-desktop
           - component: headless
             target: darwin-aarch64
-            os: macos-14
+            os: macos-15
             rust_target: aarch64-apple-darwin
-            package: cmclient-agent
-            binary: cmclient-agent
           - component: cli
             target: darwin-aarch64
-            os: macos-14
+            os: macos-15
             rust_target: aarch64-apple-darwin
-            package: cmclient-cli
-            binary: cmclient
           - component: desktop
             target: darwin-x86_64
-            os: macos-13
+            os: macos-15-intel
             rust_target: x86_64-apple-darwin
-            package: cmclient-desktop
-            binary: cmclient-desktop
           - component: headless
             target: darwin-x86_64
-            os: macos-13
+            os: macos-15-intel
             rust_target: x86_64-apple-darwin
-            package: cmclient-agent
-            binary: cmclient-agent
           - component: cli
             target: darwin-x86_64
-            os: macos-13
+            os: macos-15-intel
             rust_target: x86_64-apple-darwin
-            package: cmclient-cli
-            binary: cmclient
           - component: desktop
             target: linux-aarch64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             rust_target: aarch64-unknown-linux-gnu
-            package: cmclient-desktop
-            binary: cmclient-desktop
           - component: headless
             target: linux-aarch64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             rust_target: aarch64-unknown-linux-gnu
-            package: cmclient-agent
-            binary: cmclient-agent
           - component: cli
             target: linux-aarch64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             rust_target: aarch64-unknown-linux-gnu
-            package: cmclient-cli
-            binary: cmclient
           - component: desktop
             target: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             rust_target: x86_64-unknown-linux-gnu
-            package: cmclient-desktop
-            binary: cmclient-desktop
           - component: headless
             target: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             rust_target: x86_64-unknown-linux-gnu
-            package: cmclient-agent
-            binary: cmclient-agent
           - component: cli
             target: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             rust_target: x86_64-unknown-linux-gnu
-            package: cmclient-cli
-            binary: cmclient
           - component: desktop
             target: windows-x86_64
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
-            package: cmclient-desktop
-            binary: cmclient-desktop.exe
           - component: headless
             target: windows-x86_64
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
-            package: cmclient-agent
-            binary: cmclient-agent.exe
           - component: cli
             target: windows-x86_64
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
-            package: cmclient-cli
-            binary: cmclient.exe
           - component: service
             target: windows-x86_64
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
-            package: cmclient-service-host
-            binary: cmclient-service-host.exe
     steps:
       - uses: actions/checkout@v4
         with:
@@ -191,44 +159,115 @@ jobs:
         shell: bash
         run: rustup target add "${{ matrix.rust_target }}"
       - run: pnpm install --frozen-lockfile
-      - name: Build frontend inputs
+      - name: Build production JavaScript inputs
         shell: bash
         run: |
-          pnpm --filter @cmclient/contracts run build
-          if [ "${{ matrix.component }}" = "desktop" ]; then
+          component="${{ matrix.component }}"
+          rm -rf release-build-input
+          if [ "$component" = "desktop" ]; then
             pnpm --filter @cmclient/desktop run build
           fi
-          if [ "${{ matrix.component }}" = "headless" ]; then
+          if [ "$component" != "cli" ]; then
+            pnpm --filter @cmclient/contracts run build
             pnpm --filter @cmclient/gateway run build
             pnpm --filter @cmclient/web run build
+            pnpm --config.node-linker=hoisted --filter @cmclient/gateway deploy \
+              --legacy --prod release-build-input/gateway
           fi
-      - name: Build ${{ matrix.component }} executable
+      - name: Build canonical Rust inputs
         shell: bash
         run: |
+          packages=(--package cmclient-cli)
+          case "${{ matrix.component }}" in
+            headless) packages+=(--package cmclient-agent --package cmclient-legacy-migration) ;;
+            desktop) packages+=(--package cmclient-agent --package cmclient-legacy-migration --package cmclient-desktop) ;;
+            service) packages+=(--package cmclient-agent --package cmclient-legacy-migration --package cmclient-service-host) ;;
+          esac
           cargo build --release --locked \
-            --package "${{ matrix.package }}" \
+            "${packages[@]}" \
             --target "${{ matrix.rust_target }}"
-      - name: Stage build with canonical release metadata
+      - name: Stage complete canonical composition
         id: stage
         shell: bash
         run: |
           version="$(node -p "require('./package.json').version")"
+          component="${{ matrix.component }}"
+          target="${{ matrix.target }}"
+          rust_output="target/${{ matrix.rust_target }}/release"
+          executable_suffix=""
+          if [[ "$target" == windows-* ]]; then
+            executable_suffix=".exe"
+          fi
+
+          inputs=(--input "cli=$rust_output/cmclient$executable_suffix")
+          if [ "$component" != "cli" ]; then
+            inputs+=(
+              --input "agent=$rust_output/cmclient-agent$executable_suffix"
+              --input "migration=$rust_output/cmclient-migrate$executable_suffix"
+              --input "gateway=release-build-input/gateway"
+              --input "web=apps/web/dist"
+              --input "proto=proto"
+            )
+            if [[ "$target" == linux-* ]]; then
+              inputs+=(
+                --input "systemdManager=scripts/cmclient-systemd.sh"
+                --input "systemdUnit=packaging/systemd/cmclient-agent.service.in"
+              )
+            elif [[ "$target" == darwin-* ]]; then
+              inputs+=(
+                --input "launchdManager=scripts/cmclient-launchd.sh"
+                --input "launchdPlist=packaging/launchd/io.cmclient.agent.plist.in"
+              )
+            fi
+          fi
+          if [ "$component" = "desktop" ]; then
+            inputs+=(--input "desktop=$rust_output/cmclient-desktop$executable_suffix")
+          elif [ "$component" = "service" ]; then
+            inputs+=(
+              --input "serviceHost=$rust_output/cmclient-service-host$executable_suffix"
+              --input "windowsServiceManager=scripts/cmclient-windows-service.ps1"
+            )
+          fi
+
           node scripts/release-artifacts.mjs stage \
-            --component "${{ matrix.component }}" \
+            --component "$component" \
             --target "${{ matrix.target }}" \
             --version "$version" \
-            --binary "target/${{ matrix.rust_target }}/release/${{ matrix.binary }}" \
+            "${inputs[@]}" \
             --output release-build
           echo "artifact=cmclient-build-${{ matrix.component }}-${{ matrix.target }}-$version" >> "$GITHUB_OUTPUT"
+      - name: Smoke staged Headless runtime composition
+        if: matrix.component == 'headless'
+        shell: bash
+        run: |
+          bash scripts/release-bundle-smoke.sh \
+            "release-build/headless/${{ matrix.target }}" \
+            "${{ matrix.target }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.artifact }}
           path: release-build/
           if-no-files-found: error
 
+  docker-composition:
+    name: Docker Gateway and Web composition
+    needs: artifact-plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify Docker excludes host-control components
+        run: node --test scripts/docker.test.mjs
+      - name: Build and exercise the constrained Docker deployment
+        run: bash scripts/docker-smoke.sh
+
   supply-chain:
     name: Assemble archives, checksums, and SBOM
-    needs: build
+    needs: [build, docker-composition]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -273,6 +312,16 @@ jobs:
           node scripts/release-supply-chain.mjs verify \
             --output release-dist \
             --version "$version"
+      - name: Smoke extracted final Headless archive
+        shell: bash
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          tar --zstd -xf \
+            "release-dist/cmclient-headless-linux-x86_64-$version.tar.zst" \
+            -C "$smoke_root"
+          bash scripts/release-bundle-smoke.sh "$smoke_root" linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: cmclient-supply-chain-unsigned-${{ steps.release.outputs.version }}
@@ -316,14 +365,27 @@ jobs:
   sign-update-manifest:
     name: Sign Agent update manifest
     needs: supply-chain
-    if: github.event_name == 'workflow_dispatch' && inputs.release_base_url != '' && secrets.CMCLIENT_UPDATE_SIGNING_KEY != '' && vars.CMCLIENT_UPDATE_SIGNING_KEY_ID != ''
+    if: github.event_name == 'workflow_dispatch' && inputs.release_base_url != ''
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: actions/download-artifact@v4
         with:
           pattern: cmclient-supply-chain-unsigned-*
           path: release-dist
           merge-multiple: true
+      - name: Verify release input before exposing the signing key
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          node scripts/release-supply-chain.mjs verify \
+            --output release-dist \
+            --version "$version"
       - name: Sign canonical Agent manifest without exposing the private key
         shell: bash
         env:
@@ -333,6 +395,14 @@ jobs:
           RELEASE_MINIMUM_AGENT_VERSION: ${{ inputs.minimum_agent_version }}
           RELEASE_SIGNING_KEY_ID: ${{ vars.CMCLIENT_UPDATE_SIGNING_KEY_ID }}
         run: |
+          [[ -n "$CMCLIENT_UPDATE_SIGNING_KEY" ]] || {
+            echo "RELEASE_SIGNING_KEY_MISSING" >&2
+            exit 1
+          }
+          [[ -n "$RELEASE_SIGNING_KEY_ID" ]] || {
+            echo "RELEASE_SIGNING_KEY_ID_MISSING" >&2
+            exit 1
+          }
           published_at="$(date --utc +%Y-%m-%dT%H:%M:%S.000Z)"
           node scripts/release-supply-chain.mjs sign-update-manifest \
             --index release-dist/release-index.json \

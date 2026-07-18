@@ -24,6 +24,22 @@ fn fixture_source(directory: &PathBuf) -> PathBuf {
 }
 
 #[test]
+fn reports_the_packaged_migration_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cmclient-migrate"))
+        .arg("--version")
+        .output()
+        .expect("migration command should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .expect("stdout should be UTF-8")
+            .trim(),
+        format!("cmclient-migrate {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn dry_run_reports_a_safe_candidate_without_echoing_a_legacy_secret() {
     let directory = temporary_directory("dry-run");
     let _ = fs::remove_dir_all(&directory);

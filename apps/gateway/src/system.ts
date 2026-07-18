@@ -1,4 +1,5 @@
 import {
+  BUILD_CHANNELS,
   type BuildMetadata,
   type SystemCapabilities,
 } from "@cmclient/contracts";
@@ -30,7 +31,15 @@ export function defaultGatewaySystemState(
   const build: BuildMetadata = {
     version: environment.CMCLIENT_BUILD_VERSION?.trim() || "2.0.0-dev.0",
     commit: environment.CMCLIENT_BUILD_COMMIT?.trim() || "unknown",
-    channel: "dev",
+    channel: BUILD_CHANNELS.includes(
+      environment.CMCLIENT_BUILD_CHANNEL?.trim() as BuildMetadata["channel"],
+    )
+      ? (environment.CMCLIENT_BUILD_CHANNEL?.trim() as BuildMetadata["channel"])
+      : "dev",
+    ...(environment.CMCLIENT_BUILD_AT &&
+    Number.isFinite(Date.parse(environment.CMCLIENT_BUILD_AT))
+      ? { builtAt: new Date(environment.CMCLIENT_BUILD_AT).toISOString() }
+      : {}),
   };
   const dockerDeployment = isDockerDeployment(environment);
   return {
@@ -60,6 +69,10 @@ export function defaultGatewaySystemState(
         docker: dockerDeployment
           ? { available: true }
           : { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
+        remoteDispatch: {
+          available: false,
+          reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
+        },
       },
     },
   };

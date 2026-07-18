@@ -220,6 +220,7 @@ export class PositionHighWaterStore {
     event: PositionCanonicalEvent,
     target: PositionMappingTarget,
     decidedAt: string,
+    onAccepted?: (event: PositionCanonicalEvent) => void,
   ): PositionHighWaterResult {
     if (!target.callsign.trim() || !target.mappingVersion.trim()) {
       throw new PositionPersistenceError();
@@ -251,6 +252,9 @@ export class PositionHighWaterStore {
         plan.code,
         decidedAt,
       );
+      if (decision.code === "POSITION_ACCEPTED") {
+        onAccepted?.(eventWithEpoch);
+      }
       this.database.exec("COMMIT");
       transactionOpen = false;
       return { event: eventWithEpoch, decision, ...(state ? { state } : {}) };
@@ -260,6 +264,14 @@ export class PositionHighWaterStore {
       }
       throw new PositionPersistenceError();
     }
+  }
+
+  getState(
+    meshNetworkId: string,
+    nodeNum: number,
+    target: PositionMappingTarget,
+  ): NodePositionState | undefined {
+    return this.findState(meshNetworkId, nodeNum, target);
   }
 
   private findState(

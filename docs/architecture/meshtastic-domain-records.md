@@ -6,10 +6,12 @@ and supports only these explicit application ports:
 - `NODEINFO_APP`: protobuf `User`, used to enrich node identity metadata.
 - `TEXT_MESSAGE_APP`: strict UTF-8 text.
 - `TELEMETRY_APP`: protobuf `Telemetry` with its active oneof metric variant.
+- `POSITION_APP`: protobuf `Position`, normalized to the shared Position sample
+  units with a SHA-256 payload identity before canonical processing.
 
-Unsupported ports, missing identifiers, invalid UTF-8, missing telemetry
-variants, and out-of-range message channels return stable `MESH_*` reason
-codes. They do not create partial domain records. Compressed text is not
+Unsupported ports, missing identifiers, invalid UTF-8, missing telemetry or
+Position fields, and out-of-range message channels return stable `MESH_*`
+reason codes. They do not create partial domain records. Compressed text is not
 silently guessed or decompressed by this layer.
 
 ## Persistence
@@ -27,3 +29,8 @@ Telemetry keeps its device-supplied `time` separately as
 `telemetryTimeSeconds`; it is not used as a position source event time or a
 node registry ordering key. All `observedAt` values come from the separately
 persisted CMClient API ingest timestamp.
+
+Position payloads do not enter the Node/Message/Telemetry repositories. The
+production runtime converts them to an observation and canonical event before
+mapping, validation, high-water ordering, and APRS outbox decisions described
+in [Gateway Production Runtime](./gateway-runtime.md).

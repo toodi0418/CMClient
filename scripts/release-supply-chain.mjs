@@ -21,6 +21,7 @@ import {
   archiveForTarget,
   releaseArtifactName,
   releaseArtifactPlan,
+  releaseComposition,
 } from "./release-artifacts.mjs";
 
 const CHANNELS = new Set(["stable", "beta", "dev"]);
@@ -42,35 +43,34 @@ export async function assembleReleaseArtifacts({ input, output, version }) {
     const artifacts = [];
     for (const planned of plan) {
       const buildDirectory = join(inputRoot, planned.component, planned.target);
-      const buildManifest = await readBuildManifest(join(buildDirectory, "build-manifest.json"), planned, version);
-      const binaryName = assertBinaryName(buildManifest.binary);
-      const sourceBinary = join(buildDirectory, binaryName);
-      const sourceMetadata = await lstat(sourceBinary);
-      if (!sourceMetadata.isFile()) {
-        throw new Error("RELEASE_BUILD_BINARY_INVALID");
-      }
+      const buildManifest = await readBuildManifest(
+        join(buildDirectory, "build-manifest.json"),
+        planned,
+        version,
+      );
+      await assertNoUnexpectedBuildEntries(buildDirectory, buildManifest);
 
       const packageRoot = join(temporaryRoot, `${planned.component}-${planned.target}`);
-      const binDirectory = join(packageRoot, "bin");
       const metadataDirectory = join(packageRoot, "metadata");
-      await mkdir(binDirectory, { recursive: true });
       await mkdir(metadataDirectory, { recursive: true });
 
-      const stagedBinary = join(binDirectory, binaryName);
+      for (const content of buildManifest.contents) {
+        const source = manifestPath(buildDirectory, content.path);
+        const destination = manifestPath(packageRoot, content.path);
+        await copyReleaseContent(source, destination, content);
+      }
       const stagedManifest = join(metadataDirectory, "build-manifest.json");
-      await copyFile(sourceBinary, stagedBinary);
       await writeFile(stagedManifest, `${JSON.stringify(buildManifest, null, 2)}\n`);
-      await chmod(stagedBinary, 0o755);
       await chmod(stagedManifest, 0o644);
-      await utimes(stagedBinary, EPOCH, EPOCH);
       await utimes(stagedManifest, EPOCH, EPOCH);
+      await normalizeReleaseDirectories(packageRoot);
 
       const archivePath = join(outputRoot, planned.fileName);
       await rm(archivePath, { force: true });
       await createArchive({
         archive: planned.archive,
         archivePath,
-        binaryName,
+        entries: [...buildManifest.contents.map(({ path }) => path), "metadata/build-manifest.json"],
         cwd: packageRoot,
       });
       const metadata = await stat(archivePath);
@@ -167,7 +167,7 @@ export function checksumFileContents(entries) {
       names.add(entry.fileName);
       return { fileName: entry.fileName, sha256: entry.sha256 };
     })
-    .sort((left, right) => left.fileName.localeCompare(right.fileName));
+    .sort((left, right) => compareCanonicalText(left.fileName, right.fileName));
   return `${normalized.map((entry) => `${entry.sha256} *${entry.fileName}`).join("\n")}\n`;
 }
 
@@ -263,10 +263,9 @@ export function createSignedUpdateManifest({
   };
 }
 
-async function createArchive({ archive, archivePath, binaryName, cwd }) {
-  const entries = [`bin/${binaryName}`, "metadata/build-manifest.json"];
+async function createArchive({ archive, archivePath, entries, cwd }) {
   if (archive === "zip") {
-    await run("zip", ["-X", "-q", archivePath, ...entries], cwd);
+    await run("zip", ["-X", "-q", "-r", archivePath, ...entries], cwd);
     return;
   }
   if (process.platform !== "linux") {
@@ -296,6 +295,125 @@ async function createArchive({ archive, archivePath, binaryName, cwd }) {
   );
 }
 
+async function assertNoUnexpectedBuildEntries(buildDirectory, manifest) {
+  const { contents } = manifest;
+  const exactFiles = new Set([
+    "build-manifest.json",
+    ...contents.filter(({ kind }) => kind === "file").map(({ path }) => path),
+  ]);
+  const directoryRoots = contents
+    .filter(({ kind }) => kind === "directory")
+    .map(({ path }) => path);
+  const permittedParents = new Set();
+  for (const path of [...exactFiles, ...directoryRoots]) {
+    const segments = path.split("/");
+    for (let index = 1; index < segments.length; index += 1) {
+      permittedParents.add(segments.slice(0, index).join("/"));
+    }
+  }
+
+  const actualFiles = [];
+  await walkBuildEntries(buildDirectory, "", ({ path, metadata }) => {
+    if (metadata.isSymbolicLink() || (!metadata.isFile() && !metadata.isDirectory())) {
+      throw new Error("RELEASE_BUILD_CONTENT_INVALID");
+    }
+    const insideDirectory = directoryRoots.some(
+      (root) => path === root || path.startsWith(`${root}/`),
+    );
+    if (metadata.isDirectory()) {
+      if (!insideDirectory && !permittedParents.has(path)) {
+        throw new Error("RELEASE_BUILD_CONTENT_UNEXPECTED");
+      }
+    } else {
+      if (!insideDirectory && !exactFiles.has(path)) {
+        throw new Error("RELEASE_BUILD_CONTENT_UNEXPECTED");
+      }
+      if (path !== "build-manifest.json") {
+        actualFiles.push(path);
+      }
+    }
+  });
+  actualFiles.sort(compareCanonicalText);
+  if (JSON.stringify(actualFiles) !== JSON.stringify(manifest.files)) {
+    throw new Error("RELEASE_BUILD_CONTENT_UNEXPECTED");
+  }
+}
+
+async function walkBuildEntries(directory, prefix, visitor) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  entries.sort((left, right) => compareCanonicalText(left.name, right.name));
+  for (const entry of entries) {
+    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const filesystemPath = join(directory, entry.name);
+    const metadata = await lstat(filesystemPath);
+    visitor({ path, metadata });
+    if (metadata.isDirectory()) {
+      await walkBuildEntries(filesystemPath, path, visitor);
+    }
+  }
+}
+
+function manifestPath(root, relativePath) {
+  return join(root, ...relativePath.split("/"));
+}
+
+async function copyReleaseContent(source, destination, content) {
+  const metadata = await lstat(source);
+  if (content.kind === "file") {
+    if (!metadata.isFile()) {
+      throw new Error("RELEASE_BUILD_CONTENT_INVALID");
+    }
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(source, destination);
+    await chmod(destination, content.executable ? 0o755 : 0o644);
+    await utimes(destination, EPOCH, EPOCH);
+    return;
+  }
+  if (!metadata.isDirectory()) {
+    throw new Error("RELEASE_BUILD_CONTENT_INVALID");
+  }
+  await copyReleaseTree(source, destination);
+}
+
+async function copyReleaseTree(source, destination) {
+  await mkdir(destination, { recursive: true });
+  const entries = await readdir(source, { withFileTypes: true });
+  entries.sort((left, right) => compareCanonicalText(left.name, right.name));
+  if (entries.length === 0) {
+    throw new Error("RELEASE_BUILD_CONTENT_EMPTY");
+  }
+  for (const entry of entries) {
+    const sourcePath = join(source, entry.name);
+    const destinationPath = join(destination, entry.name);
+    const metadata = await lstat(sourcePath);
+    if (metadata.isSymbolicLink() || (!metadata.isFile() && !metadata.isDirectory())) {
+      throw new Error("RELEASE_BUILD_CONTENT_INVALID");
+    }
+    if (metadata.isDirectory()) {
+      await copyReleaseTree(sourcePath, destinationPath);
+    } else {
+      await copyFile(sourcePath, destinationPath);
+      await chmod(destinationPath, 0o644);
+      await utimes(destinationPath, EPOCH, EPOCH);
+    }
+  }
+  await chmod(destination, 0o755);
+  await utimes(destination, EPOCH, EPOCH);
+}
+
+async function normalizeReleaseDirectories(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const path = join(directory, entry.name);
+    await normalizeReleaseDirectories(path);
+    await chmod(path, 0o755);
+    await utimes(path, EPOCH, EPOCH);
+  }
+}
+
 async function readBuildManifest(path, planned, version) {
   let manifest;
   try {
@@ -303,17 +421,48 @@ async function readBuildManifest(path, planned, version) {
   } catch {
     throw new Error("RELEASE_BUILD_MANIFEST_INVALID");
   }
+  const expectedContents = releaseComposition(planned.component, planned.target);
   if (
-    manifest?.schemaVersion !== 1 ||
+    manifest?.schemaVersion !== 2 ||
     manifest.component !== planned.component ||
     manifest.target !== planned.target ||
     manifest.version !== version ||
     manifest.releaseAsset?.archive !== planned.archive ||
-    manifest.releaseAsset?.fileName !== planned.fileName
+    manifest.releaseAsset?.fileName !== planned.fileName ||
+    JSON.stringify(manifest.contents) !== JSON.stringify(expectedContents) ||
+    !isCanonicalBuildFileList(manifest.files, expectedContents)
   ) {
     throw new Error("RELEASE_BUILD_MANIFEST_INVALID");
   }
   return manifest;
+}
+
+function isCanonicalBuildFileList(files, contents) {
+  if (!Array.isArray(files) || files.length === 0) {
+    return false;
+  }
+  const sorted = [...files].sort(compareCanonicalText);
+  if (JSON.stringify(files) !== JSON.stringify(sorted) || new Set(files).size !== files.length) {
+    return false;
+  }
+  const validPath = (path) =>
+    typeof path === "string" &&
+    path.length > 0 &&
+    !path.includes("\\") &&
+    !path.includes("\0") &&
+    path.split("/").every((segment) => segment && segment !== "." && segment !== "..");
+  if (!files.every(validPath)) {
+    return false;
+  }
+  return contents.every((content) =>
+    content.kind === "file"
+      ? files.includes(content.path)
+      : files.some((path) => path.startsWith(`${content.path}/`)),
+  ) && files.every((path) =>
+    contents.some((content) =>
+      content.kind === "file" ? path === content.path : path.startsWith(`${content.path}/`),
+    ),
+  );
 }
 
 async function readReleaseIndex(outputRoot) {
@@ -452,17 +601,14 @@ function isHttpsUrl(value) {
   }
 }
 
-function assertBinaryName(value) {
-  if (typeof value !== "string" || value !== basename(value) || !value || value.includes("\0")) {
-    throw new Error("RELEASE_BUILD_BINARY_INVALID");
-  }
-  return value;
-}
-
 function assertVersion(value) {
   if (!SEMVER.test(value)) {
     throw new Error("RELEASE_MANIFEST_VERSION_INVALID");
   }
+}
+
+function compareCanonicalText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isSafeArtifactFileName(value) {

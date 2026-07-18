@@ -1,6 +1,7 @@
 import {
   ApiErrorSchema,
   AprsOutboxEntryListSchema,
+  AprsRuntimeStatusSchema,
   BuildMetadataSchema,
   CallMeshOverviewSchema,
   JobAcceptedSchema,
@@ -8,6 +9,7 @@ import {
   MeshMessageListSchema,
   MeshNodeListSchema,
   MeshTelemetryListSchema,
+  MeshtasticRuntimeStatusSchema,
   PositionCanonicalEventListSchema,
   ProxyStatusSchema,
   SystemCapabilitiesSchema,
@@ -17,11 +19,13 @@ import {
   type CallMeshOverview,
   type ApiError,
   type AprsOutboxEntryList,
+  type AprsRuntimeStatus,
   type JobAccepted,
   type JobDetail,
   type MeshMessageList,
   type MeshNodeList,
   type MeshTelemetryList,
+  type MeshtasticRuntimeStatus,
   type PositionCanonicalEventList,
   type ProxyStatus,
   type SystemCapabilities,
@@ -48,6 +52,15 @@ export interface GatewayApiClientOptions {
   baseUrl?: string;
   fetch?: typeof fetch;
   traceIdFactory?: () => string;
+}
+
+export interface TelemetryRangeQuery {
+  limit?: number;
+  meshNetworkId?: string;
+  nodeNum?: number;
+  metricKind?: string;
+  from?: string;
+  to?: string;
 }
 
 export interface GatewayApiErrorOptions {
@@ -173,8 +186,11 @@ export class GatewayApiClient {
     nodes: () => this.request<MeshNodeList>("/nodes", MeshNodeListSchema),
     messages: () =>
       this.request<MeshMessageList>("/messages", MeshMessageListSchema),
-    telemetry: () =>
-      this.request<MeshTelemetryList>("/telemetry", MeshTelemetryListSchema),
+    telemetry: (query: TelemetryRangeQuery = {}) =>
+      this.request<MeshTelemetryList>(
+        telemetryPath(query),
+        MeshTelemetryListSchema,
+      ),
     positions: () =>
       this.request<PositionCanonicalEventList>(
         "/positions",
@@ -183,10 +199,20 @@ export class GatewayApiClient {
   };
 
   readonly aprs = {
+    status: () =>
+      this.request<AprsRuntimeStatus>("/aprs", AprsRuntimeStatusSchema),
     outbox: () =>
       this.request<AprsOutboxEntryList>(
         "/aprs/outbox",
         AprsOutboxEntryListSchema,
+      ),
+  };
+
+  readonly meshtastic = {
+    status: () =>
+      this.request<MeshtasticRuntimeStatus>(
+        "/meshtastic",
+        MeshtasticRuntimeStatusSchema,
       ),
   };
 
@@ -258,6 +284,40 @@ export class GatewayApiClient {
   }
 }
 
+function telemetryPath(query: TelemetryRangeQuery): string {
+  const fromTime =
+    query.from === undefined ? undefined : Date.parse(query.from);
+  const toTime = query.to === undefined ? undefined : Date.parse(query.to);
+  if (
+    (query.limit !== undefined &&
+      (!Number.isInteger(query.limit) ||
+        query.limit < 1 ||
+        query.limit > 200)) ||
+    (query.nodeNum !== undefined &&
+      (query.meshNetworkId === undefined ||
+        !Number.isInteger(query.nodeNum) ||
+        query.nodeNum < 0 ||
+        query.nodeNum > 4_294_967_295)) ||
+    (fromTime !== undefined && !Number.isFinite(fromTime)) ||
+    (toTime !== undefined && !Number.isFinite(toTime)) ||
+    (fromTime !== undefined && toTime !== undefined && fromTime > toTime)
+  ) {
+    throw new GatewayApiError({ code: "CLIENT_INPUT_INVALID" });
+  }
+  const parameters = new URLSearchParams();
+  for (const [name, value] of Object.entries(query)) {
+    if (value !== undefined) {
+      const normalized =
+        name === "from" || name === "to"
+          ? new Date(String(value)).toISOString()
+          : String(value);
+      parameters.set(name, normalized);
+    }
+  }
+  const encoded = parameters.toString();
+  return encoded ? `/telemetry?${encoded}` : "/telemetry";
+}
+
 export type GatewaySystemApi = {
   health: () => Promise<SystemHealth>;
   version: () => Promise<BuildMetadata>;
@@ -267,6 +327,10 @@ export type GatewaySystemApi = {
 
 export type GatewayProxyApi = {
   status: () => Promise<ProxyStatus>;
+};
+
+export type GatewayMeshtasticApi = {
+  status: () => Promise<MeshtasticRuntimeStatus>;
 };
 
 async function readJson(response: Response): Promise<unknown> {

@@ -131,6 +131,28 @@ export const AprsOutboxEntryListSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const APRS_MONITOR_STATUSES = [
+  "stopped",
+  "idle",
+  "connecting",
+  "connected",
+  "error",
+] as const;
+export const AprsRuntimeStatusSchema = Type.Object(
+  {
+    configured: Type.Boolean(),
+    running: Type.Boolean(),
+    monitorStatus: Type.Union(
+      APRS_MONITOR_STATUSES.map((status) => Type.Literal(status)),
+    ),
+    mappedCallsigns: Type.Integer({ minimum: 0 }),
+    pendingOutbox: Type.Integer({ minimum: 0 }),
+    failedOutbox: Type.Integer({ minimum: 0 }),
+    lastErrorCode: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  },
+  { additionalProperties: false },
+);
+
 export const PositionDecisionCodeSchema = Type.Union(
   POSITION_DECISION_CODES.map((code) => Type.Literal(code)),
 );
@@ -193,5 +215,7 @@ export type PositionCanonicalEventList = Static<
 >;
 export type AprsOutboxEntry = Static<typeof AprsOutboxEntrySchema>;
 export type AprsOutboxEntryList = Static<typeof AprsOutboxEntryListSchema>;
+export type AprsMonitorStatus = (typeof APRS_MONITOR_STATUSES)[number];
+export type AprsRuntimeStatus = Static<typeof AprsRuntimeStatusSchema>;
 export type PositionDecision = Static<typeof PositionDecisionSchema>;
 export type NodePositionState = Static<typeof NodePositionStateSchema>;

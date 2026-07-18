@@ -106,6 +106,16 @@ export const MeshObservationSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+export const MeshtasticRuntimeStatusSchema = Type.Object(
+  {
+    configured: Type.Boolean(),
+    meshNetworkId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    gatewayId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    connection: Type.Optional(TransportConnectionStateSchema),
+    metrics: Type.Optional(TransportMetricsSchema),
+  },
+  { additionalProperties: false },
+);
 
 export type TransportKind = (typeof TRANSPORT_KINDS)[number];
 export type ConnectionStatus = (typeof CONNECTION_STATUSES)[number];
@@ -118,3 +128,6 @@ export type SerialDevice = Static<typeof SerialDeviceSchema>;
 export type NormalizedMeshPacket = Static<typeof NormalizedMeshPacketSchema>;
 export type NormalizedFromRadio = Static<typeof NormalizedFromRadioSchema>;
 export type MeshObservation = Static<typeof MeshObservationSchema>;
+export type MeshtasticRuntimeStatus = Static<
+  typeof MeshtasticRuntimeStatusSchema
+>;

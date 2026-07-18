@@ -10,7 +10,11 @@ use serde::Serialize;
 use std::{fs, path::PathBuf, process::ExitCode};
 
 #[derive(Debug, Parser)]
-#[command(name = "cmclient-migrate", about = "CMClient Legacy migration tool")]
+#[command(
+    name = "cmclient-migrate",
+    version,
+    about = "CMClient Legacy migration tool"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

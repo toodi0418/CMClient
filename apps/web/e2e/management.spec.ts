@@ -129,6 +129,127 @@ test("proxy runtime status remains legible across desktop and mobile", async ({
   await expectNoHorizontalOverflow(page);
 });
 
+test("Meshtastic and APRS runtime projections remain operable on mobile", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/meshtastic");
+
+  const workspace = page.locator("main");
+  await expect(
+    workspace.getByRole("heading", { name: "Radio runtime" }),
+  ).toBeVisible();
+  await expect(workspace.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(workspace.getByText("mesh-e2e", { exact: true })).toBeVisible();
+  await expect(workspace.getByText("12 / 4", { exact: true })).toBeVisible();
+
+  await page.getByRole("link", { name: "APRS" }).click();
+  await expect(
+    workspace.getByRole("heading", { name: "APRS-IS runtime" }),
+  ).toBeVisible();
+  await expect(workspace.getByText("Connected", { exact: true })).toBeVisible();
+  await expect(workspace.getByText("N0CALL-7", { exact: true })).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectNoHorizontalOverflow(page);
+});
+
+test("offline positions and telemetry render real visual layers without overflow", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/positions");
+
+  const map = page.getByRole("application", { name: "Coordinates" });
+  await expect(map).toBeVisible();
+  await expect(map.locator(".offline-map-tile")).not.toHaveCount(0);
+  await expect(map.locator(".leaflet-interactive")).toHaveCount(3);
+
+  await page.getByRole("link", { name: "Telemetry" }).click();
+  const chart = page.locator(".telemetry-chart");
+  const canvas = chart.locator("canvas");
+  await expect(chart).toBeVisible();
+  await expect(canvas).toHaveCount(1);
+  await expect
+    .poll(() =>
+      canvas.evaluate((canvas: HTMLCanvasElement) => {
+        const context = canvas.getContext("2d");
+        if (!context || canvas.width === 0 || canvas.height === 0) return 0;
+        const pixels = context.getImageData(
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        ).data;
+        let painted = 0;
+        for (let index = 3; index < pixels.length; index += 64) {
+          if (pixels[index] !== 0) painted += 1;
+        }
+        return painted;
+      }),
+    )
+    .toBeGreaterThan(20);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(chart).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+});
+
+test("domain SSE events trigger a coalesced telemetry projection refresh", async ({
+  page,
+}) => {
+  let telemetryRequests = 0;
+  let sentEvent = false;
+  await page.unroute("**/api/v1/telemetry");
+  await page.unroute("**/api/v1/events");
+  await page.route("**/api/v1/telemetry", (route) => {
+    telemetryRequests += 1;
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: telemetryFixture(telemetryRequests === 1 ? 3.8 : 4.2),
+      }),
+    });
+  });
+  await page.route("**/api/v1/events", async (route) => {
+    if (!sentEvent) {
+      sentEvent = true;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const event = {
+        eventId: "telemetry-e2e",
+        schemaVersion: 1,
+        type: "telemetry.received",
+        occurredAt: "2026-07-18T00:01:00.000Z",
+        source: "gateway",
+        payload: { nodeNum: 42 },
+      };
+      return route.fulfill({
+        contentType: "text/event-stream",
+        body: `id: ${event.eventId}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+      });
+    }
+    return route.fulfill({
+      contentType: "text/event-stream",
+      body: ": heartbeat\n\n",
+    });
+  });
+
+  await page.goto("/telemetry");
+  await expect.poll(() => telemetryRequests).toBeGreaterThanOrEqual(2);
+  await expect(page.locator(".telemetry-chart canvas")).toBeVisible();
+  await expect(page.getByRole("img", { name: /4\.2/ })).toBeVisible();
+});
+
+test("remote dispatch stays visibly fail-closed behind its capability", async ({
+  page,
+}) => {
+  await page.goto("/remote-dispatch");
+  await expect(
+    page.getByRole("heading", { name: "Dispatch service status" }),
+  ).toBeVisible();
+  await expect(page.getByText("REMOTE_DISPATCH_NOT_ENABLED")).toBeVisible();
+});
+
 test("LAN management login unlocks protected commands with the CSRF token", async ({
   page,
 }) => {
@@ -249,6 +370,10 @@ async function mockGateway(page: Page): Promise<void> {
             reasonCode: "CAPABILITY_OWNED_BY_AGENT",
           },
           docker: { available: true },
+          remoteDispatch: {
+            available: false,
+            reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
+          },
         },
       }),
     }),
@@ -257,6 +382,24 @@ async function mockGateway(page: Page): Promise<void> {
     route.fulfill({
       contentType: "text/event-stream",
       body: ": heartbeat\n\n",
+    }),
+  );
+  await page.route("**/api/v1/nodes", (route) =>
+    route.fulfill({ contentType: "application/json", body: '{"items":[]}' }),
+  );
+  await page.route("**/api/v1/messages", (route) =>
+    route.fulfill({ contentType: "application/json", body: '{"items":[]}' }),
+  );
+  await page.route("**/api/v1/positions", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ items: positionFixtures() }),
+    }),
+  );
+  await page.route("**/api/v1/telemetry", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ items: telemetryFixture(3.9) }),
     }),
   );
   await page.route("**/api/v1/proxy", (route) =>
@@ -311,6 +454,110 @@ async function mockGateway(page: Page): Promise<void> {
       }),
     }),
   );
+  await page.route("**/api/v1/meshtastic", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        configured: true,
+        meshNetworkId: "mesh-e2e",
+        gatewayId: "gateway-e2e",
+        connection: {
+          transport: "serial",
+          status: "ready",
+          changedAt: "2026-07-18T00:00:00.000Z",
+        },
+        metrics: {
+          bytesReceived: 1024,
+          bytesSent: 256,
+          framesReceived: 12,
+          framesSent: 4,
+          malformedFrames: 0,
+          reconnects: 1,
+        },
+      }),
+    }),
+  );
+  await page.route("**/api/v1/aprs", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        configured: true,
+        running: true,
+        monitorStatus: "connected",
+        mappedCallsigns: 1,
+        pendingOutbox: 1,
+        failedOutbox: 0,
+      }),
+    }),
+  );
+  await page.route("**/api/v1/aprs/outbox", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [
+          {
+            id: "outbox-e2e",
+            callsign: "N0CALL-7",
+            canonicalEventId: "position-e2e",
+            status: "queued",
+            attempts: 0,
+            nextAttemptAt: "2026-07-18T00:00:00.000Z",
+            createdAt: "2026-07-18T00:00:00.000Z",
+            updatedAt: "2026-07-18T00:00:00.000Z",
+          },
+        ],
+      }),
+    }),
+  );
+}
+
+function positionFixtures() {
+  return [
+    [42, 25.0478, 121.5319],
+    [43, 24.1477, 120.6736],
+    [44, 22.6273, 120.3014],
+  ].map(([nodeNum, latitude, longitude], index) => ({
+    schemaVersion: 1,
+    id: `position-${index}`,
+    canonicalKey: `fixture-${index}`,
+    meshNetworkId: "mesh-e2e",
+    nodeNum,
+    sourceObservationId: `observation-${index}`,
+    payloadHash: String(index).padStart(64, "0"),
+    eventTime: `2026-07-18T00:0${index}:00.000Z`,
+    eventTimeSource: "position_timestamp",
+    position: {
+      latitudeI: Math.round(Number(latitude) * 10_000_000),
+      longitudeI: Math.round(Number(longitude) * 10_000_000),
+      precisionBits: 32,
+    },
+    createdAt: `2026-07-18T00:0${index}:01.000Z`,
+  }));
+}
+
+function telemetryFixture(voltage: number) {
+  return [
+    {
+      schemaVersion: 1,
+      id: `telemetry-${voltage}`,
+      observationId: `observation-${voltage}`,
+      meshNetworkId: "mesh-e2e",
+      nodeNum: 42,
+      metricKind: "deviceMetrics",
+      metrics: { voltage, batteryLevel: 78 },
+      observedAt: "2026-07-18T00:00:00.000Z",
+    },
+    {
+      schemaVersion: 1,
+      id: "telemetry-environment",
+      observationId: "observation-environment",
+      meshNetworkId: "mesh-e2e",
+      nodeNum: 43,
+      metricKind: "environmentMetrics",
+      metrics: { temperature: 27.5, relativeHumidity: 68 },
+      observedAt: "2026-07-18T00:01:00.000Z",
+    },
+  ];
 }
 
 async function expectNoHorizontalOverflow(page: Page): Promise<void> {

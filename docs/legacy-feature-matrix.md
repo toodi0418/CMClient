@@ -75,4 +75,7 @@ P11 must use this matrix and `docs/legacy-inventory.md` to distinguish
 intentional removal from an accidental regression. A retained capability needs
 an implementation and test in the new architecture; a replaced implementation
 must not remain reachable; a removed feature must have no code, environment
-variable, schema, UI, test, or documentation compatibility path.
+variable, schema, UI, test, or documentation compatibility path. The retained
+implementation and per-surface evidence is recorded in
+[Retained Feature Parity Audit](./testing/feature-parity.md). Repository-wide
+removal proof remains the separate P11-T04 gate.

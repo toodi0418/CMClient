@@ -481,6 +481,110 @@ export class MeshTelemetryRepository {
       .all(limit)
       .map((row) => toMeshTelemetry(row as Record<string, unknown>));
   }
+
+  query(input: MeshTelemetryRangeQuery): MeshTelemetry[] {
+    if (!validTelemetryRangeQuery(input)) {
+      throw new MeshDomainPersistenceError();
+    }
+    const clauses: string[] = [];
+    const parameters: Array<string | number> = [];
+    const from = canonicalTimestamp(input.from);
+    const to = canonicalTimestamp(input.to);
+    if (input.meshNetworkId !== undefined) {
+      clauses.push("mesh_network_id = ?");
+      parameters.push(input.meshNetworkId);
+    }
+    if (input.nodeNum !== undefined) {
+      clauses.push("node_num = ?");
+      parameters.push(input.nodeNum);
+    }
+    if (input.metricKind !== undefined) {
+      clauses.push("metric_kind = ?");
+      parameters.push(input.metricKind);
+    }
+    if (from !== undefined) {
+      clauses.push("observed_at >= ?");
+      parameters.push(from);
+    }
+    if (to !== undefined) {
+      clauses.push("observed_at <= ?");
+      parameters.push(to);
+    }
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    return this.database
+      .prepare(
+        `SELECT * FROM telemetry${where} ORDER BY observed_at DESC, id ASC LIMIT ?`,
+      )
+      .all(...parameters, input.limit)
+      .map((row) => toMeshTelemetry(row as Record<string, unknown>));
+  }
+
+  deleteBefore(cutoffExclusive: string, limit = 1_000): number {
+    const cutoff = canonicalTimestamp(cutoffExclusive);
+    if (
+      cutoff === undefined ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 10_000
+    ) {
+      throw new MeshDomainPersistenceError();
+    }
+    try {
+      const result = this.database
+        .prepare(
+          "DELETE FROM telemetry WHERE id IN (SELECT id FROM telemetry WHERE observed_at < ? ORDER BY observed_at ASC, id ASC LIMIT ?)",
+        )
+        .run(cutoff, limit);
+      return Number(result.changes);
+    } catch {
+      throw new MeshDomainPersistenceError();
+    }
+  }
+}
+
+export interface MeshTelemetryRangeQuery {
+  limit: number;
+  meshNetworkId?: string;
+  nodeNum?: number;
+  metricKind?: string;
+  from?: string;
+  to?: string;
+}
+
+function validTelemetryRangeQuery(input: MeshTelemetryRangeQuery): boolean {
+  const validTimestamp = (value: string | undefined) =>
+    value === undefined ||
+    (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) &&
+      Number.isFinite(Date.parse(value)));
+  return (
+    Number.isInteger(input.limit) &&
+    input.limit >= 1 &&
+    input.limit <= 200 &&
+    (input.meshNetworkId === undefined ||
+      (input.meshNetworkId.length >= 1 && input.meshNetworkId.length <= 128)) &&
+    (input.nodeNum === undefined ||
+      (input.meshNetworkId !== undefined &&
+        Number.isInteger(input.nodeNum) &&
+        input.nodeNum >= 0 &&
+        input.nodeNum <= 4_294_967_295)) &&
+    (input.metricKind === undefined ||
+      (input.metricKind.length >= 1 && input.metricKind.length <= 64)) &&
+    validTimestamp(input.from) &&
+    validTimestamp(input.to) &&
+    (input.from === undefined ||
+      input.to === undefined ||
+      Date.parse(input.from) <= Date.parse(input.to))
+  );
+}
+
+function canonicalTimestamp(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp).toISOString()
+    : undefined;
 }
 
 function toStoredJob(row: Record<string, unknown>): StoredJob {
@@ -839,6 +943,15 @@ const defaultMigrations: Migration[] = [
       );
       database.exec(
         "CREATE INDEX callmesh_mappings_target_index ON callmesh_mappings (mesh_network_id, node_num, effective_at DESC)",
+      );
+    },
+  },
+  {
+    version: 9,
+    name: "telemetry_range_query_index",
+    up(database) {
+      database.exec(
+        "CREATE INDEX telemetry_metric_observed_at_index ON telemetry (metric_kind, observed_at DESC)",
       );
     },
   },

@@ -7,13 +7,16 @@ import { Type } from "@sinclair/typebox";
 import {
   ApiErrorSchema,
   AprsOutboxEntryListSchema,
+  AprsRuntimeStatusSchema,
   BuildMetadataSchema,
   CallMeshOverviewSchema,
+  DomainEventListSchema,
   JobAcceptedSchema,
   JobDetailSchema,
   MeshMessageListSchema,
   MeshNodeListSchema,
   MeshTelemetryListSchema,
+  MeshtasticRuntimeStatusSchema,
   PositionCanonicalEventListSchema,
   ProxyStatusSchema,
   SystemCapabilitiesSchema,
@@ -21,12 +24,14 @@ import {
   SystemStatusSchema,
   type DomainEvent,
   type AprsOutboxEntry,
+  type AprsRuntimeStatus,
   type CallMeshOverview,
   type JobAccepted,
   type JobDetail,
   type MeshMessage,
   type MeshNode,
   type MeshTelemetry,
+  type MeshtasticRuntimeStatus,
   type PositionCanonicalEvent,
   type ProxyStatus,
 } from "@cmclient/contracts";
@@ -56,14 +61,28 @@ export interface GatewayJobApi {
     correlationId?: string,
     idempotencyKey?: string,
   ): { created: boolean; job: JobDetail };
+  submitBackup?(
+    correlationId?: string,
+    idempotencyKey?: string,
+  ): { created: boolean; job: JobDetail };
 }
 
 export interface GatewayDomainReadApi {
   listNodes(limit: number): MeshNode[];
   listMessages(limit: number): MeshMessage[];
   listTelemetry(limit: number): MeshTelemetry[];
+  queryTelemetry?(query: GatewayTelemetryRangeQuery): MeshTelemetry[];
   listPositions(limit: number): PositionCanonicalEvent[];
   listAprsOutbox(limit: number): AprsOutboxEntry[];
+}
+
+export interface GatewayTelemetryRangeQuery {
+  limit: number;
+  meshNetworkId?: string;
+  nodeNum?: number;
+  metricKind?: string;
+  from?: string;
+  to?: string;
 }
 
 export interface GatewayCallMeshReadApi {
@@ -72,6 +91,14 @@ export interface GatewayCallMeshReadApi {
 
 export interface GatewayProxyReadApi {
   status(): ProxyStatus;
+}
+
+export interface GatewayMeshtasticReadApi {
+  status(): MeshtasticRuntimeStatus;
+}
+
+export interface GatewayAprsReadApi {
+  status(): AprsRuntimeStatus;
 }
 
 declare module "fastify" {
@@ -100,6 +127,14 @@ interface JobIdParams {
 
 interface ListQuery {
   limit?: number;
+}
+
+interface TelemetryQuery extends ListQuery {
+  meshNetworkId?: string;
+  nodeNum?: number;
+  metricKind?: string;
+  from?: string;
+  to?: string;
 }
 
 interface IdempotencyHeaders {
@@ -151,6 +186,8 @@ export class GatewayRuntime {
     domain?: GatewayDomainReadApi,
     callmesh?: GatewayCallMeshReadApi,
     proxy?: GatewayProxyReadApi,
+    meshtastic?: GatewayMeshtasticReadApi,
+    aprs?: GatewayAprsReadApi,
   ) {
     this.options = options;
     this.app = createGatewayApp(
@@ -162,6 +199,8 @@ export class GatewayRuntime {
       domain,
       callmesh,
       proxy,
+      meshtastic,
+      aprs,
     );
   }
 
@@ -200,6 +239,8 @@ export function createGatewayApp(
   domain?: GatewayDomainReadApi,
   callmesh?: GatewayCallMeshReadApi,
   proxy?: GatewayProxyReadApi,
+  meshtastic?: GatewayMeshtasticReadApi,
+  aprs?: GatewayAprsReadApi,
 ): FastifyInstance {
   const heartbeatIntervalMs = sseOptions.heartbeatIntervalMs ?? 15_000;
   if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
@@ -235,6 +276,32 @@ export function createGatewayApp(
     });
     done();
   });
+  app.get(
+    "/api/v1/aprs",
+    {
+      schema: {
+        response: { 200: AprsRuntimeStatusSchema },
+      },
+    },
+    () =>
+      aprs?.status() ?? {
+        configured: false,
+        running: false,
+        monitorStatus: "stopped",
+        mappedCallsigns: 0,
+        pendingOutbox: 0,
+        failedOutbox: 0,
+      },
+  );
+  app.get(
+    "/api/v1/meshtastic",
+    {
+      schema: {
+        response: { 200: MeshtasticRuntimeStatusSchema },
+      },
+    },
+    () => meshtastic?.status() ?? { configured: false },
+  );
   app.get(
     "/api/v1/system/health",
     {
@@ -332,18 +399,34 @@ export function createGatewayApp(
         ? { items: domain.listMessages(resolveListLimit(request.query.limit)) }
         : sendDomainDataUnavailable(request, reply),
   );
-  app.get<{ Querystring: ListQuery }>(
+  app.get<{ Querystring: TelemetryQuery }>(
     "/api/v1/telemetry",
     {
       schema: {
-        querystring: listQuerySchema(),
-        response: { 200: MeshTelemetryListSchema, 503: ApiErrorSchema },
+        querystring: telemetryQuerySchema(),
+        response: {
+          200: MeshTelemetryListSchema,
+          400: ApiErrorSchema,
+          503: ApiErrorSchema,
+        },
       },
     },
-    (request, reply) =>
-      domain
-        ? { items: domain.listTelemetry(resolveListLimit(request.query.limit)) }
-        : sendDomainDataUnavailable(request, reply),
+    (request, reply) => {
+      if (!domain) {
+        return sendDomainDataUnavailable(request, reply);
+      }
+      const query = resolveTelemetryQuery(request.query);
+      if (!query) {
+        return sendTelemetryRangeInvalid(request, reply);
+      }
+      if (domain.queryTelemetry) {
+        return { items: domain.queryTelemetry(query) };
+      }
+      if (hasTelemetryRangeFilter(request.query)) {
+        return sendDomainDataUnavailable(request, reply);
+      }
+      return { items: domain.listTelemetry(query.limit) };
+    },
   );
   app.get<{ Querystring: ListQuery }>(
     "/api/v1/positions",
@@ -364,6 +447,18 @@ export function createGatewayApp(
   app.get("/api/v1/events", (request, reply) => {
     openSseStream(request, reply, eventBus, logger, heartbeatIntervalMs);
   });
+  app.get<{ Querystring: ListQuery }>(
+    "/api/v1/events/recent",
+    {
+      schema: {
+        querystring: listQuerySchema(),
+        response: { 200: DomainEventListSchema },
+      },
+    },
+    (request) => ({
+      items: eventBus.recent(resolveListLimit(request.query.limit)),
+    }),
+  );
   app.post<{ Headers: IdempotencyHeaders }>(
     "/api/v1/diagnostics/integrity-check",
     {
@@ -391,6 +486,34 @@ export function createGatewayApp(
         reused: !submitted.created,
       };
       return reply.code(202).send(accepted);
+    },
+  );
+  app.post<{ Headers: IdempotencyHeaders }>(
+    "/api/v1/backups",
+    {
+      schema: {
+        response: { 202: JobAcceptedSchema, 503: ApiErrorSchema },
+      },
+    },
+    (request, reply) => {
+      if (!jobs?.submitBackup) {
+        return sendJobEngineUnavailable(request, reply);
+      }
+      const idempotencyKey = request.headers["idempotency-key"];
+      if (
+        idempotencyKey !== undefined &&
+        !/^[a-zA-Z0-9._:-]{1,128}$/.test(idempotencyKey)
+      ) {
+        return sendJobInputInvalid(request, reply);
+      }
+      const submitted = jobs.submitBackup(
+        request.correlationId,
+        idempotencyKey,
+      );
+      return reply.code(202).send({
+        jobId: submitted.job.id,
+        reused: !submitted.created,
+      } satisfies JobAccepted);
     },
   );
   app.get<{ Params: JobIdParams }>(
@@ -482,6 +605,65 @@ function listQuerySchema() {
   });
 }
 
+function telemetryQuerySchema() {
+  const timestamp = Type.String({
+    pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z$",
+  });
+  return Type.Object(
+    {
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+      meshNetworkId: Type.Optional(
+        Type.String({ minLength: 1, maxLength: 128 }),
+      ),
+      nodeNum: Type.Optional(
+        Type.Integer({ minimum: 0, maximum: 4_294_967_295 }),
+      ),
+      metricKind: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+      from: Type.Optional(timestamp),
+      to: Type.Optional(timestamp),
+    },
+    { additionalProperties: false },
+  );
+}
+
+function resolveTelemetryQuery(
+  query: TelemetryQuery,
+): GatewayTelemetryRangeQuery | undefined {
+  const fromTime =
+    query.from === undefined ? undefined : Date.parse(query.from);
+  const toTime = query.to === undefined ? undefined : Date.parse(query.to);
+  if (
+    (query.nodeNum !== undefined && query.meshNetworkId === undefined) ||
+    (fromTime !== undefined && !Number.isFinite(fromTime)) ||
+    (toTime !== undefined && !Number.isFinite(toTime)) ||
+    (fromTime !== undefined && toTime !== undefined && fromTime > toTime)
+  ) {
+    return undefined;
+  }
+  return {
+    limit: resolveListLimit(query.limit),
+    ...(query.meshNetworkId !== undefined
+      ? { meshNetworkId: query.meshNetworkId }
+      : {}),
+    ...(query.nodeNum !== undefined ? { nodeNum: query.nodeNum } : {}),
+    ...(query.metricKind !== undefined ? { metricKind: query.metricKind } : {}),
+    ...(fromTime !== undefined
+      ? { from: new Date(fromTime).toISOString() }
+      : {}),
+    ...(toTime !== undefined ? { to: new Date(toTime).toISOString() } : {}),
+  };
+}
+
+function hasTelemetryRangeFilter(query: TelemetryQuery): boolean {
+  return (
+    query.meshNetworkId !== undefined ||
+    query.nodeNum !== undefined ||
+    query.metricKind !== undefined ||
+    query.from !== undefined ||
+    query.to !== undefined
+  );
+}
+
 function resolveListLimit(limit: number | undefined): number {
   return limit ?? 100;
 }
@@ -519,6 +701,17 @@ function sendDomainDataUnavailable(
 ) {
   return reply.code(503).send({
     code: "GATEWAY_DOMAIN_DATA_UNAVAILABLE",
+    params: {},
+    traceId: request.traceId,
+  });
+}
+
+function sendTelemetryRangeInvalid(
+  request: FastifyRequest,
+  reply: FastifyReply,
+) {
+  return reply.code(400).send({
+    code: "TELEMETRY_RANGE_INVALID",
     params: {},
     traceId: request.traceId,
   });

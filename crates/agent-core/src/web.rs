@@ -3,7 +3,7 @@ use std::{
     collections::BTreeMap,
     io::{self, BufReader, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,6 +24,7 @@ pub struct ManagementWebConfig {
     pub gateway: SocketAddr,
     pub allow_lan: bool,
     pub tls: Option<ManagementTlsConfig>,
+    pub static_web_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,7 @@ impl Default for ManagementWebConfig {
             gateway: SocketAddr::from(([127, 0, 0, 1], 4810)),
             allow_lan: false,
             tls: None,
+            static_web_root: None,
         }
     }
 }
@@ -107,6 +109,7 @@ pub struct ManagementWebListener {
     gateway: SocketAddr,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     tls: Option<Arc<ServerConfig>>,
+    static_web_root: Option<PathBuf>,
 }
 
 pub struct ManagementWebService {
@@ -194,11 +197,23 @@ impl ManagementWebListener {
         let listener = TcpListener::bind(SocketAddr::new(config.bind, config.port))
             .map_err(|_| ManagementWebError::Io)?;
         let tls = config.tls.as_ref().map(load_tls_config).transpose()?;
+        let static_web_root = config
+            .static_web_root
+            .as_ref()
+            .map(|root| {
+                let root = std::fs::canonicalize(root).map_err(|_| ManagementWebError::Io)?;
+                if !root.is_dir() {
+                    return Err(ManagementWebError::Io);
+                }
+                Ok(root)
+            })
+            .transpose()?;
         Ok(Self {
             listener,
             gateway: config.gateway,
             api_handler,
             tls,
+            static_web_root,
         })
     }
 
@@ -215,8 +230,16 @@ impl ManagementWebListener {
             let gateway = self.gateway;
             let api_handler = self.api_handler.clone();
             let tls = self.tls.clone();
+            let static_web_root = self.static_web_root.clone();
             thread::spawn(move || {
-                let _ = serve_connection(stream, remote_addr, gateway, api_handler, tls);
+                let _ = serve_connection(
+                    stream,
+                    remote_addr,
+                    gateway,
+                    api_handler,
+                    tls,
+                    static_web_root,
+                );
             });
         }
     }
@@ -229,6 +252,7 @@ impl ManagementWebListener {
             self.gateway,
             self.api_handler.clone(),
             self.tls.clone(),
+            self.static_web_root.clone(),
         )
     }
 
@@ -242,8 +266,16 @@ impl ManagementWebListener {
                     let gateway = self.gateway;
                     let api_handler = self.api_handler.clone();
                     let tls = self.tls.clone();
+                    let static_web_root = self.static_web_root.clone();
                     thread::spawn(move || {
-                        let _ = serve_connection(stream, remote_addr, gateway, api_handler, tls);
+                        let _ = serve_connection(
+                            stream,
+                            remote_addr,
+                            gateway,
+                            api_handler,
+                            tls,
+                            static_web_root,
+                        );
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -284,6 +316,7 @@ fn serve_connection(
     gateway: SocketAddr,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     tls: Option<Arc<ServerConfig>>,
+    static_web_root: Option<PathBuf>,
 ) -> Result<(), ManagementWebError> {
     client
         .set_read_timeout(Some(GATEWAY_TIMEOUT))
@@ -295,9 +328,21 @@ fn serve_connection(
         let connection =
             ServerConnection::new(tls).map_err(|_| ManagementWebError::TlsConfiguration)?;
         let mut stream = StreamOwned::new(connection, client);
-        return serve_http_connection(&mut stream, remote_addr, gateway, api_handler);
+        return serve_http_connection(
+            &mut stream,
+            remote_addr,
+            gateway,
+            api_handler,
+            static_web_root.as_deref(),
+        );
     }
-    serve_http_connection(&mut client, remote_addr, gateway, api_handler)
+    serve_http_connection(
+        &mut client,
+        remote_addr,
+        gateway,
+        api_handler,
+        static_web_root.as_deref(),
+    )
 }
 
 fn serve_http_connection(
@@ -305,31 +350,213 @@ fn serve_http_connection(
     remote_addr: SocketAddr,
     gateway: SocketAddr,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
+    static_web_root: Option<&Path>,
 ) -> Result<(), ManagementWebError> {
-    let request = read_request(client)?;
-    let request_context = parse_request(&request, remote_addr)?;
+    let request = match read_request(client) {
+        Ok(request) => request,
+        Err(ManagementWebError::InvalidHttp) => {
+            return write_response(
+                client,
+                "400 Bad Request",
+                "application/json",
+                r#"{"code":"MANAGEMENT_WEB_HTTP_INVALID"}"#,
+            );
+        }
+        Err(ManagementWebError::RequestTooLarge) => {
+            return write_response(
+                client,
+                "413 Content Too Large",
+                "application/json",
+                r#"{"code":"MANAGEMENT_WEB_REQUEST_TOO_LARGE"}"#,
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    let request_context = match parse_request(&request, remote_addr) {
+        Ok(request) => request,
+        Err(ManagementWebError::InvalidHttp) => {
+            return write_response(
+                client,
+                "400 Bad Request",
+                "application/json",
+                r#"{"code":"MANAGEMENT_WEB_HTTP_INVALID"}"#,
+            );
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(api_handler) = api_handler
         && api_handler.handle(client, &request_context)?
     {
         return Ok(());
     }
+    let routed_path = request_path(&request_context.path);
+    if routed_path == "/api" || routed_path.starts_with("/api/") {
+        return proxy_api(client, gateway, &request);
+    }
+    if let Some(static_web_root) = static_web_root {
+        return serve_static_web(client, &request_context, static_web_root);
+    }
     match (
         request_context.method.as_str(),
-        request_context.path.as_str(),
+        request_path(&request_context.path),
     ) {
-        ("GET", "/") | ("GET", "/index.html") => write_response(
+        ("GET" | "HEAD", "/" | "/index.html") => write_bytes_response(
             client,
             "200 OK",
             "text/html; charset=utf-8",
-            "<!doctype html><title>CMClient</title><main id=app>CMClient management web</main>",
+            "no-cache",
+            b"<!doctype html><title>CMClient</title><main id=app>CMClient management web</main>",
+            request_context.method == "HEAD",
         ),
-        (_, path) if path.starts_with("/api/") => proxy_api(client, gateway, &request),
         (_, _) => write_response(
             client,
             "404 Not Found",
             "application/json",
             r#"{"code":"WEB_ROUTE_NOT_FOUND"}"#,
         ),
+    }
+}
+
+fn serve_static_web(
+    client: &mut dyn ManagementWebStream,
+    request: &ManagementWebRequest,
+    root: &Path,
+) -> Result<(), ManagementWebError> {
+    if request.method != "GET" && request.method != "HEAD" {
+        return write_bytes_response(
+            client,
+            "405 Method Not Allowed",
+            "application/json",
+            "no-store",
+            br#"{"code":"WEB_METHOD_NOT_ALLOWED"}"#,
+            false,
+        );
+    }
+
+    let path = request_path(&request.path);
+    let relative_path = path.strip_prefix('/').unwrap_or(path);
+    let requested_file = if relative_path.is_empty() {
+        root.join("index.html")
+    } else {
+        root.join(relative_path)
+    };
+    if let Some(file) = readable_static_file(root, &requested_file) {
+        return write_static_file(client, request, &file, path == "/index.html" || path == "/");
+    }
+
+    if looks_like_asset_path(path) {
+        return write_bytes_response(
+            client,
+            "404 Not Found",
+            "application/json",
+            "no-store",
+            br#"{"code":"WEB_ASSET_NOT_FOUND"}"#,
+            request.method == "HEAD",
+        );
+    }
+
+    let index = root.join("index.html");
+    let Some(index) = readable_static_file(root, &index) else {
+        return write_bytes_response(
+            client,
+            "404 Not Found",
+            "application/json",
+            "no-store",
+            br#"{"code":"WEB_ROUTE_NOT_FOUND"}"#,
+            request.method == "HEAD",
+        );
+    };
+    write_static_file(client, request, &index, true)
+}
+
+fn readable_static_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let candidate = std::fs::canonicalize(candidate).ok()?;
+    (candidate.starts_with(root) && candidate.is_file()).then_some(candidate)
+}
+
+fn write_static_file(
+    client: &mut dyn ManagementWebStream,
+    request: &ManagementWebRequest,
+    file: &Path,
+    is_index: bool,
+) -> Result<(), ManagementWebError> {
+    let mut body = std::fs::File::open(file).map_err(|_| ManagementWebError::Io)?;
+    let content_length = body.metadata().map_err(|_| ManagementWebError::Io)?.len();
+    let content_type = static_content_type(file);
+    let cache_control = if is_index {
+        "no-cache"
+    } else if has_vite_content_hash(file) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    write_response_header(
+        client,
+        "200 OK",
+        content_type,
+        cache_control,
+        content_length,
+    )?;
+    if request.method != "HEAD" {
+        io::copy(&mut body, client).map_err(|_| ManagementWebError::Io)?;
+    }
+    Ok(())
+}
+
+fn request_path(target: &str) -> &str {
+    target.split_once('?').map_or(target, |(path, _)| path)
+}
+
+fn looks_like_asset_path(path: &str) -> bool {
+    path == "/assets"
+        || path.starts_with("/assets/")
+        || Path::new(path)
+            .file_name()
+            .and_then(|name| Path::new(name).extension())
+            .is_some()
+}
+
+fn has_vite_content_hash(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    (8..=64.min(bytes.len().saturating_sub(1))).any(|hash_length| {
+        let separator = bytes.len() - hash_length - 1;
+        matches!(bytes[separator], b'-' | b'.')
+            && bytes[separator + 1..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+    })
+}
+
+fn static_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("json" | "map") => "application/json; charset=utf-8",
+        Some("webmanifest") => "application/manifest+json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("wasm") => "application/wasm",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("xml") => "application/xml; charset=utf-8",
+        _ => "application/octet-stream",
     }
 }
 
@@ -418,6 +645,7 @@ fn parse_request(
     if parts.next().is_some() || !version.starts_with("HTTP/") || !path.starts_with('/') {
         return Err(ManagementWebError::InvalidHttp);
     }
+    validate_request_target(path)?;
     let mut headers = BTreeMap::new();
     for line in header.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
@@ -443,6 +671,77 @@ fn parse_request(
         body: request[header_end..].to_vec(),
         remote_addr,
     })
+}
+
+fn validate_request_target(target: &str) -> Result<(), ManagementWebError> {
+    if target.contains('#') {
+        return Err(ManagementWebError::InvalidHttp);
+    }
+    let (path, query) = target
+        .split_once('?')
+        .map_or((target, None), |(path, query)| (path, Some(query)));
+    if path.is_empty() || path.contains('\\') {
+        return Err(ManagementWebError::InvalidHttp);
+    }
+    let decoded_path = percent_decode_component(path, true)?;
+    let decoded_path =
+        std::str::from_utf8(&decoded_path).map_err(|_| ManagementWebError::InvalidHttp)?;
+    if decoded_path.starts_with("//")
+        || decoded_path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(ManagementWebError::InvalidHttp);
+    }
+    if let Some(query) = query {
+        percent_decode_component(query, false)?;
+    }
+    Ok(())
+}
+
+fn percent_decode_component(
+    component: &str,
+    reject_encoded_separator: bool,
+) -> Result<Vec<u8>, ManagementWebError> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let decoded_byte = if byte == b'%' {
+            let high = bytes
+                .get(index + 1)
+                .and_then(|byte| hex_value(*byte))
+                .ok_or(ManagementWebError::InvalidHttp)?;
+            let low = bytes
+                .get(index + 2)
+                .and_then(|byte| hex_value(*byte))
+                .ok_or(ManagementWebError::InvalidHttp)?;
+            index += 3;
+            let decoded = high * 16 + low;
+            if reject_encoded_separator && matches!(decoded, b'/' | b'\\') {
+                return Err(ManagementWebError::InvalidHttp);
+            }
+            decoded
+        } else {
+            index += 1;
+            byte
+        };
+        if decoded_byte == 0 || decoded_byte.is_ascii_control() {
+            return Err(ManagementWebError::InvalidHttp);
+        }
+        decoded.push(decoded_byte);
+    }
+    Ok(decoded)
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn content_length(header: &[u8]) -> Result<usize, ManagementWebError> {
@@ -509,13 +808,50 @@ fn write_response(
     content_type: &str,
     body: &str,
 ) -> Result<(), ManagementWebError> {
+    write_bytes_response(
+        stream,
+        status,
+        content_type,
+        "no-store",
+        body.as_bytes(),
+        false,
+    )
+}
+
+fn write_bytes_response(
+    stream: &mut dyn ManagementWebStream,
+    status: &str,
+    content_type: &str,
+    cache_control: &str,
+    body: &[u8],
+    head_only: bool,
+) -> Result<(), ManagementWebError> {
+    write_response_header(
+        stream,
+        status,
+        content_type,
+        cache_control,
+        body.len() as u64,
+    )?;
+    if !head_only {
+        stream.write_all(body).map_err(|_| ManagementWebError::Io)?;
+    }
+    Ok(())
+}
+
+fn write_response_header(
+    stream: &mut dyn ManagementWebStream,
+    status: &str,
+    content_type: &str,
+    cache_control: &str,
+    content_length: u64,
+) -> Result<(), ManagementWebError> {
     let header = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncache-control: {cache_control}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        content_length
     );
     stream
         .write_all(header.as_bytes())
-        .and_then(|_| stream.write_all(body.as_bytes()))
         .map_err(|_| ManagementWebError::Io)
 }
 
@@ -549,13 +885,92 @@ mod tests {
         ManagementWebService, ManagementWebStream, gateway_health,
     };
     use std::{
+        fs,
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
+        path::{Path, PathBuf},
         sync::Arc,
         thread,
     };
 
     struct AgentRoute;
+
+    struct RejectEveryRequest;
+
+    struct StaticWebFixture {
+        root: PathBuf,
+    }
+
+    impl StaticWebFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("cmclient-management-web-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(root.join("assets")).expect("fixture directories should exist");
+            fs::write(
+                root.join("index.html"),
+                b"<!doctype html><main id=app>production bundle</main>",
+            )
+            .expect("index should write");
+            fs::write(
+                root.join("assets/app-BWWK_6zJ.js"),
+                b"globalThis.cmclient=true;",
+            )
+            .expect("JavaScript asset should write");
+            fs::write(root.join("assets/app-a1b2c3d4.css"), b"#app{display:block}")
+                .expect("CSS asset should write");
+            fs::write(root.join("favicon.ico"), [0_u8, 1, 2, 3]).expect("icon should write");
+            Self { root }
+        }
+    }
+
+    impl Drop for StaticWebFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn static_response(root: &Path, request: &[u8]) -> Vec<u8> {
+        static_response_with_handler(root, request, None)
+    }
+
+    fn static_response_with_handler(
+        root: &Path,
+        request: &[u8],
+        handler: Option<Arc<dyn ManagementWebApiHandler>>,
+    ) -> Vec<u8> {
+        let config = ManagementWebConfig {
+            port: 0,
+            static_web_root: Some(root.to_owned()),
+            ..Default::default()
+        };
+        let listener = match handler {
+            Some(handler) => ManagementWebListener::bind_with_api_handler(&config, handler),
+            None => ManagementWebListener::bind(&config),
+        }
+        .expect("management listener should bind");
+        let address = listener.local_addr().expect("listener address should load");
+        let server = thread::spawn(move || listener.serve_once());
+        let mut client = TcpStream::connect(address).expect("client should connect");
+        client.write_all(request).expect("request should write");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .expect("response should read");
+        server
+            .join()
+            .expect("server should join")
+            .expect("server should respond");
+        response
+    }
+
+    fn response_body(response: &[u8]) -> &[u8] {
+        let body_start = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response should have a header")
+            + 4;
+        &response[body_start..]
+    }
 
     impl ManagementWebApiHandler for AgentRoute {
         fn handle(
@@ -572,6 +987,22 @@ mod tests {
                 return Ok(true);
             }
             Ok(false)
+        }
+    }
+
+    impl ManagementWebApiHandler for RejectEveryRequest {
+        fn handle(
+            &self,
+            client: &mut dyn ManagementWebStream,
+            _request: &super::ManagementWebRequest,
+        ) -> Result<bool, ManagementWebError> {
+            super::write_response(
+                client,
+                "401 Unauthorized",
+                "application/json",
+                r#"{"code":"AUTH_REQUIRED"}"#,
+            )?;
+            Ok(true)
         }
     }
 
@@ -618,6 +1049,196 @@ mod tests {
             ),
             Err(ManagementWebError::InvalidHttp)
         ));
+    }
+
+    #[test]
+    fn serves_vite_bundle_files_with_mime_and_cache_headers() {
+        let fixture = StaticWebFixture::new();
+        let index = static_response(&fixture.root, b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n");
+        let index = String::from_utf8(index).expect("index response should be UTF-8");
+        assert!(index.starts_with("HTTP/1.1 200 OK"));
+        assert!(index.contains("content-type: text/html; charset=utf-8\r\n"));
+        assert!(index.contains("cache-control: no-cache\r\n"));
+        assert!(index.ends_with("<!doctype html><main id=app>production bundle</main>"));
+
+        let javascript = static_response(
+            &fixture.root,
+            b"GET /assets/app-BWWK_6zJ.js?v=1 HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        let javascript =
+            String::from_utf8(javascript).expect("JavaScript response should be UTF-8");
+        assert!(javascript.starts_with("HTTP/1.1 200 OK"));
+        assert!(javascript.contains("content-type: text/javascript; charset=utf-8\r\n"));
+        assert!(javascript.contains("cache-control: public, max-age=31536000, immutable\r\n"));
+        assert!(javascript.ends_with("globalThis.cmclient=true;"));
+
+        let css = static_response(
+            &fixture.root,
+            b"GET /assets/app-a1b2c3d4.css HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        let css = String::from_utf8(css).expect("CSS response should be UTF-8");
+        assert!(css.contains("content-type: text/css; charset=utf-8\r\n"));
+        assert!(css.contains("cache-control: public, max-age=31536000, immutable\r\n"));
+
+        let icon = static_response(
+            &fixture.root,
+            b"GET /favicon.ico HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        assert!(icon.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(
+            icon.windows(b"content-type: image/x-icon\r\n".len())
+                .any(|window| window == b"content-type: image/x-icon\r\n")
+        );
+        assert!(
+            icon.windows(b"cache-control: no-cache\r\n".len())
+                .any(|window| window == b"cache-control: no-cache\r\n")
+        );
+        assert_eq!(response_body(&icon), [0_u8, 1, 2, 3]);
+    }
+
+    #[test]
+    fn recognizes_common_vite_asset_content_types() {
+        for (file, expected) in [
+            ("app.mjs", "text/javascript; charset=utf-8"),
+            ("data.json", "application/json; charset=utf-8"),
+            ("logo.svg", "image/svg+xml"),
+            ("logo.png", "image/png"),
+            ("photo.webp", "image/webp"),
+            ("font.woff2", "font/woff2"),
+            ("module.wasm", "application/wasm"),
+            ("site.webmanifest", "application/manifest+json"),
+            ("opaque.bin", "application/octet-stream"),
+        ] {
+            assert_eq!(super::static_content_type(Path::new(file)), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_a_configured_static_root_that_does_not_exist() {
+        let missing =
+            std::env::temp_dir().join(format!("cmclient-web-missing-{}", uuid::Uuid::new_v4()));
+        let result = ManagementWebListener::bind(&ManagementWebConfig {
+            port: 0,
+            static_web_root: Some(missing),
+            ..Default::default()
+        });
+        assert!(matches!(result, Err(ManagementWebError::Io)));
+    }
+
+    #[test]
+    fn head_reports_static_length_without_sending_a_body() {
+        let fixture = StaticWebFixture::new();
+        let response = static_response(
+            &fixture.root,
+            b"HEAD /assets/app-BWWK_6zJ.js HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        let header = String::from_utf8(response.clone()).expect("HEAD response should be UTF-8");
+        assert!(header.starts_with("HTTP/1.1 200 OK"));
+        assert!(header.contains("content-length: 25\r\n"));
+        assert!(response_body(&response).is_empty());
+    }
+
+    #[test]
+    fn falls_back_to_index_for_spa_routes_but_not_missing_assets() {
+        let fixture = StaticWebFixture::new();
+        let route = static_response(
+            &fixture.root,
+            b"GET /nodes/meshtastic-1?tab=telemetry HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        let route = String::from_utf8(route).expect("route response should be UTF-8");
+        assert!(route.starts_with("HTTP/1.1 200 OK"));
+        assert!(route.contains("cache-control: no-cache\r\n"));
+        assert!(route.ends_with("<!doctype html><main id=app>production bundle</main>"));
+
+        for missing in [
+            b"GET /assets/missing.js HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET /missing.css HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+        ] {
+            let response = static_response(&fixture.root, missing);
+            let response = String::from_utf8(response).expect("error response should be UTF-8");
+            assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(response.contains("WEB_ASSET_NOT_FOUND"));
+            assert!(!response.contains("production bundle"));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_and_traversal_request_targets() {
+        let fixture = StaticWebFixture::new();
+        for request in [
+            b"GET /../secret HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET /%2e%2e/secret HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET /assets%2fapp-BWWK_6zJ.js HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET /assets/app.js%00 HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET /assets/app.js?value=%ZZ HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET //outside HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET /assets\\outside.js HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
+        ] {
+            let response = static_response(&fixture.root, request);
+            let response = String::from_utf8(response).expect("error response should be UTF-8");
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(response.contains("MANAGEMENT_WEB_HTTP_INVALID"));
+            assert!(!response.contains("production bundle"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_static_symlinks_that_escape_the_bundle_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = StaticWebFixture::new();
+        let outside = fixture.root.with_extension("secret.txt");
+        fs::write(&outside, b"must not escape").expect("outside file should write");
+        symlink(&outside, fixture.root.join("assets/leak.txt")).expect("symlink should create");
+
+        let response = static_response(
+            &fixture.root,
+            b"GET /assets/leak.txt HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        let response = String::from_utf8(response).expect("error response should be UTF-8");
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(!response.contains("must not escape"));
+        fs::remove_file(outside).expect("outside file should remove");
+    }
+
+    #[test]
+    fn runs_access_handler_before_static_file_serving() {
+        let fixture = StaticWebFixture::new();
+        let response = static_response_with_handler(
+            &fixture.root,
+            b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n",
+            Some(Arc::new(RejectEveryRequest)),
+        );
+        let response = String::from_utf8(response).expect("auth response should be UTF-8");
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(response.contains("AUTH_REQUIRED"));
+        assert!(!response.contains("production bundle"));
+    }
+
+    #[test]
+    fn retains_minimal_shell_when_static_root_is_not_configured() {
+        let listener = ManagementWebListener::bind(&ManagementWebConfig {
+            port: 0,
+            ..Default::default()
+        })
+        .expect("listener should bind");
+        let address = listener.local_addr().expect("address should load");
+        let server = thread::spawn(move || listener.serve_once());
+        let mut client = TcpStream::connect(address).expect("client should connect");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("request should write");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("response should read");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("CMClient management web"));
+        server
+            .join()
+            .expect("server should join")
+            .expect("server should respond");
     }
 
     #[test]
@@ -670,6 +1291,57 @@ mod tests {
             .join()
             .expect("server should join")
             .expect("server should respond");
+        gateway_thread.join().expect("gateway should join");
+    }
+
+    #[test]
+    fn proxies_api_requests_before_considering_spa_fallback() {
+        let fixture = StaticWebFixture::new();
+        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
+        let gateway_address = gateway.local_addr().expect("gateway address should load");
+        let gateway_thread = thread::spawn(move || {
+            let (mut stream, _) = gateway.accept().expect("gateway should accept");
+            let mut request = [0_u8; 4096];
+            let count = stream
+                .read(&mut request)
+                .expect("gateway request should read");
+            let request = &request[..count];
+            assert!(request.starts_with(b"GET /api/v1/nodes?limit=1 HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .windows(b"connection: close\r\n".len())
+                    .any(|window| window == b"connection: close\r\n")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 12\r\nconnection: close\r\n\r\n{\"nodes\":[]}",
+                )
+                .expect("gateway response should write");
+        });
+        let listener = ManagementWebListener::bind(&ManagementWebConfig {
+            port: 0,
+            gateway: gateway_address,
+            static_web_root: Some(fixture.root.clone()),
+            ..Default::default()
+        })
+        .expect("listener should bind");
+        let address = listener.local_addr().expect("address should load");
+        let server = thread::spawn(move || listener.serve_once());
+        let mut client = TcpStream::connect(address).expect("client should connect");
+        client
+            .write_all(b"GET /api/v1/nodes?limit=1 HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("request should write");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("response should read");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("{\"nodes\":[]}"));
+        assert!(!response.contains("production bundle"));
+        server
+            .join()
+            .expect("server should join")
+            .expect("server should proxy");
         gateway_thread.join().expect("gateway should join");
     }
 

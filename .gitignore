@@ -16,6 +16,8 @@ target/
 *.swp
 playwright-report/
 test-results/
+output/playwright/
+.playwright-cli/
 
 # Secrets and runtime state
 .env

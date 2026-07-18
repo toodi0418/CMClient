@@ -17,6 +17,7 @@ import {
   RefreshCw,
   Satellite,
   ScrollText,
+  Send,
   Server,
   Settings,
   Stethoscope,
@@ -28,17 +29,26 @@ import { RouterLink, RouterView, useRoute } from "vue-router";
 import { useI18n } from "vue-i18n";
 
 import { isSupportedLocale, type ThemePreference } from "@/preferences";
+import { projectionForEvent } from "@/realtime-refresh";
+import { useAprsStore } from "@/stores/aprs";
+import { useCallMeshStore } from "@/stores/callmesh";
+import { useDomainStore } from "@/stores/domain";
 import { useGatewayStore } from "@/stores/gateway";
 import {
   isManagementSessionError,
   useManagementAuthStore,
 } from "@/stores/management-auth";
 import { usePreferencesStore } from "@/stores/preferences";
+import { useProxyStore } from "@/stores/proxy";
 import { useShellStore } from "@/stores/shell";
 import ManagementLoginView from "@/views/ManagementLoginView.vue";
 
 const shell = useShellStore();
 const gateway = useGatewayStore();
+const domain = useDomainStore();
+const aprs = useAprsStore();
+const callmesh = useCallMeshStore();
+const proxy = useProxyStore();
 const auth = useManagementAuthStore();
 const preferences = usePreferencesStore();
 const route = useRoute();
@@ -52,6 +62,11 @@ const primaryNavigation = [
   { labelKey: "navigation.nodes", to: "/nodes", icon: Network },
   { labelKey: "navigation.positions", to: "/positions", icon: MapPinned },
   { labelKey: "navigation.messages", to: "/messages", icon: MessageSquareText },
+  {
+    labelKey: "navigation.remoteDispatch",
+    to: "/remote-dispatch",
+    icon: Send,
+  },
   { labelKey: "navigation.telemetry", to: "/telemetry", icon: Gauge },
   { labelKey: "navigation.aprs", to: "/aprs", icon: Satellite },
   { labelKey: "navigation.callmesh", to: "/callmesh", icon: Cloud },
@@ -115,6 +130,29 @@ watch(
     }
   },
   { immediate: true },
+);
+
+watch(
+  () => gateway.recentEvents[0],
+  (event) => {
+    if (!event) {
+      return;
+    }
+    switch (projectionForEvent(event.type)) {
+      case "domain":
+        void domain.refresh();
+        break;
+      case "aprs":
+        void aprs.refresh();
+        break;
+      case "callmesh":
+        void callmesh.refresh();
+        break;
+      case "proxy":
+        void proxy.refresh();
+        break;
+    }
+  },
 );
 
 function setLocale(event: Event) {
