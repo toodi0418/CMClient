@@ -1,39 +1,85 @@
-version: "3.9"
-
 services:
-  callmesh-client:
-    container_name: callmesh-client
-    image: callmesh-client:latest
+  gateway:
+    image: "${CMCLIENT_IMAGE:-cmclient:local}"
     build:
       context: .
       dockerfile: Dockerfile
+    command: ["gateway"]
+    init: true
     restart: unless-stopped
     environment:
-      CALLMESH_API_KEY: "${CALLMESH_API_KEY}"
-      CALLMESH_ARTIFACTS_DIR: "/data/callmesh"
-      CALLMESH_VERIFICATION_FILE: "/data/callmesh/monitor.json"
-      TMAG_WEB_DASHBOARD: "${TMAG_WEB_DASHBOARD:-1}"
-      TMAG_TIMEZONE: "${TMAG_TIMEZONE:-Asia/Taipei}"
-      TENMAN_DISABLE: "${TENMAN_DISABLE:-0}"
-      AUTO_UPDATE: "${AUTO_UPDATE:-1}"
-      AUTO_UPDATE_REPO: "${AUTO_UPDATE_REPO:-https://github.com/toodi0418/CMClient.git}"
-      AUTO_UPDATE_BRANCH: "${AUTO_UPDATE_BRANCH:-main}"
-      AUTO_UPDATE_WORKDIR: "${AUTO_UPDATE_WORKDIR:-/data/callmesh/app-src}"
-      AUTO_UPDATE_POLL_SECONDS: "${AUTO_UPDATE_POLL_SECONDS:-300}"
-      MESHTASTIC_HOST: "${MESHTASTIC_HOST}"
-      MESHTASTIC_PORT: "${MESHTASTIC_PORT}"
+      CMCLIENT_DEPLOYMENT_MODE: docker
+      CMCLIENT_GATEWAY_HOST: 0.0.0.0
+      CMCLIENT_GATEWAY_PORT: "8081"
+      CMCLIENT_DATA_DIR: /var/lib/cmclient
     volumes:
-      - callmesh-data:/data/callmesh
+      - cmclient-data:/var/lib/cmclient
+    expose:
+      - "8081"
+    networks:
+      - cmclient-internal
+      - cmclient-egress
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    pids_limit: 128
+    mem_limit: 512m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8081/api/v1/system/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  web:
+    image: "${CMCLIENT_IMAGE:-cmclient:local}"
+    command: ["web"]
+    init: true
+    restart: unless-stopped
+    environment:
+      CMCLIENT_WEB_PORT: "8080"
+      CMCLIENT_WEB_UPSTREAM: http://gateway:8081
+    depends_on:
+      gateway:
+        condition: service_healthy
     ports:
-      - "${TMAG_WEB_PORT:-7080}:7080"
-    command:
-      - "npm"
-      - "start"
-      - "--"
-      - "--host"
-      - "${MESHTASTIC_HOST:-meshtastic.local}"
-      - "--port"
-      - "${MESHTASTIC_PORT:-4403}"
+      - "127.0.0.1:${CMCLIENT_WEB_PORT:-8080}:8080"
+    networks:
+      - cmclient-internal
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    pids_limit: 64
+    mem_limit: 256m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
 volumes:
-  callmesh-data:
+  cmclient-data:
+
+networks:
+  cmclient-internal:
+    internal: true
+  cmclient-egress:

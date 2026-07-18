@@ -43,3 +43,12 @@ signatures, provenance, and signed update manifest from this exact matrix.
 
 The workflow has `contents: read` only. Build verification on `dev` and pull
 requests cannot create releases, publish containers, or upload assets.
+
+## Docker image
+
+Docker is a separately versioned deployment image rather than an updater
+component: it contains Gateway and Web only, and cannot self-update. A future
+release workflow will publish immutable image tags and digests after the same
+SBOM, checksum, signature, and provenance gates that protect binary assets.
+The compose deployment and its runtime capability restrictions are documented
+in [Docker Deployment](./docker-deployment.md).

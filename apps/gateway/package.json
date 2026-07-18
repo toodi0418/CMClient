@@ -3,6 +3,9 @@
   "version": "2.0.0-dev.0",
   "private": true,
   "type": "module",
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc --project tsconfig.build.json",
     "start": "node dist/main.js",

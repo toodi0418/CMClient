@@ -40,6 +40,7 @@ import {
 } from "./observability.js";
 import {
   defaultGatewaySystemState,
+  isDockerDeployment,
   type GatewaySystemState,
 } from "./system.js";
 import {
@@ -116,7 +117,7 @@ export function parseGatewayListenOptions(
   const portValue = environment.CMCLIENT_GATEWAY_PORT?.trim() || "0";
   const port = Number(portValue);
   if (
-    !isLoopbackHost(host) ||
+    !isGatewayHostAllowed(host, environment) ||
     !Number.isInteger(port) ||
     port < 0 ||
     port > 65_535
@@ -124,6 +125,16 @@ export function parseGatewayListenOptions(
     throw new GatewayConfigurationError();
   }
   return { host, port };
+}
+
+function isGatewayHostAllowed(
+  host: string,
+  environment: Record<string, string | undefined>,
+): boolean {
+  return (
+    isLoopbackHost(host) ||
+    (isDockerDeployment(environment) && host === "0.0.0.0")
+  );
 }
 
 export class GatewayRuntime {

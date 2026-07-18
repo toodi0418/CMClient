@@ -15,3 +15,8 @@ Gateway exposes the following schema-backed, versioned endpoints:
 The Agent remains authoritative for Agent-owned capabilities such as services,
 updates, tray, and Management Web. Gateway returns them as unavailable with an
 explicit ownership/configuration reason rather than inferring support.
+
+In the constrained Docker deployment, Gateway reports `docker` as available
+and reports `update`, `serial`, `service`, and `autoStart` as unavailable with
+`CAPABILITY_UNAVAILABLE_DOCKER`. This prevents Web clients from presenting
+host-only controls in a container that has neither an Agent nor device access.

@@ -112,3 +112,13 @@ jobs:
         run: |
           $rendered = powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 render -HostPath 'C:\Program Files\CMClient\current\bin\cmclient-service-host.exe' | ConvertFrom-Json
           if ($rendered.serviceName -ne 'CMClientAgent' -or $rendered.storesCredentials) { throw 'Windows service render failed' }
+
+  docker-smoke:
+    name: Docker restricted runtime smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Build and start the restricted Docker deployment
+        run: bash scripts/docker-smoke.sh

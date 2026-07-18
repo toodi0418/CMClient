@@ -20,6 +20,22 @@ describe("GatewayRuntime", () => {
     ).toThrow(GatewayConfigurationError);
   });
 
+  it("allows a wildcard bind only for the constrained Docker runtime", () => {
+    expect(
+      parseGatewayListenOptions({
+        CMCLIENT_DEPLOYMENT_MODE: "docker",
+        CMCLIENT_GATEWAY_HOST: "0.0.0.0",
+        CMCLIENT_GATEWAY_PORT: "8081",
+      }),
+    ).toEqual({ host: "0.0.0.0", port: 8081 });
+    expect(() =>
+      parseGatewayListenOptions({
+        CMCLIENT_DEPLOYMENT_MODE: "desktop",
+        CMCLIENT_GATEWAY_HOST: "0.0.0.0",
+      }),
+    ).toThrow(GatewayConfigurationError);
+  });
+
   it("propagates request IDs and redacts structured fields", async () => {
     const logger = new MemoryLogger();
     const app = createGatewayApp(logger);

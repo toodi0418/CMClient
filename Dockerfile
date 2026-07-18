@@ -1,32 +1,45 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22-bookworm-slim AS base
+FROM node:22-bookworm-slim AS build
 
-ENV NODE_ENV=production \
-    TMAG_WEB_PORT=7080 \
-    CALLMESH_ARTIFACTS_DIR=/data/callmesh \
-    CALLMESH_VERIFICATION_FILE=/data/callmesh/monitor.json
-
-WORKDIR /app
+WORKDIR /workspace
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+    && apt-get install --yes --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable \
+    && corepack install --global pnpm@11.9.0
 
 COPY . .
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-RUN mkdir -p /data/callmesh \
-    && chown -R node:node /app /data
+RUN pnpm install --frozen-lockfile \
+    && pnpm --filter @cmclient/contracts run build \
+    && pnpm --filter @cmclient/gateway run build \
+    && pnpm --filter @cmclient/web run build \
+    && pnpm --filter @cmclient/gateway deploy --legacy --prod /opt/cmclient/gateway
 
-USER node
+FROM node:22-bookworm-slim AS runtime
 
-EXPOSE 7080
-VOLUME ["/data/callmesh"]
+RUN groupadd --gid 10001 cmclient \
+    && useradd --uid 10001 --gid cmclient --home-dir /nonexistent \
+      --no-create-home --shell /usr/sbin/nologin cmclient \
+    && mkdir --parents /var/lib/cmclient \
+    && touch /var/lib/cmclient/.volume-initialized
 
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["npm", "start"]
+WORKDIR /app
+COPY --from=build --chown=cmclient:cmclient /opt/cmclient/gateway /app/gateway
+COPY --from=build --chown=cmclient:cmclient /workspace/apps/web/dist /app/web
+COPY --from=build --chown=cmclient:cmclient /workspace/scripts/container-entrypoint.mjs /app/container-entrypoint.mjs
+COPY --from=build --chown=cmclient:cmclient /workspace/scripts/container-runtime.mjs /app/container-runtime.mjs
+RUN chown --recursive cmclient:cmclient /var/lib/cmclient
+
+ENV NODE_ENV=production \
+    CMCLIENT_DATA_DIR=/var/lib/cmclient
+
+USER cmclient:cmclient
+
+EXPOSE 8080
+
+ENTRYPOINT ["node", "/app/container-entrypoint.mjs"]
+CMD ["gateway"]

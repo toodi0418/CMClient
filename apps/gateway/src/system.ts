@@ -8,7 +8,17 @@ export interface GatewaySystemState {
   capabilities: SystemCapabilities;
 }
 
-export function defaultGatewaySystemState(): GatewaySystemState {
+export function isDockerDeployment(
+  environment: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    environment.CMCLIENT_DEPLOYMENT_MODE?.trim().toLowerCase() === "docker"
+  );
+}
+
+export function defaultGatewaySystemState(
+  environment: NodeJS.ProcessEnv = process.env,
+): GatewaySystemState {
   const platform =
     process.platform === "darwin" ||
     process.platform === "linux" ||
@@ -18,10 +28,11 @@ export function defaultGatewaySystemState(): GatewaySystemState {
         : process.platform
       : "unknown";
   const build: BuildMetadata = {
-    version: process.env.CMCLIENT_BUILD_VERSION?.trim() || "2.0.0-dev.0",
-    commit: process.env.CMCLIENT_BUILD_COMMIT?.trim() || "unknown",
+    version: environment.CMCLIENT_BUILD_VERSION?.trim() || "2.0.0-dev.0",
+    commit: environment.CMCLIENT_BUILD_COMMIT?.trim() || "unknown",
     channel: "dev",
   };
+  const dockerDeployment = isDockerDeployment(environment);
   return {
     build,
     capabilities: {
@@ -33,15 +44,22 @@ export function defaultGatewaySystemState(): GatewaySystemState {
           available: false,
           reasonCode: "CAPABILITY_OWNED_BY_AGENT",
         },
-        update: { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
+        update: dockerDeployment
+          ? { available: false, reasonCode: "CAPABILITY_UNAVAILABLE_DOCKER" }
+          : { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
         tray: { available: false, reasonCode: "CAPABILITY_OWNED_BY_DESKTOP" },
-        serial: { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
-        service: { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
-        autoStart: {
-          available: false,
-          reasonCode: "CAPABILITY_OWNED_BY_AGENT",
-        },
-        docker: { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
+        serial: dockerDeployment
+          ? { available: false, reasonCode: "CAPABILITY_UNAVAILABLE_DOCKER" }
+          : { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
+        service: dockerDeployment
+          ? { available: false, reasonCode: "CAPABILITY_UNAVAILABLE_DOCKER" }
+          : { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
+        autoStart: dockerDeployment
+          ? { available: false, reasonCode: "CAPABILITY_UNAVAILABLE_DOCKER" }
+          : { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
+        docker: dockerDeployment
+          ? { available: true }
+          : { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
       },
     },
   };
