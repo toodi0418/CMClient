@@ -16,6 +16,7 @@ import {
   PositionCanonicalEventSchema,
   PositionDecisionSchema,
   PositionObservationSchema,
+  ProxyStatusSchema,
   SystemCapabilitiesSchema,
   SystemStatusSchema,
   SanitizedPacketFixtureSetSchema,
@@ -222,6 +223,70 @@ describe("transport contract", () => {
         },
       }),
     ).toBe(true);
+  });
+});
+
+describe("proxy contract", () => {
+  it("projects operational state without raw client or address identifiers", () => {
+    const check = TypeCompiler.Compile(ProxyStatusSchema);
+    const status = {
+      state: "running",
+      listener: { host: "127.0.0.1", port: 4403 },
+      policy: {
+        activeClients: 1,
+        allowLan: false,
+        allowedAddressCount: 0,
+        maxClients: 16,
+        maxWritesPerMinute: 120,
+        mode: "monitor",
+      },
+      queue: {
+        broadcastAccepted: 0,
+        broadcastDropped: 0,
+        broadcastFrames: 0,
+        directAccepted: 0,
+        directDropped: 0,
+        pendingCorrelations: 0,
+        queuedWrites: 0,
+        writing: false,
+      },
+      recentAudit: [
+        {
+          action: "client_admitted",
+          clientFingerprint: "0123456789abcdef",
+          mode: "monitor",
+          occurredAt: "2026-07-18T00:00:00.000Z",
+        },
+      ],
+      upstream: {
+        configFrameCount: 0,
+        metrics: {
+          bytesReceived: 0,
+          bytesSent: 0,
+          framesReceived: 0,
+          framesSent: 0,
+          malformedFrames: 0,
+          reconnects: 0,
+        },
+        state: {
+          transport: "tcp",
+          status: "ready",
+          changedAt: "2026-07-18T00:00:00.000Z",
+        },
+      },
+    };
+    expect(check.Check(status)).toBe(true);
+    expect(
+      check.Check({
+        ...status,
+        recentAudit: [
+          {
+            ...status.recentAudit[0],
+            clientId: "must-not-be-public",
+          },
+        ],
+      }),
+    ).toBe(false);
   });
 });
 

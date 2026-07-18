@@ -9,6 +9,7 @@ import {
   MeshNodeListSchema,
   MeshTelemetryListSchema,
   PositionCanonicalEventListSchema,
+  ProxyStatusSchema,
   SystemCapabilitiesSchema,
   SystemHealthSchema,
   SystemStatusSchema,
@@ -22,6 +23,7 @@ import {
   type MeshNodeList,
   type MeshTelemetryList,
   type PositionCanonicalEventList,
+  type ProxyStatus,
   type SystemCapabilities,
   type SystemHealth,
   type SystemStatus,
@@ -182,6 +184,10 @@ export class GatewayApiClient {
       this.request<CallMeshOverview>("/callmesh", CallMeshOverviewSchema),
   };
 
+  readonly proxy = {
+    status: () => this.request<ProxyStatus>("/proxy", ProxyStatusSchema),
+  };
+
   private async request<T>(
     path: string,
     schema: TSchema,
@@ -243,6 +249,10 @@ export type GatewaySystemApi = {
   version: () => Promise<BuildMetadata>;
   capabilities: () => Promise<SystemCapabilities>;
   status: () => Promise<SystemStatus>;
+};
+
+export type GatewayProxyApi = {
+  status: () => Promise<ProxyStatus>;
 };
 
 async function readJson(response: Response): Promise<unknown> {

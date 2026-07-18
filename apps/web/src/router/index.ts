@@ -27,6 +27,12 @@ export const router = createRouter({
       meta: { labelKey: "navigation.meshtastic", group: "operations" },
     },
     {
+      path: "/proxy",
+      name: "proxy",
+      component: () => import("@/views/ProxyView.vue"),
+      meta: { labelKey: "navigation.proxy", group: "operations" },
+    },
+    {
       path: "/aprs",
       name: "aprs",
       component: () => import("@/views/AprsView.vue"),

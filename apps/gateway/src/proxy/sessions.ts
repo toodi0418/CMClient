@@ -30,6 +30,14 @@ export interface ProxySessionSnapshot {
   queuedFrames: number;
 }
 
+export interface ProxySessionMetrics {
+  broadcastAccepted: number;
+  broadcastDropped: number;
+  broadcastFrames: number;
+  directAccepted: number;
+  directDropped: number;
+}
+
 export class ProxySessionError extends Error {
   constructor(readonly code: string) {
     super(code);
@@ -41,6 +49,13 @@ export class ProxySessionManager {
   private readonly maxClients: number;
   private readonly maxQueuedBytes: number;
   private readonly maxQueuedFrames: number;
+  private readonly metrics: ProxySessionMetrics = {
+    broadcastAccepted: 0,
+    broadcastDropped: 0,
+    broadcastFrames: 0,
+    directAccepted: 0,
+    directDropped: 0,
+  };
   private unsubscribe: (() => void) | undefined;
 
   constructor(
@@ -130,11 +145,24 @@ export class ProxySessionManager {
         dropped += 1;
       }
     }
+    this.metrics.broadcastFrames += 1;
+    this.metrics.broadcastAccepted += accepted;
+    this.metrics.broadcastDropped += dropped;
     return { accepted, dropped };
   }
 
   deliver(id: string, frame: Uint8Array): boolean {
-    return this.sessions.get(id)?.enqueue(frame) ?? false;
+    const accepted = this.sessions.get(id)?.enqueue(frame) ?? false;
+    if (accepted) {
+      this.metrics.directAccepted += 1;
+    } else {
+      this.metrics.directDropped += 1;
+    }
+    return accepted;
+  }
+
+  get metricsSnapshot(): ProxySessionMetrics {
+    return { ...this.metrics };
   }
 
   get snapshot(): ProxySessionSnapshot[] {

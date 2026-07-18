@@ -21,6 +21,7 @@ import {
   Settings,
   Stethoscope,
   Sun,
+  Waypoints,
 } from "@lucide/vue";
 import Button from "primevue/button";
 import { RouterLink, RouterView, useRoute } from "vue-router";
@@ -41,6 +42,7 @@ const primaryNavigation = [
   { labelKey: "navigation.overview", to: "/", icon: LayoutDashboard },
   { labelKey: "navigation.system", to: "/system", icon: Server },
   { labelKey: "navigation.meshtastic", to: "/meshtastic", icon: Radio },
+  { labelKey: "navigation.proxy", to: "/proxy", icon: Waypoints },
   { labelKey: "navigation.nodes", to: "/nodes", icon: Network },
   { labelKey: "navigation.positions", to: "/positions", icon: MapPinned },
   { labelKey: "navigation.messages", to: "/messages", icon: MessageSquareText },

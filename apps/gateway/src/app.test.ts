@@ -137,6 +137,36 @@ describe("GatewayRuntime", () => {
     await unavailable.close();
   });
 
+  it("projects proxy status and fails closed when no proxy runtime exists", async () => {
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      undefined,
+      {},
+      undefined,
+      undefined,
+      undefined,
+      {
+        status: () => proxyStatusFixture(),
+      },
+    );
+    const response = await app.inject("/api/v1/proxy");
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      state: "running",
+      policy: { activeClients: 1, mode: "monitor" },
+    });
+    await app.close();
+
+    const unavailable = createGatewayApp(new MemoryLogger());
+    const unavailableResponse = await unavailable.inject("/api/v1/proxy");
+    expect(unavailableResponse.statusCode).toBe(503);
+    expect(unavailableResponse.json()).toMatchObject({
+      code: "PROXY_RUNTIME_UNAVAILABLE",
+    });
+    await unavailable.close();
+  });
+
   it("submits an idempotent diagnostics integrity-check job", async () => {
     const submissions: Array<{
       correlationId?: string;
@@ -345,4 +375,46 @@ function readUntil(response: IncomingMessage, needle: string): Promise<string> {
     });
     response.once("error", reject);
   });
+}
+
+function proxyStatusFixture() {
+  return {
+    state: "running" as const,
+    listener: { host: "127.0.0.1", port: 4403 },
+    policy: {
+      activeClients: 1,
+      allowLan: false,
+      allowedAddressCount: 0,
+      maxClients: 16,
+      maxWritesPerMinute: 120,
+      mode: "monitor" as const,
+    },
+    queue: {
+      broadcastAccepted: 0,
+      broadcastDropped: 0,
+      broadcastFrames: 0,
+      directAccepted: 0,
+      directDropped: 0,
+      pendingCorrelations: 0,
+      queuedWrites: 0,
+      writing: false,
+    },
+    recentAudit: [],
+    upstream: {
+      configFrameCount: 0,
+      metrics: {
+        bytesReceived: 0,
+        bytesSent: 0,
+        framesReceived: 0,
+        framesSent: 0,
+        malformedFrames: 0,
+        reconnects: 0,
+      },
+      state: {
+        changedAt: "2026-07-18T00:00:00.000Z",
+        status: "ready" as const,
+        transport: "tcp" as const,
+      },
+    },
+  };
 }

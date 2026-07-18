@@ -46,5 +46,17 @@ Every active client has an independent bounded one-minute write window.
 Policy decisions emit a bounded audit trail and optional redacted structured
 log. Audit entries contain only one-way client/address fingerprints, mode,
 allowed command variant, and stable code: never a raw remote address, client
-identifier, message text, or protobuf payload. The P07-T05 listener/API layer
-will own lifecycle wiring and public projections for these snapshots.
+identifier, message text, or protobuf payload. `ProxyRuntime` owns listener
+lifecycle and exposes its privacy-safe snapshot through `/api/v1/proxy`; its
+`proxy.*` lifecycle, upstream, client, queue, and error events use the global
+bounded SSE journal.
+
+When `CMCLIENT_PROXY_ENABLED=true`, Gateway starts the listener only after a
+TCP Meshtastic upstream has completed its config session. Required upstream
+variables are `CMCLIENT_PROXY_UPSTREAM_HOST` and
+`CMCLIENT_PROXY_UPSTREAM_PORT`; `CMCLIENT_PROXY_PORT` defaults to `4403` and
+`CMCLIENT_PROXY_HOST` defaults to `127.0.0.1`. `CMCLIENT_PROXY_MODE` defaults
+to `monitor`. A LAN listener additionally requires
+`CMCLIENT_PROXY_ALLOW_LAN=true` and comma-separated numeric IP addresses in
+`CMCLIENT_PROXY_ALLOWLIST`. Invalid configuration or upstream startup exits
+with a stable proxy error code instead of leaving a half-started Gateway.

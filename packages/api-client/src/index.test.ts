@@ -94,6 +94,22 @@ describe("gateway API client", () => {
     });
     expect(headers?.get("idempotency-key")).toBe("diagnostics-42");
   });
+
+  it("reads the privacy-safe proxy status through the versioned API", async () => {
+    let url: string | undefined;
+    const client = new GatewayApiClient({
+      fetch: async (input) => {
+        url = String(input);
+        return jsonResponse(proxyStatus());
+      },
+    });
+
+    await expect(client.proxy.status()).resolves.toMatchObject({
+      state: "running",
+      policy: { activeClients: 2, mode: "message" },
+    });
+    expect(url).toBe("/api/v1/proxy");
+  });
 });
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -101,4 +117,46 @@ function jsonResponse(payload: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function proxyStatus() {
+  return {
+    state: "running",
+    listener: { host: "127.0.0.1", port: 4403 },
+    policy: {
+      activeClients: 2,
+      allowLan: false,
+      allowedAddressCount: 0,
+      maxClients: 16,
+      maxWritesPerMinute: 120,
+      mode: "message",
+    },
+    queue: {
+      broadcastAccepted: 4,
+      broadcastDropped: 0,
+      broadcastFrames: 2,
+      directAccepted: 1,
+      directDropped: 0,
+      pendingCorrelations: 0,
+      queuedWrites: 0,
+      writing: false,
+    },
+    recentAudit: [],
+    upstream: {
+      configFrameCount: 1,
+      metrics: {
+        bytesReceived: 10,
+        bytesSent: 8,
+        framesReceived: 2,
+        framesSent: 1,
+        malformedFrames: 0,
+        reconnects: 0,
+      },
+      state: {
+        changedAt: "2026-07-18T00:00:00.000Z",
+        status: "ready",
+        transport: "tcp",
+      },
+    },
+  };
 }

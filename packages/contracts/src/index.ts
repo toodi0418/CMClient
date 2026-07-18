@@ -3,6 +3,7 @@ export * from "./events.js";
 export * from "./jobs.js";
 export * from "./mesh-domain.js";
 export * from "./position.js";
+export * from "./proxy.js";
 export * from "./recording.js";
 export * from "./system.js";
 export * from "./transport.js";

@@ -15,6 +15,7 @@ import {
   MeshNodeListSchema,
   MeshTelemetryListSchema,
   PositionCanonicalEventListSchema,
+  ProxyStatusSchema,
   SystemCapabilitiesSchema,
   SystemHealthSchema,
   SystemStatusSchema,
@@ -27,6 +28,7 @@ import {
   type MeshNode,
   type MeshTelemetry,
   type PositionCanonicalEvent,
+  type ProxyStatus,
 } from "@cmclient/contracts";
 
 import {
@@ -65,6 +67,10 @@ export interface GatewayDomainReadApi {
 
 export interface GatewayCallMeshReadApi {
   getOverview(): CallMeshOverview;
+}
+
+export interface GatewayProxyReadApi {
+  status(): ProxyStatus;
 }
 
 declare module "fastify" {
@@ -133,6 +139,7 @@ export class GatewayRuntime {
     jobs?: GatewayJobApi,
     domain?: GatewayDomainReadApi,
     callmesh?: GatewayCallMeshReadApi,
+    proxy?: GatewayProxyReadApi,
   ) {
     this.options = options;
     this.app = createGatewayApp(
@@ -143,6 +150,7 @@ export class GatewayRuntime {
       jobs,
       domain,
       callmesh,
+      proxy,
     );
   }
 
@@ -180,6 +188,7 @@ export function createGatewayApp(
   jobs?: GatewayJobApi,
   domain?: GatewayDomainReadApi,
   callmesh?: GatewayCallMeshReadApi,
+  proxy?: GatewayProxyReadApi,
 ): FastifyInstance {
   const heartbeatIntervalMs = sseOptions.heartbeatIntervalMs ?? 15_000;
   if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
@@ -273,6 +282,16 @@ export function createGatewayApp(
       callmesh
         ? callmesh.getOverview()
         : sendCallMeshUnavailable(request, reply),
+  );
+  app.get(
+    "/api/v1/proxy",
+    {
+      schema: {
+        response: { 200: ProxyStatusSchema, 503: ApiErrorSchema },
+      },
+    },
+    (request, reply) =>
+      proxy ? proxy.status() : sendProxyUnavailable(request, reply),
   );
   app.get<{ Querystring: ListQuery }>(
     "/api/v1/aprs/outbox",
@@ -497,6 +516,14 @@ function sendDomainDataUnavailable(
 function sendCallMeshUnavailable(request: FastifyRequest, reply: FastifyReply) {
   return reply.code(503).send({
     code: "CALLMESH_CLIENT_UNAVAILABLE",
+    params: {},
+    traceId: request.traceId,
+  });
+}
+
+function sendProxyUnavailable(request: FastifyRequest, reply: FastifyReply) {
+  return reply.code(503).send({
+    code: "PROXY_RUNTIME_UNAVAILABLE",
     params: {},
     traceId: request.traceId,
   });

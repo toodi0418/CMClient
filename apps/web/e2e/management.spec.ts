@@ -93,6 +93,26 @@ test("diagnostics job and navigation stay usable on mobile", async ({
   await expectNoHorizontalOverflow(page);
 });
 
+test("proxy runtime status remains legible across desktop and mobile", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/proxy");
+
+  const workspace = page.locator("main");
+  await expect(
+    workspace.getByRole("heading", { name: "TCP Proxy", level: 2 }),
+  ).toBeVisible();
+  await expect(workspace.getByText("127.0.0.1:4403")).toBeVisible();
+  await expect(workspace.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(workspace.getByText("2 / 16")).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(workspace.getByText("127.0.0.1:4403")).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+});
+
 async function mockGateway(page: Page): Promise<void> {
   await page.route("**/api/v1/system/status", (route) =>
     route.fulfill({
@@ -132,6 +152,58 @@ async function mockGateway(page: Page): Promise<void> {
     route.fulfill({
       contentType: "text/event-stream",
       body: ": heartbeat\n\n",
+    }),
+  );
+  await page.route("**/api/v1/proxy", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        state: "running",
+        listener: { host: "127.0.0.1", port: 4403 },
+        policy: {
+          activeClients: 2,
+          allowLan: false,
+          allowedAddressCount: 0,
+          maxClients: 16,
+          maxWritesPerMinute: 120,
+          mode: "message",
+        },
+        queue: {
+          broadcastAccepted: 4,
+          broadcastDropped: 1,
+          broadcastFrames: 2,
+          directAccepted: 1,
+          directDropped: 0,
+          pendingCorrelations: 0,
+          queuedWrites: 0,
+          writing: false,
+        },
+        recentAudit: [
+          {
+            action: "write_allowed",
+            clientFingerprint: "0123456789abcdef",
+            mode: "message",
+            occurredAt: "2026-07-18T00:00:00.000Z",
+            variant: "packet",
+          },
+        ],
+        upstream: {
+          configFrameCount: 3,
+          metrics: {
+            bytesReceived: 10,
+            bytesSent: 8,
+            framesReceived: 2,
+            framesSent: 1,
+            malformedFrames: 0,
+            reconnects: 0,
+          },
+          state: {
+            changedAt: "2026-07-18T00:00:00.000Z",
+            status: "ready",
+            transport: "tcp",
+          },
+        },
+      }),
     }),
   );
 }
