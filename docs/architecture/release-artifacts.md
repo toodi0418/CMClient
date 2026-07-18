@@ -38,8 +38,9 @@ cmclient-service-windows-x86_64-2.0.0.zip
 unknown components, unknown targets, and non-SemVer versions, and records the
 future asset name in each CI build manifest. CI uploads build inputs under
 `cmclient-build-<component>-<target>-<semver>`; those are intentionally not
-published release assets. P10-T05 will create the archives, checksums, SBOM,
-signatures, provenance, and signed update manifest from this exact matrix.
+published release assets. `scripts/release-supply-chain.mjs` turns exactly this
+matrix into archives, checksums, SBOM, provenance subjects, and (when an
+offline key is explicitly supplied) a signed update manifest.
 
 The workflow has `contents: read` only. Build verification on `dev` and pull
 requests cannot create releases, publish containers, or upload assets.
@@ -52,3 +53,6 @@ release workflow will publish immutable image tags and digests after the same
 SBOM, checksum, signature, and provenance gates that protect binary assets.
 The compose deployment and its runtime capability restrictions are documented
 in [Docker Deployment](./docker-deployment.md).
+
+The archive, SBOM, checksum, keyless provenance, and offline manifest-signing
+boundaries are documented in [Release Supply Chain](./supply-chain.md).

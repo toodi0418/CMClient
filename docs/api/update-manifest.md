@@ -37,6 +37,11 @@ the outer metadata. The Agent accepts a document only when `signingKeyId`
 equals its locally configured trusted key identifier and verification succeeds
 with that corresponding public key.
 
+The release workflow accepts the offline private key only as a base64-encoded
+PKCS#8 Ed25519 GitHub secret, reconstructs this exact canonical payload, and
+emits unpadded standard Base64 for `signature`. It never exposes the key to the
+Agent, Gateway, CLI, Desktop, command arguments, logs, or release artifacts.
+
 All fields are mandatory and reject unknown properties. `version` and
 `minimumAgentVersion` are strict SemVer. `publishedAt` is UTC with millisecond
 precision. A bundle is HTTPS only, has one lowercase 64-character SHA-256

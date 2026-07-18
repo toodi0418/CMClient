@@ -6,6 +6,27 @@ on:
   pull_request:
     branches: [dev]
   workflow_dispatch:
+    inputs:
+      attest:
+        description: Generate keyless Cosign and GitHub provenance attestations
+        required: false
+        default: false
+        type: boolean
+      channel:
+        description: Update channel for an explicitly signed manifest
+        required: false
+        default: dev
+        type: choice
+        options: [stable, beta, dev]
+      minimum_agent_version:
+        description: Minimum Agent SemVer for an explicitly signed manifest
+        required: false
+        default: 2.0.0
+        type: string
+      release_base_url:
+        description: Immutable HTTPS directory containing the finalized archives
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -203,4 +224,127 @@ jobs:
         with:
           name: ${{ steps.stage.outputs.artifact }}
           path: release-build/
+          if-no-files-found: error
+
+  supply-chain:
+    name: Assemble archives, checksums, and SBOM
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cmclient-build-*
+          path: release-build
+          merge-multiple: true
+      - name: Install deterministic archive tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zip zstd
+      - name: Assemble canonical release archives
+        id: release
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          node scripts/release-supply-chain.mjs assemble \
+            --input release-build \
+            --output release-dist \
+            --version "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Generate source SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-dist/cmclient-${{ steps.release.outputs.version }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Finalize and verify supply-chain metadata
+        shell: bash
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          node scripts/release-supply-chain.mjs finalize --output release-dist
+          node scripts/release-supply-chain.mjs verify \
+            --output release-dist \
+            --version "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cmclient-supply-chain-unsigned-${{ steps.release.outputs.version }}
+          path: release-dist/
+          if-no-files-found: error
+
+  attest:
+    name: Sign checksums and publish provenance
+    needs: supply-chain
+    if: github.event_name == 'workflow_dispatch' && inputs.attest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cmclient-supply-chain-unsigned-*
+          path: release-dist
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@b4da77ecad80ff9afe572690e3ce4a55a58e629c # v3.9.1
+        with:
+          cosign-release: v2.5.2
+      - name: Create keyless checksum signature bundle
+        shell: bash
+        run: |
+          cosign sign-blob --yes \
+            --bundle release-dist/SHA256SUMS.sigstore.json \
+            release-dist/SHA256SUMS
+      - name: Attest archive and SBOM checksums
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-checksums: release-dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cmclient-supply-chain-attested
+          path: release-dist/
+          if-no-files-found: error
+
+  sign-update-manifest:
+    name: Sign Agent update manifest
+    needs: supply-chain
+    if: github.event_name == 'workflow_dispatch' && inputs.release_base_url != '' && secrets.CMCLIENT_UPDATE_SIGNING_KEY != '' && vars.CMCLIENT_UPDATE_SIGNING_KEY_ID != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cmclient-supply-chain-unsigned-*
+          path: release-dist
+          merge-multiple: true
+      - name: Sign canonical Agent manifest without exposing the private key
+        shell: bash
+        env:
+          CMCLIENT_UPDATE_SIGNING_KEY: ${{ secrets.CMCLIENT_UPDATE_SIGNING_KEY }}
+          RELEASE_BASE_URL: ${{ inputs.release_base_url }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_MINIMUM_AGENT_VERSION: ${{ inputs.minimum_agent_version }}
+          RELEASE_SIGNING_KEY_ID: ${{ vars.CMCLIENT_UPDATE_SIGNING_KEY_ID }}
+        run: |
+          published_at="$(date --utc +%Y-%m-%dT%H:%M:%S.000Z)"
+          node scripts/release-supply-chain.mjs sign-update-manifest \
+            --index release-dist/release-index.json \
+            --output release-dist/update-manifest.json \
+            --channel "$RELEASE_CHANNEL" \
+            --minimum-agent-version "$RELEASE_MINIMUM_AGENT_VERSION" \
+            --published-at "$published_at" \
+            --release-base-url "$RELEASE_BASE_URL" \
+            --signing-key-id "$RELEASE_SIGNING_KEY_ID" \
+            --private-key-env CMCLIENT_UPDATE_SIGNING_KEY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cmclient-signed-update-manifest
+          path: release-dist/update-manifest.json
           if-no-files-found: error
