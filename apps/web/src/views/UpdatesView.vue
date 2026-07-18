@@ -1,18 +1,74 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, onUnmounted } from "vue";
 import { RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
 import { useGatewayStore } from "@/stores/gateway";
+import { useUpdatesStore } from "@/stores/updates";
 
 const gateway = useGatewayStore();
-const { t } = useI18n();
+const updates = useUpdatesStore();
+const { locale, t } = useI18n();
 const updateCapability = computed(
   () => gateway.capabilities?.capabilities.update,
 );
+const job = computed(() => updates.status?.job);
+const phase = computed(() => job.value?.phase ?? "idle");
+const phaseLabel = computed(() => t("updates.phase." + phase.value));
+const transferLabel = computed(() => {
+  if (!job.value || job.value.bytesDownloaded === null) {
+    return "--";
+  }
+  const total =
+    job.value.bytesTotal === null ? "--" : formatBytes(job.value.bytesTotal);
+  return [formatBytes(job.value.bytesDownloaded), total].join(" / ");
+});
+const speedLabel = computed(() => {
+  if (!job.value || job.value.bytesPerSecond === null) {
+    return "--";
+  }
+  return formatBytes(job.value.bytesPerSecond) + "/s";
+});
 
-onMounted(() => void gateway.refresh());
+async function refresh(): Promise<void> {
+  await Promise.all([gateway.refresh(), updates.refresh()]);
+}
+
+function formatBytes(bytes: number): string {
+  const units = ["B", "KiB", "MiB", "GiB"];
+  const exponent = Math.min(
+    Math.floor(Math.log(Math.max(bytes, 1)) / Math.log(1024)),
+    units.length - 1,
+  );
+  const value = bytes / 1024 ** exponent;
+  return [
+    new Intl.NumberFormat(locale.value, {
+      maximumFractionDigits: exponent === 0 ? 0 : 1,
+    }).format(value),
+    units[exponent],
+  ].join(" ");
+}
+
+function formatUpdatedAt(value: string | undefined): string {
+  if (!value) {
+    return "--";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(locale.value, {
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(date);
+}
+
+onMounted(() => {
+  updates.start();
+  void gateway.refresh();
+});
+onUnmounted(() => updates.stop());
 </script>
 
 <template>
@@ -21,7 +77,7 @@ onMounted(() => void gateway.refresh());
       <div class="panel-heading">
         <div>
           <p class="section-placeholder__eyebrow">
-            {{ t("navigation.updates") }}
+            {{ t("updates.agent") }}
           </p>
           <h2>{{ t("updates.status") }}</h2>
         </div>
@@ -31,16 +87,72 @@ onMounted(() => void gateway.refresh());
           type="button"
           :aria-label="t('common.refresh')"
           :title="t('common.refresh')"
-          :disabled="gateway.loading"
-          @click="gateway.refresh"
+          :disabled="updates.loading"
+          @click="refresh"
           ><RefreshCw :size="17" aria-hidden="true"
         /></Button>
       </div>
-      <p v-if="gateway.errorCode" class="status-message">
+      <template v-if="updates.status">
+        <dl class="facts-grid update-facts">
+          <div>
+            <dt>{{ t("updates.phaseLabel") }}</dt>
+            <dd>
+              <span class="status-badge" :data-state="phase">
+                {{ phaseLabel }}
+              </span>
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("updates.updatedAt") }}</dt>
+            <dd>{{ formatUpdatedAt(job?.updatedAt) }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("updates.transfer") }}</dt>
+            <dd>{{ transferLabel }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("updates.speed") }}</dt>
+            <dd>{{ speedLabel }}</dd>
+          </div>
+        </dl>
+        <div v-if="job" class="update-job-meta">
+          <span>{{ t("updates.job") }}</span>
+          <code>{{ job.id }}</code>
+          <code v-if="job.errorCode" class="stable-code">{{
+            job.errorCode
+          }}</code>
+        </div>
+        <p v-else class="status-message">{{ t("updates.idle") }}</p>
+        <div v-if="job?.recentLogCodes.length" class="update-log">
+          <p>{{ t("updates.log") }}</p>
+          <ul>
+            <li v-for="code in job.recentLogCodes" :key="code">
+              <code>{{ code }}</code>
+            </li>
+          </ul>
+        </div>
+        <code v-if="updates.errorCode" class="stable-code">{{
+          updates.errorCode
+        }}</code>
+      </template>
+      <p v-else class="status-message">
         {{ t("common.unavailable") }}
-        <code class="stable-code">{{ gateway.errorCode }}</code>
+        <code v-if="updates.errorCode" class="stable-code">{{
+          updates.errorCode
+        }}</code>
       </p>
-      <dl v-else class="facts-grid">
+    </div>
+
+    <div class="status-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-placeholder__eyebrow">
+            {{ t("updates.release") }}
+          </p>
+          <h2>{{ t("updates.currentVersion") }}</h2>
+        </div>
+      </div>
+      <dl class="facts-grid">
         <div>
           <dt>{{ t("updates.currentVersion") }}</dt>
           <dd>{{ gateway.status?.build.version ?? "--" }}</dd>
@@ -58,11 +170,7 @@ onMounted(() => void gateway.refresh());
                 updateCapability?.available ? 'available' : 'unavailable'
               "
             >
-              {{
-                updateCapability?.available
-                  ? t("common.available")
-                  : t("common.notConfigured")
-              }}
+              {{ t("updates.agent") }}
             </span>
           </dd>
         </div>

@@ -53,9 +53,24 @@ impl ManagementWebError {
     }
 }
 
+/// Handles a small Agent-owned API surface before a request is forwarded to Gateway.
+///
+/// The management listener remains transport-only: ownership of the actual state stays with
+/// the Agent application that installs this handler.
+pub trait ManagementWebApiHandler: Send + Sync {
+    /// Returns `true` after writing a complete response to `client`.
+    fn handle(
+        &self,
+        client: &mut TcpStream,
+        method: &str,
+        path: &str,
+    ) -> Result<bool, ManagementWebError>;
+}
+
 pub struct ManagementWebListener {
     listener: TcpListener,
     gateway: SocketAddr,
+    api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
 }
 
 pub struct ManagementWebService {
@@ -67,6 +82,18 @@ pub struct ManagementWebService {
 impl ManagementWebService {
     pub fn start(config: &ManagementWebConfig) -> Result<Self, ManagementWebError> {
         let listener = ManagementWebListener::bind(config)?;
+        Self::start_listener(listener)
+    }
+
+    pub fn start_with_api_handler(
+        config: &ManagementWebConfig,
+        api_handler: Arc<dyn ManagementWebApiHandler>,
+    ) -> Result<Self, ManagementWebError> {
+        let listener = ManagementWebListener::bind_with_api_handler(config, api_handler)?;
+        Self::start_listener(listener)
+    }
+
+    fn start_listener(listener: ManagementWebListener) -> Result<Self, ManagementWebError> {
         let address = listener.local_addr()?;
         let shutdown = Arc::new(AtomicBool::new(true));
         let worker_shutdown = Arc::clone(&shutdown);
@@ -105,6 +132,20 @@ impl Drop for ManagementWebService {
 
 impl ManagementWebListener {
     pub fn bind(config: &ManagementWebConfig) -> Result<Self, ManagementWebError> {
+        Self::bind_internal(config, None)
+    }
+
+    pub fn bind_with_api_handler(
+        config: &ManagementWebConfig,
+        api_handler: Arc<dyn ManagementWebApiHandler>,
+    ) -> Result<Self, ManagementWebError> {
+        Self::bind_internal(config, Some(api_handler))
+    }
+
+    fn bind_internal(
+        config: &ManagementWebConfig,
+        api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
+    ) -> Result<Self, ManagementWebError> {
         if !config.enabled {
             return Err(ManagementWebError::Disabled);
         }
@@ -116,6 +157,7 @@ impl ManagementWebListener {
         Ok(Self {
             listener,
             gateway: config.gateway,
+            api_handler,
         })
     }
 
@@ -129,15 +171,16 @@ impl ManagementWebListener {
         loop {
             let (stream, _) = self.listener.accept().map_err(|_| ManagementWebError::Io)?;
             let gateway = self.gateway;
+            let api_handler = self.api_handler.clone();
             thread::spawn(move || {
-                let _ = serve_connection(stream, gateway);
+                let _ = serve_connection(stream, gateway, api_handler);
             });
         }
     }
 
     pub fn serve_once(&self) -> Result<(), ManagementWebError> {
         let (stream, _) = self.listener.accept().map_err(|_| ManagementWebError::Io)?;
-        serve_connection(stream, self.gateway)
+        serve_connection(stream, self.gateway, self.api_handler.clone())
     }
 
     fn serve_until(self, shutdown: &AtomicBool) -> Result<(), ManagementWebError> {
@@ -148,8 +191,9 @@ impl ManagementWebListener {
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     let gateway = self.gateway;
+                    let api_handler = self.api_handler.clone();
                     thread::spawn(move || {
-                        let _ = serve_connection(stream, gateway);
+                        let _ = serve_connection(stream, gateway, api_handler);
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -184,12 +228,21 @@ pub fn gateway_health(gateway: SocketAddr) -> bool {
             .any(|window| window == br#"{"status":"ok"}"#)
 }
 
-fn serve_connection(mut client: TcpStream, gateway: SocketAddr) -> Result<(), ManagementWebError> {
+fn serve_connection(
+    mut client: TcpStream,
+    gateway: SocketAddr,
+    api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
+) -> Result<(), ManagementWebError> {
     client
         .set_read_timeout(Some(GATEWAY_TIMEOUT))
         .map_err(|_| ManagementWebError::Io)?;
     let request = read_request(&mut client)?;
     let (method, path) = request_target(&request)?;
+    if let Some(api_handler) = api_handler
+        && api_handler.handle(&mut client, &method, &path)?
+    {
+        return Ok(());
+    }
     match (method.as_str(), path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => write_response(
             &mut client,
@@ -362,14 +415,36 @@ fn write_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagementWebConfig, ManagementWebError, ManagementWebListener, ManagementWebService,
-        gateway_health,
+        ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
+        ManagementWebService, gateway_health,
     };
     use std::{
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
+        sync::Arc,
         thread,
     };
+
+    struct AgentRoute;
+
+    impl ManagementWebApiHandler for AgentRoute {
+        fn handle(
+            &self,
+            client: &mut TcpStream,
+            method: &str,
+            path: &str,
+        ) -> Result<bool, ManagementWebError> {
+            if method == "GET" && path == "/api/v1/updates" {
+                client
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 16\r\nconnection: close\r\n\r\n{\"schemaVersion\":1}",
+                    )
+                    .map_err(|_| ManagementWebError::Io)?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
 
     #[test]
     fn rejects_lan_bind_without_the_security_layer() {
@@ -459,6 +534,38 @@ mod tests {
             .expect("response should read");
         assert!(response.starts_with("HTTP/1.1 503"));
         assert!(response.contains("GATEWAY_PROXY_UNAVAILABLE"));
+        server
+            .join()
+            .expect("server should join")
+            .expect("server should respond");
+    }
+
+    #[test]
+    fn serves_agent_owned_routes_when_gateway_is_unavailable() {
+        let reserved = TcpListener::bind("127.0.0.1:0").expect("port should bind");
+        let gateway = reserved.local_addr().expect("gateway address should load");
+        drop(reserved);
+        let listener = ManagementWebListener::bind_with_api_handler(
+            &ManagementWebConfig {
+                port: 0,
+                gateway,
+                ..Default::default()
+            },
+            Arc::new(AgentRoute),
+        )
+        .expect("listener should bind");
+        let address = listener.local_addr().expect("address should load");
+        let server = thread::spawn(move || listener.serve_once());
+        let mut client = TcpStream::connect(address).expect("client should connect");
+        client
+            .write_all(b"GET /api/v1/updates HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("request should write");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("response should read");
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("{\"schemaVersion\":1}"));
         server
             .join()
             .expect("server should join")

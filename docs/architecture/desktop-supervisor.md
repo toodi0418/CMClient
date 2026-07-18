@@ -27,5 +27,11 @@ opens only that Agent-provided URL through the official Tauri opener plugin.
 Gateway restart remains an Agent command, so the Desktop process never spawns,
 kills, or probes Gateway directly.
 
+The Desktop update panel first reads the Agent-owned update journal through
+`GET /api/v1/control/updates`. Its Tauri backend then follows the local update
+SSE and forwards only the validated status payload to the webview. It reports
+phase, transfer, speed, stable failure code, and recent stable log codes
+without accessing an archive, signing key, or Gateway update endpoint.
+
 Desktop runtime and CI smoke coverage is documented in
 `docs/testing/desktop-smoke.md`.

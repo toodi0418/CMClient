@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   ExternalLink,
   Minus,
@@ -10,6 +10,7 @@ import {
   X,
 } from "@lucide/vue";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { runWindowControl, type WindowControlAction } from "./window-controls";
@@ -28,10 +29,28 @@ interface ControlStatus {
   uptime_seconds: number;
   latest_error_code: string | null;
 }
+interface UpdateControlJob {
+  id: string;
+  phase: string;
+  updatedAt: string;
+  errorCode: string | null;
+  bytesDownloaded: number | null;
+  bytesTotal: number | null;
+  bytesPerSecond: number | null;
+  recentLogCodes: string[];
+}
+interface UpdateControlStatus {
+  schemaVersion: number;
+  job: UpdateControlJob | null;
+}
 
 const status = ref<ControlStatus>();
 const errorCode = ref<string>();
 const busy = ref(false);
+const updateStatus = ref<UpdateControlStatus>();
+const updateErrorCode = ref<string>();
+const updateBusy = ref(false);
+let unlistenUpdateEvents: UnlistenFn | undefined;
 const appWindow = isTauri() ? getCurrentWindow() : undefined;
 const windowControlTarget = appWindow
   ? {
@@ -51,6 +70,31 @@ const activeErrorCode = computed(
   () => errorCode.value ?? status.value?.latest_error_code,
 );
 const uptimeLabel = computed(() => formatUptime(status.value?.uptime_seconds));
+const updateJob = computed(() => updateStatus.value?.job);
+const updatePhase = computed(() => updateJob.value?.phase ?? "idle");
+const updatePhaseLabel = computed(() =>
+  updatePhase.value
+    .split("_")
+    .map((value) => value.charAt(0).toUpperCase() + value.slice(1))
+    .join(" "),
+);
+const updateTransferLabel = computed(() => {
+  if (!updateJob.value || updateJob.value.bytesDownloaded === null) {
+    return "--";
+  }
+  return [
+    formatBytes(updateJob.value.bytesDownloaded),
+    updateJob.value.bytesTotal === null
+      ? "--"
+      : formatBytes(updateJob.value.bytesTotal),
+  ].join(" / ");
+});
+const updateSpeedLabel = computed(() =>
+  updateJob.value?.bytesPerSecond === null ||
+  updateJob.value?.bytesPerSecond === undefined
+    ? "--"
+    : formatBytes(updateJob.value.bytesPerSecond) + "/s",
+);
 
 async function controlWindow(action: WindowControlAction): Promise<void> {
   if (!windowControlTarget) {
@@ -92,6 +136,46 @@ async function command(command: AgentCommand): Promise<void> {
   }
 }
 
+async function refreshUpdate(): Promise<void> {
+  updateBusy.value = true;
+  try {
+    updateStatus.value = await invoke<UpdateControlStatus>(
+      "agent_update_status",
+    );
+    updateErrorCode.value = undefined;
+  } catch {
+    updateErrorCode.value = "DESKTOP_UPDATE_STATUS_UNAVAILABLE";
+  } finally {
+    updateBusy.value = false;
+  }
+}
+
+async function subscribeToUpdateEvents(): Promise<void> {
+  try {
+    unlistenUpdateEvents = await listen<string>(
+      "agent-update-status",
+      (event) => {
+        try {
+          const update = JSON.parse(event.payload) as UpdateControlStatus;
+          if (
+            update.schemaVersion !== 1 ||
+            !Object.hasOwn(update, "job") ||
+            (update.job !== null && typeof update.job !== "object")
+          ) {
+            throw new Error("invalid update status");
+          }
+          updateStatus.value = update;
+          updateErrorCode.value = undefined;
+        } catch {
+          updateErrorCode.value = "DESKTOP_UPDATE_EVENT_INVALID";
+        }
+      },
+    );
+  } catch {
+    updateErrorCode.value = "DESKTOP_UPDATE_EVENT_UNAVAILABLE";
+  }
+}
+
 async function toggleManagementWeb(): Promise<void> {
   await command(
     managementWebLabel.value === "running" ? "disable_web" : "enable_web",
@@ -122,7 +206,30 @@ function formatUptime(seconds: number | undefined): string {
     .join(":");
 }
 
-onMounted(() => void refresh());
+function formatBytes(bytes: number): string {
+  const units = ["B", "KiB", "MiB", "GiB"];
+  const exponent = Math.min(
+    Math.floor(Math.log(Math.max(bytes, 1)) / Math.log(1024)),
+    units.length - 1,
+  );
+  const value = bytes / 1024 ** exponent;
+  return (
+    value.toLocaleString(undefined, {
+      maximumFractionDigits: exponent === 0 ? 0 : 1,
+    }) +
+    " " +
+    units[exponent]
+  );
+}
+
+onMounted(() => {
+  void refresh();
+  void refreshUpdate();
+  if (isTauri()) {
+    void subscribeToUpdateEvents();
+  }
+});
+onUnmounted(() => unlistenUpdateEvents?.());
 </script>
 
 <template>
@@ -205,6 +312,47 @@ onMounted(() => void refresh());
           <dd>{{ uptimeLabel }}</dd>
         </div>
       </dl>
+      <section class="update-status" aria-label="Update Agent status">
+        <div class="update-status__heading">
+          <span>Update Agent</span>
+          <button
+            class="update-status__refresh"
+            type="button"
+            aria-label="Refresh update status"
+            title="Refresh update status"
+            :disabled="updateBusy"
+            @click="refreshUpdate"
+          >
+            <RefreshCw :size="15" aria-hidden="true" />
+          </button>
+        </div>
+        <div class="update-status__metrics">
+          <div>
+            <span>Phase</span>
+            <strong :data-state="updatePhase">{{ updatePhaseLabel }}</strong>
+          </div>
+          <div>
+            <span>Transfer</span>
+            <strong>{{ updateTransferLabel }}</strong>
+          </div>
+          <div>
+            <span>Speed</span>
+            <strong>{{ updateSpeedLabel }}</strong>
+          </div>
+        </div>
+        <div v-if="updateJob" class="update-status__job">
+          <code>{{ updateJob.id }}</code>
+          <code v-if="updateJob.errorCode">{{ updateJob.errorCode }}</code>
+        </div>
+        <ul v-if="updateJob?.recentLogCodes.length" class="update-status__log">
+          <li v-for="code in updateJob.recentLogCodes" :key="code">
+            <code>{{ code }}</code>
+          </li>
+        </ul>
+        <code v-if="updateErrorCode" class="update-status__error">{{
+          updateErrorCode
+        }}</code>
+      </section>
       <code v-if="activeErrorCode">{{ activeErrorCode }}</code>
       <div class="management-controls">
         <div class="web-toggle-row">

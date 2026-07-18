@@ -1,7 +1,10 @@
 use cmclient_agent_core::AgentConfig;
-use cmclient_control_api::{ControlClient, ControlCommand, ControlStatus, default_unix_socket};
+use cmclient_control_api::{
+    ControlClient, ControlCommand, ControlStatus, UpdateControlStatus, default_unix_socket,
+};
+use std::{thread, time::Duration};
 use tauri::{
-    AppHandle, Manager, Runtime, WindowEvent,
+    AppHandle, Emitter, Manager, Runtime, WindowEvent,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
@@ -10,6 +13,7 @@ use tauri_plugin_opener::OpenerExt;
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_OPEN_ID: &str = "open";
 const TRAY_EXIT_ID: &str = "exit";
+const UPDATE_STATUS_EVENT: &str = "agent-update-status";
 
 #[tauri::command]
 fn agent_status() -> Result<ControlStatus, String> {
@@ -19,6 +23,13 @@ fn agent_status() -> Result<ControlStatus, String> {
 #[tauri::command]
 fn agent_command(command: String) -> Result<ControlStatus, String> {
     control(parse_command(&command)?)
+}
+
+#[tauri::command]
+fn agent_update_status() -> Result<UpdateControlStatus, String> {
+    control_client()?
+        .update_status()
+        .map_err(|error| error.code().to_owned())
 }
 
 #[tauri::command]
@@ -49,10 +60,7 @@ fn parse_command(command: &str) -> Result<ControlCommand, String> {
 }
 
 fn control(command: ControlCommand) -> Result<ControlStatus, String> {
-    let config =
-        AgentConfig::load().map_err(|_| String::from("DESKTOP_AGENT_CONFIG_UNAVAILABLE"))?;
-    let client = ControlClient::new(default_unix_socket(&config.paths.data_dir))
-        .map_err(|error| error.code().to_owned())?;
+    let client = control_client()?;
     match command {
         ControlCommand::Status => client.status(),
         ControlCommand::Start => client.start(),
@@ -62,6 +70,36 @@ fn control(command: ControlCommand) -> Result<ControlStatus, String> {
         ControlCommand::DisableManagementWeb => client.disable_management_web(),
     }
     .map_err(|error| error.code().to_owned())
+}
+
+fn control_client() -> Result<ControlClient, String> {
+    let config =
+        AgentConfig::load().map_err(|_| String::from("DESKTOP_AGENT_CONFIG_UNAVAILABLE"))?;
+    ControlClient::new(default_unix_socket(&config.paths.data_dir))
+        .map_err(|error| error.code().to_owned())
+}
+
+fn start_update_event_forwarder(app: AppHandle) {
+    let _ = thread::Builder::new()
+        .name(String::from("cmclient-desktop-update-events"))
+        .spawn(move || {
+            loop {
+                let Ok(client) = control_client() else {
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                };
+                let Ok(mut events) = client.subscribe_update_events() else {
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                };
+                while let Ok(Some(event)) = events.next_event() {
+                    if let Ok(status) = String::from_utf8(event.data) {
+                        let _ = app.emit(UPDATE_STATUS_EVENT, status);
+                    }
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +166,8 @@ fn main() {
         }))
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            setup_tray(&app.handle())?;
+            setup_tray(app.handle())?;
+            start_update_event_forwarder(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -142,6 +181,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             agent_status,
             agent_command,
+            agent_update_status,
             open_management_web,
             exit_desktop
         ])
@@ -151,7 +191,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{TrayMenuAction, parse_command, tray_menu_action};
+    use super::{TrayMenuAction, UPDATE_STATUS_EVENT, parse_command, tray_menu_action};
     use cmclient_control_api::ControlCommand;
 
     #[test]
@@ -178,5 +218,10 @@ mod tests {
         assert_eq!(tray_menu_action("open"), Some(TrayMenuAction::Open));
         assert_eq!(tray_menu_action("exit"), Some(TrayMenuAction::Exit));
         assert_eq!(tray_menu_action("restart"), None);
+    }
+
+    #[test]
+    fn keeps_the_agent_update_event_name_stable_for_the_webview() {
+        assert_eq!(UPDATE_STATUS_EVENT, "agent-update-status");
     }
 }

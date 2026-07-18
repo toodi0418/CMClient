@@ -392,6 +392,12 @@ mod unix {
         endpoint: PathBuf,
     }
 
+    /// Blocking reader for the Agent-owned update event stream.
+    pub struct ControlUpdateEventStream {
+        stream: UnixStream,
+        buffer: Vec<u8>,
+    }
+
     impl ControlClient {
         pub fn new(endpoint: ControlEndpoint) -> Result<Self, ControlError> {
             let ControlEndpoint::UnixSocket(endpoint) = endpoint else {
@@ -426,6 +432,32 @@ mod unix {
 
         pub fn update_status(&self) -> Result<super::UpdateControlStatus, ControlError> {
             self.request_update("GET", "/api/v1/control/updates")
+        }
+
+        pub fn subscribe_update_events(&self) -> Result<ControlUpdateEventStream, ControlError> {
+            let mut stream = UnixStream::connect(&self.endpoint).map_err(|_| ControlError::Io)?;
+            stream
+                .write_all(
+                    b"GET /api/v1/control/updates/events HTTP/1.1\r\nhost: localhost\r\naccept: text/event-stream\r\n\r\n",
+                )
+                .map_err(|_| ControlError::Io)?;
+            let response = read_sse_response_head(&mut stream)?;
+            let separator = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .ok_or(ControlError::InvalidHttp)?;
+            let (head, body) = response.split_at(separator + 4);
+            if !head.starts_with(b"HTTP/1.1 200")
+                || !String::from_utf8_lossy(head)
+                    .to_ascii_lowercase()
+                    .contains("content-type: text/event-stream")
+            {
+                return Err(ControlError::CommandFailed);
+            }
+            Ok(ControlUpdateEventStream {
+                stream,
+                buffer: body.to_vec(),
+            })
         }
 
         fn request(&self, method: &str, path: &str) -> Result<ControlStatus, ControlError> {
@@ -466,10 +498,101 @@ mod unix {
             serde_json::from_slice(body).map_err(|_| ControlError::InvalidHttp)
         }
     }
+
+    impl ControlUpdateEventStream {
+        /// Reads one update state transition. `None` means the stream closed cleanly.
+        pub fn next_event(&mut self) -> Result<Option<ControlUpdateEvent>, ControlError> {
+            loop {
+                if let Some((index, boundary_length)) = sse_boundary(&self.buffer) {
+                    let block = self.buffer[..index].to_vec();
+                    self.buffer.drain(..index + boundary_length);
+                    if let Some(event) = parse_sse_event(&block)? {
+                        return Ok(Some(event));
+                    }
+                    continue;
+                }
+                if self.buffer.len() > 64 * 1024 {
+                    return Err(ControlError::ResponseTooLarge);
+                }
+                let mut chunk = [0_u8; 4096];
+                let count = self.stream.read(&mut chunk).map_err(|_| ControlError::Io)?;
+                if count == 0 {
+                    return if self.buffer.is_empty() {
+                        Ok(None)
+                    } else {
+                        Err(ControlError::InvalidHttp)
+                    };
+                }
+                self.buffer.extend_from_slice(&chunk[..count]);
+            }
+        }
+    }
+
+    fn read_sse_response_head(stream: &mut UnixStream) -> Result<Vec<u8>, ControlError> {
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk).map_err(|_| ControlError::Io)?;
+            if count == 0 {
+                return Err(ControlError::InvalidHttp);
+            }
+            response.extend_from_slice(&chunk[..count]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(response);
+            }
+            if response.len() > 8 * 1024 {
+                return Err(ControlError::ResponseTooLarge);
+            }
+        }
+    }
+
+    fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+        buffer
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .map(|index| (index, 2))
+            .or_else(|| {
+                buffer
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| (index, 4))
+            })
+    }
+
+    fn parse_sse_event(block: &[u8]) -> Result<Option<ControlUpdateEvent>, ControlError> {
+        let block = std::str::from_utf8(block).map_err(|_| ControlError::InvalidHttp)?;
+        let mut id = None;
+        let mut event = None;
+        let mut data = None;
+        for line in block.lines() {
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            let (field, value) = line.split_once(':').ok_or(ControlError::InvalidHttp)?;
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "id" => id = Some(value.to_owned()),
+                "event" => event = Some(value.to_owned()),
+                "data" => data = Some(value.as_bytes().to_vec()),
+                _ => return Err(ControlError::InvalidHttp),
+            }
+        }
+        match (id, event, data) {
+            (None, None, None) => Ok(None),
+            (Some(id), Some(event), Some(data))
+                if is_safe_sse_token(&id)
+                    && is_safe_sse_token(&event)
+                    && !data.contains(&b'\n') =>
+            {
+                Ok(Some(ControlUpdateEvent { id, event, data }))
+            }
+            _ => Err(ControlError::InvalidHttp),
+        }
+    }
 }
 
 #[cfg(unix)]
-pub use unix::{ControlClient, ControlServer};
+pub use unix::{ControlClient, ControlServer, ControlUpdateEventStream};
 
 #[cfg(not(unix))]
 pub struct ControlServer;
@@ -490,6 +613,16 @@ impl ControlServer {
 
 #[cfg(not(unix))]
 pub struct ControlClient;
+
+#[cfg(not(unix))]
+pub struct ControlUpdateEventStream;
+
+#[cfg(not(unix))]
+impl ControlUpdateEventStream {
+    pub fn next_event(&mut self) -> Result<Option<ControlUpdateEvent>, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+}
 
 #[cfg(not(unix))]
 impl ControlClient {
@@ -524,6 +657,10 @@ impl ControlClient {
     pub fn update_status(&self) -> Result<UpdateControlStatus, ControlError> {
         Err(ControlError::UnsupportedEndpoint)
     }
+
+    pub fn subscribe_update_events(&self) -> Result<ControlUpdateEventStream, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
 }
 
 pub fn is_local_endpoint(endpoint: &ControlEndpoint) -> bool {
@@ -546,8 +683,6 @@ mod tests {
         GatewayControlStatus, ManagementWebControlStatus, StaticControlHandler, UpdateControlJob,
         UpdateControlStatus, default_unix_socket, is_local_endpoint,
     };
-    #[cfg(unix)]
-    use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, mpsc};
 
@@ -687,24 +822,19 @@ mod tests {
             update
         );
 
-        let socket_path = match endpoint {
-            ControlEndpoint::UnixSocket(path) => path,
-            ControlEndpoint::NamedPipe(_) => panic!("unix test must use a unix socket"),
-        };
-        let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
+        let mut events = client
+            .subscribe_update_events()
             .expect("SSE client should connect");
-        stream
-            .write_all(b"GET /api/v1/control/updates/events HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("SSE request should write");
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .expect("SSE response should read");
-        let response = String::from_utf8(response).expect("SSE response should be UTF-8");
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream"));
-        assert!(
-            response
-                .contains("id: update-1\nevent: update.status_changed\ndata: {\"schemaVersion\":1")
+        let event = events
+            .next_event()
+            .expect("SSE event should be valid")
+            .expect("SSE event should arrive");
+        assert_eq!(event.id, "update-1");
+        assert_eq!(event.event, "update.status_changed");
+        assert_eq!(
+            serde_json::from_slice::<UpdateControlStatus>(&event.data)
+                .expect("event data should deserialize"),
+            update
         );
         server_thread
             .join()

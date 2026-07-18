@@ -25,3 +25,10 @@ Agent Control exposes this state while Gateway is stopped at
 subsequent `update.status_changed` projections, and heartbeat comments. It is
 an observation channel only; release signing, download, installation, backup,
 and rollback remain Agent-owned operations.
+
+Desktop and CLI consume that private endpoint directly. The loopback
+Management Web listener relays the same safe projection at
+`GET /api/v1/updates` and `GET /api/v1/updates/events` so the browser has no
+access to the private socket. Each client reads the durable snapshot when it
+opens or reconnects, then follows Agent SSE; a transient stream loss never
+changes the journal state.

@@ -5,9 +5,13 @@ always-on local Control API: disabling the web listener cannot disable Agent,
 CLI, update, or recovery control.
 
 It binds `127.0.0.1:7080` only, serves the static shell, and reverse-proxies
-`/api/*` to the Agent-supervised loopback Gateway. The proxy streams upstream
-responses, including SSE, and forces the upstream connection to close after
-ordinary responses. If the Gateway cannot be reached it returns the stable
+`/api/*` to the Agent-supervised loopback Gateway. Two read-only routes are
+handled by the Agent before that proxy: `GET /api/v1/updates` and
+`GET /api/v1/updates/events`. They expose the durable update-journal
+projection and its `update.status_changed` SSE feed even while Gateway is
+stopped. The proxy streams every other upstream response, including Gateway
+SSE, and forces the upstream connection to close after ordinary responses. If
+the Gateway cannot be reached it returns the stable
 `GATEWAY_PROXY_UNAVAILABLE` code without exposing transport details.
 
 The Agent checks `GET /api/v1/system/health` before reporting a running Gateway
@@ -60,8 +64,9 @@ projections until their authenticated control APIs exist. The Diagnostics page
 submits `POST /api/v1/diagnostics/integrity-check` as an idempotent asynchronous
 Job and renders its persisted Job status; the Gateway handler performs SQLite
 `PRAGMA integrity_check` without exposing database contents. The Updates page
-reports the current build and the Agent-owned update capability only. It does
-not imply that Gateway can update itself.
+validates the Agent snapshot against the shared update contract, subscribes to
+the Agent SSE feed, and displays phase, transfer progress, speed, stable log
+codes, and rollback state. It does not imply that Gateway can update itself.
 
 The shell uses Tailwind 4 through the Vite integration and maps its `cm-*`
 utility names to semantic CSS variables in `apps/web/src/theme/tokens.css`.

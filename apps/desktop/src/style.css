@@ -190,6 +190,106 @@ dd {
   font-weight: 700;
   text-transform: capitalize;
 }
+.update-status {
+  margin-top: 24px;
+  border-top: 1px solid #d7e2d8;
+  border-bottom: 1px solid #d7e2d8;
+}
+.update-status__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 48px;
+  color: #36503d;
+  font-size: 13px;
+  font-weight: 700;
+}
+.update-status__refresh {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid #a7c0ac;
+  place-items: center;
+  color: #1c3f2a;
+  background: #e8f1e9;
+}
+.update-status__refresh:hover:not(:disabled) {
+  background: #cfe3d3;
+}
+.update-status__refresh:focus-visible {
+  outline: 2px solid #2869a4;
+  outline-offset: 2px;
+}
+.update-status__refresh:disabled {
+  opacity: 0.55;
+}
+.update-status__metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  border-top: 1px solid #d7e2d8;
+  background: #d7e2d8;
+}
+.update-status__metrics > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 11px;
+  background: #fafffa;
+}
+.update-status__metrics span {
+  color: #59705f;
+  font-size: 10px;
+  font-weight: 700;
+}
+.update-status__metrics strong {
+  overflow: hidden;
+  color: #18251e;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.update-status__metrics strong[data-state="failed"] {
+  color: #b04c3c;
+}
+.update-status__metrics strong[data-state="rolling_back"] {
+  color: #9a682d;
+}
+.update-status__job,
+.update-status__log {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin: 0;
+  padding: 11px 0;
+  border-top: 1px solid #d7e2d8;
+  list-style: none;
+}
+.update-status__job code,
+.update-status__log code,
+.update-status__error {
+  overflow-wrap: anywhere;
+  color: #36503d;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+.update-status__log {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.update-status__log li {
+  min-width: 0;
+  padding: 6px 7px;
+  border-left: 2px solid #287b52;
+  background: #eef5ef;
+}
+.update-status__error {
+  display: block;
+  padding: 11px 0;
+  border-top: 1px solid #d7e2d8;
+  color: #b04c3c;
+}
 code {
   display: block;
   margin-top: 18px;
@@ -273,5 +373,9 @@ code {
   .management-controls {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .update-status__metrics,
+  .update-status__log {
+    grid-template-columns: 1fr;
   }
 }

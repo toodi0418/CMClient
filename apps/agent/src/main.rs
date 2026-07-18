@@ -1,6 +1,7 @@
 use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::web::{
-    ManagementWebConfig, ManagementWebListener, ManagementWebService, gateway_health,
+    ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
+    ManagementWebService, gateway_health,
 };
 use cmclient_agent_core::{AgentConfig, AgentLease, ensure_runtime_directories};
 use cmclient_control_api::{
@@ -10,12 +11,19 @@ use cmclient_control_api::{
 };
 use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor};
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-    mpsc::{self, SyncSender},
+use std::{
+    collections::BTreeMap,
+    io::Write,
+    net::SocketAddr,
+    path::Path,
+    process::ExitCode,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError, SyncSender},
+    },
+    time::{Duration, Instant},
 };
-use std::{collections::BTreeMap, net::SocketAddr, path::Path, process::ExitCode, time::Instant};
 
 const EX_USAGE: u8 = 2;
 const EX_CONFIG: u8 = 5;
@@ -128,12 +136,117 @@ fn utc_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+struct AgentManagementWebApi {
+    updates: Arc<AgentUpdateService>,
+}
+
+impl ManagementWebApiHandler for AgentManagementWebApi {
+    fn handle(
+        &self,
+        client: &mut std::net::TcpStream,
+        method: &str,
+        path: &str,
+    ) -> Result<bool, ManagementWebError> {
+        match (method, path) {
+            ("GET", "/api/v1/updates") => {
+                let status = match self.updates.status() {
+                    Ok(status) => status,
+                    Err(_) => {
+                        write_management_error(client, "CONTROL_COMMAND_FAILED")?;
+                        return Ok(true);
+                    }
+                };
+                let body = serde_json::to_vec(&status).map_err(|_| ManagementWebError::Io)?;
+                write_management_json(client, "200 OK", &body)?;
+                Ok(true)
+            }
+            ("GET", "/api/v1/updates/events") => {
+                let events = match self.updates.subscribe() {
+                    Ok(events) => events,
+                    Err(_) => {
+                        write_management_error(client, "CONTROL_COMMAND_FAILED")?;
+                        return Ok(true);
+                    }
+                };
+                write_management_update_events(client, events)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+fn write_management_json(
+    client: &mut std::net::TcpStream,
+    status: &str,
+    body: &[u8],
+) -> Result<(), ManagementWebError> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    client
+        .write_all(header.as_bytes())
+        .and_then(|_| client.write_all(body))
+        .map_err(|_| ManagementWebError::Io)
+}
+
+fn write_management_error(
+    client: &mut std::net::TcpStream,
+    code: &str,
+) -> Result<(), ManagementWebError> {
+    let body = format!(r#"{{"code":"{code}"}}"#);
+    write_management_json(client, "503 Service Unavailable", body.as_bytes())
+}
+
+fn write_management_update_events(
+    client: &mut std::net::TcpStream,
+    events: mpsc::Receiver<ControlUpdateEvent>,
+) -> Result<(), ManagementWebError> {
+    client
+        .write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
+        )
+        .map_err(|_| ManagementWebError::Io)?;
+    loop {
+        match events.recv_timeout(Duration::from_secs(15)) {
+            Ok(event) => {
+                if !is_safe_sse_token(&event.id)
+                    || !is_safe_sse_token(&event.event)
+                    || event.data.contains(&b'\n')
+                {
+                    return Err(ManagementWebError::InvalidHttp);
+                }
+                client
+                    .write_all(
+                        format!("id: {}\nevent: {}\ndata: ", event.id, event.event).as_bytes(),
+                    )
+                    .and_then(|_| client.write_all(&event.data))
+                    .and_then(|_| client.write_all(b"\n\n"))
+                    .map_err(|_| ManagementWebError::Io)?;
+            }
+            Err(RecvTimeoutError::Timeout) => client
+                .write_all(b": heartbeat\n\n")
+                .map_err(|_| ManagementWebError::Io)?,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+fn is_safe_sse_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
 struct AgentController {
     supervisor: Mutex<Option<GatewaySupervisor>>,
     gateway: SocketAddr,
     management_web: Mutex<Option<ManagementWebService>>,
     management_web_config: ManagementWebConfig,
-    updates: AgentUpdateService,
+    updates: Arc<AgentUpdateService>,
     started_at: Instant,
     latest_error_code: Mutex<Option<String>>,
 }
@@ -174,16 +287,21 @@ impl AgentController {
             gateway: gateway_address(config.gateway_port),
             ..Default::default()
         };
+        let updates = Arc::new(AgentUpdateService::new(&config.paths.data_dir)?);
+        updates.recover()?;
         let management_web = if config.management_web_enabled {
             Some(
-                ManagementWebService::start(&management_web_config)
-                    .map_err(|_| ControlError::CommandFailed)?,
+                ManagementWebService::start_with_api_handler(
+                    &management_web_config,
+                    Arc::new(AgentManagementWebApi {
+                        updates: Arc::clone(&updates),
+                    }),
+                )
+                .map_err(|_| ControlError::CommandFailed)?,
             )
         } else {
             None
         };
-        let updates = AgentUpdateService::new(&config.paths.data_dir)?;
-        updates.recover()?;
         Ok(Self {
             supervisor: Mutex::new(supervisor),
             gateway: gateway_address(config.gateway_port),
@@ -260,8 +378,13 @@ impl AgentController {
             .map_err(|_| ControlError::CommandFailed)?;
         if management_web.is_none() {
             *management_web = Some(
-                ManagementWebService::start(&self.management_web_config)
-                    .map_err(|_| ControlError::CommandFailed)?,
+                ManagementWebService::start_with_api_handler(
+                    &self.management_web_config,
+                    Arc::new(AgentManagementWebApi {
+                        updates: Arc::clone(&self.updates),
+                    }),
+                )
+                .map_err(|_| ControlError::CommandFailed)?,
             );
         }
         drop(management_web);
@@ -413,7 +536,21 @@ fn serve_web_once() -> ExitCode {
         gateway: gateway_address(config.gateway_port),
         ..Default::default()
     };
-    let listener = match ManagementWebListener::bind(&web_config) {
+    let updates = match AgentUpdateService::new(&config.paths.data_dir) {
+        Ok(updates) => Arc::new(updates),
+        Err(error) => {
+            eprintln!("{}", error.code());
+            return ExitCode::from(EX_CONFIG);
+        }
+    };
+    if let Err(error) = updates.recover() {
+        eprintln!("{}", error.code());
+        return ExitCode::from(EX_CONFIG);
+    }
+    let listener = match ManagementWebListener::bind_with_api_handler(
+        &web_config,
+        Arc::new(AgentManagementWebApi { updates }),
+    ) {
         Ok(listener) => listener,
         Err(error) => {
             eprintln!("{}", error.code());

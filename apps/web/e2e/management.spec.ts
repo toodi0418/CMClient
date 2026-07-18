@@ -5,6 +5,19 @@ const build = {
   commit: "e2e-fixture",
   channel: "dev",
 };
+const updateStatus = {
+  schemaVersion: 1,
+  job: {
+    id: "update-e2e",
+    phase: "downloading",
+    updatedAt: "2026-07-18T00:00:00.000Z",
+    errorCode: null,
+    bytesDownloaded: 524288,
+    bytesTotal: 1048576,
+    bytesPerSecond: 262144,
+    recentLogCodes: ["UPDATE_DOWNLOAD_STARTED", "UPDATE_SIGNATURE_VERIFIED"],
+  },
+};
 const consoleErrors = new WeakMap<Page, string[]>();
 
 test.beforeEach(async ({ page }) => {
@@ -49,6 +62,9 @@ test("settings and update status remain usable on desktop", async ({
   await expect(
     workspace.getByRole("heading", { name: "更新", exact: true }),
   ).toBeVisible();
+  await expect(workspace.getByText("下載中", { exact: true })).toBeVisible();
+  await expect(workspace.getByText("512 KiB / 1 MiB")).toBeVisible();
+  await expect(workspace.getByText("UPDATE_SIGNATURE_VERIFIED")).toBeVisible();
   await expect(workspace.getByText("CAPABILITY_OWNED_BY_AGENT")).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });
@@ -114,6 +130,21 @@ test("proxy runtime status remains legible across desktop and mobile", async ({
 });
 
 async function mockGateway(page: Page): Promise<void> {
+  await page.route("**/api/v1/updates", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(updateStatus),
+    }),
+  );
+  await page.route("**/api/v1/updates/events", (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body:
+        "id: update-e2e\nevent: update.status_changed\ndata: " +
+        JSON.stringify(updateStatus) +
+        "\n\n",
+    }),
+  );
   await page.route("**/api/v1/system/status", (route) =>
     route.fulfill({
       contentType: "application/json",

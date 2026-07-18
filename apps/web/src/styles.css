@@ -599,6 +599,79 @@ h2 {
   border-bottom: 0;
 }
 
+.update-job-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  min-height: 54px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--cm-border-divider);
+  color: var(--cm-text-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.update-job-meta code,
+.update-log code {
+  overflow-wrap: anywhere;
+  color: var(--cm-text-strong);
+  font-family: ui-monospace, "SFMono-Regular", monospace;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.update-job-meta .stable-code {
+  margin: 0 0 0 auto;
+}
+
+.update-log {
+  padding: 15px 18px 18px;
+}
+
+.update-log p {
+  margin: 0 0 10px;
+  color: var(--cm-text-muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.update-log ul {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.update-log li {
+  min-width: 0;
+  padding: 7px 8px;
+  border-left: 2px solid var(--cm-accent);
+  background: var(--cm-surface-strip);
+}
+
+.status-badge[data-state="downloading"],
+.status-badge[data-state="verifying"],
+.status-badge[data-state="staging"],
+.status-badge[data-state="backing_up"],
+.status-badge[data-state="stopping"],
+.status-badge[data-state="installing"],
+.status-badge[data-state="migrating"],
+.status-badge[data-state="starting"],
+.status-badge[data-state="health_checking"],
+.status-badge[data-state="rolling_back"] {
+  color: var(--cm-warning);
+}
+
+.status-badge[data-state="completed"],
+.status-badge[data-state="rollback_completed"] {
+  color: var(--cm-on-accent);
+  border-color: var(--cm-accent);
+  background: var(--cm-accent);
+}
+
 .capability-row > :first-child {
   min-width: 0;
   flex: 1;
@@ -854,6 +927,14 @@ h2 {
 
   .command-action {
     width: 100%;
+  }
+
+  .update-job-meta .stable-code {
+    margin-left: 0;
+  }
+
+  .update-log ul {
+    grid-template-columns: 1fr;
   }
 
   .position-map {
