@@ -14,3 +14,10 @@ and cleared whenever the upstream begins a new config session or stops.
 This boundary has no client sockets, broadcast policy, request/ACK routing, or
 outbound queue. Those responsibilities are added in the later P07 tasks so a
 single upstream cannot regress into a raw bidirectional socket pipe.
+
+`ProxySessionManager` attaches bounded local client sinks to that upstream. A
+new client receives copied cache frames before live broadcast frames. Every
+client has its own FIFO and byte/frame limits; an in-flight write remains part
+of the limit, and only the slow client is closed with
+`PROXY_CLIENT_BACKPRESSURE`. This manager still has no outbound writer or ACK
+authority; P07-T03 adds those serialized request paths.
