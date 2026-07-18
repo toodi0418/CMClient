@@ -2,6 +2,7 @@
 members = [
   "apps/agent",
   "apps/cli",
+  "apps/desktop/src-tauri",
   "crates/agent-core",
   "crates/cli-client",
   "crates/control-api",

@@ -1,0 +1,19 @@
+[package]
+name = "cmclient-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = "2.5.6"
+
+[dependencies]
+cmclient-agent-core = { path = "../../../crates/agent-core" }
+cmclient-control-api = { path = "../../../crates/control-api" }
+serde = { version = "1.0", features = ["derive"] }
+tauri = "2.11.5"
+
+[lints]
+workspace = true

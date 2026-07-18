@@ -4,6 +4,7 @@ node_modules/
 # Build artifacts
 dist/
 target/
+*.tsbuildinfo
 *.zip
 *.asar
 *.exe
@@ -41,6 +42,9 @@ src/web/public/map/tiles.mbtiles
 
 # macOS metadata
 .DS_Store
+
+# Tauri build-generated platform and JSON-schema outputs
+apps/desktop/src-tauri/gen/
 
 # Internal documentation (keep local only)
 docs/callmesh-client.md

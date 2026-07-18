@@ -1,0 +1,22 @@
+{
+  "name": "@cmclient/desktop",
+  "version": "2.0.0-dev.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vue-tsc --noEmit --project tsconfig.json && vite build",
+    "dev": "vite",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "vue": "^3.5.40"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.5",
+    "vue-tsc": "^3.3.7"
+  }
+}

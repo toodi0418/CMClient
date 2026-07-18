@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CMClient",
+  "version": "2.0.0-dev.0",
+  "identifier": "io.cmclient.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "CMClient",
+        "width": 640,
+        "height": 500,
+        "minWidth": 420,
+        "minHeight": 380,
+        "resizable": true
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": { "active": false, "icon": [] }
+}

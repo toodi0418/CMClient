@@ -1,0 +1,97 @@
+:root {
+  color: #18251e;
+  background: #edf3ee;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-width: 320px;
+}
+button {
+  font: inherit;
+}
+.desktop-shell {
+  min-height: 100vh;
+  background: #f2f7f2;
+}
+.desktop-header {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  padding: 0 18px;
+  border-bottom: 1px solid #c8d8ca;
+  background: #f9fcf9;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.status-surface {
+  width: min(100% - 40px, 520px);
+  margin: 56px auto;
+  padding: 30px;
+  border: 1px solid #b8ccbb;
+  background: #fafffa;
+  box-shadow: 0 18px 40px #4f6c5430;
+}
+.eyebrow {
+  margin: 0;
+  color: #287b52;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+.status-surface h1 {
+  margin: 8px 0 28px;
+  font-size: 32px;
+}
+dl {
+  margin: 0;
+  border-top: 1px solid #d7e2d8;
+}
+dl div {
+  display: flex;
+  justify-content: space-between;
+  padding: 14px 0;
+  border-bottom: 1px solid #d7e2d8;
+}
+dt {
+  color: #59705f;
+}
+dd {
+  margin: 0;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+dd[data-state="running"] {
+  color: #247b4e;
+}
+dd[data-state="degraded"] {
+  color: #b85b37;
+}
+code {
+  display: block;
+  margin-top: 18px;
+  color: #b04c3c;
+  font-size: 12px;
+}
+.commands {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 24px;
+}
+.commands button {
+  min-height: 40px;
+  border: 1px solid #a7c0ac;
+  background: #e8f1e9;
+  color: #1c3f2a;
+}
+.commands button:hover:not(:disabled) {
+  background: #cfe3d3;
+}
+.commands button:disabled {
+  opacity: 0.55;
+}
