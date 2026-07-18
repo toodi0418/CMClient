@@ -18,4 +18,4 @@ from the operating system.
 contract is intentionally disabled. Gateway returns `available: false` with
 `REMOTE_DISPATCH_NOT_ENABLED`; clients must not infer availability from the
 presence of a route or task schema. The shared dispatch task/status schema does
-not create a TENMAN, TENMAP, or old Bot compatibility path.
+not create a compatibility path for removed sharing or command features.

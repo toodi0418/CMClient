@@ -91,8 +91,8 @@ claim of persisted audit history.
 
 Remote Dispatch is represented by a shared contract and required capability
 key only. Gateway reports `REMOTE_DISPATCH_NOT_ENABLED`, and the Web route
-renders that unavailable state without a send action. It is not a TENMAN,
-TENMAP, or old Bot compatibility surface.
+renders that unavailable state without a send action. It is not a compatibility
+surface for any removed sharing or command feature.
 
 Settings persists only Web display preferences (theme and locale) in the local
 browser record. Agent-owned management and update capabilities remain read-only

@@ -9,8 +9,8 @@ small supervisor, and CLI is the automation surface.
 
 References below identify implementation and automated-test evidence in the
 repository. Final cross-platform release execution remains a P12 gate. The
-repository-wide TENMAN/TENMAP/old Bot removal scan is P11-T04 and is not
-asserted by this audit.
+repository-wide removal scan is enforced independently and rejects forbidden
+code, environment, database, UI, documentation, and packaged artifacts.
 
 ## Product surfaces
 
@@ -55,8 +55,8 @@ archive launch smoke remain P12 release gates.
 
 ## Fail-closed Remote Dispatch boundary
 
-Remote Message Dispatch is a new capability, not compatibility for TENMAN,
-TENMAP, or the old `@cm` Bot. The shared v1 task/status contract records target,
+Remote Message Dispatch is a new capability, not compatibility for removed
+sharing or command features. The shared v1 task/status contract records target,
 channel, expiry, deduplication, acknowledgement, and stable result state, but
 Gateway always reports `remoteDispatch.available: false` with
 `REMOTE_DISPATCH_NOT_ENABLED`. The Web route renders that capability state and

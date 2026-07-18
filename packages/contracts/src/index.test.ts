@@ -28,7 +28,7 @@ import {
 } from "./index";
 
 describe("remote dispatch contract", () => {
-  it("defines the later feature without a legacy bot compatibility shape", () => {
+  it("defines the later feature without a removed compatibility shape", () => {
     const check = TypeCompiler.Compile(RemoteDispatchTaskSchema);
     expect(
       check.Check({
@@ -55,7 +55,7 @@ describe("remote dispatch contract", () => {
         message: "fixture message",
         expiresAt: "2026-07-18T01:00:00.000Z",
         dedupKey: "dedup-1",
-        status: "legacy_bot",
+        status: "removed_compatibility",
       }),
     ).toBe(false);
   });
