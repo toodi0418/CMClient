@@ -76,3 +76,12 @@ Useful protocol samples, protobuf definitions, data migration knowledge, and
 behavioural regression cases may be retained as references. Legacy Electron,
 raw HTTP server, CallMesh coupling, TENMAN/TENMAP, and self-updating Node
 runtime must not become foundations of the CMClient 2.0 implementation.
+
+## Final Disposition
+
+P11 removed the complete root `src/` runtime, its committed offline map corpus,
+manual root tests, obsolete build/debug scripts, and both Meshtastic gitlinks.
+The locked 41-file `proto/meshtastic/` corpus remains because the production
+Gateway, Docker image, release bundles, and compatibility tests consume it
+directly. Historical paths above identify the audited baseline only; none is a
+current entrypoint or dependency.

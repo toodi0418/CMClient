@@ -50,7 +50,10 @@ export async function assembleReleaseArtifacts({ input, output, version }) {
       );
       await assertNoUnexpectedBuildEntries(buildDirectory, buildManifest);
 
-      const packageRoot = join(temporaryRoot, `${planned.component}-${planned.target}`);
+      const packageRoot = join(
+        temporaryRoot,
+        `${planned.component}-${planned.target}`,
+      );
       const metadataDirectory = join(packageRoot, "metadata");
       await mkdir(metadataDirectory, { recursive: true });
 
@@ -60,7 +63,10 @@ export async function assembleReleaseArtifacts({ input, output, version }) {
         await copyReleaseContent(source, destination, content);
       }
       const stagedManifest = join(metadataDirectory, "build-manifest.json");
-      await writeFile(stagedManifest, `${JSON.stringify(buildManifest, null, 2)}\n`);
+      await writeFile(
+        stagedManifest,
+        `${JSON.stringify(buildManifest, null, 2)}\n`,
+      );
       await chmod(stagedManifest, 0o644);
       await utimes(stagedManifest, EPOCH, EPOCH);
       await normalizeReleaseDirectories(packageRoot);
@@ -70,7 +76,10 @@ export async function assembleReleaseArtifacts({ input, output, version }) {
       await createArchive({
         archive: planned.archive,
         archivePath,
-        entries: [...buildManifest.contents.map(({ path }) => path), "metadata/build-manifest.json"],
+        entries: [
+          ...buildManifest.contents.map(({ path }) => path),
+          "metadata/build-manifest.json",
+        ],
         cwd: packageRoot,
       });
       const metadata = await stat(archivePath);
@@ -99,7 +108,10 @@ export async function finalizeChecksums({ output }) {
   if (sbomNames.length === 0) {
     throw new Error("RELEASE_SBOM_MISSING");
   }
-  const names = [...index.artifacts.map((artifact) => artifact.fileName), ...sbomNames].sort();
+  const names = [
+    ...index.artifacts.map((artifact) => artifact.fileName),
+    ...sbomNames,
+  ].sort();
   const entries = [];
   for (const fileName of names) {
     const filePath = join(outputRoot, fileName);
@@ -124,7 +136,9 @@ export async function verifyReleaseOutput({ output, version }) {
   if (index.artifacts.length !== plan.length) {
     throw new Error("RELEASE_INDEX_ARTIFACTS_INVALID");
   }
-  const expectedByName = new Map(plan.map((artifact) => [artifact.fileName, artifact]));
+  const expectedByName = new Map(
+    plan.map((artifact) => [artifact.fileName, artifact]),
+  );
   for (const artifact of index.artifacts) {
     const expected = expectedByName.get(artifact.fileName);
     if (
@@ -140,15 +154,23 @@ export async function verifyReleaseOutput({ output, version }) {
     }
     const path = join(outputRoot, artifact.fileName);
     const metadata = await stat(path);
-    if (metadata.size !== artifact.sizeBytes || (await sha256File(path)) !== artifact.sha256) {
+    if (
+      metadata.size !== artifact.sizeBytes ||
+      (await sha256File(path)) !== artifact.sha256
+    ) {
       throw new Error("RELEASE_ARCHIVE_DIGEST_INVALID");
     }
   }
 
   const expectedChecksums = await expectedChecksumEntries(outputRoot, index);
   const checksumPath = join(outputRoot, "SHA256SUMS");
-  const actualChecksums = parseChecksumFile(await readFile(checksumPath, "utf8"));
-  if (checksumFileContents(actualChecksums) !== checksumFileContents(expectedChecksums)) {
+  const actualChecksums = parseChecksumFile(
+    await readFile(checksumPath, "utf8"),
+  );
+  if (
+    checksumFileContents(actualChecksums) !==
+    checksumFileContents(expectedChecksums)
+  ) {
     throw new Error("RELEASE_CHECKSUM_FILE_INVALID");
   }
   return index;
@@ -158,7 +180,10 @@ export function checksumFileContents(entries) {
   const names = new Set();
   const normalized = entries
     .map((entry) => {
-      if (!isSafeArtifactFileName(entry.fileName) || !SHA256.test(entry.sha256)) {
+      if (
+        !isSafeArtifactFileName(entry.fileName) ||
+        !SHA256.test(entry.sha256)
+      ) {
         throw new Error("RELEASE_CHECKSUM_ENTRY_INVALID");
       }
       if (names.has(entry.fileName)) {
@@ -208,7 +233,10 @@ export function createSignedUpdateManifest({
   if (!CHANNELS.has(channel)) {
     throw new Error("RELEASE_MANIFEST_CHANNEL_INVALID");
   }
-  if (!UTC_MILLISECONDS.test(publishedAt) || new Date(publishedAt).toISOString() !== publishedAt) {
+  if (
+    !UTC_MILLISECONDS.test(publishedAt) ||
+    new Date(publishedAt).toISOString() !== publishedAt
+  ) {
     throw new Error("RELEASE_MANIFEST_PUBLISHED_AT_INVALID");
   }
   if (!SIGNING_KEY_ID.test(signingKeyId)) {
@@ -216,7 +244,9 @@ export function createSignedUpdateManifest({
   }
   const baseUrl = normalizeReleaseBaseUrl(releaseBaseUrl);
   const expectedPlan = releaseArtifactPlan(version);
-  const artifactsByName = new Map(artifacts.map((artifact) => [artifact.fileName, artifact]));
+  const artifactsByName = new Map(
+    artifacts.map((artifact) => [artifact.fileName, artifact]),
+  );
   if (artifactsByName.size !== expectedPlan.length) {
     throw new Error("RELEASE_MANIFEST_ARTIFACTS_INVALID");
   }
@@ -272,7 +302,11 @@ async function createArchive({ archive, archivePath, entries, cwd }) {
     const tarPath = join(cwd, ".cmclient-release.tar");
     try {
       await run("tar", ["-cf", tarPath, ...entries], cwd);
-      await run("zstd", ["--quiet", "--force", "-19", "-o", archivePath, tarPath], cwd);
+      await run(
+        "zstd",
+        ["--quiet", "--force", "-19", "-o", archivePath, tarPath],
+        cwd,
+      );
     } finally {
       await rm(tarPath, { force: true });
     }
@@ -314,7 +348,10 @@ async function assertNoUnexpectedBuildEntries(buildDirectory, manifest) {
 
   const actualFiles = [];
   await walkBuildEntries(buildDirectory, "", ({ path, metadata }) => {
-    if (metadata.isSymbolicLink() || (!metadata.isFile() && !metadata.isDirectory())) {
+    if (
+      metadata.isSymbolicLink() ||
+      (!metadata.isFile() && !metadata.isDirectory())
+    ) {
       throw new Error("RELEASE_BUILD_CONTENT_INVALID");
     }
     const insideDirectory = directoryRoots.some(
@@ -386,7 +423,10 @@ async function copyReleaseTree(source, destination) {
     const sourcePath = join(source, entry.name);
     const destinationPath = join(destination, entry.name);
     const metadata = await lstat(sourcePath);
-    if (metadata.isSymbolicLink() || (!metadata.isFile() && !metadata.isDirectory())) {
+    if (
+      metadata.isSymbolicLink() ||
+      (!metadata.isFile() && !metadata.isDirectory())
+    ) {
       throw new Error("RELEASE_BUILD_CONTENT_INVALID");
     }
     if (metadata.isDirectory()) {
@@ -421,7 +461,10 @@ async function readBuildManifest(path, planned, version) {
   } catch {
     throw new Error("RELEASE_BUILD_MANIFEST_INVALID");
   }
-  const expectedContents = releaseComposition(planned.component, planned.target);
+  const expectedContents = releaseComposition(
+    planned.component,
+    planned.target,
+  );
   if (
     manifest?.schemaVersion !== 2 ||
     manifest.component !== planned.component ||
@@ -442,7 +485,10 @@ function isCanonicalBuildFileList(files, contents) {
     return false;
   }
   const sorted = [...files].sort(compareCanonicalText);
-  if (JSON.stringify(files) !== JSON.stringify(sorted) || new Set(files).size !== files.length) {
+  if (
+    JSON.stringify(files) !== JSON.stringify(sorted) ||
+    new Set(files).size !== files.length
+  ) {
     return false;
   }
   const validPath = (path) =>
@@ -450,29 +496,42 @@ function isCanonicalBuildFileList(files, contents) {
     path.length > 0 &&
     !path.includes("\\") &&
     !path.includes("\0") &&
-    path.split("/").every((segment) => segment && segment !== "." && segment !== "..");
+    path
+      .split("/")
+      .every((segment) => segment && segment !== "." && segment !== "..");
   if (!files.every(validPath)) {
     return false;
   }
-  return contents.every((content) =>
-    content.kind === "file"
-      ? files.includes(content.path)
-      : files.some((path) => path.startsWith(`${content.path}/`)),
-  ) && files.every((path) =>
-    contents.some((content) =>
-      content.kind === "file" ? path === content.path : path.startsWith(`${content.path}/`),
-    ),
+  return (
+    contents.every((content) =>
+      content.kind === "file"
+        ? files.includes(content.path)
+        : files.some((path) => path.startsWith(`${content.path}/`)),
+    ) &&
+    files.every((path) =>
+      contents.some((content) =>
+        content.kind === "file"
+          ? path === content.path
+          : path.startsWith(`${content.path}/`),
+      ),
+    )
   );
 }
 
 async function readReleaseIndex(outputRoot) {
   let index;
   try {
-    index = JSON.parse(await readFile(join(outputRoot, "release-index.json"), "utf8"));
+    index = JSON.parse(
+      await readFile(join(outputRoot, "release-index.json"), "utf8"),
+    );
   } catch {
     throw new Error("RELEASE_INDEX_INVALID");
   }
-  if (index?.schemaVersion !== 1 || !Array.isArray(index.artifacts) || !SEMVER.test(index.version)) {
+  if (
+    index?.schemaVersion !== 1 ||
+    !Array.isArray(index.artifacts) ||
+    !SEMVER.test(index.version)
+  ) {
     throw new Error("RELEASE_INDEX_INVALID");
   }
   return index;
@@ -595,7 +654,12 @@ function normalizeReleaseBaseUrl(value) {
 function isHttpsUrl(value) {
   try {
     const url = new URL(value);
-    return url.protocol === "https:" && Boolean(url.hostname) && !url.username && !url.password;
+    return (
+      url.protocol === "https:" &&
+      Boolean(url.hostname) &&
+      !url.username &&
+      !url.password
+    );
   } catch {
     return false;
   }
@@ -612,7 +676,11 @@ function compareCanonicalText(left, right) {
 }
 
 function isSafeArtifactFileName(value) {
-  return typeof value === "string" && value === basename(value) && !value.includes("\0");
+  return (
+    typeof value === "string" &&
+    value === basename(value) &&
+    !value.includes("\0")
+  );
 }
 
 async function sha256File(path) {
@@ -627,7 +695,9 @@ async function sha256File(path) {
 async function run(program, argumentsList, cwd) {
   await new Promise((resolvePromise, reject) => {
     const child = spawn(program, argumentsList, { cwd, stdio: "inherit" });
-    child.once("error", () => reject(new Error("RELEASE_ARCHIVE_TOOL_UNAVAILABLE")));
+    child.once("error", () =>
+      reject(new Error("RELEASE_ARCHIVE_TOOL_UNAVAILABLE")),
+    );
     child.once("exit", (code) => {
       if (code === 0) {
         resolvePromise();
@@ -661,7 +731,9 @@ async function main(argumentsList) {
     return;
   }
   if (command === "finalize") {
-    await finalizeChecksums({ output: argumentValue(argumentsList, "--output") });
+    await finalizeChecksums({
+      output: argumentValue(argumentsList, "--output"),
+    });
     return;
   }
   if (command === "verify") {
@@ -672,7 +744,10 @@ async function main(argumentsList) {
     return;
   }
   if (command === "sign-update-manifest") {
-    const privateKeyEnvironment = argumentValue(argumentsList, "--private-key-env");
+    const privateKeyEnvironment = argumentValue(
+      argumentsList,
+      "--private-key-env",
+    );
     if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(privateKeyEnvironment)) {
       throw new Error("RELEASE_SIGNING_KEY_ENVIRONMENT_INVALID");
     }
@@ -685,7 +760,10 @@ async function main(argumentsList) {
     const signed = createSignedUpdateManifest({
       artifacts: index.artifacts,
       channel: argumentValue(argumentsList, "--channel"),
-      minimumAgentVersion: argumentValue(argumentsList, "--minimum-agent-version"),
+      minimumAgentVersion: argumentValue(
+        argumentsList,
+        "--minimum-agent-version",
+      ),
       privateKeyBase64,
       publishedAt: argumentValue(argumentsList, "--published-at"),
       releaseBaseUrl: argumentValue(argumentsList, "--release-base-url"),

@@ -19,10 +19,14 @@ test("release artifact plan covers every planned component-target pair exactly o
   const plan = releaseArtifactPlan("2.0.0-dev.0");
 
   assert.equal(plan.length, 16);
-  assert.deepEqual(new Set(plan.map(({ fileName }) => fileName)).size, plan.length);
+  assert.deepEqual(
+    new Set(plan.map(({ fileName }) => fileName)).size,
+    plan.length,
+  );
   assert.deepEqual(
     plan.find(
-      ({ component, target }) => component === "desktop" && target === "darwin-aarch64",
+      ({ component, target }) =>
+        component === "desktop" && target === "darwin-aarch64",
     ),
     {
       component: "desktop",
@@ -55,15 +59,43 @@ test("canonical compositions encode complete product surfaces and constrained Do
   ]);
   assert.deepEqual(
     releaseComposition("headless", "linux-x86_64").map(({ role }) => role),
-    ["agent", "cli", "migration", "gateway", "web", "proto", "systemdManager", "systemdUnit"],
+    [
+      "agent",
+      "cli",
+      "migration",
+      "gateway",
+      "web",
+      "proto",
+      "systemdManager",
+      "systemdUnit",
+    ],
   );
   assert.deepEqual(
     releaseComposition("desktop", "darwin-aarch64").map(({ role }) => role),
-    ["desktop", "agent", "cli", "migration", "gateway", "web", "proto", "launchdManager", "launchdPlist"],
+    [
+      "desktop",
+      "agent",
+      "cli",
+      "migration",
+      "gateway",
+      "web",
+      "proto",
+      "launchdManager",
+      "launchdPlist",
+    ],
   );
   assert.deepEqual(
     releaseComposition("service", "windows-x86_64").map(({ role }) => role),
-    ["serviceHost", "agent", "cli", "migration", "gateway", "web", "proto", "windowsServiceManager"],
+    [
+      "serviceHost",
+      "agent",
+      "cli",
+      "migration",
+      "gateway",
+      "web",
+      "proto",
+      "windowsServiceManager",
+    ],
   );
   assert.deepEqual(DOCKER_COMPOSITION, {
     kind: "oci-image",
@@ -79,26 +111,49 @@ test("canonical compositions encode complete product surfaces and constrained Do
 });
 
 test("release targets remain identical to the shared signed-update contract", async () => {
-  const updateContract = await readFile("packages/contracts/src/update.ts", "utf8");
-  const match = updateContract.match(/export const UPDATE_TARGETS = \[([\s\S]*?)\] as const;/);
+  const updateContract = await readFile(
+    "packages/contracts/src/update.ts",
+    "utf8",
+  );
+  const match = updateContract.match(
+    /export const UPDATE_TARGETS = \[([\s\S]*?)\] as const;/,
+  );
   assert.ok(match, "UPDATE_TARGETS must be declared in the shared contract");
-  const contractTargets = Array.from(match[1].matchAll(/"([^"]+)"/g), ([, target]) => target);
+  const contractTargets = Array.from(
+    match[1].matchAll(/"([^"]+)"/g),
+    ([, target]) => target,
+  );
 
   assert.deepEqual(RELEASE_TARGETS, contractTargets);
 });
 
 test("release artifact plan rejects unsupported values and non-SemVer versions", () => {
   assert.throws(
-    () => releaseArtifactName({ component: "gateway", target: "linux-x86_64", version: "2.0.0" }),
+    () =>
+      releaseArtifactName({
+        component: "gateway",
+        target: "linux-x86_64",
+        version: "2.0.0",
+      }),
     /unknown release component/,
   );
   assert.throws(
-    () => releaseArtifactName({ component: "cli", target: "linux-riscv64", version: "2.0.0" }),
+    () =>
+      releaseArtifactName({
+        component: "cli",
+        target: "linux-riscv64",
+        version: "2.0.0",
+      }),
     /unknown release target/,
   );
   assert.throws(() => releaseArtifactPlan("v2.0.0"), /version must be SemVer/);
   assert.throws(
-    () => releaseArtifactName({ component: "service", target: "linux-x86_64", version: "2.0.0" }),
+    () =>
+      releaseArtifactName({
+        component: "service",
+        target: "linux-x86_64",
+        version: "2.0.0",
+      }),
     /unsupported component target/,
   );
 });
@@ -118,10 +173,18 @@ test("CLI staging contains only the CLI executable and canonical metadata", asyn
     output,
   });
 
-  assert.equal(manifest.releaseAsset.fileName, "cmclient-cli-linux-x86_64-2.0.0-dev.0.tar.zst");
-  assert.equal(await readFile(join(stagedDirectory, "bin/cmclient"), "utf8"), "fixture executable");
+  assert.equal(
+    manifest.releaseAsset.fileName,
+    "cmclient-cli-linux-x86_64-2.0.0-dev.0.tar.zst",
+  );
+  assert.equal(
+    await readFile(join(stagedDirectory, "bin/cmclient"), "utf8"),
+    "fixture executable",
+  );
   assert.deepEqual(
-    JSON.parse(await readFile(join(stagedDirectory, "build-manifest.json"), "utf8")),
+    JSON.parse(
+      await readFile(join(stagedDirectory, "build-manifest.json"), "utf8"),
+    ),
     manifest,
   );
 });
@@ -164,7 +227,11 @@ test("Headless staging copies Agent, CLI, production Gateway, Web, and platform 
   const directory = await mkdtemp(join(tmpdir(), "cmclient-release-headless-"));
   const output = join(directory, "output");
   t.after(() => rm(directory, { force: true, recursive: true }));
-  const inputs = await createCompositionInputs(directory, "headless", "linux-x86_64");
+  const inputs = await createCompositionInputs(
+    directory,
+    "headless",
+    "linux-x86_64",
+  );
 
   const { manifest, stagedDirectory } = await stageBuild({
     component: "headless",
@@ -176,12 +243,34 @@ test("Headless staging copies Agent, CLI, production Gateway, Web, and platform 
 
   assert.deepEqual(
     manifest.contents.map(({ role }) => role),
-    ["agent", "cli", "migration", "gateway", "web", "proto", "systemdManager", "systemdUnit"],
+    [
+      "agent",
+      "cli",
+      "migration",
+      "gateway",
+      "web",
+      "proto",
+      "systemdManager",
+      "systemdUnit",
+    ],
   );
-  assert.ok(manifest.files.includes("gateway/node_modules/runtime-package/package.json"));
-  assert.equal(manifest.files.some((path) => path.includes("node_modules/.bin/")), false);
-  assert.equal(await readFile(join(stagedDirectory, "bin/cmclient-agent"), "utf8"), "agent");
-  assert.equal(await readFile(join(stagedDirectory, "bin/cmclient"), "utf8"), "cli");
+  assert.ok(
+    manifest.files.includes(
+      "gateway/node_modules/runtime-package/package.json",
+    ),
+  );
+  assert.equal(
+    manifest.files.some((path) => path.includes("node_modules/.bin/")),
+    false,
+  );
+  assert.equal(
+    await readFile(join(stagedDirectory, "bin/cmclient-agent"), "utf8"),
+    "agent",
+  );
+  assert.equal(
+    await readFile(join(stagedDirectory, "bin/cmclient"), "utf8"),
+    "cli",
+  );
   assert.equal(
     await readFile(join(stagedDirectory, "bin/cmclient-migrate"), "utf8"),
     "migration",
@@ -190,20 +279,35 @@ test("Headless staging copies Agent, CLI, production Gateway, Web, and platform 
     await readFile(join(stagedDirectory, "gateway/dist/main.js"), "utf8"),
     "gateway-entrypoint",
   );
-  assert.equal(await readFile(join(stagedDirectory, "web/index.html"), "utf8"), "web-index");
   assert.equal(
-    await readFile(join(stagedDirectory, "proto/meshtastic/mesh.proto"), "utf8"),
-    "syntax = \"proto3\";",
+    await readFile(join(stagedDirectory, "web/index.html"), "utf8"),
+    "web-index",
   );
-  await assert.rejects(() => readFile(join(stagedDirectory, "gateway/node_modules/.bin/tool")));
+  assert.equal(
+    await readFile(
+      join(stagedDirectory, "proto/meshtastic/mesh.proto"),
+      "utf8",
+    ),
+    'syntax = "proto3";',
+  );
+  await assert.rejects(() =>
+    readFile(join(stagedDirectory, "gateway/node_modules/.bin/tool")),
+  );
 });
 
 test("staging fails closed on incomplete production inputs and non-canonical roles", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "cmclient-release-invalid-"));
   t.after(() => rm(directory, { force: true, recursive: true }));
-  const inputs = await createCompositionInputs(directory, "headless", "windows-x86_64");
+  const inputs = await createCompositionInputs(
+    directory,
+    "headless",
+    "windows-x86_64",
+  );
 
-  await rm(join(inputs.gateway, "node_modules"), { force: true, recursive: true });
+  await rm(join(inputs.gateway, "node_modules"), {
+    force: true,
+    recursive: true,
+  });
   await assert.rejects(
     () =>
       stageBuild({
@@ -273,10 +377,19 @@ test("release workflow builds each composition and gates the separate Docker sur
   }
   assert.match(workflow, /docker-composition:/);
   assert.match(workflow, /os: macos-15\n\s+rust_target: aarch64-apple-darwin/);
-  assert.match(workflow, /os: macos-15-intel\n\s+rust_target: x86_64-apple-darwin/);
+  assert.match(
+    workflow,
+    /os: macos-15-intel\n\s+rust_target: x86_64-apple-darwin/,
+  );
   assert.doesNotMatch(workflow, /os: macos-(?:13|14)\b/);
-  assert.match(workflow, /os: ubuntu-22\.04-arm\n\s+rust_target: aarch64-unknown-linux-gnu/);
-  assert.match(workflow, /os: ubuntu-22\.04\n\s+rust_target: x86_64-unknown-linux-gnu/);
+  assert.match(
+    workflow,
+    /os: ubuntu-22\.04-arm\n\s+rust_target: aarch64-unknown-linux-gnu/,
+  );
+  assert.match(
+    workflow,
+    /os: ubuntu-22\.04\n\s+rust_target: x86_64-unknown-linux-gnu/,
+  );
   assert.match(workflow, /node --test scripts\/docker\.test\.mjs/);
   assert.match(workflow, /bash scripts\/docker-smoke\.sh/);
   assert.match(workflow, /bash scripts\/release-bundle-smoke\.sh/);
@@ -298,26 +411,37 @@ async function createCompositionInputs(root, component, target) {
       await writeFile(source, content.role);
     } else if (content.role === "gateway") {
       await mkdir(join(source, "dist"), { recursive: true });
-      await mkdir(join(source, "node_modules", "runtime-package"), { recursive: true });
+      await mkdir(join(source, "node_modules", "runtime-package"), {
+        recursive: true,
+      });
       await mkdir(join(source, "node_modules", ".bin"), { recursive: true });
       await writeFile(join(source, "dist/main.js"), "gateway-entrypoint");
       await writeFile(
         join(source, "package.json"),
         '{"type":"module","dependencies":{"runtime-package":"1.0.0"}}\n',
       );
-      await writeFile(join(source, "node_modules/runtime-package/index.js"), "runtime-package");
+      await writeFile(
+        join(source, "node_modules/runtime-package/index.js"),
+        "runtime-package",
+      );
       await writeFile(
         join(source, "node_modules/runtime-package/package.json"),
         '{"name":"runtime-package","version":"1.0.0"}\n',
       );
-      await writeFile(join(source, "node_modules/.bin/tool"), "install-only-wrapper");
+      await writeFile(
+        join(source, "node_modules/.bin/tool"),
+        "install-only-wrapper",
+      );
     } else if (content.role === "web") {
       await mkdir(join(source, "assets"), { recursive: true });
       await writeFile(join(source, "index.html"), "web-index");
       await writeFile(join(source, "assets/app.js"), "web-asset");
     } else if (content.role === "proto") {
       await mkdir(join(source, "meshtastic"), { recursive: true });
-      await writeFile(join(source, "meshtastic/mesh.proto"), 'syntax = "proto3";');
+      await writeFile(
+        join(source, "meshtastic/mesh.proto"),
+        'syntax = "proto3";',
+      );
     }
     inputs[content.role] = source;
   }

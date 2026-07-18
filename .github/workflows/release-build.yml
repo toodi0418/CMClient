@@ -41,8 +41,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -132,8 +130,6 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: false
       - uses: pnpm/action-setup@v4
         with:
           version: 11.9.0
@@ -255,8 +251,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -271,8 +265,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -369,8 +361,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22

@@ -27,7 +27,8 @@ export const DOCKER_COMPOSITION = Object.freeze({
   excluded: ["agent", "cli", "desktop", "serviceHost"],
 });
 
-const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const SEMVER =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 export function archiveForTarget(target) {
   assertTarget(target);
@@ -79,7 +80,10 @@ export function releaseComposition(component, target) {
     case "headless":
       return headless;
     case "desktop":
-      return [executable("desktop", binaryPath("cmclient-desktop", target)), ...headless];
+      return [
+        executable("desktop", binaryPath("cmclient-desktop", target)),
+        ...headless,
+      ];
     case "service":
       return [
         executable("serviceHost", binaryPath("cmclient-service-host", target)),
@@ -103,7 +107,13 @@ export function releasePlanDocument(version) {
   };
 }
 
-export async function stageBuild({ component, target, version, inputs, output }) {
+export async function stageBuild({
+  component,
+  target,
+  version,
+  inputs,
+  output,
+}) {
   const fileName = releaseArtifactName({ component, target, version });
   const contents = releaseComposition(component, target);
   const inputMap = normalizeInputs(inputs);
@@ -115,7 +125,11 @@ export async function stageBuild({ component, target, version, inputs, output })
 
   for (const content of contents) {
     const source = inputMap.get(content.role);
-    await copyCanonicalInput(source, join(directory, ...content.path.split("/")), content);
+    await copyCanonicalInput(
+      source,
+      join(directory, ...content.path.split("/")),
+      content,
+    );
   }
   const files = (await listReleaseFiles(directory)).sort(compareCanonicalText);
 
@@ -131,7 +145,10 @@ export async function stageBuild({ component, target, version, inputs, output })
     contents,
     files,
   };
-  await writeFile(join(directory, "build-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  await writeFile(
+    join(directory, "build-manifest.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
   return { manifest, stagedDirectory: directory };
 }
 
@@ -260,15 +277,21 @@ async function assertProductionDirectory(source, role) {
         ? ["index.html"]
         : role === "proto"
           ? ["meshtastic/mesh.proto"]
-        : [];
+          : [];
   for (const relativePath of required) {
     try {
       const metadata = await lstat(join(source, ...relativePath.split("/")));
-      if (relativePath === "node_modules" ? !metadata.isDirectory() : !metadata.isFile()) {
+      if (
+        relativePath === "node_modules"
+          ? !metadata.isDirectory()
+          : !metadata.isFile()
+      ) {
         throw new Error();
       }
     } catch {
-      throw new Error(`release production input invalid: ${role} missing ${relativePath}`);
+      throw new Error(
+        `release production input invalid: ${role} missing ${relativePath}`,
+      );
     }
   }
   if (role === "gateway") {
@@ -279,17 +302,25 @@ async function assertProductionDirectory(source, role) {
 async function assertGatewayProductionDependencies(source) {
   let packageJson;
   try {
-    packageJson = JSON.parse(await readFile(join(source, "package.json"), "utf8"));
+    packageJson = JSON.parse(
+      await readFile(join(source, "package.json"), "utf8"),
+    );
   } catch {
     throw new Error("release production input invalid: gateway package.json");
   }
   const dependencies = Object.keys(packageJson.dependencies ?? {});
   if (dependencies.length === 0) {
-    throw new Error("release production input invalid: gateway dependencies missing");
+    throw new Error(
+      "release production input invalid: gateway dependencies missing",
+    );
   }
   for (const dependency of dependencies) {
     try {
-      const dependencyRoot = join(source, "node_modules", ...dependency.split("/"));
+      const dependencyRoot = join(
+        source,
+        "node_modules",
+        ...dependency.split("/"),
+      );
       const [metadata, packageMetadata] = await Promise.all([
         lstat(dependencyRoot),
         lstat(join(dependencyRoot, "package.json")),
@@ -326,7 +357,8 @@ async function copyDirectory(source, destination, options) {
     if (metadata.isDirectory()) {
       copiedFiles += await copyDirectory(sourcePath, destinationPath, {
         ...options,
-        insideNodeModules: options.insideNodeModules || entry.name === "node_modules",
+        insideNodeModules:
+          options.insideNodeModules || entry.name === "node_modules",
       });
       continue;
     }
@@ -376,7 +408,9 @@ function argumentValue(argumentsList, name) {
 
 function argumentValues(argumentsList, name) {
   return argumentsList.flatMap((value, index) =>
-    value === name && index < argumentsList.length - 1 ? [argumentsList[index + 1]] : [],
+    value === name && index < argumentsList.length - 1
+      ? [argumentsList[index + 1]]
+      : [],
   );
 }
 
@@ -419,11 +453,16 @@ async function main(argumentsList) {
     return;
   }
   if (command === "check-plan") {
-    const content = await readFile(argumentValue(argumentsList, "--input"), "utf8");
+    const content = await readFile(
+      argumentValue(argumentsList, "--input"),
+      "utf8",
+    );
     const plan = JSON.parse(content);
     const expected = releasePlanDocument(plan.version);
     if (JSON.stringify(plan) !== JSON.stringify(expected)) {
-      throw new Error("release artifact plan does not match the canonical matrix");
+      throw new Error(
+        "release artifact plan does not match the canonical matrix",
+      );
     }
     return;
   }

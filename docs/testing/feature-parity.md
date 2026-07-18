@@ -10,7 +10,8 @@ small supervisor, and CLI is the automation surface.
 References below identify implementation and automated-test evidence in the
 repository. Final cross-platform release execution remains a P12 gate. The
 repository-wide removal scan is enforced independently and rejects forbidden
-code, environment, database, UI, documentation, and packaged artifacts.
+code, environment, database, UI, documentation, packaged artifacts, root
+Legacy runtime paths, gitlinks, and retired direct dependencies.
 
 ## Product surfaces
 

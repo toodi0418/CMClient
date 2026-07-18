@@ -1,14 +1,14 @@
-'use strict';
+"use strict";
 
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const test = require('node:test');
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const test = require("node:test");
 
-const fixturePath = path.join(__dirname, 'sanitized-packets.json');
-const fixtureSet = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+const fixturePath = path.join(__dirname, "sanitized-packets.json");
+const fixtureSet = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
 
-test('sanitized packet fixtures have a valid minimal shape', () => {
+test("sanitized packet fixtures have a valid minimal shape", () => {
   assert.equal(fixtureSet.schemaVersion, 1);
   assert.equal(fixtureSet.sanitized, true);
   assert.equal(fixtureSet.privacy.containsProductionTraffic, false);
@@ -23,7 +23,7 @@ test('sanitized packet fixtures have a valid minimal shape', () => {
     assert.match(fixture.id, /^[a-z0-9-]+$/);
     assert.equal(ids.has(fixture.id), false, `${fixture.id} must be unique`);
     ids.add(fixture.id);
-    assert.equal(fixture.recording.rawFrameEncoding, 'synthetic-hex');
+    assert.equal(fixture.recording.rawFrameEncoding, "synthetic-hex");
     assert.match(fixture.recording.rawFrameHex, /^[0-9a-f]+$/i);
     assert.match(fixture.recording.gatewayId, /^fixture-gateway-[a-z]+$/);
     assert.match(fixture.recording.serverIngestedAt, /^\d{4}-\d{2}-\d{2}T/);
@@ -32,8 +32,10 @@ test('sanitized packet fixtures have a valid minimal shape', () => {
   }
 });
 
-test('position fixture expectations preserve CMClient 2.0 safety rules', () => {
-  const positions = fixtureSet.fixtures.filter((fixture) => fixture.category === 'position');
+test("position fixture expectations preserve CMClient 2.0 safety rules", () => {
+  const positions = fixtureSet.fixtures.filter(
+    (fixture) => fixture.category === "position",
+  );
   assert.equal(positions.length, 4);
 
   for (const fixture of positions) {
@@ -41,26 +43,28 @@ test('position fixture expectations preserve CMClient 2.0 safety rules', () => {
     assert.ok(Number.isInteger(position.precisionBits));
     if (fixture.expected.aprsUploadEligible) {
       assert.equal(position.precisionBits, 32);
-      assert.equal(fixture.expected.decisionCode, 'POSITION_ACCEPTED');
+      assert.equal(fixture.expected.decisionCode, "POSITION_ACCEPTED");
     }
   }
 
   assert.equal(
-    positions.find((fixture) => fixture.id === 'position-rejected-insufficient-precision').expected
-      .aprsUploadEligible,
-    false
+    positions.find(
+      (fixture) => fixture.id === "position-rejected-insufficient-precision",
+    ).expected.aprsUploadEligible,
+    false,
   );
   assert.equal(
-    positions.find((fixture) => fixture.id === 'position-backlog-older-than-high-water').recording
-      .isBacklog,
-    true
+    positions.find(
+      (fixture) => fixture.id === "position-backlog-older-than-high-water",
+    ).recording.isBacklog,
+    true,
   );
 });
 
-test('fixture serialization contains no credential markers', () => {
+test("fixture serialization contains no credential markers", () => {
   const serialized = JSON.stringify(fixtureSet);
   assert.doesNotMatch(
     serialized,
-    /(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|gh[pousr]_[A-Za-z0-9_]{20,}|CALLMESH_API_KEY\s*=|APRS_PASSCODE\s*=)/i
+    /(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|gh[pousr]_[A-Za-z0-9_]{20,}|CALLMESH_API_KEY\s*=|APRS_PASSCODE\s*=)/i,
   );
 });

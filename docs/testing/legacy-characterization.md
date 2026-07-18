@@ -11,7 +11,7 @@ location.
 Run the current fixture contract with:
 
 ```bash
-npm run test:fixtures
+pnpm run test:fixtures
 ```
 
 ## Fixture Rules
@@ -48,6 +48,10 @@ npm run test:fixtures
 | Proxy | No valid legacy equivalent | Multi-client framed manager, ACK routing, modes, limits, audit, and backpressure | P07 |
 | Removed features | TENMAN/TENMAP and `@cm` code/docs | Repository scan proves no code, environment variable, database, UI, fixture, or documentation compatibility path remains | P11 |
 | Release and migration | Legacy scripts/data paths | Clean install, import dry run, backup/restore, signed update/rollback, service and Docker smoke | P09-P12 |
+
+The Legacy evidence column names paths from the audited baseline commit. P11
+removed those runtime paths after their retained behaviours were covered by the
+listed CMClient 2.0 tests; the paths are not present in the current tree.
 
 ## Position Replay Cases Required Before Release
 

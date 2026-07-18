@@ -45,11 +45,20 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
     version,
   });
   assert.deepEqual(
-    repeated.artifacts.map(({ fileName, sha256, sizeBytes }) => ({ fileName, sha256, sizeBytes })),
-    index.artifacts.map(({ fileName, sha256, sizeBytes }) => ({ fileName, sha256, sizeBytes })),
+    repeated.artifacts.map(({ fileName, sha256, sizeBytes }) => ({
+      fileName,
+      sha256,
+      sizeBytes,
+    })),
+    index.artifacts.map(({ fileName, sha256, sizeBytes }) => ({
+      fileName,
+      sha256,
+      sizeBytes,
+    })),
   );
   const desktopArchive = plan.find(
-    ({ component, target }) => component === "desktop" && target === "darwin-aarch64",
+    ({ component, target }) =>
+      component === "desktop" && target === "darwin-aarch64",
   );
   assert.ok(desktopArchive);
   const { stdout: desktopListing } = await runFile("tar", [
@@ -70,7 +79,10 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
     "packaging/launchd/io.cmclient.agent.plist.in",
     "metadata/build-manifest.json",
   ]) {
-    assert.ok(desktopEntries.has(expected), `desktop archive must contain ${expected}`);
+    assert.ok(
+      desktopEntries.has(expected),
+      `desktop archive must contain ${expected}`,
+    );
   }
 
   const portableArchive = plan.find(
@@ -91,7 +103,12 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   const portableV2 = join(root, "portable-v2");
   const retainedData = join(root, "user-data", "retained-state");
   await mkdir(portableV1, { recursive: true });
-  await runFile("tar", ["-xf", join(output, portableArchive.fileName), "-C", portableV1]);
+  await runFile("tar", [
+    "-xf",
+    join(output, portableArchive.fileName),
+    "-C",
+    portableV1,
+  ]);
   assert.equal(
     await readFile(join(portableV1, "bin/cmclient"), "utf8"),
     `fixture-${portableIndex}-cli`,
@@ -111,41 +128,69 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   });
   const upgradeArchive = upgradePlan.find(
     (artifact) =>
-      artifact.component === portableArchive.component && artifact.target === portableArchive.target,
+      artifact.component === portableArchive.component &&
+      artifact.target === portableArchive.target,
   );
   assert.ok(upgradeArchive);
   await mkdir(portableV2, { recursive: true });
-  await runFile("tar", ["-xf", join(upgradeOutput, upgradeArchive.fileName), "-C", portableV2]);
+  await runFile("tar", [
+    "-xf",
+    join(upgradeOutput, upgradeArchive.fileName),
+    "-C",
+    portableV2,
+  ]);
   await rm(portableV1, { force: true, recursive: true });
   assert.equal(
     await readFile(join(portableV2, "bin/cmclient"), "utf8"),
     `upgrade-${portableIndex}-cli`,
   );
-  assert.equal(await readFile(retainedData, "utf8"), "must survive portable refresh");
+  assert.equal(
+    await readFile(retainedData, "utf8"),
+    "must survive portable refresh",
+  );
 
-  await writeFile(join(output, "cmclient-2.0.0-dev.0.spdx.json"), "{\"spdxVersion\":\"SPDX-2.3\"}\n");
+  await writeFile(
+    join(output, "cmclient-2.0.0-dev.0.spdx.json"),
+    '{"spdxVersion":"SPDX-2.3"}\n',
+  );
   await finalizeChecksums({ output });
   await assert.doesNotReject(() => verifyReleaseOutput({ output, version }));
 });
 
 async function stageFixture(input, plan, version, prefix) {
   for (const [index, artifact] of plan.entries()) {
-    const sourceRoot = join(input, "..", "sources", `${artifact.component}-${artifact.target}`);
+    const sourceRoot = join(
+      input,
+      "..",
+      "sources",
+      `${artifact.component}-${artifact.target}`,
+    );
     const inputs = {};
-    for (const content of releaseComposition(artifact.component, artifact.target)) {
+    for (const content of releaseComposition(
+      artifact.component,
+      artifact.target,
+    )) {
       const source = join(sourceRoot, content.role);
       if (content.kind === "file") {
         await mkdir(sourceRoot, { recursive: true });
         await writeFile(source, `${prefix}-${index}-${content.role}`);
       } else if (content.role === "gateway") {
         await mkdir(join(source, "dist"), { recursive: true });
-        await mkdir(join(source, "node_modules", "runtime-package"), { recursive: true });
-        await writeFile(join(source, "dist/main.js"), `${prefix}-${index}-gateway`);
+        await mkdir(join(source, "node_modules", "runtime-package"), {
+          recursive: true,
+        });
+        await writeFile(
+          join(source, "dist/main.js"),
+          `${prefix}-${index}-gateway`,
+        );
         await writeFile(
           join(source, "package.json"),
           '{"type":"module","dependencies":{"runtime-package":"1.0.0"}}\n',
         );
-        await writeFile(join(source, "node_modules/runtime-package/index.js"), "runtime-package");
+        await writeFile(
+          join(source, "node_modules/runtime-package/index.js"),
+          "runtime-package",
+        );
         await writeFile(
           join(source, "node_modules/runtime-package/package.json"),
           '{"name":"runtime-package","version":"1.0.0"}\n',
@@ -155,7 +200,10 @@ async function stageFixture(input, plan, version, prefix) {
         await writeFile(join(source, "index.html"), `${prefix}-${index}-web`);
       } else if (content.role === "proto") {
         await mkdir(join(source, "meshtastic"), { recursive: true });
-        await writeFile(join(source, "meshtastic/mesh.proto"), 'syntax = "proto3";');
+        await writeFile(
+          join(source, "meshtastic/mesh.proto"),
+          'syntax = "proto3";',
+        );
       }
       inputs[content.role] = source;
     }
@@ -181,7 +229,12 @@ test("assembler rejects files outside the canonical staged composition", async (
   );
 
   await assert.rejects(
-    () => assembleReleaseArtifacts({ input, output: join(root, "output"), version }),
+    () =>
+      assembleReleaseArtifacts({
+        input,
+        output: join(root, "output"),
+        version,
+      }),
     /RELEASE_BUILD_CONTENT_UNEXPECTED/,
   );
 });
@@ -202,7 +255,10 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
       sizeBytes: contents.length,
     });
   }
-  await writeFile(join(output, "cmclient-2.0.0-dev.0.spdx.json"), "{\"spdxVersion\":\"SPDX-2.3\"}\n");
+  await writeFile(
+    join(output, "cmclient-2.0.0-dev.0.spdx.json"),
+    '{"spdxVersion":"SPDX-2.3"}\n',
+  );
   await writeFile(
     join(output, "release-index.json"),
     `${JSON.stringify({ schemaVersion: 1, version, artifacts }, null, 2)}\n`,
@@ -210,7 +266,10 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
 
   const checksums = await finalizeChecksums({ output });
   assert.equal(checksums.length, plan.length + 1);
-  assert.match(checksumFileContents(checksums), /\*cmclient-2\.0\.0-dev\.0\.spdx\.json/);
+  assert.match(
+    checksumFileContents(checksums),
+    /\*cmclient-2\.0\.0-dev\.0\.spdx\.json/,
+  );
   await assert.doesNotReject(() => verifyReleaseOutput({ output, version }));
 
   await writeFile(join(output, plan[0].fileName), "tampered");
@@ -232,7 +291,9 @@ test("signed update manifest is exact Ed25519 canonical payload data", () => {
     })),
     channel: "dev",
     minimumAgentVersion: "2.0.0-dev.0",
-    privateKeyBase64: privateKey.export({ format: "der", type: "pkcs8" }).toString("base64"),
+    privateKeyBase64: privateKey
+      .export({ format: "der", type: "pkcs8" })
+      .toString("base64"),
     publishedAt: "2026-07-18T08:00:00.000Z",
     releaseBaseUrl: "https://releases.example.invalid/cmclient/2.0.0-dev.0",
     signingKeyId: "release-2026",
@@ -272,7 +333,9 @@ test("manifest creation rejects invalid publication inputs before signing", () =
     })),
     channel: "stable",
     minimumAgentVersion: "2.0.0",
-    privateKeyBase64: privateKey.export({ format: "der", type: "pkcs8" }).toString("base64"),
+    privateKeyBase64: privateKey
+      .export({ format: "der", type: "pkcs8" })
+      .toString("base64"),
     publishedAt: "2026-07-18T08:00:00.000Z",
     releaseBaseUrl: "https://releases.example.invalid/cmclient/2.0.0",
     signingKeyId: "release-2026",
@@ -280,7 +343,11 @@ test("manifest creation rejects invalid publication inputs before signing", () =
   };
 
   assert.throws(
-    () => createSignedUpdateManifest({ ...options, releaseBaseUrl: "http://example.invalid" }),
+    () =>
+      createSignedUpdateManifest({
+        ...options,
+        releaseBaseUrl: "http://example.invalid",
+      }),
     /RELEASE_MANIFEST_BASE_URL_INVALID/,
   );
   assert.throws(
@@ -294,19 +361,39 @@ test("manifest creation rejects invalid publication inputs before signing", () =
 });
 
 test("release workflow keeps provenance and signing outside ordinary CI permissions", async () => {
-  const workflow = await readFile(".github/workflows/release-build.yml", "utf8");
-  const signingJob = workflow.slice(workflow.indexOf("  sign-update-manifest:"));
+  const workflow = await readFile(
+    ".github/workflows/release-build.yml",
+    "utf8",
+  );
+  const signingJob = workflow.slice(
+    workflow.indexOf("  sign-update-manifest:"),
+  );
 
-  assert.match(workflow, /anchore\/sbom-action@e22c389904149dbc22b58101806040fa8d37a610/);
-  assert.match(workflow, /sigstore\/cosign-installer@b4da77ecad80ff9afe572690e3ce4a55a58e629c/);
-  assert.match(workflow, /actions\/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45/);
+  assert.match(
+    workflow,
+    /anchore\/sbom-action@e22c389904149dbc22b58101806040fa8d37a610/,
+  );
+  assert.match(
+    workflow,
+    /sigstore\/cosign-installer@b4da77ecad80ff9afe572690e3ce4a55a58e629c/,
+  );
+  assert.match(
+    workflow,
+    /actions\/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45/,
+  );
   assert.match(workflow, /cosign sign-blob --yes/);
   assert.match(workflow, /subject-checksums: release-dist\/SHA256SUMS/);
   assert.match(workflow, /id-token: write/);
   assert.match(workflow, /attestations: write/);
   assert.match(workflow, /secrets\.CMCLIENT_UPDATE_SIGNING_KEY/);
-  assert.match(workflow, /github\.event_name == 'workflow_dispatch' && inputs\.attest/);
-  assert.match(workflow, /RELEASE_BASE_URL: \$\{\{ inputs\.release_base_url \}\}/);
+  assert.match(
+    workflow,
+    /github\.event_name == 'workflow_dispatch' && inputs\.attest/,
+  );
+  assert.match(
+    workflow,
+    /RELEASE_BASE_URL: \$\{\{ inputs\.release_base_url \}\}/,
+  );
   assert.match(workflow, /--release-base-url "\$RELEASE_BASE_URL"/);
   assert.match(signingJob, /actions\/checkout@v4/);
   assert.match(signingJob, /actions\/setup-node@v4/);
@@ -316,14 +403,20 @@ test("release workflow keeps provenance and signing outside ordinary CI permissi
     signingJob,
     /Sign canonical Agent manifest[\s\S]*CMCLIENT_UPDATE_SIGNING_KEY: \$\{\{ secrets\.CMCLIENT_UPDATE_SIGNING_KEY \}\}/,
   );
+  assert.doesNotMatch(signingJob, /if:.*secrets\.CMCLIENT_UPDATE_SIGNING_KEY/);
   assert.doesNotMatch(
-    signingJob,
-    /if:.*secrets\.CMCLIENT_UPDATE_SIGNING_KEY/,
-  );
-  assert.doesNotMatch(
-    signingJob.slice(0, signingJob.indexOf("      - name: Sign canonical Agent manifest")),
+    signingJob.slice(
+      0,
+      signingJob.indexOf("      - name: Sign canonical Agent manifest"),
+    ),
     /CMCLIENT_UPDATE_SIGNING_KEY:/,
   );
-  assert.doesNotMatch(workflow, /--release-base-url "\$\{\{ inputs\.release_base_url \}\}"/);
-  assert.doesNotMatch(workflow, /CMCLIENT_UPDATE_SIGNING_KEY:\s+['"][A-Za-z0-9+/=]+/);
+  assert.doesNotMatch(
+    workflow,
+    /--release-base-url "\$\{\{ inputs\.release_base_url \}\}"/,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /CMCLIENT_UPDATE_SIGNING_KEY:\s+['"][A-Za-z0-9+/=]+/,
+  );
 });

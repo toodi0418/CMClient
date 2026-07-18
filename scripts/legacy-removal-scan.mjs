@@ -74,8 +74,7 @@ export const ALLOWED_REMOVAL_EVIDENCE = new Map([
         code: "LEGACY_MAP_REFERENCE",
         line: 24,
         count: 2,
-        context:
-          "| `shareWithTenmanMap` | `LEGACY_SETTINGS_REMOVED_TENMAN` |",
+        context: "| `shareWithTenmanMap` | `LEGACY_SETTINGS_REMOVED_TENMAN` |",
       },
       {
         code: "LEGACY_MAP_REFERENCE",
@@ -169,7 +168,7 @@ export const ALLOWED_REMOVAL_EVIDENCE = new Map([
     [
       {
         code: "LEGACY_MAP_REFERENCE",
-        line: 37,
+        line: 49,
         count: 1,
         context: "    /TENMAN|TMAG_|AUTO_UPDATE|git clone|callmesh-client/i,",
       },
@@ -195,13 +194,49 @@ const FORBIDDEN_ARTIFACT_PATHS = [
   /\.(?:log|out)$/i,
 ];
 
+const FORBIDDEN_LEGACY_RUNTIME_PATHS = [
+  /^\.gitmodules$/,
+  /^src(?:\/|$)/,
+  /^meshtastic(?:-device)?$/,
+  /^decrypt_meshtastic\.py$/,
+  /^test_[^/]*\.js$/,
+  /^scripts\/(?:aprs-feed-test|build-linux|build-win|fix-telemetry-timestamps|run-electron|test-aprs-feed|testAprsConnection)\.js$/,
+  /^docs\/(?:callmesh-client|meshwaya-anti-backtrack)\.md$/,
+  /^meshtastic_aprs_antibacktrack_spec\.md$/,
+];
+
+const FORBIDDEN_PACKAGE_DEPENDENCIES = new Set([
+  "@yao-pkg/pkg",
+  "bonjour-service",
+  "chart.js",
+  "electron",
+  "electron-packager",
+  "geojson-vt",
+  "maplibre-gl",
+  "unishox2.siara.cc",
+  "vt-pbf",
+  "ws",
+  "yargs",
+]);
+
+const FORBIDDEN_PACKAGE_SCRIPT =
+  /(?:electron(?:-packager)?|@yao-pkg\/pkg|node\s+src\/index\.js|scripts\/(?:build-(?:linux|win)|run-electron)\.js)/i;
+
+const REQUIRED_RETAINED_PATHS = new Set([
+  "crates/legacy-migration/src/lib.rs",
+  "crates/legacy-migration/tests/cli.rs",
+  "docs/architecture/legacy-settings-migration.md",
+  "docs/legacy-feature-matrix.md",
+  "docs/legacy-inventory.md",
+  "docs/testing/legacy-characterization.md",
+  "proto/meshtastic/mesh.proto",
+  "test/fixtures/legacy-settings-sanitized.json",
+]);
+
 const FORBIDDEN_CONTENT = [
   ["LEGACY_MAP_REFERENCE", /tenman(?:map)?|tenmap/gi],
   ["LEGACY_ENV_REFERENCE", /\bTMAG_[A-Z0-9_]+\b/g],
-  [
-    "LEGACY_BOT_REFERENCE",
-    /@cm(?![A-Z0-9_-])|(?:legacy|old)[\s_.-]*bot/gi,
-  ],
+  ["LEGACY_BOT_REFERENCE", /@cm(?![A-Z0-9_-])|(?:legacy|old)[\s_.-]*bot/gi],
 ];
 
 function searchableText(bytes) {
@@ -218,6 +253,9 @@ function rawViolations(path, bytes) {
     /tenman(?:map)?|tenmap|tmag/i.test(path)
   ) {
     violations.push({ path, code: "LEGACY_ARTIFACT_PATH", count: 1 });
+  }
+  if (FORBIDDEN_LEGACY_RUNTIME_PATHS.some((pattern) => pattern.test(path))) {
+    violations.push({ path, code: "LEGACY_RUNTIME_PATH", count: 1 });
   }
   if (path === SCANNER_PATH) {
     return violations;
@@ -239,8 +277,74 @@ function rawViolations(path, bytes) {
   return violations;
 }
 
+function packageManifestViolations(path, bytes) {
+  if (!/(?:^|\/)package\.json$/.test(path)) {
+    return [];
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return [{ path, code: "LEGACY_SCAN_INVALID_PACKAGE_MANIFEST", count: 1 }];
+  }
+
+  const violations = [];
+  const dependencySections = [
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+  ];
+  for (const section of dependencySections) {
+    for (const dependency of Object.keys(manifest[section] ?? {})) {
+      if (
+        FORBIDDEN_PACKAGE_DEPENDENCIES.has(dependency) ||
+        dependency.startsWith("@electron/")
+      ) {
+        violations.push({
+          path,
+          code: "LEGACY_PACKAGE_DEPENDENCY",
+          detail: `${section}:${dependency}`,
+          count: 1,
+        });
+      }
+    }
+  }
+  for (const [name, command] of Object.entries(manifest.scripts ?? {})) {
+    if (typeof command === "string" && FORBIDDEN_PACKAGE_SCRIPT.test(command)) {
+      violations.push({
+        path,
+        code: "LEGACY_PACKAGE_SCRIPT",
+        detail: name,
+        count: 1,
+      });
+    }
+  }
+  if (
+    path === "package.json" &&
+    ["dependencies", "optionalDependencies", "peerDependencies"].some(
+      (section) => Object.keys(manifest[section] ?? {}).length > 0,
+    )
+  ) {
+    violations.push({
+      path,
+      code: "LEGACY_ROOT_RUNTIME_DEPENDENCY",
+      count: 1,
+    });
+  }
+  return violations;
+}
+
+export function scanTrackedMode(path, mode) {
+  return mode === "160000" ? [{ path, code: "LEGACY_GITLINK", count: 1 }] : [];
+}
+
 export function scanEntry(path, bytes) {
-  const remaining = rawViolations(path, bytes);
+  const remaining = [
+    ...rawViolations(path, bytes),
+    ...packageManifestViolations(path, bytes),
+  ];
   const allowances = ALLOWED_REMOVAL_EVIDENCE.get(path) ?? [];
   const mismatches = [];
 
@@ -255,7 +359,8 @@ export function scanEntry(path, bytes) {
     if (matchIndex === -1) {
       const actual = remaining.find(
         (violation) =>
-          violation.code === allowance.code && violation.line === allowance.line,
+          violation.code === allowance.code &&
+          violation.line === allowance.line,
       );
       mismatches.push({
         path,
@@ -274,16 +379,38 @@ export function scanEntry(path, bytes) {
 }
 
 export async function scanTrackedRepository(root = process.cwd()) {
-  const tracked = spawnSync("git", ["-C", root, "ls-files", "-z"], {
+  const tracked = spawnSync("git", ["-C", root, "ls-files", "--stage", "-z"], {
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
   });
   if (tracked.status !== 0) {
     throw new Error("LEGACY_REMOVAL_SCAN_GIT_FAILED");
   }
-  const paths = tracked.stdout.split("\0").filter(Boolean).sort();
+  const entries = tracked.stdout
+    .split("\0")
+    .filter(Boolean)
+    .map((record) => {
+      const separator = record.indexOf("\t");
+      const metadata = record.slice(0, separator).split(" ");
+      if (separator < 0 || metadata.length !== 3 || metadata[2] !== "0") {
+        throw new Error("LEGACY_REMOVAL_SCAN_INDEX_FAILED");
+      }
+      return { mode: metadata[0], path: record.slice(separator + 1) };
+    })
+    .sort((left, right) => left.path.localeCompare(right.path));
   const violations = [];
-  for (const path of paths) {
+  const trackedPaths = new Set(entries.map(({ path }) => path));
+  for (const requiredPath of REQUIRED_RETAINED_PATHS) {
+    if (!trackedPaths.has(requiredPath)) {
+      violations.push({
+        path: requiredPath,
+        code: "LEGACY_RETAINED_EVIDENCE_MISSING",
+        count: 1,
+      });
+    }
+  }
+  for (const { mode, path } of entries) {
+    violations.push(...scanTrackedMode(path, mode));
     let metadata;
     try {
       metadata = await lstat(join(root, path));
@@ -332,18 +459,23 @@ async function main() {
   }
   for (const violation of violations) {
     const line = violation.line === undefined ? "" : ` line=${violation.line}`;
+    const detail =
+      violation.detail === undefined ? "" : ` detail=${violation.detail}`;
     const count =
       violation.expected === undefined
         ? `count=${violation.count}`
         : `rule=${violation.rule} count=${violation.count} expected=${violation.expected}`;
     process.stderr.write(
-      `${violation.code} ${violation.path}${line} ${count}\n`,
+      `${violation.code} ${violation.path}${line}${detail} ${count}\n`,
     );
   }
   process.exitCode = 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
   main().catch((error) => {
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;

@@ -16,6 +16,7 @@ const seriesCount = ref(0);
 let chart: ECharts | undefined;
 let chartInitialization: Promise<ECharts> | undefined;
 let resizeObserver: ResizeObserver | undefined;
+let resizeFrame: number | undefined;
 let themeObserver: MutationObserver | undefined;
 
 async function refreshTelemetry() {
@@ -69,7 +70,15 @@ watch(
 );
 
 onMounted(async () => {
-  resizeObserver = new ResizeObserver(() => chart?.resize());
+  resizeObserver = new ResizeObserver(() => {
+    if (resizeFrame !== undefined) {
+      return;
+    }
+    resizeFrame = window.requestAnimationFrame(() => {
+      resizeFrame = undefined;
+      chart?.resize();
+    });
+  });
   if (chartElement.value) {
     resizeObserver.observe(chartElement.value);
   }
@@ -83,6 +92,10 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   resizeObserver?.disconnect();
+  if (resizeFrame !== undefined) {
+    window.cancelAnimationFrame(resizeFrame);
+    resizeFrame = undefined;
+  }
   themeObserver?.disconnect();
   chart?.dispose();
   chart = undefined;

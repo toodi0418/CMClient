@@ -4,20 +4,33 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: [
-      "**/node_modules/**",
-      "**/dist/**",
-      "**/target/**",
-      "src/**",
-      "scripts/**",
-      "proto/**",
-      "meshtastic/**",
-      "meshtastic-device/**",
-      "test/**/*.js",
-      "test_*.js",
-    ],
+    ignores: ["**/node_modules/**", "**/dist/**", "**/target/**", "proto/**"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
+  {
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: {
+        Buffer: "readonly",
+        URL: "readonly",
+        fetch: "readonly",
+        process: "readonly",
+      },
+    },
+  },
+  {
+    files: ["test/**/*.js"],
+    languageOptions: {
+      sourceType: "commonjs",
+      globals: {
+        __dirname: "readonly",
+        require: "readonly",
+      },
+    },
+    rules: {
+      "@typescript-eslint/no-require-imports": "off",
+    },
+  },
   eslintConfigPrettier,
 );

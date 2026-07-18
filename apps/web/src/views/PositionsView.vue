@@ -30,6 +30,7 @@ let leaflet: typeof import("leaflet") | undefined;
 let map: LeafletMap | undefined;
 let markers: LayerGroup | undefined;
 let resizeObserver: ResizeObserver | undefined;
+let resizeFrame: number | undefined;
 let fittedInitialPositions = false;
 
 function latitude(event: (typeof domain.positions)[number]) {
@@ -94,7 +95,15 @@ async function initializeMap() {
   offlineGrid.addTo(map);
   L.control.scale({ imperial: false, position: "bottomleft" }).addTo(map);
   markers = L.layerGroup().addTo(map);
-  resizeObserver = new ResizeObserver(() => map?.invalidateSize(false));
+  resizeObserver = new ResizeObserver(() => {
+    if (resizeFrame !== undefined) {
+      return;
+    }
+    resizeFrame = window.requestAnimationFrame(() => {
+      resizeFrame = undefined;
+      map?.invalidateSize(false);
+    });
+  });
   resizeObserver.observe(mapElement.value);
 }
 
@@ -157,6 +166,10 @@ watch(plottedPositions, () => renderMarkers(), { deep: true });
 onMounted(() => void refreshPositions());
 onBeforeUnmount(() => {
   resizeObserver?.disconnect();
+  if (resizeFrame !== undefined) {
+    window.cancelAnimationFrame(resizeFrame);
+    resizeFrame = undefined;
+  }
   map?.stop();
   map?.remove();
   map = undefined;

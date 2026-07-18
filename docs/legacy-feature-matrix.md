@@ -19,7 +19,7 @@ the legacy Node.js/Electron implementation.
 | Desktop supervision and quick controls | Retain and rebuild | Tauri 2 shell controlling the Rust Agent only; no duplicate management UI (P08) |
 | CLI operation and automation | Retain and rebuild | Rust CLI using Agent Control API, stable JSON and exit codes; never direct DB or Meshtastic access (P02) |
 | Browser management UI and realtime updates | Retain and rebuild | Vue 3/Vite/Pinia UI over Fastify APIs and durable SSE contracts (P03/P06) |
-| Offline map presentation | Retain capability, re-evaluate assets | Leaflet map page and positions API. Existing committed map tiles/fonts are legacy data assets and require size/licensing review before any carry-forward (P06/P11) |
+| Offline map presentation | Retain capability without the Legacy asset corpus | The Leaflet positions page renders a deterministic coordinate grid without a network dependency. The unlicensed committed tiles/fonts were removed in P11 (P06/P11) |
 | Legacy user data (SQLite, JSON, JSONL) | Retain data through explicit migration | Versioned import, dry-run report, backup, verification, and rollback; no in-place implicit conversion (P11) |
 | Headless, service, and container deployment | Retain and rebuild | Agent-owned systemd/Windows Service/launchd installers and a capability-restricted Docker image (P10) |
 | Cross-platform packaging | Retain and rebuild | CI build matrix for Agent, Gateway, CLI, Web, and Desktop artifacts with checksums, provenance, and signatures (P10) |
@@ -71,11 +71,10 @@ The same offline tool imports only verified Legacy history projections with a
 backup, post-import verification, and rollback; it never treats Legacy records
 as live packets or position/APRS state.
 
-P11 must use this matrix and `docs/legacy-inventory.md` to distinguish
-intentional removal from an accidental regression. A retained capability needs
-an implementation and test in the new architecture; a replaced implementation
-must not remain reachable; a removed feature must have no code, environment
-variable, schema, UI, test, or documentation compatibility path. The retained
-implementation and per-surface evidence is recorded in
-[Retained Feature Parity Audit](./testing/feature-parity.md). Repository-wide
-removal proof remains the separate P11-T04 gate.
+P11 used this matrix and `docs/legacy-inventory.md` to distinguish intentional
+removal from an accidental regression. Every retained capability has an
+implementation and test in the new architecture; replaced implementations are
+not reachable, and removed features have no compatibility path. The retained
+implementation and per-surface evidence is recorded in [Retained Feature
+Parity Audit](./testing/feature-parity.md). The repository-wide scanner now
+enforces both forbidden compatibility and Legacy runtime removal continuously.

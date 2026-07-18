@@ -22,7 +22,6 @@ output/playwright/
 # Secrets and runtime state
 .env
 .env.*
-!.env.example
 *.sqlite
 *.sqlite3
 *.db
@@ -39,18 +38,11 @@ nohup.out
 *.tar
 *.tgz
 
-# Local map tiles
-src/web/public/map/tiles.mbtiles
-
 # macOS metadata
 .DS_Store
 
 # Tauri build-generated platform and JSON-schema outputs
 apps/desktop/src-tauri/gen/
 
-# Internal documentation (keep local only)
-docs/callmesh-client.md
+# Workspace-local handover
 docs/handover.md
-
-# External clones (keep local only)
-MeshSense/

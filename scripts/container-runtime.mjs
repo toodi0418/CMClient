@@ -225,7 +225,12 @@ function contentType(filePath) {
 }
 
 function writeJson(response, statusCode, body) {
-  writeResponse(response, statusCode, `${JSON.stringify(body)}\n`, "application/json");
+  writeResponse(
+    response,
+    statusCode,
+    `${JSON.stringify(body)}\n`,
+    "application/json",
+  );
 }
 
 function writeResponse(response, statusCode, body, contentType) {
