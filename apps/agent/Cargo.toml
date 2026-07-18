@@ -13,5 +13,8 @@ cmclient-supervisor = { path = "../../crates/supervisor" }
 cmclient-updater = { path = "../../crates/updater" }
 serde_json = "1"
 
+[dev-dependencies]
+argon2 = "0.5"
+
 [lints]
 workspace = true

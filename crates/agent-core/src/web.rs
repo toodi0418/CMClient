@@ -1,6 +1,9 @@
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use std::{
-    io::{self, Read, Write},
+    collections::BTreeMap,
+    io::{self, BufReader, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,6 +22,14 @@ pub struct ManagementWebConfig {
     pub bind: IpAddr,
     pub port: u16,
     pub gateway: SocketAddr,
+    pub allow_lan: bool,
+    pub tls: Option<ManagementTlsConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementTlsConfig {
+    pub certificate_path: PathBuf,
+    pub private_key_path: PathBuf,
 }
 
 impl Default for ManagementWebConfig {
@@ -28,6 +39,8 @@ impl Default for ManagementWebConfig {
             bind: IpAddr::from([127, 0, 0, 1]),
             port: 7080,
             gateway: SocketAddr::from(([127, 0, 0, 1], 4810)),
+            allow_lan: false,
+            tls: None,
         }
     }
 }
@@ -39,6 +52,7 @@ pub enum ManagementWebError {
     Io,
     InvalidHttp,
     RequestTooLarge,
+    TlsConfiguration,
 }
 
 impl ManagementWebError {
@@ -49,6 +63,7 @@ impl ManagementWebError {
             Self::Io => "MANAGEMENT_WEB_IO_FAILED",
             Self::InvalidHttp => "MANAGEMENT_WEB_HTTP_INVALID",
             Self::RequestTooLarge => "MANAGEMENT_WEB_REQUEST_TOO_LARGE",
+            Self::TlsConfiguration => "MANAGEMENT_WEB_TLS_CONFIGURATION_INVALID",
         }
     }
 }
@@ -61,16 +76,37 @@ pub trait ManagementWebApiHandler: Send + Sync {
     /// Returns `true` after writing a complete response to `client`.
     fn handle(
         &self,
-        client: &mut TcpStream,
-        method: &str,
-        path: &str,
+        client: &mut dyn ManagementWebStream,
+        request: &ManagementWebRequest,
     ) -> Result<bool, ManagementWebError>;
+}
+
+pub trait ManagementWebStream: Read + Write {}
+
+impl<T: Read + Write> ManagementWebStream for T {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementWebRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+    pub remote_addr: SocketAddr,
+}
+
+impl ManagementWebRequest {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
 }
 
 pub struct ManagementWebListener {
     listener: TcpListener,
     gateway: SocketAddr,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
+    tls: Option<Arc<ServerConfig>>,
 }
 
 pub struct ManagementWebService {
@@ -149,15 +185,20 @@ impl ManagementWebListener {
         if !config.enabled {
             return Err(ManagementWebError::Disabled);
         }
-        if !config.bind.is_loopback() || !config.gateway.ip().is_loopback() {
+        if !config.gateway.ip().is_loopback()
+            || (!config.bind.is_loopback()
+                && (!config.allow_lan || api_handler.is_none() || config.tls.is_none()))
+        {
             return Err(ManagementWebError::NonLoopbackBind);
         }
         let listener = TcpListener::bind(SocketAddr::new(config.bind, config.port))
             .map_err(|_| ManagementWebError::Io)?;
+        let tls = config.tls.as_ref().map(load_tls_config).transpose()?;
         Ok(Self {
             listener,
             gateway: config.gateway,
             api_handler,
+            tls,
         })
     }
 
@@ -169,18 +210,26 @@ impl ManagementWebListener {
 
     pub fn serve(self) -> Result<(), ManagementWebError> {
         loop {
-            let (stream, _) = self.listener.accept().map_err(|_| ManagementWebError::Io)?;
+            let (stream, remote_addr) =
+                self.listener.accept().map_err(|_| ManagementWebError::Io)?;
             let gateway = self.gateway;
             let api_handler = self.api_handler.clone();
+            let tls = self.tls.clone();
             thread::spawn(move || {
-                let _ = serve_connection(stream, gateway, api_handler);
+                let _ = serve_connection(stream, remote_addr, gateway, api_handler, tls);
             });
         }
     }
 
     pub fn serve_once(&self) -> Result<(), ManagementWebError> {
-        let (stream, _) = self.listener.accept().map_err(|_| ManagementWebError::Io)?;
-        serve_connection(stream, self.gateway, self.api_handler.clone())
+        let (stream, remote_addr) = self.listener.accept().map_err(|_| ManagementWebError::Io)?;
+        serve_connection(
+            stream,
+            remote_addr,
+            self.gateway,
+            self.api_handler.clone(),
+            self.tls.clone(),
+        )
     }
 
     fn serve_until(self, shutdown: &AtomicBool) -> Result<(), ManagementWebError> {
@@ -189,11 +238,12 @@ impl ManagementWebListener {
             .map_err(|_| ManagementWebError::Io)?;
         while shutdown.load(Ordering::Acquire) {
             match self.listener.accept() {
-                Ok((stream, _)) => {
+                Ok((stream, remote_addr)) => {
                     let gateway = self.gateway;
                     let api_handler = self.api_handler.clone();
+                    let tls = self.tls.clone();
                     thread::spawn(move || {
-                        let _ = serve_connection(stream, gateway, api_handler);
+                        let _ = serve_connection(stream, remote_addr, gateway, api_handler, tls);
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -230,29 +280,52 @@ pub fn gateway_health(gateway: SocketAddr) -> bool {
 
 fn serve_connection(
     mut client: TcpStream,
+    remote_addr: SocketAddr,
     gateway: SocketAddr,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
+    tls: Option<Arc<ServerConfig>>,
 ) -> Result<(), ManagementWebError> {
     client
         .set_read_timeout(Some(GATEWAY_TIMEOUT))
         .map_err(|_| ManagementWebError::Io)?;
-    let request = read_request(&mut client)?;
-    let (method, path) = request_target(&request)?;
+    client
+        .set_write_timeout(Some(GATEWAY_TIMEOUT))
+        .map_err(|_| ManagementWebError::Io)?;
+    if let Some(tls) = tls {
+        let connection =
+            ServerConnection::new(tls).map_err(|_| ManagementWebError::TlsConfiguration)?;
+        let mut stream = StreamOwned::new(connection, client);
+        return serve_http_connection(&mut stream, remote_addr, gateway, api_handler);
+    }
+    serve_http_connection(&mut client, remote_addr, gateway, api_handler)
+}
+
+fn serve_http_connection(
+    client: &mut dyn ManagementWebStream,
+    remote_addr: SocketAddr,
+    gateway: SocketAddr,
+    api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
+) -> Result<(), ManagementWebError> {
+    let request = read_request(client)?;
+    let request_context = parse_request(&request, remote_addr)?;
     if let Some(api_handler) = api_handler
-        && api_handler.handle(&mut client, &method, &path)?
+        && api_handler.handle(client, &request_context)?
     {
         return Ok(());
     }
-    match (method.as_str(), path.as_str()) {
+    match (
+        request_context.method.as_str(),
+        request_context.path.as_str(),
+    ) {
         ("GET", "/") | ("GET", "/index.html") => write_response(
-            &mut client,
+            client,
             "200 OK",
             "text/html; charset=utf-8",
             "<!doctype html><title>CMClient</title><main id=app>CMClient management web</main>",
         ),
-        (_, path) if path.starts_with("/api/") => proxy_api(&mut client, gateway, &request),
+        (_, path) if path.starts_with("/api/") => proxy_api(client, gateway, &request),
         (_, _) => write_response(
-            &mut client,
+            client,
             "404 Not Found",
             "application/json",
             r#"{"code":"WEB_ROUTE_NOT_FOUND"}"#,
@@ -261,7 +334,7 @@ fn serve_connection(
 }
 
 fn proxy_api(
-    client: &mut TcpStream,
+    client: &mut dyn ManagementWebStream,
     gateway: SocketAddr,
     request: &[u8],
 ) -> Result<(), ManagementWebError> {
@@ -295,7 +368,7 @@ fn proxy_api(
     Ok(())
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>, ManagementWebError> {
+fn read_request(stream: &mut dyn ManagementWebStream) -> Result<Vec<u8>, ManagementWebError> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -324,7 +397,10 @@ fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>, ManagementWebError> {
     }
 }
 
-fn request_target(request: &[u8]) -> Result<(String, String), ManagementWebError> {
+fn parse_request(
+    request: &[u8],
+    remote_addr: SocketAddr,
+) -> Result<ManagementWebRequest, ManagementWebError> {
     let header_end = header_end(request).ok_or(ManagementWebError::InvalidHttp)?;
     let header =
         std::str::from_utf8(&request[..header_end]).map_err(|_| ManagementWebError::InvalidHttp)?;
@@ -342,23 +418,54 @@ fn request_target(request: &[u8]) -> Result<(String, String), ManagementWebError
     if parts.next().is_some() || !version.starts_with("HTTP/") || !path.starts_with('/') {
         return Err(ManagementWebError::InvalidHttp);
     }
-    Ok((String::from(method), String::from(path)))
+    let mut headers = BTreeMap::new();
+    for line in header.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(ManagementWebError::InvalidHttp);
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ManagementWebError::InvalidHttp);
+        }
+        let key = name.to_ascii_lowercase();
+        if headers.insert(key, value.trim().to_owned()).is_some() {
+            return Err(ManagementWebError::InvalidHttp);
+        }
+    }
+    Ok(ManagementWebRequest {
+        method: String::from(method),
+        path: String::from(path),
+        headers,
+        body: request[header_end..].to_vec(),
+        remote_addr,
+    })
 }
 
 fn content_length(header: &[u8]) -> Result<usize, ManagementWebError> {
     let header = std::str::from_utf8(header).map_err(|_| ManagementWebError::InvalidHttp)?;
+    let mut length = None;
     for line in header.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(ManagementWebError::InvalidHttp);
+        }
         if name.eq_ignore_ascii_case("content-length") {
-            return value
+            let parsed = value
                 .trim()
                 .parse::<usize>()
                 .map_err(|_| ManagementWebError::InvalidHttp);
+            if length.replace(parsed?).is_some() {
+                return Err(ManagementWebError::InvalidHttp);
+            }
         }
     }
-    Ok(0)
+    Ok(length.unwrap_or(0))
 }
 
 fn with_connection_close(request: &[u8]) -> Result<Vec<u8>, ManagementWebError> {
@@ -397,13 +504,13 @@ fn header_end(request: &[u8]) -> Option<usize> {
 }
 
 fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut dyn ManagementWebStream,
     status: &str,
     content_type: &str,
     body: &str,
 ) -> Result<(), ManagementWebError> {
     let header = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     stream
@@ -412,11 +519,34 @@ fn write_response(
         .map_err(|_| ManagementWebError::Io)
 }
 
+fn load_tls_config(config: &ManagementTlsConfig) -> Result<Arc<ServerConfig>, ManagementWebError> {
+    let certificate_file = std::fs::File::open(&config.certificate_path)
+        .map_err(|_| ManagementWebError::TlsConfiguration)?;
+    let mut certificate_reader = BufReader::new(certificate_file);
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ManagementWebError::TlsConfiguration)?;
+    if certificates.is_empty() {
+        return Err(ManagementWebError::TlsConfiguration);
+    }
+    let key_file = std::fs::File::open(&config.private_key_path)
+        .map_err(|_| ManagementWebError::TlsConfiguration)?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|_| ManagementWebError::TlsConfiguration)?
+        .ok_or(ManagementWebError::TlsConfiguration)?;
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .map(Arc::new)
+        .map_err(|_| ManagementWebError::TlsConfiguration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
-        ManagementWebService, gateway_health,
+        ManagementWebService, ManagementWebStream, gateway_health,
     };
     use std::{
         io::{Read, Write},
@@ -430,11 +560,10 @@ mod tests {
     impl ManagementWebApiHandler for AgentRoute {
         fn handle(
             &self,
-            client: &mut TcpStream,
-            method: &str,
-            path: &str,
+            client: &mut dyn ManagementWebStream,
+            request: &super::ManagementWebRequest,
         ) -> Result<bool, ManagementWebError> {
-            if method == "GET" && path == "/api/v1/updates" {
+            if request.method == "GET" && request.path == "/api/v1/updates" {
                 client
                     .write_all(
                         b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 16\r\nconnection: close\r\n\r\n{\"schemaVersion\":1}",
@@ -455,6 +584,39 @@ mod tests {
         assert!(matches!(
             ManagementWebListener::bind(&config),
             Err(ManagementWebError::NonLoopbackBind)
+        ));
+    }
+
+    #[test]
+    fn rejects_lan_bind_when_tls_files_are_missing() {
+        let missing = std::env::temp_dir().join(format!(
+            "cmclient-management-tls-missing-{}",
+            std::process::id()
+        ));
+        let config = ManagementWebConfig {
+            bind: "0.0.0.0".parse().expect("IP should parse"),
+            port: 0,
+            allow_lan: true,
+            tls: Some(super::ManagementTlsConfig {
+                certificate_path: missing.join("certificate.pem"),
+                private_key_path: missing.join("private-key.pem"),
+            }),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            ManagementWebListener::bind_with_api_handler(&config, Arc::new(AgentRoute)),
+            Err(ManagementWebError::TlsConfiguration)
+        ));
+    }
+
+    #[test]
+    fn rejects_chunked_requests_before_they_reach_the_gateway() {
+        assert!(matches!(
+            super::content_length(
+                b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\ntransfer-encoding: chunked\r\n\r\n"
+            ),
+            Err(ManagementWebError::InvalidHttp)
         ));
     }
 

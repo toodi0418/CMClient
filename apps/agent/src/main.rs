@@ -1,7 +1,9 @@
 use chrono::{SecondsFormat, Utc};
+use cmclient_agent_core::access::{ManagementAccessController, ManagementAccessError};
 use cmclient_agent_core::web::{
-    ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
-    ManagementWebService, gateway_health,
+    ManagementTlsConfig, ManagementWebApiHandler, ManagementWebConfig, ManagementWebError,
+    ManagementWebListener, ManagementWebRequest, ManagementWebService, ManagementWebStream,
+    gateway_health,
 };
 use cmclient_agent_core::{AgentConfig, AgentLease, ensure_runtime_directories};
 use cmclient_control_api::{
@@ -13,7 +15,6 @@ use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewayS
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
 use std::{
     collections::BTreeMap,
-    io::Write,
     net::SocketAddr,
     path::Path,
     process::ExitCode,
@@ -138,16 +139,43 @@ fn utc_now() -> String {
 
 struct AgentManagementWebApi {
     updates: Arc<AgentUpdateService>,
+    access: Option<Arc<ManagementAccessController>>,
 }
 
 impl ManagementWebApiHandler for AgentManagementWebApi {
     fn handle(
         &self,
-        client: &mut std::net::TcpStream,
-        method: &str,
-        path: &str,
+        client: &mut dyn ManagementWebStream,
+        request: &ManagementWebRequest,
     ) -> Result<bool, ManagementWebError> {
-        match (method, path) {
+        if let Some(access) = &self.access {
+            if request.method == "POST" && request.path == "/api/v1/auth/login" {
+                return handle_management_login(client, request, access);
+            }
+            if !matches!(
+                (request.method.as_str(), request.path.as_str()),
+                ("GET", "/") | ("GET", "/index.html")
+            ) {
+                let write = !matches!(request.method.as_str(), "GET" | "HEAD" | "OPTIONS");
+                let session = request.header("cookie").and_then(management_session_cookie);
+                let result = session
+                    .ok_or(ManagementAccessError::SessionInvalid)
+                    .and_then(|session| {
+                        access.authorize(
+                            request.header("origin"),
+                            session,
+                            request.header("x-csrf-token"),
+                            write,
+                            unix_now_seconds(),
+                        )
+                    });
+                if let Err(error) = result {
+                    write_management_access_error(client, error)?;
+                    return Ok(true);
+                }
+            }
+        }
+        match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/api/v1/updates") => {
                 let status = match self.updates.status() {
                     Ok(status) => status,
@@ -176,14 +204,111 @@ impl ManagementWebApiHandler for AgentManagementWebApi {
     }
 }
 
+fn handle_management_login(
+    client: &mut dyn ManagementWebStream,
+    request: &ManagementWebRequest,
+    access: &ManagementAccessController,
+) -> Result<bool, ManagementWebError> {
+    let password = serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .and_then(|value| {
+            let object = value.as_object()?;
+            if object.len() != 1 {
+                return None;
+            }
+            object.get("password")?.as_str().map(str::to_owned)
+        })
+        .filter(|password| !password.is_empty() && password.len() <= 1024);
+    let result = password
+        .ok_or(ManagementAccessError::CredentialsInvalid)
+        .and_then(|password| {
+            access.login(
+                &request.remote_addr.ip().to_string(),
+                request.header("origin").unwrap_or_default(),
+                &password,
+                unix_now_seconds(),
+            )
+        });
+    match result {
+        Ok(session) => {
+            let body = serde_json::json!({
+                "schemaVersion": 1,
+                "csrfToken": session.csrf_token,
+                "expiresAt": session.expires_at_unix_seconds,
+            });
+            let body = serde_json::to_vec(&body).map_err(|_| ManagementWebError::Io)?;
+            let max_age = session
+                .expires_at_unix_seconds
+                .saturating_sub(unix_now_seconds());
+            write_management_json_with_headers(
+                client,
+                "200 OK",
+                &body,
+                &[format!(
+                    "set-cookie: cmclient_session={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={max_age}",
+                    session.id
+                )],
+            )?;
+            Ok(true)
+        }
+        Err(error) => {
+            write_management_access_error(client, error)?;
+            Ok(true)
+        }
+    }
+}
+
+fn management_session_cookie(value: &str) -> Option<&str> {
+    value.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        (name == "cmclient_session"
+            && value.len() == 32
+            && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(value)
+    })
+}
+
+fn unix_now_seconds() -> u64 {
+    Utc::now().timestamp().max(0) as u64
+}
+
+fn write_management_access_error(
+    client: &mut dyn ManagementWebStream,
+    error: ManagementAccessError,
+) -> Result<(), ManagementWebError> {
+    let status = match error {
+        ManagementAccessError::CredentialsInvalid
+        | ManagementAccessError::SessionInvalid
+        | ManagementAccessError::SessionExpired => "401 Unauthorized",
+        ManagementAccessError::LoginRateLimited => "429 Too Many Requests",
+        ManagementAccessError::OriginDenied | ManagementAccessError::CsrfInvalid => "403 Forbidden",
+        ManagementAccessError::InvalidConfiguration => "500 Internal Server Error",
+    };
+    let body = format!(r#"{{"code":"{}"}}"#, error.code());
+    write_management_json(client, status, body.as_bytes())
+}
+
 fn write_management_json(
-    client: &mut std::net::TcpStream,
+    client: &mut dyn ManagementWebStream,
     status: &str,
     body: &[u8],
 ) -> Result<(), ManagementWebError> {
+    write_management_json_with_headers(client, status, body, &[])
+}
+
+fn write_management_json_with_headers(
+    client: &mut dyn ManagementWebStream,
+    status: &str,
+    body: &[u8],
+    headers: &[String],
+) -> Result<(), ManagementWebError> {
     let header = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncache-control: no-store\r\n{}content-length: {}\r\nconnection: close\r\n\r\n",
+        headers
+            .iter()
+            .map(|header| format!("{header}\r\n"))
+            .collect::<String>(),
+        body.len(),
     );
     client
         .write_all(header.as_bytes())
@@ -192,7 +317,7 @@ fn write_management_json(
 }
 
 fn write_management_error(
-    client: &mut std::net::TcpStream,
+    client: &mut dyn ManagementWebStream,
     code: &str,
 ) -> Result<(), ManagementWebError> {
     let body = format!(r#"{{"code":"{code}"}}"#);
@@ -200,7 +325,7 @@ fn write_management_error(
 }
 
 fn write_management_update_events(
-    client: &mut std::net::TcpStream,
+    client: &mut dyn ManagementWebStream,
     events: mpsc::Receiver<ControlUpdateEvent>,
 ) -> Result<(), ManagementWebError> {
     client
@@ -246,6 +371,7 @@ struct AgentController {
     gateway: SocketAddr,
     management_web: Mutex<Option<ManagementWebService>>,
     management_web_config: ManagementWebConfig,
+    management_access: Option<Arc<ManagementAccessController>>,
     updates: Arc<AgentUpdateService>,
     started_at: Instant,
     latest_error_code: Mutex<Option<String>>,
@@ -282,10 +408,31 @@ impl AgentController {
                 Ok(supervisor)
             })
             .transpose()?;
+        let management_access = config
+            .management_lan
+            .as_ref()
+            .map(|lan| {
+                ManagementAccessController::new(lan.access.clone())
+                    .map(Arc::new)
+                    .map_err(|_| ControlError::CommandFailed)
+            })
+            .transpose()?;
         let management_web_config = ManagementWebConfig {
             enabled: true,
             gateway: gateway_address(config.gateway_port),
-            ..Default::default()
+            bind: config
+                .management_lan
+                .as_ref()
+                .map_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]), |lan| lan.bind),
+            port: config.management_lan.as_ref().map_or(7080, |lan| lan.port),
+            allow_lan: management_access.is_some(),
+            tls: config
+                .management_lan
+                .as_ref()
+                .map(|lan| ManagementTlsConfig {
+                    certificate_path: lan.certificate_path.clone(),
+                    private_key_path: lan.private_key_path.clone(),
+                }),
         };
         let updates = Arc::new(AgentUpdateService::new(&config.paths.data_dir)?);
         updates.recover()?;
@@ -295,6 +442,7 @@ impl AgentController {
                     &management_web_config,
                     Arc::new(AgentManagementWebApi {
                         updates: Arc::clone(&updates),
+                        access: management_access.clone(),
                     }),
                 )
                 .map_err(|_| ControlError::CommandFailed)?,
@@ -307,6 +455,7 @@ impl AgentController {
             gateway: gateway_address(config.gateway_port),
             management_web: Mutex::new(management_web),
             management_web_config,
+            management_access,
             updates,
             started_at: Instant::now(),
             latest_error_code: Mutex::new(None),
@@ -339,6 +488,11 @@ impl AgentController {
             GatewayControlStatus::Running => GatewayControlStatus::Degraded,
             status => status,
         };
+        let management_web_scheme = if self.management_web_config.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         let (management_web, management_web_url) = self
             .management_web
             .lock()
@@ -347,7 +501,10 @@ impl AgentController {
             .map_or((ManagementWebControlStatus::Disabled, None), |service| {
                 (
                     ManagementWebControlStatus::Running,
-                    Some(format!("http://{}", service.local_addr())),
+                    Some(format!(
+                        "{management_web_scheme}://{}",
+                        service.local_addr()
+                    )),
                 )
             });
         let latest_error_code = match gateway {
@@ -382,6 +539,7 @@ impl AgentController {
                     &self.management_web_config,
                     Arc::new(AgentManagementWebApi {
                         updates: Arc::clone(&self.updates),
+                        access: self.management_access.clone(),
                     }),
                 )
                 .map_err(|_| ControlError::CommandFailed)?,
@@ -534,7 +692,29 @@ fn serve_web_once() -> ExitCode {
     let web_config = ManagementWebConfig {
         enabled: config.management_web_enabled,
         gateway: gateway_address(config.gateway_port),
-        ..Default::default()
+        bind: config
+            .management_lan
+            .as_ref()
+            .map_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]), |lan| lan.bind),
+        port: config.management_lan.as_ref().map_or(7080, |lan| lan.port),
+        allow_lan: config.management_lan.is_some(),
+        tls: config
+            .management_lan
+            .as_ref()
+            .map(|lan| ManagementTlsConfig {
+                certificate_path: lan.certificate_path.clone(),
+                private_key_path: lan.private_key_path.clone(),
+            }),
+    };
+    let management_access = match config.management_lan.as_ref() {
+        Some(lan) => match ManagementAccessController::new(lan.access.clone()) {
+            Ok(access) => Some(Arc::new(access)),
+            Err(_) => {
+                eprintln!("MANAGEMENT_LAN_AUTH_CONFIGURATION_INVALID");
+                return ExitCode::from(EX_CONFIG);
+            }
+        },
+        None => None,
     };
     let updates = match AgentUpdateService::new(&config.paths.data_dir) {
         Ok(updates) => Arc::new(updates),
@@ -549,7 +729,10 @@ fn serve_web_once() -> ExitCode {
     }
     let listener = match ManagementWebListener::bind_with_api_handler(
         &web_config,
-        Arc::new(AgentManagementWebApi { updates }),
+        Arc::new(AgentManagementWebApi {
+            updates,
+            access: management_access,
+        }),
     ) {
         Ok(listener) => listener,
         Err(error) => {
@@ -619,20 +802,28 @@ fn gateway_address(port: u16) -> SocketAddr {
 mod tests {
     #[cfg(not(target_os = "windows"))]
     use super::{
-        AgentConfig, AgentController, AgentUpdateService, ControlCommand, ControlHandler,
-        GatewayControlStatus, ManagementWebControlStatus,
+        AgentConfig, AgentController, AgentManagementWebApi, AgentUpdateService, ControlCommand,
+        ControlHandler, GatewayControlStatus, ManagementWebApiHandler, ManagementWebControlStatus,
+        ManagementWebRequest,
     };
     #[cfg(not(target_os = "windows"))]
-    use cmclient_agent_core::RuntimePaths;
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    #[cfg(not(target_os = "windows"))]
+    use cmclient_agent_core::{
+        RuntimePaths,
+        access::{LanAccessConfig, ManagementAccessController},
+    };
     #[cfg(not(target_os = "windows"))]
     use cmclient_control_api::UpdateControlStatus;
     #[cfg(not(target_os = "windows"))]
     use cmclient_updater::{PersistentUpdateJob, UpdatePhase};
     #[cfg(not(target_os = "windows"))]
     use std::{
+        collections::BTreeMap,
         io::{Read, Write},
-        net::TcpListener,
+        net::{SocketAddr, TcpListener, TcpStream},
         path::PathBuf,
+        sync::Arc,
         thread,
     };
 
@@ -671,6 +862,7 @@ mod tests {
             ]),
             gateway_port: port,
             management_web_enabled: false,
+            management_lan: None,
         };
         let controller = AgentController::from_config(&config).expect("controller should build");
 
@@ -724,5 +916,133 @@ mod tests {
         );
         assert_eq!(service.status().expect("status should load"), status);
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn lan_api_requires_a_session_and_csrf_before_gateway_proxying() {
+        let data_dir =
+            std::env::temp_dir().join(format!("cmclient-agent-access-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let salt = SaltString::encode_b64(b"cmclient-agent-access-test")
+            .expect("fixture salt should encode");
+        let password_hash = Argon2::default()
+            .hash_password(b"password", &salt)
+            .expect("fixture password should hash")
+            .to_string();
+        let access = Arc::new(
+            ManagementAccessController::new(LanAccessConfig {
+                password_hash,
+                allowed_origins: std::collections::BTreeSet::from([String::from(
+                    "https://cmclient.example",
+                )]),
+                session_ttl_seconds: 60,
+                audit_capacity: 32,
+            })
+            .expect("access configuration should load"),
+        );
+        let api = Arc::new(AgentManagementWebApi {
+            updates: Arc::new(
+                AgentUpdateService::new(&data_dir).expect("update service should initialize"),
+            ),
+            access: Some(access),
+        });
+        let remote_addr: SocketAddr = "192.168.1.20:54000"
+            .parse()
+            .expect("fixture address should parse");
+
+        let denied = invoke_management_api(
+            Arc::clone(&api),
+            ManagementWebRequest {
+                method: String::from("GET"),
+                path: String::from("/api/v1/updates"),
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+                remote_addr,
+            },
+        );
+        assert!(denied.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(denied.contains("MANAGEMENT_SESSION_INVALID"));
+
+        let login = invoke_management_api(
+            Arc::clone(&api),
+            ManagementWebRequest {
+                method: String::from("POST"),
+                path: String::from("/api/v1/auth/login"),
+                headers: BTreeMap::from([(
+                    String::from("origin"),
+                    String::from("https://cmclient.example"),
+                )]),
+                body: br#"{"password":"password"}"#.to_vec(),
+                remote_addr,
+            },
+        );
+        assert!(login.starts_with("HTTP/1.1 200 OK"));
+        assert!(login.contains("HttpOnly; Secure; SameSite=Strict"));
+        let cookie = login
+            .lines()
+            .find(|line| line.starts_with("set-cookie:"))
+            .and_then(|line| {
+                line.split_once('=')
+                    .map(|(_, value)| value.split(';').next().unwrap_or_default())
+            })
+            .expect("login should issue a session cookie");
+
+        let allowed = invoke_management_api(
+            Arc::clone(&api),
+            ManagementWebRequest {
+                method: String::from("GET"),
+                path: String::from("/api/v1/updates"),
+                headers: BTreeMap::from([(
+                    String::from("cookie"),
+                    format!("cmclient_session={cookie}"),
+                )]),
+                body: Vec::new(),
+                remote_addr,
+            },
+        );
+        assert!(allowed.starts_with("HTTP/1.1 200 OK"));
+        assert!(allowed.contains(r#"{"schemaVersion":1,"job":null}"#));
+
+        let csrf_denied = invoke_management_api(
+            api,
+            ManagementWebRequest {
+                method: String::from("POST"),
+                path: String::from("/api/v1/updates"),
+                headers: BTreeMap::from([
+                    (String::from("cookie"), format!("cmclient_session={cookie}")),
+                    (
+                        String::from("origin"),
+                        String::from("https://cmclient.example"),
+                    ),
+                ]),
+                body: Vec::new(),
+                remote_addr,
+            },
+        );
+        assert!(csrf_denied.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(csrf_denied.contains("MANAGEMENT_CSRF_INVALID"));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn invoke_management_api(
+        api: Arc<AgentManagementWebApi>,
+        request: ManagementWebRequest,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("address should load");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("listener should accept");
+            api.handle(&mut stream, &request)
+                .expect("handler should respond");
+        });
+        let mut client = TcpStream::connect(address).expect("client should connect");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("response should read");
+        server.join().expect("server should join");
+        response
     }
 }

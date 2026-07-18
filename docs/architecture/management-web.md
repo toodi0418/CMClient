@@ -16,8 +16,19 @@ the Gateway cannot be reached it returns the stable
 
 The Agent checks `GET /api/v1/system/health` before reporting a running Gateway
 through local Control API; a live process that fails the probe is `degraded`.
-Non-loopback binds fail closed. LAN binding is deferred until P09 supplies
-authentication, sessions, CSRF/origin checks, rate limits, and audit logging.
+Non-loopback binds fail closed. A LAN bind is permitted only with the complete
+`[management_lan]` configuration, including a readable PEM certificate and
+private key; it serves HTTPS and never silently downgrades to plaintext HTTP.
+
+When `[management_lan]` is configured, the Agent's management handler owns
+the authentication gate before every Agent route or Gateway proxy request.
+`POST /api/v1/auth/login` accepts only the configured HTTPS Origin and an
+Argon2-verified password, then issues a short-lived Secure/HttpOnly session
+cookie plus CSRF token. Reads require a valid session; writes require the
+session, an allowed Origin, and the CSRF header. Repeated failed logins are
+rate-limited without emitting password or token material. The audit ring is
+bounded and code-only, so it records allow/deny/rate-limit decisions without
+storing source addresses, request payloads, cookies, or credentials.
 
 `apps/web` is the Vue 3/Vite management shell. It owns presentation-only
 navigation, responsive rail/drawer state, and route composition; it does not

@@ -69,6 +69,13 @@ export const messages = {
       notConfigured: "尚未設定",
       available: "可用",
     },
+    auth: {
+      title: "管理登入",
+      password: "密碼",
+      submit: "登入",
+      working: "驗證中",
+      rejected: "無法完成登入",
+    },
     dashboard: {
       runtime: "Gateway 執行狀態",
       connecting: "正在建立 Gateway 連線",
@@ -326,6 +333,13 @@ export const messages = {
       unavailable: "Data is currently unavailable",
       notConfigured: "Not configured",
       available: "Available",
+    },
+    auth: {
+      title: "Management sign in",
+      password: "Password",
+      submit: "Sign in",
+      working: "Verifying",
+      rejected: "Sign in could not be completed",
     },
     dashboard: {
       runtime: "Gateway runtime",

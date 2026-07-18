@@ -129,6 +129,80 @@ test("proxy runtime status remains legible across desktop and mobile", async ({
   await expectNoHorizontalOverflow(page);
 });
 
+test("LAN management login unlocks protected commands with the CSRF token", async ({
+  page,
+}) => {
+  let authenticated = false;
+  let protectedHeader: string | null = null;
+  let loginBody: string | null = null;
+  await page.route("**/api/v1/system/status", (route) =>
+    route.fulfill({
+      status: authenticated ? 200 : 401,
+      contentType: "application/json",
+      body: JSON.stringify(
+        authenticated
+          ? { health: "ok", build }
+          : { code: "MANAGEMENT_SESSION_INVALID" },
+      ),
+    }),
+  );
+  await page.route("**/api/v1/auth/login", async (route) => {
+    loginBody = route.request().postData() ?? null;
+    authenticated = true;
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        schemaVersion: 1,
+        csrfToken: "a".repeat(32),
+        expiresAt: 1_784_344_000,
+      }),
+    });
+  });
+  await page.route("**/api/v1/diagnostics/integrity-check", async (route) => {
+    protectedHeader = route.request().headers()["x-csrf-token"] ?? null;
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ jobId: "diagnostics-lan", reused: false }),
+    });
+  });
+  await page.route("**/api/v1/jobs/diagnostics-lan", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "diagnostics-lan",
+        type: "diagnostics.integrity_check",
+        status: "succeeded",
+        createdAt: "2026-07-18T00:00:00.000Z",
+        updatedAt: "2026-07-18T00:00:01.000Z",
+        completedAt: "2026-07-18T00:00:01.000Z",
+      }),
+    }),
+  );
+
+  await page.goto("/diagnostics");
+  await expect(
+    page.getByRole("heading", { name: "Management sign in" }),
+  ).toBeVisible();
+  consoleErrors.set(page, []);
+  await page.getByLabel("Password").fill("correct-password");
+  await page.getByRole("button", { name: "Sign in" }).click();
+
+  const workspace = page.locator("main.workspace");
+  await expect(
+    workspace.getByRole("heading", { name: "Diagnostics" }),
+  ).toBeVisible();
+  expect(loginBody).toBe('{"password":"correct-password"}');
+  await workspace.getByRole("button", { name: "Run check" }).click();
+  await expect.poll(() => protectedHeader).toBe("a".repeat(32));
+  await expectNoHorizontalOverflow(page);
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem("cmclient.web.preferences.v1"),
+    ),
+  ).not.toContain("correct-password");
+});
+
 async function mockGateway(page: Page): Promise<void> {
   await page.route("**/api/v1/updates", (route) =>
     route.fulfill({

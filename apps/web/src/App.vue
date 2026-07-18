@@ -29,11 +29,17 @@ import { useI18n } from "vue-i18n";
 
 import { isSupportedLocale, type ThemePreference } from "@/preferences";
 import { useGatewayStore } from "@/stores/gateway";
+import {
+  isManagementSessionError,
+  useManagementAuthStore,
+} from "@/stores/management-auth";
 import { usePreferencesStore } from "@/stores/preferences";
 import { useShellStore } from "@/stores/shell";
+import ManagementLoginView from "@/views/ManagementLoginView.vue";
 
 const shell = useShellStore();
 const gateway = useGatewayStore();
+const auth = useManagementAuthStore();
 const preferences = usePreferencesStore();
 const route = useRoute();
 const { t } = useI18n();
@@ -87,6 +93,10 @@ const pageLabel = computed(() =>
 
 const gatewayLabel = computed(() => t(`gateway.${shell.gatewayAvailability}`));
 
+const requiresLogin = computed(
+  () => auth.required || isManagementSessionError(gateway.errorCode),
+);
+
 const railToggleIcon = computed(() =>
   shell.desktopRailCollapsed ? PanelLeftOpen : PanelLeftClose,
 );
@@ -97,6 +107,16 @@ watch(
   { immediate: true },
 );
 
+watch(
+  () => gateway.errorCode,
+  (errorCode) => {
+    if (isManagementSessionError(errorCode)) {
+      auth.requireLogin();
+    }
+  },
+  { immediate: true },
+);
+
 function setLocale(event: Event) {
   const locale = (event.target as HTMLSelectElement).value;
 
@@ -104,10 +124,19 @@ function setLocale(event: Event) {
     preferences.setLocale(locale);
   }
 }
+
+async function refreshAfterLogin() {
+  await gateway.refresh();
+}
 </script>
 
 <template>
+  <ManagementLoginView
+    v-if="requiresLogin"
+    @authenticated="refreshAfterLogin"
+  />
   <div
+    v-else
     class="console-shell min-h-screen font-sans"
     :class="{
       'is-rail-collapsed': shell.desktopRailCollapsed,

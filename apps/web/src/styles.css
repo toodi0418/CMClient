@@ -274,6 +274,94 @@ button {
   padding: 42px clamp(24px, 5vw, 76px);
 }
 
+.management-login {
+  display: grid;
+  min-height: 100vh;
+  padding: 24px;
+  place-items: center;
+  background-color: var(--cm-canvas);
+  background-image:
+    linear-gradient(var(--cm-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--cm-grid) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.management-login__form {
+  display: grid;
+  width: min(100%, 360px);
+  gap: 20px;
+  padding: 28px;
+  border: 1px solid var(--cm-border-panel);
+  border-radius: 6px;
+  background: var(--cm-surface-panel);
+  box-shadow: 8px 8px 0 var(--cm-grid);
+}
+
+.management-login__mark {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border: 1px solid var(--cm-accent);
+  border-radius: var(--cm-control-radius);
+  color: var(--cm-on-accent);
+  background: var(--cm-accent);
+}
+
+.management-login__eyebrow {
+  margin: 0 0 7px;
+  color: var(--cm-accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.management-login__field {
+  display: grid;
+  gap: 8px;
+  color: var(--cm-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.management-login__field input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 11px;
+  border: 1px solid var(--cm-border-strong);
+  border-radius: var(--cm-control-radius);
+  outline: 0;
+  color: var(--cm-text);
+  background: var(--cm-surface-interactive);
+  font: inherit;
+}
+
+.management-login__field input:focus {
+  outline: 2px solid var(--cm-focus-ring);
+  outline-offset: 2px;
+}
+
+.management-login__error {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 10px;
+  border-left: 2px solid var(--cm-danger);
+  color: var(--cm-text-secondary);
+  background: var(--cm-surface-strip);
+  font-size: 12px;
+}
+
+.management-login__error code {
+  overflow-wrap: anywhere;
+  color: var(--cm-danger);
+  font-family: ui-monospace, "SFMono-Regular", monospace;
+  font-size: 11px;
+}
+
+.management-login__submit {
+  width: 100%;
+}
+
 .workspace-heading {
   margin-bottom: 30px;
 }

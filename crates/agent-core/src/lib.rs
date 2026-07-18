@@ -1,15 +1,18 @@
 //! Shared Rust foundations for the CMClient Agent.
 
+pub mod access;
 pub mod web;
 
+use crate::access::{LanAccessConfig, ManagementAccessController};
 use fs2::FileExt;
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fmt::{Display, Formatter},
     fs,
     fs::OpenOptions,
+    net::IpAddr,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -34,6 +37,16 @@ pub struct AgentConfig {
     pub gateway_command: Option<Vec<String>>,
     pub gateway_port: u16,
     pub management_web_enabled: bool,
+    pub management_lan: Option<ManagementLanConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementLanConfig {
+    pub bind: IpAddr,
+    pub port: u16,
+    pub access: LanAccessConfig,
+    pub certificate_path: PathBuf,
+    pub private_key_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -56,6 +69,7 @@ pub enum ConfigError {
     InvalidConfig,
     EmptyGatewayCommand,
     InvalidGatewayPort,
+    InvalidManagementLan,
 }
 
 #[derive(Debug)]
@@ -90,6 +104,7 @@ impl ConfigError {
             Self::InvalidConfig => "AGENT_CONFIG_INVALID",
             Self::EmptyGatewayCommand => "AGENT_CONFIG_GATEWAY_COMMAND_EMPTY",
             Self::InvalidGatewayPort => "AGENT_CONFIG_GATEWAY_PORT_INVALID",
+            Self::InvalidManagementLan => "AGENT_CONFIG_MANAGEMENT_LAN_INVALID",
         }
     }
 }
@@ -106,6 +121,7 @@ impl std::error::Error for ConfigError {}
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     agent: Option<AgentSection>,
+    management_lan: Option<ManagementLanSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -114,6 +130,19 @@ struct AgentSection {
     gateway_command: Option<Vec<String>>,
     gateway_port: Option<u16>,
     management_web_enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagementLanSection {
+    bind: IpAddr,
+    port: u16,
+    password_hash: String,
+    allowed_origins: Vec<String>,
+    session_ttl_seconds: Option<u64>,
+    audit_capacity: Option<usize>,
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
 }
 
 impl AgentConfig {
@@ -149,6 +178,33 @@ impl AgentConfig {
         if gateway_port == 0 {
             return Err(ConfigError::InvalidGatewayPort);
         }
+        let management_lan = file_config
+            .management_lan
+            .map(|lan| {
+                if lan.bind.is_loopback()
+                    || lan.port == 0
+                    || !lan.certificate_path.is_absolute()
+                    || !lan.private_key_path.is_absolute()
+                {
+                    return Err(ConfigError::InvalidManagementLan);
+                }
+                let access = LanAccessConfig {
+                    password_hash: lan.password_hash,
+                    allowed_origins: lan.allowed_origins.into_iter().collect::<BTreeSet<_>>(),
+                    session_ttl_seconds: lan.session_ttl_seconds.unwrap_or(3_600),
+                    audit_capacity: lan.audit_capacity.unwrap_or(512),
+                };
+                ManagementAccessController::new(access.clone())
+                    .map_err(|_| ConfigError::InvalidManagementLan)?;
+                Ok(ManagementLanConfig {
+                    bind: lan.bind,
+                    port: lan.port,
+                    access,
+                    certificate_path: lan.certificate_path,
+                    private_key_path: lan.private_key_path,
+                })
+            })
+            .transpose()?;
 
         Ok(Self {
             paths,
@@ -156,6 +212,7 @@ impl AgentConfig {
             gateway_command: agent.gateway_command,
             gateway_port,
             management_web_enabled: agent.management_web_enabled.unwrap_or(true),
+            management_lan,
         })
     }
 }
@@ -420,6 +477,59 @@ mod tests {
         assert_eq!(
             AgentConfig::from_environment(&environment),
             Err(ConfigError::InvalidGatewayPort)
+        );
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn accepts_only_a_complete_non_loopback_management_lan_configuration() {
+        let directory =
+            std::env::temp_dir().join(format!("cmclient-agent-lan-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let config_file = directory.join("agent.toml");
+        fs::write(
+            &config_file,
+            r#"[management_lan]
+bind = "127.0.0.1"
+port = 7443
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$Y21jbGllbnQtYWNjZXNzLWZpeHR1cmU$mlUCFMgY1I8EWPxA0OXMpw"
+allowed_origins = ["https://cmclient.example"]
+session_ttl_seconds = 3600
+audit_capacity = 32
+certificate_path = "/fixture/certificate.pem"
+private_key_path = "/fixture/private-key.pem"
+"#,
+        )
+        .expect("configuration should be written");
+        let mut environment = environment();
+        environment.insert(
+            String::from("CMCLIENT_AGENT_CONFIG"),
+            config_file.display().to_string(),
+        );
+
+        assert!(AgentConfig::from_environment(&environment).is_err());
+        fs::write(
+            &config_file,
+            r#"[management_lan]
+bind = "192.168.1.10"
+port = 7443
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$Y21jbGllbnQtYWNjZXNzLWZpeHR1cmU$dpMi7KyBMZbZy6JnUqumeIrRr43snfWb1zJ6H5D2myg"
+allowed_origins = ["https://cmclient.example"]
+session_ttl_seconds = 3600
+audit_capacity = 32
+certificate_path = "/fixture/certificate.pem"
+private_key_path = "/fixture/private-key.pem"
+"#,
+        )
+        .expect("configuration should be written");
+        let config =
+            AgentConfig::from_environment(&environment).expect("LAN configuration should load");
+        assert_eq!(
+            config
+                .management_lan
+                .expect("LAN configuration should exist")
+                .port,
+            7443
         );
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }

@@ -33,6 +33,17 @@ import { Value } from "@sinclair/typebox/value";
 
 export const DEFAULT_GATEWAY_API_BASE_URL = "/api/v1";
 
+let managementCsrfToken: string | undefined;
+
+/**
+ * Keeps the LAN management CSRF token in process memory only. The management
+ * shell calls this after login; no browser persistence is used for the token.
+ */
+export function setManagementCsrfToken(token: string | undefined): void {
+  managementCsrfToken =
+    token && /^[a-f0-9]{32}$/i.test(token) ? token : undefined;
+}
+
 export interface GatewayApiClientOptions {
   baseUrl?: string;
   fetch?: typeof fetch;
@@ -203,6 +214,9 @@ export class GatewayApiClient {
         headers: {
           accept: "application/json",
           "x-trace-id": traceId,
+          ...(managementCsrfToken
+            ? { "x-csrf-token": managementCsrfToken }
+            : {}),
           ...additionalHeaders,
         },
       });

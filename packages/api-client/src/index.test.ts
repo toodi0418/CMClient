@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { GatewayApiClient, GatewayApiError, isGatewayApiError } from "./index";
+import {
+  GatewayApiClient,
+  GatewayApiError,
+  isGatewayApiError,
+  setManagementCsrfToken,
+} from "./index";
 
 describe("gateway API client", () => {
   it("uses versioned routes, validates response data, and includes trace IDs", async () => {
@@ -93,6 +98,22 @@ describe("gateway API client", () => {
       reused: false,
     });
     expect(headers?.get("idempotency-key")).toBe("diagnostics-42");
+  });
+
+  it("adds the in-memory management CSRF token without persisting credentials", async () => {
+    let headers: Headers | undefined;
+    setManagementCsrfToken("a".repeat(32));
+    const client = new GatewayApiClient({
+      fetch: async (_input, init) => {
+        headers = new Headers(init?.headers);
+        return jsonResponse({ jobId: "job-1", reused: false }, 202);
+      },
+    });
+
+    await client.diagnostics.integrityCheck();
+
+    expect(headers?.get("x-csrf-token")).toBe("a".repeat(32));
+    setManagementCsrfToken(undefined);
   });
 
   it("reads the privacy-safe proxy status through the versioned API", async () => {
