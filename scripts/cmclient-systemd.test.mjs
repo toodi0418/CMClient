@@ -20,9 +20,10 @@ async function runManager(argumentsList, environment = {}) {
   });
 }
 
-systemdTest("systemd manager installs a hardened Agent-only unit and retains runtime state on uninstall", async () => {
+systemdTest("systemd manager upgrades its unit and retains runtime state on uninstall", async () => {
   const directory = await mkdtemp(join(tmpdir(), "cmclient-systemd-"));
-  const agent = join(directory, "release/bin/cmclient-agent");
+  const agentV1 = join(directory, "releases/v1/bin/cmclient-agent");
+  const agentV2 = join(directory, "releases/v2/bin/cmclient-agent");
   const unitDir = join(directory, "units");
   const configDir = join(directory, "config");
   const dataDir = join(directory, "data");
@@ -34,15 +35,18 @@ systemdTest("systemd manager installs a hardened Agent-only unit and retains run
   const user = process.env.USER ?? process.env.LOGNAME ?? "runner";
   const group = groupOutput.trim();
 
-  await mkdir(join(directory, "release/bin"), { recursive: true });
-  await writeFile(agent, "#!/usr/bin/env sh\nexit 0\n");
-  await chmod(agent, 0o755);
+  await mkdir(join(directory, "releases/v1/bin"), { recursive: true });
+  await mkdir(join(directory, "releases/v2/bin"), { recursive: true });
+  await writeFile(agentV1, "#!/usr/bin/env sh\nexit 0\n");
+  await writeFile(agentV2, "#!/usr/bin/env sh\nexit 0\n");
+  await chmod(agentV1, 0o755);
+  await chmod(agentV2, 0o755);
   await writeFile(systemctl, `#!/usr/bin/env sh\nprintf '%s\\n' "$*" >> '${calls}'\n`);
   await chmod(systemctl, 0o755);
 
   const shared = [
     "--agent",
-    agent,
+    agentV1,
     "--unit-dir",
     unitDir,
     "--config-dir",
@@ -64,8 +68,8 @@ systemdTest("systemd manager installs a hardened Agent-only unit and retains run
 
   await runManager(["install", ...shared]);
   const unit = await readFile(join(unitDir, "cmclient-agent.service"), "utf8");
-  assert.match(unit, new RegExp(`ExecStart=${agent} --serve`));
-  assert.match(unit, new RegExp(`ExecStartPre=${agent} --check-config`));
+  assert.match(unit, new RegExp(`ExecStart=${agentV1} --serve`));
+  assert.match(unit, new RegExp(`ExecStartPre=${agentV1} --check-config`));
   assert.match(unit, new RegExp(`CMCLIENT_DATA_DIR=${dataDir}`));
   assert.match(unit, /NoNewPrivileges=true/);
   assert.match(unit, /CapabilityBoundingSet=\nAmbientCapabilities=/);
@@ -74,7 +78,13 @@ systemdTest("systemd manager installs a hardened Agent-only unit and retains run
   assert.match(await readFile(calls, "utf8"), /daemon-reload\nenable --now cmclient-agent.service\n/);
 
   await writeFile(join(dataDir, "retained-state"), "must survive uninstall");
-  await runManager(["uninstall", ...shared]);
+  const upgraded = shared.map((value) => (value === agentV1 ? agentV2 : value));
+  await runManager(["install", ...upgraded]);
+  const upgradedUnit = await readFile(join(unitDir, "cmclient-agent.service"), "utf8");
+  assert.match(upgradedUnit, new RegExp(`ExecStart=${agentV2} --serve`));
+  assert.equal(await readFile(join(dataDir, "retained-state"), "utf8"), "must survive uninstall");
+
+  await runManager(["uninstall", ...upgraded]);
   await assert.rejects(readFile(join(unitDir, "cmclient-agent.service"), "utf8"));
   assert.equal(await readFile(join(dataDir, "retained-state"), "utf8"), "must survive uninstall");
   assert.match(await readFile(calls, "utf8"), /disable --now cmclient-agent.service/);

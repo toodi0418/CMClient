@@ -27,13 +27,66 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   const plan = releaseArtifactPlan(version);
   t.after(() => rm(root, { force: true, recursive: true }));
 
+  await stageFixture(input, plan, version, "fixture");
+
+  const index = await assembleReleaseArtifacts({ input, output, version });
+  assert.equal(index.artifacts.length, plan.length);
+  for (const artifact of index.artifacts) {
+    assert.match(artifact.sha256, /^[a-f0-9]{64}$/);
+    assert.ok(artifact.sizeBytes > 0);
+  }
+  const firstArchive = plan.find((artifact) => artifact.archive === "tar.zst");
+  assert.ok(firstArchive);
+  const firstBinary = `cmclient-${firstArchive.component}`;
+  const { stdout } = await runFile("tar", ["-tf", join(output, firstArchive.fileName)]);
+  assert.deepEqual(stdout.trim().split("\n").sort(), [
+    `bin/${firstBinary}`,
+    "metadata/build-manifest.json",
+  ]);
+
+  const portableV1 = join(root, "portable-v1");
+  const portableV2 = join(root, "portable-v2");
+  const retainedData = join(root, "user-data", "retained-state");
+  await mkdir(portableV1, { recursive: true });
+  await runFile("tar", ["-xf", join(output, firstArchive.fileName), "-C", portableV1]);
+  assert.equal(await readFile(join(portableV1, `bin/${firstBinary}`), "utf8"), "fixture-0");
+  await mkdir(join(root, "user-data"), { recursive: true });
+  await writeFile(retainedData, "must survive portable refresh");
+
+  const upgradeVersion = "2.0.0-dev.1";
+  const upgradeInput = join(root, "input-v2");
+  const upgradeOutput = join(root, "output-v2");
+  const upgradePlan = releaseArtifactPlan(upgradeVersion);
+  await stageFixture(upgradeInput, upgradePlan, upgradeVersion, "upgrade");
+  await assembleReleaseArtifacts({
+    input: upgradeInput,
+    output: upgradeOutput,
+    version: upgradeVersion,
+  });
+  const upgradeArchive = upgradePlan.find(
+    (artifact) =>
+      artifact.component === firstArchive.component && artifact.target === firstArchive.target,
+  );
+  assert.ok(upgradeArchive);
+  await mkdir(portableV2, { recursive: true });
+  await runFile("tar", ["-xf", join(upgradeOutput, upgradeArchive.fileName), "-C", portableV2]);
+  await rm(portableV1, { force: true, recursive: true });
+  assert.equal(await readFile(join(portableV2, `bin/${firstBinary}`), "utf8"), "upgrade-0");
+  assert.equal(await readFile(retainedData, "utf8"), "must survive portable refresh");
+
+  await writeFile(join(output, "cmclient-2.0.0-dev.0.spdx.json"), "{\"spdxVersion\":\"SPDX-2.3\"}\n");
+  await finalizeChecksums({ output });
+  await assert.doesNotReject(() => verifyReleaseOutput({ output, version }));
+});
+
+async function stageFixture(input, plan, version, prefix) {
   for (const [index, artifact] of plan.entries()) {
     const directory = join(input, artifact.component, artifact.target);
     const binary = artifact.target.startsWith("windows-")
       ? `cmclient-${artifact.component}.exe`
       : `cmclient-${artifact.component}`;
     await mkdir(directory, { recursive: true });
-    await writeFile(join(directory, binary), `fixture-${index}`);
+    await writeFile(join(directory, binary), `${prefix}-${index}`);
     await writeFile(
       join(directory, "build-manifest.json"),
       `${JSON.stringify(
@@ -53,25 +106,7 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
       )}\n`,
     );
   }
-
-  const index = await assembleReleaseArtifacts({ input, output, version });
-  assert.equal(index.artifacts.length, plan.length);
-  for (const artifact of index.artifacts) {
-    assert.match(artifact.sha256, /^[a-f0-9]{64}$/);
-    assert.ok(artifact.sizeBytes > 0);
-  }
-  const firstArchive = plan.find((artifact) => artifact.archive === "tar.zst");
-  assert.ok(firstArchive);
-  const firstBinary = `cmclient-${firstArchive.component}`;
-  const { stdout } = await runFile("tar", ["-tf", join(output, firstArchive.fileName)]);
-  assert.deepEqual(stdout.trim().split("\n").sort(), [
-    `bin/${firstBinary}`,
-    "metadata/build-manifest.json",
-  ]);
-  await writeFile(join(output, "cmclient-2.0.0-dev.0.spdx.json"), "{\"spdxVersion\":\"SPDX-2.3\"}\n");
-  await finalizeChecksums({ output });
-  await assert.doesNotReject(() => verifyReleaseOutput({ output, version }));
-});
+}
 
 test("supply-chain checksums cover every archive and generated SBOM", async (t) => {
   const version = "2.0.0-dev.0";

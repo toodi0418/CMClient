@@ -56,3 +56,6 @@ in [Docker Deployment](./docker-deployment.md).
 
 The archive, SBOM, checksum, keyless provenance, and offline manifest-signing
 boundaries are documented in [Release Supply Chain](./supply-chain.md).
+
+Clean install, upgrade, and uninstall retention semantics are defined in
+[Packaging Lifecycle Matrix](./packaging-lifecycle.md).

@@ -4,11 +4,11 @@ param(
     [ValidateSet("install", "uninstall", "start", "stop", "restart", "status", "render")]
     [string]$Command,
     [string]$HostPath = (Join-Path $PSScriptRoot "..\bin\cmclient-service-host.exe"),
+    [string]$ServiceName = "CMClientAgent",
     [switch]$NoStart
 )
 
 $ErrorActionPreference = "Stop"
-$ServiceName = "CMClientAgent"
 $DisplayName = "CMClient Agent"
 
 function Assert-Administrator {
@@ -25,6 +25,12 @@ function Assert-SafeAbsolutePath([string]$Path) {
     }
 }
 
+function Assert-SafeServiceName([string]$Name) {
+    if ($Name -notmatch '^[A-Za-z][A-Za-z0-9_.-]{0,127}$') {
+        throw "WINDOWS_SERVICE_NAME_INVALID"
+    }
+}
+
 function Invoke-Sc([string[]]$Arguments) {
     & sc.exe @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) {
@@ -33,6 +39,7 @@ function Invoke-Sc([string[]]$Arguments) {
 }
 
 Assert-SafeAbsolutePath $HostPath
+Assert-SafeServiceName $ServiceName
 $BinaryPath = ('"{0}" --service' -f $HostPath)
 
 if ($Command -eq "render") {

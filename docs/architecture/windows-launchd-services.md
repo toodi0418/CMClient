@@ -13,7 +13,7 @@ durable update recovery handles an interrupted update on its next start.
 absolute paths under `%ProgramData%\CMClient` for data, configuration, cache,
 and logs. The manager accepts only the service-host path and operational
 actions; it never accepts or writes a CallMesh key, APRS passcode, token, or
-signing key. Uninstall removes the SCM registration only and retains
+signing key. Re-running install updates the SCM executable target. Uninstall removes the SCM registration only and retains
 `%ProgramData%\CMClient`.
 
 The private Agent Control API is the local named pipe

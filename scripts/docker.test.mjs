@@ -5,11 +5,12 @@ import test from "node:test";
 const repositoryRoot = new URL("../", import.meta.url);
 
 test("Docker deployment uses the CMClient runtime and mandatory restrictions", async () => {
-  const [dockerfile, compose, entrypoint, runtime] = await Promise.all([
+  const [dockerfile, compose, entrypoint, runtime, smoke] = await Promise.all([
     readFile(new URL("Dockerfile", repositoryRoot), "utf8"),
     readFile(new URL("docker-compose.yml", repositoryRoot), "utf8"),
     readFile(new URL("scripts/container-entrypoint.mjs", repositoryRoot), "utf8"),
     readFile(new URL("scripts/container-runtime.mjs", repositoryRoot), "utf8"),
+    readFile(new URL("scripts/docker-smoke.sh", repositoryRoot), "utf8"),
   ]);
 
   assert.match(
@@ -34,4 +35,6 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
     `${dockerfile}\n${compose}\n${entrypoint}\n${runtime}`,
     /TENMAN|TMAG_|AUTO_UPDATE|git clone|callmesh-client/i,
   );
+  assert.match(smoke, /--force-recreate/);
+  assert.match(smoke, /packaging-lifecycle-sentinel/);
 });

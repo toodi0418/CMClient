@@ -20,9 +20,10 @@ async function runManager(argumentsList, environment = {}) {
   });
 }
 
-launchdTest("launchd manager installs a per-user Agent plist without credential values", async () => {
+launchdTest("launchd manager upgrades its plist and retains runtime state on uninstall", async () => {
   const directory = await mkdtemp(join(tmpdir(), "cmclient-launchd-"));
-  const agent = join(directory, "release/bin/cmclient-agent");
+  const agentV1 = join(directory, "releases/v1/bin/cmclient-agent");
+  const agentV2 = join(directory, "releases/v2/bin/cmclient-agent");
   const home = join(directory, "home");
   const plist = join(home, "Library/LaunchAgents/io.cmclient.agent.plist");
   const data = join(home, "Library/Application Support/CMClient");
@@ -31,9 +32,12 @@ launchdTest("launchd manager installs a per-user Agent plist without credential 
   const plutil = join(directory, "plutil");
   const calls = join(directory, "launchctl-calls");
 
-  await mkdir(join(directory, "release/bin"), { recursive: true });
-  await writeFile(agent, "#!/usr/bin/env sh\nexit 0\n");
-  await chmod(agent, 0o755);
+  await mkdir(join(directory, "releases/v1/bin"), { recursive: true });
+  await mkdir(join(directory, "releases/v2/bin"), { recursive: true });
+  await writeFile(agentV1, "#!/usr/bin/env sh\nexit 0\n");
+  await writeFile(agentV2, "#!/usr/bin/env sh\nexit 0\n");
+  await chmod(agentV1, 0o755);
+  await chmod(agentV2, 0o755);
   await writeFile(launchctl, `#!/usr/bin/env sh\nprintf '%s\\n' "$*" >> '${calls}'\n`);
   await writeFile(plutil, "#!/usr/bin/env sh\nexit 0\n");
   await chmod(launchctl, 0o755);
@@ -41,7 +45,7 @@ launchdTest("launchd manager installs a per-user Agent plist without credential 
 
   const shared = [
     "--agent",
-    agent,
+    agentV1,
     "--plist",
     plist,
     "--data-dir",
@@ -62,13 +66,19 @@ launchdTest("launchd manager installs a per-user Agent plist without credential 
   await runManager(["install", ...shared], environment);
   const contents = await readFile(plist, "utf8");
   assert.match(contents, /<string>io\.cmclient\.agent<\/string>/);
-  assert.match(contents, new RegExp(`<string>${agent}<\\/string>`));
+  assert.match(contents, new RegExp(`<string>${agentV1}<\\/string>`));
   assert.match(contents, /<key>KeepAlive<\/key>/);
   assert.doesNotMatch(contents, /CALLMESH|API_KEY|PASSCODE|TOKEN/);
   assert.match(await readFile(calls, "utf8"), /bootstrap gui\/\d+ .*io\.cmclient\.agent\.plist/);
 
   await writeFile(join(data, "retained-state"), "must survive uninstall");
-  await runManager(["uninstall", ...shared], environment);
+  const upgraded = shared.map((value) => (value === agentV1 ? agentV2 : value));
+  await runManager(["install", ...upgraded], environment);
+  const upgradedContents = await readFile(plist, "utf8");
+  assert.match(upgradedContents, new RegExp(`<string>${agentV2}<\\/string>`));
+  assert.equal(await readFile(join(data, "retained-state"), "utf8"), "must survive uninstall");
+
+  await runManager(["uninstall", ...upgraded], environment);
   await assert.rejects(readFile(plist, "utf8"));
   assert.equal(await readFile(join(data, "retained-state"), "utf8"), "must survive uninstall");
   await rm(directory, { recursive: true, force: true });

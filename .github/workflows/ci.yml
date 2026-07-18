@@ -107,12 +107,43 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
       - run: cargo test -p cmclient-control-api --locked
       - run: cargo test -p cmclient-service-host --locked
+      - run: cargo build -p cmclient-service-host --locked
       - run: cargo build -p cmclient-agent --locked
       - name: Render Windows service registration without creating it
         shell: powershell
         run: |
           $rendered = powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 render -HostPath 'C:\Program Files\CMClient\current\bin\cmclient-service-host.exe' | ConvertFrom-Json
           if ($rendered.serviceName -ne 'CMClientAgent' -or $rendered.storesCredentials) { throw 'Windows service render failed' }
+      - name: Exercise isolated Windows Service install, upgrade, and uninstall
+        shell: powershell
+        run: |
+          $root = Join-Path $env:TEMP "cmclient-packaging-$env:GITHUB_RUN_ID"
+          $serviceName = "CMClientAgentPackage$env:GITHUB_RUN_ID"
+          $hostV1 = Join-Path $root "v1\cmclient-service-host.exe"
+          $hostV2 = Join-Path $root "v2\cmclient-service-host.exe"
+          $state = Join-Path $root "data\retained-state"
+          $manager = Join-Path $PWD "scripts\cmclient-windows-service.ps1"
+          New-Item -ItemType Directory -Force (Split-Path $hostV1), (Split-Path $hostV2), (Split-Path $state) | Out-Null
+          Copy-Item (Join-Path $PWD "target\debug\cmclient-service-host.exe") $hostV1
+          Copy-Item $hostV1 $hostV2
+          Set-Content -NoNewline $state "must survive service lifecycle"
+          try {
+            powershell -NoProfile -ExecutionPolicy Bypass -File $manager install -HostPath $hostV1 -ServiceName $serviceName -NoStart
+            if ((Get-Service -Name $serviceName).Status -ne "Stopped") { throw "Windows service should not start in lifecycle smoke" }
+            powershell -NoProfile -ExecutionPolicy Bypass -File $manager install -HostPath $hostV2 -ServiceName $serviceName -NoStart
+            $configuration = sc.exe qc $serviceName | Out-String
+            if ($configuration -notmatch [regex]::Escape($hostV2)) { throw "Windows service upgrade path was not applied" }
+            powershell -NoProfile -ExecutionPolicy Bypass -File $manager uninstall -HostPath $hostV2 -ServiceName $serviceName
+            for ($attempt = 0; $attempt -lt 10 -and (Get-Service -Name $serviceName -ErrorAction SilentlyContinue); $attempt++) { Start-Sleep -Milliseconds 250 }
+            if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) { throw "Windows service was not removed" }
+            if ((Get-Content -Raw $state) -ne "must survive service lifecycle") { throw "Windows service uninstall removed retained state" }
+          }
+          finally {
+            if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+              powershell -NoProfile -ExecutionPolicy Bypass -File $manager uninstall -HostPath $hostV2 -ServiceName $serviceName
+            }
+            Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+          }
 
   docker-smoke:
     name: Docker restricted runtime smoke
