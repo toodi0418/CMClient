@@ -14,10 +14,12 @@
     "typecheck": "pnpm --filter @cmclient/contracts run build && pnpm --recursive --if-present run typecheck",
     "build": "pnpm --recursive --if-present run build",
     "test": "pnpm --filter @cmclient/contracts run build && pnpm run test:fixtures && vitest run",
+    "test:e2e:web": "playwright test",
     "test:fixtures": "node --test test/fixtures/sanitized-packet-fixtures.test.js"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.61.1",
     "@types/node": "^26.1.1",
     "eslint": "^10.7.0",
     "eslint-config-prettier": "^10.1.8",

@@ -9,7 +9,17 @@ import { CallMeshClient } from "./callmesh.js";
 
 const database = new GatewayDatabase(gatewayDatabasePath(process.env));
 const events = new DomainEventBus();
-const jobs = new JobEngine(database.jobs, events);
+const jobs = new JobEngine(database.jobs, events, {
+  handlers: [
+    {
+      type: "diagnostics.integrity_check",
+      handler: async (context) => {
+        context.throwIfCancellationRequested();
+        return { integrity: database.integrityCheck() };
+      },
+    },
+  ],
+});
 jobs.recover();
 const callmeshUrl = process.env.CMCLIENT_CALLMESH_URL?.trim();
 const callmeshApiKey = process.env.CMCLIENT_CALLMESH_API_KEY;
@@ -26,7 +36,17 @@ const runtime = new GatewayRuntime(
   undefined,
   undefined,
   events,
-  jobs,
+  {
+    get: (jobId) => jobs.get(jobId),
+    cancel: (jobId, correlationId) => jobs.cancel(jobId, correlationId),
+    submitIntegrityCheck: (correlationId, idempotencyKey) =>
+      jobs.submit({
+        type: "diagnostics.integrity_check",
+        input: {},
+        ...(correlationId ? { correlationId } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      }),
+  },
   {
     listNodes: (limit) => database.meshNodes.list(limit),
     listMessages: (limit) => database.meshMessages.list(limit),

@@ -78,7 +78,8 @@ export class GatewayEventClient {
 
   constructor(options: GatewayEventClientOptions = {}) {
     this.url = validateEventsUrl(options.url ?? DEFAULT_GATEWAY_EVENTS_URL);
-    this.fetchImplementation = options.fetch ?? globalThis.fetch;
+    this.fetchImplementation =
+      options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.reconnect = resolveReconnectOptions(options.reconnect);
     this.sleep = options.sleep ?? sleepWithAbort;
   }

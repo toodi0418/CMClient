@@ -137,6 +137,65 @@ describe("GatewayRuntime", () => {
     await unavailable.close();
   });
 
+  it("submits an idempotent diagnostics integrity-check job", async () => {
+    const submissions: Array<{
+      correlationId?: string;
+      idempotencyKey?: string;
+    }> = [];
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      undefined,
+      {},
+      {
+        get: () => undefined,
+        cancel: () => undefined,
+        submitIntegrityCheck(correlationId, idempotencyKey) {
+          submissions.push({
+            ...(correlationId ? { correlationId } : {}),
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+          });
+          return {
+            created: true,
+            job: {
+              id: "diagnostics-1",
+              type: "diagnostics.integrity_check",
+              status: "queued",
+              createdAt: "2026-07-18T00:00:00.000Z",
+              updatedAt: "2026-07-18T00:00:00.000Z",
+            },
+          };
+        },
+      },
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/diagnostics/integrity-check",
+      headers: {
+        "x-correlation-id": "diagnostics-42",
+        "idempotency-key": "diagnostics-key-42",
+      },
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({ jobId: "diagnostics-1", reused: false });
+    expect(submissions).toEqual([
+      {
+        correlationId: "diagnostics-42",
+        idempotencyKey: "diagnostics-key-42",
+      },
+    ]);
+    const invalid = await app.inject({
+      method: "POST",
+      url: "/api/v1/diagnostics/integrity-check",
+      headers: { "idempotency-key": "invalid key" },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toMatchObject({ code: "JOB_INPUT_INVALID" });
+    await app.close();
+  });
+
   it("replays SSE events after Last-Event-ID and starts a heartbeat stream", async () => {
     let sequence = 0;
     const events = new DomainEventBus({

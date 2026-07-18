@@ -54,6 +54,15 @@ fail closed, clear persisted mappings, and surface only stable reason codes.
 The Logs page is a bounded, in-memory view of the current SSE session, not a
 claim of persisted audit history.
 
+Settings persists only Web display preferences (theme and locale) in the local
+browser record. Agent-owned management and update capabilities remain read-only
+projections until their authenticated control APIs exist. The Diagnostics page
+submits `POST /api/v1/diagnostics/integrity-check` as an idempotent asynchronous
+Job and renders its persisted Job status; the Gateway handler performs SQLite
+`PRAGMA integrity_check` without exposing database contents. The Updates page
+reports the current build and the Agent-owned update capability only. It does
+not imply that Gateway can update itself.
+
 The shell uses Tailwind 4 through the Vite integration and maps its `cm-*`
 utility names to semantic CSS variables in `apps/web/src/theme/tokens.css`.
 Those tokens identify canvas, surfaces, content, accent, warning, danger and
@@ -73,3 +82,9 @@ Invalid or unavailable storage values fall back to `system` and a browser
 locale match with `zh-TW` as the final fallback. Management routes carry
 translation keys rather than rendered text so section headings, navigation and
 the display controls switch immediately without changing their route identity.
+
+`pnpm test:e2e:web` starts an isolated loopback Vite instance and uses
+Playwright Chromium to cover desktop Settings/Updates and mobile
+Diagnostics/drawer flows. The checks assert route interaction, translated
+controls, durable diagnostics Job state, and no horizontal overflow. CI installs
+Chromium and runs this suite after the production build.

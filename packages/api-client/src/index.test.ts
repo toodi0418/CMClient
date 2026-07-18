@@ -77,6 +77,23 @@ describe("gateway API client", () => {
     });
     expect(url).toBe("/api/v1/callmesh");
   });
+
+  it("submits diagnostics with a client-generated idempotency key", async () => {
+    let headers: Headers | undefined;
+    const client = new GatewayApiClient({
+      traceIdFactory: () => "diagnostics-42",
+      fetch: async (_input, init) => {
+        headers = new Headers(init?.headers);
+        return jsonResponse({ jobId: "job-1", reused: false }, 202);
+      },
+    });
+
+    await expect(client.diagnostics.integrityCheck()).resolves.toEqual({
+      jobId: "job-1",
+      reused: false,
+    });
+    expect(headers?.get("idempotency-key")).toBe("diagnostics-42");
+  });
 });
 
 function jsonResponse(payload: unknown, status = 200): Response {

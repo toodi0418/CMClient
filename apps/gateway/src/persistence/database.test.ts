@@ -14,7 +14,7 @@ function databasePath(name: string): string {
 }
 
 describe("GatewayDatabase", () => {
-  it("enables WAL, journals migrations, and persists typed settings", () => {
+  it("enables WAL, journals migrations, persists typed settings, and checks integrity", () => {
     const path = databasePath("wal");
     rmSync(path, { force: true });
     const database = new GatewayDatabase(path);
@@ -27,6 +27,7 @@ describe("GatewayDatabase", () => {
     expect(String(journalMode.journal_mode).toLowerCase()).toBe("wal");
     database.settings.set("web.enabled", true);
     expect(database.settings.get<boolean>("web.enabled")).toBe(true);
+    expect(database.integrityCheck()).toBe("ok");
     expect(
       database.connection
         .prepare("SELECT version FROM schema_migrations")

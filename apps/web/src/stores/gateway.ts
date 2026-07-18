@@ -44,6 +44,7 @@ export function createGatewayStore(clients: GatewayClients = defaultClients()) {
       eventConnection: "idle" as SseConnectionState,
       lastEventType: undefined as string | undefined,
       recentEvents: [] as DomainEvent[],
+      eventErrorCode: undefined as string | undefined,
       errorCode: undefined as string | undefined,
       initialized: false,
       unsubscribers: [] as Array<() => void>,
@@ -57,9 +58,12 @@ export function createGatewayStore(clients: GatewayClients = defaultClients()) {
               this.eventConnection = state;
             }),
             clients.events.onError((error) => {
-              this.errorCode = isGatewayApiError(error)
+              this.eventErrorCode = isGatewayApiError(error)
                 ? error.code
                 : "GATEWAY_NETWORK_UNAVAILABLE";
+              if (this.availability !== "available") {
+                this.errorCode = this.eventErrorCode;
+              }
             }),
             clients.events.onEvent((event) => {
               this.lastEventType = event.type;
@@ -114,6 +118,7 @@ export function createGatewayStore(clients: GatewayClients = defaultClients()) {
         clients.events.stop();
         this.initialized = false;
         this.eventConnection = "stopped";
+        this.eventErrorCode = undefined;
       },
     },
   });

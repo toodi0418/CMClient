@@ -28,6 +28,10 @@ export class DatabaseMigrationError extends Error {
   readonly code = "DATABASE_MIGRATION_FAILED";
 }
 
+export class DatabaseIntegrityError extends Error {
+  readonly code = "DATABASE_INTEGRITY_CHECK_FAILED";
+}
+
 export class GatewayDatabase {
   readonly connection: DatabaseSync;
   readonly jobs: JobRepository;
@@ -62,6 +66,17 @@ export class GatewayDatabase {
 
   close(): void {
     this.connection.close();
+  }
+
+  integrityCheck(): "ok" {
+    const rows = this.connection.prepare("PRAGMA integrity_check").all();
+    if (
+      rows.length !== 1 ||
+      String(rows[0]?.integrity_check ?? "").toLowerCase() !== "ok"
+    ) {
+      throw new DatabaseIntegrityError();
+    }
+    return "ok";
   }
 }
 

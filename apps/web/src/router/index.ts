@@ -4,11 +4,6 @@ import {
   createWebHistory,
 } from "vue-router";
 
-const sections = [
-  ["settings", "navigation.settings", "section.settings"],
-  ["diagnostics", "navigation.diagnostics", "section.diagnostics"],
-] as const;
-
 export const router = createRouter({
   history:
     typeof window === "undefined" ? createMemoryHistory() : createWebHistory(),
@@ -50,6 +45,24 @@ export const router = createRouter({
       meta: { labelKey: "navigation.logs", group: "operations" },
     },
     {
+      path: "/updates",
+      name: "updates",
+      component: () => import("@/views/UpdatesView.vue"),
+      meta: { labelKey: "navigation.updates", group: "operations" },
+    },
+    {
+      path: "/settings",
+      name: "settings",
+      component: () => import("@/views/SettingsView.vue"),
+      meta: { labelKey: "navigation.settings", group: "operations" },
+    },
+    {
+      path: "/diagnostics",
+      name: "diagnostics",
+      component: () => import("@/views/DiagnosticsView.vue"),
+      meta: { labelKey: "navigation.diagnostics", group: "operations" },
+    },
+    {
       path: "/nodes",
       name: "nodes",
       component: () => import("@/views/NodesView.vue"),
@@ -73,13 +86,6 @@ export const router = createRouter({
       component: () => import("@/views/TelemetryView.vue"),
       meta: { labelKey: "navigation.telemetry", group: "operations" },
     },
-    ...sections.map(([name, labelKey, summaryKey]) => ({
-      path: `/${name}`,
-      name,
-      component: () => import("@/views/SectionView.vue"),
-      props: { labelKey, summaryKey },
-      meta: { labelKey, group: "operations" },
-    })),
     {
       path: "/:pathMatch(.*)*",
       redirect: "/",

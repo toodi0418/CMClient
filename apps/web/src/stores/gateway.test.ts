@@ -41,6 +41,9 @@ describe("gateway store", () => {
     await gateway.initialize();
     fake.emitState("open");
     fake.emitEvent({ type: "gateway.ready" });
+    fake.emitError(
+      new GatewayApiError({ code: "GATEWAY_NETWORK_UNAVAILABLE" }),
+    );
 
     expect(gateway.availability).toBe("available");
     expect(gateway.status).toEqual(status);
@@ -53,6 +56,8 @@ describe("gateway store", () => {
     expect(gateway.recentEvents).toMatchObject([
       { eventId: "event-fixture", type: "gateway.ready" },
     ]);
+    expect(gateway.errorCode).toBeUndefined();
+    expect(gateway.eventErrorCode).toBe("GATEWAY_NETWORK_UNAVAILABLE");
   });
 
   it("keeps a stable error code when Gateway projections are unavailable", async () => {
@@ -80,6 +85,7 @@ function createFakeClients(
         state: "idle" | "connecting" | "open" | "reconnecting" | "stopped",
       ) => void)
     | undefined;
+  let errorListener: ((error: unknown) => void) | undefined;
 
   const clients: GatewayClients = {
     api: {
@@ -97,7 +103,8 @@ function createFakeClients(
         eventListener = listener;
         return () => undefined;
       },
-      onError() {
+      onError(listener) {
+        errorListener = listener;
         return () => undefined;
       },
       onStateChange(listener) {
@@ -123,6 +130,9 @@ function createFakeClients(
       state: "idle" | "connecting" | "open" | "reconnecting" | "stopped",
     ) {
       stateListener?.(state);
+    },
+    emitError(error: unknown) {
+      errorListener?.(error);
     },
   };
 }

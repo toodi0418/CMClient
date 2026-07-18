@@ -9,6 +9,7 @@ import {
   AprsOutboxEntryListSchema,
   BuildMetadataSchema,
   CallMeshOverviewSchema,
+  JobAcceptedSchema,
   JobDetailSchema,
   MeshMessageListSchema,
   MeshNodeListSchema,
@@ -20,6 +21,7 @@ import {
   type DomainEvent,
   type AprsOutboxEntry,
   type CallMeshOverview,
+  type JobAccepted,
   type JobDetail,
   type MeshMessage,
   type MeshNode,
@@ -47,6 +49,10 @@ import {
 export interface GatewayJobApi {
   get(jobId: string): JobDetail | undefined;
   cancel(jobId: string, correlationId?: string): JobDetail | undefined;
+  submitIntegrityCheck?(
+    correlationId?: string,
+    idempotencyKey?: string,
+  ): { created: boolean; job: JobDetail };
 }
 
 export interface GatewayDomainReadApi {
@@ -87,6 +93,10 @@ interface JobIdParams {
 
 interface ListQuery {
   limit?: number;
+}
+
+interface IdempotencyHeaders {
+  "idempotency-key"?: string;
 }
 
 export class GatewayConfigurationError extends Error {
@@ -324,6 +334,35 @@ export function createGatewayApp(
   app.get("/api/v1/events", (request, reply) => {
     openSseStream(request, reply, eventBus, logger, heartbeatIntervalMs);
   });
+  app.post<{ Headers: IdempotencyHeaders }>(
+    "/api/v1/diagnostics/integrity-check",
+    {
+      schema: {
+        response: { 202: JobAcceptedSchema, 503: ApiErrorSchema },
+      },
+    },
+    (request, reply) => {
+      if (!jobs?.submitIntegrityCheck) {
+        return sendJobEngineUnavailable(request, reply);
+      }
+      const idempotencyKey = request.headers["idempotency-key"];
+      if (
+        idempotencyKey !== undefined &&
+        !/^[a-zA-Z0-9._:-]{1,128}$/.test(idempotencyKey)
+      ) {
+        return sendJobInputInvalid(request, reply);
+      }
+      const submitted = jobs.submitIntegrityCheck(
+        request.correlationId,
+        idempotencyKey,
+      );
+      const accepted: JobAccepted = {
+        jobId: submitted.job.id,
+        reused: !submitted.created,
+      };
+      return reply.code(202).send(accepted);
+    },
+  );
   app.get<{ Params: JobIdParams }>(
     "/api/v1/jobs/:jobId",
     {
@@ -431,6 +470,14 @@ function sendJobEngineUnavailable(
 ) {
   return reply.code(503).send({
     code: "GATEWAY_JOB_ENGINE_UNAVAILABLE",
+    params: {},
+    traceId: request.traceId,
+  });
+}
+
+function sendJobInputInvalid(request: FastifyRequest, reply: FastifyReply) {
+  return reply.code(400).send({
+    code: "JOB_INPUT_INVALID",
     params: {},
     traceId: request.traceId,
   });

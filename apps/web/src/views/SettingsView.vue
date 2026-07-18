@@ -1,0 +1,144 @@
+<script setup lang="ts">
+import { computed, onMounted } from "vue";
+import { Languages, Monitor, Moon, Sun } from "@lucide/vue";
+import Button from "primevue/button";
+import { useI18n } from "vue-i18n";
+
+import { isSupportedLocale, type ThemePreference } from "@/preferences";
+import { useGatewayStore } from "@/stores/gateway";
+import { usePreferencesStore } from "@/stores/preferences";
+
+const gateway = useGatewayStore();
+const preferences = usePreferencesStore();
+const { t } = useI18n();
+
+const themeOptions = [
+  {
+    value: "light" as ThemePreference,
+    labelKey: "preferences.light",
+    icon: Sun,
+  },
+  {
+    value: "dark" as ThemePreference,
+    labelKey: "preferences.dark",
+    icon: Moon,
+  },
+  {
+    value: "system" as ThemePreference,
+    labelKey: "preferences.system",
+    icon: Monitor,
+  },
+];
+
+const runtimeCapabilities = computed(() =>
+  ["managementWeb", "update"]
+    .map((key) => ({
+      key,
+      capability:
+        gateway.capabilities?.capabilities[key as "managementWeb" | "update"],
+    }))
+    .filter(
+      (
+        row,
+      ): row is {
+        key: "managementWeb" | "update";
+        capability: NonNullable<typeof row.capability>;
+      } => Boolean(row.capability),
+    ),
+);
+
+onMounted(() => void gateway.refresh());
+
+function setLocale(event: Event) {
+  const locale = (event.target as HTMLSelectElement).value;
+  if (isSupportedLocale(locale)) {
+    preferences.setLocale(locale);
+  }
+}
+</script>
+
+<template>
+  <section class="page-grid" :aria-label="t('navigation.settings')">
+    <div class="status-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-placeholder__eyebrow">
+            {{ t("navigation.settings") }}
+          </p>
+          <h2>{{ t("settings.display") }}</h2>
+        </div>
+      </div>
+      <div class="settings-controls">
+        <div class="settings-control">
+          <span>{{ t("preferences.theme") }}</span>
+          <div
+            class="theme-selector"
+            role="group"
+            :aria-label="t('preferences.theme')"
+          >
+            <Button
+              v-for="option in themeOptions"
+              :key="option.value"
+              unstyled
+              class="theme-selector__button theme-selector__button--labelled"
+              :class="{ 'is-selected': preferences.theme === option.value }"
+              type="button"
+              :aria-pressed="preferences.theme === option.value"
+              @click="preferences.setTheme(option.value)"
+            >
+              <component :is="option.icon" :size="16" aria-hidden="true" />
+              <span>{{ t(option.labelKey) }}</span>
+            </Button>
+          </div>
+        </div>
+        <label class="settings-control">
+          <span>{{ t("preferences.language") }}</span>
+          <span class="locale-selector">
+            <Languages :size="16" aria-hidden="true" />
+            <select :value="preferences.locale" @change="setLocale">
+              <option value="zh-TW">{{ t("preferences.zhTW") }}</option>
+              <option value="en-US">{{ t("preferences.enUS") }}</option>
+            </select>
+          </span>
+        </label>
+      </div>
+    </div>
+
+    <div class="status-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-placeholder__eyebrow">
+            {{ t("settings.runtime") }}
+          </p>
+          <h2>{{ t("settings.capabilities") }}</h2>
+        </div>
+      </div>
+      <p v-if="gateway.errorCode" class="status-message">
+        {{ t("common.unavailable") }}
+        <code class="stable-code">{{ gateway.errorCode }}</code>
+      </p>
+      <div v-else class="capability-list">
+        <div
+          v-for="row in runtimeCapabilities"
+          :key="row.key"
+          class="capability-row"
+        >
+          <span>{{ t(`capability.${row.key}`) }}</span>
+          <span
+            class="status-badge"
+            :data-state="row.capability.available ? 'available' : 'unavailable'"
+          >
+            {{
+              row.capability.available
+                ? t("common.available")
+                : t("common.notConfigured")
+            }}
+          </span>
+          <code v-if="!row.capability.available">{{
+            row.capability.reasonCode
+          }}</code>
+        </div>
+      </div>
+    </div>
+  </section>
+</template>

@@ -3,6 +3,7 @@ import {
   AprsOutboxEntryListSchema,
   BuildMetadataSchema,
   CallMeshOverviewSchema,
+  JobAcceptedSchema,
   JobDetailSchema,
   MeshMessageListSchema,
   MeshNodeListSchema,
@@ -15,6 +16,7 @@ import {
   type CallMeshOverview,
   type ApiError,
   type AprsOutboxEntryList,
+  type JobAccepted,
   type JobDetail,
   type MeshMessageList,
   type MeshNodeList,
@@ -118,7 +120,8 @@ export class GatewayApiClient {
     this.baseUrl = normalizeBaseUrl(
       options.baseUrl ?? DEFAULT_GATEWAY_API_BASE_URL,
     );
-    this.fetchImplementation = options.fetch ?? globalThis.fetch;
+    this.fetchImplementation =
+      options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.traceIdFactory = options.traceIdFactory ?? defaultTraceId;
   }
 
@@ -141,6 +144,16 @@ export class GatewayApiClient {
       this.requestJob<JobDetail>(jobId, "GET", JobDetailSchema),
     cancel: (jobId: string) =>
       this.requestJob<JobDetail>(jobId, "POST", JobDetailSchema),
+  };
+
+  readonly diagnostics = {
+    integrityCheck: () =>
+      this.request<JobAccepted>(
+        "/diagnostics/integrity-check",
+        JobAcceptedSchema,
+        "POST",
+        { "idempotency-key": this.traceIdFactory() },
+      ),
   };
 
   readonly domain = {
@@ -173,6 +186,7 @@ export class GatewayApiClient {
     path: string,
     schema: TSchema,
     method: "GET" | "POST" = "GET",
+    additionalHeaders: Record<string, string> = {},
   ): Promise<T> {
     const traceId = this.traceIdFactory();
     let response: Response;
@@ -183,6 +197,7 @@ export class GatewayApiClient {
         headers: {
           accept: "application/json",
           "x-trace-id": traceId,
+          ...additionalHeaders,
         },
       });
     } catch (error) {

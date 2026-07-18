@@ -14,6 +14,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Radio,
+  RefreshCw,
   Satellite,
   ScrollText,
   Server,
@@ -50,6 +51,7 @@ const primaryNavigation = [
 
 const supportNavigation = [
   { labelKey: "navigation.logs", to: "/logs", icon: ScrollText },
+  { labelKey: "navigation.updates", to: "/updates", icon: RefreshCw },
   { labelKey: "navigation.settings", to: "/settings", icon: Settings },
   { labelKey: "navigation.diagnostics", to: "/diagnostics", icon: Stethoscope },
 ];
