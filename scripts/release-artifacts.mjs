@@ -1,7 +1,7 @@
 import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
-export const RELEASE_COMPONENTS = ["desktop", "headless", "cli"];
+export const RELEASE_COMPONENTS = ["desktop", "headless", "cli", "service"];
 export const RELEASE_TARGETS = [
   "darwin-aarch64",
   "darwin-x86_64",
@@ -20,6 +20,9 @@ export function archiveForTarget(target) {
 export function releaseArtifactName({ component, target, version }) {
   assertComponent(component);
   assertTarget(target);
+  if (!targetsForComponent(component).includes(target)) {
+    throw new Error(`unsupported component target: ${component} ${target}`);
+  }
   assertVersion(version);
   return `cmclient-${component}-${target}-${version}.${archiveForTarget(target)}`;
 }
@@ -27,7 +30,7 @@ export function releaseArtifactName({ component, target, version }) {
 export function releaseArtifactPlan(version) {
   assertVersion(version);
   return RELEASE_COMPONENTS.flatMap((component) =>
-    RELEASE_TARGETS.map((target) => ({
+    targetsForComponent(component).map((target) => ({
       component,
       target,
       archive: archiveForTarget(target),
@@ -65,6 +68,10 @@ function assertComponent(component) {
   if (!RELEASE_COMPONENTS.includes(component)) {
     throw new Error(`unknown release component: ${component}`);
   }
+}
+
+function targetsForComponent(component) {
+  return component === "service" ? ["windows-x86_64"] : RELEASE_TARGETS;
 }
 
 function assertTarget(target) {

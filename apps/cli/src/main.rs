@@ -3,7 +3,7 @@ use cmclient_agent_core::AgentConfig;
 use cmclient_cli_client::{ExitCode, parse_endpoint};
 use cmclient_control_api::{
     ControlClient, ControlEndpoint, ControlError, ControlSecretKind, ControlStatus,
-    DiagnosticsControlBundle, UpdateControlStatus, default_unix_socket,
+    DiagnosticsControlBundle, UpdateControlStatus, default_local_endpoint,
 };
 use std::{io::Read, process::ExitCode as ProcessExitCode, thread, time::Duration};
 use zeroize::Zeroize;
@@ -227,7 +227,7 @@ fn control_endpoint(value: &str) -> Result<ControlEndpoint, ExitCode> {
     match parse_endpoint(value)? {
         cmclient_cli_client::ControlEndpointSpec::Local => {
             let config = AgentConfig::load().map_err(|_| ExitCode::Validation)?;
-            Ok(default_unix_socket(&config.paths.data_dir))
+            Ok(default_local_endpoint(&config.paths.data_dir))
         }
         cmclient_cli_client::ControlEndpointSpec::UnixSocket(path) => {
             Ok(ControlEndpoint::unix(path))

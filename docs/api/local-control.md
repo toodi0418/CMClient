@@ -1,5 +1,10 @@
 # Local Agent Control API
 
+The endpoint is always local: a mode-`0600` Unix socket at
+`<data-dir>/control.sock` on Unix and `\\.\pipe\cmclient-control` on Windows.
+Windows uses the service account's named-pipe security descriptor and never
+falls back to TCP.
+
 The Agent control plane is local IPC, not the public Gateway Business API. On
 Unix it listens on `<data-dir>/control.sock` with mode `0600`; Windows uses the
 equivalent `\\.\pipe\cmclient-control` endpoint abstraction. No listener is

@@ -95,3 +95,20 @@ jobs:
       - run: pnpm --filter @cmclient/desktop run build
       - run: cargo test -p cmclient-desktop --locked
       - run: cargo build -p cmclient-desktop --locked
+
+  windows-service-smoke:
+    name: Windows service and control-pipe smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - run: cargo test -p cmclient-control-api --locked
+      - run: cargo test -p cmclient-service-host --locked
+      - run: cargo build -p cmclient-agent --locked
+      - name: Render Windows service registration without creating it
+        shell: powershell
+        run: |
+          $rendered = powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 render -HostPath 'C:\Program Files\CMClient\current\bin\cmclient-service-host.exe' | ConvertFrom-Json
+          if ($rendered.serviceName -ne 'CMClientAgent' -or $rendered.storesCredentials) { throw 'Windows service render failed' }

@@ -1,6 +1,6 @@
 use cmclient_agent_core::AgentConfig;
 use cmclient_control_api::{
-    ControlClient, ControlCommand, ControlStatus, UpdateControlStatus, default_unix_socket,
+    ControlClient, ControlCommand, ControlStatus, UpdateControlStatus, default_local_endpoint,
 };
 use std::{thread, time::Duration};
 use tauri::{
@@ -75,7 +75,7 @@ fn control(command: ControlCommand) -> Result<ControlStatus, String> {
 fn control_client() -> Result<ControlClient, String> {
     let config =
         AgentConfig::load().map_err(|_| String::from("DESKTOP_AGENT_CONFIG_UNAVAILABLE"))?;
-    ControlClient::new(default_unix_socket(&config.paths.data_dir))
+    ControlClient::new(default_local_endpoint(&config.paths.data_dir))
         .map_err(|error| error.code().to_owned())
 }
 

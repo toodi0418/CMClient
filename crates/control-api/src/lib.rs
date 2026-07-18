@@ -802,10 +802,494 @@ mod unix {
 #[cfg(unix)]
 pub use unix::{ControlClient, ControlServer, ControlUpdateEventStream};
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod windows {
+    use super::{
+        ControlEndpoint, ControlError, ControlHandler, ControlResponse, ControlRouter,
+        ControlStatus, ControlUpdateEvent,
+    };
+    use interprocess::{
+        local_socket::{Listener, ListenerOptions, Stream, prelude::*},
+        os::windows::local_socket::NamedPipe,
+    };
+    use std::{
+        io::{Read, Write},
+        sync::mpsc::{Receiver, RecvTimeoutError},
+        thread,
+        time::Duration,
+    };
+    use zeroize::Zeroize;
+
+    const MAX_REQUEST_BYTES: usize = 8 * 1024;
+
+    pub struct ControlServer {
+        listener: Listener,
+        router: ControlRouter,
+    }
+
+    impl ControlServer {
+        pub fn bind(
+            endpoint: ControlEndpoint,
+            handler: std::sync::Arc<dyn ControlHandler>,
+        ) -> Result<Self, ControlError> {
+            let ControlEndpoint::NamedPipe(path) = endpoint else {
+                return Err(ControlError::UnsupportedEndpoint);
+            };
+            let name = path
+                .to_fs_name::<NamedPipe>()
+                .map_err(|_| ControlError::UnsupportedEndpoint)?;
+            let listener = ListenerOptions::new()
+                .name(name)
+                .create_sync()
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AddrInUse {
+                        ControlError::EndpointAlreadyInUse
+                    } else {
+                        ControlError::Io
+                    }
+                })?;
+            Ok(Self {
+                listener,
+                router: ControlRouter::new(handler),
+            })
+        }
+
+        pub fn serve_once(&self) -> Result<(), ControlError> {
+            let stream = self.listener.accept().map_err(|_| ControlError::Io)?;
+            let router = self.router.clone();
+            thread::spawn(move || {
+                let _ = serve_connection(stream, router);
+            });
+            Ok(())
+        }
+    }
+
+    fn serve_connection(mut stream: Stream, router: ControlRouter) -> Result<(), ControlError> {
+        let mut request = read_request(&mut stream)?;
+        let response = std::str::from_utf8(&request)
+            .map_err(|_| ControlError::InvalidHttp)
+            .and_then(|request| router.route(request));
+        request.zeroize();
+        match response? {
+            ControlResponse::Json { status, body } => {
+                write_json_response(&mut stream, status, &body)
+            }
+            ControlResponse::EventStream(events) => write_update_event_stream(&mut stream, events),
+        }
+    }
+
+    fn read_request(stream: &mut Stream) -> Result<Vec<u8>, ControlError> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 2048];
+        loop {
+            let count = stream.read(&mut chunk).map_err(|_| ControlError::Io)?;
+            if count == 0 {
+                return Err(ControlError::InvalidHttp);
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if request.len() > MAX_REQUEST_BYTES {
+                return Err(ControlError::ResponseTooLarge);
+            }
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let header = std::str::from_utf8(&request[..header_end])
+                .map_err(|_| ControlError::InvalidHttp)?;
+            let content_length = content_length(header)?;
+            let request_length = header_end.saturating_add(content_length);
+            if request_length > MAX_REQUEST_BYTES {
+                return Err(ControlError::ResponseTooLarge);
+            }
+            if request.len() >= request_length {
+                request.truncate(request_length);
+                return Ok(request);
+            }
+        }
+    }
+
+    fn content_length(header: &str) -> Result<usize, ControlError> {
+        let mut length = None;
+        for line in header.lines().skip(1) {
+            if line.is_empty() {
+                continue;
+            }
+            let (name, value) = line.split_once(':').ok_or(ControlError::InvalidHttp)?;
+            if name.eq_ignore_ascii_case("content-length") {
+                let parsed = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| ControlError::InvalidHttp)?;
+                if length.replace(parsed).is_some() {
+                    return Err(ControlError::InvalidHttp);
+                }
+            }
+        }
+        length.ok_or(ControlError::InvalidHttp)
+    }
+
+    fn write_json_response(
+        stream: &mut Stream,
+        status: u16,
+        body: &[u8],
+    ) -> Result<(), ControlError> {
+        let status_text = match status {
+            200 => "OK",
+            404 => "Not Found",
+            _ => "Internal Server Error",
+        };
+        let header = format!(
+            "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(header.as_bytes())
+            .map_err(|_| ControlError::Io)?;
+        stream.write_all(body).map_err(|_| ControlError::Io)
+    }
+
+    fn write_update_event_stream(
+        stream: &mut Stream,
+        events: Receiver<ControlUpdateEvent>,
+    ) -> Result<(), ControlError> {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
+            )
+            .map_err(|_| ControlError::Io)?;
+        loop {
+            match events.recv_timeout(Duration::from_secs(15)) {
+                Ok(event) => write_sse_event(stream, &event)?,
+                Err(RecvTimeoutError::Timeout) => stream
+                    .write_all(b": heartbeat\n\n")
+                    .map_err(|_| ControlError::Io)?,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+
+    fn write_sse_event(
+        stream: &mut Stream,
+        event: &ControlUpdateEvent,
+    ) -> Result<(), ControlError> {
+        if !is_safe_sse_token(&event.id)
+            || !is_safe_sse_token(&event.event)
+            || event.data.contains(&b'\n')
+        {
+            return Err(ControlError::InvalidHttp);
+        }
+        stream
+            .write_all(format!("id: {}\nevent: {}\ndata: ", event.id, event.event).as_bytes())
+            .and_then(|_| stream.write_all(&event.data))
+            .and_then(|_| stream.write_all(b"\n\n"))
+            .map_err(|_| ControlError::Io)
+    }
+
+    fn is_safe_sse_token(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    }
+
+    pub struct ControlClient {
+        endpoint: String,
+    }
+
+    /// Blocking reader for the Agent-owned update event stream.
+    pub struct ControlUpdateEventStream {
+        stream: Stream,
+        buffer: Vec<u8>,
+    }
+
+    impl ControlClient {
+        pub fn new(endpoint: ControlEndpoint) -> Result<Self, ControlError> {
+            let ControlEndpoint::NamedPipe(endpoint) = endpoint else {
+                return Err(ControlError::UnsupportedEndpoint);
+            };
+            pipe_name(&endpoint)?;
+            Ok(Self { endpoint })
+        }
+
+        pub fn status(&self) -> Result<ControlStatus, ControlError> {
+            self.request("GET", "/api/v1/control/status")
+        }
+
+        pub fn start(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/start")
+        }
+
+        pub fn stop(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/stop")
+        }
+
+        pub fn restart(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/restart")
+        }
+
+        pub fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/web/enable")
+        }
+
+        pub fn disable_management_web(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/web/disable")
+        }
+
+        pub fn update_status(&self) -> Result<super::UpdateControlStatus, ControlError> {
+            self.request_update("GET", "/api/v1/control/updates")
+        }
+
+        pub fn diagnostics_bundle(&self) -> Result<super::DiagnosticsControlBundle, ControlError> {
+            self.request_json("GET", "/api/v1/control/diagnostics/bundle", "")
+        }
+
+        pub fn store_secret(
+            &self,
+            kind: super::ControlSecretKind,
+            value: &str,
+        ) -> Result<super::ControlSecretReceipt, ControlError> {
+            self.request_json(
+                "PUT",
+                &format!("/api/v1/control/secrets/{}", kind.path_segment()),
+                value,
+            )
+        }
+
+        pub fn remove_secret(
+            &self,
+            kind: super::ControlSecretKind,
+        ) -> Result<super::ControlSecretReceipt, ControlError> {
+            self.request_json(
+                "DELETE",
+                &format!("/api/v1/control/secrets/{}", kind.path_segment()),
+                "",
+            )
+        }
+
+        pub fn subscribe_update_events(&self) -> Result<ControlUpdateEventStream, ControlError> {
+            let mut stream = self.connect()?;
+            stream
+                .write_all(
+                    b"GET /api/v1/control/updates/events HTTP/1.1\r\nhost: localhost\r\naccept: text/event-stream\r\ncontent-length: 0\r\n\r\n",
+                )
+                .map_err(|_| ControlError::Io)?;
+            let response = read_sse_response_head(&mut stream)?;
+            let separator = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .ok_or(ControlError::InvalidHttp)?;
+            let (head, body) = response.split_at(separator + 4);
+            if !head.starts_with(b"HTTP/1.1 200")
+                || !String::from_utf8_lossy(head)
+                    .to_ascii_lowercase()
+                    .contains("content-type: text/event-stream")
+            {
+                return Err(ControlError::CommandFailed);
+            }
+            Ok(ControlUpdateEventStream {
+                stream,
+                buffer: body.to_vec(),
+            })
+        }
+
+        fn connect(&self) -> Result<Stream, ControlError> {
+            Stream::connect(pipe_name(&self.endpoint)?).map_err(|_| ControlError::Io)
+        }
+
+        fn request(&self, method: &str, path: &str) -> Result<ControlStatus, ControlError> {
+            self.request_json(method, path, "")
+        }
+
+        fn request_update(
+            &self,
+            method: &str,
+            path: &str,
+        ) -> Result<super::UpdateControlStatus, ControlError> {
+            self.request_json(method, path, "")
+        }
+
+        fn request_json<T: serde::de::DeserializeOwned>(
+            &self,
+            method: &str,
+            path: &str,
+            body: &str,
+        ) -> Result<T, ControlError> {
+            let mut stream = self.connect()?;
+            let mut request = format!(
+                "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let write_result = stream.write_all(request.as_bytes());
+            request.zeroize();
+            write_result.map_err(|_| ControlError::Io)?;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .map_err(|_| ControlError::Io)?;
+            let separator = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .ok_or(ControlError::InvalidHttp)?;
+            let (head, body) = response.split_at(separator + 4);
+            if !head.starts_with(b"HTTP/1.1 200") {
+                return Err(ControlError::CommandFailed);
+            }
+            serde_json::from_slice(body).map_err(|_| ControlError::InvalidHttp)
+        }
+    }
+
+    impl ControlUpdateEventStream {
+        /// Reads one update state transition. `None` means the stream closed cleanly.
+        pub fn next_event(&mut self) -> Result<Option<ControlUpdateEvent>, ControlError> {
+            loop {
+                if let Some((index, boundary_length)) = sse_boundary(&self.buffer) {
+                    let block = self.buffer[..index].to_vec();
+                    self.buffer.drain(..index + boundary_length);
+                    if let Some(event) = parse_sse_event(&block)? {
+                        return Ok(Some(event));
+                    }
+                    continue;
+                }
+                if self.buffer.len() > 64 * 1024 {
+                    return Err(ControlError::ResponseTooLarge);
+                }
+                let mut chunk = [0_u8; 4096];
+                let count = self.stream.read(&mut chunk).map_err(|_| ControlError::Io)?;
+                if count == 0 {
+                    return if self.buffer.is_empty() {
+                        Ok(None)
+                    } else {
+                        Err(ControlError::InvalidHttp)
+                    };
+                }
+                self.buffer.extend_from_slice(&chunk[..count]);
+            }
+        }
+    }
+
+    fn pipe_name(value: &str) -> Result<interprocess::local_socket::Name<'_>, ControlError> {
+        value
+            .to_fs_name::<NamedPipe>()
+            .map_err(|_| ControlError::UnsupportedEndpoint)
+    }
+
+    fn read_sse_response_head(stream: &mut Stream) -> Result<Vec<u8>, ControlError> {
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk).map_err(|_| ControlError::Io)?;
+            if count == 0 {
+                return Err(ControlError::InvalidHttp);
+            }
+            response.extend_from_slice(&chunk[..count]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(response);
+            }
+            if response.len() > 8 * 1024 {
+                return Err(ControlError::ResponseTooLarge);
+            }
+        }
+    }
+
+    fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+        buffer
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .map(|index| (index, 2))
+            .or_else(|| {
+                buffer
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| (index, 4))
+            })
+    }
+
+    fn parse_sse_event(block: &[u8]) -> Result<Option<ControlUpdateEvent>, ControlError> {
+        let block = std::str::from_utf8(block).map_err(|_| ControlError::InvalidHttp)?;
+        let mut id = None;
+        let mut event = None;
+        let mut data = None;
+        for line in block.lines() {
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            let (field, value) = line.split_once(':').ok_or(ControlError::InvalidHttp)?;
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "id" => id = Some(value.to_owned()),
+                "event" => event = Some(value.to_owned()),
+                "data" => data = Some(value.as_bytes().to_vec()),
+                _ => return Err(ControlError::InvalidHttp),
+            }
+        }
+        match (id, event, data) {
+            (None, None, None) => Ok(None),
+            (Some(id), Some(event), Some(data))
+                if is_safe_sse_token(&id)
+                    && is_safe_sse_token(&event)
+                    && !data.contains(&b'\n') =>
+            {
+                Ok(Some(ControlUpdateEvent { id, event, data }))
+            }
+            _ => Err(ControlError::InvalidHttp),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ControlClient, ControlServer};
+        use crate::{
+            ControlEndpoint, ControlStatus, GatewayControlStatus, ManagementWebControlStatus,
+            StaticControlHandler,
+        };
+        use std::sync::Arc;
+
+        fn status() -> ControlStatus {
+            ControlStatus {
+                schema_version: 2,
+                agent: String::from("running"),
+                agent_version: String::from("2.0.0-dev.0"),
+                gateway: GatewayControlStatus::Running,
+                management_web: ManagementWebControlStatus::Disabled,
+                management_web_url: None,
+                uptime_seconds: 1,
+                latest_error_code: None,
+            }
+        }
+
+        #[test]
+        fn serves_status_over_a_private_named_pipe() {
+            let endpoint = ControlEndpoint::named_pipe(format!(
+                r"\\.\pipe\cmclient-control-test-{}",
+                std::process::id()
+            ));
+            let server = ControlServer::bind(
+                endpoint.clone(),
+                Arc::new(StaticControlHandler::new(status())),
+            )
+            .expect("named pipe should bind");
+            let server_thread = std::thread::spawn(move || server.serve_once());
+            let client = ControlClient::new(endpoint).expect("client should initialize");
+            assert_eq!(client.status().expect("status should load"), status());
+            server_thread
+                .join()
+                .expect("server thread should join")
+                .expect("server should serve request");
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use windows::{ControlClient, ControlServer, ControlUpdateEventStream};
+
+#[cfg(all(not(unix), not(windows)))]
 pub struct ControlServer;
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 impl ControlServer {
     pub fn bind(
         _endpoint: ControlEndpoint,
@@ -819,20 +1303,20 @@ impl ControlServer {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 pub struct ControlClient;
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 pub struct ControlUpdateEventStream;
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 impl ControlUpdateEventStream {
     pub fn next_event(&mut self) -> Result<Option<ControlUpdateEvent>, ControlError> {
         Err(ControlError::UnsupportedEndpoint)
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 impl ControlClient {
     pub fn new(_endpoint: ControlEndpoint) -> Result<Self, ControlError> {
         Err(ControlError::UnsupportedEndpoint)
@@ -901,18 +1385,36 @@ pub fn default_unix_socket(data_dir: &Path) -> ControlEndpoint {
     ControlEndpoint::UnixSocket(data_dir.join("control.sock"))
 }
 
+/// Default private Agent control endpoint for the current platform.
+pub fn default_local_endpoint(data_dir: &Path) -> ControlEndpoint {
+    #[cfg(windows)]
+    {
+        let _ = data_dir;
+        ControlEndpoint::NamedPipe(String::from(r"\\.\pipe\cmclient-control"))
+    }
+    #[cfg(not(windows))]
+    {
+        default_unix_socket(data_dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{ControlClient, ControlServer};
     use super::{
-        ControlEndpoint, ControlError, ControlHandler, ControlSecretKind, ControlStatus,
-        ControlUpdateEvent, DiagnosticsControlBundle, GatewayControlStatus,
-        ManagementWebControlStatus, StaticControlHandler, UpdateControlJob, UpdateControlStatus,
-        default_unix_socket, is_local_endpoint,
+        ControlClient, ControlError, ControlHandler, ControlSecretKind, ControlServer,
+        ControlUpdateEvent, DiagnosticsControlBundle, UpdateControlJob, UpdateControlStatus,
     };
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::{collections::BTreeMap, path::PathBuf};
+    use super::{
+        ControlEndpoint, ControlStatus, GatewayControlStatus, ManagementWebControlStatus,
+        StaticControlHandler, default_unix_socket, is_local_endpoint,
+    };
+    #[cfg(unix)]
+    use std::{
+        collections::BTreeMap,
+        sync::{Mutex, mpsc},
+    };
+    use std::{path::PathBuf, sync::Arc};
 
     fn status() -> ControlStatus {
         ControlStatus {
@@ -927,15 +1429,18 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct UpdateHandler {
         update: UpdateControlStatus,
         events: Mutex<Option<mpsc::Receiver<ControlUpdateEvent>>>,
     }
 
+    #[cfg(unix)]
     struct DiagnosticsAndSecretHandler {
         values: Mutex<BTreeMap<&'static str, String>>,
     }
 
+    #[cfg(unix)]
     impl ControlHandler for DiagnosticsAndSecretHandler {
         fn handle(&self, _command: super::ControlCommand) -> Result<ControlStatus, ControlError> {
             Ok(status())
@@ -971,6 +1476,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl ControlHandler for UpdateHandler {
         fn handle(&self, _command: super::ControlCommand) -> Result<ControlStatus, ControlError> {
             Ok(status())

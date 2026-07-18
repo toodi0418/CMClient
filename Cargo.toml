@@ -3,6 +3,7 @@ members = [
   "apps/agent",
   "apps/cli",
   "apps/desktop/src-tauri",
+  "apps/service-host",
   "crates/agent-core",
   "crates/cli-client",
   "crates/control-api",

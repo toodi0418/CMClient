@@ -135,6 +135,12 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             package: cmclient-cli
             binary: cmclient.exe
+          - component: service
+            target: windows-x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            package: cmclient-service-host
+            binary: cmclient-service-host.exe
     steps:
       - uses: actions/checkout@v4
         with:

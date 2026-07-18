@@ -11,7 +11,7 @@ use cmclient_control_api::{
     ControlCommand, ControlEndpoint, ControlError, ControlHandler, ControlSecretKind,
     ControlServer, ControlStatus, ControlUpdateEvent, DiagnosticsControlBundle,
     GatewayControlStatus, ManagementWebControlStatus, UpdateControlJob, UpdateControlStatus,
-    default_unix_socket,
+    default_local_endpoint,
 };
 use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor};
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
@@ -827,7 +827,7 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
-    let endpoint = match default_unix_socket(&config.paths.data_dir) {
+    let endpoint = match default_local_endpoint(&config.paths.data_dir) {
         ControlEndpoint::UnixSocket(path) => ControlEndpoint::unix(path),
         endpoint => endpoint,
     };

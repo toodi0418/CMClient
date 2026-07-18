@@ -12,9 +12,10 @@ the same target identifiers accepted by the signed update contract:
 | `linux-x86_64` | `ubuntu-latest` | `x86_64-unknown-linux-gnu` |
 | `windows-x86_64` | `windows-latest` | `x86_64-pc-windows-msvc` |
 
-Every target builds `desktop`, `headless`, and `cli`. The Desktop executable is
-a build input, not a substitute for a platform installer; service installers
-and Docker are independent deployment modes.
+Every target builds `desktop`, `headless`, and `cli`; Windows additionally
+builds the `service` host. The Desktop executable is a build input, not a
+substitute for a platform installer; service installers and Docker are
+independent deployment modes.
 
 ## Stable names
 
@@ -30,6 +31,7 @@ Windows assets use `zip`; Darwin and Linux assets use `tar.zst`. For example:
 cmclient-desktop-darwin-aarch64-2.0.0.tar.zst
 cmclient-headless-linux-aarch64-2.0.0.tar.zst
 cmclient-cli-windows-x86_64-2.0.0.zip
+cmclient-service-windows-x86_64-2.0.0.zip
 ```
 
 `scripts/release-artifacts.mjs` is the executable source of truth. It rejects

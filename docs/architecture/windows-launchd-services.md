@@ -1,0 +1,53 @@
+# Windows Service and macOS launchd
+
+## Windows
+
+`cmclient-service-host.exe` is a real Windows SCM process, not an `sc.exe`
+wrapper around a console binary. It receives SCM start/stop/shutdown controls,
+starts the adjacent `cmclient-agent.exe`, and reports the Agent child exit as a
+service failure. On stop it terminates and waits for the child; the Agent's
+durable update recovery handles an interrupted update on its next start.
+
+`scripts/cmclient-windows-service.ps1` registers `CMClientAgent` with the
+`LocalService` account and automatic start. The host gives the child explicit,
+absolute paths under `%ProgramData%\CMClient` for data, configuration, cache,
+and logs. The manager accepts only the service-host path and operational
+actions; it never accepts or writes a CallMesh key, APRS passcode, token, or
+signing key. Uninstall removes the SCM registration only and retains
+`%ProgramData%\CMClient`.
+
+The private Agent Control API is the local named pipe
+`\\.\pipe\cmclient-control`. It uses the default LocalService security
+descriptor, so control clients require an OS principal allowed by that local
+pipe, typically an elevated administrator. It never falls back to a TCP
+listener. This restrictive default is intentional until a user-scoped pipe ACL
+is configured as part of a future authenticated installer flow.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 install `
+  -HostPath "C:\Program Files\CMClient\current\bin\cmclient-service-host.exe"
+powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 status
+powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 uninstall
+```
+
+## macOS
+
+`scripts/cmclient-launchd.sh` installs `io.cmclient.agent` as a per-user
+LaunchAgent at `~/Library/LaunchAgents`. It launches the Agent with the owning
+user's standard CMClient Application Support and Caches paths, so Keychain
+credentials remain in that user's security context. It is intentionally not a
+root LaunchDaemon.
+
+```bash
+bash scripts/cmclient-launchd.sh install \
+  --agent /Applications/CMClient/current/bin/cmclient-agent
+bash scripts/cmclient-launchd.sh status
+bash scripts/cmclient-launchd.sh logs --lines 200
+bash scripts/cmclient-launchd.sh uninstall
+```
+
+The generated plist has `RunAtLoad`, restarts only an unsuccessful Agent exit,
+uses a five-second throttle, and writes bounded operational output to the
+user's Agent log directory. Its uninstall operation removes only the plist;
+configuration, data, cache, and logs remain available for reinstall and
+rollback.

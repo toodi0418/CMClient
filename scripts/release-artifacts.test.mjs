@@ -12,10 +12,10 @@ import {
   stageBuild,
 } from "./release-artifacts.mjs";
 
-test("release artifact plan covers every component and updater target exactly once", () => {
+test("release artifact plan covers every planned component-target pair exactly once", () => {
   const plan = releaseArtifactPlan("2.0.0-dev.0");
 
-  assert.equal(plan.length, RELEASE_COMPONENTS.length * RELEASE_TARGETS.length);
+  assert.equal(plan.length, 16);
   assert.deepEqual(
     new Set(plan.map(({ fileName }) => fileName)).size,
     plan.length,
@@ -38,6 +38,14 @@ test("release artifact plan covers every component and updater target exactly on
       version: "2.0.0",
     }),
     "cmclient-cli-windows-x86_64-2.0.0.zip",
+  );
+  assert.equal(
+    releaseArtifactName({
+      component: "service",
+      target: "windows-x86_64",
+      version: "2.0.0",
+    }),
+    "cmclient-service-windows-x86_64-2.0.0.zip",
   );
 });
 
@@ -62,6 +70,10 @@ test("release artifact plan rejects unsupported values and non-SemVer versions",
   assert.throws(
     () => releaseArtifactPlan("v2.0.0"),
     /version must be SemVer/,
+  );
+  assert.throws(
+    () => releaseArtifactName({ component: "service", target: "linux-x86_64", version: "2.0.0" }),
+    /unsupported component target/,
   );
 });
 
