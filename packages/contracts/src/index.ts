@@ -7,3 +7,4 @@ export * from "./proxy.js";
 export * from "./recording.js";
 export * from "./system.js";
 export * from "./transport.js";
+export * from "./update.js";

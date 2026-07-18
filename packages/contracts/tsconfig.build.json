@@ -7,5 +7,6 @@
     "rootDir": "src",
     "declaration": true
   },
-  "include": ["src/index.ts", "src/system.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }

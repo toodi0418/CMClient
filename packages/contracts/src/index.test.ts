@@ -21,7 +21,70 @@ import {
   SystemStatusSchema,
   SanitizedPacketFixtureSetSchema,
   TransportConnectionStateSchema,
+  SignedUpdateManifestSchema,
+  UpdateManifestSchema,
 } from "./index";
+
+describe("signed update manifest contract", () => {
+  const manifest = {
+    schemaVersion: 1,
+    channel: "dev",
+    version: "2.0.0-dev.1",
+    publishedAt: "2026-07-18T02:40:00.000Z",
+    minimumAgentVersion: "2.0.0-dev.0",
+    bundles: [
+      {
+        component: "desktop",
+        target: "darwin-aarch64",
+        archive: "tar.zst",
+        url: "https://releases.example.invalid/cmclient/2.0.0-dev.1/darwin-aarch64.tar.zst",
+        sha256:
+          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        sizeBytes: 4096,
+      },
+    ],
+  };
+
+  it("accepts the exact signed manifest wire shape", () => {
+    const check = TypeCompiler.Compile(SignedUpdateManifestSchema);
+    expect(
+      check.Check({
+        manifest,
+        signingKeyId: "release-2026",
+        signatureAlgorithm: "ed25519",
+        signature:
+          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects unsigned target, digest, and transport deviations", () => {
+    const check = TypeCompiler.Compile(UpdateManifestSchema);
+    expect(
+      check.Check({
+        ...manifest,
+        bundles: [{ ...manifest.bundles[0], target: "linux-riscv64" }],
+      }),
+    ).toBe(false);
+    expect(
+      check.Check({
+        ...manifest,
+        bundles: [{ ...manifest.bundles[0], sha256: "A".repeat(64) }],
+      }),
+    ).toBe(false);
+    expect(
+      check.Check({
+        ...manifest,
+        bundles: [
+          {
+            ...manifest.bundles[0],
+            url: "http://releases.example.invalid/archive",
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("job contracts", () => {
   it("includes terminal rollback states", () => {
