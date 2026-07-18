@@ -1,5 +1,7 @@
 //! One-shot, conservative readers for CMClient Legacy migration inputs.
 
+pub mod data;
+
 use serde::Serialize;
 use serde_json::Value;
 use std::{

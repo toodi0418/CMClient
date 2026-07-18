@@ -67,6 +67,9 @@ the legacy Node.js/Electron implementation.
 The Legacy settings reader is isolated in `cmclient-migrate`; its supported
 mapping, dry-run report, and create-only output rule are documented in
 [Legacy Settings Migration](./architecture/legacy-settings-migration.md).
+The same offline tool imports only verified Legacy history projections with a
+backup, post-import verification, and rollback; it never treats Legacy records
+as live packets or position/APRS state.
 
 P11 must use this matrix and `docs/legacy-inventory.md` to distinguish
 intentional removal from an accidental regression. A retained capability needs
