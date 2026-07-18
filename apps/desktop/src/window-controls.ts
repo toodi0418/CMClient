@@ -1,7 +1,7 @@
 export type WindowControlAction = "exit" | "minimize" | "hide";
 
 export interface WindowControlTarget {
-  close(): Promise<void>;
+  exit(): Promise<void>;
   minimize(): Promise<void>;
   hide(): Promise<void>;
 }
@@ -12,7 +12,7 @@ export async function runWindowControl(
 ): Promise<void> {
   switch (action) {
     case "exit":
-      await window.close();
+      await window.exit();
       return;
     case "minimize":
       await window.minimize();

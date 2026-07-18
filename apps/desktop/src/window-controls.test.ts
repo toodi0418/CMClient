@@ -4,8 +4,8 @@ import { runWindowControl, type WindowControlTarget } from "./window-controls";
 
 function target(calls: string[]): WindowControlTarget {
   return {
-    close: async () => {
-      calls.push("close");
+    exit: async () => {
+      calls.push("exit");
     },
     minimize: async () => {
       calls.push("minimize");
@@ -25,6 +25,6 @@ describe("runWindowControl", () => {
     await runWindowControl(window, "minimize");
     await runWindowControl(window, "hide");
 
-    expect(calls).toEqual(["close", "minimize", "hide"]);
+    expect(calls).toEqual(["exit", "minimize", "hide"]);
   });
 });

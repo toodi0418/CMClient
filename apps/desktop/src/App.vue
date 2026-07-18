@@ -18,16 +18,23 @@ const status = ref<ControlStatus>();
 const errorCode = ref<string>();
 const busy = ref(false);
 const appWindow = isTauri() ? getCurrentWindow() : undefined;
+const windowControlTarget = appWindow
+  ? {
+      exit: () => invoke<void>("exit_desktop"),
+      minimize: () => appWindow.minimize(),
+      hide: () => appWindow.hide(),
+    }
+  : undefined;
 const gatewayLabel = computed(() => status.value?.gateway ?? "stopped");
 
 async function controlWindow(action: WindowControlAction): Promise<void> {
-  if (!appWindow) {
+  if (!windowControlTarget) {
     errorCode.value = "DESKTOP_WINDOW_CONTROL_UNAVAILABLE";
     return;
   }
 
   try {
-    await runWindowControl(appWindow, action);
+    await runWindowControl(windowControlTarget, action);
   } catch {
     errorCode.value = "DESKTOP_WINDOW_CONTROL_FAILED";
   }
