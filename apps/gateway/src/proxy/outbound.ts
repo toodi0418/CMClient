@@ -26,7 +26,12 @@ export interface ProxyReplySink {
   deliver(clientId: string, frame: Uint8Array): boolean;
 }
 
+export interface ProxyOutboundAuthorizer {
+  authorizeOutbound(clientId: string, frame: Uint8Array): void;
+}
+
 export interface ProxyOutboundRouterOptions {
+  authorizer?: ProxyOutboundAuthorizer;
   maxFrameBytes?: number;
   maxPendingCorrelations?: number;
   maxQueuedWrites?: number;
@@ -82,6 +87,7 @@ export class ProxyOutboundRouter {
   private readonly maxPendingCorrelations: number;
   private readonly maxQueuedWrites: number;
   private readonly responseTimeoutMs: number;
+  private readonly authorizer: ProxyOutboundAuthorizer | undefined;
   private activeWrite: PendingWrite | undefined;
   private writing = false;
   private stopped = false;
@@ -96,6 +102,7 @@ export class ProxyOutboundRouter {
     this.maxPendingCorrelations = options.maxPendingCorrelations ?? 128;
     this.maxQueuedWrites = options.maxQueuedWrites ?? 128;
     this.responseTimeoutMs = options.responseTimeoutMs ?? 15_000;
+    this.authorizer = options.authorizer;
     if (
       !Number.isInteger(this.maxFrameBytes) ||
       this.maxFrameBytes < 1 ||
@@ -169,6 +176,11 @@ export class ProxyOutboundRouter {
           new ProxyOutboundError("PROXY_CORRELATION_CONFLICT"),
         );
       }
+    }
+    try {
+      this.authorizer?.authorizeOutbound(input.clientId, input.frame);
+    } catch (error) {
+      return Promise.reject(error);
     }
 
     for (const correlation of correlations) {
