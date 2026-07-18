@@ -1,0 +1,7 @@
+{
+  "connectionMode": "tcp",
+  "host": "meshtastic.example.invalid",
+  "webDashboardEnabled": false,
+  "shareWithTenmanMap": false,
+  "apiKey": "fixture-secret-not-for-import"
+}

@@ -720,6 +720,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmclient-legacy-migration"
+version = "2.0.0-dev.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cmclient-service-host"
 version = "2.0.0-dev.0"
 dependencies = [

@@ -64,6 +64,10 @@ the legacy Node.js/Electron implementation.
 
 ## Parity Audit Rule
 
+The Legacy settings reader is isolated in `cmclient-migrate`; its supported
+mapping, dry-run report, and create-only output rule are documented in
+[Legacy Settings Migration](./architecture/legacy-settings-migration.md).
+
 P11 must use this matrix and `docs/legacy-inventory.md` to distinguish
 intentional removal from an accidental regression. A retained capability needs
 an implementation and test in the new architecture; a replaced implementation
