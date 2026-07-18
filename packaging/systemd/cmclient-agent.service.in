@@ -1,0 +1,45 @@
+[Unit]
+Description=CMClient Agent
+Documentation=https://github.com/toodi0418/CMClient
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+@SUPPLEMENTARY_GROUP_LINE@
+WorkingDirectory=@WORKING_DIRECTORY@
+Environment="HOME=@DATA_DIR@"
+Environment="CMCLIENT_AGENT_CONFIG=@CONFIG_DIR@/agent.toml"
+Environment="CMCLIENT_DATA_DIR=@DATA_DIR@"
+Environment="CMCLIENT_CONFIG_DIR=@CONFIG_DIR@"
+Environment="CMCLIENT_CACHE_DIR=@CACHE_DIR@"
+Environment="CMCLIENT_LOG_DIR=@LOG_DIR@"
+ExecStartPre=@AGENT_BINARY@ --check-config
+ExecStart=@AGENT_BINARY@ --serve
+Restart=on-failure
+RestartPreventExitStatus=64 78
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=@DATA_DIR@ @CACHE_DIR@ @LOG_DIR@
+
+[Install]
+WantedBy=multi-user.target

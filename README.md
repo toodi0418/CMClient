@@ -210,22 +210,16 @@ npx pkg src/index.js \
 
 ### Linux systemd 服務常駐
 
-若要以服務方式常駐並開機自動啟動，可使用 `scripts/manage-service-linux.sh`（會詢問 API Key，可重裝、重設 Key 或解除安裝）。
+CMClient 2.0 以 Rust Agent 作為唯一的 systemd service。安裝程式不接受 API key、APRS passcode 或管理 token；這些值只可透過該 service account 的 OS credential store 設定。
 
-- 互動式選單：`bash scripts/manage-service-linux.sh`
-- 直接指令：`bash scripts/manage-service-linux.sh install|set-key|start|stop|restart|status|enable|disable|logs|uninstall`
-- 設定檔：`/etc/callmesh/callmesh.env`（含 `CALLMESH_API_KEY`、`TMAG_ARGS`）
-- 服務名稱：`callmesh-client.service`
-- 查看最近 log：`bash scripts/manage-service-linux.sh logs 200`
-- 檢查/更新版本：`bash scripts/manage-service-linux.sh check-update`、`bash scripts/manage-service-linux.sh update`（成功後自動重啟服務）
-- 自動更新：`bash scripts/manage-service-linux.sh auto-update-enable`（預設每日 04:00，隨機延遲 ≤30 分鐘，可改環境變數 `UPDATE_SCHEDULE`）；停用/查詢：`auto-update-disable` / `auto-update-status`
-- 安裝時可選擇 TCP/IP 或 Serial；選 Serial 時會列出 /dev/ttyUSB* / /dev/ttyACM* / /dev/ttyS* / /dev/ttyAMA* 供選擇，並可輸入自訂路徑與鮑率
-- 缺少 git / Node.js 22 會自動嘗試安裝（透過套件管理器或 `scripts/install-linux.sh`）
-- 全自動一行安裝（安裝依賴 + 建立服務，會互動詢問 API Key，會自動處理已存在目錄）：  
-  `bash -c "curl -fsSL https://raw.githubusercontent.com/toodi0418/CMClient/main/scripts/bootstrap-linux.sh | bash"`  
-  - 自訂目錄：`TMAG_DIR=/opt/CMClient`；自訂分支：`TMAG_BRANCH=main`
-  - 若無法互動輸入，可提前設定 `CALLMESH_API_KEY=<你的 Key>`
-- 安裝完成後會寫入 `/etc/profile.d/callmesh.sh`（`TMAG_HOME=<安裝路徑>`），並建立快捷指令 `/usr/local/bin/callmesh-service` 與短指令 `/usr/local/bin/tmag`，在任何目錄直接執行 `callmesh-service` 或 `tmag` 即可呼叫管理選單
+```bash
+bash scripts/cmclient-systemd.sh install \
+  --agent /opt/cmclient/current/bin/cmclient-agent
+bash scripts/cmclient-systemd.sh status
+bash scripts/cmclient-systemd.sh logs --lines 200
+```
+
+服務名稱為 `cmclient-agent.service`。`uninstall` 只移除 systemd unit，保留 `/etc/cmclient`、`/var/lib/cmclient`、`/var/cache/cmclient` 與 `/var/log/cmclient`，避免重新安裝或回滾破壞使用者狀態。完整硬化設定與 serial group 指引見 [`docs/architecture/systemd-service.md`](docs/architecture/systemd-service.md)。
 
 ---
 
@@ -507,22 +501,9 @@ AUTO_UPDATE_POLL_SECONDS=300            # 多少秒檢查一次遠端更新
    （或依系統使用 `service docker start`）
 2. 開機後若 Docker daemon 先啟動，compose 也會自動復原上一個狀態；若需要更明確的控制（例如先載入 `.env`、跑 `docker compose up -d`）可加上 systemd unit，下方提供範例。
 
-##### systemd unit 範例
+##### systemd managed Agent
 
-1. 複製範例 unit 檔並依實際路徑調整 `WorkingDirectory=`（需指向含 `docker-compose.yml` 的資料夾）：  
-   ```bash
-   sudo cp systemd/callmesh-client.service.example /etc/systemd/system/callmesh-client.service
-   sudo sed -i 's#/opt/CMClient#/home/<user>/CMClient#g' /etc/systemd/system/callmesh-client.service
-   ```
-   （或以 `nano`/`vim` 編輯，並確認 `docker compose up -d` 指令沒有其他自訂參數）
-2. 重新載入 systemd 並啟用服務：  
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now callmesh-client.service
-   ```
-3. 之後主機開機時會先啟動 Docker，再由 systemd 執行 `docker compose up -d`。若需暫停服務可 `sudo systemctl stop callmesh-client`，並於調整設定後 `sudo systemctl restart callmesh-client`。
-
-> 提醒：compose 內已設定 `restart: unless-stopped`，可確保 Docker daemon 重啟時自動復原；systemd unit 則負責在 OS 開機時立即執行 compose，適合長期部署。
+Docker Compose 的 Legacy systemd wrapper 已移除。Headless deployment 應安裝 `cmclient-agent.service`，由 Agent 監督 Gateway，而不是讓 systemd 直接執行 Docker Compose。使用方式與資料保留行為見上方的 Linux systemd 章節。
 
 #### Docker 映像更新流程
 
