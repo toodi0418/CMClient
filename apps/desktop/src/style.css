@@ -18,6 +18,7 @@ button {
   background: #f2f7f2;
 }
 .desktop-header {
+  position: relative;
   height: 48px;
   display: flex;
   align-items: center;
@@ -27,6 +28,74 @@ button {
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
+  user-select: none;
+}
+.desktop-header__title {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.window-controls {
+  display: flex;
+  gap: 0;
+  margin-left: -4px;
+}
+.window-control {
+  position: relative;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  place-items: center;
+  background: transparent;
+}
+.window-control::before {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  content: "";
+  transition:
+    transform 140ms ease-out,
+    filter 140ms ease-out,
+    box-shadow 140ms ease-out;
+}
+.window-control__icon {
+  position: absolute;
+  z-index: 1;
+  color: #142219;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease-out;
+}
+.window-controls:hover .window-control__icon,
+.window-control:focus-visible .window-control__icon {
+  opacity: 0.72;
+}
+.window-control:hover .window-control__icon {
+  opacity: 1;
+}
+.window-control:hover::before,
+.window-control:focus-visible::before {
+  filter: brightness(0.86);
+  transform: scale(1.08);
+  box-shadow: 0 1px 4px #16261966;
+}
+.window-control:active::before {
+  transform: scale(0.92);
+}
+.window-control:focus-visible {
+  outline: 2px solid #2869a4;
+  outline-offset: 1px;
+}
+.window-control--exit::before {
+  background: #ee6b61;
+}
+.window-control--minimize::before {
+  background: #e9c75d;
+}
+.window-control--hide::before {
+  background: #62bf7f;
 }
 .status-surface {
   width: min(100% - 40px, 520px);

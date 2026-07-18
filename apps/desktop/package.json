@@ -9,6 +9,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@lucide/vue": "^1.25.0",
     "@tauri-apps/api": "2.11.1",
     "vue": "^3.5.40"
   },
