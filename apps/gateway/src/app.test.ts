@@ -34,9 +34,22 @@ describe("GatewayRuntime", () => {
     expect(logger.entries).toHaveLength(1);
     expect(logger.entries[0]).toMatchObject({ correlationId: "sync-42" });
     expect(
-      redact({ nested: { apiKey: "secret", passcode: 1234 }, plain: "safe" }),
+      redact({
+        nested: {
+          apiKey: "secret",
+          credential: "credential-value",
+          sessionCookie: "session-value",
+          passcode: 1234,
+        },
+        plain: "safe",
+      }),
     ).toEqual({
-      nested: { apiKey: "[REDACTED]", passcode: "[REDACTED]" },
+      nested: {
+        apiKey: "[REDACTED]",
+        credential: "[REDACTED]",
+        sessionCookie: "[REDACTED]",
+        passcode: "[REDACTED]",
+      },
       plain: "safe",
     });
     await app.close();
@@ -250,7 +263,7 @@ describe("GatewayRuntime", () => {
 
     const stream = await openSse(address.port, "/api/v1/events", first.eventId);
     try {
-      const body = await readUntil(stream.response, `id: ${second.eventId}`);
+      const body = await readUntil(stream.response, ": heartbeat\n\n");
       expect(body).toContain(": heartbeat\n\n");
       expect(body).not.toContain(`id: ${first.eventId}`);
       expect(body).toContain(`id: ${second.eventId}`);

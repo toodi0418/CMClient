@@ -31,6 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             build-essential \
+            libdbus-1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libwebkit2gtk-4.1-dev \
@@ -84,6 +85,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             build-essential \
+            libdbus-1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libwebkit2gtk-4.1-dev \

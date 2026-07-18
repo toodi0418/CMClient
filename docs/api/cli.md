@@ -19,3 +19,8 @@ Gateway. `update --follow` reconnects to the private
 `/api/v1/control/updates/events` SSE feed and prints each complete status
 projection. With `--json`, each line is one stable
 `UpdateControlStatus` JSON document; `--quiet` suppresses normal output.
+
+`diagnostics` reads the Agent's sanitized diagnostic bundle through the private
+Control API. `secret set <kind>` reads one value from standard input and stores
+it through the Agent; `secret remove <kind>` removes it. Secret values are never
+accepted as command arguments, printed, or returned as JSON.

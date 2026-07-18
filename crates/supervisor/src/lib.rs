@@ -99,7 +99,7 @@ impl GatewaySupervisor {
             command,
             backoff_policy,
             child: None,
-            environment: BTreeMap::new(),
+            environment: inherited_runtime_environment(),
             failed_attempts: 0,
         })
     }
@@ -116,7 +116,7 @@ impl GatewaySupervisor {
     }
 
     pub fn set_environment(&mut self, environment: BTreeMap<String, String>) {
-        self.environment = environment;
+        self.environment.extend(environment);
     }
 
     pub fn start(&mut self) -> Result<SupervisorEvent, SupervisorError> {
@@ -125,6 +125,7 @@ impl GatewaySupervisor {
         }
         let child = Command::new(&self.command.program)
             .args(&self.command.arguments)
+            .env_clear()
             .envs(&self.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -180,6 +181,17 @@ impl GatewaySupervisor {
         self.failed_attempts = 0;
         Ok(SupervisorEvent::Stopped)
     }
+}
+
+fn inherited_runtime_environment() -> BTreeMap<String, String> {
+    ["PATH", "SystemRoot", "WINDIR", "ComSpec"]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (String::from(name), value))
+        })
+        .collect()
 }
 
 #[cfg(test)]

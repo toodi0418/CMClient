@@ -1,6 +1,7 @@
 //! Shared Rust foundations for the CMClient Agent.
 
 pub mod access;
+pub mod secrets;
 pub mod web;
 
 use crate::access::{LanAccessConfig, ManagementAccessController};
@@ -36,8 +37,14 @@ pub struct AgentConfig {
     pub config_file: PathBuf,
     pub gateway_command: Option<Vec<String>>,
     pub gateway_port: u16,
+    pub callmesh: Option<CallMeshConfig>,
     pub management_web_enabled: bool,
     pub management_lan: Option<ManagementLanConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallMeshConfig {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +76,7 @@ pub enum ConfigError {
     InvalidConfig,
     EmptyGatewayCommand,
     InvalidGatewayPort,
+    InvalidCallMesh,
     InvalidManagementLan,
 }
 
@@ -104,6 +112,7 @@ impl ConfigError {
             Self::InvalidConfig => "AGENT_CONFIG_INVALID",
             Self::EmptyGatewayCommand => "AGENT_CONFIG_GATEWAY_COMMAND_EMPTY",
             Self::InvalidGatewayPort => "AGENT_CONFIG_GATEWAY_PORT_INVALID",
+            Self::InvalidCallMesh => "AGENT_CONFIG_CALLMESH_INVALID",
             Self::InvalidManagementLan => "AGENT_CONFIG_MANAGEMENT_LAN_INVALID",
         }
     }
@@ -121,7 +130,14 @@ impl std::error::Error for ConfigError {}
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     agent: Option<AgentSection>,
+    callmesh: Option<CallMeshSection>,
     management_lan: Option<ManagementLanSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallMeshSection {
+    url: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,16 +221,37 @@ impl AgentConfig {
                 })
             })
             .transpose()?;
+        let callmesh = file_config
+            .callmesh
+            .map(|callmesh| {
+                let url = callmesh.url.trim();
+                if !is_https_url(url) {
+                    return Err(ConfigError::InvalidCallMesh);
+                }
+                Ok(CallMeshConfig {
+                    url: url.to_owned(),
+                })
+            })
+            .transpose()?;
 
         Ok(Self {
             paths,
             config_file,
             gateway_command: agent.gateway_command,
             gateway_port,
+            callmesh,
             management_web_enabled: agent.management_web_enabled.unwrap_or(true),
             management_lan,
         })
     }
+}
+
+fn is_https_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@') && !authority.contains(char::is_whitespace)
 }
 
 impl RuntimePaths {
@@ -477,6 +514,44 @@ mod tests {
         assert_eq!(
             AgentConfig::from_environment(&environment),
             Err(ConfigError::InvalidGatewayPort)
+        );
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn accepts_only_an_https_callmesh_url_without_a_secret_in_configuration() {
+        let directory =
+            std::env::temp_dir().join(format!("cmclient-agent-callmesh-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let config_file = directory.join("agent.toml");
+        let mut environment = environment();
+        environment.insert(
+            String::from("CMCLIENT_AGENT_CONFIG"),
+            config_file.display().to_string(),
+        );
+        fs::write(
+            &config_file,
+            "[callmesh]\nurl = \"https://api.example.invalid/v1\"\n",
+        )
+        .expect("configuration should be written");
+
+        let config = AgentConfig::from_environment(&environment)
+            .expect("HTTPS CallMesh configuration should load");
+        assert_eq!(
+            config
+                .callmesh
+                .expect("CallMesh configuration should exist")
+                .url,
+            "https://api.example.invalid/v1"
+        );
+        fs::write(
+            &config_file,
+            "[callmesh]\nurl = \"https:///missing-host\"\n",
+        )
+        .expect("configuration should be written");
+        assert_eq!(
+            AgentConfig::from_environment(&environment),
+            Err(ConfigError::InvalidCallMesh)
         );
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }

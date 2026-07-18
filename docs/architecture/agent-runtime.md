@@ -20,9 +20,25 @@ gateway_port = 4810
 management_web_enabled = true
 ```
 
-CallMesh keys, APRS passcodes, administrative tokens, and signing keys do not
-belong in this file or in Agent command arguments. Their storage and redaction
-are introduced by the security and updater phases.
+CallMesh keys, APRS passcodes, and administrative tokens do not belong in this
+file or in Agent command arguments. The Agent stores them in the operating
+system credential store (Keychain on macOS, Credential Manager on Windows, or
+Secret Service on Linux). `cmclient secret set <kind>` reads a single value from
+standard input and forwards it over the private Control API; its response never
+contains the value. Supported kinds are `callmesh-api-key`, `aprs-passcode`, and
+`management-admin-token`. Update signing private keys are deliberately not a
+runtime secret kind: release signing remains outside the product runtime.
+
+CallMesh's non-secret endpoint is optional Agent configuration. Its URL must be
+HTTPS; at Gateway launch the Agent clears inherited environment variables and
+passes this URL plus a CallMesh API key only when that key is present in the OS
+credential store. Gateway therefore cannot inherit a legacy API key from the
+parent shell.
+
+```toml
+[callmesh]
+url = "https://api.callmesh.example/v1"
+```
 
 LAN Management Web is opt-in through a separate strict section. It requires a
 non-loopback bind, absolute paths to a PEM certificate and private key, an
@@ -63,3 +79,9 @@ Verified update archives are transient Agent cache data under
 with an exact byte limit, SHA-256 verified, and atomically published by digest.
 This cache must not be treated as user data and updates must not overwrite the
 Agent data or configuration directories.
+
+`cmclient diagnostics` retrieves a local, sanitized Agent diagnostic bundle.
+Its allowlist contains component version, Gateway/Management Web state, and
+stable current/update error or log codes only. It never reads or exports
+credential values, configuration contents, environment variables, log records,
+database rows, packet captures, absolute paths, or raw request payloads.

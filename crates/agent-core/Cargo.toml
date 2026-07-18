@@ -8,12 +8,14 @@ rust-version.workspace = true
 [dependencies]
 argon2 = "0.5"
 fs2 = "0.4"
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
 rustls = "0.23"
 rustls-pemfile = "2"
 uuid = { version = "1", features = ["v4"] }
+zeroize = "1.8"
 
 [lints]
 workspace = true

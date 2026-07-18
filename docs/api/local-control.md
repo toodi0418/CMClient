@@ -16,6 +16,9 @@ POST /api/v1/control/web/enable
 POST /api/v1/control/web/disable
 GET /api/v1/control/updates
 GET /api/v1/control/updates/events
+GET /api/v1/control/diagnostics/bundle
+PUT /api/v1/control/secrets/{callmesh-api-key|aprs-passcode|management-admin-token}
+DELETE /api/v1/control/secrets/{callmesh-api-key|aprs-passcode|management-admin-token}
 ```
 
 Each route returns the schema version, Agent version/state, Gateway lifecycle,
@@ -42,3 +45,14 @@ future state transitions and a 15-second heartbeat. The Agent retains no
 unbounded per-client backlog: slow or disconnected subscribers are removed.
 The durable source of truth is the update journal, so clients reconnect by
 reading `/updates` before subscribing again.
+
+`GET /api/v1/control/diagnostics/bundle` returns a JSON allowlist of Agent and
+runtime state. It contains stable error/log codes but never paths, config,
+environment, database content, packet data, credentials, or log payloads.
+
+The secret routes are private-socket only. `PUT` accepts a single UTF-8 value in
+its request body (maximum 4096 bytes, no control characters) and stores it in
+the OS credential store. The response is only `{ "stored": true }`; secret
+values are never returned. `DELETE` removes a named value and returns whether a
+value existed. CLI users should use `cmclient secret set <kind>` with standard
+input rather than constructing these local requests by hand.

@@ -1,5 +1,6 @@
 use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::access::{ManagementAccessController, ManagementAccessError};
+use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind};
 use cmclient_agent_core::web::{
     ManagementTlsConfig, ManagementWebApiHandler, ManagementWebConfig, ManagementWebError,
     ManagementWebListener, ManagementWebRequest, ManagementWebService, ManagementWebStream,
@@ -7,9 +8,10 @@ use cmclient_agent_core::web::{
 };
 use cmclient_agent_core::{AgentConfig, AgentLease, ensure_runtime_directories};
 use cmclient_control_api::{
-    ControlCommand, ControlEndpoint, ControlError, ControlHandler, ControlServer, ControlStatus,
-    ControlUpdateEvent, GatewayControlStatus, ManagementWebControlStatus, UpdateControlJob,
-    UpdateControlStatus, default_unix_socket,
+    ControlCommand, ControlEndpoint, ControlError, ControlHandler, ControlSecretKind,
+    ControlServer, ControlStatus, ControlUpdateEvent, DiagnosticsControlBundle,
+    GatewayControlStatus, ManagementWebControlStatus, UpdateControlJob, UpdateControlStatus,
+    default_unix_socket,
 };
 use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor};
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
@@ -372,6 +374,7 @@ struct AgentController {
     management_web: Mutex<Option<ManagementWebService>>,
     management_web_config: ManagementWebConfig,
     management_access: Option<Arc<ManagementAccessController>>,
+    secrets: AgentSecretStore,
     updates: Arc<AgentUpdateService>,
     started_at: Instant,
     latest_error_code: Mutex<Option<String>>,
@@ -379,6 +382,7 @@ struct AgentController {
 
 impl AgentController {
     fn from_config(config: &AgentConfig) -> Result<Self, ControlError> {
+        let secrets = AgentSecretStore::platform();
         let supervisor = config
             .gateway_command
             .as_ref()
@@ -391,7 +395,7 @@ impl AgentController {
                     BackoffPolicy::default(),
                 )
                 .map_err(|_| ControlError::CommandFailed)?;
-                supervisor.set_environment(BTreeMap::from([
+                let mut environment = BTreeMap::from([
                     (
                         String::from("CMCLIENT_GATEWAY_HOST"),
                         String::from("127.0.0.1"),
@@ -404,7 +408,20 @@ impl AgentController {
                         String::from("CMCLIENT_DATA_DIR"),
                         config.paths.data_dir.to_string_lossy().into_owned(),
                     ),
-                ]));
+                ]);
+                if let Some(callmesh) = &config.callmesh {
+                    environment.insert(String::from("CMCLIENT_CALLMESH_URL"), callmesh.url.clone());
+                    if let Some(api_key) = secrets
+                        .read(SecretKind::CallMeshApiKey)
+                        .map_err(|_| ControlError::CommandFailed)?
+                    {
+                        environment.insert(
+                            String::from("CMCLIENT_CALLMESH_API_KEY"),
+                            api_key.expose_secret().to_owned(),
+                        );
+                    }
+                }
+                supervisor.set_environment(environment);
                 Ok(supervisor)
             })
             .transpose()?;
@@ -456,6 +473,7 @@ impl AgentController {
             management_web: Mutex::new(management_web),
             management_web_config,
             management_access,
+            secrets,
             updates,
             started_at: Instant::now(),
             latest_error_code: Mutex::new(None),
@@ -635,6 +653,40 @@ impl ControlHandler for AgentController {
 
     fn subscribe_update_events(&self) -> Result<mpsc::Receiver<ControlUpdateEvent>, ControlError> {
         self.updates.subscribe()
+    }
+
+    fn diagnostics_bundle(&self) -> Result<DiagnosticsControlBundle, ControlError> {
+        let status = self.status()?;
+        let update = self.updates.status()?;
+        Ok(DiagnosticsControlBundle {
+            schema_version: 1,
+            agent_version: status.agent_version,
+            gateway: status.gateway,
+            management_web: status.management_web,
+            latest_error_code: status.latest_error_code,
+            update_error_code: update.job.as_ref().and_then(|job| job.error_code.clone()),
+            update_log_codes: update.job.map_or_else(Vec::new, |job| job.recent_log_codes),
+        })
+    }
+
+    fn store_secret(&self, kind: ControlSecretKind, value: &str) -> Result<(), ControlError> {
+        self.secrets
+            .store(secret_kind(kind), value)
+            .map_err(|_| ControlError::CommandFailed)
+    }
+
+    fn remove_secret(&self, kind: ControlSecretKind) -> Result<bool, ControlError> {
+        self.secrets
+            .remove(secret_kind(kind))
+            .map_err(|_| ControlError::CommandFailed)
+    }
+}
+
+const fn secret_kind(kind: ControlSecretKind) -> SecretKind {
+    match kind {
+        ControlSecretKind::CallMeshApiKey => SecretKind::CallMeshApiKey,
+        ControlSecretKind::AprsPasscode => SecretKind::AprsPasscode,
+        ControlSecretKind::ManagementAdminToken => SecretKind::ManagementAdminToken,
     }
 }
 
@@ -861,10 +913,20 @@ mod tests {
                 String::from("sleep 30"),
             ]),
             gateway_port: port,
+            callmesh: None,
             management_web_enabled: false,
             management_lan: None,
         };
         let controller = AgentController::from_config(&config).expect("controller should build");
+
+        let diagnostics = controller
+            .diagnostics_bundle()
+            .expect("sanitized diagnostics should build");
+        let serialized =
+            serde_json::to_string(&diagnostics).expect("sanitized diagnostics should serialize");
+        assert_eq!(diagnostics.schema_version, 1);
+        assert!(!serialized.contains("/tmp/cmclient-agent-health"));
+        assert!(!serialized.contains("gateway_command"));
 
         let status = controller
             .handle(ControlCommand::Start)

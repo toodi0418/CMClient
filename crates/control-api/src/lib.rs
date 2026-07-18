@@ -63,6 +63,53 @@ pub struct UpdateControlStatus {
     pub job: Option<UpdateControlJob>,
 }
 
+/// Sanitized Agent diagnostic bundle exposed only through the local Control API.
+/// It intentionally has no file paths, configuration values, log records, or secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticsControlBundle {
+    pub schema_version: u8,
+    pub agent_version: String,
+    pub gateway: GatewayControlStatus,
+    pub management_web: ManagementWebControlStatus,
+    pub latest_error_code: Option<String>,
+    pub update_error_code: Option<String>,
+    pub update_log_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlSecretKind {
+    CallMeshApiKey,
+    AprsPasscode,
+    ManagementAdminToken,
+}
+
+impl ControlSecretKind {
+    pub const fn path_segment(self) -> &'static str {
+        match self {
+            Self::CallMeshApiKey => "callmesh-api-key",
+            Self::AprsPasscode => "aprs-passcode",
+            Self::ManagementAdminToken => "management-admin-token",
+        }
+    }
+
+    fn from_path_segment(value: &str) -> Option<Self> {
+        match value {
+            "callmesh-api-key" => Some(Self::CallMeshApiKey),
+            "aprs-passcode" => Some(Self::AprsPasscode),
+            "management-admin-token" => Some(Self::ManagementAdminToken),
+            _ => None,
+        }
+    }
+}
+
+/// Confirmation for a local secret mutation. It never contains the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ControlSecretReceipt {
+    pub stored: bool,
+}
+
 /// Safe update fields exposed through local control and SSE.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -103,6 +150,18 @@ pub trait ControlHandler: Send + Sync {
     }
 
     fn subscribe_update_events(&self) -> Result<mpsc::Receiver<ControlUpdateEvent>, ControlError> {
+        Err(ControlError::CommandFailed)
+    }
+
+    fn diagnostics_bundle(&self) -> Result<DiagnosticsControlBundle, ControlError> {
+        Err(ControlError::CommandFailed)
+    }
+
+    fn store_secret(&self, _kind: ControlSecretKind, _value: &str) -> Result<(), ControlError> {
+        Err(ControlError::CommandFailed)
+    }
+
+    fn remove_secret(&self, _kind: ControlSecretKind) -> Result<bool, ControlError> {
         Err(ControlError::CommandFailed)
     }
 }
@@ -171,7 +230,10 @@ impl ControlRouter {
     }
 
     fn route(&self, request: &str) -> Result<ControlResponse, ControlError> {
-        let request_line = request.lines().next().ok_or(ControlError::InvalidHttp)?;
+        let (head, body) = request
+            .split_once("\r\n\r\n")
+            .ok_or(ControlError::InvalidHttp)?;
+        let request_line = head.lines().next().ok_or(ControlError::InvalidHttp)?;
         let route = match request_line
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -205,6 +267,28 @@ impl ControlRouter {
             | ["GET", "/api/v1/control/updates", "HTTP/1.0"] => ControlRoute::UpdateStatus,
             ["GET", "/api/v1/control/updates/events", "HTTP/1.1"]
             | ["GET", "/api/v1/control/updates/events", "HTTP/1.0"] => ControlRoute::UpdateEvents,
+            ["GET", "/api/v1/control/diagnostics/bundle", "HTTP/1.1"]
+            | ["GET", "/api/v1/control/diagnostics/bundle", "HTTP/1.0"] => {
+                ControlRoute::DiagnosticsBundle
+            }
+            ["PUT", path, "HTTP/1.1"] | ["PUT", path, "HTTP/1.0"]
+                if path.starts_with("/api/v1/control/secrets/") =>
+            {
+                let kind = path
+                    .strip_prefix("/api/v1/control/secrets/")
+                    .and_then(ControlSecretKind::from_path_segment)
+                    .ok_or(ControlError::InvalidHttp)?;
+                ControlRoute::StoreSecret(kind)
+            }
+            ["DELETE", path, "HTTP/1.1"] | ["DELETE", path, "HTTP/1.0"]
+                if path.starts_with("/api/v1/control/secrets/") =>
+            {
+                let kind = path
+                    .strip_prefix("/api/v1/control/secrets/")
+                    .and_then(ControlSecretKind::from_path_segment)
+                    .ok_or(ControlError::InvalidHttp)?;
+                ControlRoute::RemoveSecret(kind)
+            }
             [_, _, _] => {
                 return Ok(ControlResponse::Json {
                     status: 404,
@@ -220,6 +304,20 @@ impl ControlRouter {
                 .handler
                 .subscribe_update_events()
                 .map(ControlResponse::EventStream),
+            ControlRoute::DiagnosticsBundle => {
+                self.handler.diagnostics_bundle().and_then(json_response)
+            }
+            ControlRoute::StoreSecret(kind) => validated_body(head, body)
+                .and_then(|value| self.handler.store_secret(kind, value))
+                .and_then(|()| json_response(ControlSecretReceipt { stored: true })),
+            ControlRoute::RemoveSecret(kind) => validated_body(head, body)
+                .and_then(|value| {
+                    if !value.is_empty() {
+                        return Err(ControlError::InvalidHttp);
+                    }
+                    self.handler.remove_secret(kind)
+                })
+                .and_then(|stored| json_response(ControlSecretReceipt { stored })),
         };
         response.or_else(error_response)
     }
@@ -229,6 +327,29 @@ enum ControlRoute {
     Command(ControlCommand),
     UpdateStatus,
     UpdateEvents,
+    DiagnosticsBundle,
+    StoreSecret(ControlSecretKind),
+    RemoveSecret(ControlSecretKind),
+}
+
+fn validated_body<'a>(head: &str, body: &'a str) -> Result<&'a str, ControlError> {
+    let mut content_length = None;
+    for line in head.lines().skip(1) {
+        let (name, value) = line.split_once(':').ok_or(ControlError::InvalidHttp)?;
+        if name.eq_ignore_ascii_case("content-length") {
+            let length = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ControlError::InvalidHttp)?;
+            if content_length.replace(length).is_some() {
+                return Err(ControlError::InvalidHttp);
+            }
+        }
+    }
+    if content_length != Some(body.len()) {
+        return Err(ControlError::InvalidHttp);
+    }
+    Ok(body)
 }
 
 fn json_response<T: Serialize>(value: T) -> Result<ControlResponse, ControlError> {
@@ -259,6 +380,9 @@ mod unix {
         thread,
         time::Duration,
     };
+    use zeroize::Zeroize;
+
+    const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
     pub struct ControlServer {
         endpoint: PathBuf,
@@ -305,16 +429,70 @@ mod unix {
     }
 
     fn serve_connection(mut stream: UnixStream, router: ControlRouter) -> Result<(), ControlError> {
-        let mut request = [0_u8; 8_192];
-        let bytes = stream.read(&mut request).map_err(|_| ControlError::Io)?;
-        let request =
-            std::str::from_utf8(&request[..bytes]).map_err(|_| ControlError::InvalidHttp)?;
-        match router.route(request)? {
+        let mut request = read_request(&mut stream)?;
+        let response = std::str::from_utf8(&request)
+            .map_err(|_| ControlError::InvalidHttp)
+            .and_then(|request| router.route(request));
+        request.zeroize();
+        match response? {
             ControlResponse::Json { status, body } => {
                 write_json_response(&mut stream, status, &body)
             }
             ControlResponse::EventStream(events) => write_update_event_stream(&mut stream, events),
         }
+    }
+
+    fn read_request(stream: &mut UnixStream) -> Result<Vec<u8>, ControlError> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 2048];
+        loop {
+            let count = stream.read(&mut chunk).map_err(|_| ControlError::Io)?;
+            if count == 0 {
+                return Err(ControlError::InvalidHttp);
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if request.len() > MAX_REQUEST_BYTES {
+                return Err(ControlError::ResponseTooLarge);
+            }
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let header = std::str::from_utf8(&request[..header_end])
+                .map_err(|_| ControlError::InvalidHttp)?;
+            let content_length = content_length(header)?;
+            let request_length = header_end.saturating_add(content_length);
+            if request_length > MAX_REQUEST_BYTES {
+                return Err(ControlError::ResponseTooLarge);
+            }
+            if request.len() >= request_length {
+                request.truncate(request_length);
+                return Ok(request);
+            }
+        }
+    }
+
+    fn content_length(header: &str) -> Result<usize, ControlError> {
+        let mut length = None;
+        for line in header.lines().skip(1) {
+            if line.is_empty() {
+                continue;
+            }
+            let (name, value) = line.split_once(':').ok_or(ControlError::InvalidHttp)?;
+            if name.eq_ignore_ascii_case("content-length") {
+                let parsed = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| ControlError::InvalidHttp)?;
+                if length.replace(parsed).is_some() {
+                    return Err(ControlError::InvalidHttp);
+                }
+            }
+        }
+        length.ok_or(ControlError::InvalidHttp)
     }
 
     fn write_json_response(
@@ -434,11 +612,38 @@ mod unix {
             self.request_update("GET", "/api/v1/control/updates")
         }
 
+        pub fn diagnostics_bundle(&self) -> Result<super::DiagnosticsControlBundle, ControlError> {
+            self.request_json("GET", "/api/v1/control/diagnostics/bundle", "")
+        }
+
+        pub fn store_secret(
+            &self,
+            kind: super::ControlSecretKind,
+            value: &str,
+        ) -> Result<super::ControlSecretReceipt, ControlError> {
+            self.request_json(
+                "PUT",
+                &format!("/api/v1/control/secrets/{}", kind.path_segment()),
+                value,
+            )
+        }
+
+        pub fn remove_secret(
+            &self,
+            kind: super::ControlSecretKind,
+        ) -> Result<super::ControlSecretReceipt, ControlError> {
+            self.request_json(
+                "DELETE",
+                &format!("/api/v1/control/secrets/{}", kind.path_segment()),
+                "",
+            )
+        }
+
         pub fn subscribe_update_events(&self) -> Result<ControlUpdateEventStream, ControlError> {
             let mut stream = UnixStream::connect(&self.endpoint).map_err(|_| ControlError::Io)?;
             stream
                 .write_all(
-                    b"GET /api/v1/control/updates/events HTTP/1.1\r\nhost: localhost\r\naccept: text/event-stream\r\n\r\n",
+                    b"GET /api/v1/control/updates/events HTTP/1.1\r\nhost: localhost\r\naccept: text/event-stream\r\ncontent-length: 0\r\n\r\n",
                 )
                 .map_err(|_| ControlError::Io)?;
             let response = read_sse_response_head(&mut stream)?;
@@ -461,7 +666,7 @@ mod unix {
         }
 
         fn request(&self, method: &str, path: &str) -> Result<ControlStatus, ControlError> {
-            self.request_json(method, path)
+            self.request_json(method, path, "")
         }
 
         fn request_update(
@@ -469,20 +674,23 @@ mod unix {
             method: &str,
             path: &str,
         ) -> Result<super::UpdateControlStatus, ControlError> {
-            self.request_json(method, path)
+            self.request_json(method, path, "")
         }
 
         fn request_json<T: serde::de::DeserializeOwned>(
             &self,
             method: &str,
             path: &str,
+            body: &str,
         ) -> Result<T, ControlError> {
             let mut stream = UnixStream::connect(&self.endpoint).map_err(|_| ControlError::Io)?;
-            let request =
-                format!("{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n");
-            stream
-                .write_all(request.as_bytes())
-                .map_err(|_| ControlError::Io)?;
+            let mut request = format!(
+                "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let write_result = stream.write_all(request.as_bytes());
+            request.zeroize();
+            write_result.map_err(|_| ControlError::Io)?;
             let mut response = Vec::new();
             stream
                 .read_to_end(&mut response)
@@ -658,6 +866,25 @@ impl ControlClient {
         Err(ControlError::UnsupportedEndpoint)
     }
 
+    pub fn diagnostics_bundle(&self) -> Result<DiagnosticsControlBundle, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
+    pub fn store_secret(
+        &self,
+        _kind: ControlSecretKind,
+        _value: &str,
+    ) -> Result<ControlSecretReceipt, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
+    pub fn remove_secret(
+        &self,
+        _kind: ControlSecretKind,
+    ) -> Result<ControlSecretReceipt, ControlError> {
+        Err(ControlError::UnsupportedEndpoint)
+    }
+
     pub fn subscribe_update_events(&self) -> Result<ControlUpdateEventStream, ControlError> {
         Err(ControlError::UnsupportedEndpoint)
     }
@@ -679,12 +906,13 @@ mod tests {
     #[cfg(unix)]
     use super::{ControlClient, ControlServer};
     use super::{
-        ControlEndpoint, ControlError, ControlHandler, ControlStatus, ControlUpdateEvent,
-        GatewayControlStatus, ManagementWebControlStatus, StaticControlHandler, UpdateControlJob,
-        UpdateControlStatus, default_unix_socket, is_local_endpoint,
+        ControlEndpoint, ControlError, ControlHandler, ControlSecretKind, ControlStatus,
+        ControlUpdateEvent, DiagnosticsControlBundle, GatewayControlStatus,
+        ManagementWebControlStatus, StaticControlHandler, UpdateControlJob, UpdateControlStatus,
+        default_unix_socket, is_local_endpoint,
     };
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex, mpsc};
+    use std::{collections::BTreeMap, path::PathBuf};
 
     fn status() -> ControlStatus {
         ControlStatus {
@@ -702,6 +930,45 @@ mod tests {
     struct UpdateHandler {
         update: UpdateControlStatus,
         events: Mutex<Option<mpsc::Receiver<ControlUpdateEvent>>>,
+    }
+
+    struct DiagnosticsAndSecretHandler {
+        values: Mutex<BTreeMap<&'static str, String>>,
+    }
+
+    impl ControlHandler for DiagnosticsAndSecretHandler {
+        fn handle(&self, _command: super::ControlCommand) -> Result<ControlStatus, ControlError> {
+            Ok(status())
+        }
+
+        fn diagnostics_bundle(&self) -> Result<DiagnosticsControlBundle, ControlError> {
+            Ok(DiagnosticsControlBundle {
+                schema_version: 1,
+                agent_version: String::from("2.0.0-dev.0"),
+                gateway: GatewayControlStatus::Running,
+                management_web: ManagementWebControlStatus::Running,
+                latest_error_code: Some(String::from("GATEWAY_HEALTH_DEGRADED")),
+                update_error_code: None,
+                update_log_codes: vec![String::from("UPDATE_SIGNATURE_VERIFIED")],
+            })
+        }
+
+        fn store_secret(&self, kind: ControlSecretKind, value: &str) -> Result<(), ControlError> {
+            self.values
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?
+                .insert(kind.path_segment(), value.to_owned());
+            Ok(())
+        }
+
+        fn remove_secret(&self, kind: ControlSecretKind) -> Result<bool, ControlError> {
+            Ok(self
+                .values
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?
+                .remove(kind.path_segment())
+                .is_some())
+        }
     }
 
     impl ControlHandler for UpdateHandler {
@@ -732,6 +999,17 @@ mod tests {
         assert!(is_local_endpoint(&ControlEndpoint::named_pipe(
             r"\\.\pipe\cmclient-control"
         )));
+    }
+
+    #[test]
+    fn routes_zero_length_control_requests_before_dispatching_them() {
+        let router = super::ControlRouter::new(Arc::new(StaticControlHandler::new(status())));
+        assert!(matches!(
+            router.route(
+                "GET /api/v1/control/status HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n"
+            ),
+            Ok(super::ControlResponse::Json { status: 200, .. })
+        ));
     }
 
     #[cfg(unix)]
@@ -840,6 +1118,55 @@ mod tests {
             .join()
             .expect("server thread should join")
             .expect("server should accept requests");
+        std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_secret_bodies_but_exposes_only_sanitized_diagnostics() {
+        let directory =
+            std::env::temp_dir().join(format!("cmclient-control-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let endpoint = default_unix_socket(&directory);
+        let handler = Arc::new(DiagnosticsAndSecretHandler {
+            values: Mutex::new(BTreeMap::new()),
+        });
+        let server =
+            ControlServer::bind(endpoint.clone(), handler.clone()).expect("server should bind");
+        let server_thread = std::thread::spawn(move || {
+            server.serve_once()?;
+            server.serve_once()?;
+            server.serve_once()
+        });
+        let client = ControlClient::new(endpoint).expect("client should initialize");
+
+        let stored = client
+            .store_secret(ControlSecretKind::CallMeshApiKey, "credential-value")
+            .expect("secret should store");
+        assert_eq!(stored, super::ControlSecretReceipt { stored: true });
+        let diagnostics = client
+            .diagnostics_bundle()
+            .expect("diagnostics should load");
+        let serialized = serde_json::to_string(&diagnostics).expect("diagnostics should serialize");
+        assert!(serialized.contains("UPDATE_SIGNATURE_VERIFIED"));
+        assert!(!serialized.contains("credential-value"));
+        assert_eq!(
+            client
+                .remove_secret(ControlSecretKind::CallMeshApiKey)
+                .expect("secret should remove"),
+            super::ControlSecretReceipt { stored: true }
+        );
+        assert!(
+            handler
+                .values
+                .lock()
+                .expect("test values should lock")
+                .is_empty()
+        );
+        server_thread
+            .join()
+            .expect("server thread should join")
+            .expect("server should respond");
         std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 }
