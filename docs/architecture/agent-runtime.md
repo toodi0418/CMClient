@@ -29,3 +29,9 @@ The Agent injects `CMCLIENT_GATEWAY_HOST=127.0.0.1`, the configured non-zero
 `CMCLIENT_GATEWAY_PORT`, and its own `CMCLIENT_DATA_DIR` into the supervised
 Gateway process. This keeps the Gateway data store and the Agent's health/proxy
 endpoint aligned without exposing a Gateway listener to the LAN.
+
+Verified update archives are transient Agent cache data under
+`<cache_dir>/updates/staging`. They are selected from a signed manifest, streamed
+with an exact byte limit, SHA-256 verified, and atomically published by digest.
+This cache must not be treated as user data and updates must not overwrite the
+Agent data or configuration directories.

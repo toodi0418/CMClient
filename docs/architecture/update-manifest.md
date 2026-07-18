@@ -19,4 +19,9 @@ verification remain Agent-only trust decisions.
 
 P09-T02 consumes the selected bundle by streaming it to staging, verifying its
 SHA-256 against the authenticated manifest, and retaining it only after both
-checks complete.
+checks complete. The production HTTP client follows no redirects, accepts only
+successful responses, compares any declared Content-Length to the signed size,
+and rejects an underflow or overflow while streaming. Staging uses the
+Agent-owned OS cache path at `cache_dir/updates/staging`; it never writes into
+the data or configuration directories. A completed archive is named only by its
+validated SHA-256, synced before publication, and revalidated before reuse.

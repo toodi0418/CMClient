@@ -4,10 +4,19 @@
 //! download and install a bundle only after this boundary authenticates the
 //! manifest and selects an exact component/target pair.
 
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use reqwest::blocking::Client;
+use reqwest::redirect::Policy;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,6 +26,8 @@ pub const COMPONENT: &str = "updater";
 
 /// The only manifest schema understood by this release line.
 pub const MANIFEST_SCHEMA_VERSION: u8 = 1;
+
+const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Release channels supported by the updater.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -304,13 +315,332 @@ impl SignedUpdateManifest {
 
 /// Computes the canonical lowercase SHA-256 digest used by bundle manifests.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+    format_sha256_digest(&Sha256::digest(bytes))
+}
+
+fn format_sha256_digest(digest: &[u8]) -> String {
     let mut rendered = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    for &byte in digest {
         use fmt::Write as _;
         let _ = write!(rendered, "{byte:02x}");
     }
     rendered
+}
+
+/// A response stream returned by a bundle transport.
+pub struct BundleResponse {
+    /// Archive stream. Callers must consume it exactly once while staging.
+    pub reader: Box<dyn Read>,
+    /// Declared HTTP response length when the transport makes it available.
+    pub content_length: Option<u64>,
+}
+
+/// Boundary used to fetch an authenticated bundle without coupling staging to HTTP.
+pub trait BundleTransport {
+    /// Opens one exact bundle URL and returns its unconsumed response stream.
+    fn download(&self, url: &str) -> Result<BundleResponse, UpdateStageError>;
+}
+
+/// Production HTTPS bundle transport used by the Agent updater.
+pub struct HttpBundleTransport {
+    client: Client,
+}
+
+impl HttpBundleTransport {
+    /// Creates a client that refuses redirects and uses the platform trust store.
+    pub fn new() -> Result<Self, UpdateStageError> {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(15 * 60))
+            .redirect(Policy::none())
+            .build()
+            .map_err(|_| UpdateStageError::TransportUnavailable)?;
+        Ok(Self { client })
+    }
+}
+
+impl BundleTransport for HttpBundleTransport {
+    fn download(&self, url: &str) -> Result<BundleResponse, UpdateStageError> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .map_err(|_| UpdateStageError::DownloadFailed)?;
+        if !response.status().is_success() {
+            return Err(UpdateStageError::UnexpectedHttpStatus);
+        }
+
+        Ok(BundleResponse {
+            content_length: response.content_length(),
+            reader: Box::new(response),
+        })
+    }
+}
+
+/// Inputs required to authenticate, select, download, and stage one bundle.
+pub struct UpdateStageRequest<'a> {
+    /// Manifest obtained from the release service.
+    pub signed_manifest: &'a SignedUpdateManifest,
+    /// Locally configured key identifier, not a remote selection.
+    pub expected_signing_key_id: &'a str,
+    /// Locally configured trusted Ed25519 public key.
+    pub verifying_key: &'a VerifyingKey,
+    /// Installed product surface to update.
+    pub component: UpdateComponent,
+    /// Current platform target.
+    pub target: UpdateTarget,
+    /// Agent-owned OS cache directory.
+    pub cache_dir: &'a Path,
+}
+
+/// An archive that has passed manifest and byte verification in Agent staging.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedBundle {
+    /// Absolute path to the verified archive in the Agent cache.
+    pub path: PathBuf,
+    /// Product surface represented by the staged archive.
+    pub component: UpdateComponent,
+    /// Platform supported by the staged archive.
+    pub target: UpdateTarget,
+    /// Archive encoding used by the staged archive.
+    pub archive: UpdateArchive,
+    /// Authenticated lowercase SHA-256 digest.
+    pub sha256: String,
+    /// Authenticated archive size.
+    pub size_bytes: u64,
+    /// Whether an earlier verified staging artifact was safely reused.
+    pub reused: bool,
+}
+
+/// Stable errors returned while downloading or staging an update bundle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateStageError {
+    /// Manifest authentication or selection failed.
+    Manifest(UpdateManifestError),
+    /// The HTTPS client could not be configured.
+    TransportUnavailable,
+    /// The HTTPS request could not reach the authenticated endpoint.
+    DownloadFailed,
+    /// The endpoint did not return a success response.
+    UnexpectedHttpStatus,
+    /// Response metadata conflicts with the authenticated size.
+    ContentLengthMismatch,
+    /// The streamed response could not be read.
+    DownloadReadFailed,
+    /// Staging directories or files could not be prepared.
+    StagingIoFailed,
+    /// A previous writer is still staging the same archive.
+    StagingInProgress,
+    /// The response has fewer or more bytes than its authenticated size.
+    DownloadSizeMismatch,
+    /// The streamed archive digest does not match the authenticated digest.
+    DownloadChecksumMismatch,
+    /// An already staged archive is not a verified regular file.
+    ExistingStageInvalid,
+    /// The temporary archive could not be synced before publishing.
+    StagingSyncFailed,
+    /// The verified temporary archive could not be atomically published.
+    StagingFinalizeFailed,
+}
+
+impl UpdateStageError {
+    /// Stable machine-readable code for API and persistent job projections.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Manifest(error) => error.code(),
+            Self::TransportUnavailable => "UPDATE_TRANSPORT_UNAVAILABLE",
+            Self::DownloadFailed => "UPDATE_DOWNLOAD_FAILED",
+            Self::UnexpectedHttpStatus => "UPDATE_DOWNLOAD_HTTP_STATUS_INVALID",
+            Self::ContentLengthMismatch => "UPDATE_DOWNLOAD_CONTENT_LENGTH_MISMATCH",
+            Self::DownloadReadFailed => "UPDATE_DOWNLOAD_READ_FAILED",
+            Self::StagingIoFailed => "UPDATE_STAGING_IO_FAILED",
+            Self::StagingInProgress => "UPDATE_STAGING_IN_PROGRESS",
+            Self::DownloadSizeMismatch => "UPDATE_DOWNLOAD_SIZE_MISMATCH",
+            Self::DownloadChecksumMismatch => "UPDATE_DOWNLOAD_CHECKSUM_MISMATCH",
+            Self::ExistingStageInvalid => "UPDATE_STAGING_EXISTING_INVALID",
+            Self::StagingSyncFailed => "UPDATE_STAGING_SYNC_FAILED",
+            Self::StagingFinalizeFailed => "UPDATE_STAGING_FINALIZE_FAILED",
+        }
+    }
+}
+
+impl fmt::Display for UpdateStageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl Error for UpdateStageError {}
+
+/// Verifies a signed manifest, streams one exact bundle, and atomically stages it.
+pub fn stage_verified_bundle(
+    request: &UpdateStageRequest<'_>,
+    transport: &impl BundleTransport,
+) -> Result<StagedBundle, UpdateStageError> {
+    let manifest = request
+        .signed_manifest
+        .verify(request.expected_signing_key_id, request.verifying_key)
+        .map_err(UpdateStageError::Manifest)?;
+    let bundle = manifest
+        .bundle_for(request.component, request.target)
+        .map_err(UpdateStageError::Manifest)?
+        .clone();
+
+    let staging_dir = request.cache_dir.join("updates").join("staging");
+    fs::create_dir_all(&staging_dir).map_err(|_| UpdateStageError::StagingIoFailed)?;
+    if !fs::metadata(&staging_dir)
+        .map_err(|_| UpdateStageError::StagingIoFailed)?
+        .is_dir()
+    {
+        return Err(UpdateStageError::StagingIoFailed);
+    }
+
+    let staged_path = staging_dir.join(format!("{}.bundle", bundle.sha256));
+    if staged_path.exists() {
+        verify_staged_bundle(&staged_path, &bundle)?;
+        return Ok(staged_bundle(staged_path, bundle, true));
+    }
+
+    let mut response = transport.download(&bundle.url)?;
+    if response
+        .content_length
+        .is_some_and(|length| length != bundle.size_bytes)
+    {
+        return Err(UpdateStageError::ContentLengthMismatch);
+    }
+
+    let temporary_path = staging_dir.join(format!("{}.part-{}", bundle.sha256, std::process::id()));
+    let mut temporary = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                UpdateStageError::StagingInProgress
+            } else {
+                UpdateStageError::StagingIoFailed
+            }
+        })?;
+
+    let download_result = write_verified_stream(
+        response.reader.as_mut(),
+        &mut temporary,
+        bundle.size_bytes,
+        &bundle.sha256,
+    );
+    if let Err(error) = download_result {
+        drop(temporary);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    if temporary.sync_all().is_err() {
+        drop(temporary);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(UpdateStageError::StagingSyncFailed);
+    }
+    drop(temporary);
+
+    let reused = match fs::hard_link(&temporary_path, &staged_path) {
+        Ok(()) => {
+            fs::remove_file(&temporary_path)
+                .map_err(|_| UpdateStageError::StagingFinalizeFailed)?;
+            false
+        }
+        Err(_) if staged_path.exists() => {
+            let verified = verify_staged_bundle(&staged_path, &bundle);
+            let _ = fs::remove_file(&temporary_path);
+            verified?;
+            true
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(UpdateStageError::StagingFinalizeFailed);
+        }
+    };
+
+    Ok(staged_bundle(staged_path, bundle, reused))
+}
+
+fn staged_bundle(path: PathBuf, bundle: UpdateBundle, reused: bool) -> StagedBundle {
+    StagedBundle {
+        path,
+        component: bundle.component,
+        target: bundle.target,
+        archive: bundle.archive,
+        sha256: bundle.sha256,
+        size_bytes: bundle.size_bytes,
+        reused,
+    }
+}
+
+fn write_verified_stream(
+    reader: &mut dyn Read,
+    output: &mut File,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), UpdateStageError> {
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; DOWNLOAD_BUFFER_SIZE];
+
+    while total < expected_size {
+        let remaining = (expected_size - total).min(DOWNLOAD_BUFFER_SIZE as u64) as usize;
+        let read = reader
+            .read(&mut buffer[..remaining])
+            .map_err(|_| UpdateStageError::DownloadReadFailed)?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|_| UpdateStageError::StagingIoFailed)?;
+        digest.update(&buffer[..read]);
+        total += read as u64;
+    }
+
+    if total != expected_size {
+        return Err(UpdateStageError::DownloadSizeMismatch);
+    }
+    let mut extra = [0_u8; 1];
+    if reader
+        .read(&mut extra)
+        .map_err(|_| UpdateStageError::DownloadReadFailed)?
+        != 0
+    {
+        return Err(UpdateStageError::DownloadSizeMismatch);
+    }
+    if format_sha256_digest(&digest.finalize()) != expected_sha256 {
+        return Err(UpdateStageError::DownloadChecksumMismatch);
+    }
+    Ok(())
+}
+
+fn verify_staged_bundle(path: &Path, bundle: &UpdateBundle) -> Result<(), UpdateStageError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| UpdateStageError::ExistingStageInvalid)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != bundle.size_bytes
+    {
+        return Err(UpdateStageError::ExistingStageInvalid);
+    }
+
+    let mut file = File::open(path).map_err(|_| UpdateStageError::ExistingStageInvalid)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; DOWNLOAD_BUFFER_SIZE];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| UpdateStageError::ExistingStageInvalid)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    if format_sha256_digest(&digest.finalize()) != bundle.sha256 {
+        return Err(UpdateStageError::ExistingStageInvalid);
+    }
+    Ok(())
 }
 
 fn validate_signing_key_id(value: &str) -> Result<(), UpdateManifestError> {
@@ -367,11 +697,18 @@ fn is_utc_millisecond_timestamp(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MANIFEST_SCHEMA_VERSION, SignatureAlgorithm, SignedUpdateManifest, UpdateArchive,
-        UpdateBundle, UpdateChannel, UpdateComponent, UpdateManifest, UpdateManifestError,
-        UpdateTarget, sha256_hex,
+        BundleResponse, BundleTransport, MANIFEST_SCHEMA_VERSION, SignatureAlgorithm,
+        SignedUpdateManifest, UpdateArchive, UpdateBundle, UpdateChannel, UpdateComponent,
+        UpdateManifest, UpdateManifestError, UpdateStageError, UpdateStageRequest, UpdateTarget,
+        sha256_hex, stage_verified_bundle,
     };
     use ed25519_dalek::{SigningKey, VerifyingKey};
+    use std::{
+        fs,
+        io::Cursor,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[7; 32])
@@ -394,6 +731,77 @@ mod tests {
                     .to_owned(),
                 size_bytes: 4_096,
             }],
+        }
+    }
+
+    fn manifest_for(bytes: &[u8]) -> UpdateManifest {
+        let mut update_manifest = manifest();
+        update_manifest.bundles[0].sha256 = sha256_hex(bytes);
+        update_manifest.bundles[0].size_bytes = bytes.len() as u64;
+        update_manifest
+    }
+
+    fn stage_directory(test_name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cmclient-updater-{test_name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        path
+    }
+
+    struct FixtureTransport {
+        bytes: Vec<u8>,
+        content_length: Option<u64>,
+        fail: bool,
+        calls: AtomicUsize,
+    }
+
+    impl FixtureTransport {
+        fn bytes(bytes: &[u8]) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                content_length: Some(bytes.len() as u64),
+                fail: false,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                bytes: Vec::new(),
+                content_length: None,
+                fail: true,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BundleTransport for FixtureTransport {
+        fn download(&self, _url: &str) -> Result<BundleResponse, UpdateStageError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(UpdateStageError::DownloadFailed);
+            }
+            Ok(BundleResponse {
+                reader: Box::new(Cursor::new(self.bytes.clone())),
+                content_length: self.content_length,
+            })
+        }
+    }
+
+    fn stage_request<'a>(
+        signed_manifest: &'a SignedUpdateManifest,
+        verifying_key: &'a VerifyingKey,
+        cache_dir: &'a Path,
+    ) -> UpdateStageRequest<'a> {
+        UpdateStageRequest {
+            signed_manifest,
+            expected_signing_key_id: "release-2026",
+            verifying_key,
+            component: UpdateComponent::Desktop,
+            target: UpdateTarget::DarwinAarch64,
+            cache_dir,
         }
     }
 
@@ -478,6 +886,167 @@ mod tests {
         }"#;
 
         assert!(serde_json::from_str::<UpdateManifest>(document).is_err());
+    }
+
+    #[test]
+    fn stages_only_an_authenticated_exact_bundle() {
+        let bytes = b"verified release archive";
+        let key = signing_key();
+        let verifying_key = VerifyingKey::from(&key);
+        let signed =
+            SignedUpdateManifest::sign(manifest_for(bytes), "release-2026".to_owned(), &key)
+                .unwrap();
+        let cache_dir = stage_directory("verified");
+        let transport = FixtureTransport::bytes(bytes);
+
+        let staged = stage_verified_bundle(
+            &stage_request(&signed, &verifying_key, &cache_dir),
+            &transport,
+        )
+        .unwrap();
+
+        assert!(!staged.reused);
+        assert_eq!(
+            staged.path,
+            cache_dir
+                .join("updates/staging")
+                .join(format!("{}.bundle", sha256_hex(bytes)))
+        );
+        assert_eq!(fs::read(&staged.path).unwrap(), bytes);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn verifies_the_manifest_before_opening_a_network_stream() {
+        let bytes = b"verified release archive";
+        let key = signing_key();
+        let verifying_key = VerifyingKey::from(&key);
+        let mut signed =
+            SignedUpdateManifest::sign(manifest_for(bytes), "release-2026".to_owned(), &key)
+                .unwrap();
+        signed.manifest.version = "2.0.0-dev.2".to_owned();
+        let transport = FixtureTransport::bytes(bytes);
+        let cache_dir = stage_directory("tampered-manifest");
+
+        assert_eq!(
+            stage_verified_bundle(
+                &stage_request(&signed, &verifying_key, &cache_dir),
+                &transport,
+            ),
+            Err(UpdateStageError::Manifest(
+                UpdateManifestError::SignatureVerificationFailed
+            ))
+        );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        assert!(!cache_dir.exists());
+    }
+
+    #[test]
+    fn rejects_checksum_or_length_mismatch_without_publishing_a_bundle() {
+        let expected = b"verified release archive";
+        let key = signing_key();
+        let verifying_key = VerifyingKey::from(&key);
+        let signed =
+            SignedUpdateManifest::sign(manifest_for(expected), "release-2026".to_owned(), &key)
+                .unwrap();
+        let cache_dir = stage_directory("checksum-mismatch");
+        let mut altered = expected.to_vec();
+        altered[0] ^= 1;
+        let transport = FixtureTransport::bytes(&altered);
+
+        assert_eq!(
+            stage_verified_bundle(
+                &stage_request(&signed, &verifying_key, &cache_dir),
+                &transport,
+            ),
+            Err(UpdateStageError::DownloadChecksumMismatch)
+        );
+        assert!(
+            !cache_dir
+                .join("updates/staging")
+                .join(format!("{}.bundle", sha256_hex(expected)))
+                .exists()
+        );
+
+        let mut wrong_length = FixtureTransport::bytes(expected);
+        wrong_length.content_length = Some(expected.len() as u64 + 1);
+        assert_eq!(
+            stage_verified_bundle(
+                &stage_request(&signed, &verifying_key, &cache_dir),
+                &wrong_length,
+            ),
+            Err(UpdateStageError::ContentLengthMismatch)
+        );
+
+        let mut oversized_bytes = expected.to_vec();
+        oversized_bytes.push(0);
+        let mut oversized = FixtureTransport::bytes(&oversized_bytes);
+        oversized.content_length = None;
+        assert_eq!(
+            stage_verified_bundle(
+                &stage_request(&signed, &verifying_key, &cache_dir),
+                &oversized,
+            ),
+            Err(UpdateStageError::DownloadSizeMismatch)
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn reuses_only_a_reverified_existing_stage() {
+        let bytes = b"verified release archive";
+        let key = signing_key();
+        let verifying_key = VerifyingKey::from(&key);
+        let signed =
+            SignedUpdateManifest::sign(manifest_for(bytes), "release-2026".to_owned(), &key)
+                .unwrap();
+        let cache_dir = stage_directory("reused");
+        let first_transport = FixtureTransport::bytes(bytes);
+        stage_verified_bundle(
+            &stage_request(&signed, &verifying_key, &cache_dir),
+            &first_transport,
+        )
+        .unwrap();
+        let unavailable = FixtureTransport::unavailable();
+
+        let staged = stage_verified_bundle(
+            &stage_request(&signed, &verifying_key, &cache_dir),
+            &unavailable,
+        )
+        .unwrap();
+        assert!(staged.reused);
+        assert_eq!(unavailable.calls.load(Ordering::SeqCst), 0);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn rejects_a_poisoned_existing_stage_without_downloading() {
+        let bytes = b"verified release archive";
+        let key = signing_key();
+        let verifying_key = VerifyingKey::from(&key);
+        let signed =
+            SignedUpdateManifest::sign(manifest_for(bytes), "release-2026".to_owned(), &key)
+                .unwrap();
+        let cache_dir = stage_directory("poisoned");
+        let staging_dir = cache_dir.join("updates/staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(
+            staging_dir.join(format!("{}.bundle", sha256_hex(bytes))),
+            b"altered release archive",
+        )
+        .unwrap();
+        let transport = FixtureTransport::bytes(bytes);
+
+        assert_eq!(
+            stage_verified_bundle(
+                &stage_request(&signed, &verifying_key, &cache_dir),
+                &transport,
+            ),
+            Err(UpdateStageError::ExistingStageInvalid)
+        );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        let _ = fs::remove_dir_all(cache_dir);
     }
 
     #[test]
