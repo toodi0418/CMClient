@@ -34,6 +34,27 @@ PUT /api/v1/control/secrets/{callmesh-api-key|aprs-passcode|management-admin-tok
 DELETE /api/v1/control/secrets/{callmesh-api-key|aprs-passcode|management-admin-token}
 ```
 
+Local IPC exposes every route above, including `agent/shutdown` and secret
+storage. The authenticated HTTPS bridge exposes status, lifecycle, Web,
+updates, diagnostics, Gateway projections, events, Jobs, and secret routes but
+deliberately does not forward `POST /api/v1/control/agent/shutdown`. Shutdown
+is local-only so a remote browser or CLI cannot terminate the host Agent.
+
+Control routes use exact method/path matching. Query strings are not accepted;
+an unmatched method or path returns the code-only
+`{"code":"CONTROL_ROUTE_NOT_FOUND"}` envelope. Lifecycle, backup, diagnostics,
+and projection commands currently ignore a request body after the HTTP request
+has been parsed, so clients must send an empty body. Secret `PUT` is the only
+value-bearing route, and secret `DELETE` requires an empty body.
+
+Requests are capped at 8 KiB and JSON responses at 2 MiB. Control SSE events
+are capped at 60 KiB, the connection pool is capped at 64 concurrent requests
+or streams, and every operation keeps a bounded deadline. Control payloads use
+the Rust serde contract; lifecycle fields are snake_case while the nested
+update projection follows the shared `UpdateControlStatus` field names. A
+transport or size violation maps to a stable `CONTROL_*` error rather than a
+raw parser message.
+
 Lifecycle status routes return the schema version, Agent version/state, Gateway
 lifecycle, Management Web listener state and its loopback URL (only when
 running), uptime, and the latest stable error code. The enable/disable commands
@@ -56,9 +77,11 @@ resource-draining commands remain safe while teardown completes.
 Gateway projection routes are an Agent-owned bridge. The local client asks
 Agent, Agent calls the loopback Gateway with a bounded timeout, and Agent
 returns the schema-backed JSON or stable Control error. `events` streams the
-bounded Gateway SSE feed; `events/recent` is its snapshot. The bridge applies a
-one-second upstream read poll even after HTTP connection setup. A timed-out read
-checks the bounded downstream channel and continues the same healthy stream, so
+bounded Gateway SSE feed; `events/recent` forwards Gateway's default 100-item,
+newest-first process-local snapshot and exposes no `limit` query. The bridge
+applies a one-second upstream read poll even after HTTP connection setup. A
+timed-out read checks the bounded downstream channel and continues the same
+healthy stream, so
 dropping a Control SSE client terminates its bridge thread and loopback socket
 even when Gateway is half-open and sends no heartbeat. Backup and database
 integrity routes return accepted persistent Jobs rather than performing work in
@@ -67,6 +90,8 @@ the CLI or Desktop process. Gateway events use non-blocking offers to the fixed
 instead of blocking its upstream reader. The bridge retains the last event ID
 it successfully forwarded and sends it as `Last-Event-ID` after an upstream
 reconnect, allowing Gateway's bounded replay window to fill short disconnects.
+The snapshot and reconnect replay do not survive a Gateway restart and cannot
+recover events that have already left the bounded Gateway buffer.
 
 When the supervisor has a live child process, Agent additionally probes the
 Gateway loopback health endpoint. The control status is `running` only after a
@@ -91,24 +116,28 @@ environment, database content, packet data, credentials, or log payloads.
 
 The secret routes never pass through Gateway. `PUT` accepts a single UTF-8 value
 in its request body (maximum 4096 bytes, no control characters) and stores it in
-the OS credential store. The response is only `{ "stored": true }`; secret
-values are never returned. `DELETE` removes a named value and returns whether a
-value existed. CLI users should use `cmclient secret set <kind>` with standard
-input rather than constructing these requests by hand. Local IPC protects the
-body with OS permissions; the optional remote bridge additionally requires TLS
-and the HMAC control authorization described below.
+the Agent-selected secret backend. Interactive sessions use the platform
+credential store; the packaged systemd service uses its `LoadCredential`
+wrapping key and authenticated private ciphertext vault. The response is only
+`{ "stored": true }`; secret values are never returned. `DELETE` removes a
+named value and returns whether a value existed. CLI users should use
+`cmclient secret set <kind>` with standard input rather than constructing these
+requests by hand. Local IPC protects the body with OS permissions; the optional
+remote bridge additionally requires TLS and the HMAC control authorization
+described below.
 
 ## Authenticated HTTPS bridge
 
 When the opt-in Management LAN HTTPS listener is configured, the same
 `/api/v1/control/*` contract is available to the remote CLI. It is not
-authorized by the browser session cookie. Every request uses the OS-stored
-`management-admin-token` to authenticate an HMAC-SHA-256 signature bound to
-schema version, `control:admin` scope, Unix timestamp, random nonce, HTTP method,
-path, and SHA-256 body digest. Agent requires the four authentication headers,
-compares signatures in constant time, accepts only a 30-second clock window,
-and rejects nonce replay with a stable `REMOTE_CONTROL_*` code before forwarding
-to local IPC.
+authorized by the browser session cookie. Agent verifies every request with
+its OS-stored `management-admin-token`; the remote CLI receives the same value
+through its own `CMCLIENT_CONTROL_TOKEN` process environment. The resulting
+HMAC-SHA-256 signature is bound to schema version, `control:admin` scope, Unix
+timestamp, random nonce, HTTP method, path, and SHA-256 body digest. Agent
+requires the four authentication headers, compares signatures in constant
+time, accepts only a 30-second clock window, and rejects nonce replay with a
+stable `REMOTE_CONTROL_*` code before forwarding to local IPC.
 
 ```text
 Authorization: CMClient-HMAC <lowercase HMAC-SHA-256 hex>

@@ -52,6 +52,16 @@ pnpm test:e2e:web
 - [Release artifacts](docs/architecture/release-artifacts.md)
 - [Release security audit](docs/security/release-audit.md)
 - [Feature parity evidence](docs/testing/feature-parity.md)
+- [Getting started](docs/user/getting-started.md)
+- [Using CMClient](docs/user/using-cmclient.md)
+- [Administrator deployment](docs/admin/deployment.md)
+- [Configuration and security](docs/admin/configuration-security.md)
+- [Operations](docs/admin/operations.md)
+- [Developer guide](docs/developer/README.md)
+- [API reference](docs/api/README.md)
+- [Domain projection API](docs/api/domain-projections.md)
+- [RC release notes](docs/releases/2.0.0-rc.1.md)
+- [Changelog](CHANGELOG.md)
 
-Release candidates, installation instructions, upgrade procedures, and final
-release notes are completed by the P12 release gates before publication.
+The RC documentation describes installation, upgrade, operations, API
+boundaries, and the field-validation evidence required before promotion.

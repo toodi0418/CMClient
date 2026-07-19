@@ -1,8 +1,11 @@
 # Signed Update Manifest Contract
 
 The Rust Agent is the only component that consumes and executes an update.
-Gateway, Web, Desktop, and CLI may display or request an update job, but they
-never download an unverified archive or select a signing key.
+Gateway, Web, Desktop, and CLI may display the Agent-owned update projection,
+but this RC exposes no public "start update" route. They never download an
+unverified archive or select a signing key. An update can be initiated only by
+the later Agent-owned release/update control flow after its signed manifest is
+available.
 
 The release service returns this JSON document:
 
@@ -19,7 +22,7 @@ The release service returns this JSON document:
         "component": "desktop",
         "target": "darwin-aarch64",
         "archive": "tar.zst",
-        "url": "https://releases.example.invalid/cmclient/2.0.1/darwin-aarch64.tar.zst",
+        "url": "https://releases.example.invalid/cmclient/2.0.1/cmclient-desktop-darwin-aarch64-2.0.1.tar.zst",
         "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "sizeBytes": 4096
       }
@@ -54,5 +57,7 @@ digest, a non-zero size, and is unique for its `(component, target)` pair.
 | `target` | `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64`, `linux-x86_64`, `windows-x86_64` |
 | `archive` | `tar.zst`, `zip` |
 
-Docker images are not in-place update bundles. They are published and upgraded
-by their deployment tooling, never by Gateway or the Agent updater.
+Docker images are not in-place update bundles. The RC workflow exposes OCI
+archives as downloadable, source-bound workflow artifacts; it does not push a
+registry image or put Docker in the Agent manifest. Operators import and
+upgrade them with Docker tooling, never through Gateway or the Agent updater.

@@ -1,8 +1,9 @@
 # System Version And Capabilities Contract
 
 `@cmclient/contracts` defines the schema-versioned payload shared by Agent,
-Gateway, Web, Desktop, and CLI for system version and capabilities. P03 exposes
-this contract at `/api/v1/system/version` and `/api/v1/system/capabilities`.
+Gateway, Web, Desktop, and CLI for system version and capabilities. Gateway
+exposes this contract at `/api/v1/system/version` and
+`/api/v1/system/capabilities`.
 
 `build` always identifies the version, source commit, and release channel.
 `builtAt` is present only when the build pipeline supplies a verified UTC
@@ -19,3 +20,8 @@ contract is intentionally disabled. Gateway returns `available: false` with
 `REMOTE_DISPATCH_NOT_ENABLED`; clients must not infer availability from the
 presence of a route or task schema. The shared dispatch task/status schema does
 not create a compatibility path for removed sharing or command features.
+
+The capability owner is part of the reason code: Desktop owns tray behavior,
+Agent owns lifecycle/update/Web behavior, and Docker owns only its constrained
+Gateway/Web/Ingress surface. A client must hide an unavailable action instead
+of rendering a button that cannot be executed.

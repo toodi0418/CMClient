@@ -13,8 +13,10 @@ Gateway exposes the following schema-backed, versioned endpoints:
   diagnostics Job; see [Diagnostics API](./diagnostics.md).
 
 The Agent remains authoritative for Agent-owned capabilities such as services,
-updates, tray, and Management Web. Gateway returns them as unavailable with an
-explicit ownership/configuration reason rather than inferring support.
+updates, and Management Web. The Desktop application owns the tray capability;
+Gateway reports it unavailable with `CAPABILITY_OWNED_BY_DESKTOP`. Gateway
+returns every other host-owned capability as unavailable with an explicit
+ownership/configuration reason rather than inferring support.
 
 The first-phase Remote Dispatch contract is deliberately fail closed. Gateway
 always reports `remoteDispatch` as unavailable with

@@ -86,6 +86,25 @@ export const ALLOWED_REMOVAL_EVIDENCE = new Map([
     ],
   ],
   [
+    "docs/releases/2.0.0-rc.1.md",
+    [
+      {
+        code: "LEGACY_MAP_REFERENCE",
+        line: 98,
+        count: 2,
+        context:
+          "TENMAN and TENMAP sharing, their environment/configuration/database/UI paths,",
+      },
+      {
+        code: "LEGACY_BOT_REFERENCE",
+        line: 99,
+        count: 1,
+        context:
+          "and the old `@cm` Bot are removed without a compatibility layer. Remote Message",
+      },
+    ],
+  ],
+  [
     "docs/legacy-feature-matrix.md",
     [
       {

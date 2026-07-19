@@ -35,18 +35,29 @@ parsing, reconnect after transient disconnects, and exit cleanly on Ctrl+C.
 than an ordinary connection failure. Human output, JSON, quiet mode, and colour
 suppression are handled by the CLI after a shared projection is returned.
 
-For a remote endpoint, configure the Agent's Management LAN HTTPS listener and
-place the same OS-stored management admin token in the calling process's
-`CMCLIENT_CONTROL_TOKEN` environment variable:
+`events` displays every validated domain event. `logs` is currently a reserved
+projection that filters for `log.entry`; no production Gateway publisher emits
+that event type in this RC, so `logs` can remain empty. Use `events` plus the
+platform service manager's logs for current operational output.
+
+For a remote endpoint, configure the Agent's Management LAN HTTPS listener,
+provision its OS-stored management admin token, and give the same value to the
+remote CLI through only the calling process's `CMCLIENT_CONTROL_TOKEN`
+environment variable. This Bash example avoids placing the value directly in
+the command or shell history:
 
 ```bash
-CMCLIENT_CONTROL_TOKEN='replace-with-at-least-32-random-characters' \
-  cmclient --endpoint https://cmclient.example --timeout 30 status
+IFS= read -r -s -p 'CMClient control token: ' CMCLIENT_CONTROL_TOKEN
+printf '\n' >&2
+export CMCLIENT_CONTROL_TOKEN
+cmclient --endpoint https://cmclient.example --timeout 30 status
+unset CMCLIENT_CONTROL_TOKEN
 ```
 
 The token is never accepted by a CLI option. The client rejects non-HTTPS URLs,
-URL credentials/query/fragment, and tokens outside the bounded format, then
-signs each request with the shared `control:admin` HMAC contract. It does not
-follow redirects. Agent rejects expired or replayed signatures.
+URL credentials, non-root paths, query/fragment, and tokens outside 32 through
+4096 UTF-8 bytes or containing ASCII control characters, then signs each
+request with the shared `control:admin` HMAC contract. It does not follow
+redirects. Agent rejects expired or replayed signatures.
 Missing/malformed tokens and remote 401/403 responses map to authentication
 exit 4.

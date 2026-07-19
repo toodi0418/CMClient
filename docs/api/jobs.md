@@ -44,3 +44,30 @@ Terminal Jobs are eligible for incremental retention after 90 days by default.
 The idempotency guarantee therefore covers that configured retention window;
 after expiry a repeated key may create a new Job. Queued or active Jobs are
 never retention candidates.
+
+## Submission endpoints
+
+Both submission routes accept an optional `Idempotency-Key` header matching
+`[a-zA-Z0-9._:-]{1,128}` and return:
+
+```json
+{ "jobId": "job-01J...", "reused": false }
+```
+
+`POST /api/v1/backups` creates a durable backup Job. `POST
+/api/v1/diagnostics/integrity-check` creates the SQLite integrity-check Job;
+the detailed contract is in [diagnostics.md](./diagnostics.md). A malformed
+key returns `JOB_INPUT_INVALID` (`400`), a full queue returns `JOB_QUEUE_FULL`
+(`503`), and an unavailable engine returns
+`GATEWAY_JOB_ENGINE_UNAVAILABLE` (`503`). The current handlers ignore any
+successfully parsed request body; clients must send an empty body because an
+ignored field is not a supported extension contract. Results never expose file
+paths, database rows, or secret values.
+
+After acceptance, poll `GET /api/v1/jobs/:jobId`, cancel with `POST
+/api/v1/jobs/:jobId/cancel`, and optionally subscribe to `GET
+/api/v1/jobs/:jobId/events`. A cancel request returns `202` with the current
+Job detail and is safe to repeat.
+
+The cancel handler likewise ignores a successfully parsed request body. Job ID
+path parameters remain bounded to 128 characters.
