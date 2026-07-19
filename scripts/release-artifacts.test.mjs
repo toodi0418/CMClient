@@ -702,7 +702,12 @@ test("release workflow builds and inspects native Desktop packages from portable
   assert.match(shellSmoke, /--appimage-extract/);
   assert.match(shellSmoke, /desktop-native-bundles\.mjs verify-runtime/);
   assert.match(shellSmoke, /launch_native_app/);
-  assert.match(windowsSmoke, /msiexec\.exe \/a/);
+  assert.match(windowsSmoke, /System32\\msiexec\.exe/);
+  assert.match(windowsSmoke, /"\/a"/);
+  assert.match(windowsSmoke, /Start-Process/);
+  assert.match(windowsSmoke, /-Wait/);
+  assert.match(windowsSmoke, /-PassThru/);
+  assert.match(windowsSmoke, /\/L\*v/);
   assert.match(windowsSmoke, /7z\.exe x/);
   assert.match(windowsSmoke, /build-manifest\.json/);
   assert.match(windowsSmoke, /-Force -Filter/);

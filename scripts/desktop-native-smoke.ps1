@@ -77,14 +77,34 @@ function Assert-NativeAppLaunch([string]$Root) {
     }
 }
 
+function Invoke-MsiAdministrativeExtract([string]$Package, [string]$Destination, [string]$LogPath) {
+    $arguments = @(
+        "/a"
+        ('"{0}"' -f $Package)
+        "/qn"
+        ('TARGETDIR="{0}"' -f $Destination)
+        "/L*v"
+        ('"{0}"' -f $LogPath)
+    )
+    $process = Start-Process `
+        -FilePath (Join-Path $env:SystemRoot "System32\msiexec.exe") `
+        -ArgumentList $arguments `
+        -Wait `
+        -PassThru `
+        -WindowStyle Hidden
+    if ($process.ExitCode -ne 0) {
+        Write-Host "msiexec exit code: $($process.ExitCode)"
+        Get-Content -LiteralPath $LogPath -Tail 80 -ErrorAction SilentlyContinue
+        throw "NATIVE_DESKTOP_MSI_EXTRACT_FAILED"
+    }
+}
+
 try {
     $msi = Join-Path $Stage "cmclient-desktop-$Target-$Version.msi"
     $msiRoot = Join-Path $temporary "msi"
+    $msiLog = Join-Path $temporary "msiexec.log"
     New-Item -ItemType Directory -Force $msiRoot | Out-Null
-    & msiexec.exe /a $msi /qn "TARGETDIR=$msiRoot"
-    if ($LASTEXITCODE -ne 0) {
-        throw "NATIVE_DESKTOP_MSI_EXTRACT_FAILED"
-    }
+    Invoke-MsiAdministrativeExtract $msi $msiRoot $msiLog
     Assert-BundledRuntime $msiRoot
     Assert-NativeAppLaunch $msiRoot
 
