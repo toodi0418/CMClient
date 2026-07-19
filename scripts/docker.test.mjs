@@ -67,6 +67,9 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
   const gatewayService = composeService(compose, "gateway");
   const webService = composeService(compose, "web");
   const ingressService = composeService(compose, "ingress");
+  for (const service of [gatewayService, webService, ingressService]) {
+    assert.match(service, /^ {4}init: true$/m);
+  }
   assert.match(
     webService,
     /networks:\n {6}- cmclient-internal\n {6}- cmclient-web/,

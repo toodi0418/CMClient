@@ -45,6 +45,13 @@ executable as a product surface.
 | Signed update and rollback visibility | Agent remains the only update owner and persists update state independently of Gateway | Web, Desktop, and CLI consume the Agent snapshot/SSE; no Gateway self-update path is introduced. |
 | Legacy settings and history | Offline `cmclient-migrate` performs dry-run, create-only configuration output, backup, verified import, and rollback | It is included in deployable Headless/Desktop/Service layouts, but never runs inside Agent, Gateway, Desktop, or the ordinary CLI. |
 
+The final Legacy `main` dashboard added DOM-only toggles for self packet-summary
+rows and heartbeat log lines. CMClient 2.0 does not recreate that raw packet/log
+surface: SSE heartbeats are control comments and are never stored as domain
+events, while self-originated normalized records remain inspectable in their
+owning domain views. This is an explicit replacement decision, not an omitted
+Legacy file merge.
+
 ## Release verification boundary
 
 The current portable composition does not embed Node.js. Its staged-bundle
