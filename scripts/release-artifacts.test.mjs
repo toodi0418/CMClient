@@ -674,6 +674,10 @@ test("release workflow builds and inspects native Desktop packages from portable
   );
   assert.match(workflow, /desktop-native-bundles\.mjs collect/);
   assert.match(workflow, /if: matrix\.component != 'cli'/);
+  assert.match(
+    workflow,
+    /libfuse2 \\\n\s+patchelf \\\n\s+xdg-utils \\\n\s+xvfb/,
+  );
 
   assert.match(shellSmoke, /hdiutil attach/);
   assert.match(shellSmoke, /dpkg-deb --extract/);

@@ -155,7 +155,16 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
   assert.match(releaseWorkflow, /--target "\$\{\{ matrix\.target \}\}"/);
   assert.match(releaseWorkflow, /release-supply-chain\.mjs include-docker/);
   assert.match(releaseWorkflow, /pattern: cmclient-docker-oci-\*/);
-  assert.match(releaseWorkflow, /skopeo copy "oci-archive:\$archive"/);
+  assert.match(
+    releaseWorkflow,
+    /skopeo copy \\\n\s+--format v2s2 \\\n\s+"oci-archive:\$archive" \\\n\s+"docker-archive:\$docker_archive:\$release_image"/,
+  );
+  assert.match(releaseWorkflow, /docker load --input "\$docker_archive"/);
+  assert.match(
+    releaseWorkflow,
+    /docker image inspect "\$release_image" >\/dev\/null/,
+  );
+  assert.doesNotMatch(releaseWorkflow, /docker-daemon:/);
   assert.match(releaseWorkflow, /CMCLIENT_SMOKE_PREBUILT=1/);
   assert.match(releaseWorkflow, /oci-archive:release-dist\/cmclient-docker/);
   assert.match(releaseWorkflow, /for target in linux-x86_64 linux-aarch64/);

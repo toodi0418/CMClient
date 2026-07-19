@@ -213,7 +213,9 @@ jobs:
             librsvg2-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
+            libfuse2 \
             patchelf \
+            xdg-utils \
             xvfb
       - name: Install exact Rust target
         shell: bash
@@ -450,7 +452,13 @@ jobs:
             --target "${{ matrix.target }}" \
             --version "$version"
           release_image="cmclient:release-${{ matrix.target }}-$version"
-          skopeo copy "oci-archive:$archive" "docker-daemon:$release_image"
+          docker_archive="docker-build/cmclient.docker.tar"
+          skopeo copy \
+            --format v2s2 \
+            "oci-archive:$archive" \
+            "docker-archive:$docker_archive:$release_image"
+          docker load --input "$docker_archive"
+          docker image inspect "$release_image" >/dev/null
           CMCLIENT_IMAGE="$release_image" \
             CMCLIENT_SMOKE_PREBUILT=1 \
             CMCLIENT_EXPECTED_VERSION="$version" \
