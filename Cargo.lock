@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "cmclient-agent"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "argon2",
  "chrono",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "cmclient-agent-core"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "argon2",
  "fs2",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "cmclient-cli"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "clap",
  "cmclient-agent-core",
@@ -711,11 +711,11 @@ dependencies = [
 
 [[package]]
 name = "cmclient-cli-client"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 
 [[package]]
 name = "cmclient-control-api"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "hmac",
  "interprocess",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "cmclient-desktop"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "cmclient-agent-core",
  "cmclient-control-api",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "cmclient-legacy-migration"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "chrono",
  "clap",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "cmclient-service-host"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "cmclient-control-api",
  "windows-service",
@@ -767,11 +767,11 @@ dependencies = [
 
 [[package]]
 name = "cmclient-supervisor"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 
 [[package]]
 name = "cmclient-updater"
-version = "2.0.0-dev.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",

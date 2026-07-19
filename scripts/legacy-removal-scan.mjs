@@ -164,17 +164,6 @@ export const ALLOWED_REMOVAL_EVIDENCE = new Map([
     ],
   ],
   [
-    "scripts/docker.test.mjs",
-    [
-      {
-        code: "LEGACY_MAP_REFERENCE",
-        line: 73,
-        count: 1,
-        context: "    /TENMAN|TMAG_|AUTO_UPDATE|git clone|callmesh-client/i,",
-      },
-    ],
-  ],
-  [
     "test/fixtures/legacy-settings-sanitized.json",
     [
       {

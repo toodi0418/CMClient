@@ -3,7 +3,7 @@ set -euo pipefail
 
 project="cmclient-smoke-$$"
 port="${CMCLIENT_SMOKE_PORT:-18080}"
-image="cmclient:smoke-${project}"
+image="${CMCLIENT_IMAGE:-cmclient:smoke-${project}}"
 compose=(docker compose --project-name "${project}" --file docker-compose.yml)
 
 cleanup() {
@@ -12,7 +12,13 @@ cleanup() {
 trap cleanup EXIT
 
 CMCLIENT_IMAGE="${image}" CMCLIENT_WEB_PORT="${port}" "${compose[@]}" config --quiet
-CMCLIENT_IMAGE="${image}" CMCLIENT_WEB_PORT="${port}" "${compose[@]}" up --build --detach
+up=(up --detach)
+if [[ "${CMCLIENT_SMOKE_PREBUILT:-0}" != "1" ]]; then
+  up+=(--build)
+else
+  up+=(--no-build)
+fi
+CMCLIENT_IMAGE="${image}" CMCLIENT_WEB_PORT="${port}" "${compose[@]}" "${up[@]}"
 
 published_port="$("${compose[@]}" port ingress 8080)"
 if [[ ! "${published_port}" =~ ^127\.0\.0\.1:[0-9]+$ ]]; then
@@ -74,6 +80,14 @@ verify_application() {
     const capabilities = body.capabilities;
     if (capabilities.docker.available !== true) process.exit(1);
     if (capabilities.update.reasonCode !== "CAPABILITY_UNAVAILABLE_DOCKER") process.exit(1);
+    if (process.env.CMCLIENT_EXPECTED_VERSION) {
+      const versionResponse = await fetch(`${process.env.CMCLIENT_SMOKE_URL}/api/v1/system/version`);
+      if (!versionResponse.ok) process.exit(1);
+      const build = await versionResponse.json();
+      if (build.version !== process.env.CMCLIENT_EXPECTED_VERSION) process.exit(1);
+      if (build.commit !== process.env.CMCLIENT_EXPECTED_COMMIT) process.exit(1);
+      if (build.channel !== process.env.CMCLIENT_EXPECTED_CHANNEL) process.exit(1);
+    }
   '; then
     CMCLIENT_SMOKE_URL="${url}" node --input-type=module --eval '
       const response = await fetch(process.env.CMCLIENT_SMOKE_URL);
@@ -110,7 +124,11 @@ assert_ingress_gateway_isolation
   import { writeFileSync } from "node:fs";
   writeFileSync("/var/lib/cmclient/packaging-lifecycle-sentinel", "must survive recreate");
 '
-CMCLIENT_IMAGE="${image}" CMCLIENT_WEB_PORT="${port}" "${compose[@]}" up --detach --force-recreate
+recreate=(up --detach --force-recreate)
+if [[ "${CMCLIENT_SMOKE_PREBUILT:-0}" == "1" ]]; then
+  recreate+=(--no-build)
+fi
+CMCLIENT_IMAGE="${image}" CMCLIENT_WEB_PORT="${port}" "${compose[@]}" "${recreate[@]}"
 wait_for_application
 assert_network_topology web 2 2
 assert_ingress_gateway_isolation

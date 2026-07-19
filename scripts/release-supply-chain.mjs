@@ -20,18 +20,337 @@ import { pathToFileURL } from "node:url";
 
 import {
   archiveForTarget,
+  DOCKER_COMPOSITION,
+  dockerArtifactPlan as canonicalDockerArtifactPlan,
+  nativeDesktopArtifactPlan,
   releaseArtifactName,
   releaseArtifactPlan,
   releaseComposition,
 } from "./release-artifacts.mjs";
+import { verifyNativeDesktopStage } from "./desktop-native-bundles.mjs";
 
 const CHANNELS = new Set(["stable", "beta", "dev"]);
 const SEMVER =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const OCI_DIGEST = /^sha256:([a-f0-9]{64})$/;
+const SOURCE_SHA = /^[a-f0-9]{40}$/;
 const SIGNING_KEY_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const UTC_MILLISECONDS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const EPOCH = new Date(0);
+const OCI_IMAGE_MANIFEST = "application/vnd.oci.image.manifest.v1+json";
+const OCI_IMAGE_CONFIG = "application/vnd.oci.image.config.v1+json";
+
+export function dockerArtifactPlans(version) {
+  return canonicalDockerArtifactPlan(version);
+}
+
+function dockerArtifactPlanForTarget(version, target) {
+  const plan = dockerArtifactPlans(version).find(
+    (artifact) => artifact.target === target,
+  );
+  if (!plan) {
+    throw new Error("RELEASE_DOCKER_TARGET_INVALID");
+  }
+  return plan;
+}
+
+export async function stageDockerArtifact({
+  input,
+  output,
+  sourceSha,
+  target,
+  version,
+}) {
+  assertSourceSha(sourceSha);
+  const plan = dockerArtifactPlanForTarget(version, target);
+  const sourcePath = resolve(input);
+  const metadata = await lstat(sourcePath);
+  if (!metadata.isFile() || metadata.size < 1) {
+    throw new Error("RELEASE_DOCKER_ARCHIVE_INVALID");
+  }
+  const image = await inspectOciArchive({
+    archivePath: sourcePath,
+    sourceSha,
+    target: plan.target,
+    version,
+  });
+  const outputRoot = resolve(output);
+  await rm(outputRoot, { force: true, recursive: true });
+  await mkdir(outputRoot, { recursive: true });
+  const archivePath = join(outputRoot, plan.fileName);
+  await copyFile(sourcePath, archivePath);
+  const staged = {
+    schemaVersion: 1,
+    ...plan,
+    sourceSha,
+    imageDigest: image.imageDigest,
+    createdAt: image.createdAt,
+    sha256: await sha256File(archivePath),
+    sizeBytes: metadata.size,
+    composition: DOCKER_COMPOSITION,
+  };
+  await writeJson(join(outputRoot, plan.metadataFileName), staged);
+  return staged;
+}
+
+export async function includeDockerArtifact({
+  input,
+  output,
+  sourceSha,
+  version,
+}) {
+  assertSourceSha(sourceSha);
+  const plans = dockerArtifactPlans(version);
+  const inputRoot = resolve(input);
+  const entries = (await readdir(inputRoot, { withFileTypes: true }))
+    .map((entry) => `${entry.isFile() ? "file" : "other"}:${entry.name}`)
+    .sort(compareCanonicalText);
+  const expectedEntries = plans
+    .flatMap((plan) => [
+      `file:${plan.fileName}`,
+      `file:${plan.metadataFileName}`,
+    ])
+    .sort(compareCanonicalText);
+  if (JSON.stringify(entries) !== JSON.stringify(expectedEntries)) {
+    throw new Error("RELEASE_DOCKER_INPUT_INVALID");
+  }
+
+  const dockerImages = [];
+  for (const plan of plans) {
+    let docker;
+    try {
+      docker = JSON.parse(
+        await readFile(join(inputRoot, plan.metadataFileName), "utf8"),
+      );
+    } catch {
+      throw new Error("RELEASE_DOCKER_METADATA_INVALID");
+    }
+    await assertDockerMetadata({
+      archivePath: join(inputRoot, plan.fileName),
+      docker,
+      plan,
+      sourceSha,
+      version,
+    });
+    dockerImages.push(docker);
+  }
+
+  const outputRoot = resolve(output);
+  const index = await readReleaseIndex(outputRoot);
+  if (
+    index.version !== version ||
+    index.sourceSha !== undefined ||
+    index.dockerImages !== undefined
+  ) {
+    throw new Error("RELEASE_DOCKER_INDEX_INVALID");
+  }
+  for (const docker of dockerImages) {
+    await copyFile(
+      join(inputRoot, docker.fileName),
+      join(outputRoot, docker.fileName),
+    );
+    await writeJson(join(outputRoot, docker.metadataFileName), docker);
+  }
+  index.sourceSha = sourceSha;
+  index.dockerImages = dockerImages;
+  await writeJson(join(outputRoot, "release-index.json"), index);
+  return dockerImages;
+}
+
+async function assertDockerMetadata({
+  archivePath,
+  docker,
+  plan,
+  sourceSha,
+  version,
+}) {
+  assertSourceSha(sourceSha);
+  if (
+    !docker ||
+    docker.schemaVersion !== 1 ||
+    Object.entries(plan).some(([key, value]) => docker[key] !== value) ||
+    docker.sourceSha !== sourceSha ||
+    !OCI_DIGEST.test(docker.imageDigest) ||
+    typeof docker.createdAt !== "string" ||
+    Number.isNaN(Date.parse(docker.createdAt)) ||
+    !SHA256.test(docker.sha256) ||
+    !Number.isSafeInteger(docker.sizeBytes) ||
+    docker.sizeBytes < 1 ||
+    JSON.stringify(docker.composition) !== JSON.stringify(DOCKER_COMPOSITION)
+  ) {
+    throw new Error("RELEASE_DOCKER_METADATA_INVALID");
+  }
+  let archiveMetadata;
+  try {
+    archiveMetadata = await lstat(archivePath);
+  } catch {
+    throw new Error("RELEASE_DOCKER_ARCHIVE_INVALID");
+  }
+  if (
+    !archiveMetadata.isFile() ||
+    archiveMetadata.size !== docker.sizeBytes ||
+    (await sha256File(archivePath)) !== docker.sha256
+  ) {
+    throw new Error("RELEASE_DOCKER_ARCHIVE_INVALID");
+  }
+  const inspected = await inspectOciArchive({
+    archivePath,
+    sourceSha,
+    target: plan.target,
+    version,
+  });
+  if (
+    inspected.imageDigest !== docker.imageDigest ||
+    inspected.createdAt !== docker.createdAt
+  ) {
+    throw new Error("RELEASE_DOCKER_METADATA_INVALID");
+  }
+}
+
+export async function inspectOciArchive({
+  archivePath,
+  sourceSha,
+  target,
+  version,
+}) {
+  assertSourceSha(sourceSha);
+  const plan = dockerArtifactPlanForTarget(version, target);
+  const entries = new Set(
+    (await readTarOutput(archivePath, ["-tf"]))
+      .toString("utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((entry) => entry.replace(/^\.\//u, "").replace(/\/$/u, "")),
+  );
+  if (
+    !entries.has("index.json") ||
+    !entries.has("oci-layout") ||
+    [...entries].some(
+      (entry) =>
+        entry.startsWith("/") ||
+        entry.split("/").some((segment) => segment === ".."),
+    )
+  ) {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+
+  const layout = await readOciJson(archivePath, "oci-layout");
+  if (layout?.imageLayoutVersion !== "1.0.0") {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+
+  const index = await readOciJson(archivePath, "index.json");
+  if (
+    index?.schemaVersion !== 2 ||
+    !Array.isArray(index.manifests) ||
+    index.manifests.length !== 1
+  ) {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+  const manifestDescriptor = index.manifests[0];
+  if (
+    manifestDescriptor?.platform?.os !== "linux" ||
+    manifestDescriptor?.platform?.architecture !== plan.architecture
+  ) {
+    throw new Error("RELEASE_DOCKER_OCI_IDENTITY_INVALID");
+  }
+  const manifestPath = descriptorPath(manifestDescriptor, OCI_IMAGE_MANIFEST);
+  if (!entries.has(manifestPath)) {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+  const manifestBytes = await readTarOutput(archivePath, [
+    "-xOf",
+    manifestPath,
+  ]);
+  assertDescriptorBytes(manifestDescriptor, manifestBytes);
+  const manifest = parseOciJson(manifestBytes);
+  if (
+    manifest?.schemaVersion !== 2 ||
+    manifest.mediaType !== OCI_IMAGE_MANIFEST ||
+    !Array.isArray(manifest.layers) ||
+    manifest.layers.length === 0
+  ) {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+  const configPath = descriptorPath(manifest.config, OCI_IMAGE_CONFIG);
+  for (const descriptor of manifest.layers) {
+    const layerPath = descriptorPath(descriptor);
+    if (!entries.has(layerPath)) {
+      throw new Error("RELEASE_DOCKER_OCI_INVALID");
+    }
+  }
+  if (!entries.has(configPath)) {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+  const configBytes = await readTarOutput(archivePath, ["-xOf", configPath]);
+  assertDescriptorBytes(manifest.config, configBytes);
+  const config = parseOciJson(configBytes);
+  const labels = config?.config?.Labels;
+  const environment = new Set(config?.config?.Env ?? []);
+  if (
+    config?.os !== "linux" ||
+    config?.architecture !== plan.architecture ||
+    labels?.["org.opencontainers.image.title"] !== "cmclient" ||
+    labels?.["org.opencontainers.image.version"] !== version ||
+    labels?.["org.opencontainers.image.revision"] !== sourceSha ||
+    typeof labels?.["org.opencontainers.image.created"] !== "string" ||
+    Number.isNaN(Date.parse(labels["org.opencontainers.image.created"])) ||
+    !environment.has(`CMCLIENT_BUILD_VERSION=${version}`) ||
+    !environment.has(`CMCLIENT_BUILD_COMMIT=${sourceSha}`) ||
+    !environment.has(`CMCLIENT_BUILD_CHANNEL=${buildChannel(version)}`)
+  ) {
+    throw new Error("RELEASE_DOCKER_OCI_IDENTITY_INVALID");
+  }
+  return {
+    imageDigest: manifestDescriptor.digest,
+    createdAt: labels["org.opencontainers.image.created"],
+  };
+}
+
+function buildChannel(version) {
+  return version.includes("-dev.")
+    ? "dev"
+    : version.includes("-")
+      ? "beta"
+      : "stable";
+}
+
+function descriptorPath(descriptor, expectedMediaType) {
+  const match = OCI_DIGEST.exec(descriptor?.digest);
+  if (
+    !match ||
+    !Number.isSafeInteger(descriptor.size) ||
+    descriptor.size < 1 ||
+    (expectedMediaType !== undefined &&
+      descriptor.mediaType !== expectedMediaType)
+  ) {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+  return `blobs/sha256/${match[1]}`;
+}
+
+function assertDescriptorBytes(descriptor, bytes) {
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  if (
+    descriptor.size !== bytes.length ||
+    descriptor.digest !== `sha256:${digest}`
+  ) {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+}
+
+async function readOciJson(archivePath, entry) {
+  return parseOciJson(await readTarOutput(archivePath, ["-xOf", entry]));
+}
+
+function parseOciJson(bytes) {
+  try {
+    return JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+}
 
 export async function assembleReleaseArtifacts({ input, output, version }) {
   const plan = releaseArtifactPlan(version);
@@ -91,7 +410,17 @@ export async function assembleReleaseArtifacts({ input, output, version }) {
       });
     }
 
-    const index = { schemaVersion: 1, version, artifacts };
+    const nativeDesktop = await collectNativeDesktopArtifacts({
+      input: join(inputRoot, "native-desktop"),
+      output: outputRoot,
+      version,
+    });
+    const index = {
+      schemaVersion: 2,
+      version,
+      artifacts,
+      nativeDesktop,
+    };
     await writeJson(join(outputRoot, "release-index.json"), index);
     return index;
   } finally {
@@ -99,19 +428,74 @@ export async function assembleReleaseArtifacts({ input, output, version }) {
   }
 }
 
+export async function collectNativeDesktopArtifacts({
+  input,
+  output,
+  version,
+}) {
+  const plan = nativeDesktopArtifactPlan(version);
+  const inputRoot = resolve(input);
+  const outputRoot = resolve(output);
+  const targets = [...new Set(plan.map(({ target }) => target))];
+  let targetEntries;
+  try {
+    targetEntries = (await readdir(inputRoot, { withFileTypes: true }))
+      .map(
+        (entry) =>
+          `${entry.isDirectory() ? "directory" : "other"}:${entry.name}`,
+      )
+      .sort(compareCanonicalText);
+  } catch {
+    throw new Error("RELEASE_NATIVE_DESKTOP_INPUT_INVALID");
+  }
+  const expectedEntries = targets
+    .map((target) => `directory:${target}`)
+    .sort(compareCanonicalText);
+  if (JSON.stringify(targetEntries) !== JSON.stringify(expectedEntries)) {
+    throw new Error("RELEASE_NATIVE_DESKTOP_INPUT_INVALID");
+  }
+
+  for (const target of targets) {
+    try {
+      await verifyNativeDesktopStage({
+        target,
+        version,
+        input: join(inputRoot, target),
+      });
+    } catch {
+      throw new Error("RELEASE_NATIVE_DESKTOP_INPUT_INVALID");
+    }
+  }
+
+  const artifacts = [];
+  for (const planned of plan) {
+    const source = join(inputRoot, planned.target, planned.fileName);
+    const destination = join(outputRoot, planned.fileName);
+    await copyFile(source, destination);
+    await chmod(destination, 0o644);
+    const metadata = await stat(destination);
+    artifacts.push({
+      ...planned,
+      sha256: await sha256File(destination),
+      sizeBytes: metadata.size,
+    });
+  }
+  return artifacts;
+}
+
 export async function finalizeChecksums({ output }) {
   const outputRoot = resolve(output);
   const index = await readReleaseIndex(outputRoot);
-  const sbomNames = (await readdir(outputRoot, { withFileTypes: true }))
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".spdx.json"))
-    .map((entry) => entry.name)
-    .sort();
-  if (sbomNames.length === 0) {
-    throw new Error("RELEASE_SBOM_MISSING");
-  }
+  const sbomNames = await exactSbomNames(outputRoot, index);
   const names = [
     ...index.artifacts.map((artifact) => artifact.fileName),
+    ...index.nativeDesktop.map((artifact) => artifact.fileName),
+    ...(index.dockerImages ?? []).flatMap((image) => [
+      image.fileName,
+      image.metadataFileName,
+    ]),
     ...sbomNames,
+    "release-index.json",
   ].sort();
   const entries = [];
   for (const fileName of names) {
@@ -127,7 +511,7 @@ export async function finalizeChecksums({ output }) {
   return entries;
 }
 
-export async function verifyReleaseOutput({ output, version }) {
+export async function verifyReleaseOutput({ output, sourceSha, version }) {
   const outputRoot = resolve(output);
   const index = await readReleaseIndex(outputRoot);
   if (index.version !== version) {
@@ -163,6 +547,95 @@ export async function verifyReleaseOutput({ output, version }) {
     }
   }
 
+  const nativePlan = nativeDesktopArtifactPlan(version);
+  if (index.nativeDesktop.length !== nativePlan.length) {
+    throw new Error("RELEASE_NATIVE_DESKTOP_INDEX_INVALID");
+  }
+  const nativeByName = new Map(
+    nativePlan.map((artifact) => [artifact.fileName, artifact]),
+  );
+  const seenNative = new Set();
+  for (const artifact of index.nativeDesktop) {
+    const expected = nativeByName.get(artifact.fileName);
+    if (
+      !expected ||
+      seenNative.has(artifact.fileName) ||
+      artifact.component !== expected.component ||
+      artifact.target !== expected.target ||
+      artifact.bundle !== expected.bundle ||
+      artifact.updaterManaged !== false ||
+      !SHA256.test(artifact.sha256) ||
+      !Number.isSafeInteger(artifact.sizeBytes) ||
+      artifact.sizeBytes < 1
+    ) {
+      throw new Error("RELEASE_NATIVE_DESKTOP_INDEX_INVALID");
+    }
+    seenNative.add(artifact.fileName);
+    const path = join(outputRoot, artifact.fileName);
+    const metadata = await stat(path);
+    if (
+      metadata.size !== artifact.sizeBytes ||
+      (await sha256File(path)) !== artifact.sha256
+    ) {
+      throw new Error("RELEASE_NATIVE_DESKTOP_DIGEST_INVALID");
+    }
+  }
+
+  if (sourceSha !== undefined) {
+    assertSourceSha(sourceSha);
+    if (index.sourceSha !== sourceSha) {
+      throw new Error("RELEASE_INDEX_SOURCE_SHA_INVALID");
+    }
+    if (
+      !Array.isArray(index.dockerImages) ||
+      index.dockerImages.length !== dockerArtifactPlans(version).length
+    ) {
+      throw new Error("RELEASE_DOCKER_INDEX_INVALID");
+    }
+  }
+  if (index.dockerImages !== undefined) {
+    if (!SOURCE_SHA.test(index.sourceSha)) {
+      throw new Error("RELEASE_INDEX_SOURCE_SHA_INVALID");
+    }
+    const dockerPlan = dockerArtifactPlans(version);
+    if (
+      !Array.isArray(index.dockerImages) ||
+      index.dockerImages.length !== dockerPlan.length
+    ) {
+      throw new Error("RELEASE_DOCKER_INDEX_INVALID");
+    }
+    const imagesByTarget = new Map(
+      index.dockerImages.map((image) => [image?.target, image]),
+    );
+    if (imagesByTarget.size !== dockerPlan.length) {
+      throw new Error("RELEASE_DOCKER_INDEX_INVALID");
+    }
+    for (const plan of dockerPlan) {
+      const docker = imagesByTarget.get(plan.target);
+      if (!docker) {
+        throw new Error("RELEASE_DOCKER_INDEX_INVALID");
+      }
+      await assertDockerMetadata({
+        archivePath: join(outputRoot, docker.fileName),
+        docker,
+        plan,
+        sourceSha: sourceSha ?? index.sourceSha,
+        version,
+      });
+      let metadata;
+      try {
+        metadata = JSON.parse(
+          await readFile(join(outputRoot, docker.metadataFileName), "utf8"),
+        );
+      } catch {
+        throw new Error("RELEASE_DOCKER_METADATA_INVALID");
+      }
+      if (JSON.stringify(metadata) !== JSON.stringify(docker)) {
+        throw new Error("RELEASE_DOCKER_METADATA_INVALID");
+      }
+    }
+  }
+
   const expectedChecksums = await expectedChecksumEntries(outputRoot, index);
   const checksumPath = join(outputRoot, "SHA256SUMS");
   const actualChecksums = parseChecksumFile(
@@ -174,6 +647,7 @@ export async function verifyReleaseOutput({ output, version }) {
   ) {
     throw new Error("RELEASE_CHECKSUM_FILE_INVALID");
   }
+  await assertExactReleaseOutputEntries(outputRoot, index);
   return index;
 }
 
@@ -529,8 +1003,10 @@ async function readReleaseIndex(outputRoot) {
     throw new Error("RELEASE_INDEX_INVALID");
   }
   if (
-    index?.schemaVersion !== 1 ||
+    index?.schemaVersion !== 2 ||
     !Array.isArray(index.artifacts) ||
+    !Array.isArray(index.nativeDesktop) ||
+    (index.sourceSha !== undefined && !SOURCE_SHA.test(index.sourceSha)) ||
     !SEMVER.test(index.version)
   ) {
     throw new Error("RELEASE_INDEX_INVALID");
@@ -539,21 +1015,73 @@ async function readReleaseIndex(outputRoot) {
 }
 
 async function expectedChecksumEntries(outputRoot, index) {
-  const sboms = (await readdir(outputRoot, { withFileTypes: true }))
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".spdx.json"))
-    .map((entry) => entry.name)
-    .sort();
-  if (sboms.length === 0) {
-    throw new Error("RELEASE_SBOM_MISSING");
-  }
+  const sboms = await exactSbomNames(outputRoot, index);
   return Promise.all(
-    [...index.artifacts.map((artifact) => artifact.fileName), ...sboms]
+    [
+      ...index.artifacts.map((artifact) => artifact.fileName),
+      ...index.nativeDesktop.map((artifact) => artifact.fileName),
+      ...(index.dockerImages ?? []).flatMap((image) => [
+        image.fileName,
+        image.metadataFileName,
+      ]),
+      ...sboms,
+      "release-index.json",
+    ]
       .sort()
       .map(async (fileName) => ({
         fileName,
         sha256: await sha256File(join(outputRoot, fileName)),
       })),
   );
+}
+
+async function exactSbomNames(outputRoot, index) {
+  const expected = [
+    `cmclient-${index.version}.spdx.json`,
+    ...(index.dockerImages ?? []).map((image) => image.sbomFileName),
+  ].sort(compareCanonicalText);
+  if (
+    expected.some((fileName) => !isSafeArtifactFileName(fileName)) ||
+    new Set(expected).size !== expected.length
+  ) {
+    throw new Error("RELEASE_SBOM_SET_INVALID");
+  }
+  const actual = (await readdir(outputRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".spdx.json"))
+    .map((entry) => entry.name)
+    .sort(compareCanonicalText);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error("RELEASE_SBOM_SET_INVALID");
+  }
+  return actual;
+}
+
+async function assertExactReleaseOutputEntries(outputRoot, index) {
+  const expected = new Set([
+    ...index.artifacts.map((artifact) => artifact.fileName),
+    ...index.nativeDesktop.map((artifact) => artifact.fileName),
+    ...(index.dockerImages ?? []).flatMap((image) => [
+      image.fileName,
+      image.metadataFileName,
+    ]),
+    ...(await exactSbomNames(outputRoot, index)),
+    "release-index.json",
+    "SHA256SUMS",
+  ]);
+  const optional = new Set(["SHA256SUMS.sigstore.json"]);
+  const actual = await readdir(outputRoot, { withFileTypes: true });
+  if (
+    actual.some(
+      (entry) =>
+        !entry.isFile() ||
+        (!expected.has(entry.name) && !optional.has(entry.name)),
+    ) ||
+    [...expected].some(
+      (fileName) => !actual.some(({ name }) => name === fileName),
+    )
+  ) {
+    throw new Error("RELEASE_OUTPUT_SET_INVALID");
+  }
 }
 
 function parseChecksumFile(content) {
@@ -672,6 +1200,12 @@ function assertVersion(value) {
   }
 }
 
+function assertSourceSha(value) {
+  if (!SOURCE_SHA.test(value)) {
+    throw new Error("RELEASE_DOCKER_SOURCE_SHA_INVALID");
+  }
+}
+
 function compareCanonicalText(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -691,6 +1225,45 @@ async function sha256File(path) {
     hash.update(chunk);
   }
   return hash.digest("hex");
+}
+
+async function readTarOutput(archivePath, argumentsList) {
+  try {
+    return await runCapture("tar", [
+      argumentsList[0],
+      archivePath,
+      ...argumentsList.slice(1),
+    ]);
+  } catch {
+    throw new Error("RELEASE_DOCKER_OCI_INVALID");
+  }
+}
+
+async function runCapture(program, argumentsList) {
+  return new Promise((resolvePromise, reject) => {
+    const chunks = [];
+    let length = 0;
+    const child = spawn(program, argumentsList, {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    child.stdout.on("data", (chunk) => {
+      length += chunk.length;
+      if (length > 16 * 1024 * 1024) {
+        child.kill();
+        reject(new Error("RELEASE_ARCHIVE_OUTPUT_TOO_LARGE"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) {
+        resolvePromise(Buffer.concat(chunks));
+      } else {
+        reject(new Error("RELEASE_ARCHIVE_READ_FAILED"));
+      }
+    });
+  });
 }
 
 async function run(program, argumentsList, cwd) {
@@ -721,8 +1294,33 @@ function argumentValue(argumentsList, name) {
   return argumentsList[index + 1];
 }
 
+function optionalArgumentValue(argumentsList, name) {
+  return argumentsList.includes(name)
+    ? argumentValue(argumentsList, name)
+    : undefined;
+}
+
 async function main(argumentsList) {
   const [command] = argumentsList;
+  if (command === "stage-docker") {
+    await stageDockerArtifact({
+      input: argumentValue(argumentsList, "--input"),
+      output: argumentValue(argumentsList, "--output"),
+      sourceSha: argumentValue(argumentsList, "--source-sha"),
+      target: argumentValue(argumentsList, "--target"),
+      version: argumentValue(argumentsList, "--version"),
+    });
+    return;
+  }
+  if (command === "include-docker") {
+    await includeDockerArtifact({
+      input: argumentValue(argumentsList, "--input"),
+      output: argumentValue(argumentsList, "--output"),
+      sourceSha: argumentValue(argumentsList, "--source-sha"),
+      version: argumentValue(argumentsList, "--version"),
+    });
+    return;
+  }
   if (command === "assemble") {
     await assembleReleaseArtifacts({
       input: argumentValue(argumentsList, "--input"),
@@ -740,6 +1338,7 @@ async function main(argumentsList) {
   if (command === "verify") {
     await verifyReleaseOutput({
       output: argumentValue(argumentsList, "--output"),
+      sourceSha: optionalArgumentValue(argumentsList, "--source-sha"),
       version: argumentValue(argumentsList, "--version"),
     });
     return;
@@ -775,7 +1374,7 @@ async function main(argumentsList) {
     return;
   }
   throw new Error(
-    "usage: release-supply-chain.mjs <assemble|finalize|verify|sign-update-manifest> ...",
+    "usage: release-supply-chain.mjs <assemble|stage-docker|include-docker|finalize|verify|sign-update-manifest> ...",
   );
 }
 

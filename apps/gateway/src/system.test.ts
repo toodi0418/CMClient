@@ -33,14 +33,41 @@ describe("Docker system capability state", () => {
   });
 
   it("does not infer Docker mode from the host platform", () => {
-    expect(
-      defaultGatewaySystemState().capabilities.capabilities.docker,
-    ).toEqual({
+    const state = defaultGatewaySystemState();
+    expect(state.build).toMatchObject({
+      version: "2.0.0-rc.1",
+      channel: "beta",
+    });
+    expect(state.capabilities.capabilities.docker).toEqual({
       available: false,
       reasonCode: "CAPABILITY_NOT_CONFIGURED",
     });
     expect(isDockerDeployment({ CMCLIENT_DEPLOYMENT_MODE: "container" })).toBe(
       false,
     );
+  });
+
+  it("rejects runtime metadata that conflicts with the compiled identity", () => {
+    expect(() =>
+      defaultGatewaySystemState({ CMCLIENT_BUILD_VERSION: "2.0.0" }),
+    ).toThrow("BUILD_VERSION_MISMATCH");
+    expect(() =>
+      defaultGatewaySystemState({ CMCLIENT_BUILD_CHANNEL: "stable" }),
+    ).toThrow("BUILD_CHANNEL_MISMATCH");
+    expect(() =>
+      defaultGatewaySystemState({ CMCLIENT_BUILD_COMMIT: "not-a-commit" }),
+    ).toThrow("BUILD_COMMIT_INVALID");
+
+    expect(
+      defaultGatewaySystemState({
+        CMCLIENT_BUILD_VERSION: "2.0.0-rc.1",
+        CMCLIENT_BUILD_CHANNEL: "beta",
+        CMCLIENT_BUILD_COMMIT: "a".repeat(40),
+      }).build,
+    ).toMatchObject({
+      version: "2.0.0-rc.1",
+      channel: "beta",
+      commit: "a".repeat(40),
+    });
   });
 });

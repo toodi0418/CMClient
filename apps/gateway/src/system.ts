@@ -1,8 +1,9 @@
 import {
-  BUILD_CHANNELS,
   type BuildMetadata,
   type SystemCapabilities,
 } from "@cmclient/contracts";
+
+const COMPILED_BUILD_VERSION = "2.0.0-rc.1";
 
 export interface GatewaySystemState {
   build: BuildMetadata;
@@ -28,14 +29,28 @@ export function defaultGatewaySystemState(
         ? "windows"
         : process.platform
       : "unknown";
+  const injectedVersion = environment.CMCLIENT_BUILD_VERSION?.trim();
+  if (injectedVersion && injectedVersion !== COMPILED_BUILD_VERSION) {
+    throw new Error("BUILD_VERSION_MISMATCH");
+  }
+  const version = COMPILED_BUILD_VERSION;
+  const channel: BuildMetadata["channel"] = version.includes("-dev.")
+    ? "dev"
+    : version.includes("-")
+      ? "beta"
+      : "stable";
+  const injectedChannel = environment.CMCLIENT_BUILD_CHANNEL?.trim();
+  if (injectedChannel && injectedChannel !== channel) {
+    throw new Error("BUILD_CHANNEL_MISMATCH");
+  }
+  const injectedCommit = environment.CMCLIENT_BUILD_COMMIT?.trim();
+  if (injectedCommit && !/^[a-f0-9]{40}$/.test(injectedCommit)) {
+    throw new Error("BUILD_COMMIT_INVALID");
+  }
   const build: BuildMetadata = {
-    version: environment.CMCLIENT_BUILD_VERSION?.trim() || "2.0.0-dev.0",
-    commit: environment.CMCLIENT_BUILD_COMMIT?.trim() || "unknown",
-    channel: BUILD_CHANNELS.includes(
-      environment.CMCLIENT_BUILD_CHANNEL?.trim() as BuildMetadata["channel"],
-    )
-      ? (environment.CMCLIENT_BUILD_CHANNEL?.trim() as BuildMetadata["channel"])
-      : "dev",
+    version,
+    commit: injectedCommit || "unknown",
+    channel,
     ...(environment.CMCLIENT_BUILD_AT &&
     Number.isFinite(Date.parse(environment.CMCLIENT_BUILD_AT))
       ? { builtAt: new Date(environment.CMCLIENT_BUILD_AT).toISOString() }

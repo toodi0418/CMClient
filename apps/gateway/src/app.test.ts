@@ -89,8 +89,8 @@ describe("GatewayRuntime", () => {
     ]);
     expect(health.json()).toEqual({ status: "ok" });
     expect(version.json()).toMatchObject({
-      version: "2.0.0-dev.0",
-      channel: "dev",
+      version: "2.0.0-rc.1",
+      channel: "beta",
     });
     expect(capabilities.json()).toMatchObject({
       schemaVersion: 1,

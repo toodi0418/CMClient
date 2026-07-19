@@ -715,6 +715,18 @@ impl AgentController {
                 let mut environment = BTreeMap::from([
                     (String::from("CMCLIENT_SUPERVISED"), String::from("1")),
                     (
+                        String::from("CMCLIENT_BUILD_VERSION"),
+                        String::from(env!("CARGO_PKG_VERSION")),
+                    ),
+                    (
+                        String::from("CMCLIENT_BUILD_COMMIT"),
+                        compiled_build_commit(),
+                    ),
+                    (
+                        String::from("CMCLIENT_BUILD_CHANNEL"),
+                        String::from(compiled_build_channel()),
+                    ),
+                    (
                         String::from("CMCLIENT_GATEWAY_HOST"),
                         String::from("127.0.0.1"),
                     ),
@@ -1862,6 +1874,23 @@ fn gateway_address(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
+fn compiled_build_commit() -> String {
+    option_env!("CMCLIENT_BUILD_COMMIT")
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+fn compiled_build_channel() -> &'static str {
+    if env!("CARGO_PKG_VERSION").contains("-dev.") {
+        "dev"
+    } else if env!("CARGO_PKG_VERSION").contains('-') {
+        "beta"
+    } else {
+        "stable"
+    }
+}
+
 fn resolve_static_web_root() -> PathBuf {
     if let Some(path) = std::env::var_os("CMCLIENT_WEB_ROOT") {
         return PathBuf::from(path);
@@ -1917,6 +1946,7 @@ mod tests {
         remote_control_error_status, shutdown_agent_runtime, try_forward_gateway_event,
         unix_now_seconds,
     };
+    use super::{compiled_build_channel, compiled_build_commit};
     #[cfg(not(target_os = "windows"))]
     use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
     #[cfg(not(target_os = "windows"))]
@@ -1930,6 +1960,7 @@ mod tests {
         REMOTE_CONTROL_SCOPE_HEADER, REMOTE_CONTROL_TIMESTAMP_HEADER, StaticControlHandler,
         UpdateControlStatus, sign_remote_control_request,
     };
+
     #[cfg(not(target_os = "windows"))]
     use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewaySupervisor};
     #[cfg(not(target_os = "windows"))]
@@ -1948,6 +1979,16 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn derives_release_candidate_identity_for_the_gateway_child() {
+        assert_eq!(compiled_build_channel(), "beta");
+        let commit = compiled_build_commit();
+        assert!(
+            commit == "unknown"
+                || (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        );
+    }
 
     #[cfg(not(target_os = "windows"))]
     struct DisableManagementWebRoute {

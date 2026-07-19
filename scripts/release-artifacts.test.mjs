@@ -7,13 +7,24 @@ import test from "node:test";
 
 import {
   DOCKER_COMPOSITION,
+  DOCKER_PLATFORMS,
+  NATIVE_DESKTOP_BUNDLES,
   RELEASE_TARGETS,
+  dockerArtifactPlan,
+  nativeDesktopArtifactName,
+  nativeDesktopArtifactPlan,
   releaseArtifactName,
   releaseArtifactPlan,
   releaseComposition,
   releasePlanDocument,
   stageBuild,
 } from "./release-artifacts.mjs";
+import {
+  collectNativeDesktopBundles,
+  tauriReleaseConfig,
+  verifyBundledDesktopRuntime,
+  verifyNativeDesktopStage,
+} from "./desktop-native-bundles.mjs";
 
 test("release artifact plan covers every planned component-target pair exactly once", () => {
   const plan = releaseArtifactPlan("2.0.0-dev.0");
@@ -105,9 +116,181 @@ test("canonical compositions encode complete product surfaces and constrained Do
   });
 
   const document = releasePlanDocument("2.0.0");
-  assert.equal(document.schemaVersion, 2);
-  assert.deepEqual(document.docker, DOCKER_COMPOSITION);
+  assert.equal(document.schemaVersion, 3);
+  const { artifacts: dockerArtifacts, ...dockerComposition } = document.docker;
+  assert.deepEqual(dockerComposition, DOCKER_COMPOSITION);
+  assert.deepEqual(dockerArtifacts, dockerArtifactPlan("2.0.0"));
   assert.equal(document.artifacts[0].contents[0].role, "desktop");
+  assert.deepEqual(document.nativeDesktop, nativeDesktopArtifactPlan("2.0.0"));
+});
+
+test("Docker artifact plan covers native x64 and ARM64 without Agent updater ownership", () => {
+  const version = "2.0.0-rc.1";
+  const plan = dockerArtifactPlan(version);
+  assert.deepEqual(DOCKER_PLATFORMS, [
+    {
+      target: "linux-x86_64",
+      platform: "linux/amd64",
+      architecture: "amd64",
+    },
+    {
+      target: "linux-aarch64",
+      platform: "linux/arm64",
+      architecture: "arm64",
+    },
+  ]);
+  assert.equal(plan.length, 2);
+  assert.equal(new Set(plan.map(({ fileName }) => fileName)).size, 2);
+  assert.deepEqual(
+    plan.map(({ target, fileName, updaterManaged }) => ({
+      target,
+      fileName,
+      updaterManaged,
+    })),
+    [
+      {
+        target: "linux-x86_64",
+        fileName: "cmclient-docker-linux-x86_64-2.0.0-rc.1.oci.tar",
+        updaterManaged: false,
+      },
+      {
+        target: "linux-aarch64",
+        fileName: "cmclient-docker-linux-aarch64-2.0.0-rc.1.oci.tar",
+        updaterManaged: false,
+      },
+    ],
+  );
+});
+
+test("native Desktop plan covers installer formats on every supported target", () => {
+  const version = "2.0.0-rc.1";
+  const plan = nativeDesktopArtifactPlan(version);
+  assert.equal(plan.length, 8);
+  assert.deepEqual(NATIVE_DESKTOP_BUNDLES, {
+    "darwin-aarch64": ["dmg"],
+    "darwin-x86_64": ["dmg"],
+    "linux-aarch64": ["deb", "appimage"],
+    "linux-x86_64": ["deb", "appimage"],
+    "windows-x86_64": ["msi", "nsis"],
+  });
+  assert.equal(new Set(plan.map(({ fileName }) => fileName)).size, plan.length);
+  assert.deepEqual(
+    plan.find(
+      ({ target, bundle }) =>
+        target === "linux-aarch64" && bundle === "appimage",
+    ),
+    {
+      component: "desktop",
+      target: "linux-aarch64",
+      bundle: "appimage",
+      fileName: "cmclient-desktop-linux-aarch64-2.0.0-rc.1.AppImage",
+      updaterManaged: false,
+    },
+  );
+  assert.equal(
+    nativeDesktopArtifactName({
+      target: "windows-x86_64",
+      bundle: "nsis",
+      version,
+    }),
+    "cmclient-desktop-windows-x86_64-2.0.0-rc.1.setup.exe",
+  );
+  assert.throws(
+    () =>
+      nativeDesktopArtifactName({
+        target: "darwin-aarch64",
+        bundle: "msi",
+        version,
+      }),
+    /unsupported native Desktop bundle/,
+  );
+});
+
+test("Tauri release config embeds the complete portable Desktop composition", () => {
+  const config = tauriReleaseConfig({
+    target: "windows-x86_64",
+    version: "2.0.0-rc.1",
+    portable: "release-build/desktop/windows-x86_64",
+    icons: "apps/desktop/src-tauri/icons/release",
+  });
+  assert.deepEqual(config.bundle.targets, ["msi", "nsis"]);
+  assert.equal(config.bundle.active, true);
+  assert.equal(config.bundle.createUpdaterArtifacts, false);
+  assert.equal(config.bundle.windows.allowDowngrades, false);
+  assert.equal(Object.values(config.bundle.resources)[0], "cmclient-runtime/");
+  assert.match(
+    Object.keys(config.bundle.resources)[0],
+    /release-build\/desktop\/windows-x86_64\/$/,
+  );
+  assert.ok(config.bundle.icon.some((path) => path.endsWith("icon.ico")));
+  assert.ok(config.bundle.icon.some((path) => path.endsWith("icon.icns")));
+});
+
+test("native Desktop collector renames and verifies exact Tauri outputs", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "cmclient-native-desktop-"));
+  const bundleRoot = join(root, "bundle");
+  const output = join(root, "output");
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await mkdir(join(bundleRoot, "msi"), { recursive: true });
+  await mkdir(join(bundleRoot, "nsis"), { recursive: true });
+  await writeFile(join(bundleRoot, "msi/CMClient_fixture.msi"), "msi");
+  await writeFile(join(bundleRoot, "nsis/CMClient_fixture.exe"), "nsis");
+
+  const { directory, manifest } = await collectNativeDesktopBundles({
+    target: "windows-x86_64",
+    version: "2.0.0-rc.1",
+    bundleRoot,
+    output,
+  });
+  assert.equal(manifest.agentLaunch, "external-service-required");
+  assert.equal(manifest.portableResource, "cmclient-runtime");
+  await assert.doesNotReject(() =>
+    verifyNativeDesktopStage({
+      target: "windows-x86_64",
+      version: "2.0.0-rc.1",
+      input: directory,
+    }),
+  );
+  await writeFile(join(directory, "unexpected.txt"), "unexpected");
+  await assert.rejects(
+    () =>
+      verifyNativeDesktopStage({
+        target: "windows-x86_64",
+        version: "2.0.0-rc.1",
+        input: directory,
+      }),
+    /staged files do not match canonical plan/,
+  );
+});
+
+test("bundled Desktop runtime verification requires the complete Agent composition", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "cmclient-native-runtime-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const inputs = await createCompositionInputs(root, "desktop", "linux-x86_64");
+  const { stagedDirectory } = await stageBuild({
+    component: "desktop",
+    target: "linux-x86_64",
+    version: "2.0.0-rc.1",
+    inputs,
+    output: join(root, "stage"),
+  });
+  await assert.doesNotReject(() =>
+    verifyBundledDesktopRuntime({
+      target: "linux-x86_64",
+      version: "2.0.0-rc.1",
+      input: stagedDirectory,
+    }),
+  );
+  await rm(join(stagedDirectory, "bin/cmclient-agent"));
+  await assert.rejects(
+    () =>
+      verifyBundledDesktopRuntime({
+        target: "linux-x86_64",
+        version: "2.0.0-rc.1",
+        input: stagedDirectory,
+      }),
+    /ENOENT/,
+  );
 });
 
 test("release targets remain identical to the shared signed-update contract", async () => {
@@ -379,6 +562,10 @@ test("release workflow builds each composition and gates the separate Docker sur
     readFile(".github/workflows/release-build.yml", "utf8"),
     readFile("scripts/release-bundle-smoke.sh", "utf8"),
   ]);
+  const buildJob = workflow.slice(
+    workflow.indexOf("\n  build:"),
+    workflow.indexOf("\n  docker-composition:"),
+  );
 
   assert.match(workflow, /packages=\(--package cmclient-cli\)/);
   assert.match(
@@ -418,6 +605,11 @@ test("release workflow builds each composition and gates the separate Docker sur
   );
   assert.match(
     workflow,
+    /build:[\s\S]*CMCLIENT_BUILD_COMMIT: \$\{\{ github\.sha \}\}[\s\S]*cargo build --release --locked/,
+  );
+  assert.doesNotMatch(buildJob, /CMCLIENT_BUILD_CHANNEL:/);
+  assert.match(
+    workflow,
     /docker-composition:[\s\S]*needs: \[artifact-plan, load-gate, security-gate\]/,
   );
   assert.match(workflow, /os: macos-15\n\s+rust_target: aarch64-apple-darwin/);
@@ -444,6 +636,141 @@ test("release workflow builds each composition and gates the separate Docker sur
   assert.doesNotMatch(workflow, /--binary|matrix\.package|matrix\.binary/);
   assert.match(smoke, /\[\[ -f "\$executable" \]\]/);
   assert.match(smoke, /"\$target" != windows-\*/);
+  assert.match(
+    smoke,
+    /expected_version="\$\{3:\?expected version is required\}"/,
+  );
+  assert.match(
+    smoke,
+    /expected_commit="\$\{4:\?expected source commit is required\}"/,
+  );
+  assert.match(smoke, /surface="\$\{5:-headless\}"/);
+  assert.match(smoke, /xvfb-run -a "\$desktop"/);
+  assert.match(
+    workflow,
+    /cmclient-desktop-linux-x86_64-\$version\.tar\.zst[\s\S]*release-bundle-smoke\.sh[\s\S]*desktop/,
+  );
+});
+
+test("release workflow builds and inspects native Desktop packages from portable staging", async () => {
+  const [workflow, shellSmoke, windowsSmoke, tauriConfig] = await Promise.all([
+    readFile(".github/workflows/release-build.yml", "utf8"),
+    readFile("scripts/desktop-native-smoke.sh", "utf8"),
+    readFile("scripts/desktop-native-smoke.ps1", "utf8"),
+    readFile("apps/desktop/src-tauri/tauri.conf.json", "utf8"),
+  ]);
+  assert.match(
+    workflow,
+    /name: Build native Desktop installers with the complete portable composition/,
+  );
+  assert.match(workflow, /pnpm --filter @cmclient\/desktop exec tauri icon/);
+  assert.match(
+    workflow,
+    /pnpm --filter @cmclient\/desktop exec tauri bundle[\s\S]*--no-sign[\s\S]*--target "\$rust_target"/,
+  );
+  assert.match(
+    workflow,
+    /--portable "\$GITHUB_WORKSPACE\/release-build\/desktop\/\$target"/,
+  );
+  assert.match(workflow, /desktop-native-bundles\.mjs collect/);
+  assert.match(workflow, /if: matrix\.component != 'cli'/);
+
+  assert.match(shellSmoke, /hdiutil attach/);
+  assert.match(shellSmoke, /dpkg-deb --extract/);
+  assert.match(shellSmoke, /--appimage-extract/);
+  assert.match(shellSmoke, /desktop-native-bundles\.mjs verify-runtime/);
+  assert.match(shellSmoke, /launch_native_app/);
+  assert.match(windowsSmoke, /msiexec\.exe \/a/);
+  assert.match(windowsSmoke, /7z\.exe x/);
+  assert.match(windowsSmoke, /desktop-native-bundles\.mjs verify-runtime/);
+  assert.match(windowsSmoke, /Assert-NativeAppLaunch/);
+
+  const config = JSON.parse(tauriConfig);
+  assert.equal(config.bundle.active, false);
+  assert.deepEqual(config.bundle.icon, ["icons/icon.png", "icons/icon.ico"]);
+});
+
+test("staged and final Windows Service archives share the real SCM launch gate", async () => {
+  const [workflow, serviceSmoke] = await Promise.all([
+    readFile(".github/workflows/release-build.yml", "utf8"),
+    readFile("scripts/release-windows-service-smoke.ps1", "utf8"),
+  ]);
+  const buildJob = workflow.slice(
+    workflow.indexOf("\n  build:"),
+    workflow.indexOf("\n  docker-composition:"),
+  );
+  const finalJob = workflow.slice(
+    workflow.indexOf("\n  final-windows-service-smoke:"),
+    workflow.indexOf("\n  attest:"),
+  );
+  const attestJob = workflow.slice(
+    workflow.indexOf("\n  attest:"),
+    workflow.indexOf("\n  sign-update-manifest:"),
+  );
+
+  assert.match(
+    buildJob,
+    /Smoke staged Windows Service archive lifecycle[\s\S]*release-windows-service-smoke\.ps1[\s\S]*-Bundle "release-build\/service\/windows-x86_64"/,
+  );
+  assert.match(finalJob, /needs: supply-chain/);
+  assert.match(finalJob, /runs-on: windows-latest/);
+  assert.match(finalJob, /actions\/setup-node@[a-f0-9]{40}/);
+  assert.match(finalJob, /pattern: cmclient-supply-chain-unsigned-\*/);
+  assert.match(finalJob, /cmclient-service-windows-x86_64-\$version\.zip/);
+  assert.match(finalJob, /Expand-Archive -LiteralPath \$archive/);
+  assert.match(
+    finalJob,
+    /Get-FileHash -LiteralPath \$archive -Algorithm SHA256/,
+  );
+  assert.match(finalJob, /release-windows-service-smoke\.ps1/);
+  assert.match(finalJob, /-Commit \$env:GITHUB_SHA/);
+  assert.match(
+    attestJob,
+    /needs: \[supply-chain, final-windows-service-smoke\]/,
+  );
+  assert.equal(
+    (workflow.match(/release-windows-service-smoke\.ps1/g) ?? []).length,
+    2,
+  );
+
+  for (const parameter of ["Bundle", "Version", "Commit", "NodePath"]) {
+    assert.match(
+      serviceSmoke,
+      new RegExp(
+        `\\[Parameter\\(Mandatory = \\$true\\)\\]\\s+\\[string\\]\\$${parameter}`,
+      ),
+    );
+  }
+  assert.match(serviceSmoke, /RELEASE_SERVICE_NODE_MUST_BE_EXTERNAL/);
+  assert.match(serviceSmoke, /RELEASE_SERVICE_BUNDLED_NODE_FORBIDDEN/);
+  assert.match(serviceSmoke, /PropertyType MultiString/);
+  assert.match(serviceSmoke, /@\("PATH=\$servicePath"\)/);
+  assert.match(
+    serviceSmoke,
+    /Invoke-ServiceManager \$manager "install" \$hostPath -NoStart/,
+  );
+  assert.match(serviceSmoke, /Start-Service -Name \$ServiceName/);
+  assert.match(serviceSmoke, /--json status/);
+  assert.match(serviceSmoke, /--json start/);
+  assert.match(serviceSmoke, /api\/v1\/system\/health/);
+  assert.match(serviceSmoke, /api\/v1\/system\/version/);
+  assert.match(serviceSmoke, /\$ReleaseVersion -match '-dev\\\.'/);
+  assert.match(serviceSmoke, /\$ReleaseVersion\.Contains\("-"\)/);
+  assert.match(serviceSmoke, /\[regex\]::Match/);
+  assert.match(serviceSmoke, /\$nodeVersionMatch\.Groups\[1\]\.Value/);
+  assert.doesNotMatch(serviceSmoke, /\$Matches\[/);
+  assert.match(serviceSmoke, /\$candidate\.commit -eq \$Commit/);
+  assert.match(serviceSmoke, /\$candidate\.channel -eq \$expectedChannel/);
+  assert.match(
+    serviceSmoke,
+    /\$_.ParentProcessId -eq \$agent\.ProcessId -and \$_.ExecutablePath -eq \$NodePath/,
+  );
+  assert.match(serviceSmoke, /RELEASE_SERVICE_STATE_NOT_RETAINED/);
+  assert.doesNotMatch(serviceSmoke, /Copy-Item[\s\S]*node\.exe/i);
+  assert.doesNotMatch(
+    serviceSmoke,
+    /\?\?|\?\.|&&|\|\||ForEach-Object\s+-Parallel|IsPathFullyQualified/,
+  );
 });
 
 async function createCompositionInputs(root, component, target) {

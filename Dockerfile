@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 
-FROM node:22-bookworm-slim AS build
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS build
 
 WORKDIR /workspace
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
@@ -19,7 +19,11 @@ RUN pnpm install --frozen-lockfile \
     && pnpm --filter @cmclient/web run build \
     && pnpm --filter @cmclient/gateway deploy --prod --frozen-lockfile /opt/cmclient/gateway
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS runtime
+
+ARG CMCLIENT_BUILD_VERSION=""
+ARG CMCLIENT_BUILD_COMMIT=""
+ARG CMCLIENT_BUILD_CHANNEL=""
 
 RUN groupadd --gid 10001 cmclient \
     && useradd --uid 10001 --gid cmclient --home-dir /nonexistent \
@@ -36,7 +40,10 @@ COPY --from=build --chown=cmclient:cmclient /workspace/scripts/container-runtime
 RUN chown --recursive cmclient:cmclient /var/lib/cmclient
 
 ENV NODE_ENV=production \
-    CMCLIENT_DATA_DIR=/var/lib/cmclient
+    CMCLIENT_DATA_DIR=/var/lib/cmclient \
+    CMCLIENT_BUILD_VERSION=${CMCLIENT_BUILD_VERSION} \
+    CMCLIENT_BUILD_COMMIT=${CMCLIENT_BUILD_COMMIT} \
+    CMCLIENT_BUILD_CHANNEL=${CMCLIENT_BUILD_CHANNEL}
 
 USER cmclient:cmclient
 

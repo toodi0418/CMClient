@@ -18,7 +18,7 @@ Legacy runtime paths, gitlinks, and retired direct dependencies.
 | Surface | Runtime composition and control boundary | Deliberate boundary | Evidence |
 | --- | --- | --- | --- |
 | Management Web | Agent serves the compiled Vue bundle and handles Agent-owned routes before proxying Gateway HTTP/SSE | No direct file, process, SQLite, Meshtastic, or updater access | `crates/agent-core/src/web.rs`, `apps/web/src`, `apps/web/e2e/management.spec.ts` |
-| Desktop | Tauri calls the local Agent Control API for lifecycle, Web, update, and bounded service-status projections | It does not duplicate the full Web or call Gateway directly; the current archive carries a raw Tauri executable, not a platform installer | `apps/desktop/src-tauri/src/main.rs`, `apps/desktop/src-tauri/src/service_status.rs`, `apps/desktop/src/service-status.test.ts` |
+| Desktop | Tauri calls the local Agent Control API for lifecycle, Web, update, and bounded service-status projections; portable and native packages carry the complete Agent composition | It does not duplicate the full Web, call Gateway directly, or silently register a privileged Agent service | `apps/desktop/src-tauri/src/main.rs`, `scripts/desktop-native-bundles.mjs`, native package and launch smoke |
 | CLI client | Rust client uses local IPC or the authenticated HTTPS Control bridge for commands and SSE follow | It never opens SQLite or a radio transport; the standalone archive contains only the CLI | `apps/cli/src/main.rs`, `crates/control-api/src/lib.rs` |
 | Headless | Agent, CLI, migration tool, production Gateway, compiled Web, and locked protobuf corpus share one staged layout | A supported Node.js runtime is currently an external runtime prerequisite for Gateway | `scripts/release-artifacts.mjs`, `scripts/release-bundle-smoke.sh` |
 | systemd / launchd | The service manager starts the same Agent-owned Headless composition | Installers never accept or manufacture runtime credentials | `scripts/cmclient-systemd.sh`, `scripts/cmclient-launchd.sh` and their tests |
@@ -51,9 +51,12 @@ The current portable composition does not embed Node.js. Its staged-bundle
 smoke therefore requires Node.js `^22.18.0` or `>=24.11.0` on the target. This
 is an explicit
 portable-runtime prerequisite and remaining release risk, not a claim that the
-archive is self-contained. Cross-platform workflow execution and the final
-runtime composition decision, Desktop installers, and final Desktop/Service
-archive launch smoke remain P12 release gates.
+archive is self-contained. The P12 Release Build Matrix produces and inspects
+all native Desktop formats, launches every staged Desktop, starts the final
+staged Windows Service Host through SCM, repeats the service lifecycle from the
+supply-chain final ZIP, and launches the final Linux x64 Desktop archive.
+Signed/notarized installation, interactive tray and single-instance behaviour,
+hardware transports, and operator evidence remain RC field gates.
 
 ## Fail-closed Remote Dispatch boundary
 

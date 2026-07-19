@@ -337,6 +337,9 @@ function auditReleaseDocument(path, document) {
   }
 
   const attest = isRecord(jobs.attest) ? jobs.attest : undefined;
+  const finalWindowsService = isRecord(jobs["final-windows-service-smoke"])
+    ? jobs["final-windows-service-smoke"]
+    : undefined;
   if (!attest) {
     violations.push({
       code: "RELEASE_ATTESTATION_GATE_INVALID",
@@ -347,7 +350,13 @@ function auditReleaseDocument(path, document) {
     const condition = typeof attest.if === "string" ? attest.if : "";
     const permissions = isRecord(attest.permissions) ? attest.permissions : {};
     if (
-      !sameStringSet(attest.needs, ["supply-chain"]) ||
+      !sameStringSet(attest.needs, [
+        "supply-chain",
+        "final-windows-service-smoke",
+      ]) ||
+      !finalWindowsService ||
+      !sameStringSet(finalWindowsService.needs, ["supply-chain"]) ||
+      finalWindowsService["continue-on-error"] === true ||
       attest["continue-on-error"] === true ||
       attest.environment !== "production-release" ||
       !condition.includes("github.event_name == 'workflow_dispatch'") ||

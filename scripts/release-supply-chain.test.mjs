@@ -1,27 +1,41 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, generateKeyPairSync, verify } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
 import {
+  nativeDesktopArtifactPlan,
   releaseArtifactPlan,
   releaseComposition,
   stageBuild,
 } from "./release-artifacts.mjs";
+import { collectNativeDesktopBundles } from "./desktop-native-bundles.mjs";
 import {
   assembleReleaseArtifacts,
   canonicalUpdateManifest,
   checksumFileContents,
   createSignedUpdateManifest,
+  dockerArtifactPlans,
   finalizeChecksums,
+  includeDockerArtifact,
+  inspectOciArchive,
+  stageDockerArtifact,
   verifyReleaseOutput,
 } from "./release-supply-chain.mjs";
 
 const runFile = promisify(execFile);
+const sourceSha = "0123456789abcdef0123456789abcdef01234567";
 
 test("assembler creates every updater-safe archive from canonical staged inputs", async (t) => {
   const version = "2.0.0-dev.0";
@@ -34,7 +48,12 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   await stageFixture(input, plan, version, "fixture");
 
   const index = await assembleReleaseArtifacts({ input, output, version });
+  assert.equal(index.schemaVersion, 2);
   assert.equal(index.artifacts.length, plan.length);
+  assert.equal(
+    index.nativeDesktop.length,
+    nativeDesktopArtifactPlan(version).length,
+  );
   for (const artifact of index.artifacts) {
     assert.match(artifact.sha256, /^[a-f0-9]{64}$/);
     assert.ok(artifact.sizeBytes > 0);
@@ -51,6 +70,18 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
       sizeBytes,
     })),
     index.artifacts.map(({ fileName, sha256, sizeBytes }) => ({
+      fileName,
+      sha256,
+      sizeBytes,
+    })),
+  );
+  assert.deepEqual(
+    repeated.nativeDesktop.map(({ fileName, sha256, sizeBytes }) => ({
+      fileName,
+      sha256,
+      sizeBytes,
+    })),
+    index.nativeDesktop.map(({ fileName, sha256, sizeBytes }) => ({
       fileName,
       sha256,
       sizeBytes,
@@ -215,6 +246,41 @@ async function stageFixture(input, plan, version, prefix) {
       output: input,
     });
   }
+  await stageNativeDesktopFixture(input, version, prefix);
+}
+
+async function stageNativeDesktopFixture(input, version, prefix) {
+  const plan = nativeDesktopArtifactPlan(version);
+  const extensions = {
+    appimage: ".AppImage",
+    deb: ".deb",
+    dmg: ".dmg",
+    msi: ".msi",
+    nsis: ".exe",
+  };
+  for (const target of new Set(plan.map((artifact) => artifact.target))) {
+    const bundleRoot = join(input, "..", "native-sources", target);
+    await rm(bundleRoot, { force: true, recursive: true });
+    for (const artifact of plan.filter(
+      (candidate) => candidate.target === target,
+    )) {
+      const directory = join(bundleRoot, artifact.bundle);
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        join(
+          directory,
+          `${prefix}-${artifact.bundle}${extensions[artifact.bundle]}`,
+        ),
+        `${prefix}-${target}-${artifact.bundle}`,
+      );
+    }
+    await collectNativeDesktopBundles({
+      target,
+      version,
+      bundleRoot,
+      output: input,
+    });
+  }
 }
 
 test("assembler rejects files outside the canonical staged composition", async (t) => {
@@ -239,17 +305,111 @@ test("assembler rejects files outside the canonical staged composition", async (
   );
 });
 
+test("Docker OCI staging binds the image digest to version and source SHA", async (t) => {
+  const version = "2.0.0-dev.0";
+  const root = await mkdtemp(join(tmpdir(), "cmclient-docker-oci-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  for (const plan of dockerArtifactPlans(version)) {
+    const archive = await createOciFixture(join(root, plan.target), {
+      architecture: plan.architecture,
+      sourceSha,
+      version,
+    });
+
+    const inspected = await inspectOciArchive({
+      archivePath: archive,
+      sourceSha,
+      target: plan.target,
+      version,
+    });
+    assert.match(inspected.imageDigest, /^sha256:[a-f0-9]{64}$/);
+    const staged = await stageDockerArtifact({
+      input: archive,
+      output: join(root, `staged-${plan.target}`),
+      sourceSha,
+      target: plan.target,
+      version,
+    });
+    assert.equal(staged.imageDigest, inspected.imageDigest);
+    assert.equal(staged.sourceSha, sourceSha);
+    assert.equal(staged.version, version);
+    assert.equal(staged.platform, plan.platform);
+    assert.deepEqual(staged.composition.excluded, [
+      "agent",
+      "cli",
+      "desktop",
+      "serviceHost",
+    ]);
+  }
+
+  const amd64Plan = dockerArtifactPlans(version)[0];
+  const archive = join(root, amd64Plan.target, "cmclient.oci.tar");
+  await assert.rejects(
+    () =>
+      inspectOciArchive({
+        archivePath: archive,
+        sourceSha: "f".repeat(40),
+        target: amd64Plan.target,
+        version,
+      }),
+    /RELEASE_DOCKER_OCI_IDENTITY_INVALID/,
+  );
+  await assert.rejects(
+    () =>
+      inspectOciArchive({
+        archivePath: archive,
+        sourceSha,
+        target: amd64Plan.target,
+        version: "2.0.0-dev.1",
+      }),
+    /RELEASE_DOCKER_OCI_IDENTITY_INVALID/,
+  );
+
+  const incompleteInput = join(root, "incomplete");
+  await mkdir(incompleteInput, { recursive: true });
+  for (const fileName of [amd64Plan.fileName, amd64Plan.metadataFileName]) {
+    await copyFile(
+      join(root, `staged-${amd64Plan.target}`, fileName),
+      join(incompleteInput, fileName),
+    );
+  }
+  await assert.rejects(
+    () =>
+      includeDockerArtifact({
+        input: incompleteInput,
+        output: join(root, "unused-output"),
+        sourceSha,
+        version,
+      }),
+    /RELEASE_DOCKER_INPUT_INVALID/,
+  );
+});
+
 test("supply-chain checksums cover every archive and generated SBOM", async (t) => {
   const version = "2.0.0-dev.0";
-  const output = await mkdtemp(join(tmpdir(), "cmclient-supply-chain-"));
+  const root = await mkdtemp(join(tmpdir(), "cmclient-supply-chain-"));
+  const output = join(root, "output");
   const plan = releaseArtifactPlan(version);
   const artifacts = [];
-  t.after(() => rm(output, { force: true, recursive: true }));
+  const nativeDesktop = [];
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await mkdir(output, { recursive: true });
 
   for (const [index, artifact] of plan.entries()) {
     const contents = Buffer.from(`fixture-${index}`);
     await writeFile(join(output, artifact.fileName), contents);
     artifacts.push({
+      ...artifact,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+      sizeBytes: contents.length,
+    });
+  }
+  for (const [index, artifact] of nativeDesktopArtifactPlan(
+    version,
+  ).entries()) {
+    const contents = Buffer.from(`native-fixture-${index}`);
+    await writeFile(join(output, artifact.fileName), contents);
+    nativeDesktop.push({
       ...artifact,
       sha256: createHash("sha256").update(contents).digest("hex"),
       sizeBytes: contents.length,
@@ -261,21 +421,157 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
   );
   await writeFile(
     join(output, "release-index.json"),
-    `${JSON.stringify({ schemaVersion: 1, version, artifacts }, null, 2)}\n`,
+    `${JSON.stringify({ schemaVersion: 2, version, artifacts, nativeDesktop }, null, 2)}\n`,
   );
-
+  const dockerInput = join(root, "docker-input");
+  await mkdir(dockerInput, { recursive: true });
+  const dockerPlans = dockerArtifactPlans(version);
+  for (const dockerPlan of dockerPlans) {
+    const dockerArchive = await createOciFixture(
+      join(root, `oci-${dockerPlan.target}`),
+      {
+        architecture: dockerPlan.architecture,
+        sourceSha,
+        version,
+      },
+    );
+    const stagedDirectory = join(root, `docker-stage-${dockerPlan.target}`);
+    await stageDockerArtifact({
+      input: dockerArchive,
+      output: stagedDirectory,
+      sourceSha,
+      target: dockerPlan.target,
+      version,
+    });
+    for (const fileName of [dockerPlan.fileName, dockerPlan.metadataFileName]) {
+      await copyFile(
+        join(stagedDirectory, fileName),
+        join(dockerInput, fileName),
+      );
+    }
+    await writeFile(
+      join(output, dockerPlan.sbomFileName),
+      `{"spdxVersion":"SPDX-2.3","name":"docker-${dockerPlan.target}"}\n`,
+    );
+  }
+  await includeDockerArtifact({
+    input: dockerInput,
+    output,
+    sourceSha,
+    version,
+  });
   const checksums = await finalizeChecksums({ output });
-  assert.equal(checksums.length, plan.length + 1);
+  assert.equal(
+    checksums.length,
+    plan.length + nativeDesktopArtifactPlan(version).length + 8,
+  );
   assert.match(
     checksumFileContents(checksums),
     /\*cmclient-2\.0\.0-dev\.0\.spdx\.json/,
   );
-  await assert.doesNotReject(() => verifyReleaseOutput({ output, version }));
+  assert.match(checksumFileContents(checksums), /\.oci\.tar/);
+  assert.match(checksumFileContents(checksums), /\.metadata\.json/);
+  assert.match(checksumFileContents(checksums), /\.AppImage/);
+  assert.match(checksumFileContents(checksums), /\.setup\.exe/);
+  assert.match(checksumFileContents(checksums), /\*release-index\.json/);
+  assert.match(
+    checksumFileContents(checksums),
+    /\*cmclient-docker-linux-x86_64-2\.0\.0-dev\.0\.spdx\.json/,
+  );
+  assert.match(
+    checksumFileContents(checksums),
+    /\*cmclient-docker-linux-aarch64-2\.0\.0-dev\.0\.spdx\.json/,
+  );
+  await assert.doesNotReject(() =>
+    verifyReleaseOutput({ output, sourceSha, version }),
+  );
+  await assert.rejects(
+    () => verifyReleaseOutput({ output, sourceSha: "f".repeat(40), version }),
+    /RELEASE_INDEX_SOURCE_SHA_INVALID/,
+  );
+  const indexPath = join(output, "release-index.json");
+  const canonicalIndex = await readFile(indexPath, "utf8");
+  const indexWithoutSource = JSON.parse(canonicalIndex);
+  delete indexWithoutSource.sourceSha;
+  await writeFile(
+    indexPath,
+    `${JSON.stringify(indexWithoutSource, null, 2)}\n`,
+  );
+  await assert.rejects(
+    () => verifyReleaseOutput({ output, sourceSha, version }),
+    /RELEASE_INDEX_SOURCE_SHA_INVALID/,
+  );
+  await writeFile(indexPath, canonicalIndex);
+
+  const armSbomPath = join(output, dockerPlans[1].sbomFileName);
+  const armSbom = await readFile(armSbomPath);
+  await rm(armSbomPath);
+  await assert.rejects(
+    () => finalizeChecksums({ output }),
+    /RELEASE_SBOM_SET_INVALID/,
+  );
+  await writeFile(armSbomPath, armSbom);
+  const extraSbomPath = join(output, "unexpected.spdx.json");
+  await writeFile(extraSbomPath, '{"spdxVersion":"SPDX-2.3"}\n');
+  await assert.rejects(
+    () => finalizeChecksums({ output }),
+    /RELEASE_SBOM_SET_INVALID/,
+  );
+  await rm(extraSbomPath);
+  await finalizeChecksums({ output });
+
+  const unexpectedPath = join(output, "unchecked-release-payload.bin");
+  await writeFile(unexpectedPath, "unexpected");
+  await assert.rejects(
+    () => verifyReleaseOutput({ output, sourceSha, version }),
+    /RELEASE_OUTPUT_SET_INVALID/,
+  );
+  await rm(unexpectedPath);
+
+  const sigstorePath = join(output, "SHA256SUMS.sigstore.json");
+  await writeFile(
+    sigstorePath,
+    '{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3"}\n',
+  );
+  await assert.doesNotReject(() =>
+    verifyReleaseOutput({ output, sourceSha, version }),
+  );
+  await rm(sigstorePath);
 
   await writeFile(join(output, plan[0].fileName), "tampered");
   await assert.rejects(
     () => verifyReleaseOutput({ output, version }),
     /RELEASE_ARCHIVE_DIGEST_INVALID/,
+  );
+});
+
+test("supply-chain rejects a missing or tampered native Desktop package", async (t) => {
+  const version = "2.0.0-dev.0";
+  const root = await mkdtemp(join(tmpdir(), "cmclient-native-supply-chain-"));
+  const input = join(root, "input");
+  const output = join(root, "output");
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await stageFixture(input, releaseArtifactPlan(version), version, "native");
+  const nativePlan = nativeDesktopArtifactPlan(version);
+  await rm(
+    join(input, "native-desktop", nativePlan[0].target, nativePlan[0].fileName),
+  );
+  await assert.rejects(
+    () => assembleReleaseArtifacts({ input, output, version }),
+    /RELEASE_NATIVE_DESKTOP_INPUT_INVALID/,
+  );
+
+  await stageNativeDesktopFixture(input, version, "restaged");
+  const index = await assembleReleaseArtifacts({ input, output, version });
+  await writeFile(
+    join(output, "cmclient-2.0.0-dev.0.spdx.json"),
+    '{"spdxVersion":"SPDX-2.3"}\n',
+  );
+  await finalizeChecksums({ output });
+  await writeFile(join(output, index.nativeDesktop[0].fileName), "tampered");
+  await assert.rejects(
+    () => verifyReleaseOutput({ output, version }),
+    /RELEASE_NATIVE_DESKTOP_DIGEST_INVALID/,
   );
 });
 
@@ -515,6 +811,93 @@ test("release workflow gates provenance and signing behind immutable release inp
     /CMCLIENT_UPDATE_SIGNING_KEY:\s+['"][A-Za-z0-9+/=]+/,
   );
 });
+
+async function createOciFixture(
+  root,
+  { architecture, sourceSha: revision, version },
+) {
+  const layout = join(root, "layout");
+  const blobs = join(layout, "blobs", "sha256");
+  await mkdir(blobs, { recursive: true });
+  const createdAt = "2026-07-19T00:00:00Z";
+  const config = Buffer.from(
+    JSON.stringify({
+      architecture,
+      os: "linux",
+      config: {
+        Env: [
+          `CMCLIENT_BUILD_VERSION=${version}`,
+          `CMCLIENT_BUILD_COMMIT=${revision}`,
+          `CMCLIENT_BUILD_CHANNEL=${version.includes("-dev.") ? "dev" : version.includes("-") ? "beta" : "stable"}`,
+        ],
+        Labels: {
+          "org.opencontainers.image.created": createdAt,
+          "org.opencontainers.image.revision": revision,
+          "org.opencontainers.image.title": "cmclient",
+          "org.opencontainers.image.version": version,
+        },
+      },
+    }),
+  );
+  const layer = Buffer.from("cmclient-docker-fixture");
+  const configDescriptor = ociDescriptor(
+    config,
+    "application/vnd.oci.image.config.v1+json",
+  );
+  const layerDescriptor = ociDescriptor(
+    layer,
+    "application/vnd.oci.image.layer.v1.tar",
+  );
+  const manifest = Buffer.from(
+    JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      config: configDescriptor,
+      layers: [layerDescriptor],
+    }),
+  );
+  const manifestDescriptor = ociDescriptor(
+    manifest,
+    "application/vnd.oci.image.manifest.v1+json",
+  );
+  manifestDescriptor.platform = { architecture, os: "linux" };
+  const index = {
+    schemaVersion: 2,
+    mediaType: "application/vnd.oci.image.index.v1+json",
+    manifests: [manifestDescriptor],
+  };
+  for (const [bytes, descriptor] of [
+    [config, configDescriptor],
+    [layer, layerDescriptor],
+    [manifest, manifestDescriptor],
+  ]) {
+    await writeFile(
+      join(blobs, descriptor.digest.replace("sha256:", "")),
+      bytes,
+    );
+  }
+  await writeFile(join(layout, "index.json"), JSON.stringify(index));
+  await writeFile(join(layout, "oci-layout"), '{"imageLayoutVersion":"1.0.0"}');
+  const archive = join(root, "cmclient.oci.tar");
+  await runFile("tar", [
+    "-cf",
+    archive,
+    "-C",
+    layout,
+    "oci-layout",
+    "index.json",
+    "blobs",
+  ]);
+  return archive;
+}
+
+function ociDescriptor(bytes, mediaType) {
+  return {
+    mediaType,
+    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    size: bytes.length,
+  };
+}
 
 function workflowJob(workflow, name) {
   const match = new RegExp(`^ {2}${name}:\\s*$`, "m").exec(workflow);

@@ -30,7 +30,20 @@ port binding. For a bind-mounted data directory, the host directory must be
 writable by UID/GID `10001`; do not mount source code, a Docker socket, or
 device nodes.
 
-To update, pull or build a new immutable image and recreate the containers.
+Release workflow runs provide downloadable, checksummed offline images named
+`cmclient-docker-linux-x86_64-<semver>.oci.tar` and
+`cmclient-docker-linux-aarch64-<semver>.oci.tar`. Select the archive matching
+the host architecture and import it with an OCI-aware runtime, for example:
+
+```bash
+skopeo copy \
+  oci-archive:cmclient-docker-linux-x86_64-<semver>.oci.tar \
+  docker-daemon:cmclient:<semver>
+```
+
+Verify `SHA256SUMS` and the adjacent metadata before import; the metadata binds
+the archive to the release source SHA and OCI manifest digest. To update, pull,
+import, or build a new immutable image and recreate the containers.
 The container never fetches Git, executes a self-update loop, or modifies its
 own root filesystem. A Host Agent deployment is required for signed update,
 rollback, local service management, and direct serial-device support.

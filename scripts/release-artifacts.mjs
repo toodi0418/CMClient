@@ -21,12 +21,33 @@ export const RELEASE_TARGETS = [
   "windows-x86_64",
 ];
 
+export const NATIVE_DESKTOP_BUNDLES = Object.freeze({
+  "darwin-aarch64": Object.freeze(["dmg"]),
+  "darwin-x86_64": Object.freeze(["dmg"]),
+  "linux-aarch64": Object.freeze(["deb", "appimage"]),
+  "linux-x86_64": Object.freeze(["deb", "appimage"]),
+  "windows-x86_64": Object.freeze(["msi", "nsis"]),
+});
+
 export const DOCKER_COMPOSITION = Object.freeze({
   kind: "oci-image",
   updaterManaged: false,
   services: ["gateway", "web", "ingress"],
   excluded: ["agent", "cli", "desktop", "serviceHost"],
 });
+
+export const DOCKER_PLATFORMS = Object.freeze([
+  Object.freeze({
+    target: "linux-x86_64",
+    platform: "linux/amd64",
+    architecture: "amd64",
+  }),
+  Object.freeze({
+    target: "linux-aarch64",
+    platform: "linux/arm64",
+    architecture: "arm64",
+  }),
+]);
 
 const SEMVER =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -56,6 +77,52 @@ export function releaseArtifactPlan(version) {
       fileName: releaseArtifactName({ component, target, version }),
     })),
   );
+}
+
+export function nativeDesktopArtifactName({ target, bundle, version }) {
+  assertTarget(target);
+  assertNativeDesktopBundle(target, bundle);
+  assertVersion(version);
+  const suffix =
+    bundle === "appimage"
+      ? "AppImage"
+      : bundle === "nsis"
+        ? "setup.exe"
+        : bundle;
+  return `cmclient-desktop-${target}-${version}.${suffix}`;
+}
+
+export function nativeDesktopArtifactPlan(version) {
+  assertVersion(version);
+  return RELEASE_TARGETS.flatMap((target) =>
+    NATIVE_DESKTOP_BUNDLES[target].map((bundle) => ({
+      component: "desktop",
+      target,
+      bundle,
+      fileName: nativeDesktopArtifactName({ target, bundle, version }),
+      updaterManaged: false,
+    })),
+  );
+}
+
+export function dockerArtifactPlan(version) {
+  assertVersion(version);
+  return DOCKER_PLATFORMS.map(({ target, platform, architecture }) => {
+    const stem = `cmclient-docker-${target}-${version}`;
+    return {
+      component: "docker",
+      kind: DOCKER_COMPOSITION.kind,
+      version,
+      target,
+      platform,
+      architecture,
+      archive: "oci.tar",
+      fileName: `${stem}.oci.tar`,
+      metadataFileName: `${stem}.metadata.json`,
+      sbomFileName: `${stem}.spdx.json`,
+      updaterManaged: false,
+    };
+  });
 }
 
 export function releaseComposition(component, target) {
@@ -98,13 +165,17 @@ export function releaseComposition(component, target) {
 
 export function releasePlanDocument(version) {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     version,
     artifacts: releaseArtifactPlan(version).map((artifact) => ({
       ...artifact,
       contents: releaseComposition(artifact.component, artifact.target),
     })),
-    docker: DOCKER_COMPOSITION,
+    nativeDesktop: nativeDesktopArtifactPlan(version),
+    docker: {
+      ...DOCKER_COMPOSITION,
+      artifacts: dockerArtifactPlan(version),
+    },
   };
 }
 
@@ -390,6 +461,12 @@ function targetsForComponent(component) {
 function assertTarget(target) {
   if (!RELEASE_TARGETS.includes(target)) {
     throw new Error(`unknown release target: ${target}`);
+  }
+}
+
+function assertNativeDesktopBundle(target, bundle) {
+  if (!NATIVE_DESKTOP_BUNDLES[target].includes(bundle)) {
+    throw new Error(`unsupported native Desktop bundle: ${target} ${bundle}`);
   }
 }
 
