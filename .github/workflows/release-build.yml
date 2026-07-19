@@ -636,9 +636,478 @@ jobs:
             -Commit $env:GITHUB_SHA `
             -NodePath $nodePath
 
+  platform-sign-native:
+    name: Platform-sign native Desktop (${{ matrix.target }})
+    needs: [build, supply-chain, final-windows-service-smoke]
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.attest &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    environment: production-release
+    env:
+      CMCLIENT_APPLE_API_ISSUER: ${{ vars.CMCLIENT_APPLE_API_ISSUER }}
+      CMCLIENT_APPLE_API_KEY_ID: ${{ vars.CMCLIENT_APPLE_API_KEY_ID }}
+      CMCLIENT_APPLE_SIGNING_IDENTITY: ${{ vars.CMCLIENT_APPLE_SIGNING_IDENTITY }}
+      CMCLIENT_LINUX_SIGNING_KEY_ID: ${{ vars.CMCLIENT_LINUX_SIGNING_KEY_ID }}
+      CMCLIENT_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.CMCLIENT_WINDOWS_CERTIFICATE_THUMBPRINT }}
+      CMCLIENT_WINDOWS_TIMESTAMP_URL: ${{ vars.CMCLIENT_WINDOWS_TIMESTAMP_URL }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-aarch64
+            os: macos-15
+            rust_target: aarch64-apple-darwin
+          - target: darwin-x86_64
+            os: macos-15-intel
+            rust_target: x86_64-apple-darwin
+          - target: linux-aarch64
+            os: ubuntu-22.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+          - target: linux-x86_64
+            os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+          - target: windows-x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+      - name: Verify exact tag and non-secret signing identity
+        id: identity
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          [[ "$GITHUB_REF" == "refs/tags/v$version" ]] || {
+            echo "RELEASE_TAG_VERSION_MISMATCH" >&2
+            exit 1
+          }
+          case "${{ matrix.target }}" in
+            darwin-*)
+              [[ "$CMCLIENT_APPLE_API_ISSUER" =~ ^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$ &&
+                 "$CMCLIENT_APPLE_API_KEY_ID" =~ ^[A-Za-z0-9]{10}$ ]] || {
+                echo "RELEASE_APPLE_NOTARIZATION_IDENTITY_INVALID" >&2
+                exit 1
+              }
+              identity="$CMCLIENT_APPLE_SIGNING_IDENTITY"
+              ;;
+            linux-*)
+              [[ "$CMCLIENT_LINUX_SIGNING_KEY_ID" =~ ^[A-Fa-f0-9]{40}$ ]] || {
+                echo "RELEASE_LINUX_SIGNING_IDENTITY_INVALID" >&2
+                exit 1
+              }
+              identity="${CMCLIENT_LINUX_SIGNING_KEY_ID^^}"
+              ;;
+            windows-*)
+              [[ "$CMCLIENT_WINDOWS_CERTIFICATE_THUMBPRINT" =~ ^[A-Fa-f0-9]{40}$ ]] || {
+                echo "RELEASE_WINDOWS_SIGNING_IDENTITY_INVALID" >&2
+                exit 1
+              }
+              identity="${CMCLIENT_WINDOWS_CERTIFICATE_THUMBPRINT^^}"
+              ;;
+            *) echo "RELEASE_PLATFORM_SIGNING_TARGET_INVALID" >&2; exit 1 ;;
+          esac
+          [[ -n "$identity" && ${#identity} -le 256 &&
+             "$identity" != *$'\n'* && "$identity" != *$'\r'* ]] || {
+            echo "RELEASE_PLATFORM_SIGNING_IDENTITY_MISSING" >&2
+            exit 1
+          }
+          IDENTITY_REFERENCE="$identity" node -e '
+            const value = process.env.IDENTITY_REFERENCE;
+            if (value.trim() !== value || [...value].some((character) => {
+              const code = character.codePointAt(0);
+              return code < 0x20 || code === 0x7f;
+            })) {
+              process.stderr.write("RELEASE_PLATFORM_SIGNING_IDENTITY_INVALID\n");
+              process.exit(1);
+            }
+          '
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "identity_reference=$identity" >> "$GITHUB_OUTPUT"
+      - name: Install Linux native bundle dependencies
+        if: startsWith(matrix.target, 'linux-')
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libfuse2 \
+            patchelf \
+            xdg-utils
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cmclient-build-desktop-${{ matrix.target }}-${{ steps.identity.outputs.version }}
+          path: release-build
+          merge-multiple: true
+      - name: Prepare exact prebuilt Desktop binary and signing config
+        shell: bash
+        run: |
+          target="${{ matrix.target }}"
+          rust_target="${{ matrix.rust_target }}"
+          version="${{ steps.identity.outputs.version }}"
+          executable_suffix=""
+          if [[ "$target" == windows-* ]]; then executable_suffix=".exe"; fi
+          node scripts/desktop-native-bundles.mjs verify-stage \
+            --target "$target" \
+            --version "$version" \
+            --input "release-build/native-desktop/$target"
+          mkdir -p "target/$rust_target/release"
+          cp \
+            "release-build/desktop/$target/bin/cmclient-desktop$executable_suffix" \
+            "target/$rust_target/release/cmclient-desktop$executable_suffix"
+          if [[ "$target" != windows-* ]]; then
+            chmod 755 "target/$rust_target/release/cmclient-desktop"
+          fi
+          icon_output="$RUNNER_TEMP/tauri-icons"
+          config="$RUNNER_TEMP/tauri-platform-signed.json"
+          pnpm --filter @cmclient/desktop exec tauri icon \
+            "$GITHUB_WORKSPACE/apps/desktop/src-tauri/icons/icon.png" \
+            --output "$icon_output"
+          config_args=(
+            --target "$target"
+            --version "$version"
+            --portable "$GITHUB_WORKSPACE/release-build/desktop/$target"
+            --icons "$icon_output"
+            --output "$config"
+          )
+          if [[ "$target" == windows-* ]]; then
+            config_args+=(
+              --windows-certificate-thumbprint "$CMCLIENT_WINDOWS_CERTIFICATE_THUMBPRINT"
+              --windows-timestamp-url "$CMCLIENT_WINDOWS_TIMESTAMP_URL"
+            )
+          fi
+          node scripts/desktop-native-bundles.mjs config "${config_args[@]}"
+          echo "CMCLIENT_PLATFORM_CONFIG=$config" >> "$GITHUB_ENV"
+      - name: Import Apple certificate and notarization key
+        if: startsWith(matrix.target, 'darwin-')
+        shell: bash
+        env:
+          CMCLIENT_APPLE_API_KEY_PRIVATE: ${{ secrets.CMCLIENT_APPLE_API_KEY_PRIVATE }}
+          CMCLIENT_APPLE_CERTIFICATE: ${{ secrets.CMCLIENT_APPLE_CERTIFICATE }}
+          CMCLIENT_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.CMCLIENT_APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          [[ -n "$CMCLIENT_APPLE_CERTIFICATE" && \
+             -n "$CMCLIENT_APPLE_CERTIFICATE_PASSWORD" && \
+             -n "$CMCLIENT_APPLE_API_KEY_PRIVATE" && \
+             -n "$CMCLIENT_APPLE_API_ISSUER" && \
+             -n "$CMCLIENT_APPLE_API_KEY_ID" ]] || {
+            echo "RELEASE_APPLE_SIGNING_CREDENTIAL_MISSING" >&2
+            exit 1
+          }
+          umask 077
+          certificate="$RUNNER_TEMP/cmclient-apple-certificate.p12"
+          api_key="$RUNNER_TEMP/AuthKey_$CMCLIENT_APPLE_API_KEY_ID.p8"
+          keychain="$RUNNER_TEMP/cmclient-signing.keychain-db"
+          node -e \
+            'require("node:fs").writeFileSync(process.argv[1], Buffer.from(process.env.CMCLIENT_APPLE_CERTIFICATE, "base64"))' \
+            "$certificate"
+          printf '%s' "$CMCLIENT_APPLE_API_KEY_PRIVATE" > "$api_key"
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security default-keychain -s "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$CMCLIENT_APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          echo "APPLE_API_KEY_PATH=$api_key" >> "$GITHUB_ENV"
+          echo "CMCLIENT_APPLE_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+      - name: Import Windows Authenticode certificate
+        if: startsWith(matrix.target, 'windows-')
+        shell: powershell
+        env:
+          CMCLIENT_WINDOWS_CERTIFICATE: ${{ secrets.CMCLIENT_WINDOWS_CERTIFICATE }}
+          CMCLIENT_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.CMCLIENT_WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CMCLIENT_WINDOWS_CERTIFICATE) -or
+              [string]::IsNullOrWhiteSpace($env:CMCLIENT_WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "RELEASE_WINDOWS_SIGNING_CREDENTIAL_MISSING"
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "cmclient-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $pfx,
+            [Convert]::FromBase64String($env:CMCLIENT_WINDOWS_CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString `
+            $env:CMCLIENT_WINDOWS_CERTIFICATE_PASSWORD `
+            -AsPlainText `
+            -Force
+          $certificates = @(Import-PfxCertificate `
+            -FilePath $pfx `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password)
+          $expected = $env:CMCLIENT_WINDOWS_CERTIFICATE_THUMBPRINT.ToUpperInvariant()
+          $matching = @($certificates | Where-Object {
+            $_.HasPrivateKey -and $_.Thumbprint.ToUpperInvariant() -eq $expected
+          })
+          if ($matching.Count -ne 1) {
+            throw "RELEASE_WINDOWS_SIGNING_IDENTITY_MISMATCH"
+          }
+          "CMCLIENT_IMPORTED_CERT_THUMBPRINT=$expected" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Import Linux AppImage signing key
+        if: startsWith(matrix.target, 'linux-')
+        shell: bash
+        env:
+          CMCLIENT_LINUX_SIGNING_KEY: ${{ secrets.CMCLIENT_LINUX_SIGNING_KEY }}
+        run: |
+          [[ -n "$CMCLIENT_LINUX_SIGNING_KEY" ]] || {
+            echo "RELEASE_LINUX_SIGNING_KEY_MISSING" >&2
+            exit 1
+          }
+          export GNUPGHOME="$RUNNER_TEMP/cmclient-gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          printf '%s' "$CMCLIENT_LINUX_SIGNING_KEY" | \
+            base64 --decode | \
+            gpg --batch --import
+          gpg --batch --list-secret-keys "$CMCLIENT_LINUX_SIGNING_KEY_ID" >/dev/null
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+      - name: Bundle and notarize macOS Desktop
+        if: startsWith(matrix.target, 'darwin-')
+        shell: bash
+        env:
+          APPLE_API_ISSUER: ${{ vars.CMCLIENT_APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ vars.CMCLIENT_APPLE_API_KEY_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.CMCLIENT_APPLE_SIGNING_IDENTITY }}
+        run: |
+          pnpm --filter @cmclient/desktop exec tauri bundle \
+            --ci \
+            --target "${{ matrix.rust_target }}" \
+            --config "$CMCLIENT_PLATFORM_CONFIG"
+      - name: Bundle Authenticode-signed Windows Desktop
+        if: startsWith(matrix.target, 'windows-')
+        shell: bash
+        run: |
+          pnpm --filter @cmclient/desktop exec tauri bundle \
+            --ci \
+            --target "${{ matrix.rust_target }}" \
+            --config "$CMCLIENT_PLATFORM_CONFIG"
+      - name: Bundle GPG-signed Linux AppImage and checksum-bound DEB
+        if: startsWith(matrix.target, 'linux-')
+        shell: bash
+        env:
+          APPIMAGETOOL_FORCE_SIGN: "1"
+          APPIMAGETOOL_SIGN_PASSPHRASE: ${{ secrets.CMCLIENT_LINUX_SIGNING_PASSPHRASE }}
+          NO_STRIP: "true"
+          SIGN: "1"
+          SIGN_KEY: ${{ vars.CMCLIENT_LINUX_SIGNING_KEY_ID }}
+        run: |
+          [[ -n "$APPIMAGETOOL_SIGN_PASSPHRASE" ]] || {
+            echo "RELEASE_LINUX_SIGNING_PASSPHRASE_MISSING" >&2
+            exit 1
+          }
+          pnpm --filter @cmclient/desktop exec tauri bundle \
+            --ci \
+            --verbose \
+            --target "${{ matrix.rust_target }}" \
+            --config "$CMCLIENT_PLATFORM_CONFIG"
+      - name: Collect canonical platform-signed packages
+        shell: bash
+        run: |
+          node scripts/desktop-native-bundles.mjs collect \
+            --target "${{ matrix.target }}" \
+            --version "${{ steps.identity.outputs.version }}" \
+            --bundle-root "target/${{ matrix.rust_target }}/release/bundle" \
+            --output release-signed
+      - name: Verify Apple signature, notarization, and staple
+        if: startsWith(matrix.target, 'darwin-')
+        shell: bash
+        run: |
+          stage="release-signed/native-desktop/${{ matrix.target }}"
+          dmg="$(find "$stage" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg" ]] || { echo "RELEASE_APPLE_DMG_MISSING" >&2; exit 1; }
+          mountpoint="$(mktemp -d)"
+          trap 'hdiutil detach "$mountpoint" -force >/dev/null 2>&1 || true; rm -rf "$mountpoint"' EXIT
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mountpoint" >/dev/null
+          app="$(find "$mountpoint" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$app" ]] || { echo "RELEASE_APPLE_APP_MISSING" >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          xcrun stapler validate "$dmg"
+      - name: Verify Windows Authenticode and timestamp
+        if: startsWith(matrix.target, 'windows-')
+        shell: powershell
+        run: |
+          $stage = "release-signed/native-desktop/${{ matrix.target }}"
+          $packages = Get-ChildItem -LiteralPath $stage -File |
+            Where-Object { $_.Extension -in @(".msi", ".exe") }
+          if ($packages.Count -ne 2) { throw "RELEASE_WINDOWS_PACKAGE_SET_INVALID" }
+          foreach ($package in $packages) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $package.FullName
+            if ($signature.Status -ne "Valid" -or
+                $null -eq $signature.TimeStamperCertificate -or
+                $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne
+                  $env:CMCLIENT_WINDOWS_CERTIFICATE_THUMBPRINT.ToUpperInvariant()) {
+              throw "RELEASE_WINDOWS_AUTHENTICODE_INVALID"
+            }
+          }
+      - name: Verify embedded Linux AppImage signature
+        if: startsWith(matrix.target, 'linux-')
+        shell: bash
+        run: |
+          stage="release-signed/native-desktop/${{ matrix.target }}"
+          appimage="$(find "$stage" -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+          [[ -n "$appimage" ]] || { echo "RELEASE_LINUX_APPIMAGE_MISSING" >&2; exit 1; }
+          chmod 755 "$appimage"
+          bash scripts/install-appimage-validator.sh \
+            "$RUNNER_TEMP/cmclient-appimage-tools"
+          "$RUNNER_TEMP/cmclient-appimage-tools/validate" "$appimage"
+      - name: Reinspect signed native package resources
+        if: ${{ !startsWith(matrix.target, 'windows-') }}
+        shell: bash
+        run: |
+          bash scripts/desktop-native-smoke.sh \
+            "release-signed/native-desktop/${{ matrix.target }}" \
+            "${{ matrix.target }}" \
+            "${{ steps.identity.outputs.version }}"
+      - name: Reinspect signed Windows package resources
+        if: startsWith(matrix.target, 'windows-')
+        shell: powershell
+        run: |
+          & "$PWD/scripts/desktop-native-smoke.ps1" `
+            -Stage "release-signed/native-desktop/${{ matrix.target }}" `
+            -Target "${{ matrix.target }}" `
+            -Version "${{ steps.identity.outputs.version }}"
+      - name: Create canonical platform-signing receipt
+        shell: bash
+        run: |
+          node scripts/release-supply-chain.mjs platform-receipt \
+            --input "release-signed/native-desktop/${{ matrix.target }}" \
+            --output "release-signed/platform-signing/cmclient-platform-signing-${{ matrix.target }}-${{ steps.identity.outputs.version }}.json" \
+            --target "${{ matrix.target }}" \
+            --version "${{ steps.identity.outputs.version }}" \
+            --source-sha "$GITHUB_SHA" \
+            --identity-reference "${{ steps.identity.outputs.identity_reference }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cmclient-platform-signed-${{ matrix.target }}-${{ steps.identity.outputs.version }}
+          path: release-signed/
+          if-no-files-found: error
+      - name: Remove temporary Apple signing material
+        if: always() && startsWith(matrix.target, 'darwin-')
+        shell: bash
+        run: |
+          if [[ -n "${CMCLIENT_APPLE_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$CMCLIENT_APPLE_KEYCHAIN" || true
+          fi
+          rm -f \
+            "$RUNNER_TEMP/cmclient-apple-certificate.p12" \
+            "$RUNNER_TEMP/AuthKey_$CMCLIENT_APPLE_API_KEY_ID.p8"
+      - name: Remove imported Windows certificate
+        if: always() && startsWith(matrix.target, 'windows-')
+        shell: powershell
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:CMCLIENT_IMPORTED_CERT_THUMBPRINT)) {
+            Remove-Item `
+              "Cert:\CurrentUser\My\$env:CMCLIENT_IMPORTED_CERT_THUMBPRINT" `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+          Remove-Item `
+            (Join-Path $env:RUNNER_TEMP "cmclient-signing.pfx") `
+            -Force `
+            -ErrorAction SilentlyContinue
+      - name: Remove temporary Linux signing keyring
+        if: always() && startsWith(matrix.target, 'linux-')
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/cmclient-gnupg"
+
+  finalize-platform-signed:
+    name: Re-finalize platform-signed supply chain
+    needs: [supply-chain, final-windows-service-smoke, platform-sign-native]
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.attest &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production-release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+      - name: Verify the exact immutable release tag
+        id: identity
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          [[ "$GITHUB_REF" == "refs/tags/v$version" ]] || {
+            echo "RELEASE_TAG_VERSION_MISMATCH" >&2
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cmclient-supply-chain-unsigned-*
+          path: release-dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cmclient-platform-signed-*
+          path: release-signed
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cmclient-build-*
+          path: release-build
+          merge-multiple: true
+      - name: Install checksum-pinned SBOM tool
+        shell: bash
+        run: bash scripts/install-sbom-tool.sh "$RUNNER_TEMP/cmclient-sbom-tools"
+      - name: Generate platform-signed composition SBOM
+        shell: bash
+        run: |
+          rm -rf release-build/native-desktop release-build/platform-signing
+          cp -R release-signed/native-desktop release-build/native-desktop
+          cp -R release-signed/platform-signing release-build/platform-signing
+          "$RUNNER_TEMP/cmclient-sbom-tools/syft" scan dir:release-build \
+            --output "spdx-json=$RUNNER_TEMP/cmclient-platform-signed.spdx.json"
+      - name: Replace signed bytes and regenerate release metadata
+        shell: bash
+        run: |
+          version="${{ steps.identity.outputs.version }}"
+          node scripts/release-supply-chain.mjs finalize-platform-signed \
+            --input release-signed \
+            --output release-dist \
+            --sbom "$RUNNER_TEMP/cmclient-platform-signed.spdx.json" \
+            --source-sha "$GITHUB_SHA" \
+            --version "$version"
+          node scripts/release-supply-chain.mjs verify \
+            --output release-dist \
+            --require-platform-signing \
+            --source-sha "$GITHUB_SHA" \
+            --version "$version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cmclient-supply-chain-platform-signed-${{ steps.identity.outputs.version }}
+          path: release-dist/
+          if-no-files-found: error
+
   attest:
-    name: Sign checksums and publish provenance
-    needs: [supply-chain, final-windows-service-smoke]
+    name: Sign finalized checksums and publish provenance
+    needs: [finalize-platform-signed]
     if: >-
       github.event_name == 'workflow_dispatch' &&
       inputs.attest &&
@@ -656,7 +1125,12 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.23.1
-      - name: Verify the exact immutable release tag
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cmclient-supply-chain-platform-signed-*
+          path: release-dist
+          merge-multiple: true
+      - name: Verify the exact immutable release tag and finalized input
         shell: bash
         run: |
           version="$(node -p "require('./package.json').version")"
@@ -664,11 +1138,11 @@ jobs:
             echo "RELEASE_TAG_VERSION_MISMATCH" >&2
             exit 1
           }
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: cmclient-supply-chain-unsigned-*
-          path: release-dist
-          merge-multiple: true
+          node scripts/release-supply-chain.mjs verify \
+            --output release-dist \
+            --require-platform-signing \
+            --source-sha "$GITHUB_SHA" \
+            --version "$version"
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v3.1.2
@@ -690,7 +1164,7 @@ jobs:
 
   sign-update-manifest:
     name: Sign Agent update manifest
-    needs: [supply-chain, attest]
+    needs: [attest]
     if: >-
       github.event_name == 'workflow_dispatch' &&
       inputs.attest &&
@@ -723,6 +1197,7 @@ jobs:
           }
           node scripts/release-supply-chain.mjs verify \
             --output release-dist \
+            --require-platform-signing \
             --source-sha "$GITHUB_SHA" \
             --version "$version"
           cosign verify-blob \

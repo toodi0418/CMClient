@@ -27,9 +27,11 @@ import {
   assembleReleaseArtifacts,
   canonicalUpdateManifest,
   checksumFileContents,
+  createPlatformSigningReceipt,
   createSignedUpdateManifest,
   dockerArtifactPlans,
   finalizeChecksums,
+  finalizePlatformSignedRelease,
   includeDockerArtifact,
   inspectOciArchive,
   stageDockerArtifact,
@@ -672,6 +674,294 @@ test("supply-chain rejects a missing or tampered native Desktop package", async 
   );
 });
 
+test("platform-signed native bytes are re-finalized before checksums and provenance", async (t) => {
+  const version = "2.0.0-dev.0";
+  const root = await mkdtemp(join(tmpdir(), "cmclient-platform-signed-"));
+  const input = join(root, "input");
+  const output = join(root, "output");
+  const signedInput = join(root, "signed-input");
+  const compose = join(root, "docker-compose.yml");
+  const dockerInput = join(root, "docker-input");
+  const updateManifest = join(root, "update-manifest.json");
+  const signManifestArguments = [
+    "scripts/release-supply-chain.mjs",
+    "sign-update-manifest",
+    "--index",
+    join(output, "release-index.json"),
+    "--output",
+    updateManifest,
+    "--channel",
+    "dev",
+    "--minimum-agent-version",
+    version,
+    "--published-at",
+    "2026-07-19T00:00:00.000Z",
+    "--release-base-url",
+    `https://releases.example.invalid/cmclient/${version}`,
+    "--signing-key-id",
+    "fixture-release-key",
+    "--private-key-env",
+    "CMCLIENT_TEST_SIGNING_KEY",
+  ];
+  t.after(() => rm(root, { force: true, recursive: true }));
+
+  await stageFixture(input, releaseArtifactPlan(version), version, "unsigned");
+  await assembleReleaseArtifacts({ input, output, version });
+  await writeFile(
+    join(output, `cmclient-${version}.spdx.json`),
+    '{"spdxVersion":"SPDX-2.3","name":"unsigned-composition"}\n',
+  );
+  await writeFile(
+    compose,
+    "services:\n  gateway:\n    image: ${CMCLIENT_IMAGE:-cmclient:local}\n",
+  );
+  await mkdir(dockerInput, { recursive: true });
+  for (const plan of dockerArtifactPlans(version)) {
+    const archive = await createOciFixture(join(root, `oci-${plan.target}`), {
+      architecture: plan.architecture,
+      sourceSha,
+      version,
+    });
+    const staged = join(root, `docker-${plan.target}`);
+    await stageDockerArtifact({
+      input: archive,
+      output: staged,
+      sourceSha,
+      target: plan.target,
+      version,
+    });
+    for (const fileName of [plan.fileName, plan.metadataFileName]) {
+      await copyFile(join(staged, fileName), join(dockerInput, fileName));
+    }
+    await writeFile(
+      join(output, plan.sbomFileName),
+      `{"spdxVersion":"SPDX-2.3","name":"${plan.target}"}\n`,
+    );
+  }
+  await includeDockerArtifact({
+    compose,
+    input: dockerInput,
+    output,
+    sourceSha,
+    version,
+  });
+  await finalizeChecksums({ output });
+  const unsignedIndex = await readFile(join(output, "release-index.json"));
+  const unsignedChecksums = await readFile(join(output, "SHA256SUMS"));
+  const firstNativeArtifact = nativeDesktopArtifactPlan(version)[0];
+  const unsignedFirstNative = await readFile(
+    join(output, firstNativeArtifact.fileName),
+  );
+  await assert.rejects(
+    () =>
+      verifyReleaseOutput({
+        output,
+        requirePlatformSigning: true,
+        sourceSha,
+        version,
+      }),
+    /RELEASE_PLATFORM_SIGNING_REQUIRED/,
+  );
+  await assert.rejects(
+    () =>
+      runFile(process.execPath, signManifestArguments, {
+        encoding: "utf8",
+        env: { ...process.env, CMCLIENT_TEST_SIGNING_KEY: "" },
+      }),
+    (error) => {
+      assert.match(error.stderr, /RELEASE_PLATFORM_SIGNING_REQUIRED/);
+      return true;
+    },
+  );
+
+  await stageNativeDesktopFixture(signedInput, version, "signed");
+  const receiptRoot = join(signedInput, "platform-signing");
+  await mkdir(receiptRoot, { recursive: true });
+  const targets = [
+    ...new Set(nativeDesktopArtifactPlan(version).map(({ target }) => target)),
+  ];
+  const writeReceipt = (target) =>
+    createPlatformSigningReceipt({
+      identityReference: `fixture-${target}`,
+      input: join(signedInput, "native-desktop", target),
+      output: join(
+        receiptRoot,
+        `cmclient-platform-signing-${target}-${version}.json`,
+      ),
+      sourceSha,
+      target,
+      version,
+    });
+  for (const target of targets) await writeReceipt(target);
+
+  const changedArtifact = nativeDesktopArtifactPlan(version).find(
+    ({ target, bundle }) => target === "darwin-aarch64" && bundle === "dmg",
+  );
+  assert.ok(changedArtifact);
+  const signedArtifactPath = join(
+    signedInput,
+    "native-desktop",
+    changedArtifact.target,
+    changedArtifact.fileName,
+  );
+  const signedArtifact = await readFile(signedArtifactPath);
+  await copyFile(join(output, changedArtifact.fileName), signedArtifactPath);
+  await writeReceipt(changedArtifact.target);
+  const replacementSbom = join(root, "signed-composition.spdx.json");
+  await writeFile(
+    replacementSbom,
+    '{"spdxVersion":"SPDX-2.3","name":"signed-composition"}\n',
+  );
+  await assert.rejects(
+    () =>
+      finalizePlatformSignedRelease({
+        input: signedInput,
+        output,
+        sbom: replacementSbom,
+        sourceSha,
+        version,
+      }),
+    /RELEASE_PLATFORM_SIGNING_ARTIFACT_UNCHANGED/,
+  );
+
+  await writeFile(signedArtifactPath, signedArtifact);
+  await writeReceipt(changedArtifact.target);
+
+  const lateArtifact = nativeDesktopArtifactPlan(version).find(
+    ({ target, bundle }) => target === "windows-x86_64" && bundle === "msi",
+  );
+  assert.ok(lateArtifact);
+  const lateArtifactPath = join(
+    signedInput,
+    "native-desktop",
+    lateArtifact.target,
+    lateArtifact.fileName,
+  );
+  const signedLateArtifact = await readFile(lateArtifactPath);
+  await copyFile(join(output, lateArtifact.fileName), lateArtifactPath);
+  await writeReceipt(lateArtifact.target);
+  await assert.rejects(
+    () =>
+      finalizePlatformSignedRelease({
+        input: signedInput,
+        output,
+        sbom: replacementSbom,
+        sourceSha,
+        version,
+      }),
+    /RELEASE_PLATFORM_SIGNING_ARTIFACT_UNCHANGED/,
+  );
+  assert.deepEqual(
+    await readFile(join(output, "release-index.json")),
+    unsignedIndex,
+  );
+  assert.deepEqual(
+    await readFile(join(output, "SHA256SUMS")),
+    unsignedChecksums,
+  );
+  assert.deepEqual(
+    await readFile(join(output, firstNativeArtifact.fileName)),
+    unsignedFirstNative,
+  );
+  await writeFile(lateArtifactPath, signedLateArtifact);
+  await writeReceipt(lateArtifact.target);
+
+  const invalidSbom = join(root, "invalid-signed-composition.spdx.json");
+  await writeFile(invalidSbom, '{"spdxVersion":"SPDX-2.2"}\n');
+  await assert.rejects(
+    () =>
+      finalizePlatformSignedRelease({
+        input: signedInput,
+        output,
+        sbom: invalidSbom,
+        sourceSha,
+        version,
+      }),
+    /RELEASE_PLATFORM_SIGNING_SBOM_INVALID/,
+  );
+  assert.deepEqual(
+    await readFile(join(output, "release-index.json")),
+    unsignedIndex,
+  );
+  assert.deepEqual(
+    await readFile(join(output, "SHA256SUMS")),
+    unsignedChecksums,
+  );
+  assert.deepEqual(
+    await readFile(join(output, firstNativeArtifact.fileName)),
+    unsignedFirstNative,
+  );
+
+  const finalized = await finalizePlatformSignedRelease({
+    input: signedInput,
+    output,
+    sbom: replacementSbom,
+    sourceSha,
+    version,
+  });
+  assert.equal(finalized.platformSigning.receipts.length, targets.length);
+  assert.equal(finalized.platformSigning.sourceSha, sourceSha);
+  assert.equal(
+    JSON.parse(
+      await readFile(join(output, `cmclient-${version}.spdx.json`), "utf8"),
+    ).name,
+    "signed-composition",
+  );
+  const sums = await readFile(join(output, "SHA256SUMS"), "utf8");
+  for (const target of targets) {
+    assert.match(
+      sums,
+      new RegExp(`\\*cmclient-platform-signing-${target}-${version}\\.json`),
+    );
+  }
+  await assert.doesNotReject(() =>
+    verifyReleaseOutput({
+      output,
+      requirePlatformSigning: true,
+      sourceSha,
+      version,
+    }),
+  );
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const privateKeyBase64 = privateKey
+    .export({ format: "der", type: "pkcs8" })
+    .toString("base64");
+  await runFile(process.execPath, signManifestArguments, {
+    encoding: "utf8",
+    env: { ...process.env, CMCLIENT_TEST_SIGNING_KEY: privateKeyBase64 },
+  });
+  assert.equal(
+    JSON.parse(await readFile(updateManifest, "utf8")).manifest.version,
+    version,
+  );
+
+  await writeFile(
+    join(output, `cmclient-platform-signing-${targets[0]}-${version}.json`),
+    '{"tampered":true}\n',
+  );
+  await assert.rejects(
+    () =>
+      verifyReleaseOutput({
+        output,
+        requirePlatformSigning: true,
+        sourceSha,
+        version,
+      }),
+    /RELEASE_PLATFORM_SIGNING_RECEIPT_INVALID/,
+  );
+  await assert.rejects(
+    () =>
+      runFile(process.execPath, signManifestArguments, {
+        encoding: "utf8",
+        env: { ...process.env, CMCLIENT_TEST_SIGNING_KEY: privateKeyBase64 },
+      }),
+    (error) => {
+      assert.match(error.stderr, /RELEASE_PLATFORM_SIGNING_RECEIPT_INVALID/);
+      return true;
+    },
+  );
+});
+
 test("signed update manifest is exact Ed25519 canonical payload data", () => {
   const version = "2.0.0-dev.0";
   const plan = releaseArtifactPlan(version);
@@ -810,6 +1100,8 @@ test("release workflow gates provenance and signing behind immutable release inp
     ".github/workflows/release-build.yml",
     "utf8",
   );
+  const platformSigningJob = workflowJob(workflow, "platform-sign-native");
+  const finalizerJob = workflowJob(workflow, "finalize-platform-signed");
   const attestJob = workflowJob(workflow, "attest");
   const signingJob = workflowJob(workflow, "sign-update-manifest");
   const sbomStep = workflowStepBlocks(workflow).find((block) =>
@@ -825,6 +1117,19 @@ test("release workflow gates provenance and signing behind immutable release inp
   assert.match(
     sbomInstaller,
     /0d6be741479eddd2c8644a288990c04f3df0d609bbc1599a005532a9dff63509/,
+  );
+  const appImageValidatorInstaller = await readFile(
+    "scripts/install-appimage-validator.sh",
+    "utf8",
+  );
+  assert.match(appImageValidatorInstaller, /2\.0\.0-alpha-1-20251018/);
+  assert.match(
+    appImageValidatorInstaller,
+    /b10c8d39a0a917432af185afc92f1cd54b7f68aa70deda927acacf38ded84990/,
+  );
+  assert.match(
+    appImageValidatorInstaller,
+    /79ca9d7b97ffbfb87838659cf7ffa35aa6956226c45bb038c323cda6843a49d4/,
   );
   assert.match(
     workflow,
@@ -842,6 +1147,54 @@ test("release workflow gates provenance and signing behind immutable release inp
   assert.match(workflow, /attestations: write/);
   assert.match(workflow, /secrets\.CMCLIENT_UPDATE_SIGNING_KEY/);
   assert.match(
+    platformSigningJob,
+    /needs: \[build, supply-chain, final-windows-service-smoke\]/,
+  );
+  assert.match(platformSigningJob, /environment: production-release/);
+  assert.match(
+    platformSigningJob,
+    /github\.event_name == 'workflow_dispatch'[\s\S]*inputs\.attest[\s\S]*startsWith\(github\.ref, 'refs\/tags\/v'\)/,
+  );
+  assert.doesNotMatch(platformSigningJob, /--no-sign/);
+  for (const secret of [
+    "CMCLIENT_APPLE_API_KEY_PRIVATE",
+    "CMCLIENT_APPLE_CERTIFICATE",
+    "CMCLIENT_APPLE_CERTIFICATE_PASSWORD",
+    "CMCLIENT_WINDOWS_CERTIFICATE",
+    "CMCLIENT_WINDOWS_CERTIFICATE_PASSWORD",
+    "CMCLIENT_LINUX_SIGNING_KEY",
+    "CMCLIENT_LINUX_SIGNING_PASSPHRASE",
+  ]) {
+    assert.match(platformSigningJob, new RegExp(`secrets\\.${secret}`));
+  }
+  assert.ok(
+    platformSigningJob.indexOf("RELEASE_TAG_VERSION_MISMATCH") <
+      platformSigningJob.indexOf("secrets.CMCLIENT_APPLE_API_KEY_PRIVATE"),
+    "exact tag validation must precede platform secret exposure",
+  );
+  assert.match(platformSigningJob, /codesign --verify --deep --strict/);
+  assert.match(platformSigningJob, /xcrun stapler validate/);
+  assert.match(platformSigningJob, /Get-AuthenticodeSignature/);
+  assert.match(platformSigningJob, /TimeStamperCertificate/);
+  assert.match(platformSigningJob, /scripts\/install-appimage-validator\.sh/);
+  assert.match(platformSigningJob, /appimage-tools\/validate" "\$appimage"/);
+  assert.match(platformSigningJob, /platform-receipt/);
+  assert.match(platformSigningJob, /name: cmclient-platform-signed-/);
+
+  assert.match(
+    finalizerJob,
+    /needs: \[supply-chain, final-windows-service-smoke, platform-sign-native\]/,
+  );
+  assert.match(finalizerJob, /environment: production-release/);
+  assert.match(finalizerJob, /pattern: cmclient-supply-chain-unsigned-\*/);
+  assert.match(finalizerJob, /pattern: cmclient-platform-signed-\*/);
+  assert.match(finalizerJob, /syft" scan dir:release-build/);
+  assert.match(finalizerJob, /finalize-platform-signed/);
+  assert.match(finalizerJob, /--require-platform-signing/);
+  assert.match(finalizerJob, /name: cmclient-supply-chain-platform-signed-/);
+
+  assert.match(attestJob, /needs: \[finalize-platform-signed\]/);
+  assert.match(
     attestJob,
     /github\.event_name == 'workflow_dispatch'[\s\S]*inputs\.attest[\s\S]*startsWith\(github\.ref, 'refs\/tags\/v'\)/,
   );
@@ -855,7 +1208,13 @@ test("release workflow gates provenance and signing behind immutable release inp
       attestJob.indexOf("cosign sign-blob"),
     "exact tag validation must precede attestation signing",
   );
-  assert.match(signingJob, /needs: \[supply-chain, attest\]/);
+  assert.ok(
+    attestJob.indexOf("cmclient-supply-chain-platform-signed-*") <
+      attestJob.indexOf("release-supply-chain.mjs verify"),
+    "platform-signed bytes must be downloaded before verification",
+  );
+  assert.match(attestJob, /--require-platform-signing/);
+  assert.match(signingJob, /needs: \[attest\]/);
   assert.match(
     signingJob,
     /github\.event_name == 'workflow_dispatch'[\s\S]*inputs\.attest[\s\S]*inputs\.release_base_url != ''[\s\S]*startsWith\(github\.ref, 'refs\/tags\/v'\)/,
@@ -877,6 +1236,7 @@ test("release workflow gates provenance and signing behind immutable release inp
   );
   assert.match(signingJob, /RELEASE_SIGNING_KEY_MISSING/);
   assert.match(signingJob, /release-supply-chain\.mjs verify/);
+  assert.match(signingJob, /--require-platform-signing/);
   assert.match(
     signingJob,
     /\[\[ "\$GITHUB_REF" == "refs\/tags\/v\$version" \]\]/,

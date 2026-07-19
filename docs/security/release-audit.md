@@ -113,16 +113,33 @@ SHAs, and every checkout disables persisted credentials. The policy gate rejects
 mutable action tags, excessive top-level write permissions, direct secret
 interpolation into shell commands, unsafe dependency sources, unexpected
 package lifecycle scripts, and forbidden tracked artifacts. Release OIDC write
-permissions exist only in the attestation job. Attestation and update-manifest
-signing require an exact `v<package-version>` tag and the
-`production-release` environment; signing downloads the attested artifact and
-verifies the Cosign bundle before the private signing key is exposed to the
-process environment.
+permissions exist only in the attestation job.
 
-The SBOM is generated from the staged canonical `release-build` compositions,
-not merely from the source checkout. Checksums, staged-file inventories,
-archive verification, keyless provenance, and final manifest verification are
-therefore tied to the actual release inputs.
+The production release path is an ordered, tag-only chain in the protected
+`production-release` environment: platform signing, re-finalization, keyless
+checksum/provenance attestation, and only then Agent update-manifest signing.
+Platform signing receives the Apple certificate/API-key material, Windows PFX
+and password material, or Linux GPG key/passphrase only in the target-specific
+step environment; the update signer receives its Ed25519 key only after it has
+downloaded the attested artifact and verified the Cosign bundle. No signing
+value is an action input, command argument, artifact, log field, application
+setting, or runtime secret. The finalizer records one canonical receipt per
+target, overlays the signed bytes, regenerates the SBOM, `release-index.json`,
+and `SHA256SUMS`, and requires
+`verify --require-platform-signing` before attestation can consume the output.
+The Linux trust check installs the official AppImageUpdate validator from one
+fixed release and verifies architecture-specific SHA-256 before executing it;
+the installer source itself is also digest-locked by the repository policy.
+The workflow contract does not prove that those external identities or
+notarization accounts are configured; P12-T05 field evidence must establish
+that separately.
+
+The unsigned RC SBOM is generated from the staged canonical `release-build`
+compositions, not merely from the source checkout. For a production artifact,
+the finalizer regenerates the SBOM after signed native bytes and receipts are
+overlaid. Checksums, staged-file inventories, archive verification, keyless
+provenance, and final manifest verification are therefore tied to the exact
+bytes that were accepted for release.
 
 ## LAN Authentication Hardening
 

@@ -17,6 +17,7 @@ const REQUIRED_TRACKED_FILES = new Set([
   "pnpm-workspace.yaml",
   "rust-toolchain.toml",
   "security/rustsec-waivers.json",
+  "scripts/install-appimage-validator.sh",
   "scripts/install-sbom-tool.sh",
   "scripts/install-security-audit-tools.sh",
 ]);
@@ -92,10 +93,27 @@ const SBOM_TOOL_INSTALLER_PATTERNS = [
   /curl --proto '=https' --tlsv1\.2/u,
 ];
 
+const APPIMAGE_VALIDATOR_INSTALLER_PATTERNS = [
+  /set -euo pipefail/u,
+  /VALIDATOR_VERSION="2\.0\.0-alpha-1-20251018"/u,
+  /Linux:x86_64/u,
+  /b10c8d39a0a917432af185afc92f1cd54b7f68aa70deda927acacf38ded84990/u,
+  /Linux:aarch64/u,
+  /79ca9d7b97ffbfb87838659cf7ffa35aa6956226c45bb038c323cda6843a49d4/u,
+  /APPIMAGE_VALIDATOR_UNSUPPORTED_PLATFORM/u,
+  /https:\/\/github\.com\/AppImageCommunity\/AppImageUpdate\/releases\/download/u,
+  /curl --proto '=https' --tlsv1\.2/u,
+  /--fail --silent --show-error --location/u,
+  /sha256sum --check --strict/u,
+  /install -m 0755/u,
+];
+
 const SECURITY_TOOL_INSTALLER_SHA256 =
   "b1c65ffc381687925d4e305ae9a3d5bbf581a599cb7f35a743a99d285d4e0e66";
 const SBOM_TOOL_INSTALLER_SHA256 =
   "bb803e39839b54913c1bba18e9cf7303965357072efeac786ca3a251f6c6c53a";
+const APPIMAGE_VALIDATOR_INSTALLER_SHA256 =
+  "b74b5cdf2fb402383ea4e1b97c6511344017a6c1a7929e116a83511c5dfcac91";
 
 const ALLOWED_DEPENDENCY_SPECIFIER =
   /^(?:workspace:\*|[~^]?\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?)$/u;
@@ -110,6 +128,58 @@ const LOCKED_PRODUCTION_DEPLOYS = new Map([
     "pnpm --config.node-linker=hoisted --filter @cmclient/gateway deploy --prod --frozen-lockfile release-build-input/gateway",
   ],
 ]);
+
+const RELEASE_SIGNING_SECRET_NAMES = [
+  "CMCLIENT_APPLE_API_KEY_PRIVATE",
+  "CMCLIENT_APPLE_CERTIFICATE",
+  "CMCLIENT_APPLE_CERTIFICATE_PASSWORD",
+  "CMCLIENT_LINUX_SIGNING_KEY",
+  "CMCLIENT_LINUX_SIGNING_PASSPHRASE",
+  "CMCLIENT_UPDATE_SIGNING_KEY",
+  "CMCLIENT_WINDOWS_CERTIFICATE",
+  "CMCLIENT_WINDOWS_CERTIFICATE_PASSWORD",
+];
+
+const RELEASE_SIGNING_SECRET_SET = new Set(RELEASE_SIGNING_SECRET_NAMES);
+
+const PRODUCTION_RELEASE_CONDITION =
+  "github.event_name == 'workflow_dispatch' && inputs.attest && startsWith(github.ref, 'refs/tags/v')";
+
+const UPDATE_MANIFEST_CONDITION =
+  "github.event_name == 'workflow_dispatch' && inputs.attest && inputs.release_base_url != '' && startsWith(github.ref, 'refs/tags/v')";
+
+const PLATFORM_SECRET_SCOPES = [
+  {
+    condition: "startsWith(matrix.target, 'darwin-')",
+    markers: ["security import", "APPLE_API_KEY_PATH"],
+    names: [
+      "CMCLIENT_APPLE_API_KEY_PRIVATE",
+      "CMCLIENT_APPLE_CERTIFICATE",
+      "CMCLIENT_APPLE_CERTIFICATE_PASSWORD",
+    ],
+  },
+  {
+    condition: "startsWith(matrix.target, 'windows-')",
+    markers: ["Import-PfxCertificate", "CMCLIENT_IMPORTED_CERT_THUMBPRINT"],
+    names: [
+      "CMCLIENT_WINDOWS_CERTIFICATE",
+      "CMCLIENT_WINDOWS_CERTIFICATE_PASSWORD",
+    ],
+  },
+  {
+    condition: "startsWith(matrix.target, 'linux-')",
+    markers: ["gpg --batch --import", "GNUPGHOME"],
+    names: ["CMCLIENT_LINUX_SIGNING_KEY"],
+  },
+  {
+    condition: "startsWith(matrix.target, 'linux-')",
+    envNames: {
+      CMCLIENT_LINUX_SIGNING_PASSPHRASE: "APPIMAGETOOL_SIGN_PASSPHRASE",
+    },
+    markers: ["tauri bundle", "APPIMAGETOOL_SIGN_PASSPHRASE"],
+    names: ["CMCLIENT_LINUX_SIGNING_PASSPHRASE"],
+  },
+];
 
 export function scanSecretEntry(path, bytes) {
   const violations = [];
@@ -160,7 +230,7 @@ export function auditWorkflow(path, workflow) {
   for (const expression of workflowSecretExpressions(document)) {
     const allowedReleaseSigningSecret =
       path === ".github/workflows/release-build.yml" &&
-      isExactUpdateSigningSecretExpression(expression);
+      isAllowedReleaseSigningSecretExpression(expression);
     if (!allowedReleaseSigningSecret) {
       violations.push({
         code: "WORKFLOW_SECRET_CONTEXT_UNEXPECTED",
@@ -333,10 +403,183 @@ function auditReleaseDocument(path, document) {
     }
   }
 
-  const attest = isRecord(jobs.attest) ? jobs.attest : undefined;
   const finalWindowsService = isRecord(jobs["final-windows-service-smoke"])
     ? jobs["final-windows-service-smoke"]
     : undefined;
+  if (
+    !finalWindowsService ||
+    !sameStringSet(finalWindowsService.needs, ["supply-chain"]) ||
+    finalWindowsService["continue-on-error"] === true
+  ) {
+    violations.push({
+      code: "RELEASE_PLATFORM_SIGNING_GATE_INVALID",
+      path,
+      detail: "final-windows-service-smoke:policy",
+    });
+  }
+
+  const releaseSecretExpressions = workflowSecretExpressions(document);
+  const releaseSecretNames = releaseSecretExpressions
+    .map(releaseSigningSecretName)
+    .filter((name) => name !== undefined);
+  if (
+    releaseSecretExpressions.length !== RELEASE_SIGNING_SECRET_NAMES.length ||
+    !sameStringSet(releaseSecretNames, RELEASE_SIGNING_SECRET_NAMES)
+  ) {
+    violations.push({
+      code: "RELEASE_SIGNING_SECRET_SCOPE_INVALID",
+      path,
+      detail: "release:secret-set",
+    });
+  }
+
+  const platformSigning = isRecord(jobs["platform-sign-native"])
+    ? jobs["platform-sign-native"]
+    : undefined;
+  if (!platformSigning) {
+    violations.push({
+      code: "RELEASE_PLATFORM_SIGNING_GATE_INVALID",
+      path,
+      detail: "platform-sign-native:missing",
+    });
+  } else {
+    const steps = workflowSteps(platformSigning);
+    const exactTagIndex = steps.findIndex((step) =>
+      hasRunMarkers(step, [
+        '[[ "$GITHUB_REF" == "refs/tags/v$version" ]]',
+        "RELEASE_TAG_VERSION_MISMATCH",
+      ]),
+    );
+    if (
+      !sameStringSet(platformSigning.needs, [
+        "build",
+        "supply-chain",
+        "final-windows-service-smoke",
+      ]) ||
+      !isProductionReleaseJob(platformSigning, PRODUCTION_RELEASE_CONDITION) ||
+      exactTagIndex < 0 ||
+      !isFailClosedStep(steps[exactTagIndex]) ||
+      !platformSecretScopesAreValid(platformSigning, steps, exactTagIndex)
+    ) {
+      violations.push({
+        code: "RELEASE_PLATFORM_SIGNING_GATE_INVALID",
+        path,
+        detail: "platform-sign-native:policy",
+      });
+    }
+    const receiptIndex = steps.findIndex((step) =>
+      hasRunMarkers(step, [
+        "release-supply-chain.mjs platform-receipt",
+        "--identity-reference",
+      ]),
+    );
+    const platformVerificationScopes = [
+      {
+        condition: "startsWith(matrix.target, 'darwin-')",
+        markers: ["codesign --verify", "xcrun stapler validate"],
+      },
+      {
+        condition: "startsWith(matrix.target, 'windows-')",
+        markers: ["Get-AuthenticodeSignature", "TimeStamperCertificate"],
+      },
+      {
+        condition: "startsWith(matrix.target, 'linux-')",
+        markers: [
+          "install-appimage-validator.sh",
+          "cmclient-appimage-tools/validate",
+        ],
+      },
+    ];
+    const platformVerificationIndexes = platformVerificationScopes.map(
+      ({ markers }) => steps.findIndex((step) => hasRunMarkers(step, markers)),
+    );
+    if (
+      receiptIndex < 0 ||
+      platformVerificationIndexes.some(
+        (index) => index <= exactTagIndex || index >= receiptIndex,
+      ) ||
+      !isFailClosedStep(steps[receiptIndex]) ||
+      !platformVerificationIndexes.every(
+        (index, scopeIndex) =>
+          steps[index]["continue-on-error"] !== true &&
+          normalizeWorkflowCondition(steps[index].if) ===
+            platformVerificationScopes[scopeIndex].condition,
+      )
+    ) {
+      violations.push({
+        code: "RELEASE_PLATFORM_SIGNING_GATE_INVALID",
+        path,
+        detail: "platform-sign-native:trust-receipt",
+      });
+    }
+  }
+
+  const finalizer = isRecord(jobs["finalize-platform-signed"])
+    ? jobs["finalize-platform-signed"]
+    : undefined;
+  if (!finalizer) {
+    violations.push({
+      code: "RELEASE_PLATFORM_FINALIZATION_GATE_INVALID",
+      path,
+      detail: "finalize-platform-signed:missing",
+    });
+  } else {
+    const steps = workflowSteps(finalizer);
+    const exactTagIndex = steps.findIndex((step) =>
+      hasRunMarkers(step, [
+        '[[ "$GITHUB_REF" == "refs/tags/v$version" ]]',
+        "RELEASE_TAG_VERSION_MISMATCH",
+      ]),
+    );
+    const unsignedDownloadIndex = findArtifactDownloadIndex(
+      steps,
+      "cmclient-supply-chain-unsigned-*",
+    );
+    const signedDownloadIndex = findArtifactDownloadIndex(
+      steps,
+      "cmclient-platform-signed-*",
+    );
+    const finalizationIndex = steps.findIndex((step) =>
+      hasRunMarkers(step, [
+        "release-supply-chain.mjs finalize-platform-signed",
+        "release-supply-chain.mjs verify",
+        "--require-platform-signing",
+      ]),
+    );
+    const uploadIndex = findArtifactUploadIndex(
+      steps,
+      "cmclient-supply-chain-platform-signed-${{ steps.identity.outputs.version }}",
+    );
+    if (
+      !sameStringSet(finalizer.needs, [
+        "supply-chain",
+        "final-windows-service-smoke",
+        "platform-sign-native",
+      ]) ||
+      !isProductionReleaseJob(finalizer, PRODUCTION_RELEASE_CONDITION) ||
+      exactTagIndex < 0 ||
+      unsignedDownloadIndex <= exactTagIndex ||
+      signedDownloadIndex <= exactTagIndex ||
+      finalizationIndex <=
+        Math.max(unsignedDownloadIndex, signedDownloadIndex) ||
+      uploadIndex <= finalizationIndex ||
+      ![
+        exactTagIndex,
+        unsignedDownloadIndex,
+        signedDownloadIndex,
+        finalizationIndex,
+        uploadIndex,
+      ].every((index) => index >= 0 && isFailClosedStep(steps[index]))
+    ) {
+      violations.push({
+        code: "RELEASE_PLATFORM_FINALIZATION_GATE_INVALID",
+        path,
+        detail: "finalize-platform-signed:policy",
+      });
+    }
+  }
+
+  const attest = isRecord(jobs.attest) ? jobs.attest : undefined;
   if (!attest) {
     violations.push({
       code: "RELEASE_ATTESTATION_GATE_INVALID",
@@ -344,64 +587,47 @@ function auditReleaseDocument(path, document) {
       detail: "attest:missing",
     });
   } else {
-    const condition = typeof attest.if === "string" ? attest.if : "";
     const permissions = isRecord(attest.permissions) ? attest.permissions : {};
+    const steps = workflowSteps(attest);
+    const downloadIndex = findArtifactDownloadIndex(
+      steps,
+      "cmclient-supply-chain-platform-signed-*",
+    );
+    const verificationIndex = steps.findIndex((step) =>
+      hasRunMarkers(step, [
+        '[[ "$GITHUB_REF" == "refs/tags/v$version" ]]',
+        "RELEASE_TAG_VERSION_MISMATCH",
+        "release-supply-chain.mjs verify",
+        "--require-platform-signing",
+      ]),
+    );
+    const signingIndexes = steps
+      .map((step, index) => ({ index, step }))
+      .filter(
+        ({ step }) =>
+          hasRunMarkers(step, ["cosign sign-blob"]) ||
+          (typeof step.uses === "string" &&
+            step.uses.startsWith("actions/attest-build-provenance@")),
+      )
+      .map(({ index }) => index);
     if (
-      !sameStringSet(attest.needs, [
-        "supply-chain",
-        "final-windows-service-smoke",
-      ]) ||
-      !finalWindowsService ||
-      !sameStringSet(finalWindowsService.needs, ["supply-chain"]) ||
-      finalWindowsService["continue-on-error"] === true ||
-      attest["continue-on-error"] === true ||
-      attest.environment !== "production-release" ||
-      !condition.includes("github.event_name == 'workflow_dispatch'") ||
-      !condition.includes("inputs.attest") ||
-      !condition.includes("startsWith(github.ref, 'refs/tags/v')") ||
+      !sameStringSet(attest.needs, ["finalize-platform-signed"]) ||
+      !isProductionReleaseJob(attest, PRODUCTION_RELEASE_CONDITION) ||
       permissions.contents !== "read" ||
       permissions["id-token"] !== "write" ||
-      permissions.attestations !== "write"
+      permissions.attestations !== "write" ||
+      downloadIndex < 0 ||
+      verificationIndex <= downloadIndex ||
+      signingIndexes.length !== 2 ||
+      signingIndexes.some((index) => index <= verificationIndex) ||
+      ![downloadIndex, verificationIndex, ...signingIndexes].every((index) =>
+        isFailClosedStep(steps[index]),
+      )
     ) {
       violations.push({
         code: "RELEASE_ATTESTATION_GATE_INVALID",
         path,
         detail: "attest:policy",
-      });
-    }
-    const steps = workflowSteps(attest);
-    const exactTagIndex = steps.findIndex(
-      (step) =>
-        typeof step.run === "string" &&
-        step.run.includes('[[ "$GITHUB_REF" == "refs/tags/v$version" ]]') &&
-        step.run.includes("RELEASE_TAG_VERSION_MISMATCH"),
-    );
-    const signingIndex = steps.findIndex(
-      (step) =>
-        (typeof step.run === "string" &&
-          step.run.includes("cosign sign-blob")) ||
-        (typeof step.uses === "string" &&
-          step.uses.startsWith("actions/attest-build-provenance@")),
-    );
-    if (
-      exactTagIndex < 0 ||
-      signingIndex < 0 ||
-      exactTagIndex >= signingIndex ||
-      !isFailClosedStep(steps[exactTagIndex]) ||
-      !steps
-        .filter(
-          (step) =>
-            (typeof step.run === "string" &&
-              step.run.includes("cosign sign-blob")) ||
-            (typeof step.uses === "string" &&
-              step.uses.startsWith("actions/attest-build-provenance@")),
-        )
-        .every(isFailClosedStep)
-    ) {
-      violations.push({
-        code: "RELEASE_ATTESTATION_GATE_INVALID",
-        path,
-        detail: "attest:exact-tag-order",
       });
     }
   }
@@ -446,47 +672,44 @@ function auditReleaseDocument(path, document) {
       detail: "sign-update-manifest:missing",
     });
   } else {
-    const condition = typeof signing.if === "string" ? signing.if : "";
     const steps = workflowSteps(signing);
-    const download = steps.find(
-      (step) =>
-        typeof step.uses === "string" &&
-        step.uses.startsWith("actions/download-artifact@"),
+    const downloadIndex = findArtifactDownloadIndex(
+      steps,
+      "cmclient-supply-chain-attested",
     );
-    const verificationIndex = steps.findIndex(
-      (step) =>
-        typeof step.run === "string" &&
-        step.run.includes("release-supply-chain.mjs verify") &&
-        step.run.includes("cosign verify-blob") &&
-        step.run.includes("RELEASE_TAG_VERSION_MISMATCH"),
+    const verificationIndex = steps.findIndex((step) =>
+      hasRunMarkers(step, [
+        '[[ "$GITHUB_REF" == "refs/tags/v$version" ]]',
+        "RELEASE_TAG_VERSION_MISMATCH",
+        "release-supply-chain.mjs verify",
+        "--require-platform-signing",
+        "cosign verify-blob",
+      ]),
     );
-    const secretSteps = steps.filter(containsUpdateSigningSecret);
-    const secretStep = secretSteps[0];
-    const secretIndex = secretStep ? steps.indexOf(secretStep) : -1;
+    const secretIndexes = steps
+      .map((step, index) => ({ index, names: workflowSecretNames(step), step }))
+      .filter(({ names }) => names.includes("CMCLIENT_UPDATE_SIGNING_KEY"));
+    const secretEntry = secretIndexes[0];
+    const secretStep = secretEntry?.step;
     if (
-      !sameStringSet(signing.needs, ["supply-chain", "attest"]) ||
-      signing["continue-on-error"] === true ||
-      signing.environment !== "production-release" ||
-      !condition.includes("github.event_name == 'workflow_dispatch'") ||
-      !condition.includes("inputs.attest") ||
-      !condition.includes("inputs.release_base_url != ''") ||
-      !condition.includes("startsWith(github.ref, 'refs/tags/v')") ||
-      !download ||
-      !isRecord(download.with) ||
-      download.with.pattern !== "cmclient-supply-chain-attested" ||
-      verificationIndex < 0 ||
-      secretIndex < 0 ||
-      verificationIndex >= secretIndex ||
+      !sameStringSet(signing.needs, ["attest"]) ||
+      !isProductionReleaseJob(signing, UPDATE_MANIFEST_CONDITION) ||
+      downloadIndex < 0 ||
+      verificationIndex <= downloadIndex ||
+      secretIndexes.length !== 1 ||
+      secretEntry.index <= verificationIndex ||
+      !isFailClosedStep(steps[downloadIndex]) ||
       !isFailClosedStep(steps[verificationIndex]) ||
-      secretSteps.length !== 1 ||
-      countUpdateSigningSecret(document) !== 1 ||
-      countWorkflowSecretExpressions(document) !== 1 ||
+      !isFailClosedStep(secretStep) ||
+      !sameStringSet(workflowSecretNames(secretStep), [
+        "CMCLIENT_UPDATE_SIGNING_KEY",
+      ]) ||
+      !hasExactSecretEnvBinding(secretStep, "CMCLIENT_UPDATE_SIGNING_KEY") ||
       typeof secretStep.run !== "string" ||
       !secretStep.run.includes(
         "release-supply-chain.mjs sign-update-manifest",
       ) ||
-      typeof secretStep.uses === "string" ||
-      !isFailClosedStep(secretStep)
+      typeof secretStep.uses === "string"
     ) {
       violations.push({
         code: "RELEASE_MANIFEST_SIGNING_GATE_INVALID",
@@ -633,6 +856,27 @@ export function auditSbomToolInstaller(path, installer) {
     installer,
     SBOM_TOOL_INSTALLER_SHA256,
     "SBOM_TOOL_INSTALLER_INVALID",
+  );
+  return violations;
+}
+
+export function auditAppImageValidatorInstaller(path, installer) {
+  const violations = [];
+  for (const pattern of APPIMAGE_VALIDATOR_INSTALLER_PATTERNS) {
+    requirePattern(
+      violations,
+      path,
+      installer,
+      pattern,
+      "APPIMAGE_VALIDATOR_INSTALLER_INVALID",
+    );
+  }
+  requireSourceDigest(
+    violations,
+    path,
+    installer,
+    APPIMAGE_VALIDATOR_INSTALLER_SHA256,
+    "APPIMAGE_VALIDATOR_INSTALLER_INVALID",
   );
   return violations;
 }
@@ -813,6 +1057,7 @@ export async function auditTrackedRepository() {
     pnpmLock,
     installer,
     sbomInstaller,
+    appImageValidatorInstaller,
     rustsecWaivers,
   ] = await Promise.all([
     readFile("Cargo.toml", "utf8"),
@@ -821,6 +1066,7 @@ export async function auditTrackedRepository() {
     readFile("pnpm-lock.yaml", "utf8"),
     readFile("scripts/install-security-audit-tools.sh", "utf8"),
     readFile("scripts/install-sbom-tool.sh", "utf8"),
+    readFile("scripts/install-appimage-validator.sh", "utf8"),
     readFile("security/rustsec-waivers.json", "utf8"),
   ]);
 
@@ -863,6 +1109,12 @@ export async function auditTrackedRepository() {
   );
   violations.push(
     ...auditSbomToolInstaller("scripts/install-sbom-tool.sh", sbomInstaller),
+  );
+  violations.push(
+    ...auditAppImageValidatorInstaller(
+      "scripts/install-appimage-validator.sh",
+      appImageValidatorInstaller,
+    ),
   );
 
   return {
@@ -1091,9 +1343,99 @@ function workflowSecretExpressions(value) {
     : [];
 }
 
-function isExactUpdateSigningSecretExpression(expression) {
-  return /^\$\{\{\s*secrets(?:\.CMCLIENT_UPDATE_SIGNING_KEY|\s*\[\s*['"]CMCLIENT_UPDATE_SIGNING_KEY['"]\s*\])\s*\}\}$/u.test(
-    expression,
+function releaseSigningSecretName(expression) {
+  const match =
+    /^\$\{\{\s*secrets(?:\.([A-Z0-9_]+)|\s*\[\s*['"]([A-Z0-9_]+)['"]\s*\])\s*\}\}$/u.exec(
+      expression,
+    );
+  return match?.[1] ?? match?.[2];
+}
+
+function isAllowedReleaseSigningSecretExpression(expression) {
+  const name = releaseSigningSecretName(expression);
+  return name !== undefined && RELEASE_SIGNING_SECRET_SET.has(name);
+}
+
+function workflowSecretNames(value) {
+  return workflowSecretExpressions(value)
+    .map(releaseSigningSecretName)
+    .filter((name) => name !== undefined);
+}
+
+function hasExactSecretEnvBinding(step, name, envName = name) {
+  return (
+    isRecord(step.env) && releaseSigningSecretName(step.env[envName]) === name
+  );
+}
+
+function platformSecretScopesAreValid(job, steps, exactTagIndex) {
+  const expectedNames = PLATFORM_SECRET_SCOPES.flatMap(({ names }) => names);
+  if (
+    !sameStringSet(workflowSecretNames(job), expectedNames) ||
+    !sameStringSet(workflowSecretNames(steps), expectedNames)
+  ) {
+    return false;
+  }
+  for (const scope of PLATFORM_SECRET_SCOPES) {
+    const matching = steps
+      .map((step, index) => ({ index, names: workflowSecretNames(step), step }))
+      .filter(({ names }) => names.some((name) => scope.names.includes(name)));
+    if (matching.length !== 1) {
+      return false;
+    }
+    const [{ index, names, step }] = matching;
+    if (
+      index <= exactTagIndex ||
+      !sameStringSet(names, scope.names) ||
+      normalizeWorkflowCondition(step.if) !== scope.condition ||
+      step["continue-on-error"] === true ||
+      !scope.names.every((name) =>
+        hasExactSecretEnvBinding(step, name, scope.envNames?.[name] ?? name),
+      ) ||
+      !hasRunMarkers(step, scope.markers)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isProductionReleaseJob(job, expectedCondition) {
+  return (
+    job.environment === "production-release" &&
+    job["continue-on-error"] !== true &&
+    normalizeWorkflowCondition(job.if) === expectedCondition
+  );
+}
+
+function normalizeWorkflowCondition(value) {
+  return typeof value === "string" ? value.replace(/\s+/gu, " ").trim() : "";
+}
+
+function hasRunMarkers(step, markers) {
+  return (
+    typeof step.run === "string" &&
+    markers.every((marker) => step.run.includes(marker))
+  );
+}
+
+function findArtifactDownloadIndex(steps, pattern) {
+  return steps.findIndex(
+    (step) =>
+      typeof step.uses === "string" &&
+      step.uses.startsWith("actions/download-artifact@") &&
+      isRecord(step.with) &&
+      step.with.pattern === pattern,
+  );
+}
+
+function findArtifactUploadIndex(steps, name) {
+  return steps.findIndex(
+    (step) =>
+      typeof step.uses === "string" &&
+      step.uses.startsWith("actions/upload-artifact@") &&
+      isRecord(step.with) &&
+      step.with.name === name,
   );
 }
 
@@ -1106,20 +1448,6 @@ function normalizeShellCommand(value) {
     .replace(/\\\r?\n\s*/gu, " ")
     .replace(/\s+/gu, " ")
     .trim();
-}
-
-function containsUpdateSigningSecret(value) {
-  return countUpdateSigningSecret(value) > 0;
-}
-
-function countUpdateSigningSecret(value) {
-  return workflowSecretExpressions(value).filter(
-    isExactUpdateSigningSecretExpression,
-  ).length;
-}
-
-function countWorkflowSecretExpressions(value) {
-  return workflowSecretExpressions(value).length;
 }
 
 function isPinnedAction(value) {

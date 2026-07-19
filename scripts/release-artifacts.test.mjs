@@ -252,6 +252,55 @@ test("Tauri release config embeds the complete portable Desktop composition", ()
   assert.ok(config.bundle.icon.some((path) => path.endsWith("icon.icns")));
 });
 
+test("production Windows Tauri config requires an exact certificate and HTTPS timestamp", () => {
+  const signing = {
+    certificateThumbprint: "ab".repeat(20),
+    timestampUrl: "https://timestamp.example.test/authority",
+  };
+  const config = tauriReleaseConfig({
+    target: "windows-x86_64",
+    version: "2.0.0",
+    portable: "release-build/desktop/windows-x86_64",
+    icons: "apps/desktop/src-tauri/icons/release",
+    windowsSigning: signing,
+  });
+  assert.equal(
+    config.bundle.windows.certificateThumbprint,
+    signing.certificateThumbprint.toUpperCase(),
+  );
+  assert.equal(config.bundle.windows.digestAlgorithm, "sha256");
+  assert.equal(config.bundle.windows.timestampUrl, signing.timestampUrl);
+
+  for (const invalid of [
+    { ...signing, certificateThumbprint: "short" },
+    { ...signing, timestampUrl: "http://timestamp.example.test" },
+    { ...signing, timestampUrl: "https://timestamp.example.test/?token=x" },
+  ]) {
+    assert.throws(
+      () =>
+        tauriReleaseConfig({
+          target: "windows-x86_64",
+          version: "2.0.0",
+          portable: "release-build/desktop/windows-x86_64",
+          icons: "apps/desktop/src-tauri/icons/release",
+          windowsSigning: invalid,
+        }),
+      /Windows signing configuration invalid/,
+    );
+  }
+  assert.throws(
+    () =>
+      tauriReleaseConfig({
+        target: "darwin-aarch64",
+        version: "2.0.0",
+        portable: "release-build/desktop/darwin-aarch64",
+        icons: "apps/desktop/src-tauri/icons/release",
+        windowsSigning: signing,
+      }),
+    /Windows signing configuration invalid/,
+  );
+});
+
 test("Windows Tauri package versions stay MSI-compatible without changing RC asset identity", () => {
   assert.equal(tauriPackageVersion("windows-x86_64", "2.0.0-rc.1"), "2.0.0-1");
   assert.equal(tauriPackageVersion("windows-x86_64", "2.0.0"), "2.0.0");
@@ -954,7 +1003,7 @@ test("staged and final Windows Service archives share the real SCM launch gate",
   );
   const finalJob = workflow.slice(
     workflow.indexOf("\n  final-windows-service-smoke:"),
-    workflow.indexOf("\n  attest:"),
+    workflow.indexOf("\n  platform-sign-native:"),
   );
   const attestJob = workflow.slice(
     workflow.indexOf("\n  attest:"),
@@ -977,10 +1026,7 @@ test("staged and final Windows Service archives share the real SCM launch gate",
   );
   assert.match(finalJob, /release-windows-service-smoke\.ps1/);
   assert.match(finalJob, /-Commit \$env:GITHUB_SHA/);
-  assert.match(
-    attestJob,
-    /needs: \[supply-chain, final-windows-service-smoke\]/,
-  );
+  assert.match(attestJob, /needs: \[finalize-platform-signed\]/);
   assert.equal(
     (workflow.match(/release-windows-service-smoke\.ps1/g) ?? []).length,
     2,

@@ -76,10 +76,17 @@ export function tauriPackageVersion(target, version) {
   return `${core}-${numeric}`;
 }
 
-export function tauriReleaseConfig({ target, version, portable, icons }) {
+export function tauriReleaseConfig({
+  target,
+  version,
+  portable,
+  icons,
+  windowsSigning,
+}) {
   const artifacts = nativeDesktopArtifactsForTarget(target, version);
   const portableRoot = resolve(portable);
   const iconRoot = resolve(icons);
+  const signing = windowsSigningConfig(target, windowsSigning);
   return {
     version: tauriPackageVersion(target, version),
     bundle: {
@@ -107,8 +114,35 @@ export function tauriReleaseConfig({ target, version, portable, icons }) {
           type: "downloadBootstrapper",
           silent: true,
         },
+        ...signing,
       },
     },
+  };
+}
+
+function windowsSigningConfig(target, signing) {
+  if (signing === undefined) return {};
+  let timestamp;
+  try {
+    timestamp = new URL(signing.timestampUrl);
+  } catch {
+    throw new Error("Windows signing configuration invalid");
+  }
+  if (
+    !target.startsWith("windows-") ||
+    !/^[A-Fa-f0-9]{40}$/.test(signing.certificateThumbprint) ||
+    timestamp.protocol !== "https:" ||
+    timestamp.username ||
+    timestamp.password ||
+    timestamp.search ||
+    timestamp.hash
+  ) {
+    throw new Error("Windows signing configuration invalid");
+  }
+  return {
+    certificateThumbprint: signing.certificateThumbprint.toUpperCase(),
+    digestAlgorithm: "sha256",
+    timestampUrl: timestamp.href,
   };
 }
 
@@ -306,15 +340,39 @@ function argumentValue(argumentsList, name) {
   return argumentsList[index + 1];
 }
 
+function optionalArgumentValue(argumentsList, name) {
+  return argumentsList.includes(name)
+    ? argumentValue(argumentsList, name)
+    : undefined;
+}
+
 async function main(argumentsList) {
   const [command] = argumentsList;
   if (command === "config") {
     const output = argumentValue(argumentsList, "--output");
+    const certificateThumbprint = optionalArgumentValue(
+      argumentsList,
+      "--windows-certificate-thumbprint",
+    );
+    const timestampUrl = optionalArgumentValue(
+      argumentsList,
+      "--windows-timestamp-url",
+    );
+    if (
+      (certificateThumbprint === undefined) !==
+      (timestampUrl === undefined)
+    ) {
+      throw new Error("Windows signing configuration incomplete");
+    }
     const config = tauriReleaseConfig({
       target: argumentValue(argumentsList, "--target"),
       version: argumentValue(argumentsList, "--version"),
       portable: argumentValue(argumentsList, "--portable"),
       icons: argumentValue(argumentsList, "--icons"),
+      windowsSigning:
+        certificateThumbprint === undefined
+          ? undefined
+          : { certificateThumbprint, timestampUrl },
     });
     await mkdir(dirname(output), { recursive: true });
     await writeFile(output, `${JSON.stringify(config, null, 2)}\n`);

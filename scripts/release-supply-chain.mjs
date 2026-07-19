@@ -28,7 +28,10 @@ import {
   releaseArtifactPlan,
   releaseComposition,
 } from "./release-artifacts.mjs";
-import { verifyNativeDesktopStage } from "./desktop-native-bundles.mjs";
+import {
+  nativeDesktopArtifactsForTarget,
+  verifyNativeDesktopStage,
+} from "./desktop-native-bundles.mjs";
 
 const CHANNELS = new Set(["stable", "beta", "dev"]);
 const SEMVER =
@@ -41,6 +44,13 @@ const UTC_MILLISECONDS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const EPOCH = new Date(0);
 const OCI_IMAGE_MANIFEST = "application/vnd.oci.image.manifest.v1+json";
 const OCI_IMAGE_CONFIG = "application/vnd.oci.image.config.v1+json";
+const PLATFORM_SIGNING_SCHEMA_VERSION = 1;
+const PLATFORM_TRUST = Object.freeze({
+  apple: "apple-codesign-notarization",
+  authenticode: "windows-authenticode",
+  appImage: "linux-appimage-gpg",
+  provenance: "checksum-provenance",
+});
 
 export function dockerArtifactPlans(version) {
   return canonicalDockerArtifactPlan(version);
@@ -553,6 +563,163 @@ export async function collectNativeDesktopArtifacts({
   return artifacts;
 }
 
+export async function createPlatformSigningReceipt({
+  identityReference,
+  input,
+  output,
+  sourceSha,
+  target,
+  version,
+}) {
+  assertSourceSha(sourceSha);
+  assertPlatformIdentityReference(identityReference);
+  const inputRoot = resolve(input);
+  const plan = nativeDesktopArtifactsForTarget(target, version);
+  await verifyNativeDesktopStage({ target, version, input: inputRoot });
+  const artifacts = [];
+  for (const planned of plan) {
+    const artifactPath = join(inputRoot, planned.fileName);
+    const metadata = await lstat(artifactPath);
+    if (!metadata.isFile() || metadata.size < 1) {
+      throw new Error("RELEASE_PLATFORM_SIGNING_ARTIFACT_INVALID");
+    }
+    artifacts.push({
+      fileName: planned.fileName,
+      sha256: await sha256File(artifactPath),
+      sizeBytes: metadata.size,
+      trust: platformTrustForArtifact(planned),
+    });
+  }
+  const receipt = {
+    schemaVersion: PLATFORM_SIGNING_SCHEMA_VERSION,
+    target,
+    version,
+    sourceSha,
+    identityReference,
+    artifacts,
+  };
+  const outputPath = resolve(output);
+  await mkdir(dirname(outputPath), { recursive: true });
+  await writeJson(outputPath, receipt);
+  return receipt;
+}
+
+export async function finalizePlatformSignedRelease({
+  input,
+  output,
+  sbom,
+  sourceSha,
+  version,
+}) {
+  assertSourceSha(sourceSha);
+  const outputRoot = resolve(output);
+  await verifyReleaseOutput({ output: outputRoot, sourceSha, version });
+  const index = await readReleaseIndex(outputRoot);
+  if (index.platformSigning !== undefined) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_ALREADY_FINALIZED");
+  }
+  const receipts = await readPlatformSignedNativeInput({
+    input,
+    sourceSha,
+    version,
+  });
+  const unsignedByName = new Map(
+    index.nativeDesktop.map((artifact) => [artifact.fileName, { ...artifact }]),
+  );
+  const nativeByName = new Map(
+    index.nativeDesktop.map((artifact) => [artifact.fileName, artifact]),
+  );
+  const receiptPlans = receipts.map((receipt) => {
+    const finalizedArtifacts = [];
+    for (const artifact of receipt.artifacts) {
+      const unsigned = unsignedByName.get(artifact.fileName);
+      const indexed = nativeByName.get(artifact.fileName);
+      if (!unsigned || !indexed) {
+        throw new Error("RELEASE_PLATFORM_SIGNING_ARTIFACT_INVALID");
+      }
+      if (
+        artifact.trust !== PLATFORM_TRUST.provenance &&
+        artifact.sha256 === unsigned.sha256
+      ) {
+        throw new Error("RELEASE_PLATFORM_SIGNING_ARTIFACT_UNCHANGED");
+      }
+      finalizedArtifacts.push({
+        ...artifact,
+        unsignedSha256: unsigned.sha256,
+      });
+    }
+    return { finalizedArtifacts, receipt };
+  });
+
+  const sbomSource = resolve(sbom);
+  let sbomValue;
+  try {
+    const metadata = await lstat(sbomSource);
+    sbomValue = JSON.parse(await readFile(sbomSource, "utf8"));
+    if (!metadata.isFile() || metadata.size < 1) throw new Error();
+  } catch {
+    throw new Error("RELEASE_PLATFORM_SIGNING_SBOM_INVALID");
+  }
+  if (sbomValue?.spdxVersion !== "SPDX-2.3") {
+    throw new Error("RELEASE_PLATFORM_SIGNING_SBOM_INVALID");
+  }
+
+  const finalizedReceipts = [];
+  for (const { finalizedArtifacts, receipt } of receiptPlans) {
+    for (const artifact of receipt.artifacts) {
+      const indexed = nativeByName.get(artifact.fileName);
+      const source = join(
+        resolve(input),
+        "native-desktop",
+        receipt.target,
+        artifact.fileName,
+      );
+      const destination = join(outputRoot, artifact.fileName);
+      await copyFile(source, destination);
+      await chmod(destination, 0o644);
+      indexed.sha256 = artifact.sha256;
+      indexed.sizeBytes = artifact.sizeBytes;
+    }
+    const receiptFileName = platformSigningReceiptFileName(
+      receipt.target,
+      version,
+    );
+    const receiptSource = join(
+      resolve(input),
+      "platform-signing",
+      receiptFileName,
+    );
+    const receiptDestination = join(outputRoot, receiptFileName);
+    await copyFile(receiptSource, receiptDestination);
+    await chmod(receiptDestination, 0o644);
+    finalizedReceipts.push({
+      target: receipt.target,
+      identityReference: receipt.identityReference,
+      receiptFileName,
+      receiptSha256: await sha256File(receiptDestination),
+      artifacts: finalizedArtifacts,
+    });
+  }
+  await copyFile(sbomSource, join(outputRoot, `cmclient-${version}.spdx.json`));
+
+  index.platformSigning = {
+    schemaVersion: PLATFORM_SIGNING_SCHEMA_VERSION,
+    sourceSha,
+    receipts: finalizedReceipts,
+  };
+  await writeJson(join(outputRoot, "release-index.json"), index);
+  await rm(join(outputRoot, "SHA256SUMS"), { force: true });
+  await rm(join(outputRoot, "SHA256SUMS.sigstore.json"), { force: true });
+  await finalizeChecksums({ output: outputRoot });
+  await verifyReleaseOutput({
+    output: outputRoot,
+    requirePlatformSigning: true,
+    sourceSha,
+    version,
+  });
+  return index;
+}
+
 export async function finalizeChecksums({ output }) {
   const outputRoot = resolve(output);
   const index = await readReleaseIndex(outputRoot);
@@ -565,6 +732,7 @@ export async function finalizeChecksums({ output }) {
       image.metadataFileName,
     ]),
     ...(index.dockerCompose ? [index.dockerCompose.fileName] : []),
+    ...platformSigningReceiptNames(index),
     ...sbomNames,
     "release-index.json",
   ].sort();
@@ -582,7 +750,12 @@ export async function finalizeChecksums({ output }) {
   return entries;
 }
 
-export async function verifyReleaseOutput({ output, sourceSha, version }) {
+export async function verifyReleaseOutput({
+  output,
+  requirePlatformSigning = false,
+  sourceSha,
+  version,
+}) {
   const outputRoot = resolve(output);
   const index = await readReleaseIndex(outputRoot);
   if (index.version !== version) {
@@ -715,6 +888,14 @@ export async function verifyReleaseOutput({ output, sourceSha, version }) {
       sourceSha: sourceSha ?? index.sourceSha,
     });
   }
+
+  await assertPlatformSigningMetadata({
+    index,
+    outputRoot,
+    requirePlatformSigning,
+    sourceSha: sourceSha ?? index.sourceSha,
+    version,
+  });
 
   const expectedChecksums = await expectedChecksumEntries(outputRoot, index);
   const checksumPath = join(outputRoot, "SHA256SUMS");
@@ -1073,6 +1254,303 @@ function isCanonicalBuildFileList(files, contents) {
   );
 }
 
+function platformTrustForArtifact(artifact) {
+  if (artifact.target.startsWith("darwin-") && artifact.bundle === "dmg") {
+    return PLATFORM_TRUST.apple;
+  }
+  if (artifact.target.startsWith("windows-")) {
+    return PLATFORM_TRUST.authenticode;
+  }
+  if (artifact.target.startsWith("linux-") && artifact.bundle === "appimage") {
+    return PLATFORM_TRUST.appImage;
+  }
+  if (artifact.target.startsWith("linux-") && artifact.bundle === "deb") {
+    return PLATFORM_TRUST.provenance;
+  }
+  throw new Error("RELEASE_PLATFORM_SIGNING_TRUST_INVALID");
+}
+
+function platformSigningReceiptFileName(target, version) {
+  nativeDesktopArtifactsForTarget(target, version);
+  return `cmclient-platform-signing-${target}-${version}.json`;
+}
+
+function platformSigningReceiptNames(index) {
+  return (
+    index.platformSigning?.receipts?.map(
+      ({ receiptFileName }) => receiptFileName,
+    ) ?? []
+  );
+}
+
+function assertPlatformIdentityReference(value) {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 256 ||
+    value.trim() !== value ||
+    [...value].some((character) => {
+      const code = character.codePointAt(0);
+      return code < 0x20 || code === 0x7f;
+    })
+  ) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_IDENTITY_INVALID");
+  }
+}
+
+function hasExactKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort(compareCanonicalText)) ===
+      JSON.stringify([...expected].sort(compareCanonicalText))
+  );
+}
+
+async function readPlatformSigningReceipt({
+  path,
+  sourceSha,
+  stage,
+  target,
+  version,
+}) {
+  let receipt;
+  try {
+    receipt = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    throw new Error("RELEASE_PLATFORM_SIGNING_RECEIPT_INVALID");
+  }
+  if (
+    !hasExactKeys(receipt, [
+      "schemaVersion",
+      "target",
+      "version",
+      "sourceSha",
+      "identityReference",
+      "artifacts",
+    ]) ||
+    receipt.schemaVersion !== PLATFORM_SIGNING_SCHEMA_VERSION ||
+    receipt.target !== target ||
+    receipt.version !== version ||
+    receipt.sourceSha !== sourceSha ||
+    !Array.isArray(receipt.artifacts)
+  ) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_RECEIPT_INVALID");
+  }
+  assertPlatformIdentityReference(receipt.identityReference);
+  const plan = nativeDesktopArtifactsForTarget(target, version);
+  if (receipt.artifacts.length !== plan.length) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_RECEIPT_INVALID");
+  }
+  for (const [index, artifact] of receipt.artifacts.entries()) {
+    const planned = plan[index];
+    if (
+      !hasExactKeys(artifact, ["fileName", "sha256", "sizeBytes", "trust"]) ||
+      artifact.fileName !== planned.fileName ||
+      artifact.trust !== platformTrustForArtifact(planned) ||
+      !SHA256.test(artifact.sha256) ||
+      !Number.isSafeInteger(artifact.sizeBytes) ||
+      artifact.sizeBytes < 1
+    ) {
+      throw new Error("RELEASE_PLATFORM_SIGNING_RECEIPT_INVALID");
+    }
+    const artifactPath = join(stage, artifact.fileName);
+    let metadata;
+    try {
+      metadata = await lstat(artifactPath);
+    } catch {
+      throw new Error("RELEASE_PLATFORM_SIGNING_ARTIFACT_INVALID");
+    }
+    if (
+      !metadata.isFile() ||
+      metadata.size !== artifact.sizeBytes ||
+      (await sha256File(artifactPath)) !== artifact.sha256
+    ) {
+      throw new Error("RELEASE_PLATFORM_SIGNING_ARTIFACT_INVALID");
+    }
+  }
+  return receipt;
+}
+
+async function readPlatformSignedNativeInput({ input, sourceSha, version }) {
+  const inputRoot = resolve(input);
+  const plan = nativeDesktopArtifactPlan(version);
+  const targets = [...new Set(plan.map(({ target }) => target))];
+  const expectedRootEntries = ["native-desktop", "platform-signing"];
+  let rootEntries;
+  try {
+    rootEntries = (await readdir(inputRoot, { withFileTypes: true }))
+      .map(
+        (entry) =>
+          `${entry.isDirectory() ? "directory" : "other"}:${entry.name}`,
+      )
+      .sort(compareCanonicalText);
+  } catch {
+    throw new Error("RELEASE_PLATFORM_SIGNING_INPUT_INVALID");
+  }
+  if (
+    JSON.stringify(rootEntries) !==
+    JSON.stringify(
+      expectedRootEntries
+        .map((name) => `directory:${name}`)
+        .sort(compareCanonicalText),
+    )
+  ) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_INPUT_INVALID");
+  }
+
+  const nativeRoot = join(inputRoot, "native-desktop");
+  const receiptRoot = join(inputRoot, "platform-signing");
+  const nativeEntries = (await readdir(nativeRoot, { withFileTypes: true }))
+    .map(
+      (entry) => `${entry.isDirectory() ? "directory" : "other"}:${entry.name}`,
+    )
+    .sort(compareCanonicalText);
+  const receiptEntries = (await readdir(receiptRoot, { withFileTypes: true }))
+    .map((entry) => `${entry.isFile() ? "file" : "other"}:${entry.name}`)
+    .sort(compareCanonicalText);
+  if (
+    JSON.stringify(nativeEntries) !==
+      JSON.stringify(
+        targets
+          .map((target) => `directory:${target}`)
+          .sort(compareCanonicalText),
+      ) ||
+    JSON.stringify(receiptEntries) !==
+      JSON.stringify(
+        targets
+          .map(
+            (target) =>
+              `file:${platformSigningReceiptFileName(target, version)}`,
+          )
+          .sort(compareCanonicalText),
+      )
+  ) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_INPUT_INVALID");
+  }
+
+  const receipts = [];
+  for (const target of targets) {
+    const stage = join(nativeRoot, target);
+    await verifyNativeDesktopStage({ target, version, input: stage });
+    receipts.push(
+      await readPlatformSigningReceipt({
+        path: join(
+          receiptRoot,
+          platformSigningReceiptFileName(target, version),
+        ),
+        sourceSha,
+        stage,
+        target,
+        version,
+      }),
+    );
+  }
+  return receipts;
+}
+
+async function assertPlatformSigningMetadata({
+  index,
+  outputRoot,
+  requirePlatformSigning,
+  sourceSha,
+  version,
+}) {
+  const signing = index.platformSigning;
+  if (signing === undefined) {
+    if (requirePlatformSigning) {
+      throw new Error("RELEASE_PLATFORM_SIGNING_REQUIRED");
+    }
+    return;
+  }
+  if (
+    !hasExactKeys(signing, ["schemaVersion", "sourceSha", "receipts"]) ||
+    signing.schemaVersion !== PLATFORM_SIGNING_SCHEMA_VERSION ||
+    signing.sourceSha !== sourceSha ||
+    signing.sourceSha !== index.sourceSha ||
+    !Array.isArray(signing.receipts)
+  ) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_INDEX_INVALID");
+  }
+  const targets = [
+    ...new Set(nativeDesktopArtifactPlan(version).map(({ target }) => target)),
+  ];
+  if (signing.receipts.length !== targets.length) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_INDEX_INVALID");
+  }
+  const byTarget = new Map(
+    signing.receipts.map((receipt) => [receipt?.target, receipt]),
+  );
+  if (byTarget.size !== targets.length) {
+    throw new Error("RELEASE_PLATFORM_SIGNING_INDEX_INVALID");
+  }
+  const nativeByName = new Map(
+    index.nativeDesktop.map((artifact) => [artifact.fileName, artifact]),
+  );
+  for (const target of targets) {
+    const metadata = byTarget.get(target);
+    if (
+      !hasExactKeys(metadata, [
+        "target",
+        "identityReference",
+        "receiptFileName",
+        "receiptSha256",
+        "artifacts",
+      ]) ||
+      metadata.target !== target ||
+      metadata.receiptFileName !==
+        platformSigningReceiptFileName(target, version) ||
+      !SHA256.test(metadata.receiptSha256) ||
+      !Array.isArray(metadata.artifacts)
+    ) {
+      throw new Error("RELEASE_PLATFORM_SIGNING_INDEX_INVALID");
+    }
+    assertPlatformIdentityReference(metadata.identityReference);
+    const receiptPath = join(outputRoot, metadata.receiptFileName);
+    if ((await sha256File(receiptPath)) !== metadata.receiptSha256) {
+      throw new Error("RELEASE_PLATFORM_SIGNING_RECEIPT_INVALID");
+    }
+    const receipt = await readPlatformSigningReceipt({
+      path: receiptPath,
+      sourceSha,
+      stage: outputRoot,
+      target,
+      version,
+    });
+    if (
+      receipt.identityReference !== metadata.identityReference ||
+      metadata.artifacts.length !== receipt.artifacts.length
+    ) {
+      throw new Error("RELEASE_PLATFORM_SIGNING_INDEX_INVALID");
+    }
+    for (const [artifactIndex, artifact] of metadata.artifacts.entries()) {
+      const recorded = receipt.artifacts[artifactIndex];
+      const indexed = nativeByName.get(recorded.fileName);
+      if (
+        !hasExactKeys(artifact, [
+          "fileName",
+          "sha256",
+          "sizeBytes",
+          "trust",
+          "unsignedSha256",
+        ]) ||
+        artifact.fileName !== recorded.fileName ||
+        artifact.sha256 !== recorded.sha256 ||
+        artifact.sizeBytes !== recorded.sizeBytes ||
+        artifact.trust !== recorded.trust ||
+        !SHA256.test(artifact.unsignedSha256) ||
+        (artifact.trust !== PLATFORM_TRUST.provenance &&
+          artifact.unsignedSha256 === artifact.sha256) ||
+        indexed?.sha256 !== artifact.sha256 ||
+        indexed?.sizeBytes !== artifact.sizeBytes
+      ) {
+        throw new Error("RELEASE_PLATFORM_SIGNING_INDEX_INVALID");
+      }
+    }
+  }
+}
+
 async function readReleaseIndex(outputRoot) {
   let index;
   try {
@@ -1105,6 +1583,7 @@ async function expectedChecksumEntries(outputRoot, index) {
         image.metadataFileName,
       ]),
       ...(index.dockerCompose ? [index.dockerCompose.fileName] : []),
+      ...platformSigningReceiptNames(index),
       ...sboms,
       "release-index.json",
     ]
@@ -1146,6 +1625,7 @@ async function assertExactReleaseOutputEntries(outputRoot, index) {
       image.metadataFileName,
     ]),
     ...(index.dockerCompose ? [index.dockerCompose.fileName] : []),
+    ...platformSigningReceiptNames(index),
     ...(await exactSbomNames(outputRoot, index)),
     "release-index.json",
     "SHA256SUMS",
@@ -1418,9 +1898,33 @@ async function main(argumentsList) {
     });
     return;
   }
+  if (command === "platform-receipt") {
+    await createPlatformSigningReceipt({
+      identityReference: argumentValue(argumentsList, "--identity-reference"),
+      input: argumentValue(argumentsList, "--input"),
+      output: argumentValue(argumentsList, "--output"),
+      sourceSha: argumentValue(argumentsList, "--source-sha"),
+      target: argumentValue(argumentsList, "--target"),
+      version: argumentValue(argumentsList, "--version"),
+    });
+    return;
+  }
+  if (command === "finalize-platform-signed") {
+    await finalizePlatformSignedRelease({
+      input: argumentValue(argumentsList, "--input"),
+      output: argumentValue(argumentsList, "--output"),
+      sbom: argumentValue(argumentsList, "--sbom"),
+      sourceSha: argumentValue(argumentsList, "--source-sha"),
+      version: argumentValue(argumentsList, "--version"),
+    });
+    return;
+  }
   if (command === "verify") {
     await verifyReleaseOutput({
       output: argumentValue(argumentsList, "--output"),
+      requirePlatformSigning: argumentsList.includes(
+        "--require-platform-signing",
+      ),
       sourceSha: optionalArgumentValue(argumentsList, "--source-sha"),
       version: argumentValue(argumentsList, "--version"),
     });
@@ -1435,7 +1939,13 @@ async function main(argumentsList) {
       throw new Error("RELEASE_SIGNING_KEY_ENVIRONMENT_INVALID");
     }
     const indexPath = resolve(argumentValue(argumentsList, "--index"));
-    const index = await readReleaseIndex(dirname(indexPath));
+    const unverifiedIndex = await readReleaseIndex(dirname(indexPath));
+    const index = await verifyReleaseOutput({
+      output: dirname(indexPath),
+      requirePlatformSigning: true,
+      sourceSha: unverifiedIndex.sourceSha,
+      version: unverifiedIndex.version,
+    });
     const privateKeyBase64 = process.env[privateKeyEnvironment];
     if (!privateKeyBase64) {
       throw new Error("RELEASE_SIGNING_KEY_UNAVAILABLE");
@@ -1457,7 +1967,7 @@ async function main(argumentsList) {
     return;
   }
   throw new Error(
-    "usage: release-supply-chain.mjs <assemble|stage-docker|include-docker|finalize|verify|sign-update-manifest> ...",
+    "usage: release-supply-chain.mjs <assemble|stage-docker|include-docker|finalize|platform-receipt|finalize-platform-signed|verify|sign-update-manifest> ...",
   );
 }
 

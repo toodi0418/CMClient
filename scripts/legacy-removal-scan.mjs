@@ -90,14 +90,14 @@ export const ALLOWED_REMOVAL_EVIDENCE = new Map([
     [
       {
         code: "LEGACY_MAP_REFERENCE",
-        line: 98,
+        line: 109,
         count: 2,
         context:
           "TENMAN and TENMAP sharing, their environment/configuration/database/UI paths,",
       },
       {
         code: "LEGACY_BOT_REFERENCE",
-        line: 99,
+        line: 110,
         count: 1,
         context:
           "and the old `@cm` Bot are removed without a compatibility layer. Remote Message",

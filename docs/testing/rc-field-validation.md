@@ -35,17 +35,23 @@ The identity and referenced evidence store must establish:
 - target OS, architecture, Node version, and a non-identifying host alias in
   the applicable result evidence, not as unvalidated top-level metadata.
 
-The ordinary `dev` workflow intentionally creates an unsigned RC. Cosign,
-GitHub provenance, and the signed Agent update manifest require an exact
-version tag plus the protected `production-release` environment. Those are
-the `production` cases in the plan and remain unavailable until the P12-T05
-human approval gate. An unsigned RC must never be described as signed or
-production-published.
+The ordinary `dev` and pull-request workflow intentionally creates an unsigned
+RC. A tagged production dispatch first creates the same unsigned base, then a
+protected platform-signing matrix signs the exact native Desktop bytes: Apple
+codesign/notarization/stapling on Darwin, Authenticode plus timestamp on
+Windows, and an embedded GPG signature on Linux AppImage that is verified by
+the checksum-pinned AppImageUpdate validator. Linux DEB remains a
+checksum/provenance-bound package and is not described as independently signed.
 
-Native Desktop packages are also unsigned RC inputs. Platform code signing,
-macOS notarization, Windows Authenticode verification, and applicable Linux
-package/AppImage signatures are a separate required production case. Checksum
-Cosign and GitHub provenance do not substitute for those platform trust chains.
+Each target produces a canonical platform-signing receipt. A finalization step
+overlays those signed bytes and receipts, regenerates the composition SPDX
+SBOM, updates `release-index.json.platformSigning`, regenerates `SHA256SUMS`,
+and must pass `verify --require-platform-signing`. Only that final artifact is
+eligible for keyless Cosign/GitHub provenance; the Agent update manifest is
+signed afterward from the attested artifact. These production jobs require the
+protected `production-release` environment and remain unavailable until the
+P12-T05 approval and real credential/evidence handoff. An unsigned RC must
+never be described as signed or production-published.
 
 ## Result records
 
@@ -138,7 +144,7 @@ reviewed release-only commit that changes all product version declarations and
 release metadata to `2.0.0` without changing product behavior or dependencies.
 That commit must pass CI, be promoted to `main`, and be tagged exactly
 `v2.0.0`; the manually dispatched tagged Release Build Matrix must then produce
-the attested supply-chain artifact.
+the platform-signed, re-finalized, and attested supply-chain artifact.
 
 The evidence document must retain the RC identity and add both independently
 verifiable production records:
@@ -192,16 +198,18 @@ node scripts/rc-readiness.mjs check-evidence \
 
 The validator derives `2.0.0`, `v2.0.0`, and
 `cmclient-supply-chain-attested` from the reviewed RC line and workflow
-contract. A final artifact cannot reuse the RC commit, an unsigned `dev`
-artifact, a different tag, or an unrelated workflow run.
+contract. A final artifact must include the complete platform-signing receipt
+set and cannot reuse the RC commit, an unsigned `dev` artifact, a different
+tag, or an unrelated workflow run.
 
 ## Machine evidence
 
 Machine cases must point to the exact successful workflow jobs. Relevant
 evidence includes:
 
-- canonical artifact plan, build manifests, release index, archive extraction,
-  native package inventory, OCI load, checksums, and SPDX SBOM;
+- canonical artifact plan, build manifests, release index (including
+  `platformSigning`), per-target signing receipts, archive extraction, native
+  package inventory, OCI load, checksums, and SPDX SBOM;
 - full verify, resource/load soak, Web Playwright, Control API, CLI, Desktop,
   service, and constrained Docker smoke;
 - dependency signatures, advisory audit, secret scan, workflow policy, and

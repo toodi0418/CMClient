@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  auditAppImageValidatorInstaller,
   auditPackageManifest,
   auditPnpmWorkspace,
   auditProductionDeploy,
@@ -43,6 +44,29 @@ function workflow({
 
 function violationCodes(violations) {
   return new Set(violations.map(({ code }) => code));
+}
+
+function replaceInWorkflowJob(
+  source,
+  jobName,
+  nextJobName,
+  expected,
+  replacement,
+) {
+  const startMarker = `\n  ${jobName}:\n`;
+  const startMatch = source.indexOf(startMarker);
+  const start = startMatch < 0 ? -1 : startMatch + 1;
+  const endMarker = nextJobName ? `\n  ${nextJobName}:\n` : undefined;
+  const endMatch = endMarker ? source.indexOf(endMarker, start + 1) : -1;
+  const end = endMarker ? (endMatch < 0 ? -1 : endMatch + 1) : source.length;
+  assert.notEqual(start, -1, `${jobName} fixture is missing`);
+  if (nextJobName) {
+    assert.notEqual(end, -1, `${nextJobName} fixture is missing`);
+  }
+  const job = source.slice(start, end);
+  const mutated = job.replace(expected, replacement);
+  assert.notEqual(mutated, job, `${jobName} mutation did not apply`);
+  return `${source.slice(0, start)}${mutated}${source.slice(end)}`;
 }
 
 function rustsecMetadataFixture() {
@@ -289,9 +313,12 @@ test("required workflow gates are structural and fail closed", async () => {
       auditWorkflow(".github/workflows/ci.yml", swallowedAudit).violations,
     ).has("CI_SECURITY_GATE_MISSING"),
   );
-  const ignoredTag = release.replace(
-    "      - name: Verify the exact immutable release tag",
-    "      - name: Verify the exact immutable release tag\n        continue-on-error: true",
+  const ignoredTag = replaceInWorkflowJob(
+    release,
+    "attest",
+    "sign-update-manifest",
+    "      - name: Verify the exact immutable release tag and finalized input",
+    "      - name: Verify the exact immutable release tag and finalized input\n        continue-on-error: true",
   );
   assert.ok(
     violationCodes(
@@ -325,7 +352,7 @@ test("required workflow gates are structural and fail closed", async () => {
         ".github/workflows/release-build.yml",
         duplicatedSigningSecret,
       ).violations,
-    ).has("RELEASE_MANIFEST_SIGNING_GATE_INVALID"),
+    ).has("RELEASE_SIGNING_SECRET_SCOPE_INVALID"),
   );
   const allSecretsExpression = ["${{", " toJSON(secrets)", " }}"].join("");
   const earlySecretExposure = release.replace(
@@ -337,7 +364,157 @@ test("required workflow gates are structural and fail closed", async () => {
       .violations,
   );
   assert.ok(earlySecretCodes.has("WORKFLOW_SECRET_CONTEXT_UNEXPECTED"));
-  assert.ok(earlySecretCodes.has("RELEASE_MANIFEST_SIGNING_GATE_INVALID"));
+  assert.ok(earlySecretCodes.has("RELEASE_SIGNING_SECRET_SCOPE_INVALID"));
+
+  const missingSigningInput = replaceInWorkflowJob(
+    release,
+    "platform-sign-native",
+    "finalize-platform-signed",
+    "    needs: [build, supply-chain, final-windows-service-smoke]",
+    "    needs: [build, supply-chain]",
+  );
+  assert.ok(
+    violationCodes(
+      auditWorkflow(".github/workflows/release-build.yml", missingSigningInput)
+        .violations,
+    ).has("RELEASE_PLATFORM_SIGNING_GATE_INVALID"),
+  );
+
+  const missingPlatformDependency = replaceInWorkflowJob(
+    release,
+    "finalize-platform-signed",
+    "attest",
+    "    needs: [supply-chain, final-windows-service-smoke, platform-sign-native]",
+    "    needs: [supply-chain, final-windows-service-smoke]",
+  );
+  assert.ok(
+    violationCodes(
+      auditWorkflow(
+        ".github/workflows/release-build.yml",
+        missingPlatformDependency,
+      ).violations,
+    ).has("RELEASE_PLATFORM_FINALIZATION_GATE_INVALID"),
+  );
+
+  const bypassedFinalizer = replaceInWorkflowJob(
+    release,
+    "attest",
+    "sign-update-manifest",
+    "    needs: [finalize-platform-signed]",
+    "    needs: [supply-chain]",
+  );
+  assert.ok(
+    violationCodes(
+      auditWorkflow(".github/workflows/release-build.yml", bypassedFinalizer)
+        .violations,
+    ).has("RELEASE_ATTESTATION_GATE_INVALID"),
+  );
+
+  const bypassedFinalVerification = replaceInWorkflowJob(
+    release,
+    "finalize-platform-signed",
+    "attest",
+    "            --require-platform-signing \\",
+    "            --allow-unsigned-platform \\",
+  );
+  assert.ok(
+    violationCodes(
+      auditWorkflow(
+        ".github/workflows/release-build.yml",
+        bypassedFinalVerification,
+      ).violations,
+    ).has("RELEASE_PLATFORM_FINALIZATION_GATE_INVALID"),
+  );
+
+  const unsignedAttestation = replaceInWorkflowJob(
+    release,
+    "attest",
+    "sign-update-manifest",
+    "            --require-platform-signing \\",
+    "            --allow-unsigned-platform \\",
+  );
+  assert.ok(
+    violationCodes(
+      auditWorkflow(".github/workflows/release-build.yml", unsignedAttestation)
+        .violations,
+    ).has("RELEASE_ATTESTATION_GATE_INVALID"),
+  );
+
+  const unsignedManifest = replaceInWorkflowJob(
+    release,
+    "sign-update-manifest",
+    undefined,
+    "            --require-platform-signing \\",
+    "            --allow-unsigned-platform \\",
+  );
+  assert.ok(
+    violationCodes(
+      auditWorkflow(".github/workflows/release-build.yml", unsignedManifest)
+        .violations,
+    ).has("RELEASE_MANIFEST_SIGNING_GATE_INVALID"),
+  );
+
+  const bypassedAttestation = replaceInWorkflowJob(
+    release,
+    "sign-update-manifest",
+    undefined,
+    "    needs: [attest]",
+    "    needs: [finalize-platform-signed]",
+  );
+  assert.ok(
+    violationCodes(
+      auditWorkflow(".github/workflows/release-build.yml", bypassedAttestation)
+        .violations,
+    ).has("RELEASE_MANIFEST_SIGNING_GATE_INVALID"),
+  );
+
+  const appleCertificateSecret = [
+    "${{",
+    " secrets.",
+    "CMCLIENT_APPLE_CERTIFICATE",
+    " }}",
+  ].join("");
+  const earlyPlatformSecret = replaceInWorkflowJob(
+    release,
+    "platform-sign-native",
+    "finalize-platform-signed",
+    "        id: identity\n        shell: bash",
+    `        id: identity\n        env:\n          LEAKED_APPLE_CERTIFICATE: ${appleCertificateSecret}\n        shell: bash`,
+  );
+  const earlyPlatformCodes = violationCodes(
+    auditWorkflow(".github/workflows/release-build.yml", earlyPlatformSecret)
+      .violations,
+  );
+  assert.ok(earlyPlatformCodes.has("RELEASE_PLATFORM_SIGNING_GATE_INVALID"));
+  assert.ok(earlyPlatformCodes.has("RELEASE_SIGNING_SECRET_SCOPE_INVALID"));
+
+  const missingLinuxTrust = replaceInWorkflowJob(
+    release,
+    "platform-sign-native",
+    "finalize-platform-signed",
+    "          bash scripts/install-appimage-validator.sh \\",
+    "          bash scripts/install-unreviewed-validator.sh \\",
+  );
+  assert.ok(
+    violationCodes(
+      auditWorkflow(".github/workflows/release-build.yml", missingLinuxTrust)
+        .violations,
+    ).has("RELEASE_PLATFORM_SIGNING_GATE_INVALID"),
+  );
+
+  const earlyUpdateSecret = replaceInWorkflowJob(
+    release,
+    "sign-update-manifest",
+    undefined,
+    "      - name: Verify immutable tag, release input, and attestation before exposing the signing key\n        shell: bash",
+    `      - name: Verify immutable tag, release input, and attestation before exposing the signing key\n        env:\n          LEAKED_UPDATE_SIGNING_KEY: ${signingSecret}\n        shell: bash`,
+  );
+  const earlyUpdateCodes = violationCodes(
+    auditWorkflow(".github/workflows/release-build.yml", earlyUpdateSecret)
+      .violations,
+  );
+  assert.ok(earlyUpdateCodes.has("RELEASE_MANIFEST_SIGNING_GATE_INVALID"));
+  assert.ok(earlyUpdateCodes.has("RELEASE_SIGNING_SECRET_SCOPE_INVALID"));
 });
 
 test("package audit rejects unsafe dependency sources and lifecycle scripts", () => {
@@ -601,6 +778,50 @@ test("SBOM installer audit locks the complete reviewed source", async () => {
       ),
     ).has("SBOM_TOOL_INSTALLER_INVALID"),
   );
+});
+
+test("AppImage validator installer audit locks both architectures and the complete source", async () => {
+  const installer = await readFile(
+    "scripts/install-appimage-validator.sh",
+    "utf8",
+  );
+  assert.deepEqual(
+    auditAppImageValidatorInstaller(
+      "scripts/install-appimage-validator.sh",
+      installer,
+    ),
+    [],
+  );
+  assert.deepEqual(
+    auditAppImageValidatorInstaller(
+      "scripts/install-appimage-validator.sh",
+      installer.replaceAll("\n", "\r\n"),
+    ),
+    [],
+  );
+
+  for (const tampered of [
+    installer.replace("2.0.0-alpha-1-20251018", "latest"),
+    installer.replace(
+      "b10c8d39a0a917432af185afc92f1cd54b7f68aa70deda927acacf38ded84990",
+      "0".repeat(64),
+    ),
+    installer.replace(
+      "79ca9d7b97ffbfb87838659cf7ffa35aa6956226c45bb038c323cda6843a49d4",
+      "0".repeat(64),
+    ),
+    installer.replace("--check --strict", "--status"),
+    `${installer}\nprintf 'replacement' > "$destination/validate"\n`,
+  ]) {
+    assert.ok(
+      violationCodes(
+        auditAppImageValidatorInstaller(
+          "scripts/install-appimage-validator.sh",
+          tampered,
+        ),
+      ).has("APPIMAGE_VALIDATOR_INSTALLER_INVALID"),
+    );
+  }
 });
 
 test("repository entries include tracked and untracked non-ignored files", async (t) => {

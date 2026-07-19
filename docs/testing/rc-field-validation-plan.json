@@ -280,9 +280,9 @@
       "validator": "human",
       "targets": ["all"],
       "modes": ["artifact", "security"],
-      "procedure": "After P12-T05 approval, dispatch the exact immutable version tag through the protected production-release environment with attestation enabled.",
-      "expected": "Cosign verifies the SHA256SUMS signature against the exact workflow identity and tag.",
-      "evidence": ["tag commit", "production workflow run URL", "Sigstore bundle verification"]
+      "procedure": "After P12-T05 approval, dispatch the exact immutable version tag through the protected production-release environment with attestation enabled, after the platform-signed finalizer has completed.",
+      "expected": "Cosign verifies the finalized SHA256SUMS signature against the exact workflow identity and tag.",
+      "evidence": ["tag commit", "production workflow run URL", "platform-signed artifact digest", "Sigstore bundle verification"]
     },
     {
       "id": "PROD-PLATFORM-SIGNING",
@@ -291,9 +291,9 @@
       "validator": "human",
       "targets": ["all"],
       "modes": ["desktop-native"],
-      "procedure": "After P12-T05 approval, rebuild the exact native Desktop packages through protected platform signing identities and verify macOS signing/notarization, Windows Authenticode, and Linux package/AppImage signatures as applicable.",
-      "expected": "Every native Desktop package resolves to the approved source commit and passes the target platform trust verification without exposing signing material.",
-      "evidence": ["signed package SHA-256", "platform trust verification", "notarization or signing identity reference"]
+      "procedure": "After P12-T05 approval, dispatch the exact immutable version tag through the protected production-release environment. For each target, sign the prebuilt native Desktop bytes with Apple codesign plus notarization and staple on Darwin, Authenticode plus a trusted timestamp on Windows, or an embedded GPG signature on Linux AppImage verified by the checksum-pinned AppImageUpdate validator; keep Linux DEB checksum/provenance-bound. Verify the platform trust result, emit the canonical receipt, overlay all five target outputs, regenerate the SBOM, release index, and SHA256SUMS, and run verify --require-platform-signing.",
+      "expected": "Every native Desktop package and receipt resolves to the approved source commit, signed bytes differ from the unsigned base where platform trust applies, and the finalized artifact passes required platform-signing verification without exposing signing material.",
+      "evidence": ["signed package SHA-256", "platform-signing receipt set", "platform trust verification", "notarization or signing identity reference", "finalized release index and SHA256SUMS"]
     },
     {
       "id": "PROD-PROVENANCE",
@@ -302,7 +302,7 @@
       "validator": "human",
       "targets": ["all"],
       "modes": ["artifact", "security"],
-      "procedure": "After P12-T05 approval, verify GitHub provenance subjects against every checksummed archive, installer, OCI image, and SBOM.",
+      "procedure": "After P12-T05 approval and platform-signing finalization, verify GitHub provenance subjects against every checksummed archive, installer, platform-signing receipt, OCI image, and SBOM.",
       "expected": "All production subjects bind to the approved tag workflow with no unchecksummed deliverable.",
       "evidence": ["attestation URL", "subject digest set", "verification transcript"]
     },
@@ -313,8 +313,8 @@
       "validator": "human",
       "targets": ["all"],
       "modes": ["artifact", "update-rollback"],
-      "procedure": "After P12-T05 approval and provenance verification, create the signed Agent update manifest for the immutable HTTPS archive directory.",
-      "expected": "The manifest contains only updater-managed portable archives, validates the expected key ID, and installs through the Agent health/rollback gate.",
+      "procedure": "After P12-T05 approval, platform-signing verification, and provenance verification, create the signed Agent update manifest for the immutable HTTPS archive directory.",
+      "expected": "The manifest is created only from the attested platform-signed index, contains only updater-managed portable archives, validates the expected key ID, and installs through the Agent health/rollback gate.",
       "evidence": ["manifest SHA-256", "signing key ID", "sanitized verification and update result"]
     }
   ]

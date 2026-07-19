@@ -79,6 +79,35 @@ exposes setup-node's external `node.exe` to only the test service environment;
 it rejects a Node executable inside the bundle and verifies that Gateway uses
 the external Node as the final Agent's child process.
 
+## Platform signing and finalization
+
+Ordinary pull-request and `dev` builds, including the unsigned base of a
+production dispatch, produce the native files without platform trust
+signatures. A protected tag-only matrix can then sign the exact prebuilt
+Desktop staging output. Darwin uses Apple codesign, notarization, and ticket
+stapling; Windows uses Authenticode with a trusted timestamp for both MSI and
+NSIS; Linux embeds a GPG signature in AppImage and verifies it with the
+checksum-pinned AppImageUpdate `validate` tool. Linux DEB files remain
+checksum- and provenance-bound deliverables rather than pretending to have an
+independent package signature.
+
+Each target emits one canonical platform-signing receipt containing the source
+SHA, target/version, non-secret identity reference, package digest and size,
+and the applicable trust type. A finalizer overlays those signed native bytes
+and receipts onto the unsigned supply-chain output, regenerates the SPDX SBOM
+from the resulting composition, updates `release-index.json.platformSigning`,
+and regenerates `SHA256SUMS`. It must pass
+`release-supply-chain.mjs verify --require-platform-signing` before the
+platform-signed artifact can be attested. Keyless checksum/provenance
+attestation is therefore over the final signed bytes; Agent update-manifest
+signing is a later step that consumes only that attested artifact.
+
+Signing identities and credentials are protected release-environment inputs,
+not repository files or ordinary CI inputs. The receipts and release index
+prove which bytes were accepted, but do not claim that real Apple,
+Authenticode, GPG, or notarization execution has occurred until the field gate
+provides its external evidence.
+
 Linux artifacts are built on the pinned Ubuntu 22.04 runners rather than
 `ubuntu-latest`. This keeps the native glibc baseline compatible with current
 Raspberry Pi ARM64 and long-lived x64 deployments while preventing a runner
@@ -126,10 +155,12 @@ CI uploads staged inputs under
 published release assets. `scripts/release-supply-chain.mjs` validates each
 manifest against the canonical composition before producing archives,
 checksums, SBOM, provenance subjects, and, when explicitly authorized, a
-signed update manifest. Every target runs each staged complete runtime
-composition; the supply-chain job also extracts and starts the final Linux x64
-Headless and Desktop archives, including a bounded Tauri launch, so archive
-creation cannot silently change runtime layout or executable modes.
+signed update manifest. Platform-signed bytes are a later overlay with a
+receipt, regenerated SBOM/index/checksum set, and a required platform-signing
+verification. Every target runs each staged complete runtime composition; the
+supply-chain job also extracts and starts the final Linux x64 Headless and
+Desktop archives, including a bounded Tauri launch, so archive creation cannot
+silently change runtime layout or executable modes.
 `scripts/desktop-native-bundles.mjs` separately generates
 the release-only Tauri configuration, collects platform-dependent Tauri
 filenames under stable names, and rejects missing, duplicate, extra, or empty

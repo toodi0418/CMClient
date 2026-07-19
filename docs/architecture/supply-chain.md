@@ -14,7 +14,8 @@ the standalone CLI archive remains CLI-only. The Agent
 installer independently rejects traversal, symlinks, special files, digest
 changes, and oversized extraction.
 
-The release workflow always builds an unsigned artifact bundle containing:
+Every pull request, `dev` run, and the unsigned first stage of a tagged release
+builds the same unsigned artifact bundle containing:
 
 - every canonical archive;
 - all checksum-covered native Desktop installers and application packages,
@@ -49,10 +50,49 @@ service. Each extracted resource tree is checked against the canonical Desktop
 composition and its packaged Tauri executable must remain running through a
 bounded native launch. The final Linux x64 portable Desktop archive separately
 starts Agent, Gateway, Web, CLI, and Tauri after supply-chain assembly. These
-packages are unsigned during ordinary `dev` CI; production platform code
-signing is not performed by this workflow. It requires human-approved protected
-release credentials and must be recorded by the RC field gate before promotion;
-no ambient CI secret is assumed.
+packages are unsigned during ordinary `dev` and pull-request CI. A production
+dispatch does not treat that unsigned bundle as final; it runs the protected
+platform-signing and re-finalization boundary described below.
+
+## Protected platform signing
+
+Platform signing is a production-only matrix. It can run only from an exact
+`v<package-version>` tag with `workflow_dispatch` and `attest=true` through the
+protected `production-release` environment. The matrix downloads the exact
+prebuilt Desktop staging tree and signs only the native package bytes for its
+target:
+
+- Darwin signs the application with Apple codesign, submits the DMG for
+  notarization, staples the notarization ticket, and verifies codesign,
+  Gatekeeper assessment, and staple validation.
+- Windows signs both MSI and NSIS outputs with Authenticode and a trusted
+  timestamp, then verifies the signer thumbprint and timestamp certificate.
+- Linux embeds a GPG signature in each AppImage and verifies it with the
+  checksum-pinned AppImageUpdate `validate` tool. The DEB is deliberately not
+  treated as a separately signed package; its exact bytes are bound by the
+  checksum and provenance chain.
+
+Each target writes one canonical
+`cmclient-platform-signing-<target>-<version>.json` receipt. A receipt binds
+the schema, target, version, source SHA, non-secret identity reference, exact
+package filename, byte size, SHA-256, and platform trust type. It contains no
+private key, password, token, or host-specific path.
+
+The `finalize-platform-signed` job downloads the unsigned supply-chain bundle,
+all five target outputs, and the exact build stages. It overlays the signed
+native bytes and receipts, regenerates the SPDX SBOM from that signed
+composition, updates `release-index.json.platformSigning`, regenerates
+`SHA256SUMS` (including the receipts), and runs
+`verify --require-platform-signing`. The resulting
+`cmclient-supply-chain-platform-signed-*` artifact is the only input accepted
+by attestation. Keyless Cosign and GitHub provenance run next; the optional
+Agent update-manifest signer runs only after that attested artifact has passed
+the same platform-signing verification.
+
+The workflow defines the protected secret and variable boundary, but ordinary
+CI never receives those values. Actual Apple, Windows, and Linux identities,
+notarization accounts, and release approval remain field/handoff prerequisites
+and are not evidence that production signing has already executed.
 
 The final Windows Service ZIP has an additional post-assembly gate on a native
 Windows runner. The job downloads the exact unsigned supply-chain artifact,
@@ -84,12 +124,13 @@ deploy resolver or a production deploy command that omits the frozen lock.
 Normal `dev` and pull-request runs keep `contents: read` and do not request an
 OIDC token. A maintainer must manually dispatch `Release Build Matrix` from an
 exact `v<package-version>` tag with `attest=true`, through the protected
-`production-release` environment, to enable the separate attestation job. That
-job has only `contents: read`, `id-token: write`, and `attestations: write`; it
-creates a keyless Cosign bundle for `SHA256SUMS` and a GitHub SLSA provenance
-attestation whose subjects are the checksummed archives and SBOM. Every
-third-party workflow action is pinned to a reviewed complete commit SHA, and
-checkout credentials are not persisted.
+`production-release` environment. Platform signing and re-finalization must
+complete first. The attestation job then has only `contents: read`,
+`id-token: write`, and `attestations: write`; it creates a keyless Cosign bundle
+for the finalized `SHA256SUMS` and a GitHub SLSA provenance attestation whose
+subjects are every checksummed archive, native installer, receipt, OCI image,
+and SBOM. Every third-party workflow action is pinned to a reviewed complete
+commit SHA, and checkout credentials are not persisted.
 
 Stable promotion does not rename an RC artifact. After RC field validation and
 P12-T05 approval, one reviewed release-only commit changes the synchronized
@@ -109,11 +150,13 @@ repository variable
 The secret is a base64-encoded PKCS#8 Ed25519 private key. It is passed only as
 an environment value to the signing process; it is never an action input,
 command argument, artifact, log field, application setting, or runtime secret.
-The signing job downloads only the attested supply-chain artifact, checks out
-the exact workflow commit, checks that the tag is `v<package-version>`, verifies
-the Cosign bundle identity, and re-verifies every archive, SBOM, checksum,
-digest, size, and Docker source SHA against that commit's canonical matrix
-before exposing the key. It fails closed when either signing value is absent.
+The signing job downloads only the attested, platform-signed supply-chain
+artifact, checks out the exact workflow commit, checks that the tag is
+`v<package-version>`, verifies the Cosign bundle identity, requires
+`index.platformSigning`, and re-verifies every archive, native package, receipt,
+SBOM, checksum, digest, size, and Docker source SHA against that commit's
+canonical matrix before exposing the key. It fails closed when either signing
+value or the platform-signing metadata is absent.
 
 The script reconstructs the Rust Agent's compact JSON field order before
 calling Ed25519 and emits unpadded standard Base64. The Agent already treats
