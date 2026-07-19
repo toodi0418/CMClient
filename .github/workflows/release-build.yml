@@ -317,11 +317,19 @@ jobs:
             --portable "$GITHUB_WORKSPACE/release-build/desktop/$target" \
             --icons "$icon_output" \
             --output "$config"
-          pnpm --filter @cmclient/desktop exec tauri bundle \
-            --ci \
-            --no-sign \
-            --target "$rust_target" \
+          bundle_args=(
+            --ci
+            --no-sign
+            --target "$rust_target"
             --config "$config"
+          )
+          if [[ "$target" == linux-* ]]; then
+            # linuxdeploy scans the complete portable runtime. Do not let its
+            # strip/patchelf pass reject static ELF helpers shipped as data.
+            export NO_STRIP=true
+            bundle_args+=(--verbose)
+          fi
+          pnpm --filter @cmclient/desktop exec tauri bundle "${bundle_args[@]}"
           node scripts/desktop-native-bundles.mjs collect \
             --target "$target" \
             --version "$version" \

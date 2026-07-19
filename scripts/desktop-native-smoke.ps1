@@ -22,12 +22,27 @@ if ($LASTEXITCODE -ne 0) {
 $temporary = Join-Path $env:TEMP "cmclient-native-desktop-$([Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force $temporary | Out-Null
 
-function Assert-BundledRuntime([string]$Root) {
-    $runtime = Get-ChildItem -LiteralPath $Root -Directory -Recurse -Filter "cmclient-runtime" |
+function Find-BundledRuntime([string]$Root) {
+    # Locate the contract manifest rather than relying on provider-specific
+    # directory filtering after an administrative MSI extraction.
+    $manifest = Get-ChildItem -LiteralPath $Root -File -Recurse -Force -Filter "build-manifest.json" -ErrorAction SilentlyContinue |
         Select-Object -First 1
-    if ($null -eq $runtime) {
+    if ($null -eq $manifest) {
+        $hints = Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(?i)cmclient-runtime|build-manifest' } |
+            Select-Object -First 20
+        $hints | ForEach-Object { Write-Host "resource hint: $($_.FullName)" }
         throw "NATIVE_DESKTOP_RUNTIME_MISSING"
     }
+    $runtime = $manifest.Directory
+    if ($runtime.Name -ne "cmclient-runtime") {
+        throw "NATIVE_DESKTOP_RUNTIME_PATH_INVALID"
+    }
+    return $runtime
+}
+
+function Assert-BundledRuntime([string]$Root) {
+    $runtime = Find-BundledRuntime $Root
     & node scripts/desktop-native-bundles.mjs verify-runtime --target $Target --version $Version --input $runtime.FullName
     if ($LASTEXITCODE -ne 0) {
         throw "NATIVE_DESKTOP_RUNTIME_INVALID"

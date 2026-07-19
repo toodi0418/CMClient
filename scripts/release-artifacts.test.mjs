@@ -682,8 +682,10 @@ test("release workflow builds and inspects native Desktop packages from portable
   assert.match(workflow, /pnpm --filter @cmclient\/desktop exec tauri icon/);
   assert.match(
     workflow,
-    /pnpm --filter @cmclient\/desktop exec tauri bundle[\s\S]*--no-sign[\s\S]*--target "\$rust_target"/,
+    /bundle_args=\([\s\S]*--no-sign[\s\S]*--target "\$rust_target"[\s\S]*\)[\s\S]*pnpm --filter @cmclient\/desktop exec tauri bundle/,
   );
+  assert.match(workflow, /export NO_STRIP=true/);
+  assert.match(workflow, /bundle_args\+=\(--verbose\)/);
   assert.match(
     workflow,
     /--portable "\$GITHUB_WORKSPACE\/release-build\/desktop\/\$target"/,
@@ -702,6 +704,8 @@ test("release workflow builds and inspects native Desktop packages from portable
   assert.match(shellSmoke, /launch_native_app/);
   assert.match(windowsSmoke, /msiexec\.exe \/a/);
   assert.match(windowsSmoke, /7z\.exe x/);
+  assert.match(windowsSmoke, /build-manifest\.json/);
+  assert.match(windowsSmoke, /-Force -Filter/);
   assert.match(windowsSmoke, /desktop-native-bundles\.mjs verify-runtime/);
   assert.match(windowsSmoke, /Assert-NativeAppLaunch/);
 
