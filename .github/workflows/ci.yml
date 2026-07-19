@@ -155,11 +155,13 @@ jobs:
           $hostV1 = Join-Path $root "v1\cmclient-service-host.exe"
           $hostV2 = Join-Path $root "v2\cmclient-service-host.exe"
           $state = Join-Path $root "data\retained-state"
+          $sentinel = "must survive service lifecycle"
           $manager = Join-Path $PWD "scripts\cmclient-windows-service.ps1"
           New-Item -ItemType Directory -Force (Split-Path $hostV1), (Split-Path $hostV2), (Split-Path $state) | Out-Null
           Copy-Item (Join-Path $PWD "target\debug\cmclient-service-host.exe") $hostV1
           Copy-Item $hostV1 $hostV2
-          Set-Content -NoNewline $state "must survive service lifecycle"
+          [IO.File]::WriteAllText($state, $sentinel)
+          if (-not (Test-Path -LiteralPath $state -PathType Leaf) -or [IO.File]::ReadAllText($state) -ne $sentinel) { throw "Windows lifecycle retained-state fixture was not created" }
           try {
             powershell -NoProfile -ExecutionPolicy Bypass -File $manager install -HostPath $hostV1 -ServiceName $serviceName -NoStart
             if ((Get-Service -Name $serviceName).Status -ne "Stopped") { throw "Windows service should not start in lifecycle smoke" }
@@ -169,7 +171,7 @@ jobs:
             powershell -NoProfile -ExecutionPolicy Bypass -File $manager uninstall -HostPath $hostV2 -ServiceName $serviceName
             for ($attempt = 0; $attempt -lt 10 -and (Get-Service -Name $serviceName -ErrorAction SilentlyContinue); $attempt++) { Start-Sleep -Milliseconds 250 }
             if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) { throw "Windows service was not removed" }
-            if ((Get-Content -Raw $state) -ne "must survive service lifecycle") { throw "Windows service uninstall removed retained state" }
+            if (-not (Test-Path -LiteralPath $state -PathType Leaf) -or [IO.File]::ReadAllText($state) -ne $sentinel) { throw "Windows service uninstall removed retained state" }
           }
           finally {
             if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
