@@ -5,8 +5,17 @@
 `cmclient-service-host.exe` is a real Windows SCM process, not an `sc.exe`
 wrapper around a console binary. It receives SCM start/stop/shutdown controls,
 starts the adjacent `cmclient-agent.exe`, and reports the Agent child exit as a
-service failure. On stop it terminates and waits for the child; the Agent's
-durable update recovery handles an interrupted update on its next start.
+service failure. On stop it repeatedly requests the local-only Agent shutdown
+route, waits up to 50 seconds for Agent and Gateway cooperative teardown, then
+uses process termination only as a bounded fallback. The supervised Gateway
+also treats its Agent stdin pipe closing as parent death, so fallback cannot
+leave an orphan Gateway holding the loopback port. The Agent's durable update
+recovery handles an interrupted update on its next start.
+
+Each local shutdown request runs in a single bounded worker, and both its wait
+and the following poll sleep are capped by the remaining 50-second budget. A
+stalled named-pipe request therefore cannot delay the process fallback beyond
+the service deadline.
 
 `scripts/cmclient-windows-service.ps1` registers `CMClientAgent` with the
 `LocalService` account and automatic start. The host gives the child explicit,

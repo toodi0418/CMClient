@@ -8,6 +8,8 @@ import { DomainEventSchema, type DomainEvent } from "@cmclient/contracts";
 import { Value } from "@sinclair/typebox/value";
 
 export const DEFAULT_GATEWAY_EVENTS_URL = "/api/v1/events";
+export const DEFAULT_SSE_FRAME_MAX_BYTES = 60 * 1024;
+const PARSER_INPUT_SLICE_CODE_UNITS = 8 * 1024;
 
 export type SseConnectionState =
   "idle" | "connecting" | "open" | "reconnecting" | "stopped";
@@ -30,20 +32,56 @@ export interface SseFrame {
   data?: string;
 }
 
+export interface SseFrameParserOptions {
+  maxFrameBytes?: number;
+}
+
 export class SseFrameParser {
   private buffer = "";
+  private readonly maxFrameBytes: number;
+
+  constructor(options: SseFrameParserOptions = {}) {
+    this.maxFrameBytes = options.maxFrameBytes ?? DEFAULT_SSE_FRAME_MAX_BYTES;
+    if (
+      !Number.isInteger(this.maxFrameBytes) ||
+      this.maxFrameBytes < 1 ||
+      this.maxFrameBytes > DEFAULT_SSE_FRAME_MAX_BYTES
+    ) {
+      throw new RangeError("SSE frame byte limit is invalid");
+    }
+  }
 
   push(chunk: string): SseFrame[] {
-    this.buffer += chunk;
     const frames: SseFrame[] = [];
-    let boundary: RegExpExecArray | null;
-
-    while ((boundary = /\r?\n\r?\n/.exec(this.buffer))) {
-      const block = this.buffer.slice(0, boundary.index);
-      this.buffer = this.buffer.slice(boundary.index + boundary[0].length);
-      const frame = parseSseBlock(block);
-      if (frame) {
-        frames.push(frame);
+    for (
+      let offset = 0;
+      offset < chunk.length;
+      offset += PARSER_INPUT_SLICE_CODE_UNITS
+    ) {
+      this.buffer += chunk.slice(
+        offset,
+        offset + PARSER_INPUT_SLICE_CODE_UNITS,
+      );
+      let boundary: RegExpExecArray | null;
+      while ((boundary = /\r?\n\r?\n/.exec(this.buffer))) {
+        const consumedLength = boundary.index + boundary[0].length;
+        const block = this.buffer.slice(0, boundary.index);
+        if (
+          utf8ByteLength(this.buffer.slice(0, consumedLength)) >
+          this.maxFrameBytes
+        ) {
+          this.buffer = "";
+          throw new GatewayApiError({ code: "SSE_EVENT_TOO_LARGE" });
+        }
+        this.buffer = this.buffer.slice(consumedLength);
+        const frame = parseSseBlock(block);
+        if (frame) {
+          frames.push(frame);
+        }
+      }
+      if (utf8ByteLength(this.buffer) > this.maxFrameBytes) {
+        this.buffer = "";
+        throw new GatewayApiError({ code: "SSE_EVENT_TOO_LARGE" });
       }
     }
 
@@ -53,8 +91,15 @@ export class SseFrameParser {
   finish(): SseFrame[] {
     const remaining = this.buffer;
     this.buffer = "";
+    if (utf8ByteLength(remaining) > this.maxFrameBytes) {
+      throw new GatewayApiError({ code: "SSE_EVENT_TOO_LARGE" });
+    }
     const frame = parseSseBlock(remaining);
     return frame ? [frame] : [];
+  }
+
+  get bufferedBytes(): number {
+    return utf8ByteLength(this.buffer);
   }
 }
 
@@ -114,7 +159,16 @@ export class GatewayEventClient {
     this.running = true;
     const controller = new AbortController();
     this.controller = controller;
-    void this.run(controller);
+    void this.run(controller).catch((error: unknown) => {
+      if (!this.running || controller.signal.aborted) {
+        return;
+      }
+      this.running = false;
+      this.emitError(
+        isGatewayApiError(error) ? error : createNetworkError(error),
+      );
+      this.setState("stopped");
+    });
   }
 
   stop(): void {
@@ -129,6 +183,9 @@ export class GatewayEventClient {
     try {
       while (this.running && !controller.signal.aborted) {
         this.setState(attempt === 0 ? "connecting" : "reconnecting");
+        if (!this.running || controller.signal.aborted) {
+          break;
+        }
 
         try {
           const response = await this.openStream(controller.signal);
@@ -162,6 +219,9 @@ export class GatewayEventClient {
             ? error
             : createNetworkError(error);
           this.emitError(mapped);
+          if (!this.running || controller.signal.aborted) {
+            break;
+          }
           attempt += 1;
           this.setState("reconnecting");
           try {
@@ -250,7 +310,7 @@ export class GatewayEventClient {
     if (!Value.Check(DomainEventSchema, payload)) {
       throw new GatewayApiError({ code: "SSE_EVENT_INVALID" });
     }
-    const event = payload as DomainEvent;
+    const event = deepFreeze(payload as DomainEvent);
     if (frame.id && frame.id !== event.eventId) {
       throw new GatewayApiError({ code: "SSE_EVENT_ID_MISMATCH" });
     }
@@ -259,15 +319,11 @@ export class GatewayEventClient {
     }
 
     this.lastEventId = event.eventId;
-    for (const listener of this.eventListeners) {
-      listener(event);
-    }
+    notifyListeners(this.eventListeners, event);
   }
 
   private emitError(error: GatewayApiError): void {
-    for (const listener of this.errorListeners) {
-      listener(error);
-    }
+    notifyListeners(this.errorListeners, error);
   }
 
   private setState(state: SseConnectionState): void {
@@ -275,8 +331,19 @@ export class GatewayEventClient {
       return;
     }
     this.state = state;
-    for (const listener of this.stateListeners) {
-      listener(state);
+    notifyListeners(this.stateListeners, state);
+  }
+}
+
+function notifyListeners<T>(
+  listeners: Set<(value: T) => void>,
+  value: T,
+): void {
+  for (const listener of [...listeners]) {
+    try {
+      listener(value);
+    } catch {
+      // Observer failures must not disrupt the stream or later observers.
     }
   }
 }
@@ -310,6 +377,20 @@ function parseSseBlock(block: string): SseFrame | undefined {
     frame.data = data.join("\n");
   }
   return frame.data || frame.id || frame.event ? frame : undefined;
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value)) {
+      deepFreeze(nested);
+    }
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function validateEventsUrl(url: string): string {

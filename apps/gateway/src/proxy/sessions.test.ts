@@ -70,6 +70,36 @@ describe("proxy client session manager", () => {
       ProxySessionError,
     );
   });
+
+  it("replays the maximum default config cache without evicting a new client", () => {
+    const entries = Array.from({ length: 512 }, (_, index) =>
+      configFrame("config", new Uint8Array(512).fill(index % 256)),
+    );
+    const manager = new ProxySessionManager(new FakeUpstream(entries));
+    const client = new FakeClient("client-config-replay", true);
+
+    expect(manager.attach(client)).toEqual({
+      id: "client-config-replay",
+      queuedBytes: 512 * 512,
+      queuedFrames: 512,
+    });
+    expect(client.closedWith).toBeUndefined();
+    manager.stop();
+  });
+
+  it("removes a session even when its sink throws while closing", () => {
+    const manager = new ProxySessionManager(new FakeUpstream([]));
+    manager.attach({
+      id: "throwing-client",
+      close: () => {
+        throw new Error("fixture close failure");
+      },
+      write: async () => undefined,
+    });
+
+    expect(() => manager.detach("throwing-client")).not.toThrow();
+    expect(manager.snapshot).toEqual([]);
+  });
 });
 
 const timestamp = "2026-07-18T00:00:00.000Z";

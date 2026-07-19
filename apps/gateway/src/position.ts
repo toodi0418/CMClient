@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 
 import type {
   NodePositionState,
@@ -47,6 +48,19 @@ export interface PositionHighWaterResult {
   decision: PositionDecision;
   event: PositionCanonicalEvent;
   state?: NodePositionState;
+}
+
+export interface PositionHighWaterApplyOptions {
+  observationId?: string;
+  onAccepted?: (
+    event: PositionCanonicalEvent,
+  ) => "APRS_SKIPPED_OUT_OF_ORDER" | void;
+}
+
+export interface PositionRetentionResult {
+  decisionsDeleted: number;
+  eventsDeleted: number;
+  observationsDeleted: number;
 }
 
 export class PositionRepository {
@@ -157,6 +171,55 @@ export class PositionRepository {
       .map((row) => toPositionCanonicalEvent(row as Record<string, unknown>));
   }
 
+  deleteHistoryBefore(
+    cutoffExclusive: string,
+    limit = 1_000,
+  ): PositionRetentionResult {
+    const cutoff = canonicalTimestamp(cutoffExclusive);
+    if (
+      cutoff === undefined ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 10_000
+    ) {
+      throw new PositionPersistenceError();
+    }
+    let transactionOpen = false;
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const decisionsDeleted = Number(
+        this.database
+          .prepare(
+            "DELETE FROM position_decisions WHERE id IN (SELECT id FROM position_decisions INDEXED BY position_decisions_retention_index WHERE decided_at < ? ORDER BY decided_at ASC, id ASC LIMIT ?)",
+          )
+          .run(cutoff, limit).changes,
+      );
+      const eventsDeleted = Number(
+        this.database
+          .prepare(
+            "DELETE FROM position_events WHERE id IN (SELECT event.id FROM position_events AS event INDEXED BY position_events_retention_index WHERE event.created_at < ? AND NOT EXISTS (SELECT 1 FROM position_decisions AS decision WHERE decision.canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM node_position_state AS state WHERE state.latest_canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM aprs_delivery_high_water AS delivery WHERE delivery.latest_canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM aprs_outbox AS outbox WHERE outbox.canonical_event_id = event.id) ORDER BY event.created_at ASC, event.id ASC LIMIT ?)",
+          )
+          .run(cutoff, limit).changes,
+      );
+      const observationsDeleted = Number(
+        this.database
+          .prepare(
+            "DELETE FROM position_observations WHERE id IN (SELECT observation.id FROM position_observations AS observation INDEXED BY position_observations_retention_index WHERE observation.ingested_at < ? AND NOT EXISTS (SELECT 1 FROM position_events AS event WHERE event.source_observation_id = observation.id) AND NOT EXISTS (SELECT 1 FROM position_decisions AS decision WHERE decision.observation_id = observation.id) ORDER BY observation.ingested_at ASC, observation.id ASC LIMIT ?)",
+          )
+          .run(cutoff, limit).changes,
+      );
+      this.database.exec("COMMIT");
+      transactionOpen = false;
+      return { decisionsDeleted, eventsDeleted, observationsDeleted };
+    } catch {
+      if (transactionOpen) {
+        this.database.exec("ROLLBACK");
+      }
+      throw new PositionPersistenceError();
+    }
+  }
+
   insertOrFindDecision(decision: PositionDecision): PositionDecision {
     try {
       this.database
@@ -220,7 +283,7 @@ export class PositionHighWaterStore {
     event: PositionCanonicalEvent,
     target: PositionMappingTarget,
     decidedAt: string,
-    onAccepted?: (event: PositionCanonicalEvent) => void,
+    options: PositionHighWaterApplyOptions = {},
   ): PositionHighWaterResult {
     if (!target.callsign.trim() || !target.mappingVersion.trim()) {
       throw new PositionPersistenceError();
@@ -234,27 +297,34 @@ export class PositionHighWaterStore {
         event.nodeNum,
         target,
       );
-      const plan: PositionOrderPlan = this.isBacklogObservation(
-        event.sourceObservationId,
-      )
-        ? { advance: false, code: "POSITION_BACKLOG" as const }
-        : decidePositionOrder(current, event);
+      const observationId = options.observationId ?? event.sourceObservationId;
+      const observation = this.requireMatchingObservation(observationId, event);
+      const localPlan = decidePositionOrder(current, event);
       const eventWithEpoch =
-        plan.sequenceEpoch === undefined
+        localPlan.sequenceEpoch === undefined
           ? event
-          : this.assignSequenceEpoch(event, plan.sequenceEpoch);
+          : { ...event, sequenceEpoch: localPlan.sequenceEpoch };
+      const plan: PositionOrderPlan =
+        observation.backlogClassification === "backlog"
+          ? { advance: false, code: "POSITION_BACKLOG" as const }
+          : localPlan.advance &&
+              this.isCoveredByDeliveryHighWater(eventWithEpoch, target)
+            ? { advance: false, code: "APRS_SKIPPED_OUT_OF_ORDER" as const }
+            : localPlan;
       const state = plan.advance
         ? this.writeState(eventWithEpoch, target, decidedAt)
         : current;
+      const decisionCode =
+        plan.code === "POSITION_ACCEPTED"
+          ? (options.onAccepted?.(eventWithEpoch) ?? plan.code)
+          : plan.code;
       const decision = this.writeDecision(
         eventWithEpoch,
+        observationId,
         target,
-        plan.code,
+        decisionCode,
         decidedAt,
       );
-      if (decision.code === "POSITION_ACCEPTED") {
-        onAccepted?.(eventWithEpoch);
-      }
       this.database.exec("COMMIT");
       transactionOpen = false;
       return { event: eventWithEpoch, decision, ...(state ? { state } : {}) };
@@ -287,30 +357,80 @@ export class PositionHighWaterStore {
     return row ? toNodePositionState(row) : undefined;
   }
 
-  private isBacklogObservation(observationId: string): boolean {
+  private isCoveredByDeliveryHighWater(
+    event: PositionCanonicalEvent,
+    target: PositionMappingTarget,
+  ): boolean {
     const row = this.database
       .prepare(
-        "SELECT backlog_classification FROM position_observations WHERE id = ?",
+        "SELECT latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number FROM aprs_delivery_high_water WHERE mesh_network_id = ? AND node_num = ? AND callsign = ?",
       )
+      .get(event.meshNetworkId, event.nodeNum, target.callsign);
+    if (!row) {
+      return false;
+    }
+    const latestEventTime = String(row.latest_event_time);
+    if (
+      !event.eventTime ||
+      !Number.isFinite(Date.parse(event.eventTime)) ||
+      !Number.isFinite(Date.parse(latestEventTime))
+    ) {
+      return true;
+    }
+    const timeOrder = event.eventTime.localeCompare(latestEventTime);
+    if (timeOrder !== 0) {
+      return timeOrder < 0;
+    }
+    if (String(row.latest_canonical_event_id) === event.id) {
+      return true;
+    }
+    const latestSequenceEpoch = optionalInteger(row.latest_sequence_epoch);
+    const latestSequenceNumber = optionalInteger(row.latest_sequence_number);
+    if (
+      row.latest_mapping_version !== target.mappingVersion ||
+      typeof latestSequenceEpoch !== "number" ||
+      typeof latestSequenceNumber !== "number" ||
+      event.sequenceEpoch === undefined ||
+      event.sequenceNumber === undefined
+    ) {
+      return true;
+    }
+    return (
+      event.sequenceEpoch < latestSequenceEpoch ||
+      (event.sequenceEpoch === latestSequenceEpoch &&
+        event.sequenceNumber <= latestSequenceNumber)
+    );
+  }
+
+  private requireMatchingObservation(
+    observationId: string,
+    event: PositionCanonicalEvent,
+  ): PositionObservation {
+    const row = this.database
+      .prepare("SELECT * FROM position_observations WHERE id = ?")
       .get(observationId);
     if (!row) {
       throw new PositionPersistenceError();
     }
-    const classification = String(row.backlog_classification);
-    if (!["backlog", "live", "unknown"].includes(classification)) {
+    const observation = toPositionObservation(row);
+    const candidate = createCanonicalPositionEvent(observation).event;
+    if (
+      !["backlog", "live", "unknown"].includes(
+        observation.backlogClassification,
+      ) ||
+      candidate.id !== event.id ||
+      candidate.canonicalKey !== event.canonicalKey ||
+      candidate.meshNetworkId !== event.meshNetworkId ||
+      candidate.nodeNum !== event.nodeNum ||
+      candidate.payloadHash !== event.payloadHash ||
+      candidate.eventTime !== event.eventTime ||
+      candidate.eventTimeSource !== event.eventTimeSource ||
+      candidate.sequenceNumber !== event.sequenceNumber ||
+      !isDeepStrictEqual(candidate.position, event.position)
+    ) {
       throw new PositionPersistenceError();
     }
-    return classification === "backlog";
-  }
-
-  private assignSequenceEpoch(
-    event: PositionCanonicalEvent,
-    sequenceEpoch: number,
-  ): PositionCanonicalEvent {
-    this.database
-      .prepare("UPDATE position_events SET sequence_epoch = ? WHERE id = ?")
-      .run(sequenceEpoch, event.id);
-    return { ...event, sequenceEpoch };
+    return observation;
   }
 
   private writeState(
@@ -344,12 +464,13 @@ export class PositionHighWaterStore {
 
   private writeDecision(
     event: PositionCanonicalEvent,
+    observationId: string,
     target: PositionMappingTarget,
     code: PositionDecisionCode,
     decidedAt: string,
   ): PositionDecision {
     const id = `position-order-${shortHash(
-      `${event.id}|${target.callsign}|${target.mappingVersion}|${code}`,
+      `${event.id}|${observationId}|${target.callsign}|${target.mappingVersion}|${code}`,
     )}`;
     this.database
       .prepare(
@@ -357,7 +478,7 @@ export class PositionHighWaterStore {
       )
       .run(
         id,
-        event.sourceObservationId,
+        observationId,
         event.id,
         code,
         decidedAt,
@@ -752,6 +873,13 @@ function optionalSignedIntegerProperty<Key extends string>(
 
 function shortHash(value: string): string {
   return sha256(value).slice(0, 32);
+}
+
+function canonicalTimestamp(value: string): string | undefined {
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp).toISOString()
+    : undefined;
 }
 
 function sha256(value: string): string {

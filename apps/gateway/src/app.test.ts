@@ -9,8 +9,12 @@ import {
   parseGatewayListenOptions,
 } from "./app";
 import { MemoryLogger, redact } from "./observability";
-import { DomainEventBus } from "./events";
-import { JobEngine } from "./jobs";
+import {
+  DEFAULT_EVENT_PAYLOAD_MAX_BYTES,
+  DEFAULT_SSE_FRAME_MAX_BYTES,
+  DomainEventBus,
+} from "./events";
+import { JobEngine, JobQueueFullError } from "./jobs";
 import { GatewayDatabase } from "./persistence/database";
 
 describe("GatewayRuntime", () => {
@@ -297,6 +301,38 @@ describe("GatewayRuntime", () => {
     await app.close();
   });
 
+  it("returns a stable 503 when the durable Job queue is full", async () => {
+    const queueFull = (): never => {
+      throw new JobQueueFullError();
+    };
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      undefined,
+      {},
+      {
+        get: () => undefined,
+        cancel: () => undefined,
+        submitIntegrityCheck: queueFull,
+        submitBackup: queueFull,
+      },
+    );
+
+    for (const url of [
+      "/api/v1/diagnostics/integrity-check",
+      "/api/v1/backups",
+    ]) {
+      const response = await app.inject({ method: "POST", url });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({
+        code: "JOB_QUEUE_FULL",
+        params: {},
+        traceId: expect.any(String),
+      });
+    }
+    await app.close();
+  });
+
   it("replays SSE events after Last-Event-ID and starts a heartbeat stream", async () => {
     let sequence = 0;
     const events = new DomainEventBus({
@@ -331,6 +367,74 @@ describe("GatewayRuntime", () => {
       stream.response.destroy();
       await app.close();
     }
+  });
+
+  it("replays the maximum accepted payload within the SSE frame cap", async () => {
+    const logger = new MemoryLogger();
+    const events = new DomainEventBus({
+      eventIdFactory: () => "oversized-event",
+    });
+    events.publish({
+      type: "gateway.load_sample",
+      source: "gateway",
+      payload: {
+        sample: "x".repeat(
+          DEFAULT_EVENT_PAYLOAD_MAX_BYTES -
+            Buffer.byteLength('{"sample":""}', "utf8"),
+        ),
+      },
+    });
+    const app = createGatewayApp(logger, undefined, events);
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Gateway did not bind a TCP address");
+    }
+
+    const stream = await openSse(address.port, "/api/v1/events", "missing");
+    const body = await readUntil(stream.response, ": heartbeat\n\n");
+    const frame = body.slice(0, body.indexOf(": heartbeat\n\n"));
+
+    expect(Buffer.byteLength(frame, "utf8")).toBeLessThanOrEqual(
+      DEFAULT_SSE_FRAME_MAX_BYTES,
+    );
+    expect(frame).toContain("id: oversized-event");
+    expect(events.metricsSnapshot.subscriberCount).toBe(1);
+    expect(logger.entries).not.toContainEqual(
+      expect.objectContaining({ fields: { reason: "SSE_FRAME_TOO_LARGE" } }),
+    );
+    stream.request.destroy();
+    stream.response.destroy();
+    await app.close();
+  });
+
+  it("rejects excess SSE subscribers with a stable 503 before streaming", async () => {
+    const logger = new MemoryLogger();
+    const events = new DomainEventBus({ maxSubscribers: 1 });
+    const unsubscribe = events.subscribe(() => undefined);
+    const app = createGatewayApp(logger, undefined, events);
+
+    const response = await app.inject("/api/v1/events");
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      code: "SSE_SUBSCRIBER_LIMIT_REACHED",
+      params: {},
+      traceId: expect.any(String),
+    });
+    expect(events.metricsSnapshot).toMatchObject({
+      subscriberCount: 1,
+      subscriberRejections: 1,
+    });
+    expect(logger.entries).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        message: "gateway.sse_client_rejected",
+        fields: { reason: "SSE_SUBSCRIBER_LIMIT_REACHED" },
+      }),
+    );
+    unsubscribe();
+    await app.close();
   });
 
   it("serves persisted Job state and replays job-only SSE events", async () => {
@@ -412,6 +516,44 @@ describe("GatewayRuntime", () => {
     expect(closed).toBe(true);
     expect(runtime.app.server.listening).toBe(false);
   });
+
+  it("closes a healthy SSE client before HTTP shutdown completes", async () => {
+    const logger = new MemoryLogger();
+    const events = new DomainEventBus();
+    const runtime = new GatewayRuntime(
+      { host: "127.0.0.1", port: 0 },
+      logger,
+      undefined,
+      events,
+    );
+    const address = await runtime.start();
+    const stream = await openSse(address.port, "/api/v1/events", "missing");
+    await readUntil(stream.response, ": heartbeat\n\n");
+    expect(events.metricsSnapshot.subscriberCount).toBe(1);
+    const responseClosed = new Promise<void>((resolve) => {
+      stream.response.once("close", resolve);
+    });
+
+    try {
+      await settlesWithin(runtime.close(), 1_000);
+      await settlesWithin(responseClosed, 1_000);
+      expect(events.metricsSnapshot.subscriberCount).toBe(0);
+      expect(logger.entries).toContainEqual(
+        expect.objectContaining({
+          level: "info",
+          message: "gateway.sse_client_closed",
+          fields: { reason: "SSE_SERVER_SHUTDOWN" },
+        }),
+      );
+      expect(runtime.app.server.listening).toBe(false);
+    } finally {
+      stream.request.destroy();
+      stream.response.destroy();
+      if (runtime.app.server.listening) {
+        await runtime.close();
+      }
+    }
+  });
 });
 
 function openSse(
@@ -445,6 +587,28 @@ function readUntil(response: IncomingMessage, needle: string): Promise<string> {
       }
     });
     response.once("error", reject);
+  });
+}
+
+function settlesWithin<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("fixture operation timed out")),
+      timeoutMs,
+    );
+    void operation.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
   });
 }
 

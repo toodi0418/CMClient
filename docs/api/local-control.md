@@ -14,6 +14,7 @@ GET /api/v1/control/status
 POST /api/v1/control/start
 POST /api/v1/control/stop
 POST /api/v1/control/restart
+POST /api/v1/control/agent/shutdown
 POST /api/v1/control/web/enable
 POST /api/v1/control/web/disable
 GET /api/v1/control/updates
@@ -39,13 +40,33 @@ running), uptime, and the latest stable error code. The enable/disable commands
 control only the optional loopback Management Web listener; the private Control
 API remains available in both states. This bounded endpoint exists to support
 local Agent control, CLI, and Desktop operations while Gateway is unavailable.
+The IPC server admits at most 64 concurrent requests/SSE streams and applies
+bounded server-side read/write deadlines. Excess clients receive the stable
+`CONTROL_RESOURCE_EXHAUSTED` error; releasing a connection immediately returns
+its slot.
+
+`POST /api/v1/control/agent/shutdown` is reserved for local IPC and the Windows
+Service Host. It requests one terminal Agent teardown and is not forwarded by
+the authenticated HTTPS bridge. Agent stops the supervisor worker,
+cooperatively drains Gateway, and closes Management Web before exiting.
+Once terminal teardown is requested, resource-starting commands (`start`,
+`restart`, and `web/enable`) fail with `CONTROL_COMMAND_FAILED`; status and
+resource-draining commands remain safe while teardown completes.
 
 Gateway projection routes are an Agent-owned bridge. The local client asks
 Agent, Agent calls the loopback Gateway with a bounded timeout, and Agent
 returns the schema-backed JSON or stable Control error. `events` streams the
-bounded Gateway SSE feed; `events/recent` is its snapshot. Backup and database
+bounded Gateway SSE feed; `events/recent` is its snapshot. The bridge applies a
+one-second upstream read poll even after HTTP connection setup. A timed-out read
+checks the bounded downstream channel and continues the same healthy stream, so
+dropping a Control SSE client terminates its bridge thread and loopback socket
+even when Gateway is half-open and sends no heartbeat. Backup and database
 integrity routes return accepted persistent Jobs rather than performing work in
-the CLI or Desktop process.
+the CLI or Desktop process. Gateway events use non-blocking offers to the fixed
+64-entry downstream queue; a full or disconnected queue closes that one bridge
+instead of blocking its upstream reader. The bridge retains the last event ID
+it successfully forwarded and sends it as `Last-Event-ID` after an upstream
+reconnect, allowing Gateway's bounded replay window to fill short disconnects.
 
 When the supervisor has a live child process, Agent additionally probes the
 Gateway loopback health endpoint. The control status is `running` only after a

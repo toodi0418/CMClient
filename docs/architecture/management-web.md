@@ -15,6 +15,12 @@ forces the upstream connection to close after ordinary responses. If the
 Gateway cannot be reached it returns the stable
 `GATEWAY_PROXY_UNAVAILABLE` code without exposing transport details.
 
+The listener admits at most 64 active connections. Excess connections receive
+`503 MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED`; each admitted socket owns an
+RAII slot and a shutdown handle. Disabling or stopping the listener first ends
+acceptance and then shuts down every active socket, so stalled requests and SSE
+clients cannot leave an unbounded thread or keep the service alive.
+
 The Agent checks `GET /api/v1/system/health` before reporting a running Gateway
 through local Control API; a live process that fails the probe is `degraded`.
 Non-loopback binds fail closed. A LAN bind is permitted only with the complete

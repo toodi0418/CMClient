@@ -156,6 +156,11 @@ describe("PositionHighWaterStore", () => {
       event: { sequenceEpoch: 1 },
       state: { latestSequenceEpoch: 1, latestSequenceNumber: 1 },
     });
+    expect(
+      database.connection
+        .prepare("SELECT sequence_epoch FROM position_events WHERE id = ?")
+        .get(events[3]!.id),
+    ).toEqual({ sequence_epoch: null });
     database.close();
   });
 
@@ -186,6 +191,96 @@ describe("PositionHighWaterStore", () => {
       decision: { code: "APRS_SKIPPED_OUT_OF_ORDER" },
     });
     expect(result.state).toBeUndefined();
+    database.close();
+  });
+
+  it("allows a live duplicate to recover a canonical event first seen as backlog", () => {
+    const database = new GatewayDatabase(":memory:");
+    const backlog: PositionObservation = {
+      ...positionObservation("position-observation-backlog"),
+      backlogClassification: "backlog",
+    };
+    const live: PositionObservation = {
+      ...backlog,
+      id: "position-observation-live",
+      meshObservationId: "mesh-position-observation-live",
+      gatewayId: "fixture-gateway-b",
+      backlogClassification: "live",
+      serverIngestedAt: "2026-07-18T00:00:02.005Z",
+    };
+    for (const observation of [backlog, live]) {
+      database.meshObservations.insert(
+        meshObservation(observation.meshObservationId),
+      );
+    }
+    const detector = new PositionDuplicateDetector(
+      new PositionRepository(database.connection),
+    );
+    const canonical = detector.observe(backlog).event;
+    const duplicate = detector.observe(live);
+    const state = new PositionHighWaterStore(database.connection);
+    const target = { callsign: "N0CALL-7", mappingVersion: "mapping-v1" };
+
+    const rejected = state.apply(canonical, target, backlog.serverIngestedAt, {
+      observationId: backlog.id,
+    });
+    const accepted = state.apply(
+      duplicate.event,
+      target,
+      live.serverIngestedAt,
+      { observationId: live.id },
+    );
+
+    expect(rejected).toMatchObject({
+      decision: { observationId: backlog.id, code: "POSITION_BACKLOG" },
+    });
+    expect(accepted).toMatchObject({
+      decision: { observationId: live.id, code: "POSITION_ACCEPTED" },
+      state: { latestCanonicalEventId: canonical.id },
+    });
+    expect(accepted.event.canonicalKey).toBe(canonical.canonicalKey);
+    database.close();
+  });
+
+  it("fails closed when the supplied observation does not match the event", () => {
+    const database = new GatewayDatabase(":memory:");
+    const expected = positionObservation("position-observation-expected");
+    const unrelatedBase = positionObservation("position-observation-unrelated");
+    const unrelated: PositionObservation = {
+      ...unrelatedBase,
+      nodeNum: 7,
+      payloadHash: "b".repeat(64),
+      position: {
+        ...unrelatedBase.position,
+        latitudeI: 260000000,
+      },
+    };
+    for (const observation of [expected, unrelated]) {
+      database.meshObservations.insert(
+        meshObservation(observation.meshObservationId),
+      );
+    }
+    const detector = new PositionDuplicateDetector(
+      new PositionRepository(database.connection),
+    );
+    const event = detector.observe(expected).event;
+    detector.observe(unrelated);
+    const state = new PositionHighWaterStore(database.connection);
+
+    expect(() =>
+      state.apply(
+        event,
+        { callsign: "N0CALL-7", mappingVersion: "mapping-v1" },
+        unrelated.serverIngestedAt,
+        { observationId: unrelated.id },
+      ),
+    ).toThrow("POSITION_PERSISTENCE_FAILED");
+    expect(
+      database.connection.prepare("SELECT * FROM node_position_state").all(),
+    ).toEqual([]);
+    expect(
+      database.connection.prepare("SELECT * FROM position_decisions").all(),
+    ).toEqual([]);
     database.close();
   });
 });

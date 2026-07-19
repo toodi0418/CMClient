@@ -32,6 +32,16 @@ export class DatabaseIntegrityError extends Error {
   readonly code = "DATABASE_INTEGRITY_CHECK_FAILED";
 }
 
+export class DatabaseCheckpointError extends Error {
+  readonly code = "DATABASE_CHECKPOINT_FAILED";
+}
+
+export interface WalCheckpointResult {
+  busy: number;
+  checkpointedFrames: number;
+  logFrames: number;
+}
+
 export class GatewayDatabase {
   readonly connection: DatabaseSync;
   readonly jobs: JobRepository;
@@ -44,7 +54,7 @@ export class GatewayDatabase {
   readonly callmeshMappings: CallMeshMappingRepository;
   readonly settings: SettingsRepository;
 
-  constructor(path: string, migrations: Migration[] = defaultMigrations) {
+  constructor(path: string, migrations: Migration[] = gatewayMigrations) {
     if (path !== ":memory:") {
       mkdirSync(dirname(path), { recursive: true });
     }
@@ -77,6 +87,24 @@ export class GatewayDatabase {
       throw new DatabaseIntegrityError();
     }
     return "ok";
+  }
+
+  checkpoint(): WalCheckpointResult {
+    const row = this.connection.prepare("PRAGMA wal_checkpoint(PASSIVE)").get();
+    const busy = Number(row?.busy);
+    const logFrames = Number(row?.log);
+    const checkpointedFrames = Number(row?.checkpointed);
+    if (
+      !Number.isInteger(busy) ||
+      busy < 0 ||
+      !Number.isInteger(logFrames) ||
+      logFrames < -1 ||
+      !Number.isInteger(checkpointedFrames) ||
+      checkpointedFrames < -1
+    ) {
+      throw new DatabaseCheckpointError();
+    }
+    return { busy, checkpointedFrames, logFrames };
   }
 }
 
@@ -222,14 +250,57 @@ export class JobRepository {
     return row ? toStoredJob(row) : undefined;
   }
 
-  findByStatuses(statuses: readonly JobStatus[]): StoredJob[] {
+  findByStatuses(statuses: readonly JobStatus[], limit?: number): StoredJob[] {
     if (statuses.length === 0) {
       return [];
     }
+    if (
+      limit !== undefined &&
+      (!Number.isInteger(limit) || limit < 1 || limit > 10_000)
+    ) {
+      throw new JobPersistenceError();
+    }
     const placeholders = statuses.map(() => "?").join(", ");
+    const limitClause = limit === undefined ? "" : " LIMIT ?";
     return this.database
-      .prepare(`SELECT * FROM jobs WHERE status IN (${placeholders})`)
-      .all(...statuses)
+      .prepare(
+        `SELECT * FROM jobs WHERE status IN (${placeholders}) ORDER BY created_at ASC, id ASC${limitClause}`,
+      )
+      .all(...statuses, ...(limit === undefined ? [] : [limit]))
+      .map(toStoredJob);
+  }
+
+  findQueued(limit: number): StoredJob[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20_000) {
+      throw new JobPersistenceError();
+    }
+    return this.database
+      .prepare(
+        "SELECT * FROM jobs INDEXED BY jobs_queued_created_at_index WHERE status = 'queued' ORDER BY created_at ASC, id ASC LIMIT ?",
+      )
+      .all(limit)
+      .map(toStoredJob);
+  }
+
+  findQueuedByTypes(types: readonly string[], limit: number): StoredJob[] {
+    if (types.length === 0) {
+      return [];
+    }
+    if (
+      types.length > 10_000 ||
+      types.some((type) => !/^[a-z][a-z0-9_.-]{0,127}$/.test(type)) ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 20_000
+    ) {
+      throw new JobPersistenceError();
+    }
+    const placeholders = types.map(() => "?").join(", ");
+    return this.database
+      .prepare(
+        `SELECT * FROM jobs INDEXED BY jobs_queued_type_created_at_index WHERE status = 'queued' AND type IN (${placeholders}) ORDER BY created_at ASC, id ASC LIMIT ?`,
+      )
+      .all(...types, limit)
       .map(toStoredJob);
   }
 
@@ -274,6 +345,28 @@ export class JobRepository {
       .prepare(`UPDATE jobs SET ${assignments.join(", ")} WHERE id = ?`)
       .run(...values);
     return this.find(id);
+  }
+
+  deleteTerminalBefore(cutoffExclusive: string, limit = 1_000): number {
+    const cutoff = canonicalTimestamp(cutoffExclusive);
+    if (
+      cutoff === undefined ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 10_000
+    ) {
+      throw new JobPersistenceError();
+    }
+    try {
+      const result = this.database
+        .prepare(
+          "DELETE FROM jobs WHERE id IN (SELECT id FROM jobs INDEXED BY jobs_terminal_retention_index WHERE status IN ('succeeded', 'failed', 'cancelled', 'rolled_back') AND completed_at IS NOT NULL AND completed_at < ? ORDER BY completed_at ASC, id ASC LIMIT ?)",
+        )
+        .run(cutoff, limit);
+      return Number(result.changes);
+    } catch {
+      throw new JobPersistenceError();
+    }
   }
 }
 
@@ -324,6 +417,28 @@ export class MeshObservationRepository {
       .prepare("SELECT * FROM mesh_observations WHERE id = ?")
       .get(id);
     return row ? toMeshObservation(row) : undefined;
+  }
+
+  deleteUnreferencedBefore(cutoffExclusive: string, limit = 1_000): number {
+    const cutoff = canonicalTimestamp(cutoffExclusive);
+    if (
+      cutoff === undefined ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 40_000
+    ) {
+      throw new MeshObservationPersistenceError();
+    }
+    try {
+      const result = this.database
+        .prepare(
+          "DELETE FROM mesh_observations WHERE id IN (SELECT observation.id FROM mesh_observations AS observation WHERE observation.ingested_at < ? AND NOT EXISTS (SELECT 1 FROM nodes WHERE nodes.last_observation_id = observation.id) AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.observation_id = observation.id) AND NOT EXISTS (SELECT 1 FROM telemetry WHERE telemetry.observation_id = observation.id) AND NOT EXISTS (SELECT 1 FROM position_observations WHERE position_observations.mesh_observation_id = observation.id) ORDER BY observation.ingested_at ASC, observation.id ASC LIMIT ?)",
+        )
+        .run(cutoff, limit);
+      return Number(result.changes);
+    } catch {
+      throw new MeshObservationPersistenceError();
+    }
   }
 }
 
@@ -426,6 +541,28 @@ export class MeshMessageRepository {
       )
       .all(limit)
       .map((row) => toMeshMessage(row as Record<string, unknown>));
+  }
+
+  deleteBefore(cutoffExclusive: string, limit = 1_000): number {
+    const cutoff = canonicalTimestamp(cutoffExclusive);
+    if (
+      cutoff === undefined ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 10_000
+    ) {
+      throw new MeshDomainPersistenceError();
+    }
+    try {
+      const result = this.database
+        .prepare(
+          "DELETE FROM messages WHERE id IN (SELECT id FROM messages INDEXED BY messages_retention_index WHERE observed_at < ? ORDER BY observed_at ASC, id ASC LIMIT ?)",
+        )
+        .run(cutoff, limit);
+      return Number(result.changes);
+    } catch {
+      throw new MeshDomainPersistenceError();
+    }
   }
 }
 
@@ -822,7 +959,7 @@ function parseNormalizedFromRadio(
   }
 }
 
-const defaultMigrations: Migration[] = [
+export const gatewayMigrations: Migration[] = [
   {
     version: 1,
     name: "settings",
@@ -952,6 +1089,125 @@ const defaultMigrations: Migration[] = [
     up(database) {
       database.exec(
         "CREATE INDEX telemetry_metric_observed_at_index ON telemetry (metric_kind, observed_at DESC)",
+      );
+    },
+  },
+  {
+    version: 10,
+    name: "load_retention_indexes",
+    up(database) {
+      database.exec(
+        "CREATE INDEX mesh_observations_ingested_at_index ON mesh_observations (ingested_at, id)",
+      );
+      database.exec(
+        "CREATE INDEX nodes_last_observation_id_index ON nodes (last_observation_id)",
+      );
+      database.exec(
+        "CREATE INDEX position_observations_mesh_observation_id_index ON position_observations (mesh_observation_id)",
+      );
+      database.exec(
+        "CREATE INDEX telemetry_observed_at_index ON telemetry (observed_at, id)",
+      );
+      database.exec(
+        "CREATE INDEX jobs_terminal_retention_index ON jobs (completed_at, id) WHERE status IN ('succeeded', 'failed', 'cancelled', 'rolled_back')",
+      );
+      database.exec(
+        "CREATE INDEX jobs_queued_created_at_index ON jobs (created_at, id) WHERE status = 'queued'",
+      );
+    },
+  },
+  {
+    version: 11,
+    name: "read_projection_indexes",
+    up(database) {
+      database.exec(
+        "CREATE INDEX nodes_recent_projection_index ON nodes (last_seen_at DESC, node_num ASC)",
+      );
+      database.exec(
+        "CREATE INDEX messages_recent_projection_index ON messages (observed_at DESC, id ASC)",
+      );
+      database.exec(
+        "CREATE INDEX telemetry_recent_projection_index ON telemetry (observed_at DESC, id ASC)",
+      );
+      database.exec(
+        "CREATE INDEX position_events_recent_projection_index ON position_events (COALESCE(event_time, created_at) DESC, id ASC)",
+      );
+      database.exec(
+        "CREATE INDEX aprs_outbox_recent_projection_index ON aprs_outbox (updated_at DESC, id ASC)",
+      );
+      database.exec(
+        "CREATE INDEX aprs_outbox_due_order_index ON aprs_outbox (next_attempt_at ASC, created_at ASC, id ASC) WHERE status IN ('queued', 'failed')",
+      );
+      database.exec(
+        "CREATE INDEX aprs_outbox_sent_retention_index ON aprs_outbox (sent_at ASC, id ASC) WHERE status = 'sent'",
+      );
+    },
+  },
+  {
+    version: 12,
+    name: "bounded_domain_retention_and_delivery_high_water",
+    up(database) {
+      database.exec(
+        "CREATE TABLE aprs_delivery_high_water (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, latest_canonical_event_id TEXT NOT NULL REFERENCES position_events(id), latest_event_time TEXT NOT NULL, latest_sequence_epoch INTEGER CHECK (latest_sequence_epoch IS NULL OR latest_sequence_epoch >= 0), latest_sequence_number INTEGER CHECK (latest_sequence_number IS NULL OR (latest_sequence_number >= 0 AND latest_sequence_number <= 4294967295)), delivered_at TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num, callsign))",
+      );
+      database.exec(
+        "INSERT INTO aprs_delivery_high_water (mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_event_time, latest_sequence_epoch, latest_sequence_number, delivered_at) SELECT mesh_network_id, node_num, callsign, canonical_event_id, event_time, sequence_epoch, sequence_number, sent_at FROM (SELECT event.mesh_network_id, event.node_num, outbox.callsign, event.id AS canonical_event_id, event.event_time, event.sequence_epoch, event.sequence_number, outbox.sent_at, ROW_NUMBER() OVER (PARTITION BY event.mesh_network_id, event.node_num, outbox.callsign ORDER BY event.event_time DESC, outbox.sent_at DESC, event.id DESC) AS delivery_rank FROM aprs_outbox AS outbox JOIN position_events AS event ON event.id = outbox.canonical_event_id WHERE outbox.status = 'sent' AND outbox.sent_at IS NOT NULL AND event.event_time IS NOT NULL) WHERE delivery_rank = 1",
+      );
+      database.exec(
+        "CREATE INDEX aprs_delivery_high_water_latest_event_id_index ON aprs_delivery_high_water (latest_canonical_event_id)",
+      );
+      database.exec(
+        "CREATE INDEX node_position_state_latest_event_id_index ON node_position_state (latest_canonical_event_id)",
+      );
+      database.exec(
+        "CREATE INDEX jobs_queued_type_created_at_index ON jobs (type, created_at ASC, id ASC) WHERE status = 'queued'",
+      );
+
+      database.exec(
+        "CREATE INDEX messages_retention_index ON messages (observed_at ASC, id ASC)",
+      );
+      database.exec(
+        "CREATE INDEX position_decisions_retention_index ON position_decisions (decided_at ASC, id ASC)",
+      );
+      database.exec(
+        "CREATE INDEX position_decisions_canonical_event_id_index ON position_decisions (canonical_event_id)",
+      );
+      database.exec(
+        "CREATE INDEX position_events_retention_index ON position_events (created_at ASC, id ASC)",
+      );
+      database.exec(
+        "CREATE INDEX position_events_source_observation_id_index ON position_events (source_observation_id)",
+      );
+      database.exec(
+        "CREATE INDEX position_observations_retention_index ON position_observations (ingested_at ASC, id ASC)",
+      );
+      database.exec(
+        "CREATE INDEX aprs_outbox_canonical_event_id_index ON aprs_outbox (canonical_event_id)",
+      );
+    },
+  },
+  {
+    version: 13,
+    name: "aprs_outbox_order_snapshots",
+    up(database) {
+      database.exec("ALTER TABLE aprs_outbox ADD COLUMN mesh_network_id TEXT");
+      database.exec("ALTER TABLE aprs_outbox ADD COLUMN node_num INTEGER");
+      database.exec("ALTER TABLE aprs_outbox ADD COLUMN mapping_version TEXT");
+      database.exec("ALTER TABLE aprs_outbox ADD COLUMN event_time TEXT");
+      database.exec(
+        "ALTER TABLE aprs_outbox ADD COLUMN sequence_epoch INTEGER",
+      );
+      database.exec(
+        "ALTER TABLE aprs_outbox ADD COLUMN sequence_number INTEGER",
+      );
+      database.exec(
+        "UPDATE aprs_outbox SET mesh_network_id = (SELECT event.mesh_network_id FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id), node_num = (SELECT event.node_num FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id), event_time = (SELECT event.event_time FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id), sequence_epoch = (SELECT event.sequence_epoch FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id), sequence_number = (SELECT event.sequence_number FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id)",
+      );
+      database.exec(
+        "ALTER TABLE aprs_delivery_high_water ADD COLUMN latest_mapping_version TEXT",
+      );
+      database.exec(
+        "CREATE INDEX aprs_outbox_active_order_index ON aprs_outbox (mesh_network_id, node_num, callsign, event_time DESC, sequence_epoch DESC, sequence_number DESC, id ASC) WHERE status IN ('queued', 'sending', 'failed')",
       );
     },
   },

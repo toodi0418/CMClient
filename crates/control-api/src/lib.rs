@@ -7,7 +7,11 @@ use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
@@ -23,6 +27,7 @@ const REMOTE_CONTROL_WINDOW_SECONDS: u64 = 30;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CONTROL_RESPONSE_WIRE_BYTES: usize = MAX_CONTROL_RESPONSE_BYTES + 8 * 1024;
 const MAX_CONTROL_SSE_EVENT_BYTES: usize = 60 * 1024;
+const MAX_CONTROL_CONNECTIONS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteControlAuth {
@@ -210,6 +215,7 @@ fn error_from_http_response(head: &[u8], body: &[u8]) -> ControlError {
         Some("CONTROL_HTTP_INVALID") => ControlError::InvalidHttp,
         Some("CONTROL_RESPONSE_TOO_LARGE") => ControlError::ResponseTooLarge,
         Some("CONTROL_TIMEOUT") => ControlError::Timeout,
+        Some("CONTROL_RESOURCE_EXHAUSTED") => ControlError::ResourceExhausted,
         Some("CONTROL_AUTHENTICATION_FAILED") => ControlError::Authentication,
         Some("CONTROL_COMMAND_FAILED") => ControlError::CommandFailed,
         _ if head.starts_with(b"HTTP/1.1 401") || head.starts_with(b"HTTP/1.1 403") => {
@@ -387,6 +393,7 @@ pub enum ControlCommand {
     Start,
     Stop,
     Restart,
+    ShutdownAgent,
     EnableManagementWeb,
     DisableManagementWeb,
 }
@@ -451,6 +458,7 @@ pub enum ControlError {
     InvalidHttp,
     ResponseTooLarge,
     Timeout,
+    ResourceExhausted,
     Authentication,
     CommandFailed,
 }
@@ -464,9 +472,52 @@ impl ControlError {
             Self::InvalidHttp => "CONTROL_HTTP_INVALID",
             Self::ResponseTooLarge => "CONTROL_RESPONSE_TOO_LARGE",
             Self::Timeout => "CONTROL_TIMEOUT",
+            Self::ResourceExhausted => "CONTROL_RESOURCE_EXHAUSTED",
             Self::Authentication => "CONTROL_AUTHENTICATION_FAILED",
             Self::CommandFailed => "CONTROL_COMMAND_FAILED",
         }
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionLimiter {
+    active: Arc<AtomicUsize>,
+    maximum: usize,
+}
+
+impl ConnectionLimiter {
+    fn new(maximum: usize) -> Self {
+        debug_assert!(maximum > 0);
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            maximum,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<ConnectionPermit> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.maximum).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| ConnectionPermit {
+                active: Arc::clone(&self.active),
+            })
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+struct ConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -518,6 +569,10 @@ impl ControlRouter {
             ["POST", "/api/v1/control/restart", "HTTP/1.1"]
             | ["POST", "/api/v1/control/restart", "HTTP/1.0"] => {
                 ControlRoute::Command(ControlCommand::Restart)
+            }
+            ["POST", "/api/v1/control/agent/shutdown", "HTTP/1.1"]
+            | ["POST", "/api/v1/control/agent/shutdown", "HTTP/1.0"] => {
+                ControlRoute::Command(ControlCommand::ShutdownAgent)
             }
             ["POST", "/api/v1/control/web/enable", "HTTP/1.1"]
             | ["POST", "/api/v1/control/web/enable", "HTTP/1.0"] => {
@@ -682,6 +737,7 @@ fn error_response(error: ControlError) -> Result<ControlResponse, ControlError> 
         ControlError::Authentication => 401,
         ControlError::ResponseTooLarge => 413,
         ControlError::Timeout => 504,
+        ControlError::ResourceExhausted => 503,
         _ => 500,
     };
     serde_json::to_vec(&serde_json::json!({ "code": error.code() }))
@@ -692,9 +748,10 @@ fn error_response(error: ControlError) -> Result<ControlResponse, ControlError> 
 #[cfg(unix)]
 mod unix {
     use super::{
-        ControlEndpoint, ControlError, ControlHandler, ControlResponse, ControlRouter,
-        ControlStatus, ControlUpdateEvent, MAX_CONTROL_RESPONSE_BYTES,
-        MAX_CONTROL_RESPONSE_WIRE_BYTES, MAX_CONTROL_SSE_EVENT_BYTES, error_from_http_response,
+        ConnectionLimiter, ControlEndpoint, ControlError, ControlHandler, ControlResponse,
+        ControlRouter, ControlStatus, ControlUpdateEvent, MAX_CONTROL_CONNECTIONS,
+        MAX_CONTROL_RESPONSE_BYTES, MAX_CONTROL_RESPONSE_WIRE_BYTES, MAX_CONTROL_SSE_EVENT_BYTES,
+        error_from_http_response,
     };
     use std::{
         fs,
@@ -709,11 +766,13 @@ mod unix {
     use zeroize::Zeroize;
 
     const MAX_REQUEST_BYTES: usize = 8 * 1024;
+    const CONTROL_SERVER_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub struct ControlServer {
         endpoint: PathBuf,
         listener: UnixListener,
         router: ControlRouter,
+        connections: ConnectionLimiter,
     }
 
     impl ControlServer {
@@ -737,13 +796,23 @@ mod unix {
                 endpoint: path,
                 listener,
                 router: ControlRouter::new(handler),
+                connections: ConnectionLimiter::new(MAX_CONTROL_CONNECTIONS),
             })
         }
 
         pub fn serve_once(&self) -> Result<(), ControlError> {
-            let (stream, _) = self.listener.accept().map_err(|_| ControlError::Io)?;
+            let (mut stream, _) = self.listener.accept().map_err(|_| ControlError::Io)?;
+            if configure_stream(&stream).is_err() {
+                return Ok(());
+            }
+            let Some(permit) = self.connections.try_acquire() else {
+                let body = br#"{"code":"CONTROL_RESOURCE_EXHAUSTED"}"#;
+                let _ = write_json_response(&mut stream, 503, body);
+                return Ok(());
+            };
             let router = self.router.clone();
             thread::spawn(move || {
+                let _permit = permit;
                 let _ = serve_connection(stream, router);
             });
             Ok(())
@@ -752,6 +821,13 @@ mod unix {
         pub fn endpoint(&self) -> &std::path::Path {
             &self.endpoint
         }
+    }
+
+    fn configure_stream(stream: &UnixStream) -> Result<(), ControlError> {
+        stream
+            .set_read_timeout(Some(CONTROL_SERVER_IO_TIMEOUT))
+            .and_then(|_| stream.set_write_timeout(Some(CONTROL_SERVER_IO_TIMEOUT)))
+            .map_err(|_| ControlError::Io)
     }
 
     fn serve_connection(mut stream: UnixStream, router: ControlRouter) -> Result<(), ControlError> {
@@ -831,6 +907,7 @@ mod unix {
             400 => "Bad Request",
             401 => "Unauthorized",
             413 => "Content Too Large",
+            503 => "Service Unavailable",
             404 => "Not Found",
             504 => "Gateway Timeout",
             _ => "Internal Server Error",
@@ -940,6 +1017,10 @@ mod unix {
 
         pub fn restart(&self) -> Result<ControlStatus, ControlError> {
             self.request("POST", "/api/v1/control/restart")
+        }
+
+        pub fn shutdown_agent(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/agent/shutdown")
         }
 
         pub fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
@@ -1193,9 +1274,10 @@ pub use unix::{ControlClient, ControlServer, ControlUpdateEventStream};
 #[cfg(windows)]
 mod windows {
     use super::{
-        ControlEndpoint, ControlError, ControlHandler, ControlResponse, ControlRouter,
-        ControlStatus, ControlUpdateEvent, MAX_CONTROL_RESPONSE_BYTES,
-        MAX_CONTROL_RESPONSE_WIRE_BYTES, MAX_CONTROL_SSE_EVENT_BYTES, error_from_http_response,
+        ConnectionLimiter, ControlEndpoint, ControlError, ControlHandler, ControlResponse,
+        ControlRouter, ControlStatus, ControlUpdateEvent, MAX_CONTROL_CONNECTIONS,
+        MAX_CONTROL_RESPONSE_BYTES, MAX_CONTROL_RESPONSE_WIRE_BYTES, MAX_CONTROL_SSE_EVENT_BYTES,
+        error_from_http_response,
     };
     use interprocess::{
         local_socket::{Listener, ListenerOptions, Stream, prelude::*},
@@ -1210,10 +1292,12 @@ mod windows {
     use zeroize::Zeroize;
 
     const MAX_REQUEST_BYTES: usize = 8 * 1024;
+    const CONTROL_SERVER_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub struct ControlServer {
         listener: Listener,
         router: ControlRouter,
+        connections: ConnectionLimiter,
     }
 
     impl ControlServer {
@@ -1240,17 +1324,31 @@ mod windows {
             Ok(Self {
                 listener,
                 router: ControlRouter::new(handler),
+                connections: ConnectionLimiter::new(MAX_CONTROL_CONNECTIONS),
             })
         }
 
         pub fn serve_once(&self) -> Result<(), ControlError> {
-            let stream = self.listener.accept().map_err(|_| ControlError::Io)?;
+            let mut stream = self.listener.accept().map_err(|_| ControlError::Io)?;
+            if configure_stream(&stream).is_err() {
+                return Ok(());
+            }
+            let Some(permit) = self.connections.try_acquire() else {
+                let body = br#"{"code":"CONTROL_RESOURCE_EXHAUSTED"}"#;
+                let _ = write_json_response(&mut stream, 503, body);
+                return Ok(());
+            };
             let router = self.router.clone();
             thread::spawn(move || {
+                let _permit = permit;
                 let _ = serve_connection(stream, router);
             });
             Ok(())
         }
+    }
+
+    fn configure_stream(stream: &Stream) -> Result<(), ControlError> {
+        stream.set_nonblocking(true).map_err(|_| ControlError::Io)
     }
 
     fn serve_connection(mut stream: Stream, router: ControlRouter) -> Result<(), ControlError> {
@@ -1270,8 +1368,9 @@ mod windows {
     fn read_request(stream: &mut Stream) -> Result<Vec<u8>, ControlError> {
         let mut request = Vec::new();
         let mut chunk = [0_u8; 2048];
+        let deadline = deadline_after(CONTROL_SERVER_IO_TIMEOUT)?;
         loop {
-            let count = stream.read(&mut chunk).map_err(|_| ControlError::Io)?;
+            let count = read_until(stream, &mut chunk, deadline)?;
             if count == 0 {
                 return Err(ControlError::InvalidHttp);
             }
@@ -1330,6 +1429,7 @@ mod windows {
             400 => "Bad Request",
             401 => "Unauthorized",
             413 => "Content Too Large",
+            503 => "Service Unavailable",
             404 => "Not Found",
             504 => "Gateway Timeout",
             _ => "Internal Server Error",
@@ -1338,27 +1438,28 @@ mod windows {
             "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
         );
-        stream
-            .write_all(header.as_bytes())
-            .map_err(|_| ControlError::Io)?;
-        stream.write_all(body).map_err(|_| ControlError::Io)
+        let deadline = deadline_after(CONTROL_SERVER_IO_TIMEOUT)?;
+        write_all_until(stream, header.as_bytes(), deadline)?;
+        write_all_until(stream, body, deadline)
     }
 
     fn write_update_event_stream(
         stream: &mut Stream,
         events: Receiver<ControlUpdateEvent>,
     ) -> Result<(), ControlError> {
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
-            )
-            .map_err(|_| ControlError::Io)?;
+        write_all_until(
+            stream,
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
+            deadline_after(CONTROL_SERVER_IO_TIMEOUT)?,
+        )?;
         loop {
             match events.recv_timeout(Duration::from_secs(15)) {
                 Ok(event) => write_sse_event(stream, &event)?,
-                Err(RecvTimeoutError::Timeout) => stream
-                    .write_all(b": heartbeat\n\n")
-                    .map_err(|_| ControlError::Io)?,
+                Err(RecvTimeoutError::Timeout) => write_all_until(
+                    stream,
+                    b": heartbeat\n\n",
+                    deadline_after(CONTROL_SERVER_IO_TIMEOUT)?,
+                )?,
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
@@ -1375,11 +1476,14 @@ mod windows {
         {
             return Err(ControlError::InvalidHttp);
         }
-        stream
-            .write_all(format!("id: {}\nevent: {}\ndata: ", event.id, event.event).as_bytes())
-            .and_then(|_| stream.write_all(&event.data))
-            .and_then(|_| stream.write_all(b"\n\n"))
-            .map_err(|_| ControlError::Io)
+        let deadline = deadline_after(CONTROL_SERVER_IO_TIMEOUT)?;
+        write_all_until(
+            stream,
+            format!("id: {}\nevent: {}\ndata: ", event.id, event.event).as_bytes(),
+            deadline,
+        )?;
+        write_all_until(stream, &event.data, deadline)?;
+        write_all_until(stream, b"\n\n", deadline)
     }
 
     fn is_safe_sse_token(value: &str) -> bool {
@@ -1435,6 +1539,10 @@ mod windows {
 
         pub fn restart(&self) -> Result<ControlStatus, ControlError> {
             self.request("POST", "/api/v1/control/restart")
+        }
+
+        pub fn shutdown_agent(&self) -> Result<ControlStatus, ControlError> {
+            self.request("POST", "/api/v1/control/agent/shutdown")
         }
 
         pub fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
@@ -1949,6 +2057,26 @@ mod tests {
         collections::BTreeMap,
         sync::{Mutex, mpsc},
     };
+
+    #[test]
+    fn bounds_and_releases_control_connection_slots() {
+        let limiter = super::ConnectionLimiter::new(2);
+        let first = limiter.try_acquire().expect("first slot should acquire");
+        let second = limiter.try_acquire().expect("second slot should acquire");
+
+        assert!(limiter.try_acquire().is_none());
+        assert_eq!(limiter.active(), 2);
+
+        drop(first);
+        let replacement = limiter
+            .try_acquire()
+            .expect("released slot should be reusable");
+        assert_eq!(limiter.active(), 2);
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(limiter.active(), 0);
+    }
     use std::{path::PathBuf, sync::Arc};
 
     fn status() -> ControlStatus {
@@ -2207,11 +2335,16 @@ mod tests {
             server.serve_once()?;
             server.serve_once()?;
             server.serve_once()?;
+            server.serve_once()?;
             server.serve_once()
         });
         let client = ControlClient::new(endpoint).expect("client should initialize");
         assert_eq!(client.status().expect("status should load"), status());
         assert_eq!(client.start().expect("start should load"), status());
+        assert_eq!(
+            client.shutdown_agent().expect("Agent shutdown should load"),
+            status()
+        );
         assert_eq!(
             client
                 .enable_management_web()

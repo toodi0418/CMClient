@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
-import { createVerifiedGatewayBackup } from "./backup";
+import { createVerifiedGatewayBackup, GatewayBackupError } from "./backup";
 import { GatewayDatabase } from "./persistence/database";
 
 describe("verified Gateway backup", () => {
@@ -43,6 +43,25 @@ describe("verified Gateway backup", () => {
         .get(),
     ).toEqual({ value: '{"value":42}' });
     snapshot.close();
+    source.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it("fails before creating an artifact when shutdown already cancelled work", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmclient-backup-abort-"));
+    const source = new GatewayDatabase(join(directory, "gateway.sqlite"));
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      createVerifiedGatewayBackup(
+        source.connection,
+        join(directory, "backups"),
+        "backup-aborted",
+        controller.signal,
+      ),
+    ).rejects.toBeInstanceOf(GatewayBackupError);
+
     source.close();
     await rm(directory, { recursive: true, force: true });
   });

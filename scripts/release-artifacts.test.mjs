@@ -376,6 +376,12 @@ test("release workflow builds each composition and gates the separate Docker sur
     assert.match(workflow, new RegExp(`--input "${role}=`));
   }
   assert.match(workflow, /docker-composition:/);
+  assert.match(workflow, /load-gate:[\s\S]*pnpm test:load/);
+  assert.match(workflow, /build:[\s\S]*needs: \[artifact-plan, load-gate\]/);
+  assert.match(
+    workflow,
+    /docker-composition:[\s\S]*needs: \[artifact-plan, load-gate\]/,
+  );
   assert.match(workflow, /os: macos-15\n\s+rust_target: aarch64-apple-darwin/);
   assert.match(
     workflow,

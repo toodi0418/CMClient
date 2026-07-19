@@ -6,8 +6,12 @@ export interface MeshtasticFrameDecoderOptions {
 }
 
 export interface FrameDecoderMetrics {
+  bufferedBytes: number;
+  copiedBytes: number;
+  copyOperations: number;
   malformedFrames: number;
   discardedBytes: number;
+  scanSteps: number;
 }
 
 export class MeshtasticFrameError extends Error {
@@ -19,6 +23,9 @@ export class MeshtasticFrameDecoder {
   private readonly maxPayloadBytes: number;
   private malformedFrames = 0;
   private discardedBytes = 0;
+  private copiedBytes = 0;
+  private copyOperations = 0;
+  private scanSteps = 0;
 
   constructor(options: MeshtasticFrameDecoderOptions = {}) {
     this.maxPayloadBytes = options.maxPayloadBytes ?? 512;
@@ -32,41 +39,49 @@ export class MeshtasticFrameDecoder {
   }
 
   push(chunk: Uint8Array): Uint8Array[] {
-    this.buffer = concat(this.buffer, chunk);
+    const input = concat(this.buffer, chunk);
+    this.copiedBytes += input.length;
+    this.copyOperations += 1;
     const frames: Uint8Array[] = [];
-    while (this.buffer.length >= HEADER_BYTES) {
-      if (readUint16(this.buffer, 0) !== MAGIC) {
-        this.discardInvalidByte();
+    let offset = 0;
+    while (input.length - offset >= HEADER_BYTES) {
+      this.scanSteps += 1;
+      if (readUint16(input, offset) !== MAGIC) {
+        this.malformedFrames += 1;
+        this.discardedBytes += 1;
+        offset += 1;
         continue;
       }
-      const payloadLength = readUint16(this.buffer, 2);
+      const payloadLength = readUint16(input, offset + 2);
       if (payloadLength === 0 || payloadLength > this.maxPayloadBytes) {
         this.malformedFrames += 1;
-        this.buffer = this.buffer.slice(2);
         this.discardedBytes += 2;
+        offset += 2;
         continue;
       }
       const frameLength = HEADER_BYTES + payloadLength;
-      if (this.buffer.length < frameLength) {
+      if (input.length - offset < frameLength) {
         break;
       }
-      frames.push(this.buffer.slice(HEADER_BYTES, frameLength));
-      this.buffer = this.buffer.slice(frameLength);
+      frames.push(input.slice(offset + HEADER_BYTES, offset + frameLength));
+      offset += frameLength;
     }
+    // Copy the bounded incomplete tail so a large source chunk is not retained.
+    this.buffer = input.slice(offset);
+    this.copiedBytes += this.buffer.length;
+    this.copyOperations += 1;
     return frames;
   }
 
   get metrics(): FrameDecoderMetrics {
     return {
+      bufferedBytes: this.buffer.length,
+      copiedBytes: this.copiedBytes,
+      copyOperations: this.copyOperations,
       malformedFrames: this.malformedFrames,
       discardedBytes: this.discardedBytes,
+      scanSteps: this.scanSteps,
     };
-  }
-
-  private discardInvalidByte(): void {
-    this.malformedFrames += 1;
-    this.discardedBytes += 1;
-    this.buffer = this.buffer.slice(1);
   }
 }
 

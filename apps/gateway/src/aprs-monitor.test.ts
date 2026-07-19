@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import net, { type Server } from "node:net";
+import net, { type Server, type Socket } from "node:net";
 
 import { describe, expect, it } from "vitest";
 
@@ -126,6 +126,133 @@ describe("AprsIsRxClient", () => {
     await session.close();
     await close(server);
   });
+
+  it("isolates a throwing line callback and continues with later lines", async () => {
+    let sent = false;
+    const server = net.createServer((socket) => {
+      socket.on("data", () => {
+        if (sent) {
+          return;
+        }
+        sent = true;
+        socket.write(
+          [
+            encode(event("2026-07-18T00:00:35.000Z")),
+            encode(event("2026-07-18T00:01:35.000Z", "b")),
+            "",
+          ].join("\r\n"),
+        );
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsRxClient({
+      host: "127.0.0.1",
+      port: address.port,
+      loginLine: "user N0CALL pass -1 vers CMClient 2.0",
+      filterExpression: "b/N0CALL-7",
+    });
+    const processed: string[] = [];
+    const callbackErrors: unknown[] = [];
+    let callbacks = 0;
+
+    const session = await client.connect(
+      (line) => {
+        callbacks += 1;
+        if (callbacks === 1) {
+          throw new Error("fixture callback failure");
+        }
+        processed.push(line);
+      },
+      (error) => {
+        callbackErrors.push(error);
+        throw new Error("fixture error callback failure");
+      },
+    );
+    await waitFor(() => callbacks === 2);
+
+    expect(callbackErrors).toHaveLength(1);
+    expect(processed).toEqual([encode(event("2026-07-18T00:01:35.000Z", "b"))]);
+    await session.close();
+    await close(server);
+  });
+
+  it("drains a coalesced burst before bounding the unterminated remainder", async () => {
+    const received: string[] = [];
+    let peerClosed = false;
+    let sent = false;
+    const line = encode(event("2026-07-18T00:00:35.000Z"));
+    const burst = Array.from({ length: 20 }, () => line).join("\r\n") + "\r\n";
+    expect(Buffer.byteLength(burst)).toBeGreaterThan(1_024);
+    const server = net.createServer((socket) => {
+      socket.once("close", () => {
+        peerClosed = true;
+      });
+      socket.on("data", () => {
+        if (!sent) {
+          sent = true;
+          socket.write(burst);
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsRxClient({
+      host: "127.0.0.1",
+      port: address.port,
+      loginLine: "user N0CALL pass -1 vers CMClient 2.0",
+      filterExpression: "b/N0CALL-7",
+    });
+
+    const session = await client.connect((value) => received.push(value));
+    await waitFor(() => received.length === 20);
+
+    expect(received).toEqual(Array.from({ length: 20 }, () => line));
+    expect(peerClosed).toBe(false);
+    await session.close();
+    await close(server);
+  });
+
+  it("forces a bounded socket close when the peer remains half-open", async () => {
+    const sockets = new Set<Socket>();
+    const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+      sockets.add(socket);
+      socket.on("error", () => undefined);
+      socket.once("close", () => sockets.delete(socket));
+      socket.resume();
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsRxClient({
+      host: "127.0.0.1",
+      port: address.port,
+      loginLine: "user N0CALL pass -1 vers CMClient 2.0",
+      filterExpression: "b/N0CALL-7",
+      closeTimeoutMs: 25,
+    });
+
+    try {
+      const session = await client.connect(() => undefined);
+      await settlesWithin(session.close(), 1_000);
+    } finally {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await close(server);
+    }
+  });
 });
 
 function encode(positionEvent: PositionCanonicalEvent): string {
@@ -175,4 +302,24 @@ async function close(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
+}
+
+async function settlesWithin(
+  operation: Promise<void>,
+  timeoutMs: number,
+): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<void>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("fixture operation did not settle")),
+      timeoutMs,
+    );
+  });
+  try {
+    await Promise.race([operation, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }

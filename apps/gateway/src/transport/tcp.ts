@@ -15,12 +15,18 @@ import type {
   TransportEventListener,
 } from "./types.js";
 
+const DEFAULT_TCP_CONNECT_TIMEOUT_MS = 10_000;
+const MAX_TCP_TIMEOUT_MS = 120_000;
+
+type TcpSocketFactory = (options: { host: string; port: number }) => Socket;
+
 export interface TcpMeshtasticTransportOptions {
   host: string;
   port: number;
   configSession: ConfigSessionCodec;
   maxPayloadBytes?: number;
   configTimeoutMs?: number;
+  connectTimeoutMs?: number;
   reconnect?: ReconnectBackoffOptions;
   random?: () => number;
   clock?: () => Date;
@@ -44,6 +50,7 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
   private socket: Socket | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private configTimer: NodeJS.Timeout | undefined;
+  private connectTimer: NodeJS.Timeout | undefined;
   private manualDisconnect = false;
   private attempts = 0;
   private connectPromise: Promise<void> | undefined;
@@ -52,14 +59,25 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
   private failureCode = "TCP_CONNECTION_CLOSED";
   private sessionConnectedAt: string | undefined;
 
-  constructor(private readonly options: TcpMeshtasticTransportOptions) {
+  constructor(
+    private readonly options: TcpMeshtasticTransportOptions,
+    private readonly socketFactory: TcpSocketFactory = (socketOptions) =>
+      net.createConnection(socketOptions),
+  ) {
     if (
       !options.host.trim() ||
       !Number.isInteger(options.port) ||
       options.port < 1 ||
       options.port > 65_535 ||
       !Number.isInteger(options.configTimeoutMs ?? 15_000) ||
-      (options.configTimeoutMs ?? 15_000) < 1
+      (options.configTimeoutMs ?? 15_000) < 1 ||
+      (options.configTimeoutMs ?? 15_000) > MAX_TCP_TIMEOUT_MS ||
+      !Number.isInteger(
+        options.connectTimeoutMs ?? DEFAULT_TCP_CONNECT_TIMEOUT_MS,
+      ) ||
+      (options.connectTimeoutMs ?? DEFAULT_TCP_CONNECT_TIMEOUT_MS) < 1 ||
+      (options.connectTimeoutMs ?? DEFAULT_TCP_CONNECT_TIMEOUT_MS) >
+        MAX_TCP_TIMEOUT_MS
     ) {
       throw new TcpTransportError("TCP_CONFIGURATION_INVALID");
     }
@@ -115,6 +133,7 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    this.clearConnectTimeout();
     this.clearConfigTimeout();
     this.configSession.reset();
     this.sessionConnectedAt = undefined;
@@ -149,20 +168,43 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     return this.options.configTimeoutMs ?? 15_000;
   }
 
+  private get connectTimeoutMs(): number {
+    return this.options.connectTimeoutMs ?? DEFAULT_TCP_CONNECT_TIMEOUT_MS;
+  }
+
   private openSocket(): void {
     if (this.manualDisconnect || this.socket) {
       return;
     }
     this.emitState(this.stateMachine.transition("connecting"));
-    const socket = net.createConnection({
-      host: this.options.host,
-      port: this.options.port,
-    });
+    let socket: Socket;
+    try {
+      socket = this.socketFactory({
+        host: this.options.host,
+        port: this.options.port,
+      });
+    } catch {
+      this.failureCode = "TCP_CONNECT_FAILED";
+      this.emit({ kind: "error", code: this.failureCode });
+      this.scheduleReconnect();
+      return;
+    }
     this.socket = socket;
-    socket.once("connect", () => {
-      if (this.socket !== socket || this.manualDisconnect) {
+    this.connectTimer = setTimeout(() => {
+      if (this.socket !== socket || this.state.status !== "connecting") {
         return;
       }
+      this.failureCode = "TCP_CONNECT_TIMEOUT";
+      this.emit({ kind: "error", code: this.failureCode });
+      socket.destroy();
+    }, this.connectTimeoutMs);
+    this.connectTimer.unref();
+    socket.once("connect", () => {
+      if (this.socket !== socket || this.manualDisconnect) {
+        socket.destroy();
+        return;
+      }
+      this.clearConnectTimeout();
       this.failureCode = "TCP_CONNECTION_CLOSED";
       this.configSession.reset();
       this.sessionConnectedAt = undefined;
@@ -201,6 +243,9 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
       }
     });
     socket.on("error", () => {
+      if (this.socket !== socket || this.manualDisconnect) {
+        return;
+      }
       this.failureCode = "TCP_SOCKET_ERROR";
       this.emit({ kind: "error", code: this.failureCode });
     });
@@ -246,8 +291,16 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     this.socket = undefined;
     this.configSession.reset();
     this.sessionConnectedAt = undefined;
+    this.clearConnectTimeout();
     this.clearConfigTimeout();
     if (this.manualDisconnect) {
+      return;
+    }
+    this.scheduleReconnect();
+  }
+
+  private scheduleReconnect(): void {
+    if (this.manualDisconnect || this.reconnectTimer) {
       return;
     }
     this.attempts += 1;
@@ -316,6 +369,13 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     if (this.configTimer) {
       clearTimeout(this.configTimer);
       this.configTimer = undefined;
+    }
+  }
+
+  private clearConnectTimeout(): void {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = undefined;
     }
   }
 }

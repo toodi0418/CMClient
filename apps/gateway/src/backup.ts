@@ -25,6 +25,7 @@ export async function createVerifiedGatewayBackup(
   source: DatabaseSync,
   backupDirectory: string,
   backupId: string,
+  signal?: AbortSignal,
 ): Promise<GatewayBackupResult> {
   if (!isAbsolute(backupDirectory) || !/^[a-zA-Z0-9-]{1,96}$/.test(backupId)) {
     throw new GatewayBackupError();
@@ -32,18 +33,22 @@ export async function createVerifiedGatewayBackup(
   const fileName = `${backupId}.sqlite`;
   const destination = join(backupDirectory, fileName);
   try {
+    signal?.throwIfAborted();
     await mkdir(backupDirectory, { recursive: true, mode: 0o700 });
     await chmod(backupDirectory, 0o700);
+    signal?.throwIfAborted();
     const pages = await backup(source, destination);
+    signal?.throwIfAborted();
     await chmod(destination, 0o600);
     verifyBackup(destination);
+    signal?.throwIfAborted();
     const metadata = await stat(destination);
     return {
       backupId,
       fileName,
       bytes: metadata.size,
       pages,
-      sha256: await sha256File(destination),
+      sha256: await sha256File(destination, signal),
     };
   } catch {
     await rm(destination, { force: true }).catch(() => undefined);
@@ -66,9 +71,10 @@ function verifyBackup(path: string): void {
   }
 }
 
-async function sha256File(path: string): Promise<string> {
+async function sha256File(path: string, signal?: AbortSignal): Promise<string> {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) {
+    signal?.throwIfAborted();
     hash.update(chunk);
   }
   return hash.digest("hex");

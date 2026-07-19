@@ -5,11 +5,79 @@ import { GatewayDatabase } from "./persistence/database";
 import {
   GatewayRuntimeConfigurationError,
   createConfiguredAprsGatewayRuntime,
+  createConfiguredGatewayMaintenanceRuntime,
   createConfiguredMeshGatewayRuntime,
   parseAprsEncodingOptions,
 } from "./runtime-config";
 
 describe("Gateway production runtime configuration", () => {
+  it("rejects invalid bounded maintenance retention settings", () => {
+    const database = new GatewayDatabase(":memory:");
+    const events = new DomainEventBus();
+
+    expect(() =>
+      createConfiguredGatewayMaintenanceRuntime(
+        { CMCLIENT_APRS_OUTBOX_RETENTION_BATCH_SIZE: "0" },
+        database,
+        events,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "APRS_OUTBOX_RETENTION_CONFIGURATION_INVALID",
+      }),
+    );
+    expect(() =>
+      createConfiguredGatewayMaintenanceRuntime(
+        { CMCLIENT_JOB_RETENTION_DAYS: "not-a-number" },
+        database,
+        events,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "JOB_RETENTION_CONFIGURATION_INVALID",
+      }),
+    );
+    expect(() =>
+      createConfiguredGatewayMaintenanceRuntime(
+        { CMCLIENT_MESSAGE_RETENTION_DAYS: "0" },
+        database,
+        events,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "MESSAGE_RETENTION_CONFIGURATION_INVALID",
+      }),
+    );
+    expect(() =>
+      createConfiguredGatewayMaintenanceRuntime(
+        { CMCLIENT_POSITION_RETENTION_BATCH_SIZE: "not-a-number" },
+        database,
+        events,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "POSITION_RETENTION_CONFIGURATION_INVALID",
+      }),
+    );
+    expect(() =>
+      createConfiguredGatewayMaintenanceRuntime(
+        {
+          CMCLIENT_TELEMETRY_RETENTION_BATCH_SIZE: "17",
+          CMCLIENT_MESSAGE_RETENTION_BATCH_SIZE: "64",
+          CMCLIENT_POSITION_RETENTION_BATCH_SIZE: "63",
+          CMCLIENT_OBSERVATION_RETENTION_BATCH_SIZE: "1143",
+        },
+        database,
+        events,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "OBSERVATION_RETENTION_CONFIGURATION_INVALID",
+      }),
+    );
+    database.close();
+  });
+
   it("keeps Meshtastic explicitly disabled unless a transport is selected", async () => {
     const database = new GatewayDatabase(":memory:");
 

@@ -2,12 +2,22 @@
 
 use std::{
     collections::BTreeMap,
+    io::{ErrorKind, Write},
     process::{Child, Command, Stdio},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 /// Stable workspace identity for the supervisor boundary.
 pub const COMPONENT: &str = "supervisor";
+/// Runtime a restarted child must survive before its crash counter is cleared.
+pub const DEFAULT_STABLE_WINDOW: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(40);
+#[cfg(test)]
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SHUTDOWN_COMMAND: &[u8] = b"CMCLIENT_SHUTDOWN\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayCommand {
@@ -59,12 +69,17 @@ pub enum SupervisorEvent {
         status: Option<i32>,
         restart_delay: Duration,
     },
+    Backoff {
+        attempt: u32,
+        restart_in: Duration,
+    },
     Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorError {
     EmptyProgram,
+    InvalidTimingPolicy,
     SpawnFailed,
     ProcessIoFailed,
 }
@@ -73,6 +88,7 @@ impl SupervisorError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::EmptyProgram => "GATEWAY_SUPERVISOR_PROGRAM_EMPTY",
+            Self::InvalidTimingPolicy => "GATEWAY_SUPERVISOR_TIMING_POLICY_INVALID",
             Self::SpawnFailed => "GATEWAY_SUPERVISOR_SPAWN_FAILED",
             Self::ProcessIoFailed => "GATEWAY_SUPERVISOR_PROCESS_IO_FAILED",
         }
@@ -85,6 +101,9 @@ pub struct GatewaySupervisor {
     child: Option<Child>,
     environment: BTreeMap<String, String>,
     failed_attempts: u32,
+    restart_not_before: Option<Instant>,
+    stable_window: Duration,
+    started_at: Option<Instant>,
 }
 
 impl GatewaySupervisor {
@@ -92,8 +111,25 @@ impl GatewaySupervisor {
         command: GatewayCommand,
         backoff_policy: BackoffPolicy,
     ) -> Result<Self, SupervisorError> {
+        Self::new_with_stable_window(command, backoff_policy, DEFAULT_STABLE_WINDOW)
+    }
+
+    pub fn new_with_stable_window(
+        command: GatewayCommand,
+        backoff_policy: BackoffPolicy,
+        stable_window: Duration,
+    ) -> Result<Self, SupervisorError> {
         if command.program.trim().is_empty() {
             return Err(SupervisorError::EmptyProgram);
+        }
+        let now = Instant::now();
+        if backoff_policy.initial_delay.is_zero()
+            || backoff_policy.maximum_delay < backoff_policy.initial_delay
+            || stable_window.is_zero()
+            || now.checked_add(backoff_policy.maximum_delay).is_none()
+            || now.checked_add(stable_window).is_none()
+        {
+            return Err(SupervisorError::InvalidTimingPolicy);
         }
         Ok(Self {
             command,
@@ -101,6 +137,9 @@ impl GatewaySupervisor {
             child: None,
             environment: inherited_runtime_environment(),
             failed_attempts: 0,
+            restart_not_before: None,
+            stable_window,
+            started_at: None,
         })
     }
 
@@ -123,18 +162,55 @@ impl GatewaySupervisor {
         if let Some(child) = self.child.as_ref() {
             return Ok(SupervisorEvent::Heartbeat { pid: child.id() });
         }
+        self.spawn_child()
+    }
+
+    /// Advances process supervision using the supervisor's monotonic clock.
+    ///
+    /// A running child is polled once. An exited child enters backoff, and a
+    /// later tick starts it only after the internally tracked deadline. Callers
+    /// never supply wall-clock or elapsed-time values.
+    pub fn tick(&mut self) -> Result<SupervisorEvent, SupervisorError> {
+        if self.child.is_some() {
+            return self.poll_heartbeat();
+        }
+        if self.failed_attempts == 0 {
+            return Ok(SupervisorEvent::Stopped);
+        }
+
+        let now = Instant::now();
+        let restart_not_before = self
+            .restart_not_before
+            .ok_or(SupervisorError::ProcessIoFailed)?;
+        if now < restart_not_before {
+            return Ok(SupervisorEvent::Backoff {
+                attempt: self.failed_attempts,
+                restart_in: restart_not_before.duration_since(now),
+            });
+        }
+        self.spawn_child()
+    }
+
+    fn spawn_child(&mut self) -> Result<SupervisorEvent, SupervisorError> {
         let child = Command::new(&self.command.program)
             .args(&self.command.arguments)
             .env_clear()
             .envs(&self.environment)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| SupervisorError::SpawnFailed)?;
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(_) => {
+                self.register_failure(Instant::now());
+                return Err(SupervisorError::SpawnFailed);
+            }
+        };
         let pid = child.id();
         self.child = Some(child);
-        self.failed_attempts = 0;
+        self.restart_not_before = None;
+        self.started_at = Some(Instant::now());
         Ok(SupervisorEvent::Started { pid })
     }
 
@@ -142,15 +218,29 @@ impl GatewaySupervisor {
         let Some(child) = self.child.as_mut() else {
             return Ok(SupervisorEvent::Stopped);
         };
-        match child
+        let result = child
             .try_wait()
-            .map_err(|_| SupervisorError::ProcessIoFailed)?
-        {
-            None => Ok(SupervisorEvent::Heartbeat { pid: child.id() }),
+            .map_err(|_| SupervisorError::ProcessIoFailed)?;
+        let observed_at = Instant::now();
+        let survived_stable_window = self
+            .started_at
+            .is_some_and(|started_at| observed_at.duration_since(started_at) >= self.stable_window);
+        match result {
+            None => {
+                let pid = child.id();
+                if survived_stable_window {
+                    self.failed_attempts = 0;
+                    self.restart_not_before = None;
+                }
+                Ok(SupervisorEvent::Heartbeat { pid })
+            }
             Some(status) => {
                 self.child = None;
-                self.failed_attempts = self.failed_attempts.saturating_add(1);
-                let restart_delay = self.backoff_policy.delay_for_attempt(self.failed_attempts);
+                if survived_stable_window {
+                    self.failed_attempts = 0;
+                    self.restart_not_before = None;
+                }
+                let restart_delay = self.register_failure(observed_at);
                 Ok(SupervisorEvent::Exited {
                     status: status.code(),
                     restart_delay,
@@ -159,28 +249,71 @@ impl GatewaySupervisor {
         }
     }
 
-    pub fn restart_if_due(
-        &mut self,
-        elapsed_since_exit: Duration,
-    ) -> Result<Option<SupervisorEvent>, SupervisorError> {
-        if self.child.is_some() || self.failed_attempts == 0 {
-            return Ok(None);
-        }
-        if elapsed_since_exit < self.backoff_policy.delay_for_attempt(self.failed_attempts) {
-            return Ok(None);
-        }
-        self.start().map(Some)
+    fn register_failure(&mut self, observed_at: Instant) -> Duration {
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+        self.started_at = None;
+        let delay = self.backoff_policy.delay_for_attempt(self.failed_attempts);
+        self.restart_not_before = observed_at.checked_add(delay);
+        delay
     }
 
     pub fn stop(&mut self) -> Result<SupervisorEvent, SupervisorError> {
         let Some(mut child) = self.child.take() else {
+            self.reset_tracking();
             return Ok(SupervisorEvent::Stopped);
         };
-        child.kill().map_err(|_| SupervisorError::ProcessIoFailed)?;
-        child.wait().map_err(|_| SupervisorError::ProcessIoFailed)?;
-        self.failed_attempts = 0;
+        if terminate_child(&mut child).is_err() {
+            self.child = Some(child);
+            return Err(SupervisorError::ProcessIoFailed);
+        }
+        self.reset_tracking();
         Ok(SupervisorEvent::Stopped)
     }
+
+    fn reset_tracking(&mut self) {
+        self.failed_attempts = 0;
+        self.restart_not_before = None;
+        self.started_at = None;
+    }
+}
+
+impl Drop for GatewaySupervisor {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = terminate_child(&mut child);
+        }
+    }
+}
+
+fn terminate_child(child: &mut Child) -> std::io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    let graceful_requested = child.stdin.take().is_some_and(|mut input| {
+        input
+            .write_all(SHUTDOWN_COMMAND)
+            .and_then(|()| input.flush())
+            .is_ok()
+    });
+    if graceful_requested {
+        let deadline = Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT;
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(SHUTDOWN_POLL_INTERVAL);
+        }
+    }
+    match child.kill() {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::InvalidInput => {}
+        Err(error) => return Err(error),
+    }
+    child.wait()?;
+    Ok(())
 }
 
 fn inherited_runtime_environment() -> BTreeMap<String, String> {
@@ -196,8 +329,22 @@ fn inherited_runtime_environment() -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor, SupervisorEvent};
-    use std::time::Duration;
+    use super::{
+        BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor, SupervisorError,
+        SupervisorEvent,
+    };
+    use std::{
+        collections::BTreeMap,
+        env, fs,
+        io::BufRead,
+        path::PathBuf,
+        process, thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    const FIXTURE_MODE: &str = "CMCLIENT_SUPERVISOR_TEST_MODE";
+    const FIXTURE_DELAY_MS: &str = "CMCLIENT_SUPERVISOR_TEST_DELAY_MS";
+    const FIXTURE_MARKER: &str = "CMCLIENT_SUPERVISOR_TEST_MARKER";
 
     #[test]
     fn bounds_exponential_restart_delays() {
@@ -224,53 +371,365 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
-    fn reports_exit_and_backoff_after_a_gateway_crash() {
-        let mut supervisor = GatewaySupervisor::new(
-            GatewayCommand {
-                program: String::from("sh"),
-                arguments: vec![String::from("-c"), String::from("exit 7")],
+    fn rejects_invalid_timing_policies() {
+        let command = fixture_command();
+        assert!(matches!(
+            GatewaySupervisor::new_with_stable_window(
+                command.clone(),
+                BackoffPolicy {
+                    initial_delay: Duration::ZERO,
+                    maximum_delay: Duration::from_secs(1),
+                },
+                Duration::from_secs(1),
+            ),
+            Err(SupervisorError::InvalidTimingPolicy)
+        ));
+        assert!(matches!(
+            GatewaySupervisor::new_with_stable_window(
+                command,
+                BackoffPolicy::default(),
+                Duration::ZERO,
+            ),
+            Err(SupervisorError::InvalidTimingPolicy)
+        ));
+    }
+
+    #[test]
+    fn tick_preserves_consecutive_failures_and_enforces_each_deadline() {
+        let initial_delay = Duration::from_millis(40);
+        let mut supervisor = fixture_supervisor(
+            "crash",
+            Duration::ZERO,
+            BackoffPolicy {
+                initial_delay,
+                maximum_delay: Duration::from_millis(160),
             },
-            BackoffPolicy::default(),
-        )
-        .expect("supervisor should initialize");
+            Duration::from_secs(1),
+            None,
+        );
         assert!(matches!(
             supervisor.start(),
             Ok(SupervisorEvent::Started { .. })
         ));
 
-        let event = loop {
-            match supervisor.poll_heartbeat().expect("poll should succeed") {
-                SupervisorEvent::Heartbeat { .. } => std::thread::sleep(Duration::from_millis(5)),
-                event => break event,
-            }
-        };
+        let event = wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Exited { .. })
+        });
+        let first_exit_observed = Instant::now();
         assert_eq!(
             event,
             SupervisorEvent::Exited {
                 status: Some(7),
-                restart_delay: Duration::from_secs(1)
+                restart_delay: initial_delay,
             }
         );
         assert_eq!(
             supervisor.status(),
             GatewayStatus::Backoff {
                 attempt: 1,
-                delay: Duration::from_secs(1)
+                delay: initial_delay,
+            }
+        );
+        assert!(matches!(
+            supervisor.tick(),
+            Ok(SupervisorEvent::Backoff { attempt: 1, .. })
+        ));
+
+        wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Started { .. })
+        });
+        assert!(first_exit_observed.elapsed() + Duration::from_millis(2) >= initial_delay);
+        let second_exit = wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Exited { .. })
+        });
+        let second_exit_observed = Instant::now();
+        assert_eq!(
+            second_exit,
+            SupervisorEvent::Exited {
+                status: Some(7),
+                restart_delay: Duration::from_millis(80),
             }
         );
         assert_eq!(
-            supervisor
-                .restart_if_due(Duration::from_millis(999))
-                .expect("restart evaluation should succeed"),
-            None
+            supervisor.status(),
+            GatewayStatus::Backoff {
+                attempt: 2,
+                delay: Duration::from_millis(80),
+            }
         );
         assert!(matches!(
-            supervisor
-                .restart_if_due(Duration::from_secs(1))
-                .expect("restart evaluation should succeed"),
-            Some(SupervisorEvent::Started { .. })
+            supervisor.tick(),
+            Ok(SupervisorEvent::Backoff { attempt: 2, .. })
         ));
+        wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Started { .. })
+        });
+        assert!(
+            second_exit_observed.elapsed() + Duration::from_millis(2) >= Duration::from_millis(80)
+        );
+        supervisor.stop().expect("child should stop");
+    }
+
+    #[test]
+    fn stable_heartbeat_resets_the_crash_loop() {
+        let mut supervisor = fixture_supervisor(
+            "crash",
+            Duration::ZERO,
+            BackoffPolicy {
+                initial_delay: Duration::from_millis(20),
+                maximum_delay: Duration::from_millis(80),
+            },
+            Duration::from_millis(40),
+            None,
+        );
+        supervisor.start().expect("first child should start");
+        wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Exited { .. })
+        });
+        supervisor.set_environment(BTreeMap::from([
+            (String::from(FIXTURE_MODE), String::from("delayed-exit")),
+            (String::from(FIXTURE_DELAY_MS), String::from("120")),
+        ]));
+        wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Started { .. })
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(matches!(
+            supervisor.tick(),
+            Ok(SupervisorEvent::Heartbeat { .. })
+        ));
+        let exit = wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Exited { .. })
+        });
+        assert_eq!(
+            exit,
+            SupervisorEvent::Exited {
+                status: Some(7),
+                restart_delay: Duration::from_millis(20),
+            }
+        );
+        assert_eq!(
+            supervisor.status(),
+            GatewayStatus::Backoff {
+                attempt: 1,
+                delay: Duration::from_millis(20),
+            }
+        );
+    }
+
+    #[test]
+    fn exit_first_observed_after_the_stable_window_resets_the_crash_loop() {
+        let initial_delay = Duration::from_millis(20);
+        let stable_window = Duration::from_millis(40);
+        let mut supervisor = fixture_supervisor(
+            "crash",
+            Duration::ZERO,
+            BackoffPolicy {
+                initial_delay,
+                maximum_delay: Duration::from_millis(80),
+            },
+            stable_window,
+            None,
+        );
+        supervisor.start().expect("first child should start");
+        wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Exited { .. })
+        });
+        supervisor.set_environment(BTreeMap::from([
+            (String::from(FIXTURE_MODE), String::from("delayed-exit")),
+            (String::from(FIXTURE_DELAY_MS), String::from("80")),
+        ]));
+        wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Started { .. })
+        });
+
+        // Deliberately do not poll while the child crosses the stable window and exits.
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            supervisor.tick().expect("exit should be observed"),
+            SupervisorEvent::Exited {
+                status: Some(7),
+                restart_delay: initial_delay,
+            }
+        );
+        assert_eq!(
+            supervisor.status(),
+            GatewayStatus::Backoff {
+                attempt: 1,
+                delay: initial_delay,
+            }
+        );
+    }
+
+    #[test]
+    fn stop_terminates_and_reaps_a_real_child() {
+        let marker = unique_marker("stop");
+        let mut supervisor = fixture_supervisor(
+            "delayed-marker",
+            Duration::from_millis(250),
+            BackoffPolicy::default(),
+            Duration::from_secs(1),
+            Some(&marker),
+        );
+        supervisor.start().expect("child should start");
+        assert_eq!(
+            supervisor.stop().expect("child should stop"),
+            SupervisorEvent::Stopped
+        );
+        assert_eq!(supervisor.status(), GatewayStatus::Stopped);
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(
+            fs::read(&marker).expect("graceful marker should exist"),
+            b"graceful shutdown"
+        );
+        fs::remove_file(marker).expect("marker should remove");
+    }
+
+    #[test]
+    fn drop_terminates_and_reaps_a_real_child() {
+        let marker = unique_marker("drop");
+        {
+            let mut supervisor = fixture_supervisor(
+                "delayed-marker",
+                Duration::from_millis(250),
+                BackoffPolicy::default(),
+                Duration::from_secs(1),
+                Some(&marker),
+            );
+            supervisor.start().expect("child should start");
+        }
+        assert_eq!(
+            fs::read(&marker).expect("graceful marker should exist"),
+            b"graceful shutdown"
+        );
+        fs::remove_file(marker).expect("marker should remove");
+    }
+
+    #[test]
+    fn stop_force_terminates_a_child_that_ignores_the_graceful_deadline() {
+        let mut supervisor = fixture_supervisor(
+            "ignore-shutdown",
+            Duration::ZERO,
+            BackoffPolicy::default(),
+            Duration::from_secs(1),
+            None,
+        );
+        supervisor.start().expect("child should start");
+        let started_at = Instant::now();
+        supervisor.stop().expect("child should stop after fallback");
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(supervisor.status(), GatewayStatus::Stopped);
+    }
+
+    fn fixture_supervisor(
+        mode: &str,
+        delay: Duration,
+        policy: BackoffPolicy,
+        stable_window: Duration,
+        marker: Option<&PathBuf>,
+    ) -> GatewaySupervisor {
+        let mut supervisor =
+            GatewaySupervisor::new_with_stable_window(fixture_command(), policy, stable_window)
+                .expect("fixture supervisor should initialize");
+        let mut environment = BTreeMap::from([
+            (String::from(FIXTURE_MODE), String::from(mode)),
+            (
+                String::from(FIXTURE_DELAY_MS),
+                delay.as_millis().to_string(),
+            ),
+        ]);
+        if let Some(marker) = marker {
+            environment.insert(
+                String::from(FIXTURE_MARKER),
+                marker.to_string_lossy().into_owned(),
+            );
+        }
+        supervisor.set_environment(environment);
+        supervisor
+    }
+
+    fn fixture_command() -> GatewayCommand {
+        GatewayCommand {
+            program: env::current_exe()
+                .expect("test executable should resolve")
+                .to_string_lossy()
+                .into_owned(),
+            arguments: vec![
+                String::from("--ignored"),
+                String::from("--exact"),
+                String::from("tests::supervisor_child_fixture"),
+            ],
+        }
+    }
+
+    fn wait_for_event(
+        supervisor: &mut GatewaySupervisor,
+        timeout: Duration,
+        predicate: impl Fn(&SupervisorEvent) -> bool,
+    ) -> SupervisorEvent {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let event = supervisor.tick().expect("supervisor tick should succeed");
+            if predicate(&event) {
+                return event;
+            }
+            assert!(Instant::now() < deadline, "supervisor event timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn unique_marker(label: &str) -> PathBuf {
+        let sequence = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should follow the epoch")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "cmclient-supervisor-{label}-{}-{sequence}",
+            process::id()
+        ))
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn supervisor_child_fixture() {
+        let mode = env::var(FIXTURE_MODE).expect("fixture mode should be configured");
+        let delay = env::var(FIXTURE_DELAY_MS)
+            .expect("fixture delay should be configured")
+            .parse::<u64>()
+            .expect("fixture delay should be numeric");
+        match mode.as_str() {
+            "crash" => process::exit(7),
+            "delayed-exit" => {
+                thread::sleep(Duration::from_millis(delay));
+                process::exit(7);
+            }
+            "delayed-marker" => {
+                let mut command = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut command)
+                    .expect("shutdown command should read");
+                if command.trim() == "CMCLIENT_SHUTDOWN" {
+                    fs::write(
+                        env::var(FIXTURE_MARKER).expect("fixture marker should be configured"),
+                        b"graceful shutdown",
+                    )
+                    .expect("fixture marker should be writable");
+                } else {
+                    thread::sleep(Duration::from_millis(delay));
+                }
+            }
+            "ignore-shutdown" => {
+                let mut command = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut command)
+                    .expect("shutdown command should read");
+                thread::sleep(Duration::from_secs(30));
+            }
+            _ => process::exit(64),
+        }
     }
 }

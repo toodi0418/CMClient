@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import { DomainEventBus } from "./events";
-import { JobEngine, JobTypeUnsupportedError } from "./jobs";
+import {
+  JobEngine,
+  JobEngineStoppedError,
+  JobQueueFullError,
+  JobShutdownTimeoutError,
+  JobTypeUnsupportedError,
+} from "./jobs";
 import { GatewayDatabase } from "./persistence/database";
 
 describe("JobEngine", () => {
@@ -108,6 +114,409 @@ describe("JobEngine", () => {
     database.close();
   });
 
+  it("caps concurrent executions and drains queued jobs in submission order", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let jobSequence = 0;
+    let active = 0;
+    let maximumActive = 0;
+    const started: string[] = [];
+    const releases = new Map<string, () => void>();
+    const engine = new JobEngine(database.jobs, new DomainEventBus(), {
+      maximumConcurrency: 2,
+      maximumQueuedJobs: 6,
+      idFactory: () => `load-job-${++jobSequence}`,
+      handlers: [
+        {
+          type: "load.wait",
+          handler: async ({ job }) => {
+            active += 1;
+            maximumActive = Math.max(maximumActive, active);
+            started.push(job.id);
+            await new Promise<void>((resolve) => {
+              releases.set(job.id, resolve);
+            });
+            active -= 1;
+            if (job.id === "load-job-4") {
+              throw new Error("fixture load failure");
+            }
+          },
+        },
+      ],
+    });
+    const accepted = Array.from({ length: 8 }, () =>
+      engine.submit({ type: "load.wait", input: {} }),
+    );
+
+    expect(started).toEqual(["load-job-1", "load-job-2"]);
+    expect(engine.scheduleSnapshot).toEqual({
+      active: 2,
+      maximumConcurrency: 2,
+      maximumQueuedJobs: 6,
+      queued: 6,
+    });
+
+    for (const submission of accepted) {
+      const release = releases.get(submission.job.id);
+      if (!release) {
+        throw new Error(
+          `job did not start in FIFO order: ${submission.job.id}`,
+        );
+      }
+      release();
+      await expect(engine.waitFor(submission.job.id)).resolves.toMatchObject({
+        status: submission.job.id === "load-job-4" ? "failed" : "succeeded",
+      });
+    }
+
+    expect(started).toEqual(accepted.map((entry) => entry.job.id));
+    expect(maximumActive).toBe(2);
+    expect(engine.scheduleSnapshot).toEqual({
+      active: 0,
+      maximumConcurrency: 2,
+      maximumQueuedJobs: 6,
+      queued: 0,
+    });
+    database.close();
+  });
+
+  it("removes a cancelled queued job without waiting for an execution slot", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let jobSequence = 0;
+    let releaseRunning = (): void => undefined;
+    const engine = new JobEngine(database.jobs, new DomainEventBus(), {
+      maximumConcurrency: 1,
+      maximumQueuedJobs: 1,
+      idFactory: () => `cancel-job-${++jobSequence}`,
+      handlers: [
+        {
+          type: "load.wait",
+          handler: async () =>
+            new Promise<void>((resolve) => {
+              releaseRunning = resolve;
+            }),
+        },
+      ],
+    });
+    const running = engine.submit({ type: "load.wait", input: {} });
+    const queued = engine.submit({ type: "load.wait", input: {} });
+
+    expect(engine.cancel(queued.job.id)).toMatchObject({ status: "cancelled" });
+    await expect(engine.waitFor(queued.job.id)).resolves.toMatchObject({
+      status: "cancelled",
+    });
+    expect(engine.scheduleSnapshot).toMatchObject({ active: 1, queued: 0 });
+
+    releaseRunning();
+    await engine.waitFor(running.job.id);
+    database.close();
+  });
+
+  it("rejects new work at queue capacity while reusing an idempotent Job", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let jobSequence = 0;
+    let releaseRunning = (): void => undefined;
+    const engine = new JobEngine(database.jobs, new DomainEventBus(), {
+      maximumConcurrency: 1,
+      maximumQueuedJobs: 2,
+      idFactory: () => `capacity-job-${++jobSequence}`,
+      handlers: [
+        {
+          type: "load.wait",
+          handler: async () =>
+            new Promise<void>((resolve) => {
+              releaseRunning = resolve;
+            }),
+        },
+      ],
+    });
+    const first = engine.submit({
+      type: "load.wait",
+      input: {},
+      idempotencyKey: "capacity-reuse",
+    });
+    const second = engine.submit({ type: "load.wait", input: {} });
+    const third = engine.submit({ type: "load.wait", input: {} });
+
+    expect(
+      engine.submit({
+        type: "load.wait",
+        input: { ignored: true },
+        idempotencyKey: "capacity-reuse",
+      }),
+    ).toMatchObject({ created: false, job: { id: first.job.id } });
+    expect(() => engine.submit({ type: "load.wait", input: {} })).toThrow(
+      JobQueueFullError,
+    );
+    expect(
+      database.connection.prepare("SELECT COUNT(*) AS count FROM jobs").get()
+        ?.count,
+    ).toBe(3);
+
+    engine.cancel(second.job.id);
+    engine.cancel(third.job.id);
+    releaseRunning();
+    await engine.waitFor(first.job.id);
+    database.close();
+  });
+
+  it("recovers only a bounded SQLite queue window and refills it to completion", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const jobIds = Array.from(
+      { length: 25 },
+      (_, index) => `recovered-${String(index).padStart(2, "0")}`,
+    );
+    for (const id of jobIds) {
+      database.jobs.create({
+        id,
+        type: "load.recover",
+        input: {},
+        now: "2026-07-18T00:00:00.000Z",
+      });
+    }
+    const releases = new Map<string, () => void>();
+    const engine = new JobEngine(database.jobs, new DomainEventBus(), {
+      maximumConcurrency: 2,
+      maximumQueuedJobs: 3,
+      handlers: [
+        {
+          type: "load.recover",
+          handler: async ({ job }) =>
+            new Promise<void>((resolve) => {
+              releases.set(job.id, resolve);
+            }),
+        },
+      ],
+    });
+
+    engine.recover();
+
+    expect(engine.scheduleSnapshot).toEqual({
+      active: 2,
+      maximumConcurrency: 2,
+      maximumQueuedJobs: 3,
+      queued: 3,
+    });
+    for (const id of jobIds) {
+      await waitFor(() => releases.has(id));
+      releases.get(id)?.();
+      await waitFor(() => database.jobs.find(id)?.status === "succeeded");
+    }
+    expect(engine.scheduleSnapshot).toMatchObject({ active: 0, queued: 0 });
+    expect(database.jobs.findByStatuses(["queued"])).toEqual([]);
+    database.close();
+  });
+
+  it("recovers a registered type behind more than 20k unsupported queued rows", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const insert = database.connection.prepare(
+      "INSERT INTO jobs (id, type, status, input, created_at, updated_at) VALUES (?, 'legacy.unknown', 'queued', '{}', ?, ?)",
+    );
+    database.connection.exec("BEGIN IMMEDIATE");
+    try {
+      for (let index = 0; index < 20_001; index += 1) {
+        insert.run(
+          `unsupported-${String(index).padStart(5, "0")}`,
+          "2026-07-18T00:00:00.000Z",
+          "2026-07-18T00:00:00.000Z",
+        );
+      }
+      database.connection.exec("COMMIT");
+    } catch (error) {
+      database.connection.exec("ROLLBACK");
+      throw error;
+    }
+    database.jobs.create({
+      id: "b-supported",
+      type: "diagnostics.noop",
+      input: {},
+      now: "2026-07-18T00:00:01.000Z",
+    });
+    const engine = new JobEngine(database.jobs, new DomainEventBus(), {
+      maximumConcurrency: 1,
+      maximumQueuedJobs: 1,
+      handlers: [
+        {
+          type: "diagnostics.noop",
+          handler: async () => undefined,
+        },
+      ],
+    });
+
+    engine.recover();
+
+    await expect(engine.waitFor("b-supported")).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(engine.get("unsupported-00000")).toMatchObject({
+      status: "queued",
+    });
+    await engine.stop();
+    database.close();
+  });
+
+  it("stops dispatch, cancels active work, and drains before persistence closes", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let jobSequence = 0;
+    let markStarted = (): void => undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const engine = new JobEngine(database.jobs, new DomainEventBus(), {
+      maximumConcurrency: 1,
+      maximumQueuedJobs: 1,
+      idFactory: () => `shutdown-job-${++jobSequence}`,
+      handlers: [
+        {
+          type: "load.wait",
+          handler: async ({ signal }) => {
+            markStarted();
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) {
+                resolve();
+                return;
+              }
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          },
+        },
+      ],
+    });
+    const running = engine.submit({ type: "load.wait", input: {} });
+    const queued = engine.submit({ type: "load.wait", input: {} });
+    await started;
+
+    const stopping = engine.stop();
+
+    expect(engine.stop()).toBe(stopping);
+    await expect(stopping).resolves.toBeUndefined();
+    expect(engine.get(running.job.id)).toMatchObject({ status: "cancelled" });
+    expect(engine.get(queued.job.id)).toMatchObject({ status: "queued" });
+    expect(engine.scheduleSnapshot).toMatchObject({ active: 0, queued: 0 });
+    expect(() => engine.submit({ type: "load.wait", input: {} })).toThrow(
+      JobEngineStoppedError,
+    );
+
+    database.close();
+  });
+
+  it("bounds shutdown when a handler ignores its abort signal", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const engine = new JobEngine(database.jobs, new DomainEventBus(), {
+      idFactory: () => "shutdown-timeout-job",
+      shutdownTimeoutMs: 25,
+      handlers: [
+        {
+          type: "load.hung",
+          handler: async () => new Promise<void>(() => undefined),
+        },
+      ],
+    });
+    const accepted = engine.submit({ type: "load.hung", input: {} });
+
+    const stopping = engine.stop();
+
+    expect(engine.stop()).toBe(stopping);
+    await expect(stopping).rejects.toBeInstanceOf(JobShutdownTimeoutError);
+    expect(engine.get(accepted.job.id)).toMatchObject({
+      status: "cancelling",
+    });
+    expect(() => engine.submit({ type: "load.hung", input: {} })).toThrow(
+      JobEngineStoppedError,
+    );
+    database.close();
+  });
+
+  it("aborts and drains when cancellation event publication fails", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const engine = new JobEngine(
+      database.jobs,
+      new FailingCancellationEventBus(),
+      {
+        idFactory: () => "shutdown-publish-failure",
+        handlers: [
+          {
+            type: "load.wait",
+            handler: async ({ signal }) =>
+              new Promise<void>((resolve) => {
+                signal.addEventListener("abort", () => resolve(), {
+                  once: true,
+                });
+              }),
+          },
+        ],
+      },
+    );
+    const accepted = engine.submit({ type: "load.wait", input: {} });
+
+    const stopping = engine.stop();
+
+    expect(engine.stop()).toBe(stopping);
+    await expect(stopping).resolves.toBeUndefined();
+    expect(engine.get(accepted.job.id)).toMatchObject({ status: "cancelled" });
+    expect(engine.scheduleSnapshot).toMatchObject({ active: 0, queued: 0 });
+    database.close();
+  });
+
+  it("aborts and drains when cancellation persistence fails", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const transition = database.jobs.transition.bind(database.jobs);
+    let failCancellation = true;
+    database.jobs.transition = (...args) => {
+      if (failCancellation && args[2] === "cancelling") {
+        failCancellation = false;
+        throw new Error("fixture cancellation persistence failure");
+      }
+      return transition(...args);
+    };
+    const engine = new JobEngine(database.jobs, new DomainEventBus(), {
+      idFactory: () => "shutdown-persistence-failure",
+      handlers: [
+        {
+          type: "load.wait",
+          handler: async ({ signal }) =>
+            new Promise<void>((_resolve, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => reject(new Error("fixture handler aborted")),
+                { once: true },
+              );
+            }),
+        },
+      ],
+    });
+    const accepted = engine.submit({ type: "load.wait", input: {} });
+
+    await expect(engine.stop()).resolves.toBeUndefined();
+
+    expect(failCancellation).toBe(false);
+    expect(engine.get(accepted.job.id)).toMatchObject({ status: "failed" });
+    expect(engine.scheduleSnapshot).toMatchObject({ active: 0, queued: 0 });
+    database.close();
+  });
+
+  it("terminally catches an unexpected execution rejection", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const events = new FailingJobStatusEventBus();
+    const engine = new JobEngine(database.jobs, events, {
+      idFactory: () => "failed-publish-job",
+      handlers: [
+        {
+          type: "diagnostics.noop",
+          handler: async () => undefined,
+        },
+      ],
+    });
+
+    const accepted = engine.submit({ type: "diagnostics.noop", input: {} });
+
+    await expect(engine.waitFor(accepted.job.id)).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "EVENT_PUBLISH_FAILED" },
+    });
+    await expect(engine.stop()).resolves.toBeUndefined();
+    database.close();
+  });
+
   it("rejects submission for an unregistered job type", () => {
     const database = new GatewayDatabase(":memory:");
     const engine = new JobEngine(database.jobs, new DomainEventBus());
@@ -118,3 +527,49 @@ describe("JobEngine", () => {
     database.close();
   });
 });
+
+class FailingJobStatusEventBus extends DomainEventBus {
+  private failed = false;
+
+  override publish(
+    input: Parameters<DomainEventBus["publish"]>[0],
+  ): ReturnType<DomainEventBus["publish"]> {
+    if (input.type === "job.status_changed" && !this.failed) {
+      this.failed = true;
+      const error = new Error("EVENT_PUBLISH_FAILED") as Error & {
+        code: string;
+      };
+      error.code = "EVENT_PUBLISH_FAILED";
+      throw error;
+    }
+    return super.publish(input);
+  }
+}
+
+class FailingCancellationEventBus extends DomainEventBus {
+  override publish(
+    input: Parameters<DomainEventBus["publish"]>[0],
+  ): ReturnType<DomainEventBus["publish"]> {
+    const job = input.payload.job;
+    if (
+      input.type === "job.status_changed" &&
+      typeof job === "object" &&
+      job !== null &&
+      "status" in job &&
+      job.status === "cancelling"
+    ) {
+      throw new Error("fixture cancellation publication failure");
+    }
+    return super.publish(input);
+  }
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error("fixture condition was not reached");
+}

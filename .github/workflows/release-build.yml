@@ -56,9 +56,30 @@ jobs:
           path: release-build/artifact-plan.json
           if-no-files-found: error
 
+  load-gate:
+    name: Release load and resource gate
+    needs: artifact-plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install Agent native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential libdbus-1-dev pkg-config
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:load
+
   build:
     name: ${{ matrix.component }} ${{ matrix.target }}
-    needs: artifact-plan
+    needs: [artifact-plan, load-gate]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -247,7 +268,7 @@ jobs:
 
   docker-composition:
     name: Docker Gateway and Web composition
-    needs: artifact-plan
+    needs: [artifact-plan, load-gate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

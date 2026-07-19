@@ -17,27 +17,35 @@ use cmclient_control_api::{
     RemoteControlAuth, RemoteControlAuthError, RemoteControlReplayGuard, UpdateControlJob,
     UpdateControlStatus, default_local_endpoint,
 };
-use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor};
+use cmclient_supervisor::{
+    BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor, SupervisorEvent,
+};
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
 use std::{
     collections::BTreeMap,
-    io::{BufRead, BufReader, Read},
-    net::SocketAddr,
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, RecvTimeoutError, SyncSender},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 const EX_USAGE: u8 = 2;
 const EX_CONFIG: u8 = 5;
 const UPDATE_EVENT_BUFFER: usize = 64;
 const MAX_SSE_EVENT_BYTES: usize = 60 * 1024;
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const GATEWAY_SSE_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const GATEWAY_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 struct AgentUpdateService {
     journal: UpdateJournalStore,
@@ -637,14 +645,54 @@ struct AgentController {
     supervisor: Mutex<Option<GatewaySupervisor>>,
     gateway: SocketAddr,
     management_web: Mutex<Option<ManagementWebService>>,
+    management_web_shutdown: Mutex<Option<JoinHandle<Result<(), ManagementWebError>>>>,
     management_web_config: ManagementWebConfig,
     management_access: Option<Arc<ManagementAccessController>>,
     control_endpoint: ControlEndpoint,
     remote_replay: Arc<RemoteControlReplayGuard>,
     secrets: AgentSecretStore,
     updates: Arc<AgentUpdateService>,
+    shutdown_requested: AtomicBool,
     started_at: Instant,
     latest_error_code: Mutex<Option<String>>,
+}
+
+struct SupervisorWorker {
+    shutdown: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl SupervisorWorker {
+    fn start(controller: Arc<AgentController>) -> Result<Self, ControlError> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::Builder::new()
+            .name(String::from("cmclient-gateway-supervisor"))
+            .spawn(move || {
+                while !worker_shutdown.load(Ordering::Acquire) {
+                    let _ = controller.tick_supervisor();
+                    thread::sleep(SUPERVISOR_POLL_INTERVAL);
+                }
+            })
+            .map_err(|_| ControlError::CommandFailed)?;
+        Ok(Self {
+            shutdown,
+            worker: Some(worker),
+        })
+    }
+
+    fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for SupervisorWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl AgentController {
@@ -665,6 +713,7 @@ impl AgentController {
                 )
                 .map_err(|_| ControlError::CommandFailed)?;
                 let mut environment = BTreeMap::from([
+                    (String::from("CMCLIENT_SUPERVISED"), String::from("1")),
                     (
                         String::from("CMCLIENT_GATEWAY_HOST"),
                         String::from("127.0.0.1"),
@@ -845,33 +894,31 @@ impl AgentController {
             supervisor: Mutex::new(supervisor),
             gateway: gateway_address(config.gateway_port),
             management_web: Mutex::new(management_web),
+            management_web_shutdown: Mutex::new(None),
             management_web_config,
             management_access,
             control_endpoint,
             remote_replay,
             secrets,
             updates,
+            shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             latest_error_code: Mutex::new(None),
         })
     }
 
     fn status(&self) -> Result<ControlStatus, ControlError> {
+        self.tick_supervisor()?;
         let mut supervisor = self
             .supervisor
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
         let lifecycle = match supervisor.as_mut() {
-            Some(supervisor) => {
-                let _ = supervisor
-                    .poll_heartbeat()
-                    .map_err(|_| ControlError::CommandFailed)?;
-                match supervisor.status() {
-                    GatewayStatus::Stopped => GatewayControlStatus::Stopped,
-                    GatewayStatus::Running { .. } => GatewayControlStatus::Running,
-                    GatewayStatus::Backoff { .. } => GatewayControlStatus::Backoff,
-                }
-            }
+            Some(supervisor) => match supervisor.status() {
+                GatewayStatus::Stopped => GatewayControlStatus::Stopped,
+                GatewayStatus::Running { .. } => GatewayControlStatus::Running,
+                GatewayStatus::Backoff { .. } => GatewayControlStatus::Backoff,
+            },
             None => GatewayControlStatus::Stopped,
         };
         drop(supervisor);
@@ -923,10 +970,15 @@ impl AgentController {
     }
 
     fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
+        self.ensure_resource_start_allowed()?;
+        if !self.reap_management_web_shutdown()? {
+            return Err(ControlError::ResourceExhausted);
+        }
         let mut management_web = self
             .management_web
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
+        self.ensure_resource_start_allowed()?;
         if management_web.is_none() {
             *management_web = Some(
                 ManagementWebService::start_with_api_handler(
@@ -947,20 +999,107 @@ impl AgentController {
     }
 
     fn disable_management_web(&self) -> Result<ControlStatus, ControlError> {
+        let shutdown_ready = self.reap_management_web_shutdown()?;
+        if !shutdown_ready {
+            return self.status();
+        }
         let service = self
             .management_web
             .lock()
             .map_err(|_| ControlError::CommandFailed)?
             .take();
         if let Some(service) = service {
-            service.stop().map_err(|_| ControlError::CommandFailed)?;
+            let worker = thread::Builder::new()
+                .name(String::from("cmclient-management-web-shutdown"))
+                .spawn(move || service.stop())
+                .map_err(|_| ControlError::CommandFailed)?;
+            *self
+                .management_web_shutdown
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)? = Some(worker);
         }
         self.status()
     }
 
+    fn reap_management_web_shutdown(&self) -> Result<bool, ControlError> {
+        let worker = {
+            let mut shutdown = self
+                .management_web_shutdown
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?;
+            if shutdown
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+            {
+                return Ok(false);
+            }
+            shutdown.take()
+        };
+        match worker {
+            Some(worker) => worker
+                .join()
+                .map_err(|_| ControlError::CommandFailed)?
+                .map_err(|_| ControlError::CommandFailed),
+            None => Ok(()),
+        }?;
+        Ok(true)
+    }
+
+    fn stop_management_web(&self) -> Result<(), ControlError> {
+        let service = self
+            .management_web
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .take();
+        let service_result = service.map_or(Ok(()), |service| {
+            service.stop().map_err(|_| ControlError::CommandFailed)
+        });
+        let worker = self
+            .management_web_shutdown
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .take();
+        let worker_result = worker.map_or(Ok(()), |worker| {
+            worker
+                .join()
+                .map_err(|_| ControlError::CommandFailed)?
+                .map_err(|_| ControlError::CommandFailed)
+        });
+        service_result.and(worker_result)
+    }
+
+    fn request_shutdown(&self) {
+        if self.shutdown_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let endpoint = self.control_endpoint.clone();
+        let _ = thread::Builder::new()
+            .name(String::from("cmclient-control-shutdown-wake"))
+            .spawn(move || {
+                let _ = ControlClient::new_with_timeout(endpoint, Duration::from_secs(2))
+                    .and_then(|client| client.status());
+            });
+    }
+
+    fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    fn ensure_resource_start_allowed(&self) -> Result<(), ControlError> {
+        if self.is_shutdown_requested() {
+            Err(ControlError::CommandFailed)
+        } else {
+            Ok(())
+        }
+    }
+
     fn remember_error(&self, error: &ControlError) {
+        self.remember_error_code(error.code());
+    }
+
+    fn remember_error_code(&self, code: &str) {
         if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
-            *latest_error_code = Some(String::from(error.code()));
+            *latest_error_code = Some(String::from(code));
         }
     }
 
@@ -969,6 +1108,74 @@ impl AgentController {
             *latest_error_code = None;
         }
     }
+
+    fn has_precise_supervisor_error(&self) -> bool {
+        self.latest_error_code
+            .lock()
+            .is_ok_and(|latest_error_code| {
+                latest_error_code
+                    .as_deref()
+                    .is_some_and(|code| code.starts_with("GATEWAY_SUPERVISOR_"))
+            })
+    }
+
+    fn stop_supervisor(&self) -> Result<bool, ControlError> {
+        let mut supervisor = self
+            .supervisor
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?;
+        if let Some(supervisor) = supervisor.as_mut() {
+            supervisor.stop().map_err(|_| ControlError::CommandFailed)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn tick_supervisor(&self) -> Result<(), ControlError> {
+        if self.is_shutdown_requested() {
+            return Ok(());
+        }
+        let result = {
+            let mut supervisor = self
+                .supervisor
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?;
+            if self.is_shutdown_requested() {
+                return Ok(());
+            }
+            match supervisor.as_mut() {
+                Some(supervisor) => supervisor.tick().map(Some),
+                None => Ok(None),
+            }
+        };
+        match result {
+            Ok(Some(SupervisorEvent::Started { .. } | SupervisorEvent::Heartbeat { .. })) => {
+                if let Ok(mut latest_error_code) = self.latest_error_code.lock()
+                    && latest_error_code
+                        .as_deref()
+                        .is_some_and(|code| code.starts_with("GATEWAY_SUPERVISOR_"))
+                {
+                    *latest_error_code = None;
+                }
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.remember_error_code(error.code());
+                Err(ControlError::CommandFailed)
+            }
+        }
+    }
+}
+
+fn shutdown_agent_runtime(
+    controller: &AgentController,
+    supervisor_worker: &mut SupervisorWorker,
+) -> Result<(), ControlError> {
+    supervisor_worker.stop();
+    let supervisor_result = controller.stop_supervisor().map(|_| ());
+    let management_web_result = controller.stop_management_web();
+    supervisor_result.and(management_web_result)
 }
 
 impl ControlHandler for AgentController {
@@ -976,10 +1183,12 @@ impl ControlHandler for AgentController {
         let result = match command {
             ControlCommand::Status => self.status(),
             ControlCommand::Start => {
+                self.ensure_resource_start_allowed()?;
                 let mut supervisor = self
                     .supervisor
                     .lock()
                     .map_err(|_| ControlError::CommandFailed)?;
+                self.ensure_resource_start_allowed()?;
                 supervisor
                     .as_mut()
                     .ok_or(ControlError::CommandFailed)?
@@ -989,30 +1198,30 @@ impl ControlHandler for AgentController {
                 self.status()
             }
             ControlCommand::Stop => {
-                let mut supervisor = self
-                    .supervisor
-                    .lock()
-                    .map_err(|_| ControlError::CommandFailed)?;
-                supervisor
-                    .as_mut()
-                    .ok_or(ControlError::CommandFailed)?
-                    .stop()
-                    .map_err(|_| ControlError::CommandFailed)?;
-                drop(supervisor);
+                self.stop_supervisor()?
+                    .then_some(())
+                    .ok_or(ControlError::CommandFailed)?;
                 self.status()
             }
             ControlCommand::Restart => {
+                self.ensure_resource_start_allowed()?;
                 {
                     let mut supervisor = self
                         .supervisor
                         .lock()
                         .map_err(|_| ControlError::CommandFailed)?;
+                    self.ensure_resource_start_allowed()?;
                     let supervisor = supervisor.as_mut().ok_or(ControlError::CommandFailed)?;
                     supervisor.stop().map_err(|_| ControlError::CommandFailed)?;
+                    self.ensure_resource_start_allowed()?;
                     supervisor
                         .start()
                         .map_err(|_| ControlError::CommandFailed)?;
                 }
+                self.status()
+            }
+            ControlCommand::ShutdownAgent => {
+                self.request_shutdown();
                 self.status()
             }
             ControlCommand::EnableManagementWeb => self.enable_management_web(),
@@ -1021,6 +1230,9 @@ impl ControlHandler for AgentController {
         match &result {
             Ok(_) if !matches!(command, ControlCommand::Status) => self.clear_error(),
             Ok(_) => {}
+            Err(ControlError::CommandFailed)
+                if matches!(command, ControlCommand::Status)
+                    && self.has_precise_supervisor_error() => {}
             Err(error) => self.remember_error(error),
         }
         result
@@ -1144,50 +1356,68 @@ fn map_gateway_io_error(error: std::io::Error) -> ControlError {
 }
 
 fn bridge_gateway_events(gateway: SocketAddr) -> mpsc::Receiver<ControlUpdateEvent> {
+    bridge_gateway_events_with_read_poll(gateway, GATEWAY_SSE_READ_POLL_INTERVAL)
+}
+
+fn bridge_gateway_events_with_read_poll(
+    gateway: SocketAddr,
+    read_poll: Duration,
+) -> mpsc::Receiver<ControlUpdateEvent> {
+    debug_assert!(!read_poll.is_zero());
     let (sender, receiver) = mpsc::sync_channel(64);
-    thread::spawn(move || {
-        loop {
-            if !bridge_gateway_event_stream(gateway, &sender) {
-                break;
+    let _ = thread::Builder::new()
+        .name(String::from("cmclient-gateway-event-bridge"))
+        .spawn(move || {
+            #[cfg(test)]
+            let _bridge_guard = GatewayEventBridgeTestGuard::new();
+            let mut last_event_id = None;
+            loop {
+                if !probe_gateway_event_receiver(&sender)
+                    || !bridge_gateway_event_stream(gateway, &sender, read_poll, &mut last_event_id)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
             }
-            thread::sleep(Duration::from_millis(250));
-        }
-    });
+        });
     receiver
 }
 
 fn bridge_gateway_event_stream(
     gateway: SocketAddr,
     sender: &SyncSender<ControlUpdateEvent>,
+    read_poll: Duration,
+    last_event_id: &mut Option<String>,
 ) -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .no_proxy()
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
+    let mut reader = match open_gateway_event_stream(gateway, read_poll, last_event_id.as_deref()) {
+        Ok(reader) => reader,
+        Err(()) => return wait_for_gateway_event_retry(sender, GATEWAY_SSE_RECONNECT_DELAY),
     };
-    let response = match client
-        .get(format!("http://{gateway}/api/v1/events"))
-        .header("accept", "text/event-stream")
-        .send()
-    {
-        Ok(response) if response.status().is_success() => response,
-        _ => {
-            thread::sleep(Duration::from_secs(2));
-            return sender.send(gateway_heartbeat()).is_ok();
-        }
-    };
-    let mut reader = BufReader::new(response);
-    let mut id = None;
-    let mut event = None;
-    let mut data = None;
+    let mut id: Option<String> = None;
+    let mut event: Option<String> = None;
+    let mut data: Option<Vec<u8>> = None;
+    let mut next_receiver_probe = Instant::now() + read_poll;
     loop {
+        if Instant::now() >= next_receiver_probe {
+            if !probe_gateway_event_receiver(sender) {
+                return false;
+            }
+            next_receiver_probe = Instant::now() + read_poll;
+        }
         let mut line = Vec::new();
-        let count = match read_bounded_gateway_sse_line(&mut reader, &mut line) {
-            Ok(count) => count,
-            Err(()) => return sender.send(gateway_heartbeat()).is_ok(),
+        let count = loop {
+            match read_bounded_gateway_sse_line(&mut reader, &mut line) {
+                Ok(count) => break count,
+                Err(GatewaySseLineReadError::Poll) => {
+                    if !probe_gateway_event_receiver(sender) {
+                        return false;
+                    }
+                    next_receiver_probe = Instant::now() + read_poll;
+                }
+                Err(GatewaySseLineReadError::Invalid) => {
+                    return probe_gateway_event_receiver(sender);
+                }
+            }
         };
         if count == 0 {
             break;
@@ -1199,19 +1429,27 @@ fn bridge_gateway_event_stream(
             line.pop();
         }
         let Ok(line) = std::str::from_utf8(&line) else {
-            return sender.send(gateway_heartbeat()).is_ok();
+            return probe_gateway_event_receiver(sender);
         };
         if line.starts_with(':') {
-            if sender.send(gateway_heartbeat()).is_err() {
+            if !try_forward_gateway_event(sender, gateway_heartbeat()) {
                 return false;
             }
             continue;
         }
         if line.is_empty() {
-            if let (Some(id), Some(event), Some(data)) = (id.take(), event.take(), data.take())
-                && sender.send(ControlUpdateEvent { id, event, data }).is_err()
-            {
-                return false;
+            if let (Some(id), Some(event), Some(data)) = (id.take(), event.take(), data.take()) {
+                if !try_forward_gateway_event(
+                    sender,
+                    ControlUpdateEvent {
+                        id: id.clone(),
+                        event,
+                        data,
+                    },
+                ) {
+                    return false;
+                }
+                *last_event_id = Some(id);
             }
             continue;
         }
@@ -1232,17 +1470,111 @@ fn bridge_gateway_event_stream(
             _ => {}
         }
     }
-    sender.send(gateway_heartbeat()).is_ok()
+    probe_gateway_event_receiver(sender)
+}
+
+fn open_gateway_event_stream(
+    gateway: SocketAddr,
+    read_poll: Duration,
+    last_event_id: Option<&str>,
+) -> Result<BufReader<TcpStream>, ()> {
+    const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+    let mut stream =
+        TcpStream::connect_timeout(&gateway, Duration::from_secs(3)).map_err(|_| ())?;
+    stream
+        .set_read_timeout(Some(read_poll))
+        .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(3))))
+        .map_err(|_| ())?;
+    let replay_header = last_event_id
+        .filter(|value| is_safe_sse_token(value))
+        .map_or_else(String::new, |value| format!("last-event-id: {value}\r\n"));
+    stream
+        .write_all(
+            format!(
+                "GET /api/v1/events HTTP/1.0\r\nhost: {gateway}\r\naccept: text/event-stream\r\n{replay_header}connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .map_err(|_| ())?;
+
+    let mut reader = BufReader::new(stream);
+    let mut header_bytes = 0_usize;
+    let mut content_type_valid = false;
+    let mut transfer_encoding_present = false;
+    for index in 0..128 {
+        let mut line = Vec::new();
+        let count = read_bounded_gateway_sse_line(&mut reader, &mut line).map_err(|_| ())?;
+        if count == 0 {
+            return Err(());
+        }
+        header_bytes = header_bytes.checked_add(count).ok_or(())?;
+        if header_bytes > MAX_RESPONSE_HEADER_BYTES {
+            return Err(());
+        }
+        trim_http_line(&mut line);
+        if index == 0 {
+            if line != b"HTTP/1.1 200 OK" && line != b"HTTP/1.0 200 OK" {
+                return Err(());
+            }
+            continue;
+        }
+        if line.is_empty() {
+            return (content_type_valid && !transfer_encoding_present)
+                .then_some(reader)
+                .ok_or(());
+        }
+        let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+            return Err(());
+        };
+        let name = &line[..separator];
+        let value = line[separator + 1..]
+            .iter()
+            .copied()
+            .skip_while(|byte| byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        if name.eq_ignore_ascii_case(b"content-type") {
+            content_type_valid = value
+                .split(|byte| *byte == b';')
+                .next()
+                .is_some_and(|media_type| media_type.eq_ignore_ascii_case(b"text/event-stream"));
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            transfer_encoding_present = true;
+        }
+    }
+    Err(())
+}
+
+fn trim_http_line(line: &mut Vec<u8>) {
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewaySseLineReadError {
+    Poll,
+    Invalid,
 }
 
 fn read_bounded_gateway_sse_line(
     reader: &mut impl BufRead,
     output: &mut Vec<u8>,
-) -> Result<usize, ()> {
+) -> Result<usize, GatewaySseLineReadError> {
     const MAX_GATEWAY_SSE_LINE_BYTES: usize = 64 * 1024;
-    output.clear();
     loop {
-        let available = reader.fill_buf().map_err(|_| ())?;
+        let available = reader.fill_buf().map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                GatewaySseLineReadError::Poll
+            } else {
+                GatewaySseLineReadError::Invalid
+            }
+        })?;
         if available.is_empty() {
             return Ok(output.len());
         }
@@ -1251,7 +1583,7 @@ fn read_bounded_gateway_sse_line(
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |index| index + 1);
         if output.len().saturating_add(count) > MAX_GATEWAY_SSE_LINE_BYTES {
-            return Err(());
+            return Err(GatewaySseLineReadError::Invalid);
         }
         let ended = available.get(count.saturating_sub(1)) == Some(&b'\n');
         output.extend_from_slice(&available[..count]);
@@ -1260,6 +1592,60 @@ fn read_bounded_gateway_sse_line(
             return Ok(output.len());
         }
     }
+}
+
+fn probe_gateway_event_receiver(sender: &SyncSender<ControlUpdateEvent>) -> bool {
+    try_forward_gateway_event(sender, gateway_heartbeat())
+}
+
+fn try_forward_gateway_event(
+    sender: &SyncSender<ControlUpdateEvent>,
+    event: ControlUpdateEvent,
+) -> bool {
+    match sender.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn wait_for_gateway_event_retry(sender: &SyncSender<ControlUpdateEvent>, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if !probe_gateway_event_receiver(sender) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(Duration::from_secs(1)));
+    }
+}
+
+#[cfg(test)]
+static ACTIVE_GATEWAY_EVENT_BRIDGES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+struct GatewayEventBridgeTestGuard;
+
+#[cfg(test)]
+impl GatewayEventBridgeTestGuard {
+    fn new() -> Self {
+        ACTIVE_GATEWAY_EVENT_BRIDGES.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for GatewayEventBridgeTestGuard {
+    fn drop(&mut self) {
+        ACTIVE_GATEWAY_EVENT_BRIDGES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+fn active_gateway_event_bridge_count() -> usize {
+    ACTIVE_GATEWAY_EVENT_BRIDGES.load(Ordering::Acquire)
 }
 
 fn gateway_heartbeat() -> ControlUpdateEvent {
@@ -1393,6 +1779,11 @@ fn serve_web_once() -> ExitCode {
     )
 }
 
+fn install_shutdown_signal_handler(controller: Arc<AgentController>) -> Result<(), ControlError> {
+    ctrlc::set_handler(move || controller.request_shutdown())
+        .map_err(|_| ControlError::CommandFailed)
+}
+
 fn serve() -> ExitCode {
     let config = match AgentConfig::load() {
         Ok(config) => config,
@@ -1423,18 +1814,47 @@ fn serve() -> ExitCode {
         ControlEndpoint::UnixSocket(path) => ControlEndpoint::unix(path),
         endpoint => endpoint,
     };
-    let server = match ControlServer::bind(endpoint, controller) {
+    let control_handler: Arc<dyn ControlHandler> = controller.clone();
+    let server = match ControlServer::bind(endpoint, control_handler) {
         Ok(server) => server,
         Err(error) => {
             eprintln!("{}", error.code());
             return ExitCode::from(EX_CONFIG);
         }
     };
-    loop {
-        if let Err(error) = server.serve_once() {
+    if let Err(error) = install_shutdown_signal_handler(Arc::clone(&controller)) {
+        eprintln!("{}", error.code());
+        return ExitCode::from(EX_CONFIG);
+    }
+    let mut supervisor_worker = match SupervisorWorker::start(Arc::clone(&controller)) {
+        Ok(worker) => worker,
+        Err(error) => {
             eprintln!("{}", error.code());
             return ExitCode::from(EX_CONFIG);
         }
+    };
+    let serve_error = loop {
+        if controller.is_shutdown_requested() {
+            break None;
+        }
+        match server.serve_once() {
+            Ok(()) if controller.is_shutdown_requested() => break None,
+            Ok(()) => {}
+            Err(error) => break Some(error),
+        }
+    };
+    let shutdown_error = shutdown_agent_runtime(&controller, &mut supervisor_worker).err();
+    if let Some(error) = &serve_error {
+        eprintln!("{}", error.code());
+    }
+    if let Some(error) = shutdown_error {
+        eprintln!("{}", error.code());
+        return ExitCode::from(EX_CONFIG);
+    }
+    if serve_error.is_some() {
+        ExitCode::from(EX_CONFIG)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -1490,9 +1910,12 @@ mod tests {
     use super::{
         AgentConfig, AgentController, AgentManagementWebApi, AgentSecretStore, AgentUpdateService,
         ControlCommand, ControlHandler, GatewayControlStatus, ManagementWebApiHandler,
-        ManagementWebControlStatus, ManagementWebRequest, RemoteControlReplayGuard, SecretKind,
-        default_local_endpoint, gateway_json_projection, read_bounded_gateway_sse_line,
-        remote_control_error_status, unix_now_seconds,
+        ManagementWebControlStatus, ManagementWebRequest, ManagementWebService,
+        RemoteControlReplayGuard, SecretKind, SupervisorWorker, active_gateway_event_bridge_count,
+        bridge_gateway_event_stream, bridge_gateway_events_with_read_poll, default_local_endpoint,
+        gateway_heartbeat, gateway_json_projection, read_bounded_gateway_sse_line,
+        remote_control_error_status, shutdown_agent_runtime, try_forward_gateway_event,
+        unix_now_seconds,
     };
     #[cfg(not(target_os = "windows"))]
     use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
@@ -1503,10 +1926,12 @@ mod tests {
     };
     #[cfg(not(target_os = "windows"))]
     use cmclient_control_api::{
-        ControlServer, ControlStatus, REMOTE_CONTROL_NONCE_HEADER, REMOTE_CONTROL_SCOPE_HEADER,
-        REMOTE_CONTROL_TIMESTAMP_HEADER, StaticControlHandler, UpdateControlStatus,
-        sign_remote_control_request,
+        ControlClient, ControlServer, ControlStatus, REMOTE_CONTROL_NONCE_HEADER,
+        REMOTE_CONTROL_SCOPE_HEADER, REMOTE_CONTROL_TIMESTAMP_HEADER, StaticControlHandler,
+        UpdateControlStatus, sign_remote_control_request,
     };
+    #[cfg(not(target_os = "windows"))]
+    use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewaySupervisor};
     #[cfg(not(target_os = "windows"))]
     use cmclient_updater::{PersistentUpdateJob, UpdatePhase};
     #[cfg(not(target_os = "windows"))]
@@ -1515,9 +1940,42 @@ mod tests {
         io::{Cursor, Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
         path::PathBuf,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         thread,
+        time::{Duration, Instant},
     };
+
+    #[cfg(not(target_os = "windows"))]
+    struct DisableManagementWebRoute {
+        controller: Arc<AgentController>,
+        completed: mpsc::SyncSender<()>,
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    impl ManagementWebApiHandler for DisableManagementWebRoute {
+        fn handle(
+            &self,
+            client: &mut dyn super::ManagementWebStream,
+            _request: &ManagementWebRequest,
+        ) -> Result<bool, super::ManagementWebError> {
+            self.controller
+                .disable_management_web()
+                .map_err(|_| super::ManagementWebError::Io)?;
+            self.completed
+                .send(())
+                .map_err(|_| super::ManagementWebError::Io)?;
+            client
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .map_err(|_| super::ManagementWebError::Io)?;
+            Ok(true)
+        }
+    }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
@@ -1550,7 +2008,7 @@ mod tests {
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
-                String::from("sleep 30"),
+                String::from("read _"),
             ]),
             gateway_port: port,
             callmesh: None,
@@ -1580,6 +2038,486 @@ mod tests {
             .handle(ControlCommand::Stop)
             .expect("gateway should stop");
         gateway_thread.join().expect("gateway should join");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn restarts_a_crashed_gateway_without_control_requests() {
+        let marker =
+            std::env::temp_dir().join(format!("cmclient-agent-supervisor-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: PathBuf::from("/tmp/cmclient-agent-supervisor"),
+                config_dir: PathBuf::from("/tmp/cmclient-agent-supervisor"),
+                cache_dir: PathBuf::from("/tmp/cmclient-agent-supervisor/cache"),
+                log_dir: PathBuf::from("/tmp/cmclient-agent-supervisor/logs"),
+            },
+            config_file: PathBuf::from("/tmp/cmclient-agent-supervisor/agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                format!("printf x >> '{}'; exit 7", marker.display()),
+            ]),
+            gateway_port: 48_109,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        let mut worker =
+            SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
+
+        controller
+            .handle(ControlCommand::Start)
+            .expect("first gateway process should start");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            let starts = std::fs::read(&marker).map_or(0, |contents| contents.len());
+            if starts >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background supervisor did not restart the gateway"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        worker.stop();
+        controller
+            .handle(ControlCommand::Stop)
+            .expect("supervisor should stop");
+        std::fs::remove_file(marker).expect("marker should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn terminal_shutdown_rejects_resource_starting_commands() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-shutdown-fence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                String::from("exit 0"),
+            ]),
+            gateway_port: 48_113,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            AgentController::from_config(&config).expect("controller should initialize");
+
+        controller.request_shutdown();
+
+        for command in [
+            ControlCommand::Start,
+            ControlCommand::Restart,
+            ControlCommand::EnableManagementWeb,
+        ] {
+            assert_eq!(
+                controller.handle(command),
+                Err(cmclient_control_api::ControlError::CommandFailed)
+            );
+        }
+        for command in [
+            ControlCommand::Status,
+            ControlCommand::Stop,
+            ControlCommand::DisableManagementWeb,
+            ControlCommand::ShutdownAgent,
+        ] {
+            controller
+                .handle(command)
+                .expect("non-starting command should remain safe during teardown");
+        }
+        assert!(
+            controller
+                .management_web
+                .lock()
+                .expect("management service should lock")
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn queued_start_rechecks_shutdown_after_acquiring_the_supervisor_lock() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-queued-start-fence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                String::from("sleep 5"),
+            ]),
+            gateway_port: 48_114,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        let supervisor = controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock");
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let start_controller = Arc::clone(&controller);
+        let start_thread = thread::spawn(move || {
+            ready_sender
+                .send(())
+                .expect("queued start should announce itself");
+            start_controller.handle(ControlCommand::Start)
+        });
+        ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued start should begin");
+        thread::sleep(Duration::from_millis(25));
+        assert!(!start_thread.is_finished());
+
+        controller.request_shutdown();
+        drop(supervisor);
+
+        let start_result = start_thread.join().expect("queued start should join");
+        let gateway_status = controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_ref()
+            .expect("supervisor should exist")
+            .status();
+        let _ = controller.stop_supervisor();
+        assert_eq!(
+            start_result,
+            Err(cmclient_control_api::ControlError::CommandFailed)
+        );
+        assert!(matches!(
+            gateway_status,
+            cmclient_supervisor::GatewayStatus::Stopped
+        ));
+
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn restart_rechecks_shutdown_after_draining_the_old_child() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-restart-fence-{}",
+            std::process::id()
+        ));
+        let marker = data_dir.join("shutdown-observed");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                format!("read _; printf x > '{}'; exec sleep 5", marker.display()),
+            ]),
+            gateway_port: 48_115,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_mut()
+            .expect("supervisor should exist")
+            .start()
+            .expect("initial Gateway should start");
+        let restart_controller = Arc::clone(&controller);
+        let restart_thread =
+            thread::spawn(move || restart_controller.handle(ControlCommand::Restart));
+        wait_for_resource_count(
+            || usize::from(marker.exists()),
+            1,
+            "restart did not begin draining the old Gateway",
+        );
+
+        controller
+            .handle(ControlCommand::ShutdownAgent)
+            .expect("shutdown command should latch before waiting for restart");
+        assert!(controller.is_shutdown_requested());
+
+        let restart_result = restart_thread.join().expect("restart should join");
+        let gateway_status = controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_ref()
+            .expect("supervisor should exist")
+            .status();
+        let _ = controller.stop_supervisor();
+        assert_eq!(
+            restart_result,
+            Err(cmclient_control_api::ControlError::CommandFailed)
+        );
+        assert!(matches!(
+            gateway_status,
+            cmclient_supervisor::GatewayStatus::Stopped
+        ));
+
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn teardown_stops_the_gateway_while_a_control_sse_retains_the_controller() {
+        let data_dir =
+            std::env::temp_dir().join(format!("cmclient-agent-teardown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                String::from("read _"),
+            ]),
+            gateway_port: 48_110,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        let mut worker =
+            SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
+        controller
+            .handle(ControlCommand::Start)
+            .expect("gateway should start");
+
+        let endpoint = default_local_endpoint(&data_dir);
+        let handler: Arc<dyn ControlHandler> = controller.clone();
+        let server = ControlServer::bind(endpoint.clone(), handler).expect("server should bind");
+        let server_thread = thread::spawn(move || server.serve_once());
+        let events = ControlClient::new(endpoint)
+            .expect("client should initialize")
+            .subscribe_update_events()
+            .expect("control SSE should connect");
+        server_thread
+            .join()
+            .expect("server should join")
+            .expect("server should accept SSE");
+        assert!(Arc::strong_count(&controller) >= 3);
+        controller
+            .handle(ControlCommand::ShutdownAgent)
+            .expect("local shutdown command should be accepted");
+        assert!(controller.is_shutdown_requested());
+
+        shutdown_agent_runtime(&controller, &mut worker).expect("Agent should tear down");
+        assert!(matches!(
+            controller
+                .supervisor
+                .lock()
+                .expect("supervisor should lock")
+                .as_ref()
+                .expect("supervisor should exist")
+                .status(),
+            cmclient_supervisor::GatewayStatus::Stopped
+        ));
+        assert!(Arc::strong_count(&controller) >= 2);
+
+        drop(events);
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn management_web_can_disable_itself_without_a_worker_join_deadlock() {
+        let data_dir =
+            std::env::temp_dir().join(format!("cmclient-agent-web-disable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: None,
+            gateway_port: 48_112,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        let (completed_sender, completed_receiver) = mpsc::sync_channel(1);
+        let service = ManagementWebService::start_with_api_handler(
+            &cmclient_agent_core::web::ManagementWebConfig {
+                port: 0,
+                static_web_root: None,
+                ..Default::default()
+            },
+            Arc::new(DisableManagementWebRoute {
+                controller: Arc::clone(&controller),
+                completed: completed_sender,
+            }),
+        )
+        .expect("management service should start");
+        let address = service.local_addr();
+        *controller
+            .management_web
+            .lock()
+            .expect("management service should lock") = Some(service);
+
+        let mut client = TcpStream::connect(address).expect("client should connect");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("request should write");
+        completed_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("disable handler should return");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !controller
+            .reap_management_web_shutdown()
+            .expect("shutdown should reap")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "management shutdown did not drain its request worker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            controller
+                .management_web
+                .lock()
+                .expect("management service should lock")
+                .is_none()
+        );
+
+        drop(client);
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn status_tick_preserves_the_precise_supervisor_error_code() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-supervisor-error-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let missing_program = data_dir.join("missing-gateway");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![missing_program.to_string_lossy().into_owned()]),
+            gateway_port: 48_111,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            AgentController::from_config(&config).expect("controller should initialize");
+        let mut supervisor = GatewaySupervisor::new_with_stable_window(
+            GatewayCommand {
+                program: missing_program.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+            },
+            BackoffPolicy {
+                initial_delay: std::time::Duration::from_millis(10),
+                maximum_delay: std::time::Duration::from_millis(10),
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .expect("supervisor should initialize");
+        assert!(supervisor.start().is_err());
+        *controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock") = Some(supervisor);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert_eq!(
+            controller.handle(ControlCommand::Status),
+            Err(cmclient_control_api::ControlError::CommandFailed)
+        );
+        assert_eq!(
+            controller
+                .latest_error_code
+                .lock()
+                .expect("error code should lock")
+                .as_deref(),
+            Some("GATEWAY_SUPERVISOR_SPAWN_FAILED")
+        );
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1855,10 +2793,162 @@ mod tests {
     #[test]
     fn bounds_gateway_sse_lines_before_allocating_an_event() {
         let mut oversized = Cursor::new(vec![b'a'; 64 * 1024 + 1]);
-        assert_eq!(
-            read_bounded_gateway_sse_line(&mut oversized, &mut Vec::new()),
-            Err(())
+        assert!(read_bounded_gateway_sse_line(&mut oversized, &mut Vec::new()).is_err());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn closes_a_gateway_event_bridge_instead_of_blocking_on_a_full_queue() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        assert!(try_forward_gateway_event(&sender, gateway_heartbeat()));
+        assert!(!try_forward_gateway_event(&sender, gateway_heartbeat()));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn reconnects_the_gateway_event_bridge_with_the_last_forwarded_event_id() {
+        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
+        let gateway_address = gateway.local_addr().expect("gateway address should load");
+        let gateway_thread = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 1..=2 {
+                let (mut stream, _) = gateway.accept().expect("gateway should accept");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 2_048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).expect("request should read");
+                    assert!(count > 0, "request ended before headers");
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                requests.push(String::from_utf8(request).expect("request should be UTF-8"));
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nid: gateway-{index}\nevent: mesh.position\ndata: {{\"index\":{index}}}\n\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("event should write");
+            }
+            requests
+        });
+        let (sender, _receiver) = mpsc::sync_channel(8);
+        let mut last_event_id = None;
+
+        assert!(bridge_gateway_event_stream(
+            gateway_address,
+            &sender,
+            Duration::from_millis(100),
+            &mut last_event_id,
+        ));
+        assert_eq!(last_event_id.as_deref(), Some("gateway-1"));
+        assert!(bridge_gateway_event_stream(
+            gateway_address,
+            &sender,
+            Duration::from_millis(100),
+            &mut last_event_id,
+        ));
+        assert_eq!(last_event_id.as_deref(), Some("gateway-2"));
+
+        let requests = gateway_thread.join().expect("gateway should join");
+        assert!(!requests[0].to_ascii_lowercase().contains("last-event-id:"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("last-event-id: gateway-1\r\n")
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn releases_repeated_gateway_event_bridges_when_a_hung_upstream_outlives_receivers() {
+        const SUBSCRIPTIONS: usize = 12;
+        assert_eq!(active_gateway_event_bridge_count(), 0);
+
+        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
+        let gateway_address = gateway.local_addr().expect("gateway address should load");
+        let connected = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let gateway_thread = {
+            let connected = Arc::clone(&connected);
+            let closed = Arc::clone(&closed);
+            thread::spawn(move || {
+                let mut workers = Vec::new();
+                for _ in 0..SUBSCRIPTIONS {
+                    let (mut stream, _) = gateway.accept().expect("gateway should accept");
+                    let connected = Arc::clone(&connected);
+                    let closed = Arc::clone(&closed);
+                    workers.push(thread::spawn(move || {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .expect("gateway read timeout should configure");
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 2_048];
+                        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            let count = stream.read(&mut chunk).expect("request should read");
+                            assert!(count > 0, "bridge request ended before its headers");
+                            request.extend_from_slice(&chunk[..count]);
+                        }
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n\r\n",
+                            )
+                            .expect("hung Gateway headers should write");
+                        connected.fetch_add(1, Ordering::AcqRel);
+
+                        let mut byte = [0_u8; 1];
+                        assert_eq!(
+                            stream.read(&mut byte).expect("bridge socket should close"),
+                            0,
+                            "bridge unexpectedly wrote after the SSE request"
+                        );
+                        closed.fetch_add(1, Ordering::AcqRel);
+                    }));
+                }
+                for worker in workers {
+                    worker.join().expect("Gateway connection should join");
+                }
+            })
+        };
+
+        let receivers = (0..SUBSCRIPTIONS)
+            .map(|_| {
+                bridge_gateway_events_with_read_poll(gateway_address, Duration::from_millis(100))
+            })
+            .collect::<Vec<_>>();
+        wait_for_resource_count(
+            || connected.load(Ordering::Acquire),
+            SUBSCRIPTIONS,
+            "Gateway SSE bridges did not connect",
+        );
+        wait_for_resource_count(
+            active_gateway_event_bridge_count,
+            SUBSCRIPTIONS,
+            "Gateway SSE bridge threads did not start",
+        );
+
+        drop(receivers);
+
+        wait_for_resource_count(
+            active_gateway_event_bridge_count,
+            0,
+            "Gateway SSE bridge threads survived receiver drop",
+        );
+        wait_for_resource_count(
+            || closed.load(Ordering::Acquire),
+            SUBSCRIPTIONS,
+            "Gateway SSE bridge sockets survived receiver drop",
+        );
+        gateway_thread.join().expect("hung Gateway should join");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn wait_for_resource_count(current: impl Fn() -> usize, expected: usize, message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while current() != expected {
+            assert!(Instant::now() < deadline, "{message}");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(not(target_os = "windows"))]

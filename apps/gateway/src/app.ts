@@ -121,6 +121,8 @@ export interface GatewaySseOptions {
   heartbeatIntervalMs?: number;
 }
 
+type GatewaySseSessionCloser = (reason: string) => void;
+
 interface JobIdParams {
   jobId: string;
 }
@@ -247,8 +249,14 @@ export function createGatewayApp(
     throw new GatewayConfigurationError();
   }
   const app = Fastify({ logger: false });
+  const sseSessions = new Set<GatewaySseSessionCloser>();
   app.decorate("eventBus", eventBus);
   app.decorateRequest("traceId", "");
+  app.addHook("preClose", () => {
+    for (const close of [...sseSessions]) {
+      close("SSE_SERVER_SHUTDOWN");
+    }
+  });
   app.addHook("onRequest", (request, reply, done) => {
     request.traceId = resolveTraceId(request.headers["x-trace-id"]);
     const correlationId = resolveCorrelationId(
@@ -445,7 +453,14 @@ export function createGatewayApp(
         : sendDomainDataUnavailable(request, reply),
   );
   app.get("/api/v1/events", (request, reply) => {
-    openSseStream(request, reply, eventBus, logger, heartbeatIntervalMs);
+    openSseStream(
+      request,
+      reply,
+      eventBus,
+      logger,
+      heartbeatIntervalMs,
+      sseSessions,
+    );
   });
   app.get<{ Querystring: ListQuery }>(
     "/api/v1/events/recent",
@@ -477,10 +492,20 @@ export function createGatewayApp(
       ) {
         return sendJobInputInvalid(request, reply);
       }
-      const submitted = jobs.submitIntegrityCheck(
-        request.correlationId,
-        idempotencyKey,
-      );
+      let submitted: ReturnType<
+        NonNullable<GatewayJobApi["submitIntegrityCheck"]>
+      >;
+      try {
+        submitted = jobs.submitIntegrityCheck(
+          request.correlationId,
+          idempotencyKey,
+        );
+      } catch (error) {
+        if (isJobQueueFull(error)) {
+          return sendJobQueueFull(request, reply);
+        }
+        throw error;
+      }
       const accepted: JobAccepted = {
         jobId: submitted.job.id,
         reused: !submitted.created,
@@ -506,10 +531,15 @@ export function createGatewayApp(
       ) {
         return sendJobInputInvalid(request, reply);
       }
-      const submitted = jobs.submitBackup(
-        request.correlationId,
-        idempotencyKey,
-      );
+      let submitted: ReturnType<NonNullable<GatewayJobApi["submitBackup"]>>;
+      try {
+        submitted = jobs.submitBackup(request.correlationId, idempotencyKey);
+      } catch (error) {
+        if (isJobQueueFull(error)) {
+          return sendJobQueueFull(request, reply);
+        }
+        throw error;
+      }
       return reply.code(202).send({
         jobId: submitted.job.id,
         reused: !submitted.created,
@@ -576,6 +606,7 @@ export function createGatewayApp(
         eventBus,
         logger,
         heartbeatIntervalMs,
+        sseSessions,
         (event) => isJobEvent(event, job.id),
       );
     },
@@ -695,6 +726,20 @@ function sendJobInputInvalid(request: FastifyRequest, reply: FastifyReply) {
   });
 }
 
+function sendJobQueueFull(request: FastifyRequest, reply: FastifyReply) {
+  return reply.code(503).send({
+    code: "JOB_QUEUE_FULL",
+    params: {},
+    traceId: request.traceId,
+  });
+}
+
+function isJobQueueFull(error: unknown): boolean {
+  return (
+    error instanceof Error && "code" in error && error.code === "JOB_QUEUE_FULL"
+  );
+}
+
 function sendDomainDataUnavailable(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -743,8 +788,28 @@ function openSseStream(
   eventBus: DomainEventBus,
   logger: StructuredLogger,
   heartbeatIntervalMs: number,
+  sessions: Set<GatewaySseSessionCloser>,
   filter: (event: DomainEvent) => boolean = () => true,
 ): void {
+  try {
+    eventBus.assertSubscriberCapacity();
+  } catch {
+    logger.log({
+      level: "warn",
+      message: "gateway.sse_client_rejected",
+      traceId: request.traceId || createTraceId(),
+      ...(request.correlationId
+        ? { correlationId: request.correlationId }
+        : {}),
+      fields: { reason: "SSE_SUBSCRIBER_LIMIT_REACHED" },
+    });
+    void reply.code(503).send({
+      code: "SSE_SUBSCRIBER_LIMIT_REACHED",
+      params: {},
+      traceId: request.traceId,
+    });
+    return;
+  }
   reply.hijack();
   const response = reply.raw;
   const replay = eventBus
@@ -765,8 +830,13 @@ function openSseStream(
       clearInterval(session.heartbeat);
     }
     session.unsubscribe?.();
+    sessions.delete(close);
     logger.log({
-      level: reason === "SSE_SLOW_CONSUMER" ? "warn" : "info",
+      level:
+        reason.startsWith("SSE_") &&
+        !["SSE_CLIENT_DISCONNECTED", "SSE_SERVER_SHUTDOWN"].includes(reason)
+          ? "warn"
+          : "info",
       message: "gateway.sse_client_closed",
       traceId: request.traceId || createTraceId(),
       ...(request.correlationId
@@ -774,8 +844,8 @@ function openSseStream(
         : {}),
       fields: { reason },
     });
-    if (!response.destroyed && !response.writableEnded) {
-      response.end();
+    if (!response.destroyed) {
+      response.destroy();
     }
   };
   const send = (message: string): boolean => {
@@ -788,9 +858,18 @@ function openSseStream(
     }
     return true;
   };
+  const sendEvent = (event: DomainEvent): boolean => {
+    try {
+      return send(formatSseEvent(event));
+    } catch {
+      close("SSE_FRAME_TOO_LARGE");
+      return false;
+    }
+  };
 
   response.once("close", () => close("SSE_CLIENT_DISCONNECTED"));
   response.once("error", () => close("SSE_CLIENT_ERROR"));
+  sessions.add(close);
   response.writeHead(200, {
     "cache-control": "no-cache, no-transform",
     connection: "keep-alive",
@@ -800,11 +879,11 @@ function openSseStream(
   response.flushHeaders();
   session.unsubscribe = eventBus.subscribe((event) => {
     if (filter(event)) {
-      send(formatSseEvent(event));
+      sendEvent(event);
     }
   });
   for (const event of replay) {
-    if (!send(formatSseEvent(event))) {
+    if (!sendEvent(event)) {
       return;
     }
   }

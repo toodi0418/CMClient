@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import type {
   CallMeshMapping,
@@ -50,6 +51,7 @@ export interface MeshGatewayRuntimeOptions {
   };
   clock?: () => Date;
   idFactory?: () => string;
+  stopTimeoutMs?: number;
 }
 
 export interface MeshIngestResult {
@@ -74,11 +76,16 @@ export class MeshGatewayRuntime {
   private readonly clock: () => Date;
   private readonly idFactory: () => string;
   private readonly mappingProvider: () => readonly CallMeshMapping[];
+  private readonly stopTimeoutMs: number;
   private readonly domainStore: MeshDomainStore;
   private readonly duplicateDetector: PositionDuplicateDetector;
   private readonly highWater: PositionHighWaterStore;
   private readonly remoteHighWater: AprsRemoteHighWaterStore;
   private unsubscribe: (() => void) | undefined;
+  private connectPromise: Promise<void> | undefined;
+  private stopPromise: Promise<void> | undefined;
+  private teardownRequired = false;
+  private lifecycleGeneration = 0;
   private started = false;
 
   constructor(private readonly options: MeshGatewayRuntimeOptions) {
@@ -88,6 +95,14 @@ export class MeshGatewayRuntime {
     this.mappingProvider =
       options.mappingProvider ??
       (() => options.database.callmeshMappings.list());
+    this.stopTimeoutMs = options.stopTimeoutMs ?? 10_000;
+    if (
+      !Number.isInteger(this.stopTimeoutMs) ||
+      this.stopTimeoutMs < 10 ||
+      this.stopTimeoutMs > 120_000
+    ) {
+      throw new MeshGatewayRuntimeError("MESH_STOP_TIMEOUT_INVALID");
+    }
     this.domainStore = new MeshDomainStore(
       options.database,
       options.applicationDecoder,
@@ -105,26 +120,126 @@ export class MeshGatewayRuntime {
     if (this.started) {
       return;
     }
+    if (this.stopPromise || this.teardownRequired) {
+      throw new MeshGatewayRuntimeError("MESH_RUNTIME_STOPPING");
+    }
     this.started = true;
-    this.unsubscribe = this.options.transport.subscribe((event) =>
-      this.onTransportEvent(event),
-    );
-    void this.options.transport.connect().catch((error: unknown) => {
-      this.publish("mesh.transport.error", {
-        code: stableErrorCode(error, "MESH_TRANSPORT_CONNECT_FAILED"),
-        transport: this.options.transport.kind,
-      });
+    const generation = ++this.lifecycleGeneration;
+    this.unsubscribe = this.options.transport.subscribe((event) => {
+      if (this.isActiveGeneration(generation)) {
+        this.onTransportEvent(event);
+      }
     });
+    const connectPromise = this.options.transport
+      .connect()
+      .catch((error: unknown) => {
+        if (this.isActiveGeneration(generation)) {
+          this.publish("mesh.transport.error", {
+            code: stableErrorCode(error, "MESH_TRANSPORT_CONNECT_FAILED"),
+            transport: this.options.transport.kind,
+          });
+        }
+      })
+      .finally(() => {
+        if (this.connectPromise === connectPromise) {
+          this.connectPromise = undefined;
+        }
+      });
+    this.connectPromise = connectPromise;
   }
 
-  async stop(): Promise<void> {
-    if (!this.started) {
-      return;
+  stop(): Promise<void> {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+    if (!this.started && !this.connectPromise && !this.teardownRequired) {
+      return Promise.resolve();
     }
     this.started = false;
+    this.teardownRequired = true;
+    this.lifecycleGeneration += 1;
     this.unsubscribe?.();
     this.unsubscribe = undefined;
-    await this.options.transport.disconnect();
+    const pendingConnect = this.connectPromise;
+    const stopPromise = this.stopInternal(pendingConnect)
+      .then(() => {
+        this.teardownRequired = false;
+      })
+      .finally(() => {
+        if (this.stopPromise === stopPromise) {
+          this.stopPromise = undefined;
+        }
+      });
+    this.stopPromise = stopPromise;
+    return stopPromise;
+  }
+
+  private async stopInternal(
+    pendingConnect: Promise<void> | undefined,
+  ): Promise<void> {
+    const deadline = performance.now() + this.stopTimeoutMs;
+    let firstDisconnectFailed = false;
+    let firstDisconnectError: unknown;
+    try {
+      await settleBefore(this.options.transport.disconnect(), deadline);
+    } catch (error) {
+      firstDisconnectFailed = true;
+      firstDisconnectError = error;
+    }
+    let pendingConnectFailed = false;
+    let pendingConnectError: unknown;
+    if (pendingConnect) {
+      try {
+        await settleBefore(pendingConnect, deadline);
+      } catch (error) {
+        pendingConnectFailed = true;
+        pendingConnectError = error;
+      }
+    }
+    let retryAttempted = false;
+    let retryFailed = false;
+    let retryError: unknown;
+    if (pendingConnect || firstDisconnectFailed) {
+      retryAttempted = true;
+      try {
+        await settleBefore(this.options.transport.disconnect(), deadline);
+      } catch (error) {
+        retryFailed = true;
+        retryError = error;
+      }
+    }
+    const disconnected = this.options.transport.state.status === "disconnected";
+    const firstDisconnectRecovered =
+      firstDisconnectFailed &&
+      retryAttempted &&
+      !retryFailed &&
+      !pendingConnectFailed &&
+      disconnected;
+    const terminalFailure =
+      firstDisconnectFailed && !firstDisconnectRecovered
+        ? { error: firstDisconnectError }
+        : pendingConnectFailed
+          ? { error: pendingConnectError }
+          : retryFailed
+            ? { error: retryError }
+            : undefined;
+    if (terminalFailure) {
+      throw new MeshGatewayRuntimeError(
+        stableErrorCode(
+          terminalFailure.error,
+          "MESH_TRANSPORT_DISCONNECT_FAILED",
+        ),
+      );
+    }
+    if (!disconnected) {
+      throw new MeshGatewayRuntimeError(
+        "MESH_TRANSPORT_DISCONNECT_UNCONFIRMED",
+      );
+    }
+  }
+
+  private isActiveGeneration(generation: number): boolean {
+    return this.started && generation === this.lifecycleGeneration;
   }
 
   status(): MeshtasticRuntimeStatus {
@@ -315,16 +430,50 @@ export class MeshGatewayRuntime {
       validation.event,
       target,
       observation.serverIngestedAt,
-      (acceptedEvent) => {
-        enqueued = this.options.database.aprsOutbox.enqueue({
-          callsign: target.callsign,
-          canonicalEventId: acceptedEvent.id,
-          data: encoded.data,
-          now: observation.serverIngestedAt,
-        });
+      {
+        observationId: positionObservation.id,
+        onAccepted: (acceptedEvent) => {
+          enqueued = this.options.database.aprsOutbox.enqueue({
+            callsign: target.callsign,
+            canonicalEventId: acceptedEvent.id,
+            data: encoded.data,
+            now: observation.serverIngestedAt,
+            order: {
+              meshNetworkId: acceptedEvent.meshNetworkId,
+              nodeNum: acceptedEvent.nodeNum,
+              mappingVersion: target.mappingVersion,
+              ...(acceptedEvent.eventTime
+                ? { eventTime: acceptedEvent.eventTime }
+                : {}),
+              ...(acceptedEvent.sequenceEpoch === undefined
+                ? {}
+                : { sequenceEpoch: acceptedEvent.sequenceEpoch }),
+              ...(acceptedEvent.sequenceNumber === undefined
+                ? {}
+                : { sequenceNumber: acceptedEvent.sequenceNumber }),
+            },
+          });
+          return enqueued.suppressed ? "APRS_SKIPPED_OUT_OF_ORDER" : undefined;
+        },
       },
     );
     this.publishDecision(ordered.decision);
+    if (
+      enqueued?.created &&
+      enqueued.suppressed &&
+      enqueued.entry?.status === "failed"
+    ) {
+      this.publish("aprs.outbox.failed", {
+        outboxId: enqueued.entry.id,
+        canonicalEventId: enqueued.entry.canonicalEventId,
+        callsign: enqueued.entry.callsign,
+        status: enqueued.entry.status,
+        attempts: enqueued.entry.attempts,
+        ...(enqueued.entry.lastErrorCode
+          ? { code: enqueued.entry.lastErrorCode }
+          : {}),
+      });
+    }
     if (ordered.decision.code !== "POSITION_ACCEPTED") {
       return {
         event: ordered.event,
@@ -335,6 +484,13 @@ export class MeshGatewayRuntime {
 
     if (!enqueued) {
       throw new MeshGatewayRuntimeError("APRS_OUTBOX_TRANSACTION_FAILED");
+    }
+    if (enqueued.suppressed || !enqueued.entry) {
+      return {
+        event: ordered.event,
+        decision: ordered.decision,
+        outboxCreated: false,
+      };
     }
     this.publish("aprs.outbox.queued", {
       outboxId: enqueued.entry.id,
@@ -439,6 +595,33 @@ export class MeshGatewayRuntime {
       throw new MeshGatewayRuntimeError("MESH_OBSERVATION_ID_INVALID");
     }
     return `${prefix}-${value}`;
+  }
+}
+
+async function settleBefore<T>(
+  promise: Promise<T>,
+  deadline: number,
+): Promise<T> {
+  const remainingMs = deadline - performance.now();
+  if (remainingMs <= 0) {
+    void promise.catch(() => undefined);
+    throw new MeshGatewayRuntimeError("MESH_STOP_TIMEOUT");
+  }
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new MeshGatewayRuntimeError("MESH_STOP_TIMEOUT")),
+          remainingMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 

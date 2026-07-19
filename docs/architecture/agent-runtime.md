@@ -129,6 +129,21 @@ The Agent injects `CMCLIENT_GATEWAY_HOST=127.0.0.1`, the configured non-zero
 Gateway process. This keeps the Gateway data store and the Agent's health/proxy
 endpoint aligned without exposing a Gateway listener to the LAN.
 
+Agent also marks only its child as `CMCLIENT_SUPERVISED=1` and owns a private
+stdin shutdown pipe. Stop, restart, OS termination, and service teardown send a
+bounded shutdown command; Gateway also treats parent-pipe EOF as parent death.
+Gateway runs its phased cleanup before exit, while Supervisor uses a monotonic
+40-second deadline and force termination only as a fallback. Agent installs
+SIGINT/SIGTERM handling before starting the supervisor and wakes the blocking
+local Control listener so the same once-only teardown path always runs.
+
+Gateway supervision advances on an Agent-owned 100 ms background tick and does
+not depend on status, Web, Desktop, or CLI traffic. A crash enters monotonic
+bounded exponential backoff; consecutive crashes retain their attempt count
+until the child survives a 30-second stable window. Stop and Agent teardown
+terminate and reap the child. Real subprocess tests prove crash/restart,
+deadline, stable-reset, stop, and drop behavior.
+
 Verified update archives are transient Agent cache data under
 `<cache_dir>/updates/staging`. They are selected from a signed manifest, streamed
 with an exact byte limit, SHA-256 verified, and atomically published by digest.

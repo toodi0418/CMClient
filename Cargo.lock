@@ -673,6 +673,7 @@ dependencies = [
  "cmclient-control-api",
  "cmclient-supervisor",
  "cmclient-updater",
+ "ctrlc",
  "reqwest",
  "serde",
  "serde_json",
@@ -761,6 +762,7 @@ dependencies = [
 name = "cmclient-service-host"
 version = "2.0.0-dev.0"
 dependencies = [
+ "cmclient-control-api",
  "windows-service",
 ]
 

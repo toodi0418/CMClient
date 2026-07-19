@@ -14,6 +14,41 @@ fn agent_path_from_host(host: &Path) -> PathBuf {
     })
 }
 
+#[cfg(any(windows, test))]
+fn run_before_deadline<Operation>(
+    deadline: std::time::Instant,
+    maximum_operation_timeout: std::time::Duration,
+    operation: Operation,
+) -> bool
+where
+    Operation: FnOnce(std::time::Duration) -> bool + Send + 'static,
+{
+    let Some(operation_timeout) = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .map(|remaining| remaining.min(maximum_operation_timeout))
+    else {
+        return false;
+    };
+    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name(String::from("cmclient-service-shutdown-request"))
+        .spawn(move || {
+            let _ = result_sender.send(operation(operation_timeout));
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let Some(remaining) = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        return false;
+    };
+    result_receiver.recv_timeout(remaining).unwrap_or(false)
+}
+
 #[cfg(windows)]
 fn main() -> ExitCode {
     if std::env::args_os().nth(1).as_deref() != Some(std::ffi::OsStr::new("--service")) {
@@ -37,14 +72,16 @@ fn main() -> ExitCode {
 
 #[cfg(windows)]
 mod service {
-    use super::{SERVICE_NAME, agent_path_from_host};
+    use super::{SERVICE_NAME, agent_path_from_host, run_before_deadline};
+    use cmclient_control_api::{ControlClient, default_local_endpoint};
     use std::{
         ffi::OsString,
         io,
         path::PathBuf,
         process::{Child, Command, Stdio},
         sync::mpsc,
-        time::Duration,
+        thread,
+        time::{Duration, Instant},
     };
     use windows_service::{
         define_windows_service,
@@ -57,6 +94,10 @@ mod service {
     };
 
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+    const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(50);
+    const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+    const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+    const SERVICE_TRANSITION_WAIT_HINT: Duration = Duration::from_secs(60);
 
     pub fn run() -> windows_service::Result<()> {
         service_dispatcher::start(SERVICE_NAME, ffi_service_main)
@@ -86,7 +127,8 @@ mod service {
             1,
         )?;
 
-        let mut agent = match start_agent() {
+        let runtime_root = program_data_directory();
+        let mut agent = match start_agent(&runtime_root) {
             Ok(agent) => agent,
             Err(error) => {
                 report_stopped(&status_handle, ServiceExitCode::Win32(1))?;
@@ -116,7 +158,7 @@ mod service {
                         ServiceControlAccept::empty(),
                         1,
                     )?;
-                    stop_agent(&mut agent)?;
+                    stop_agent(&mut agent, &runtime_root)?;
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -153,15 +195,14 @@ mod service {
             controls_accepted,
             exit_code: ServiceExitCode::NO_ERROR,
             checkpoint,
-            wait_hint: Duration::from_secs(10),
+            wait_hint: SERVICE_TRANSITION_WAIT_HINT,
             process_id: None,
         })
     }
 
-    fn start_agent() -> io::Result<Child> {
+    fn start_agent(root: &std::path::Path) -> io::Result<Child> {
         let host = std::env::current_exe()?;
         let agent = agent_path_from_host(&host);
-        let root = program_data_directory();
         Command::new(agent)
             .arg("--serve")
             .env("HOME", root.join("home"))
@@ -176,7 +217,30 @@ mod service {
             .spawn()
     }
 
-    fn stop_agent(agent: &mut Child) -> io::Result<()> {
+    fn stop_agent(agent: &mut Child, runtime_root: &std::path::Path) -> io::Result<()> {
+        let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
+        let mut graceful_requested = false;
+        while Instant::now() < deadline {
+            if agent.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if !graceful_requested {
+                let endpoint = default_local_endpoint(&runtime_root.join("data"));
+                graceful_requested =
+                    run_before_deadline(deadline, CONTROL_REQUEST_TIMEOUT, move |timeout| {
+                        ControlClient::new_with_timeout(endpoint, timeout)
+                            .and_then(|client| client.shutdown_agent())
+                            .is_ok()
+                    });
+            }
+            let Some(remaining) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                break;
+            };
+            thread::sleep(remaining.min(SHUTDOWN_POLL_INTERVAL));
+        }
         match agent.kill() {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
@@ -197,8 +261,13 @@ mod service {
 
 #[cfg(test)]
 mod tests {
-    use super::agent_path_from_host;
-    use std::path::Path;
+    use super::{agent_path_from_host, run_before_deadline};
+    use std::{
+        path::Path,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn locates_the_agent_beside_the_service_host() {
@@ -211,5 +280,31 @@ mod tests {
                 "cmclient-agent"
             })
         );
+    }
+
+    #[test]
+    fn bounds_an_unresponsive_control_request_to_the_remaining_deadline() {
+        let (timeout_sender, timeout_receiver) = mpsc::sync_channel(1);
+        let started_at = Instant::now();
+        let result = run_before_deadline(
+            started_at + Duration::from_millis(25),
+            Duration::from_secs(2),
+            move |timeout| {
+                timeout_sender
+                    .send(timeout)
+                    .expect("timeout observation should send");
+                thread::sleep(Duration::from_millis(500));
+                true
+            },
+        );
+
+        assert!(!result);
+        assert!(
+            timeout_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .expect("operation should receive its timeout")
+                <= Duration::from_millis(25)
+        );
+        assert!(started_at.elapsed() < Duration::from_millis(400));
     }
 }

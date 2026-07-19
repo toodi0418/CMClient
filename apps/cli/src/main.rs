@@ -902,7 +902,12 @@ fn follow_gateway_events(
     while running.load(Ordering::Relaxed) {
         let mut events = match client.subscribe_gateway_events() {
             Ok(events) => events,
-            Err(ControlError::Io | ControlError::Timeout | ControlError::CommandFailed) => {
+            Err(
+                ControlError::Io
+                | ControlError::Timeout
+                | ControlError::CommandFailed
+                | ControlError::ResourceExhausted,
+            ) => {
                 reconnect_delay(&running);
                 continue;
             }
@@ -932,7 +937,12 @@ fn follow_gateway_events(
                         return ProcessExitCode::from(ExitCode::OperationFailed.as_u8());
                     }
                 }
-                Ok(None) | Err(ControlError::Io | ControlError::CommandFailed) => break,
+                Ok(None)
+                | Err(
+                    ControlError::Io
+                    | ControlError::CommandFailed
+                    | ControlError::ResourceExhausted,
+                ) => break,
                 Err(ControlError::Timeout) => continue,
                 Err(error) => return control_error_exit(error),
             }
@@ -1277,7 +1287,12 @@ fn follow_update_events(
     while running.load(Ordering::Relaxed) {
         let mut events = match client.subscribe_update_events() {
             Ok(events) => events,
-            Err(ControlError::Io | ControlError::Timeout | ControlError::CommandFailed) => {
+            Err(
+                ControlError::Io
+                | ControlError::Timeout
+                | ControlError::CommandFailed
+                | ControlError::ResourceExhausted,
+            ) => {
                 reconnect_delay(&running);
                 continue;
             }
@@ -1298,7 +1313,12 @@ fn follow_update_events(
                         return exit;
                     }
                 }
-                Ok(None) | Err(ControlError::Io | ControlError::CommandFailed) => break,
+                Ok(None)
+                | Err(
+                    ControlError::Io
+                    | ControlError::CommandFailed
+                    | ControlError::ResourceExhausted,
+                ) => break,
                 Err(ControlError::Timeout) => continue,
                 Err(error) => return control_error_exit(error),
             }
@@ -1316,7 +1336,7 @@ fn control_error_exit(error: ControlError) -> ProcessExitCode {
         | ControlError::EndpointAlreadyInUse => ExitCode::Connection,
         ControlError::Timeout => ExitCode::Timeout,
         ControlError::Authentication => ExitCode::Authentication,
-        ControlError::CommandFailed => ExitCode::OperationFailed,
+        ControlError::CommandFailed | ControlError::ResourceExhausted => ExitCode::OperationFailed,
         ControlError::InvalidHttp | ControlError::ResponseTooLarge => ExitCode::OperationFailed,
     };
     ProcessExitCode::from(code.as_u8())

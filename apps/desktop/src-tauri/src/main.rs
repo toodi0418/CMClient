@@ -81,6 +81,9 @@ fn control(command: ControlCommand) -> Result<ControlStatus, String> {
         ControlCommand::Restart => client.restart(),
         ControlCommand::EnableManagementWeb => client.enable_management_web(),
         ControlCommand::DisableManagementWeb => client.disable_management_web(),
+        ControlCommand::ShutdownAgent => {
+            return Err(String::from("DESKTOP_AGENT_COMMAND_INVALID"));
+        }
     }
     .map_err(|error| error.code().to_owned())
 }
@@ -223,6 +226,10 @@ mod tests {
         );
         assert_eq!(
             parse_command("delete"),
+            Err(String::from("DESKTOP_AGENT_COMMAND_INVALID"))
+        );
+        assert_eq!(
+            parse_command("shutdown_agent"),
             Err(String::from("DESKTOP_AGENT_COMMAND_INVALID"))
         );
     }

@@ -87,6 +87,11 @@ supply-chain job also extracts and starts the final Linux x64 Headless archive
 so archive creation cannot silently change its runtime layout or executable
 modes.
 
+The release workflow owns a `load-gate` job in addition to ordinary CI. Every
+platform build and the Docker composition require it, so an independent manual
+workflow dispatch cannot assemble, attest, or sign release inputs while the
+bounded resource gate is failing or was never run for that revision.
+
 ## Docker image
 
 Docker is a separately versioned deployment image, not an Agent-updater

@@ -34,6 +34,29 @@ describe("Meshtastic TCP framing", () => {
     expect(decoder.metrics.malformedFrames).toBeGreaterThan(0);
     expect(() => encodeMeshtasticFrame(new Uint8Array())).toThrow();
   });
+
+  it("resynchronizes a large malformed chunk in linear time with a bounded tail", () => {
+    const decoder = new MeshtasticFrameDecoder({ maxPayloadBytes: 512 });
+    const garbage = new Uint8Array(512 * 1_024).fill(0x55);
+    const expected = new Uint8Array([1, 2, 3]);
+    const input = concat(garbage, encodeMeshtasticFrame(expected));
+
+    expect(decoder.push(input)).toEqual([expected]);
+
+    expect(decoder.metrics).toEqual({
+      bufferedBytes: 0,
+      copiedBytes: input.length,
+      copyOperations: 2,
+      discardedBytes: garbage.length,
+      malformedFrames: garbage.length,
+      scanSteps: garbage.length + 1,
+    });
+
+    expect(decoder.push(garbage)).toEqual([]);
+    expect(decoder.metrics.bufferedBytes).toBeLessThanOrEqual(515);
+    expect(decoder.push(encodeMeshtasticFrame(expected))).toEqual([expected]);
+    expect(decoder.metrics.bufferedBytes).toBe(0);
+  });
 });
 
 describe("ConfigSession and ReconnectBackoff", () => {
@@ -179,6 +202,105 @@ describe("TcpMeshtasticTransport", () => {
     }
     await close(server);
   });
+
+  it("times out a blackholed connect and can stop without a late backoff", async () => {
+    const socket = new net.Socket();
+    const transport = new TcpMeshtasticTransport(
+      {
+        host: "192.0.2.1",
+        port: 4403,
+        configSession: codec,
+        connectTimeoutMs: 10,
+        reconnect: {
+          initialDelayMs: 1_000,
+          maximumDelayMs: 1_000,
+          jitterRatio: 0,
+        },
+        random: () => 0,
+      },
+      () => socket,
+    );
+    const errors: string[] = [];
+    transport.subscribe((event) => {
+      if (event.kind === "error") {
+        errors.push(event.code);
+      }
+    });
+    const connecting = transport.connect().catch((error: unknown) => error);
+
+    await waitFor(() => transport.state.status === "backoff");
+    expect(transport.state).toMatchObject({
+      status: "backoff",
+      attempt: 1,
+      reasonCode: "TCP_CONNECT_TIMEOUT",
+    });
+    expect(errors).toEqual(["TCP_CONNECT_TIMEOUT"]);
+    expect(socket.destroyed).toBe(true);
+
+    await transport.disconnect();
+    await expect(connecting).resolves.toMatchObject({
+      code: "TRANSPORT_DISCONNECTED",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(transport.state.status).toBe("disconnected");
+    expect(transport.metrics.reconnects).toBe(1);
+  });
+
+  it("plateaus socket resources across repeated connect timeouts", async () => {
+    let activeSockets = 0;
+    let maximumActiveSockets = 0;
+    let openAttempts = 0;
+    const transport = new TcpMeshtasticTransport(
+      {
+        host: "192.0.2.1",
+        port: 4403,
+        configSession: codec,
+        connectTimeoutMs: 5,
+        reconnect: {
+          initialDelayMs: 1,
+          maximumDelayMs: 1,
+          jitterRatio: 0,
+        },
+        random: () => 0,
+      },
+      () => {
+        openAttempts += 1;
+        activeSockets += 1;
+        maximumActiveSockets = Math.max(maximumActiveSockets, activeSockets);
+        const socket = new net.Socket();
+        socket.once("close", () => {
+          activeSockets -= 1;
+        });
+        return socket;
+      },
+    );
+    const connecting = transport.connect().catch((error: unknown) => error);
+
+    await waitFor(() => openAttempts >= 5 && activeSockets === 1);
+    expect(maximumActiveSockets).toBe(1);
+    await transport.disconnect();
+    await waitFor(() => activeSockets === 0);
+    const stoppedAttempts = openAttempts;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(openAttempts).toBe(stoppedAttempts);
+    expect(transport.state.status).toBe("disconnected");
+    await expect(connecting).resolves.toMatchObject({
+      code: "TRANSPORT_DISCONNECTED",
+    });
+  });
+
+  it("rejects transport deadlines above the bounded maximum", () => {
+    expect(
+      () =>
+        new TcpMeshtasticTransport({
+          host: "127.0.0.1",
+          port: 4403,
+          configSession: codec,
+          connectTimeoutMs: 120_001,
+        }),
+    ).toThrowError(/TCP_CONFIGURATION_INVALID/);
+  });
 });
 
 function wireConfigServer(
@@ -215,6 +337,16 @@ async function close(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("fixture condition was not reached");
 }
 
 function uint32(value: number): Uint8Array {

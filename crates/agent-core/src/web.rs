@@ -2,19 +2,22 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use std::{
     collections::BTreeMap,
     io::{self, BufReader, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_ACTIVE_CONNECTIONS: usize = 64;
 const GATEWAY_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const PROXY_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CONNECTION_LIMIT_BODY: &str = r#"{"code":"MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED"}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagementWebConfig {
@@ -115,7 +118,153 @@ pub struct ManagementWebListener {
 pub struct ManagementWebService {
     address: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    connections: Arc<ActiveConnectionRegistry>,
+    connection_workers: Arc<ConnectionWorkerRegistry>,
     worker: Option<JoinHandle<Result<(), ManagementWebError>>>,
+}
+
+#[derive(Debug)]
+struct ActiveConnectionRegistry {
+    limit: usize,
+    next_id: AtomicU64,
+    streams: Mutex<BTreeMap<u64, TcpStream>>,
+}
+
+#[derive(Debug)]
+struct ActiveConnectionSlot {
+    id: u64,
+    registry: Arc<ActiveConnectionRegistry>,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionWorkerRegistry {
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+#[derive(Debug)]
+enum ConnectionRegistrationError {
+    Full,
+    Io,
+}
+
+impl ActiveConnectionRegistry {
+    fn new(limit: usize) -> Self {
+        debug_assert!(limit > 0);
+        Self {
+            limit,
+            next_id: AtomicU64::new(1),
+            streams: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn try_register(
+        self: &Arc<Self>,
+        stream: &TcpStream,
+    ) -> Result<ActiveConnectionSlot, ConnectionRegistrationError> {
+        let mut streams = self
+            .streams
+            .lock()
+            .map_err(|_| ConnectionRegistrationError::Io)?;
+        if streams.len() >= self.limit {
+            return Err(ConnectionRegistrationError::Full);
+        }
+        let shutdown_handle = stream
+            .try_clone()
+            .map_err(|_| ConnectionRegistrationError::Io)?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        streams.insert(id, shutdown_handle);
+        Ok(ActiveConnectionSlot {
+            id,
+            registry: Arc::clone(self),
+        })
+    }
+
+    fn shutdown_all(&self) {
+        let streams = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for stream in streams.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl Drop for ActiveConnectionSlot {
+    fn drop(&mut self) {
+        self.registry
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+impl ConnectionWorkerRegistry {
+    fn track(&self, worker: JoinHandle<()>) {
+        self.workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(worker);
+    }
+
+    fn reap_finished(&self) -> Result<(), ManagementWebError> {
+        let finished = {
+            let mut workers = self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut finished = Vec::new();
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    finished.push(workers.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            finished
+        };
+        join_connection_workers(finished)
+    }
+
+    fn join_all(&self) -> Result<(), ManagementWebError> {
+        let workers = std::mem::take(
+            &mut *self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        join_connection_workers(workers)
+    }
+
+    #[cfg(test)]
+    fn tracked_count(&self) -> usize {
+        self.workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+fn join_connection_workers(workers: Vec<JoinHandle<()>>) -> Result<(), ManagementWebError> {
+    let mut failed = false;
+    for worker in workers {
+        failed |= worker.join().is_err();
+    }
+    if failed {
+        Err(ManagementWebError::Io)
+    } else {
+        Ok(())
+    }
 }
 
 impl ManagementWebService {
@@ -133,16 +282,31 @@ impl ManagementWebService {
     }
 
     fn start_listener(listener: ManagementWebListener) -> Result<Self, ManagementWebError> {
+        Self::start_listener_with_connection_limit(listener, MAX_ACTIVE_CONNECTIONS)
+    }
+
+    fn start_listener_with_connection_limit(
+        listener: ManagementWebListener,
+        connection_limit: usize,
+    ) -> Result<Self, ManagementWebError> {
         let address = listener.local_addr()?;
         let shutdown = Arc::new(AtomicBool::new(true));
         let worker_shutdown = Arc::clone(&shutdown);
+        let connections = Arc::new(ActiveConnectionRegistry::new(connection_limit));
+        let worker_connections = Arc::clone(&connections);
+        let connection_workers = Arc::new(ConnectionWorkerRegistry::default());
+        let listener_workers = Arc::clone(&connection_workers);
         let worker = thread::Builder::new()
             .name(String::from("cmclient-management-web"))
-            .spawn(move || listener.serve_until(&worker_shutdown))
+            .spawn(move || {
+                listener.serve_until(worker_shutdown, worker_connections, listener_workers)
+            })
             .map_err(|_| ManagementWebError::Io)?;
         Ok(Self {
             address,
             shutdown,
+            connections,
+            connection_workers,
             worker: Some(worker),
         })
     }
@@ -152,20 +316,23 @@ impl ManagementWebService {
     }
 
     pub fn stop(mut self) -> Result<(), ManagementWebError> {
+        self.shutdown_and_join()
+    }
+
+    fn shutdown_and_join(&mut self) -> Result<(), ManagementWebError> {
         self.shutdown.store(false, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            worker.join().map_err(|_| ManagementWebError::Io)??;
-        }
-        Ok(())
+        let listener_result = self.worker.take().map_or(Ok(()), |worker| {
+            worker.join().map_err(|_| ManagementWebError::Io)?
+        });
+        self.connections.shutdown_all();
+        let connections_result = self.connection_workers.join_all();
+        listener_result.and(connections_result)
     }
 }
 
 impl Drop for ManagementWebService {
     fn drop(&mut self) {
-        self.shutdown.store(false, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        let _ = self.shutdown_and_join();
     }
 }
 
@@ -224,24 +391,26 @@ impl ManagementWebListener {
     }
 
     pub fn serve(self) -> Result<(), ManagementWebError> {
-        loop {
-            let (stream, remote_addr) =
-                self.listener.accept().map_err(|_| ManagementWebError::Io)?;
-            let gateway = self.gateway;
-            let api_handler = self.api_handler.clone();
-            let tls = self.tls.clone();
-            let static_web_root = self.static_web_root.clone();
-            thread::spawn(move || {
-                let _ = serve_connection(
+        let running = Arc::new(AtomicBool::new(true));
+        let connections = Arc::new(ActiveConnectionRegistry::new(MAX_ACTIVE_CONNECTIONS));
+        let connection_workers = Arc::new(ConnectionWorkerRegistry::default());
+        let serve_result: Result<(), ManagementWebError> = (|| {
+            loop {
+                connection_workers.reap_finished()?;
+                let (stream, remote_addr) =
+                    self.listener.accept().map_err(|_| ManagementWebError::Io)?;
+                self.dispatch_connection(
                     stream,
                     remote_addr,
-                    gateway,
-                    api_handler,
-                    tls,
-                    static_web_root,
-                );
-            });
-        }
+                    Arc::clone(&connections),
+                    Arc::clone(&connection_workers),
+                    Arc::clone(&running),
+                )?;
+            }
+        })();
+        running.store(false, Ordering::Release);
+        connections.shutdown_all();
+        serve_result.and(connection_workers.join_all())
     }
 
     pub fn serve_once(&self) -> Result<(), ManagementWebError> {
@@ -253,30 +422,30 @@ impl ManagementWebListener {
             self.api_handler.clone(),
             self.tls.clone(),
             self.static_web_root.clone(),
+            Arc::new(AtomicBool::new(true)),
         )
     }
 
-    fn serve_until(self, shutdown: &AtomicBool) -> Result<(), ManagementWebError> {
+    fn serve_until(
+        self,
+        shutdown: Arc<AtomicBool>,
+        connections: Arc<ActiveConnectionRegistry>,
+        connection_workers: Arc<ConnectionWorkerRegistry>,
+    ) -> Result<(), ManagementWebError> {
         self.listener
             .set_nonblocking(true)
             .map_err(|_| ManagementWebError::Io)?;
         while shutdown.load(Ordering::Acquire) {
+            connection_workers.reap_finished()?;
             match self.listener.accept() {
                 Ok((stream, remote_addr)) => {
-                    let gateway = self.gateway;
-                    let api_handler = self.api_handler.clone();
-                    let tls = self.tls.clone();
-                    let static_web_root = self.static_web_root.clone();
-                    thread::spawn(move || {
-                        let _ = serve_connection(
-                            stream,
-                            remote_addr,
-                            gateway,
-                            api_handler,
-                            tls,
-                            static_web_root,
-                        );
-                    });
+                    self.dispatch_connection(
+                        stream,
+                        remote_addr,
+                        Arc::clone(&connections),
+                        Arc::clone(&connection_workers),
+                        Arc::clone(&shutdown),
+                    )?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(SERVICE_POLL_INTERVAL);
@@ -284,6 +453,54 @@ impl ManagementWebListener {
                 Err(_) => return Err(ManagementWebError::Io),
             }
         }
+        Ok(())
+    }
+
+    fn dispatch_connection(
+        &self,
+        mut stream: TcpStream,
+        remote_addr: SocketAddr,
+        connections: Arc<ActiveConnectionRegistry>,
+        connection_workers: Arc<ConnectionWorkerRegistry>,
+        running: Arc<AtomicBool>,
+    ) -> Result<(), ManagementWebError> {
+        stream
+            .set_nonblocking(false)
+            .map_err(|_| ManagementWebError::Io)?;
+        let slot = match connections.try_register(&stream) {
+            Ok(slot) => slot,
+            Err(ConnectionRegistrationError::Full) => {
+                let _ = stream.set_write_timeout(Some(GATEWAY_TIMEOUT));
+                let _ = write_response(
+                    &mut stream,
+                    "503 Service Unavailable",
+                    "application/json",
+                    CONNECTION_LIMIT_BODY,
+                );
+                return Ok(());
+            }
+            Err(ConnectionRegistrationError::Io) => return Err(ManagementWebError::Io),
+        };
+        let gateway = self.gateway;
+        let api_handler = self.api_handler.clone();
+        let tls = self.tls.clone();
+        let static_web_root = self.static_web_root.clone();
+        let worker = thread::Builder::new()
+            .name(String::from("cmclient-management-web-connection"))
+            .spawn(move || {
+                let _slot = slot;
+                let _ = serve_connection(
+                    stream,
+                    remote_addr,
+                    gateway,
+                    api_handler,
+                    tls,
+                    static_web_root,
+                    running,
+                );
+            })
+            .map_err(|_| ManagementWebError::Io)?;
+        connection_workers.track(worker);
         Ok(())
     }
 }
@@ -317,6 +534,7 @@ fn serve_connection(
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     tls: Option<Arc<ServerConfig>>,
     static_web_root: Option<PathBuf>,
+    running: Arc<AtomicBool>,
 ) -> Result<(), ManagementWebError> {
     client
         .set_read_timeout(Some(GATEWAY_TIMEOUT))
@@ -334,6 +552,7 @@ fn serve_connection(
             gateway,
             api_handler,
             static_web_root.as_deref(),
+            &running,
         );
     }
     serve_http_connection(
@@ -342,6 +561,7 @@ fn serve_connection(
         gateway,
         api_handler,
         static_web_root.as_deref(),
+        &running,
     )
 }
 
@@ -351,6 +571,7 @@ fn serve_http_connection(
     gateway: SocketAddr,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     static_web_root: Option<&Path>,
+    running: &AtomicBool,
 ) -> Result<(), ManagementWebError> {
     let request = match read_request(client) {
         Ok(request) => request,
@@ -391,7 +612,7 @@ fn serve_http_connection(
     }
     let routed_path = request_path(&request_context.path);
     if routed_path == "/api" || routed_path.starts_with("/api/") {
-        return proxy_api(client, gateway, &request);
+        return proxy_api(client, gateway, &request, running);
     }
     if let Some(static_web_root) = static_web_root {
         return serve_static_web(client, &request_context, static_web_root);
@@ -564,6 +785,7 @@ fn proxy_api(
     client: &mut dyn ManagementWebStream,
     gateway: SocketAddr,
     request: &[u8],
+    running: &AtomicBool,
 ) -> Result<(), ManagementWebError> {
     let mut upstream = match TcpStream::connect_timeout(&gateway, GATEWAY_TIMEOUT) {
         Ok(stream) => stream,
@@ -577,7 +799,7 @@ fn proxy_api(
         }
     };
     upstream
-        .set_read_timeout(None)
+        .set_read_timeout(Some(PROXY_READ_POLL_INTERVAL))
         .map_err(|_| ManagementWebError::Io)?;
     upstream
         .set_write_timeout(Some(GATEWAY_TIMEOUT))
@@ -591,7 +813,29 @@ fn proxy_api(
             r#"{"code":"GATEWAY_PROXY_UNAVAILABLE"}"#,
         );
     }
-    io::copy(&mut upstream, client).map_err(|_| ManagementWebError::Io)?;
+    copy_proxy_response(&mut upstream, client, running)
+}
+
+fn copy_proxy_response(
+    upstream: &mut TcpStream,
+    client: &mut dyn ManagementWebStream,
+    running: &AtomicBool,
+) -> Result<(), ManagementWebError> {
+    let mut buffer = [0_u8; 16 * 1024];
+    while running.load(Ordering::Acquire) {
+        match upstream.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => client
+                .write_all(&buffer[..count])
+                .map_err(|_| ManagementWebError::Io)?,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(_) => return Err(ManagementWebError::Io),
+        }
+    }
     Ok(())
 }
 
@@ -881,16 +1125,18 @@ fn load_tls_config(config: &ManagementTlsConfig) -> Result<Arc<ServerConfig>, Ma
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
-        ManagementWebService, ManagementWebStream, gateway_health,
+        ActiveConnectionRegistry, ConnectionRegistrationError, ManagementWebApiHandler,
+        ManagementWebConfig, ManagementWebError, ManagementWebListener, ManagementWebService,
+        ManagementWebStream, gateway_health,
     };
     use std::{
         fs,
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, mpsc},
         thread,
+        time::{Duration, Instant},
     };
 
     struct AgentRoute;
@@ -970,6 +1216,25 @@ mod tests {
             .expect("response should have a header")
             + 4;
         &response[body_start..]
+    }
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("pair listener should bind");
+        let client = TcpStream::connect(listener.local_addr().expect("pair address should load"))
+            .expect("pair client should connect");
+        let (server, _) = listener.accept().expect("pair server should accept");
+        (client, server)
+    }
+
+    fn wait_for_active_count(registry: &ActiveConnectionRegistry, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while registry.active_count() != expected {
+            assert!(
+                Instant::now() < deadline,
+                "active connection count did not become {expected}"
+            );
+            thread::yield_now();
+        }
     }
 
     impl ManagementWebApiHandler for AgentRoute {
@@ -1404,6 +1669,171 @@ mod tests {
             .join()
             .expect("server should join")
             .expect("server should respond");
+    }
+
+    #[test]
+    fn active_connection_registry_enforces_and_releases_slots() {
+        let registry = Arc::new(ActiveConnectionRegistry::new(1));
+        let (_first_client, first_server) = tcp_pair();
+        let first_slot = registry
+            .try_register(&first_server)
+            .expect("first connection should reserve the only slot");
+        assert_eq!(registry.active_count(), 1);
+
+        let (_second_client, second_server) = tcp_pair();
+        assert!(matches!(
+            registry.try_register(&second_server),
+            Err(ConnectionRegistrationError::Full)
+        ));
+        assert_eq!(registry.active_count(), 1);
+
+        drop(first_slot);
+        assert_eq!(registry.active_count(), 0);
+        let second_slot = registry
+            .try_register(&second_server)
+            .expect("released capacity should be reusable");
+        assert_eq!(registry.active_count(), 1);
+        drop(second_slot);
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn service_rejects_excess_connections_with_a_stable_response() {
+        let listener = ManagementWebListener::bind(&ManagementWebConfig {
+            port: 0,
+            ..Default::default()
+        })
+        .expect("listener should bind");
+        let service = ManagementWebService::start_listener_with_connection_limit(listener, 1)
+            .expect("service should start");
+        let address = service.local_addr();
+
+        let stalled = TcpStream::connect(address).expect("first connection should connect");
+        wait_for_active_count(&service.connections, 1);
+
+        let mut rejected = TcpStream::connect(address).expect("excess connection should connect");
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should configure");
+        let mut response = String::new();
+        rejected
+            .read_to_string(&mut response)
+            .expect("capacity response should read");
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "unexpected capacity response: {response:?}"
+        );
+        assert_eq!(
+            response_body(response.as_bytes()),
+            br#"{"code":"MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED"}"#
+        );
+        assert_eq!(service.connections.active_count(), 1);
+
+        drop(stalled);
+        wait_for_active_count(&service.connections, 0);
+        let mut recovered = TcpStream::connect(address).expect("released slot should accept");
+        recovered
+            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("request should write");
+        let mut response = String::new();
+        recovered
+            .read_to_string(&mut response)
+            .expect("response should read");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        service.stop().expect("service should stop");
+    }
+
+    #[test]
+    fn stop_and_drop_shutdown_stalled_connections() {
+        for explicit_stop in [true, false] {
+            let service = ManagementWebService::start(&ManagementWebConfig {
+                port: 0,
+                ..Default::default()
+            })
+            .expect("service should start");
+            let registry = Arc::clone(&service.connections);
+            let mut stalled = TcpStream::connect(service.local_addr())
+                .expect("stalled connection should connect");
+            stalled
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("read timeout should configure");
+            wait_for_active_count(&registry, 1);
+
+            if explicit_stop {
+                service.stop().expect("service should stop");
+            } else {
+                drop(service);
+            }
+
+            let mut byte = [0_u8; 1];
+            match stalled.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::NotConnected
+                    ) => {}
+                result => panic!("stalled connection was not shut down: {result:?}"),
+            }
+            wait_for_active_count(&registry, 0);
+        }
+    }
+
+    #[test]
+    fn service_stop_drains_a_connection_blocked_on_the_gateway() {
+        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
+        let gateway_address = gateway.local_addr().expect("gateway address should load");
+        let (accepted_sender, accepted_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let gateway_thread = thread::spawn(move || {
+            let (mut stream, _) = gateway.accept().expect("gateway should accept");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("request should read");
+            accepted_sender
+                .send(())
+                .expect("accepted signal should send");
+            let _ = release_receiver.recv_timeout(Duration::from_secs(2));
+        });
+        let service = ManagementWebService::start(&ManagementWebConfig {
+            port: 0,
+            gateway: gateway_address,
+            ..Default::default()
+        })
+        .expect("service should start");
+        let connections = Arc::clone(&service.connections);
+        let workers = Arc::clone(&service.connection_workers);
+        let mut client = TcpStream::connect(service.local_addr()).expect("client should connect");
+        client
+            .write_all(b"GET /api/v1/events HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .expect("proxy request should write");
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("gateway should receive the request");
+        wait_for_active_count(&connections, 1);
+        assert_eq!(workers.tracked_count(), 1);
+
+        let (stopped_sender, stopped_receiver) = mpsc::sync_channel(1);
+        let stop_thread = thread::spawn(move || {
+            let _ = stopped_sender.send(service.stop());
+        });
+        let stopped = match stopped_receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(stopped) => stopped,
+            Err(error) => {
+                let _ = release_sender.send(());
+                let _ = stop_thread.join();
+                panic!("service did not drain the blocked proxy: {error}");
+            }
+        };
+        stopped.expect("service should stop cleanly");
+        stop_thread.join().expect("stop thread should join");
+        assert_eq!(connections.active_count(), 0);
+        assert_eq!(workers.tracked_count(), 0);
+
+        let _ = release_sender.send(());
+        gateway_thread.join().expect("gateway should join");
     }
 
     #[test]

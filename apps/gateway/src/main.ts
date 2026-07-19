@@ -20,171 +20,266 @@ import {
   createConfiguredGatewayMaintenanceRuntime,
   createConfiguredMeshGatewayRuntime,
 } from "./runtime-config.js";
+import {
+  createGatewaySupervisorShutdownInput,
+  createStartupShutdownCoordinator,
+  GatewayTrackedOperation,
+  runCleanupPhases,
+} from "./shutdown.js";
 import { TcpMeshtasticTransport } from "./transport/tcp.js";
 
-const dataDirectory = gatewayDataDirectory(process.env);
-const database = new GatewayDatabase(join(dataDirectory, "gateway.sqlite"));
-const events = new DomainEventBus();
-const jobs = new JobEngine(database.jobs, events, {
-  handlers: [
-    {
-      type: "diagnostics.integrity_check",
-      handler: async (context) => {
-        context.throwIfCancellationRequested();
-        return { integrity: database.integrityCheck() };
-      },
-    },
-    {
-      type: "backup.create",
-      handler: async (context) => {
-        context.throwIfCancellationRequested();
-        const result = await createVerifiedGatewayBackup(
-          database.connection,
-          join(dataDirectory, "backups"),
-          context.job.id,
-        );
-        context.throwIfCancellationRequested();
-        return { ...result };
-      },
-    },
-  ],
+void runGateway().catch((error: unknown) => {
+  process.stderr.write(`${runtimeErrorCode(error, "GATEWAY_MAIN_FAILED")}\n`);
+  process.exitCode = 1;
 });
-jobs.recover();
-const callmeshUrl = process.env.CMCLIENT_CALLMESH_URL?.trim();
-const callmeshApiKey = process.env.CMCLIENT_CALLMESH_API_KEY;
-const callmesh = new CallMeshClient(
-  {
-    baseUrl: callmeshUrl || "http://127.0.0.1:9",
-    ...(callmeshUrl && callmeshApiKey ? { apiKey: callmeshApiKey } : {}),
-  },
-  database.callmeshMappings,
-);
-let proxy: ProxyRuntime | undefined;
-let mesh: MeshGatewayRuntime | undefined;
-let aprs: AprsGatewayRuntime | undefined;
-let maintenance: GatewayMaintenanceRuntime | undefined;
-let callmeshTimer: NodeJS.Timeout | undefined;
-try {
-  await synchronizeCallMesh(callmesh, events);
-  const verifiedMappings = () => {
-    const overview = callmesh.getOverview();
-    return overview.status.state === "ready" ? overview.mappings : [];
-  };
-  proxy = await createConfiguredProxyRuntime(process.env, events);
-  await proxy?.start();
-  maintenance = createConfiguredGatewayMaintenanceRuntime(
-    process.env,
-    database,
-    events,
-  );
-  maintenance.start();
-  aprs = createConfiguredAprsGatewayRuntime(
-    process.env,
-    database,
-    events,
-    verifiedMappings,
-  );
-  aprs?.start();
-  mesh = await createConfiguredMeshGatewayRuntime(
-    process.env,
-    database,
-    events,
-    verifiedMappings,
-  );
-  mesh?.start();
-  callmeshTimer = setInterval(() => {
-    void synchronizeCallMesh(callmesh, events).then(() =>
-      aprs?.refreshMonitor(),
-    );
-  }, 60_000);
-  callmeshTimer.unref();
-} catch (error) {
-  process.stderr.write(
-    `${runtimeErrorCode(error, "GATEWAY_RUNTIME_START_FAILED")}\n`,
-  );
-  await mesh?.stop();
-  await aprs?.stop();
-  maintenance?.stop();
-  await proxy?.stop();
-  database.close();
-  process.exit(1);
-}
-const runtime = new GatewayRuntime(
-  parseGatewayListenOptions(process.env),
-  undefined,
-  undefined,
-  events,
-  {
-    get: (jobId) => jobs.get(jobId),
-    cancel: (jobId, correlationId) => jobs.cancel(jobId, correlationId),
-    submitIntegrityCheck: (correlationId, idempotencyKey) =>
-      jobs.submit({
-        type: "diagnostics.integrity_check",
-        input: {},
-        ...(correlationId ? { correlationId } : {}),
-        ...(idempotencyKey ? { idempotencyKey } : {}),
-      }),
-    submitBackup: (correlationId, idempotencyKey) =>
-      jobs.submit({
-        type: "backup.create",
-        input: {},
-        ...(correlationId ? { correlationId } : {}),
-        ...(idempotencyKey ? { idempotencyKey } : {}),
-      }),
-  },
-  {
-    listNodes: (limit) => database.meshNodes.list(limit),
-    listMessages: (limit) => database.meshMessages.list(limit),
-    listTelemetry: (limit) => database.meshTelemetry.list(limit),
-    queryTelemetry: (query) => database.meshTelemetry.query(query),
-    listPositions: (limit) => database.positions.listCanonicalEvents(limit),
-    listAprsOutbox: (limit) => database.aprsOutbox.list(limit),
-  },
-  callmesh,
-  proxy,
-  {
-    status: () => mesh?.status() ?? { configured: false },
-  },
-  {
-    status: () =>
-      aprs?.status() ?? {
-        configured: false,
-        running: false,
-        monitorStatus: "stopped",
-        mappedCallsigns: 0,
-        pendingOutbox: 0,
-        failedOutbox: 0,
-      },
-  },
-);
-let shuttingDown = false;
 
-async function shutdown(): Promise<void> {
-  if (shuttingDown) {
-    return;
-  }
-  shuttingDown = true;
-  if (callmeshTimer) {
-    clearInterval(callmeshTimer);
-    callmeshTimer = undefined;
-  }
-  await mesh?.stop();
-  await aprs?.stop();
-  maintenance?.stop();
-  await runtime.close();
-  await proxy?.stop();
-  database.close();
-}
-
-process.once("SIGINT", () => void shutdown().then(() => process.exit(0)));
-process.once("SIGTERM", () => void shutdown().then(() => process.exit(0)));
-
-runtime.start().catch((error: unknown) => {
-  process.stderr.write(`${runtimeErrorCode(error, "GATEWAY_START_FAILED")}\n`);
-  void shutdown().then(() => {
-    process.exitCode = 1;
+async function runGateway(): Promise<void> {
+  let database: GatewayDatabase | undefined;
+  let events: DomainEventBus | undefined;
+  let jobs: JobEngine | undefined;
+  let proxy: ProxyRuntime | undefined;
+  let mesh: MeshGatewayRuntime | undefined;
+  let aprs: AprsGatewayRuntime | undefined;
+  let maintenance: GatewayMaintenanceRuntime | undefined;
+  let runtime: GatewayRuntime | undefined;
+  let callmeshTimer: NodeJS.Timeout | undefined;
+  let databaseCloseAllowed = true;
+  let detachSupervisorInput = (): void => undefined;
+  const callmeshRefresh = new GatewayTrackedOperation((error) => {
+    events?.publish({
+      type: "callmesh.error",
+      source: "gateway",
+      payload: { code: runtimeErrorCode(error, "CALLMESH_REFRESH_FAILED") },
+    });
   });
-});
+  const lifecycle = createStartupShutdownCoordinator<void>(async () => {
+    detachSupervisorInput();
+    if (callmeshTimer) {
+      clearInterval(callmeshTimer);
+      callmeshTimer = undefined;
+    }
+    await runCleanupPhases([
+      [
+        () => maintenance?.stop(),
+        () => runtime?.close(),
+        () => callmeshRefresh.stopAndDrain(),
+      ],
+      [() => mesh?.stop(), () => aprs?.stop(), () => proxy?.stop()],
+      [
+        async () => {
+          try {
+            await jobs?.stop();
+          } catch (error) {
+            databaseCloseAllowed = false;
+            throw error;
+          }
+        },
+      ],
+      [() => (databaseCloseAllowed ? database?.close() : undefined)],
+    ]);
+  }, 30_000);
+  const terminateAfterShutdown = (): void => {
+    void lifecycle.shutdown().then(
+      () => process.exit(0),
+      (error: unknown) => {
+        process.stderr.write(
+          `${runtimeErrorCode(error, "GATEWAY_SHUTDOWN_FAILED")}\n`,
+        );
+        process.exit(1);
+      },
+    );
+  };
+
+  process.once("SIGINT", terminateAfterShutdown);
+  process.once("SIGTERM", terminateAfterShutdown);
+  if (process.env.CMCLIENT_SUPERVISED === "1") {
+    const supervisorInput = createGatewaySupervisorShutdownInput(
+      terminateAfterShutdown,
+    );
+    const onData = (chunk: Buffer | string): void =>
+      supervisorInput.push(chunk);
+    const onEnd = (): void => supervisorInput.end();
+    process.stdin.on("data", onData);
+    process.stdin.once("end", onEnd);
+    process.stdin.once("error", onEnd);
+    process.stdin.resume();
+    detachSupervisorInput = () => {
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("error", onEnd);
+      process.stdin.pause();
+      detachSupervisorInput = (): void => undefined;
+    };
+  }
+
+  const startup = await lifecycle.start(async (context) => {
+    const dataDirectory = gatewayDataDirectory(process.env);
+    const activeDatabase = new GatewayDatabase(
+      join(dataDirectory, "gateway.sqlite"),
+    );
+    database = activeDatabase;
+    context.throwIfShutdownRequested();
+    const activeEvents = new DomainEventBus();
+    events = activeEvents;
+    const activeJobs = new JobEngine(activeDatabase.jobs, activeEvents, {
+      handlers: [
+        {
+          type: "diagnostics.integrity_check",
+          handler: async (context) => {
+            context.throwIfCancellationRequested();
+            return { integrity: activeDatabase.integrityCheck() };
+          },
+        },
+        {
+          type: "backup.create",
+          handler: async (context) => {
+            context.throwIfCancellationRequested();
+            const result = await createVerifiedGatewayBackup(
+              activeDatabase.connection,
+              join(dataDirectory, "backups"),
+              context.job.id,
+              context.signal,
+            );
+            context.throwIfCancellationRequested();
+            return { ...result };
+          },
+        },
+      ],
+    });
+    jobs = activeJobs;
+    activeJobs.recover();
+    context.throwIfShutdownRequested();
+
+    const callmeshUrl = process.env.CMCLIENT_CALLMESH_URL?.trim();
+    const callmeshApiKey = process.env.CMCLIENT_CALLMESH_API_KEY;
+    const callmesh = new CallMeshClient(
+      {
+        baseUrl: callmeshUrl || "http://127.0.0.1:9",
+        ...(callmeshUrl && callmeshApiKey ? { apiKey: callmeshApiKey } : {}),
+      },
+      activeDatabase.callmeshMappings,
+    );
+    context.throwIfShutdownRequested();
+    const listenOptions = parseGatewayListenOptions(process.env);
+    await callmeshRefresh.run(() =>
+      synchronizeCallMesh(callmesh, activeEvents),
+    );
+    context.throwIfShutdownRequested();
+    const verifiedMappings = () => {
+      const overview = callmesh.getOverview();
+      return overview.status.state === "ready" ? overview.mappings : [];
+    };
+
+    proxy = await createConfiguredProxyRuntime(process.env, activeEvents);
+    context.throwIfShutdownRequested();
+    await proxy?.start();
+    context.throwIfShutdownRequested();
+    maintenance = createConfiguredGatewayMaintenanceRuntime(
+      process.env,
+      activeDatabase,
+      activeEvents,
+    );
+    maintenance.start();
+    context.throwIfShutdownRequested();
+    aprs = createConfiguredAprsGatewayRuntime(
+      process.env,
+      activeDatabase,
+      activeEvents,
+      verifiedMappings,
+    );
+    aprs?.start();
+    context.throwIfShutdownRequested();
+    mesh = await createConfiguredMeshGatewayRuntime(
+      process.env,
+      activeDatabase,
+      activeEvents,
+      verifiedMappings,
+    );
+    context.throwIfShutdownRequested();
+    mesh?.start();
+    context.throwIfShutdownRequested();
+
+    runtime = new GatewayRuntime(
+      listenOptions,
+      undefined,
+      undefined,
+      activeEvents,
+      {
+        get: (jobId) => activeJobs.get(jobId),
+        cancel: (jobId, correlationId) =>
+          activeJobs.cancel(jobId, correlationId),
+        submitIntegrityCheck: (correlationId, idempotencyKey) =>
+          activeJobs.submit({
+            type: "diagnostics.integrity_check",
+            input: {},
+            ...(correlationId ? { correlationId } : {}),
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+          }),
+        submitBackup: (correlationId, idempotencyKey) =>
+          activeJobs.submit({
+            type: "backup.create",
+            input: {},
+            ...(correlationId ? { correlationId } : {}),
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+          }),
+      },
+      {
+        listNodes: (limit) => activeDatabase.meshNodes.list(limit),
+        listMessages: (limit) => activeDatabase.meshMessages.list(limit),
+        listTelemetry: (limit) => activeDatabase.meshTelemetry.list(limit),
+        queryTelemetry: (query) => activeDatabase.meshTelemetry.query(query),
+        listPositions: (limit) =>
+          activeDatabase.positions.listCanonicalEvents(limit),
+        listAprsOutbox: (limit) => activeDatabase.aprsOutbox.list(limit),
+      },
+      callmesh,
+      proxy,
+      {
+        status: () => mesh?.status() ?? { configured: false },
+      },
+      {
+        status: () =>
+          aprs?.status() ?? {
+            configured: false,
+            running: false,
+            monitorStatus: "stopped",
+            mappedCallsigns: 0,
+            pendingOutbox: 0,
+            failedOutbox: 0,
+          },
+      },
+    );
+    context.throwIfShutdownRequested();
+    await runtime.start();
+    context.throwIfShutdownRequested();
+
+    callmeshTimer = setInterval(() => {
+      void callmeshRefresh.run(async () => {
+        await synchronizeCallMesh(callmesh, activeEvents);
+        await aprs?.refreshMonitor();
+      });
+    }, 60_000);
+    callmeshTimer.unref();
+  });
+
+  if (!startup.ok) {
+    if (lifecycle.shutdownRequested) {
+      return;
+    }
+    process.removeListener("SIGINT", terminateAfterShutdown);
+    process.removeListener("SIGTERM", terminateAfterShutdown);
+    process.stderr.write(
+      `${runtimeErrorCode(startup.error, "GATEWAY_RUNTIME_START_FAILED")}\n`,
+    );
+    if ("cleanupError" in startup) {
+      process.stderr.write(
+        `${runtimeErrorCode(startup.cleanupError, "GATEWAY_SHUTDOWN_FAILED")}\n`,
+      );
+      process.exit(1);
+    }
+    process.exitCode = 1;
+  }
+}
 
 async function synchronizeCallMesh(
   client: CallMeshClient,

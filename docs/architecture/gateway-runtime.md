@@ -11,8 +11,24 @@ service, or update itself.
 Gateway opens the migrated SQLite database, recovers persistent Jobs, and
 constructs CallMesh, Proxy, maintenance, APRS, and Meshtastic runtimes. Enabled
 runtimes start before the Fastify listener. A startup failure emits a stable
-code, stops already-started runtimes, and closes SQLite; shutdown stops Mesh and
-APRS activity before closing HTTP, Proxy, and persistence.
+code, stops already-started runtimes, and closes SQLite. Shutdown requests share
+one terminal promise. Cleanup runs in ordered phases while settling every member
+of a phase: HTTP and maintenance, Mesh/APRS/Proxy producers, Jobs, then SQLite.
+A component failure produces `GATEWAY_SHUTDOWN_FAILED` only after all later
+cleanup phases have run, so a failed transport close cannot skip Job drain or
+the final database decision. In an Agent deployment, a private bounded stdin
+command and parent-pipe EOF enter this same path; ordinary standalone and Docker
+processes do not interpret closed stdin as shutdown. Job drain has a 10-second
+deadline. If an active handler ignores cancellation, shutdown fails with a
+stable code and deliberately leaves SQLite for process teardown instead of
+closing it underneath live work.
+
+The complete wait-for-startup and Gateway cleanup sequence has a 30-second outer
+deadline. On expiry the process exits with `GATEWAY_SHUTDOWN_FAILED`; this is
+intentionally below the Supervisor's 40-second graceful-child deadline, which
+in turn is below the Windows Service Host's 50-second Agent deadline. The
+decreasing inner budgets give each owner time to observe failure and reap its
+child before its own fallback termination fires.
 
 When Meshtastic is enabled, the single framed transport path decodes
 `FromRadio`, persists the observation, and writes NodeInfo, strict text,
@@ -54,11 +70,31 @@ returns `TELEMETRY_RANGE_INVALID`. The repository uses parameterized fixed
 clauses and orders by persisted `observed_at`, not the device RTC. Migration 9
 adds the metric/time query index.
 
-Telemetry retention runs in bounded batches, defaults to 30 days, and emits a
-code/data-only `telemetry.retention.completed` event. A backup request creates
-a persistent `backup.create` Job, uses SQLite's backup API, applies private file
-permissions, verifies `PRAGMA integrity_check`, and reports filename, size,
-page count, and SHA-256 only after verification.
+Telemetry, Message, and Position-history retention run in independent bounded
+batches and default to 30 days. Position cleanup preserves canonical history
+referenced by mapping high-water state, the APRS delivery watermark, or any
+outbox row; unreferenced Mesh observations are scanned last. Terminal Job and
+sent APRS outbox retention default to 90 days and use independent bounded
+batches. Sent outbox cleanup requires a durable delivery-order proof, so
+expiring a sent row cannot make the same canonical event eligible after a
+mapping-version rotation. The final orphan scan uses the latest of the three
+domain cutoffs. Queued or failed APRS rows proven older than another active or
+delivered snapshot are removed in the same bounded maintenance cycle.
+
+Retention ages and batch sizes are configured with the paired
+`CMCLIENT_TELEMETRY_RETENTION_*`, `CMCLIENT_MESSAGE_RETENTION_*`,
+`CMCLIENT_POSITION_RETENTION_*`, `CMCLIENT_JOB_RETENTION_*`, and
+`CMCLIENT_APRS_OUTBOX_RETENTION_*` variables (`DAYS` and `BATCH_SIZE`). Each
+cycle's final orphan scan uses `CMCLIENT_OBSERVATION_RETENTION_BATCH_SIZE`; it
+defaults to the three domain batch sizes combined plus 1,000 and rejects a
+smaller value. The repository accepts at most 40,000 rows for this one bounded
+delete. Each cycle performs a passive WAL checkpoint and emits a code/data-only
+`telemetry.retention.completed` event with per-resource deletion counts. A
+backup request creates a persistent `backup.create` Job, uses SQLite's backup
+API, applies private file permissions, verifies `PRAGMA integrity_check`, and
+reports filename, size, page count, and SHA-256 only after verification.
+Backup and hash stages check the Job abort signal between blocking operations
+and remove an incomplete artifact on cancellation.
 
 ## Status and event surfaces
 
@@ -68,3 +104,8 @@ ingest, domain, Position, APRS, CallMesh, Proxy, retention, and Job events to th
 bounded SSE bus. Agent proxies those endpoints for Web and bridges selected
 projections/SSE to Desktop and CLI; clients do not connect to the Gateway
 listener directly in an Agent deployment.
+
+The event bus rejects payloads larger than 56 KiB by UTF-8 byte count, and SSE
+formatting rejects frames larger than 60 KiB. Listener failures are isolated so
+one consumer cannot stop ingest or later consumers; counters expose published,
+rejected, delivered, and failed-listener totals for resource tests.

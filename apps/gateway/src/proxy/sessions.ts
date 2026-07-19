@@ -63,8 +63,10 @@ export class ProxySessionManager {
     options: ProxySessionManagerOptions = {},
   ) {
     this.maxClients = options.maxClients ?? 16;
-    this.maxQueuedBytes = options.maxQueuedBytes ?? 256 * 1024;
-    this.maxQueuedFrames = options.maxQueuedFrames ?? 128;
+    // The config cache can contain 512 frames. Keep enough headroom to replay
+    // a full snapshot plus live upstream traffic to a newly attached client.
+    this.maxQueuedBytes = options.maxQueuedBytes ?? 1024 * 1024;
+    this.maxQueuedFrames = options.maxQueuedFrames ?? 1_024;
     if (
       !Number.isInteger(this.maxClients) ||
       this.maxClients < 1 ||
@@ -122,7 +124,7 @@ export class ProxySessionManager {
     for (const entry of this.upstream.configCache.snapshot()) {
       session.enqueue(entry.frame);
       if (session.closed) {
-        break;
+        throw new ProxySessionError("PROXY_CONFIG_REPLAY_BACKPRESSURE");
       }
     }
     return session.snapshot;
@@ -218,8 +220,13 @@ class ProxyClientSession {
     this.closed = true;
     this.queue.length = 0;
     this.queuedBytes = 0;
-    this.sink.close(code);
-    this.onClose();
+    try {
+      this.sink.close(code);
+    } catch {
+      // A transport close failure cannot retain the session or block peers.
+    } finally {
+      this.onClose();
+    }
   }
 
   private async drain(): Promise<void> {
@@ -235,6 +242,9 @@ class ProxyClientSession {
         }
         try {
           await this.sink.write(frame);
+          if (this.closed) {
+            return;
+          }
           this.queue.shift();
           this.queuedBytes -= frame.length;
         } catch {

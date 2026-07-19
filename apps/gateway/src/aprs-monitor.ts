@@ -3,6 +3,8 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { PositionCanonicalEvent } from "@cmclient/contracts";
 
+const DEFAULT_SESSION_CLOSE_TIMEOUT_MS = 5_000;
+
 export interface AprsMonitorTarget {
   callsign: string;
   mappingVersion: string;
@@ -38,6 +40,14 @@ export class AprsMonitorError extends Error {
 
   constructor() {
     super("APRS_MONITOR_INVALID");
+  }
+}
+
+export class AprsMonitorPersistenceError extends Error {
+  readonly code = "APRS_MONITOR_PERSISTENCE_FAILED";
+
+  constructor() {
+    super("APRS_MONITOR_PERSISTENCE_FAILED");
   }
 }
 
@@ -93,9 +103,13 @@ export class AprsRemoteHighWaterStore {
       return { advanced: true, state };
     } catch {
       if (transactionOpen) {
-        this.database.exec("ROLLBACK");
+        try {
+          this.database.exec("ROLLBACK");
+        } catch {
+          // Preserve the stable persistence error even if SQLite cannot roll back.
+        }
       }
-      throw new AprsMonitorError();
+      throw new AprsMonitorPersistenceError();
     }
   }
 
@@ -188,6 +202,7 @@ export class AprsIsRxClient {
       loginLine: string;
       filterExpression: string;
       timeoutMs?: number;
+      closeTimeoutMs?: number;
     },
   ) {
     if (
@@ -199,13 +214,19 @@ export class AprsIsRxClient {
       /[\r\n]/.test(options.loginLine) ||
       !isFilterExpression(options.filterExpression) ||
       (options.timeoutMs !== undefined &&
-        (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0))
+        (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) ||
+      (options.closeTimeoutMs !== undefined &&
+        (!Number.isFinite(options.closeTimeoutMs) ||
+          options.closeTimeoutMs <= 0))
     ) {
       throw new AprsMonitorError();
     }
   }
 
-  async connect(onLine: (line: string) => void): Promise<AprsIsRxSession> {
+  async connect(
+    onLine: (line: string) => void,
+    onLineError: (error: unknown) => void = () => undefined,
+  ): Promise<AprsIsRxSession> {
     const socket = net.createConnection({
       host: this.options.host,
       port: this.options.port,
@@ -216,8 +237,14 @@ export class AprsIsRxClient {
         socket,
         `${this.options.loginLine} filter ${this.options.filterExpression}\r\n`,
       );
-      attachLineReader(socket, onLine);
-      return { close: () => closeSocket(socket) };
+      attachLineReader(socket, onLine, onLineError);
+      return {
+        close: () =>
+          closeSocket(
+            socket,
+            this.options.closeTimeoutMs ?? DEFAULT_SESSION_CLOSE_TIMEOUT_MS,
+          ),
+      };
     } catch {
       socket.destroy();
       throw new AprsMonitorError();
@@ -391,32 +418,56 @@ function write(socket: Socket, value: string): Promise<void> {
 function attachLineReader(
   socket: Socket,
   onLine: (line: string) => void,
+  onLineError: (error: unknown) => void,
 ): void {
   let buffer = "";
   socket.on("data", (chunk: Buffer) => {
     buffer += chunk.toString("utf8");
-    if (buffer.length > 1_024) {
-      socket.destroy();
-      return;
-    }
     let lineEnd = buffer.indexOf("\n");
     while (lineEnd >= 0) {
       const line = buffer.slice(0, lineEnd).replace(/\r$/, "");
       buffer = buffer.slice(lineEnd + 1);
       if (line.length <= 512) {
-        onLine(line);
+        try {
+          onLine(line);
+        } catch (error) {
+          try {
+            onLineError(error);
+          } catch {
+            // Consumer failures must never escape the socket EventEmitter.
+          }
+        }
       }
       lineEnd = buffer.indexOf("\n");
+    }
+    if (buffer.length > 1_024) {
+      buffer = "";
+      socket.destroy();
     }
   });
 }
 
-function closeSocket(socket: Socket): Promise<void> {
+function closeSocket(socket: Socket, timeoutMs: number): Promise<void> {
   if (socket.destroyed) {
     return Promise.resolve();
   }
   return new Promise((resolve) => {
-    socket.once("close", resolve);
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.off("close", finish);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      socket.destroy();
+      finish();
+    }, timeoutMs);
+    timer.unref();
+    socket.once("close", finish);
     socket.end();
   });
 }

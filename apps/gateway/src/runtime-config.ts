@@ -7,7 +7,11 @@ import { AprsIsTcpClient, AprsOutboxWorker } from "./aprs-outbox.js";
 import { AprsGatewayRuntime } from "./aprs-runtime.js";
 import { DomainEventBus } from "./events.js";
 import { MeshGatewayRuntime } from "./mesh-runtime.js";
-import { GatewayMaintenanceRuntime } from "./maintenance.js";
+import {
+  MAX_OBSERVATION_RETENTION_BATCH_SIZE,
+  OBSERVATION_RETENTION_HEADROOM,
+  GatewayMaintenanceRuntime,
+} from "./maintenance.js";
 import { GatewayDatabase } from "./persistence/database.js";
 import { MeshtasticApplicationDecoder } from "./protobuf/application.js";
 import { MeshtasticProtobufCodec } from "./protobuf/protobuf.js";
@@ -30,19 +34,81 @@ export function createConfiguredGatewayMaintenanceRuntime(
   database: GatewayDatabase,
   eventBus: DomainEventBus,
 ): GatewayMaintenanceRuntime {
+  const messageBatchSize = parsePositiveInteger(
+    environment.CMCLIENT_MESSAGE_RETENTION_BATCH_SIZE,
+    1_000,
+    "MESSAGE_RETENTION_CONFIGURATION_INVALID",
+  );
+  const positionBatchSize = parsePositiveInteger(
+    environment.CMCLIENT_POSITION_RETENTION_BATCH_SIZE,
+    1_000,
+    "POSITION_RETENTION_CONFIGURATION_INVALID",
+  );
+  const telemetryBatchSize = parsePositiveInteger(
+    environment.CMCLIENT_TELEMETRY_RETENTION_BATCH_SIZE,
+    1_000,
+    "TELEMETRY_RETENTION_CONFIGURATION_INVALID",
+  );
+  const minimumObservationBatchSize =
+    messageBatchSize +
+    positionBatchSize +
+    telemetryBatchSize +
+    OBSERVATION_RETENTION_HEADROOM;
+  const observationBatchSize = parsePositiveInteger(
+    environment.CMCLIENT_OBSERVATION_RETENTION_BATCH_SIZE,
+    minimumObservationBatchSize,
+    "OBSERVATION_RETENTION_CONFIGURATION_INVALID",
+  );
+  if (
+    observationBatchSize < minimumObservationBatchSize ||
+    observationBatchSize > MAX_OBSERVATION_RETENTION_BATCH_SIZE
+  ) {
+    throw new GatewayRuntimeConfigurationError(
+      "OBSERVATION_RETENTION_CONFIGURATION_INVALID",
+    );
+  }
   return new GatewayMaintenanceRuntime({
     database,
     eventBus,
+    aprsOutboxRetentionDays: parsePositiveInteger(
+      environment.CMCLIENT_APRS_OUTBOX_RETENTION_DAYS,
+      90,
+      "APRS_OUTBOX_RETENTION_CONFIGURATION_INVALID",
+    ),
+    aprsOutboxBatchSize: parsePositiveInteger(
+      environment.CMCLIENT_APRS_OUTBOX_RETENTION_BATCH_SIZE,
+      1_000,
+      "APRS_OUTBOX_RETENTION_CONFIGURATION_INVALID",
+    ),
+    jobRetentionDays: parsePositiveInteger(
+      environment.CMCLIENT_JOB_RETENTION_DAYS,
+      90,
+      "JOB_RETENTION_CONFIGURATION_INVALID",
+    ),
+    jobBatchSize: parsePositiveInteger(
+      environment.CMCLIENT_JOB_RETENTION_BATCH_SIZE,
+      1_000,
+      "JOB_RETENTION_CONFIGURATION_INVALID",
+    ),
+    messageRetentionDays: parsePositiveInteger(
+      environment.CMCLIENT_MESSAGE_RETENTION_DAYS,
+      30,
+      "MESSAGE_RETENTION_CONFIGURATION_INVALID",
+    ),
+    messageBatchSize,
+    positionRetentionDays: parsePositiveInteger(
+      environment.CMCLIENT_POSITION_RETENTION_DAYS,
+      30,
+      "POSITION_RETENTION_CONFIGURATION_INVALID",
+    ),
+    positionBatchSize,
+    observationBatchSize,
     retentionDays: parsePositiveInteger(
       environment.CMCLIENT_TELEMETRY_RETENTION_DAYS,
       30,
       "TELEMETRY_RETENTION_CONFIGURATION_INVALID",
     ),
-    telemetryBatchSize: parsePositiveInteger(
-      environment.CMCLIENT_TELEMETRY_RETENTION_BATCH_SIZE,
-      1_000,
-      "TELEMETRY_RETENTION_CONFIGURATION_INVALID",
-    ),
+    telemetryBatchSize,
     intervalMs: parsePositiveInteger(
       environment.CMCLIENT_TELEMETRY_RETENTION_INTERVAL_MS,
       60 * 60 * 1_000,

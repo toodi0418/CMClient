@@ -19,6 +19,7 @@ export interface ProxyRuntimeOptions {
   listenPort?: number;
   policy: ProxyAccessController;
   schema: MeshtasticSchema;
+  stopTimeoutMs?: number;
   upstream: ProxyUpstreamManager;
 }
 
@@ -38,10 +39,15 @@ export class ProxyRuntime {
   private readonly listener: ProxyTcpListener;
   private readonly unsubscribeUpstream: () => void;
   private readonly eventBus: DomainEventBus | undefined;
+  private readonly stopTimeoutMs: number;
   private state: ProxyStatus["state"] = "stopped";
   private lastErrorCode: string | undefined;
   private startPromise: Promise<ProxyStatus> | undefined;
+  private stopPromise: Promise<void> | undefined;
+  private cleanupComplete = false;
+  private lifecycleGeneration = 0;
   private startedOnce = false;
+  private stopping = false;
 
   constructor(private readonly options: ProxyRuntimeOptions) {
     if (
@@ -50,6 +56,14 @@ export class ProxyRuntime {
       (options.listenPort ?? 0) > 65_535
     ) {
       throw new ProxyRuntimeError("PROXY_LISTEN_CONFIGURATION_INVALID");
+    }
+    this.stopTimeoutMs = options.stopTimeoutMs ?? 10_000;
+    if (
+      !Number.isInteger(this.stopTimeoutMs) ||
+      this.stopTimeoutMs < 10 ||
+      this.stopTimeoutMs > 120_000
+    ) {
+      throw new ProxyRuntimeError("PROXY_STOP_TIMEOUT_INVALID");
     }
     this.eventBus = options.eventBus;
     this.sessions = new ProxySessionManager(options.upstream, {
@@ -74,6 +88,10 @@ export class ProxyRuntime {
       sessions: this.sessions,
       onClient: (kind, code) => {
         this.publish("proxy.client", { kind, ...(code ? { code } : {}) });
+      },
+      onBackpressure: (code) => {
+        this.lastErrorCode = code;
+        this.publish("proxy.backpressure", { code });
       },
       onCommandRejected: (code) => {
         this.lastErrorCode = code;
@@ -127,39 +145,97 @@ export class ProxyRuntime {
     if (this.state === "running") {
       return Promise.resolve(this.status());
     }
+    if (this.startPromise) {
+      return this.startPromise;
+    }
     if (this.startedOnce) {
       return Promise.reject(new ProxyRuntimeError("PROXY_RUNTIME_STOPPED"));
     }
-    if (!this.startPromise) {
-      this.startPromise = this.startInternal().finally(() => {
+    this.startedOnce = true;
+    const generation = ++this.lifecycleGeneration;
+    const startPromise = this.startInternal(generation).finally(() => {
+      if (this.startPromise === startPromise) {
         this.startPromise = undefined;
-      });
-    }
-    return this.startPromise;
+      }
+    });
+    this.startPromise = startPromise;
+    return startPromise;
   }
 
-  async stop(): Promise<void> {
-    if (!this.startedOnce && this.state === "stopped") {
-      this.unsubscribeUpstream();
-      return;
+  stop(): Promise<void> {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+    if (this.cleanupComplete) {
+      return Promise.resolve();
     }
     this.startedOnce = true;
-    await this.listener.stop();
+    this.stopping = true;
+    this.lifecycleGeneration += 1;
+    const pendingStart = this.startPromise;
+    const stopPromise = this.stopInternal(pendingStart).finally(() => {
+      if (this.startPromise === pendingStart) {
+        this.startPromise = undefined;
+      }
+      if (this.stopPromise === stopPromise) {
+        this.stopPromise = undefined;
+      }
+    });
+    this.stopPromise = stopPromise;
+    return stopPromise;
+  }
+
+  private async stopInternal(
+    pendingStart: Promise<ProxyStatus> | undefined,
+  ): Promise<void> {
+    const deadline = Date.now() + this.stopTimeoutMs;
+    let stopError: unknown;
+    try {
+      await settleBefore(this.options.upstream.stop(), deadline);
+    } catch (error) {
+      stopError = error;
+    }
+    if (pendingStart) {
+      try {
+        await settleBefore(pendingStart, deadline);
+      } catch (error) {
+        if (
+          error instanceof ProxyRuntimeError &&
+          error.code === "PROXY_STOP_TIMEOUT"
+        ) {
+          stopError ??= error;
+        }
+      }
+      try {
+        await settleBefore(this.options.upstream.stop(), deadline);
+      } catch (error) {
+        stopError ??= error;
+      }
+    }
+    try {
+      await settleBefore(this.listener.stop(), deadline);
+    } catch (error) {
+      stopError ??= error;
+    }
     this.sessions.stop();
     this.outbound.stop();
     this.unsubscribeUpstream();
-    await this.options.upstream.stop();
     this.state = "stopped";
+    this.cleanupComplete = true;
     this.publish("proxy.stopped", {});
+    if (stopError) {
+      throw new ProxyRuntimeError(errorCode(stopError, "PROXY_STOP_FAILED"));
+    }
   }
 
-  private async startInternal(): Promise<ProxyStatus> {
+  private async startInternal(generation: number): Promise<ProxyStatus> {
     this.state = "starting";
     try {
       await this.options.upstream.start();
+      this.assertActiveGeneration(generation);
       this.sessions.start((event) => this.outbound.handleUpstreamEvent(event));
       await this.listener.start();
-      this.startedOnce = true;
+      this.assertActiveGeneration(generation);
       this.state = "running";
       this.publish("proxy.started", {
         port: this.listener.port,
@@ -167,6 +243,14 @@ export class ProxyRuntime {
       });
       return this.status();
     } catch (error) {
+      if (!this.isActiveGeneration(generation)) {
+        this.sessions.stop();
+        await Promise.allSettled([
+          this.listener.stop(),
+          this.options.upstream.stop(),
+        ]);
+        throw new ProxyRuntimeError("PROXY_RUNTIME_STOPPED");
+      }
       this.lastErrorCode = errorCode(error, "PROXY_START_FAILED");
       this.state = "degraded";
       this.sessions.stop();
@@ -177,6 +261,9 @@ export class ProxyRuntime {
   }
 
   private onUpstreamEvent(event: ProxyUpstreamEvent): void {
+    if (this.stopping || this.state === "stopped") {
+      return;
+    }
     if (event.kind === "error") {
       this.lastErrorCode = event.code;
       this.publish("proxy.upstream", { kind: "error", code: event.code });
@@ -212,6 +299,43 @@ export class ProxyRuntime {
   private publish(type: string, payload: Record<string, unknown>): void {
     this.eventBus?.publish({ type, source: "proxy", payload });
   }
+
+  private isActiveGeneration(generation: number): boolean {
+    return !this.stopping && generation === this.lifecycleGeneration;
+  }
+
+  private assertActiveGeneration(generation: number): void {
+    if (!this.isActiveGeneration(generation)) {
+      throw new ProxyRuntimeError("PROXY_RUNTIME_STOPPED");
+    }
+  }
+}
+
+async function settleBefore<T>(
+  promise: Promise<T>,
+  deadline: number,
+): Promise<T> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    void promise.catch(() => undefined);
+    throw new ProxyRuntimeError("PROXY_STOP_TIMEOUT");
+  }
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new ProxyRuntimeError("PROXY_STOP_TIMEOUT")),
+          remainingMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 interface ProxyTcpListenerOptions {
@@ -221,6 +345,7 @@ interface ProxyTcpListenerOptions {
     kind: "connected" | "disconnected" | "rejected",
     code?: string,
   ): void;
+  onBackpressure(code: string): void;
   onCommandRejected(code: string): void;
   onError(code: string): void;
   policy: ProxyAccessController;
@@ -300,9 +425,18 @@ class ProxyTcpListener {
         : { maxPayloadBytes: this.options.frameMaxPayloadBytes }),
     });
     let cleaned = false;
+    let closing = false;
+    let processingInput = false;
     let closingCode = "PROXY_CLIENT_DISCONNECTED";
     const closeClient = (code: string) => {
+      if (closing) {
+        return;
+      }
+      closing = true;
       closingCode = code;
+      if (isBackpressureCode(code)) {
+        this.options.onBackpressure(code);
+      }
       socket.destroy();
     };
     const cleanup = () => {
@@ -338,26 +472,46 @@ class ProxyTcpListener {
     }
     this.options.onClient("connected");
     socket.on("data", (chunk: Buffer) => {
-      let frames: Uint8Array[];
-      try {
-        frames = codec.decode(chunk);
-      } catch {
-        closeClient("PROXY_CLIENT_FRAME_INVALID");
+      if (processingInput) {
+        closeClient("PROXY_CLIENT_BACKPRESSURE");
         return;
       }
-      for (const frame of frames) {
-        void this.options.router
-          .submit({ clientId: id, frame })
-          .catch((error) => {
+      processingInput = true;
+      socket.pause();
+      void (async () => {
+        let frames: Uint8Array[];
+        try {
+          frames = codec.decode(chunk);
+        } catch {
+          closeClient("PROXY_CLIENT_FRAME_INVALID");
+          return;
+        }
+        for (const frame of frames) {
+          if (closing || cleaned || socket.destroyed) {
+            return;
+          }
+          try {
+            await this.options.router.submit({ clientId: id, frame });
+          } catch (error) {
             const code = errorCode(error, "PROXY_OUTBOUND_REJECTED");
-            if (
-              code !== "PROXY_CLIENT_DISCONNECTED" &&
-              code !== "PROXY_OUTBOUND_STOPPED"
-            ) {
-              this.options.onCommandRejected(code);
+            if (isTerminalRuntimeCode(code)) {
+              return;
             }
-          });
-      }
+            this.options.onCommandRejected(code);
+            if (code === "PROXY_OUTBOUND_QUEUE_FULL") {
+              closeClient(code);
+              return;
+            }
+          }
+        }
+      })()
+        .catch(() => closeClient("PROXY_CLIENT_PROCESSING_FAILED"))
+        .finally(() => {
+          processingInput = false;
+          if (!closing && !cleaned && !socket.destroyed) {
+            socket.resume();
+          }
+        });
     });
     socket.on("error", () => closeClient("PROXY_CLIENT_SOCKET_ERROR"));
     socket.once("close", cleanup);
@@ -387,4 +541,16 @@ function errorCode(error: unknown, fallback: string): string {
   return error instanceof Error && "code" in error
     ? String(error.code)
     : fallback;
+}
+
+function isBackpressureCode(code: string): boolean {
+  return (
+    code === "PROXY_CLIENT_BACKPRESSURE" || code === "PROXY_OUTBOUND_QUEUE_FULL"
+  );
+}
+
+function isTerminalRuntimeCode(code: string): boolean {
+  return (
+    code === "PROXY_CLIENT_DISCONNECTED" || code === "PROXY_OUTBOUND_STOPPED"
+  );
 }

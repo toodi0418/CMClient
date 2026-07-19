@@ -13,4 +13,5 @@ The status is retrieved through `GET /api/v1/jobs/:jobId` and may be cancelled
 with the existing Job cancel endpoint while non-terminal. Job results do not
 include database rows or file paths. Invalid idempotency keys return
 `JOB_INPUT_INVALID`; a missing diagnostics Job handler returns
-`GATEWAY_JOB_ENGINE_UNAVAILABLE`.
+`GATEWAY_JOB_ENGINE_UNAVAILABLE`. A saturated durable Job queue returns
+`JOB_QUEUE_FULL` with HTTP 503 and does not create another Job row.
