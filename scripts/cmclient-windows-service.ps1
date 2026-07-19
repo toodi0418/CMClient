@@ -19,8 +19,26 @@ function Assert-Administrator {
     }
 }
 
+function Test-IsWindowsAbsolutePath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    # Device namespaces are not regular drive or UNC file paths and can bypass
+    # normal Win32 path handling.
+    if ($Path.StartsWith('\\?\') -or $Path.StartsWith('\\.\')) {
+        return $false
+    }
+
+    if ($Path -match '^[A-Za-z]:[\\/]') {
+        return $true
+    }
+
+    return $Path -match '^\\\\[^\\/:*?"<>|]+\\[^\\/:*?"<>|]+(?:\\|$)'
+}
+
 function Assert-SafeAbsolutePath([string]$Path) {
-    if (-not [IO.Path]::IsPathFullyQualified($Path) -or $Path.Contains('"') -or $Path.Contains("`n") -or $Path.Contains("`r")) {
+    if (-not (Test-IsWindowsAbsolutePath $Path) -or $Path.Contains('"') -or $Path.Contains("`n") -or $Path.Contains("`r")) {
         throw "WINDOWS_SERVICE_PATH_INVALID"
     }
 }
