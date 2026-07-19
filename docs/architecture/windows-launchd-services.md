@@ -32,6 +32,14 @@ pipe, typically an elevated administrator. It never falls back to a TCP
 listener. This restrictive default is intentional until a user-scoped pipe ACL
 is configured as part of a future authenticated installer flow.
 
+Windows byte-mode `PIPE_NOWAIT` reports both a temporarily empty pipe and a
+closed peer as the same zero-byte read through the synchronous transport. The
+client therefore waits for its bounded deadline instead of treating zero bytes
+as EOF: no complete response, including a peer that closes silently, maps to
+`CONTROL_TIMEOUT`. Complete malformed HTTP still maps to
+`CONTROL_HTTP_INVALID`. A future overlapped transport may distinguish EOF
+without changing the deadline guarantee.
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 install `
   -HostPath "C:\Program Files\CMClient\current\bin\cmclient-service-host.exe"

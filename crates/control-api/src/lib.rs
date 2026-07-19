@@ -1760,9 +1760,9 @@ mod windows {
                     if Instant::now() >= deadline {
                         return Err(ControlError::Timeout);
                     }
-                    if stream.peer_creds().is_err() {
-                        return Ok(0);
-                    }
+                    // PIPE_NOWAIT exposes both temporary no-data and peer closure as zero-byte
+                    // reads through interprocess, so only protocol progress and the deadline are
+                    // reliable at this layer.
                     thread::sleep(Duration::from_millis(5));
                 }
                 Ok(count) => return Ok(count),
@@ -1787,9 +1787,6 @@ mod windows {
                 Ok(0) => {
                     if Instant::now() >= deadline {
                         return Err(ControlError::Timeout);
-                    }
-                    if stream.peer_creds().is_err() {
-                        return Err(ControlError::Io);
                     }
                     thread::sleep(Duration::from_millis(5));
                 }
@@ -1925,7 +1922,7 @@ mod windows {
         use std::{
             io::{Read, Write},
             sync::Arc,
-            time::{Duration, Instant},
+            time::Duration,
         };
 
         fn status() -> ControlStatus {
@@ -2034,18 +2031,75 @@ mod windows {
         }
 
         #[test]
-        fn observes_named_pipe_peer_closure_without_waiting_for_the_timeout() {
+        fn times_out_when_a_named_pipe_peer_closes_without_a_response() {
             let endpoint = endpoint("closed");
             let listener = listener(&endpoint);
             let server_thread = std::thread::spawn(move || {
                 let mut stream = listener.accept().expect("client should connect");
                 read_request(&mut stream);
             });
-            let client = ControlClient::new_with_timeout(endpoint, Duration::from_secs(2))
+            let client = ControlClient::new_with_timeout(endpoint, Duration::from_millis(50))
                 .expect("client should initialize");
-            let started = Instant::now();
-            assert_eq!(client.status(), Err(ControlError::InvalidHttp));
-            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(client.status(), Err(ControlError::Timeout));
+            server_thread.join().expect("server thread should join");
+        }
+
+        #[test]
+        fn times_out_for_a_truncated_named_pipe_http_response() {
+            let endpoint = endpoint("truncated");
+            let listener = listener(&endpoint);
+            let server_thread = std::thread::spawn(move || {
+                let mut stream = listener.accept().expect("client should connect");
+                read_request(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\n{")
+                    .expect("partial response should write");
+            });
+            let client = ControlClient::new_with_timeout(endpoint, Duration::from_millis(50))
+                .expect("client should initialize");
+            assert_eq!(client.status(), Err(ControlError::Timeout));
+            server_thread.join().expect("server thread should join");
+        }
+
+        #[test]
+        fn times_out_for_a_truncated_named_pipe_sse_response_head() {
+            let endpoint = endpoint("truncated-sse-head");
+            let listener = listener(&endpoint);
+            let server_thread = std::thread::spawn(move || {
+                let mut stream = listener.accept().expect("client should connect");
+                read_request(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n")
+                    .expect("partial response head should write");
+            });
+            let client = ControlClient::new_with_timeout(endpoint, Duration::from_millis(50))
+                .expect("client should initialize");
+            assert!(matches!(
+                client.subscribe_update_events(),
+                Err(ControlError::Timeout)
+            ));
+            server_thread.join().expect("server thread should join");
+        }
+
+        #[test]
+        fn times_out_for_a_truncated_named_pipe_sse_event() {
+            let endpoint = endpoint("truncated-sse-event");
+            let listener = listener(&endpoint);
+            let server_thread = std::thread::spawn(move || {
+                let mut stream = listener.accept().expect("client should connect");
+                read_request(&mut stream);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nid: partial\n",
+                    )
+                    .expect("partial event should write");
+            });
+            let client = ControlClient::new_with_timeout(endpoint, Duration::from_millis(50))
+                .expect("client should initialize");
+            let mut events = client
+                .subscribe_update_events()
+                .expect("response head should load");
+            assert_eq!(events.next_event(), Err(ControlError::Timeout));
             server_thread.join().expect("server thread should join");
         }
     }

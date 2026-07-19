@@ -77,8 +77,9 @@ const SECURITY_TOOL_INSTALLER_PATTERNS = [
   /GITLEAKS_VERSION="8\.30\.1"/u,
   /551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb/u,
   /CARGO_AUDIT_VERSION="0\.22\.2"/u,
+  /cargo-audit-x86_64-unknown-linux-musl-v/u,
   /CARGO_AUDIT_DIRECTORY=/u,
-  /ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39/u,
+  /7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428/u,
   /--strip-components=1/u,
   /sha256sum --check/u,
   /curl --proto '=https' --tlsv1\.2/u,
@@ -92,7 +93,7 @@ const SBOM_TOOL_INSTALLER_PATTERNS = [
 ];
 
 const SECURITY_TOOL_INSTALLER_SHA256 =
-  "f0282d0917801f750041ffa6c16a52c12ef68defdaaf832295c72a5dfee43e66";
+  "b1c65ffc381687925d4e305ae9a3d5bbf581a599cb7f35a743a99d285d4e0e66";
 const SBOM_TOOL_INSTALLER_SHA256 =
   "bb803e39839b54913c1bba18e9cf7303965357072efeac786ca3a251f6c6c53a";
 

@@ -32,8 +32,12 @@ bash scripts/install-sbom-tool.sh "$sbom_tools_dir"
 ```
 
 `scripts/install-security-audit-tools.sh` installs exact, checksum-verified
-Gitleaks and cargo-audit binaries. `scripts/install-sbom-tool.sh` applies the
-same control to Syft and avoids its upstream action's mutable installer path.
+Gitleaks and cargo-audit binaries. The cargo-audit Linux asset is the upstream
+`x86_64-unknown-linux-musl` static PIE, with release SHA-256
+`7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428`;
+it has no glibc runtime dependency and therefore runs on the pinned Ubuntu 22.04
+security runners. `scripts/install-sbom-tool.sh` applies the same control to
+Syft and avoids its upstream action's mutable installer path.
 CI executes the same policy, secret, Node, and Rust gates; the release build
 matrix cannot start without its independent `security-gate` succeeding.
 The same policy requires injected workspace packages and frozen-lockfile pnpm

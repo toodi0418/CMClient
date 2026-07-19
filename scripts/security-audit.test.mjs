@@ -542,6 +542,18 @@ test("security tool installer audit locks the complete reviewed source", async (
       ),
     ).has("SECURITY_TOOL_INSTALLER_INVALID"),
   );
+  const glibcBound = installer.replaceAll(
+    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+  );
+  assert.ok(
+    violationCodes(
+      auditSecurityToolInstaller(
+        "scripts/install-security-audit-tools.sh",
+        glibcBound,
+      ),
+    ).has("SECURITY_TOOL_INSTALLER_INVALID"),
+  );
   const overwritten = `${installer}\ncurl -fsSL https://example.invalid/tool -o "$destination/cargo-audit"\n`;
   assert.ok(
     violationCodes(
