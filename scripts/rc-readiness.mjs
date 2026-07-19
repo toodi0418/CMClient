@@ -19,6 +19,22 @@ export const RESULT_STATUSES = new Set([
 export const VALIDATOR_KINDS = new Set(["machine", "human", "hardware"]);
 export const VALIDATION_GATES = new Set(["rc", "production"]);
 
+const REQUIRED_EVIDENCE_KEYS = Object.freeze([
+  "schemaVersion",
+  "releaseVersion",
+  "sourceCommit",
+  "sourceTree",
+  "ciRunUrl",
+  "releaseRunUrl",
+  "artifactName",
+  "artifactDigestSha256",
+  "results",
+]);
+const OPTIONAL_EVIDENCE_KEYS = Object.freeze([
+  "productionIdentity",
+  "productionApproval",
+]);
+
 export const REQUIRED_TARGETS = Object.freeze([
   "darwin-aarch64",
   "darwin-x86_64",
@@ -343,6 +359,11 @@ export function validateFieldValidationEvidence(
   );
   if (
     !evidence ||
+    !hasExactObjectKeys(
+      evidence,
+      REQUIRED_EVIDENCE_KEYS,
+      OPTIONAL_EVIDENCE_KEYS,
+    ) ||
     evidence.schemaVersion !== 1 ||
     evidence.releaseVersion !== plan.releaseVersion ||
     !isCommit(evidence.sourceCommit) ||
@@ -355,10 +376,10 @@ export function validateFieldValidationEvidence(
   ) {
     throw new Error("RC_FIELD_EVIDENCE_INVALID");
   }
-  if (evidence.productionApproval !== undefined) {
+  if (Object.hasOwn(evidence, "productionApproval")) {
     validateProductionApproval(evidence.productionApproval);
   }
-  if (evidence.productionIdentity !== undefined) {
+  if (Object.hasOwn(evidence, "productionIdentity")) {
     validateProductionIdentity(
       evidence.productionIdentity,
       plan.releaseVersion,
@@ -383,9 +404,9 @@ export function validateFieldValidationEvidence(
     const execution = expectedExecutions.get(key);
     if (!execution) throw new Error("RC_FIELD_RESULT_UNKNOWN");
     if (result.status === "pass") {
-      assertExecutionEvidence(result);
+      assertExecutionEvidence(result, execution, evidence);
     } else if (result.status === "fail") {
-      assertExecutionEvidence(result);
+      assertExecutionEvidence(result, execution, evidence);
       if (!isNonEmptyText(result.defectId)) {
         throw new Error("RC_FIELD_FAILURE_DEFECT_MISSING");
       }
@@ -475,6 +496,7 @@ function buildExecutionMatrix(plan) {
           mode,
           gate: item.gate,
           required: item.required,
+          validator: item.validator,
         };
         executions.set(executionKey(item.id, target, mode), execution);
       }
@@ -487,7 +509,7 @@ function executionKey(caseId, target, mode) {
   return JSON.stringify([caseId, target, mode]);
 }
 
-function assertExecutionEvidence(result) {
+function assertExecutionEvidence(result, execution, releaseEvidence) {
   if (
     !isNonEmptyText(result.operator) ||
     !isNonEmptyText(result.executedAt) ||
@@ -499,6 +521,20 @@ function assertExecutionEvidence(result) {
   }
   if (!isUtcTimestamp(result.executedAt)) {
     throw new Error("RC_FIELD_TIMESTAMP_INVALID");
+  }
+  if (result.evidence.some((value) => !isSafeEvidenceReference(value))) {
+    throw new Error("RC_FIELD_EVIDENCE_REFERENCE_INVALID");
+  }
+  if (
+    execution.validator === "machine" &&
+    !result.evidence.some((value) =>
+      isCanonicalGithubActionsJobUrlForRuns(value, [
+        releaseEvidence.ciRunUrl,
+        releaseEvidence.releaseRunUrl,
+      ]),
+    )
+  ) {
+    throw new Error("RC_FIELD_MACHINE_JOB_EVIDENCE_MISSING");
   }
 }
 
@@ -635,6 +671,18 @@ function assertExactTextSet(values, expected, code) {
   }
 }
 
+function hasExactObjectKeys(value, required, optional = []) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  const allowed = new Set([...required, ...optional]);
+  return (
+    required.every((key) => Object.hasOwn(value, key)) &&
+    keys.every((key) => allowed.has(key))
+  );
+}
+
 function isNonEmptyText(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -654,6 +702,47 @@ function isCanonicalGithubActionsRunUrl(value) {
       value,
     )
   );
+}
+
+function isCanonicalGithubActionsJobUrlForRuns(value, runUrls) {
+  return runUrls.some((runUrl) => {
+    const prefix = `${runUrl}/job/`;
+    return (
+      value.startsWith(prefix) && /^[1-9]\d*$/.test(value.slice(prefix.length))
+    );
+  });
+}
+
+function isSafeEvidenceReference(value) {
+  if (
+    !isNonEmptyText(value) ||
+    hasUnsafeEvidenceCharacters(value) ||
+    /%(?:0[0-9a-f]|1[0-9a-f]|7f)/i.test(value) ||
+    value.includes("?") ||
+    value.includes("#")
+  ) {
+    return false;
+  }
+  try {
+    const reference = new URL(value);
+    return (
+      (reference.protocol === "https:" || reference.protocol === "evidence:") &&
+      reference.hostname.length > 0 &&
+      reference.username.length === 0 &&
+      reference.password.length === 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+function hasUnsafeEvidenceCharacters(value) {
+  if (typeof value !== "string") return true;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x20 || code === 0x7f) return true;
+  }
+  return false;
 }
 
 function isUtcTimestamp(value) {

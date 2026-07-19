@@ -14,16 +14,26 @@ replaced by a cross-build, unit fixture, or unchecked screenshot.
 ## RC identity
 
 Create one evidence document outside the repository for one immutable RC. It
-must contain:
+has an exact top-level schema. The required fields are `schemaVersion`,
+`releaseVersion`, `sourceCommit`, `sourceTree`, `ciRunUrl`, `releaseRunUrl`,
+`artifactName`, `artifactDigestSha256`, and `results`. Only
+`productionIdentity` and `productionApproval` may be added for stable
+promotion. A stored `summary` is never authoritative and is rejected, as are
+other top-level additions such as `artifactDownload`, `releaseMetadata`, and
+`targetEnvironments`.
+
+The identity and referenced evidence store must establish:
 
 - release version `2.0.0-rc.1`;
 - full source commit and tree SHA;
 - successful CI and Release Build Matrix URLs whose head SHA is the source
   commit;
-- GitHub artifact name, artifact digest, download time, and expiry;
+- GitHub artifact name and artifact digest, plus externally recorded download
+  time and expiry;
 - SHA-256 of `release-index.json` and `SHA256SUMS`;
 - the exact archive, installer, or OCI filename and SHA-256 used by each case;
-- target OS, architecture, Node version, and a non-identifying host alias.
+- target OS, architecture, Node version, and a non-identifying host alias in
+  the applicable result evidence, not as unvalidated top-level metadata.
 
 The ordinary `dev` workflow intentionally creates an unsigned RC. Cosign,
 GitHub provenance, and the signed Agent update manifest require an exact
@@ -115,8 +125,10 @@ node scripts/rc-readiness.mjs check-evidence \
   --expected-artifact-digest-sha256 "$ARTIFACT_DIGEST_SHA256"
 ```
 
-Only canonical run-level URLs for `toodi0418/CMClient` are accepted. Job URLs,
-redirectors, query strings, and unrelated HTTPS URLs are rejected.
+Only canonical run-level URLs for `toodi0418/CMClient` are accepted in the RC
+identity fields. Job URLs, redirectors, query strings, and unrelated HTTPS
+URLs are rejected there. Machine result evidence uses canonical job-level URLs
+under one of those two exact runs, as described below.
 
 ## Stable promotion
 
@@ -200,6 +212,16 @@ evidence includes:
 
 Machine coverage does not satisfy physical radio, APRS-IS, CallMesh tenant,
 Raspberry Pi, native installer, or real service-account cases.
+
+Every `pass` or `fail` result evidence entry must be an absolute `https://` or
+`evidence://` URI. Credentials, query strings, fragments, raw or percent-encoded
+control characters, relative references, and other URI schemes are rejected.
+An `evidence://` URI is suitable for sanitized human or hardware records in the
+approved evidence store. Every machine result additionally requires at least
+one canonical GitHub Actions job URL of the form
+`https://github.com/toodi0418/CMClient/actions/runs/<run-id>/job/<job-id>` whose
+run is exactly the evidence document's `ciRunUrl` or `releaseRunUrl`; a job from
+a newer or unrelated run cannot satisfy the case.
 
 ## Evidence hygiene
 

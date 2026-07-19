@@ -249,6 +249,86 @@ test("field evidence requires the exact case-target-mode execution set", async (
   );
 });
 
+test("field evidence rejects stored summaries and every unknown top-level field", async () => {
+  const plan = await readPlan();
+  const pending = createPendingEvidence(plan, identity);
+
+  for (const [name, value] of [
+    ["summary", false],
+    ["artifactDownload", { downloadedAt: "2026-07-19T08:00:00.000Z" }],
+    ["releaseMetadata", {}],
+    ["targetEnvironments", []],
+    ["unexpected", "field"],
+  ]) {
+    const unknownField = clone(pending);
+    unknownField[name] = value;
+    assert.throws(
+      () => validateFieldValidationEvidence(plan, unknownField),
+      /RC_FIELD_EVIDENCE_INVALID/,
+      name,
+    );
+  }
+});
+
+test("pass and fail evidence accepts only safe absolute evidence references", async () => {
+  const plan = await readPlan();
+  const pending = createPendingEvidence(plan, identity);
+  const humanResult = pending.results.find(
+    ({ caseId }) => caseId === "RC-CLI-HOST",
+  );
+
+  for (const reference of [
+    "fake://rc1/result",
+    "relative/result",
+    "https://operator:secret@example.com/result",
+    "https://example.com/result?token=secret",
+    "evidence://rc1/result#fragment",
+    "evidence://rc1/result%0aforged",
+    "evidence://rc1/result\nforged",
+  ]) {
+    const invalid = clone(pending);
+    Object.assign(
+      invalid.results.find(({ caseId }) => caseId === humanResult.caseId),
+      passedResult([reference]),
+    );
+    assert.throws(
+      () => validateFieldValidationEvidence(plan, invalid),
+      /RC_FIELD_EVIDENCE_REFERENCE_INVALID/,
+      reference,
+    );
+  }
+
+  Object.assign(
+    humanResult,
+    passedResult(["evidence://rc1/windows-cli-status"]),
+  );
+  assert.doesNotThrow(() => validateFieldValidationEvidence(plan, pending));
+});
+
+test("machine evidence binds a canonical job URL to an identity run", async () => {
+  const plan = await readPlan();
+  const pending = createPendingEvidence(plan, identity);
+  const machineResult = pending.results.find(
+    ({ caseId }) => caseId === "RC-ARTIFACT-IDENTITY",
+  );
+
+  Object.assign(
+    machineResult,
+    passedResult([
+      "https://github.com/toodi0418/CMClient/actions/runs/9999/job/3001",
+    ]),
+  );
+  assert.throws(
+    () => validateFieldValidationEvidence(plan, pending),
+    /RC_FIELD_MACHINE_JOB_EVIDENCE_MISSING/,
+  );
+
+  for (const runUrl of [identity.ciRunUrl, identity.releaseRunUrl]) {
+    Object.assign(machineResult, passedResult([`${runUrl}/job/3001`]));
+    assert.doesNotThrow(() => validateFieldValidationEvidence(plan, pending));
+  }
+});
+
 test("RC promotion binds trusted identity and every required RC execution", async () => {
   const plan = await readPlan();
   const pending = createPendingEvidence(plan, identity);
@@ -536,15 +616,23 @@ function markGatePassed(plan, evidence, gate) {
   for (const result of evidence.results) {
     const item = byId.get(result.caseId);
     if (gate === "rc" && item.gate !== "rc") continue;
-    Object.assign(result, {
-      status: "pass",
-      operator: "lab-operator",
-      executedAt: "2026-07-19T08:00:00.000Z",
-      evidence: [
-        `evidence://rc1/${result.caseId.toLowerCase()}/${result.target}/${result.mode}`,
-      ],
-    });
+    const evidenceReferences =
+      item.validator === "machine"
+        ? [`${evidence.ciRunUrl}/job/3001`]
+        : [
+            `evidence://rc1/${result.caseId.toLowerCase()}/${result.target}/${result.mode}`,
+          ];
+    Object.assign(result, passedResult(evidenceReferences));
   }
+}
+
+function passedResult(evidence) {
+  return {
+    status: "pass",
+    operator: "lab-operator",
+    executedAt: "2026-07-19T08:00:00.000Z",
+    evidence,
+  };
 }
 
 function identityCliArgs() {
