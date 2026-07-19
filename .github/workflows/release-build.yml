@@ -325,7 +325,7 @@ jobs:
           )
           if [[ "$target" == linux-* ]]; then
             # linuxdeploy scans the complete portable runtime. Do not let its
-            # strip/patchelf pass reject static ELF helpers shipped as data.
+            # strip pass reject static ELF helpers shipped as runtime data.
             export NO_STRIP=true
             bundle_args+=(--verbose)
           fi

@@ -52,6 +52,31 @@ export const DOCKER_PLATFORMS = Object.freeze([
 const SEMVER =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
+const SERIALPORT_PREBUILD_ROOT =
+  "node_modules/@serialport/bindings-cpp/prebuilds";
+const SERIALPORT_PREBUILD_TARGETS = Object.freeze({
+  "darwin-aarch64": Object.freeze({
+    directory: "darwin-x64+arm64",
+    suffix: ".node",
+  }),
+  "darwin-x86_64": Object.freeze({
+    directory: "darwin-x64+arm64",
+    suffix: ".node",
+  }),
+  "linux-aarch64": Object.freeze({
+    directory: "linux-arm64",
+    suffix: ".glibc.node",
+  }),
+  "linux-x86_64": Object.freeze({
+    directory: "linux-x64",
+    suffix: ".glibc.node",
+  }),
+  "windows-x86_64": Object.freeze({
+    directory: "win32-x64",
+    suffix: ".node",
+  }),
+});
+
 export function archiveForTarget(target) {
   assertTarget(target);
   return target.startsWith("windows-") ? "zip" : "tar.zst";
@@ -201,6 +226,7 @@ export async function stageBuild({
       source,
       join(directory, ...content.path.split("/")),
       content,
+      target,
     );
   }
   const files = (await listReleaseFiles(directory)).sort(compareCanonicalText);
@@ -316,7 +342,7 @@ function assertExactInputs(inputs, contents) {
   }
 }
 
-async function copyCanonicalInput(source, destination, content) {
+async function copyCanonicalInput(source, destination, content, target) {
   await access(source);
   const metadata = await lstat(source);
   if (content.kind === "file") {
@@ -332,9 +358,14 @@ async function copyCanonicalInput(source, destination, content) {
     throw new Error(`release input must be a directory: ${content.role}`);
   }
   await assertProductionDirectory(source, content.role);
+  if (content.role === "gateway") {
+    await assertGatewayTargetNativePrebuild(source, target);
+  }
   const copiedFiles = await copyDirectory(source, destination, {
     omitPackageBins: content.role === "gateway",
     insideNodeModules: false,
+    gatewayTarget: content.role === "gateway" ? target : undefined,
+    relativePath: "",
   });
   if (copiedFiles === 0) {
     throw new Error(`release input directory is empty: ${content.role}`);
@@ -406,17 +437,90 @@ async function assertGatewayProductionDependencies(source) {
   }
 }
 
+async function assertGatewayTargetNativePrebuild(source, target) {
+  const prebuildRoots = await findGatewaySerialportPrebuildRoots(source);
+  if (prebuildRoots.length === 0) {
+    throw new Error(
+      `release production input invalid: gateway missing ${target} serialport prebuild`,
+    );
+  }
+
+  const specification = SERIALPORT_PREBUILD_TARGETS[target];
+  for (const prebuildRoot of prebuildRoots) {
+    const targetDirectory = join(prebuildRoot.path, specification.directory);
+    let entries;
+    try {
+      entries = await readdir(targetDirectory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+      throw new Error(
+        `release production input invalid: gateway missing ${target} serialport prebuild at ${prebuildRoot.relativePath}`,
+        { cause: error },
+      );
+    }
+    if (
+      !entries.some(
+        (entry) => entry.isFile() && entry.name.endsWith(specification.suffix),
+      )
+    ) {
+      throw new Error(
+        `release production input invalid: gateway missing ${target} serialport prebuild at ${prebuildRoot.relativePath}`,
+      );
+    }
+  }
+}
+
+async function findGatewaySerialportPrebuildRoots(
+  directory,
+  relativePath = "",
+) {
+  const roots = [];
+  const entries = await readdir(directory, { withFileTypes: true });
+  entries.sort((left, right) => compareCanonicalText(left.name, right.name));
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const entryRelativePath = relativePath
+      ? `${relativePath}/${entry.name}`
+      : entry.name;
+    const entryPath = join(directory, entry.name);
+    if (serialportPrebuildRemainder(entryRelativePath) === "") {
+      roots.push({ path: entryPath, relativePath: entryRelativePath });
+      continue;
+    }
+    roots.push(
+      ...(await findGatewaySerialportPrebuildRoots(
+        entryPath,
+        entryRelativePath,
+      )),
+    );
+  }
+  return roots;
+}
+
 async function copyDirectory(source, destination, options) {
   await mkdir(destination, { recursive: true });
   let copiedFiles = 0;
   const entries = await readdir(source, { withFileTypes: true });
   entries.sort((left, right) => compareCanonicalText(left.name, right.name));
   for (const entry of entries) {
+    const relativePath = options.relativePath
+      ? `${options.relativePath}/${entry.name}`
+      : entry.name;
     if (
       options.omitPackageBins &&
       options.insideNodeModules &&
       entry.name === ".bin" &&
       entry.isDirectory()
+    ) {
+      continue;
+    }
+    if (
+      options.gatewayTarget &&
+      !isGatewayTargetPath(relativePath, options.gatewayTarget)
     ) {
       continue;
     }
@@ -431,6 +535,7 @@ async function copyDirectory(source, destination, options) {
         ...options,
         insideNodeModules:
           options.insideNodeModules || entry.name === "node_modules",
+        relativePath,
       });
       continue;
     }
@@ -442,6 +547,41 @@ async function copyDirectory(source, destination, options) {
     copiedFiles += 1;
   }
   return copiedFiles;
+}
+
+function isGatewayTargetPath(relativePath, target) {
+  const remainder = serialportPrebuildRemainder(relativePath);
+  if (remainder === undefined) {
+    return true;
+  }
+  if (remainder.length === 0) {
+    return true;
+  }
+
+  const [directory, fileName, ...nested] = remainder.split("/");
+  const specification = SERIALPORT_PREBUILD_TARGETS[target];
+  if (directory !== specification.directory) {
+    return false;
+  }
+  if (fileName === undefined) {
+    return true;
+  }
+  return nested.length === 0 && fileName.endsWith(specification.suffix);
+}
+
+function serialportPrebuildRemainder(relativePath) {
+  const segments = relativePath.split("/");
+  const rootSegments = SERIALPORT_PREBUILD_ROOT.split("/");
+  for (let index = 0; index <= segments.length - rootSegments.length; index++) {
+    if (
+      rootSegments.every(
+        (segment, offset) => segments[index + offset] === segment,
+      )
+    ) {
+      return segments.slice(index + rootSegments.length).join("/");
+    }
+  }
+  return undefined;
 }
 
 function assertComponent(component) {

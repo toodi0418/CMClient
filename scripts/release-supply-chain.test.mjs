@@ -10,7 +10,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
@@ -216,7 +216,7 @@ async function stageFixture(input, plan, version, prefix) {
         );
         await writeFile(
           join(source, "package.json"),
-          '{"type":"module","dependencies":{"runtime-package":"1.0.0"}}\n',
+          '{"type":"module","dependencies":{"runtime-package":"1.0.0","@serialport/bindings-cpp":"13.0.0"}}\n',
         );
         await writeFile(
           join(source, "node_modules/runtime-package/index.js"),
@@ -226,6 +226,7 @@ async function stageFixture(input, plan, version, prefix) {
           join(source, "node_modules/runtime-package/package.json"),
           '{"name":"runtime-package","version":"1.0.0"}\n',
         );
+        await stageSerialportFixture(source, artifact.target);
       } else if (content.role === "web") {
         await mkdir(source, { recursive: true });
         await writeFile(join(source, "index.html"), `${prefix}-${index}-web`);
@@ -247,6 +248,28 @@ async function stageFixture(input, plan, version, prefix) {
     });
   }
   await stageNativeDesktopFixture(input, version, prefix);
+}
+
+async function stageSerialportFixture(gateway, target) {
+  const fileByTarget = {
+    "darwin-aarch64": "darwin-x64+arm64/@serialport+bindings-cpp.node",
+    "darwin-x86_64": "darwin-x64+arm64/@serialport+bindings-cpp.node",
+    "linux-aarch64": "linux-arm64/@serialport+bindings-cpp.armv8.glibc.node",
+    "linux-x86_64": "linux-x64/@serialport+bindings-cpp.glibc.node",
+    "windows-x86_64": "win32-x64/@serialport+bindings-cpp.node",
+  };
+  const packageRoot = join(gateway, "node_modules/@serialport/bindings-cpp");
+  const prebuild = join(
+    packageRoot,
+    "prebuilds",
+    ...fileByTarget[target].split("/"),
+  );
+  await mkdir(dirname(prebuild), { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    '{"name":"@serialport/bindings-cpp","version":"13.0.0"}\n',
+  );
+  await writeFile(prebuild, target);
 }
 
 async function stageNativeDesktopFixture(input, version, prefix) {

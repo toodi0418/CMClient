@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -524,6 +524,157 @@ test("Headless staging copies Agent, CLI, production Gateway, Web, and platform 
   );
 });
 
+test("Gateway staging keeps only the serialport prebuild for its release target", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "cmclient-native-target-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const expectedByTarget = {
+    "darwin-aarch64": "darwin-x64+arm64/@serialport+bindings-cpp.node",
+    "darwin-x86_64": "darwin-x64+arm64/@serialport+bindings-cpp.node",
+    "linux-aarch64": "linux-arm64/@serialport+bindings-cpp.armv8.glibc.node",
+    "linux-x86_64": "linux-x64/@serialport+bindings-cpp.glibc.node",
+    "windows-x86_64": "win32-x64/@serialport+bindings-cpp.node",
+  };
+
+  for (const [target, expected] of Object.entries(expectedByTarget)) {
+    const inputs = await createCompositionInputs(
+      join(directory, target),
+      "headless",
+      target,
+    );
+    await createSerialportPrebuildFixtures(inputs.gateway);
+    const { manifest } = await stageBuild({
+      component: "headless",
+      target,
+      version: "2.0.0-rc.1",
+      inputs,
+      output: join(directory, target, "stage"),
+    });
+    const prebuilds = manifest.files
+      .filter((path) => path.includes("bindings-cpp/prebuilds/"))
+      .map((path) => path.split("bindings-cpp/prebuilds/")[1]);
+    assert.deepEqual(prebuilds, [expected], target);
+  }
+});
+
+test("Gateway staging fails closed without a compatible serialport prebuild", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "cmclient-native-missing-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const inputs = await createCompositionInputs(
+    directory,
+    "headless",
+    "linux-x86_64",
+  );
+  const prebuildRoot = join(
+    inputs.gateway,
+    "node_modules/@serialport/bindings-cpp/prebuilds/linux-x64",
+  );
+  await rm(prebuildRoot, { force: true, recursive: true });
+  await mkdir(prebuildRoot, { recursive: true });
+  await writeFile(
+    join(prebuildRoot, "@serialport+bindings-cpp.musl.node"),
+    "linux-x64-musl",
+  );
+
+  await assert.rejects(
+    () =>
+      stageBuild({
+        component: "headless",
+        target: "linux-x86_64",
+        version: "2.0.0-rc.1",
+        inputs,
+        output: join(directory, "stage"),
+      }),
+    /gateway missing linux-x86_64 serialport prebuild/,
+  );
+});
+
+test("Gateway staging requires a serialport prebuild root", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "cmclient-native-root-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const inputs = await createCompositionInputs(
+    directory,
+    "headless",
+    "linux-x86_64",
+  );
+  await rm(
+    join(inputs.gateway, "node_modules/@serialport/bindings-cpp/prebuilds"),
+    { force: true, recursive: true },
+  );
+
+  await assert.rejects(
+    () =>
+      stageBuild({
+        component: "headless",
+        target: "linux-x86_64",
+        version: "2.0.0-rc.1",
+        inputs,
+        output: join(directory, "stage"),
+      }),
+    /gateway missing linux-x86_64 serialport prebuild/,
+  );
+});
+
+test("Gateway staging validates nested roots and preserves near-prefix directories", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "cmclient-native-nested-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const inputs = await createCompositionInputs(
+    directory,
+    "headless",
+    "linux-x86_64",
+  );
+  const nestedPackage = join(
+    inputs.gateway,
+    "node_modules/wrapper/node_modules/@serialport/bindings-cpp",
+  );
+  const nestedTarget = join(nestedPackage, "prebuilds/linux-x64");
+  await mkdir(nestedTarget, { recursive: true });
+  await writeFile(
+    join(nestedTarget, "@serialport+bindings-cpp.glibc.node"),
+    "nested-linux-x64-glibc",
+  );
+  await writeFile(
+    join(nestedTarget, "@serialport+bindings-cpp.musl.node"),
+    "nested-linux-x64-musl",
+  );
+  const nearPrefix = join(nestedPackage, "prebuilds-backup/keep.txt");
+  await mkdir(dirname(nearPrefix), { recursive: true });
+  await writeFile(nearPrefix, "keep");
+
+  const { manifest } = await stageBuild({
+    component: "headless",
+    target: "linux-x86_64",
+    version: "2.0.0-rc.1",
+    inputs,
+    output: join(directory, "stage"),
+  });
+  assert.equal(
+    manifest.files.filter((path) => path.endsWith(".glibc.node")).length,
+    2,
+  );
+  assert.equal(
+    manifest.files.some((path) => path.endsWith(".musl.node")),
+    false,
+  );
+  assert.ok(
+    manifest.files.includes(
+      "gateway/node_modules/wrapper/node_modules/@serialport/bindings-cpp/prebuilds-backup/keep.txt",
+    ),
+  );
+
+  await rm(join(nestedTarget, "@serialport+bindings-cpp.glibc.node"));
+  await assert.rejects(
+    () =>
+      stageBuild({
+        component: "headless",
+        target: "linux-x86_64",
+        version: "2.0.0-rc.1",
+        inputs,
+        output: join(directory, "invalid-stage"),
+      }),
+    /gateway missing linux-x86_64 serialport prebuild at .*wrapper/,
+  );
+});
+
 test("staging fails closed on incomplete production inputs and non-canonical roles", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "cmclient-release-invalid-"));
   t.after(() => rm(directory, { force: true, recursive: true }));
@@ -818,7 +969,7 @@ async function createCompositionInputs(root, component, target) {
       await writeFile(join(source, "dist/main.js"), "gateway-entrypoint");
       await writeFile(
         join(source, "package.json"),
-        '{"type":"module","dependencies":{"runtime-package":"1.0.0"}}\n',
+        '{"type":"module","dependencies":{"runtime-package":"1.0.0","@serialport/bindings-cpp":"13.0.0"}}\n',
       );
       await writeFile(
         join(source, "node_modules/runtime-package/index.js"),
@@ -832,6 +983,7 @@ async function createCompositionInputs(root, component, target) {
         join(source, "node_modules/.bin/tool"),
         "install-only-wrapper",
       );
+      await createTargetSerialportPrebuildFixture(source, target);
     } else if (content.role === "web") {
       await mkdir(join(source, "assets"), { recursive: true });
       await writeFile(join(source, "index.html"), "web-index");
@@ -846,4 +998,44 @@ async function createCompositionInputs(root, component, target) {
     inputs[content.role] = source;
   }
   return inputs;
+}
+
+async function createSerialportPrebuildFixtures(gateway) {
+  const files = [
+    "android-arm/@serialport+bindings-cpp.armv7.node",
+    "darwin-x64+arm64/@serialport+bindings-cpp.node",
+    "linux-arm64/@serialport+bindings-cpp.armv8.glibc.node",
+    "linux-arm64/@serialport+bindings-cpp.armv8.musl.node",
+    "linux-x64/@serialport+bindings-cpp.glibc.node",
+    "linux-x64/@serialport+bindings-cpp.musl.node",
+    "win32-x64/@serialport+bindings-cpp.node",
+  ];
+  const root = join(gateway, "node_modules/@serialport/bindings-cpp/prebuilds");
+  for (const file of files) {
+    const destination = join(root, ...file.split("/"));
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, file);
+  }
+}
+
+async function createTargetSerialportPrebuildFixture(gateway, target) {
+  const fileByTarget = {
+    "darwin-aarch64": "darwin-x64+arm64/@serialport+bindings-cpp.node",
+    "darwin-x86_64": "darwin-x64+arm64/@serialport+bindings-cpp.node",
+    "linux-aarch64": "linux-arm64/@serialport+bindings-cpp.armv8.glibc.node",
+    "linux-x86_64": "linux-x64/@serialport+bindings-cpp.glibc.node",
+    "windows-x86_64": "win32-x64/@serialport+bindings-cpp.node",
+  };
+  const packageRoot = join(gateway, "node_modules/@serialport/bindings-cpp");
+  const destination = join(
+    packageRoot,
+    "prebuilds",
+    ...fileByTarget[target].split("/"),
+  );
+  await mkdir(dirname(destination), { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    '{"name":"@serialport/bindings-cpp","version":"13.0.0"}\n',
+  );
+  await writeFile(destination, target);
 }
