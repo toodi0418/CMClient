@@ -2,7 +2,7 @@
 
 The supervised TypeScript Gateway is the production owner of Meshtastic and
 APRS domain work. Agent passes a loopback listen address, shared data directory,
-validated operational configuration, and only the OS-stored secrets required
+validated operational configuration, and only the Agent-selected secrets required
 by enabled integrations. Gateway does not read Agent configuration, manage a
 service, or update itself.
 
@@ -59,7 +59,7 @@ state, never callsign identity, symbols, comment, or a derived passcode.
 ## APRS runtime
 
 APRS is enabled only when Agent supplies a validated login callsign and an
-OS-stored passcode. The runtime performs an immediate outbox flush and
+Agent-selected passcode. The runtime performs an immediate outbox flush and
 APRS-monitor refresh, then repeats both on bounded configured intervals. The
 monitor filter is rebuilt from active mappings. Duplicate callsign targets are
 treated as `CALLMESH_MAPPING_CONFLICT` and fail closed without opening a monitor

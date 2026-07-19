@@ -25,6 +25,8 @@
     <string>@CACHE_DIR@</string>
     <key>CMCLIENT_LOG_DIR</key>
     <string>@LOG_DIR@</string>
+@PLAINTEXT_SECRET_FILE_KEY@
+@PLAINTEXT_SECRET_FILE_VALUE@
   </dict>
   <key>RunAtLoad</key>
   <true/>

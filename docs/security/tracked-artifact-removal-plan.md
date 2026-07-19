@@ -8,7 +8,7 @@ parsed, copied, or restored their potentially sensitive contents.
 
 | Path | Baseline blob size | Classification | Final disposition |
 | --- | ---: | --- | --- |
-| `.env` | 496 bytes | Potential secret-bearing runtime configuration | Removed. Runtime secrets enter only supported OS storage or deployment injection; no environment file is tracked. |
+| `.env` | 496 bytes | Potential secret-bearing runtime configuration | Removed. Runtime secrets enter only an Agent-selected external backend or approved deployment injection; no environment or plaintext secret file is tracked. |
 | `callmesh-data.sqlite` | 0 bytes | Runtime database artifact | Removed. Real user databases use the verified offline migration workflow. |
 | `callmesh-client.tar` | 92,791,808 bytes | Generated archive artifact | Removed. Reproducible release archives and images are assembled by CI. |
 | `nohup.out` | 30,320 bytes | Runtime log | Removed. Operational logs use bounded, redacted runtime storage. |

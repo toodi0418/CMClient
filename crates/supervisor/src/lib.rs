@@ -19,6 +19,7 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(40);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_COMMAND: &[u8] = b"CMCLIENT_SHUTDOWN\n";
+const INHERITED_RUNTIME_ENVIRONMENT_NAMES: [&str; 4] = ["PATH", "SystemRoot", "WINDIR", "ComSpec"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayCommand {
@@ -412,13 +413,15 @@ fn terminate_child(child: &mut Child) -> std::io::Result<()> {
 }
 
 fn inherited_runtime_environment() -> BTreeMap<String, String> {
-    ["PATH", "SystemRoot", "WINDIR", "ComSpec"]
+    inherited_runtime_environment_from(|name| std::env::var(name).ok())
+}
+
+fn inherited_runtime_environment_from(
+    mut read: impl FnMut(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    INHERITED_RUNTIME_ENVIRONMENT_NAMES
         .into_iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| (String::from(name), value))
-        })
+        .filter_map(|name| read(name).map(|value| (String::from(name), value)))
         .collect()
 }
 
@@ -456,7 +459,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
 mod tests {
     use super::{
         BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor, SupervisorError,
-        SupervisorEvent,
+        SupervisorEvent, inherited_runtime_environment_from,
     };
     use cmclient_runtime_logging::{LogPolicy, MIN_LOG_MAX_BYTES, StructuredLogSink};
     use std::{
@@ -481,6 +484,28 @@ mod tests {
         assert_eq!(policy.delay_for_attempt(1), Duration::from_secs(1));
         assert_eq!(policy.delay_for_attempt(3), Duration::from_secs(4));
         assert_eq!(policy.delay_for_attempt(10), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn inherited_child_environment_excludes_plaintext_secret_paths() {
+        let source = BTreeMap::from([
+            (String::from("PATH"), String::from("/fixture/bin")),
+            (
+                String::from("CMCLIENT_PLAINTEXT_SECRET_FILE"),
+                String::from("/private/fixture/secrets.json"),
+            ),
+            (
+                String::from("CMCLIENT_CALLMESH_API_KEY"),
+                String::from("fixture-secret"),
+            ),
+        ]);
+
+        let filtered = inherited_runtime_environment_from(|name| source.get(name).cloned());
+
+        assert_eq!(
+            filtered,
+            BTreeMap::from([(String::from("PATH"), String::from("/fixture/bin"))])
+        );
     }
 
     #[test]

@@ -702,6 +702,15 @@ impl Drop for SupervisorWorker {
 
 impl AgentController {
     fn from_config(config: &AgentConfig) -> Result<Self, ControlError> {
+        let secrets =
+            AgentSecretStore::runtime(&config.paths.data_dir).map_err(control_secret_error)?;
+        Self::from_config_with_secrets(config, secrets)
+    }
+
+    fn from_config_with_secrets(
+        config: &AgentConfig,
+        secrets: AgentSecretStore,
+    ) -> Result<Self, ControlError> {
         let mut initial_log_error_code = None;
         let log_policy = match LogPolicy::from_environment() {
             Ok(policy) => Some(policy),
@@ -719,8 +728,6 @@ impl AgentController {
                 }
             }
         });
-        let secrets =
-            AgentSecretStore::runtime(&config.paths.data_dir).map_err(control_secret_error)?;
         let control_endpoint = default_local_endpoint(&config.paths.data_dir);
         let remote_replay = Arc::new(RemoteControlReplayGuard::default());
         let gateway_command = resolve_gateway_command(config);
@@ -2106,7 +2113,7 @@ mod tests {
     use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
     #[cfg(not(target_os = "windows"))]
     use cmclient_agent_core::{
-        RuntimePaths,
+        CallMeshConfig, RuntimePaths,
         access::{LanAccessConfig, ManagementAccessController},
     };
     #[cfg(not(target_os = "windows"))]
@@ -2143,6 +2150,78 @@ mod tests {
             commit == "unknown"
                 || (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn configured_callmesh_secret_reaches_only_the_gateway_contract() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-plaintext-boundary-{}",
+            std::process::id(),
+        ));
+        let marker = data_dir.join("gateway-environment");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-callmesh-value")
+            .expect("fixture secret should store");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                format!(
+                    "if [ \"$CMCLIENT_CALLMESH_URL\" = \"https://callmesh.example.invalid\" ] && [ \"$CMCLIENT_CALLMESH_API_KEY\" = \"fixture-callmesh-value\" ] && [ -z \"${{CMCLIENT_PLAINTEXT_SECRET_FILE+x}}\" ]; then printf ok > '{}'; else printf rejected > '{}'; fi; read _",
+                    marker.display(),
+                    marker.display(),
+                ),
+            ]),
+            gateway_port: 48_120,
+            callmesh: Some(CallMeshConfig {
+                url: String::from("https://callmesh.example.invalid"),
+            }),
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = AgentController::from_config_with_secrets(&config, secrets)
+            .expect("controller should initialize");
+
+        controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_mut()
+            .expect("supervisor should be configured")
+            .start()
+            .expect("gateway fixture should start");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "gateway fixture did not report");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker should read"),
+            "ok",
+        );
+        controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_mut()
+            .expect("supervisor should be configured")
+            .stop()
+            .expect("gateway fixture should stop");
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
     }
 
     #[cfg(not(target_os = "windows"))]

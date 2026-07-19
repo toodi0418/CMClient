@@ -243,7 +243,9 @@ Never store any of the following in evidence:
   usernames, or absolute user paths.
 
 Secrets must enter only through the documented Agent secret input or approved
-platform injection. Record `{stored:true}`, stable error codes, bounded counts,
+platform injection. A plaintext field backend must be outside the Repository
+and pass the documented `0700` parent plus owner/regular-file/one-link/`0600`
+checks. Record `{stored:true}`, stable error codes, bounded counts,
 digests, and hashed lab aliases. Crop screenshots and inspect them for cookies,
 headers, paths, and personal data before placing them in the approved evidence
 store. Repository commits may contain the plan and sanitized documentation,

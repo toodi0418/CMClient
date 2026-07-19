@@ -26,8 +26,11 @@ projection. With `--json`, each line is one stable
 
 `diagnostics` reads the Agent's sanitized diagnostic bundle through the private
 Control API. `secret set <kind>` reads one value from standard input and stores
-it through the Agent; `secret remove <kind>` removes it. Secret values are never
-accepted as command arguments, printed, or returned as JSON.
+it through the Agent-selected backend; `secret remove <kind>` removes it.
+Secret values are never accepted as command arguments, printed, or returned as
+JSON. A controlled Unix/macOS no-Keychain runtime selects its external
+owner-only file when Agent starts; the CLI receives no file path or value
+option.
 
 `logs --follow`, `events --follow`, and `update --follow` use bounded SSE
 parsing, reconnect after transient disconnects, and exit cleanly on Ctrl+C.
@@ -41,7 +44,7 @@ that event type in this RC, so `logs` can remain empty. Use `events` plus the
 platform service manager's logs for current operational output.
 
 For a remote endpoint, configure the Agent's Management LAN HTTPS listener,
-provision its OS-stored management admin token, and give the same value to the
+provision its Agent-stored management admin token, and give the same value to the
 remote CLI through only the calling process's `CMCLIENT_CONTROL_TOKEN`
 environment variable. This Bash example avoids placing the value directly in
 the command or shell history:

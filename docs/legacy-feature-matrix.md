@@ -49,7 +49,7 @@ the legacy Node.js/Electron implementation.
 | Gateway-specific APRS Data fields | Remove | Gateway name, RSSI, SNR, receive time, and path-specific data must not alter deterministic APRS Data |
 | Legacy raw-socket sharing model | Do not retain | P07 implements a protocol-aware, framed multi-client proxy rather than a socket pipe |
 | Docker self-update behaviour | Remove | Docker provides a constrained deployment mode; updates are not self-applied by Gateway containers |
-| Direct API-key storage in tracked files, command-line arguments, or diagnostic output | Remove | Secrets move to OS-appropriate storage/redaction paths and LAN control requires authenticated sessions |
+| Direct API-key storage in tracked files, command-line arguments, or diagnostic output | Remove | Secrets move to the Agent-selected backend outside the Repository, every output path remains redacted, and LAN control requires authenticated sessions |
 
 ## Deliberately New, Not Legacy Compatibility
 

@@ -38,6 +38,25 @@ through systemd `LoadCredential` and keeps authenticated ciphertext under its
 private data directory. The service fails closed when either half is missing or
 invalid; see [systemd Agent Service](./systemd-service.md).
 
+Controlled Unix/macOS field runtimes can explicitly select an external
+plaintext file by setting `CMCLIENT_PLAINTEXT_SECRET_FILE` to an absolute path.
+This selector is a path, never a secret value. Its existing parent must be a
+non-symlink directory owned by the Agent user with exact mode `0700`; an
+existing file must be a single-link regular file owned by that user with exact
+mode `0600`. Agent creates or atomically replaces the file as `0600`, accepts
+only its versioned three-key document, and rejects malformed, oversized,
+unknown-field, symlink, hardlink, owner, or mode violations. When selected, the
+process uses this backend instead of constructing or accessing the platform
+credential backend. Linux systemd credential mode and plaintext mode are
+mutually exclusive and fail closed if both are requested. Files must remain
+outside the Repository and are populated only through the Control API/CLI.
+
+```bash
+install -d -m 0700 /absolute/path/outside/repository/cmclient-secrets
+export CMCLIENT_PLAINTEXT_SECRET_FILE=/absolute/path/outside/repository/cmclient-secrets/runtime.json
+cmclient-agent --serve
+```
+
 `cmclient secret set <kind>` reads a single value from standard input and
 forwards it over the private Control API; its response never contains the value.
 Supported kinds are `callmesh-api-key`, `aprs-passcode`, and

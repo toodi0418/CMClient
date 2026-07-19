@@ -116,9 +116,11 @@ environment, database content, packet data, credentials, or log payloads.
 
 The secret routes never pass through Gateway. `PUT` accepts a single UTF-8 value
 in its request body (maximum 4096 bytes, no control characters) and stores it in
-the Agent-selected secret backend. Interactive sessions use the platform
-credential store; the packaged systemd service uses its `LoadCredential`
-wrapping key and authenticated private ciphertext vault. The response is only
+the Agent-selected secret backend. Interactive sessions normally use the
+platform credential store; controlled Unix/macOS field runtimes can instead
+select a strict external `0600` plaintext file with
+`CMCLIENT_PLAINTEXT_SECRET_FILE`. The packaged systemd service uses its
+`LoadCredential` wrapping key and authenticated private ciphertext vault. The response is only
 `{ "stored": true }`; secret values are never returned. `DELETE` removes a
 named value and returns whether a value existed. CLI users should use
 `cmclient secret set <kind>` with standard input rather than constructing these
@@ -131,7 +133,7 @@ described below.
 When the opt-in Management LAN HTTPS listener is configured, the same
 `/api/v1/control/*` contract is available to the remote CLI. It is not
 authorized by the browser session cookie. Agent verifies every request with
-its OS-stored `management-admin-token`; the remote CLI receives the same value
+its Agent-selected `management-admin-token`; the remote CLI receives the same value
 through its own `CMCLIENT_CONTROL_TOKEN` process environment. The resulting
 HMAC-SHA-256 signature is bound to schema version, `control:admin` scope, Unix
 timestamp, random nonce, HTTP method, path, and SHA-256 body digest. Agent

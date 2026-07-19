@@ -37,7 +37,7 @@ rate-limited without emitting password or token material. The audit ring is
 bounded and code-only, so it records allow/deny/rate-limit decisions without
 storing source addresses, request payloads, cookies, or credentials.
 Remote `/api/v1/control/*` requests do not reuse this browser cookie or CSRF
-token; they are independently authenticated with the OS-stored admin token,
+token; they are independently authenticated with the Agent-selected admin token,
 request signature, timestamp, and nonce replay guard.
 
 `apps/web` is the Vue 3/Vite management shell. It owns presentation-only

@@ -76,7 +76,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SecretCommand {
-    /// Reads one secret value from standard input and stores it in the OS credential store.
+    /// Reads one secret value from standard input and stores it in the Agent-selected backend.
     Set {
         kind: String,
     },

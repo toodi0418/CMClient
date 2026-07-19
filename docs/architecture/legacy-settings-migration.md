@@ -25,7 +25,7 @@ currently safe mapping is deliberately small:
 | Legacy traceroute controls | `LEGACY_SETTINGS_REMOVED_LEGACY_RUNTIME_FEATURE` |
 | Keys/tokens/passcodes/passwords/secrets | `LEGACY_SETTINGS_SECRET_SKIPPED` |
 
-No legacy credential is moved to the OS credential store automatically. An
+No legacy credential is moved to the Agent-selected secret backend automatically. An
 operator must add a current credential through `cmclient secret set` after
 reviewing the report. Transport and APRS fields require current CMClient 2.0
 configuration because their legacy semantics cannot be trusted or mapped to a

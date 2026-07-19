@@ -43,7 +43,7 @@ a non-empty, control-character-free platform device identifier of at most 4096
 bytes, such as `/dev/ttyUSB0` or `COM3`; it is not required to be an absolute
 filesystem path. `serial_baud_rate` is a positive integer and defaults to
 115200. APRS passcode, CallMesh key, and the Management admin token are separate
-OS credential-store entries:
+Agent-selected backend entries:
 
 ```bash
 cmclient secret set callmesh-api-key
@@ -69,6 +69,18 @@ directory; neither half is placed in the unit environment. A missing,
 malformed, or tampered service vault fails with
 `AGENT_SECRET_STORE_UNAVAILABLE`. Secret values are never echoed, logged,
 serialized into diagnostics, or passed as a CLI argument.
+
+For the controlled Unix/macOS no-Keychain field mode, set
+`CMCLIENT_PLAINTEXT_SECRET_FILE` to an absolute file path outside the Repository
+before starting Agent. The direct parent must already be an owner-only,
+non-symlink `0700` directory. Agent accepts only an owner regular file with one
+link and exact mode `0600`, writes it atomically as `0600`, and rejects unsafe
+permissions, links, unknown fields, invalid values, and an attempt to combine
+this mode with the Linux systemd vault. The environment contains only the path;
+put values into the selected backend with the same stdin-based `cmclient secret
+set` commands. A macOS LaunchAgent persists this path only when installed with
+`--plaintext-secret-file` or when the same selector is explicitly present in
+the manager environment; if neither source is present, field mode stays off.
 
 Storage and removal complete immediately, but runtime consumers have different
 refresh boundaries. Agent reads `management-admin-token` for every remote
@@ -134,8 +146,8 @@ protection still applies.
 ## Remote CLI HMAC
 
 The remote CLI uses the opt-in Agent HTTPS Control bridge, not the browser
-cookie. Agent verifies requests against its OS-stored `management-admin-token`;
-the remote CLI cannot read that credential store and must receive the same
+cookie. Agent verifies requests against its selected `management-admin-token`;
+the remote CLI cannot read that backend and must receive the same
 value in its own process's `CMCLIENT_CONTROL_TOKEN` environment variable. It
 signs method, path, body digest, timestamp, nonce, and `control:admin` scope.
 The value must be 32 through 4096 UTF-8 bytes without ASCII control characters.

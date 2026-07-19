@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
@@ -91,6 +92,7 @@ launchdTest(
     );
     assert.doesNotMatch(contents, /agent\.(?:stdout|stderr)\.log/);
     assert.doesNotMatch(contents, /CALLMESH|API_KEY|PASSCODE|TOKEN/);
+    assert.doesNotMatch(contents, /CMCLIENT_PLAINTEXT_SECRET_FILE/);
     assert.match(
       await readFile(calls, "utf8"),
       /bootstrap gui\/\d+ .*io\.cmclient\.agent\.plist/,
@@ -113,6 +115,115 @@ launchdTest(
     assert.equal(
       await readFile(join(data, "retained-state"), "utf8"),
       "must survive uninstall",
+    );
+    await rm(directory, { recursive: true, force: true });
+  },
+);
+
+launchdTest(
+  "launchd renders only an owner-private plaintext secret file path",
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmclient-launchd-secret-"));
+    const home = join(directory, "home");
+    const secretDirectory = join(directory, "private");
+    const secretFile = join(secretDirectory, "agent-secrets.json");
+    await mkdir(home, { recursive: true });
+    await mkdir(secretDirectory, { mode: 0o700 });
+    await writeFile(
+      secretFile,
+      '{"version":1,"callmesh-api-key":"fixture-value"}',
+    );
+    await chmod(secretFile, 0o600);
+
+    const { stdout } = await runManager(
+      [
+        "render",
+        "--agent",
+        join(directory, "CMClient/bin/cmclient-agent"),
+        "--plaintext-secret-file",
+        secretFile,
+      ],
+      { HOME: home },
+    );
+
+    assert.match(stdout, /<key>CMCLIENT_PLAINTEXT_SECRET_FILE<\/key>/);
+    assert.match(stdout, new RegExp(`<string>${secretFile}<\\/string>`));
+    assert.doesNotMatch(stdout, /fixture-value/);
+
+    const fromEnvironment = await runManager(
+      ["render", "--agent", join(directory, "CMClient/bin/cmclient-agent")],
+      {
+        HOME: home,
+        CMCLIENT_PLAINTEXT_SECRET_FILE: secretFile,
+      },
+    );
+    assert.match(
+      fromEnvironment.stdout,
+      /<key>CMCLIENT_PLAINTEXT_SECRET_FILE<\/key>/,
+    );
+    assert.match(
+      fromEnvironment.stdout,
+      new RegExp(`<string>${secretFile}<\\/string>`),
+    );
+    assert.doesNotMatch(fromEnvironment.stdout, /fixture-value/);
+
+    await chmod(secretFile, 0o644);
+    await assert.rejects(
+      runManager(
+        [
+          "render",
+          "--agent",
+          join(directory, "CMClient/bin/cmclient-agent"),
+          "--plaintext-secret-file",
+          secretFile,
+        ],
+        { HOME: home },
+      ),
+      /LAUNCHD_SECRET_FILE_INVALID/,
+    );
+    await assert.rejects(
+      runManager(
+        [
+          "render",
+          "--agent",
+          join(directory, "CMClient/bin/cmclient-agent"),
+          "--plaintext-secret-file",
+          "relative-secrets.json",
+        ],
+        { HOME: home },
+      ),
+      /LAUNCHD_PATH_INVALID/,
+    );
+
+    await assert.rejects(
+      runManager(
+        [
+          "render",
+          "--agent",
+          join(directory, "CMClient/bin/cmclient-agent"),
+          "--plaintext-secret-file",
+          join(directory, "missing-parent/agent-secrets.json"),
+        ],
+        { HOME: home },
+      ),
+      /LAUNCHD_SECRET_FILE_PARENT_INVALID/,
+    );
+
+    await chmod(secretFile, 0o600);
+    const hardlink = join(secretDirectory, "agent-secrets-hardlink.json");
+    await link(secretFile, hardlink);
+    await assert.rejects(
+      runManager(
+        [
+          "render",
+          "--agent",
+          join(directory, "CMClient/bin/cmclient-agent"),
+          "--plaintext-secret-file",
+          secretFile,
+        ],
+        { HOME: home },
+      ),
+      /LAUNCHD_SECRET_FILE_INVALID/,
     );
     await rm(directory, { recursive: true, force: true });
   },

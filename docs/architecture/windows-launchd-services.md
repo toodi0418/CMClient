@@ -61,13 +61,21 @@ manager error code.
 
 `scripts/cmclient-launchd.sh` installs `io.cmclient.agent` as a per-user
 LaunchAgent at `~/Library/LaunchAgents`. It launches the Agent with the owning
-user's standard CMClient Application Support and Caches paths, so Keychain
-credentials remain in that user's security context. It is intentionally not a
-root LaunchDaemon.
+user's standard CMClient Application Support and Caches paths. The controlled
+no-Keychain field mode adds `--plaintext-secret-file` with an absolute external
+path, or explicitly exports the same selector while installing; the generated
+plist contains only that path, never a secret value. The
+manager requires its direct parent to be an owner-matched, non-symlink `0700`
+directory and an existing file to be an owner-matched, single-link,
+non-symlink regular `0600` file, while Agent repeats the
+owner/link/mode validation before use. When neither the option nor selector is
+provided, the ordinary platform-backend behavior remains. It is intentionally
+not a root LaunchDaemon.
 
 ```bash
 bash scripts/cmclient-launchd.sh install \
-  --agent /Applications/CMClient/current/bin/cmclient-agent
+  --agent /Applications/CMClient/current/bin/cmclient-agent \
+  --plaintext-secret-file /absolute/path/outside/repository/agent-secrets.json
 bash scripts/cmclient-launchd.sh status
 bash scripts/cmclient-launchd.sh logs --lines 200
 bash scripts/cmclient-launchd.sh uninstall
