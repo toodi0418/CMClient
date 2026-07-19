@@ -21,6 +21,7 @@ import {
 } from "./release-artifacts.mjs";
 import {
   collectNativeDesktopBundles,
+  tauriPackageVersion,
   tauriReleaseConfig,
   verifyBundledDesktopRuntime,
   verifyNativeDesktopStage,
@@ -213,6 +214,7 @@ test("Tauri release config embeds the complete portable Desktop composition", ()
     portable: "release-build/desktop/windows-x86_64",
     icons: "apps/desktop/src-tauri/icons/release",
   });
+  assert.equal(config.version, "2.0.0-1");
   assert.deepEqual(config.bundle.targets, ["msi", "nsis"]);
   assert.equal(config.bundle.active, true);
   assert.equal(config.bundle.createUpdaterArtifacts, false);
@@ -224,6 +226,20 @@ test("Tauri release config embeds the complete portable Desktop composition", ()
   );
   assert.ok(config.bundle.icon.some((path) => path.endsWith("icon.ico")));
   assert.ok(config.bundle.icon.some((path) => path.endsWith("icon.icns")));
+});
+
+test("Windows Tauri package versions stay MSI-compatible without changing RC asset identity", () => {
+  assert.equal(tauriPackageVersion("windows-x86_64", "2.0.0-rc.1"), "2.0.0-1");
+  assert.equal(tauriPackageVersion("windows-x86_64", "2.0.0"), "2.0.0");
+  assert.equal(tauriPackageVersion("linux-x86_64", "2.0.0-rc.1"), "2.0.0-rc.1");
+  assert.throws(
+    () => tauriPackageVersion("windows-x86_64", "2.0.0-rc"),
+    /numeric identifier/,
+  );
+  assert.throws(
+    () => tauriPackageVersion("windows-x86_64", "2.0.0-rc.65536"),
+    /MSI limit/,
+  );
 });
 
 test("native Desktop collector renames and verifies exact Tauri outputs", async (t) => {

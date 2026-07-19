@@ -42,12 +42,46 @@ export function nativeDesktopArtifactsForTarget(target, version) {
   return artifacts;
 }
 
+// Windows Installer stores a SemVer prerelease as a numeric MSI field. Keep
+// the canonical release version in artifact metadata while giving Tauri/WiX a
+// bounded numeric prerelease it can encode.
+export function tauriPackageVersion(target, version) {
+  if (!target.startsWith("windows-")) {
+    return version;
+  }
+  const match = version.match(
+    /^(\d+\.\d+\.\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+  );
+  if (!match) {
+    throw new Error(`invalid Windows Tauri version: ${version}`);
+  }
+  const [, core, prerelease] = match;
+  if (!prerelease) {
+    return version;
+  }
+  const numericPart = prerelease
+    .split(".")
+    .findLast((part) => /^\d+$/.test(part));
+  if (numericPart === undefined) {
+    throw new Error(
+      `Windows Tauri prerelease must include a numeric identifier: ${version}`,
+    );
+  }
+  const numeric = Number(numericPart);
+  if (!Number.isSafeInteger(numeric) || numeric > 65_535) {
+    throw new Error(
+      `Windows Tauri prerelease identifier exceeds MSI limit: ${version}`,
+    );
+  }
+  return `${core}-${numeric}`;
+}
+
 export function tauriReleaseConfig({ target, version, portable, icons }) {
   const artifacts = nativeDesktopArtifactsForTarget(target, version);
   const portableRoot = resolve(portable);
   const iconRoot = resolve(icons);
   return {
-    version,
+    version: tauriPackageVersion(target, version),
     bundle: {
       active: true,
       targets: artifacts.map(({ bundle }) => bundle),
