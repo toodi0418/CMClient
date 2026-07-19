@@ -52,6 +52,7 @@ pnpm test:e2e:web
 - [Release artifacts](docs/architecture/release-artifacts.md)
 - [Release security audit](docs/security/release-audit.md)
 - [Feature parity evidence](docs/testing/feature-parity.md)
+- [RC field validation](docs/testing/rc-field-validation.md)
 - [Getting started](docs/user/getting-started.md)
 - [Using CMClient](docs/user/using-cmclient.md)
 - [Administrator deployment](docs/admin/deployment.md)

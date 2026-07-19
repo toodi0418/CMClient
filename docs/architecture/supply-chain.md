@@ -91,6 +91,14 @@ attestation whose subjects are the checksummed archives and SBOM. Every
 third-party workflow action is pinned to a reviewed complete commit SHA, and
 checkout credentials are not persisted.
 
+Stable promotion does not rename an RC artifact. After RC field validation and
+P12-T05 approval, one reviewed release-only commit changes the synchronized
+product declarations from `2.0.0-rc.1` to `2.0.0` and must pass CI before it is
+promoted to `main`. The immutable `v2.0.0` tag points to that exact commit. RC
+evidence keeps its original source binding, while `productionIdentity` binds
+the stable commit/tree, same-commit CI, tagged Release Build Matrix, exact tag,
+and `cmclient-supply-chain-attested` artifact digest independently.
+
 ## Agent Update Manifest
 
 The optional `sign-update-manifest` job is also manual. It requires an

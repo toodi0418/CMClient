@@ -7,6 +7,8 @@ import { promisify } from "node:util";
 const runFile = promisify(execFile);
 
 export const RC_VERSION = /^2\.0\.0-rc\.[1-9]\d*$/;
+export const STABLE_VERSION = /^2\.0\.0$/;
+export const PRODUCTION_ARTIFACT_NAME = "cmclient-supply-chain-attested";
 export const RESULT_STATUSES = new Set([
   "pending",
   "pass",
@@ -213,7 +215,9 @@ export async function inspectReleaseCandidateSources(root = process.cwd()) {
 
 export function validateReleaseCandidateSources(snapshot) {
   const version = snapshot.rootVersion;
-  if (!RC_VERSION.test(version)) throw new Error("RC_VERSION_INVALID");
+  if (!RC_VERSION.test(version) && !STABLE_VERSION.test(version)) {
+    throw new Error("RC_VERSION_INVALID");
+  }
   assertVersionMap(
     snapshot.packageVersions,
     EXPECTED_PACKAGE_IDENTITIES,
@@ -312,6 +316,14 @@ export function validateFieldValidationPlan(plan, expectedVersion) {
   };
 }
 
+export function validateFieldValidationSourceVersion(rcVersion, sourceVersion) {
+  const stableVersion = stableVersionFor(rcVersion);
+  if (sourceVersion !== rcVersion && sourceVersion !== stableVersion) {
+    throw new Error("RC_FIELD_SOURCE_VERSION_INVALID");
+  }
+  return { rcVersion, sourceVersion, stableVersion };
+}
+
 export function validateFieldValidationEvidence(
   plan,
   evidence,
@@ -320,6 +332,7 @@ export function validateFieldValidationEvidence(
     gate = "rc",
     expectedIdentity,
     expectedProductionApproval,
+    expectedProductionIdentity,
   } = {},
 ) {
   validateFieldValidationPlan(
@@ -344,6 +357,13 @@ export function validateFieldValidationEvidence(
   }
   if (evidence.productionApproval !== undefined) {
     validateProductionApproval(evidence.productionApproval);
+  }
+  if (evidence.productionIdentity !== undefined) {
+    validateProductionIdentity(
+      evidence.productionIdentity,
+      plan.releaseVersion,
+    );
+    assertProductionTransition(evidence);
   }
 
   const expectedExecutions = buildExecutionMatrix(plan);
@@ -401,6 +421,11 @@ export function validateFieldValidationEvidence(
     );
     if (incomplete) throw new Error("RC_FIELD_VALIDATION_INCOMPLETE");
     if (gate === "production") {
+      assertProductionIdentity(
+        evidence.productionIdentity,
+        expectedProductionIdentity,
+        plan.releaseVersion,
+      );
       assertProductionApproval(
         evidence.productionApproval,
         expectedProductionApproval,
@@ -513,6 +538,58 @@ function assertProductionApproval(actual, expected) {
     if (actual[name] !== expected[name]) {
       throw new Error("RC_FIELD_PRODUCTION_APPROVAL_MISMATCH");
     }
+  }
+}
+
+function assertProductionIdentity(actual, expected, rcVersion) {
+  if (!expected) throw new Error("RC_FIELD_PRODUCTION_IDENTITY_MISSING");
+  validateProductionIdentity(expected, rcVersion);
+  if (!actual) throw new Error("RC_FIELD_PRODUCTION_IDENTITY_MISSING");
+  for (const name of [
+    "releaseVersion",
+    "tag",
+    "sourceCommit",
+    "sourceTree",
+    "ciRunUrl",
+    "releaseRunUrl",
+    "artifactName",
+    "artifactDigestSha256",
+  ]) {
+    if (actual[name] !== expected[name]) {
+      throw new Error("RC_FIELD_PRODUCTION_IDENTITY_MISMATCH");
+    }
+  }
+}
+
+function validateProductionIdentity(identity, rcVersion) {
+  const stableVersion = stableVersionFor(rcVersion);
+  if (
+    !identity ||
+    identity.releaseVersion !== stableVersion ||
+    identity.tag !== `v${stableVersion}` ||
+    !isCommit(identity.sourceCommit) ||
+    !isCommit(identity.sourceTree) ||
+    !isCanonicalGithubActionsRunUrl(identity.ciRunUrl) ||
+    !isCanonicalGithubActionsRunUrl(identity.releaseRunUrl) ||
+    identity.artifactName !== PRODUCTION_ARTIFACT_NAME ||
+    !isDigest(identity.artifactDigestSha256)
+  ) {
+    throw new Error("RC_FIELD_PRODUCTION_IDENTITY_INVALID");
+  }
+}
+
+function assertProductionTransition(evidence) {
+  const production = evidence.productionIdentity;
+  const rcRunUrls = new Set([evidence.ciRunUrl, evidence.releaseRunUrl]);
+  if (
+    production.sourceCommit === evidence.sourceCommit ||
+    production.sourceTree === evidence.sourceTree ||
+    production.ciRunUrl === production.releaseRunUrl ||
+    rcRunUrls.has(production.ciRunUrl) ||
+    rcRunUrls.has(production.releaseRunUrl) ||
+    production.artifactDigestSha256 === evidence.artifactDigestSha256
+  ) {
+    throw new Error("RC_FIELD_PRODUCTION_IDENTITY_NOT_PROMOTED");
   }
 }
 
@@ -633,6 +710,30 @@ function productionApprovalFromArgs(args) {
   };
 }
 
+function productionIdentityFromArgs(args, rcVersion) {
+  const releaseVersion = stableVersionFor(rcVersion);
+  return {
+    releaseVersion,
+    tag: `v${releaseVersion}`,
+    sourceCommit: option(args, "--expected-production-source-commit"),
+    sourceTree: option(args, "--expected-production-source-tree"),
+    ciRunUrl: option(args, "--expected-production-ci-run-url"),
+    releaseRunUrl: option(args, "--expected-production-release-run-url"),
+    artifactName: PRODUCTION_ARTIFACT_NAME,
+    artifactDigestSha256: option(
+      args,
+      "--expected-production-artifact-digest-sha256",
+    ),
+  };
+}
+
+function stableVersionFor(rcVersion) {
+  if (!RC_VERSION.test(rcVersion)) {
+    throw new Error("RC_VERSION_INVALID");
+  }
+  return rcVersion.replace(/-rc\.[1-9]\d*$/, "");
+}
+
 async function main(args) {
   const [command] = args;
   if (command === "check-sources") {
@@ -644,7 +745,8 @@ async function main(args) {
   if (command === "check-plan") {
     const plan = await readJson(option(args, "--input"));
     const root = await readJson("package.json");
-    const result = validateFieldValidationPlan(plan, root.version);
+    const result = validateFieldValidationPlan(plan, plan.releaseVersion);
+    validateFieldValidationSourceVersion(plan.releaseVersion, root.version);
     process.stdout.write(
       `${JSON.stringify({ caseCount: result.caseCount, executionCount: result.executionCount })}\n`,
     );
@@ -666,6 +768,10 @@ async function main(args) {
       expectedProductionApproval:
         requirePromotionReady && gate === "production"
           ? productionApprovalFromArgs(args)
+          : undefined,
+      expectedProductionIdentity:
+        requirePromotionReady && gate === "production"
+          ? productionIdentityFromArgs(args, plan.releaseVersion)
           : undefined,
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);

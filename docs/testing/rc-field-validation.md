@@ -82,6 +82,11 @@ node scripts/rc-readiness.mjs check-plan \
   --input docs/testing/rc-field-validation-plan.json
 ```
 
+`check-sources` accepts the declared RC or its matching stable version only.
+`check-plan` remains bound to the RC field plan when a release-only promotion
+commit changes the product declarations from `2.0.0-rc.1` to `2.0.0`; another
+version or release line fails closed.
+
 Validate a completed evidence file structurally:
 
 ```bash
@@ -111,11 +116,31 @@ node scripts/rc-readiness.mjs check-evidence \
 Only canonical run-level URLs for `toodi0418/CMClient` are accepted. Job URLs,
 redirectors, query strings, and unrelated HTTPS URLs are rejected.
 
-Add `--production` only after P12-T05 approval and the protected tag workflow.
-The evidence document must then contain the exact approval record:
+## Stable promotion
+
+Add `--production` only after every RC execution passes, P12-T05 is approved,
+and the protected stable tag workflow completes. The approval authorizes a
+reviewed release-only commit that changes all product version declarations and
+release metadata to `2.0.0` without changing product behavior or dependencies.
+That commit must pass CI, be promoted to `main`, and be tagged exactly
+`v2.0.0`; the manually dispatched tagged Release Build Matrix must then produce
+the attested supply-chain artifact.
+
+The evidence document must retain the RC identity and add both independently
+verifiable production records:
 
 ```json
 {
+  "productionIdentity": {
+    "releaseVersion": "2.0.0",
+    "tag": "v2.0.0",
+    "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+    "sourceTree": "89abcdef0123456789abcdef0123456789abcdef",
+    "ciRunUrl": "https://github.com/toodi0418/CMClient/actions/runs/2001",
+    "releaseRunUrl": "https://github.com/toodi0418/CMClient/actions/runs/2002",
+    "artifactName": "cmclient-supply-chain-attested",
+    "artifactDigestSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
   "productionApproval": {
     "taskId": "P12-T05",
     "identity": "release-approver",
@@ -125,7 +150,9 @@ The evidence document must then contain the exact approval record:
 }
 ```
 
-Pass the independently obtained approval values as a second binding:
+The production source commit/tree, successful CI and tagged release run URLs,
+and artifact digest must be obtained independently from Git and the GitHub
+Actions artifact API. Pass those values and the approval as separate bindings:
 
 ```bash
 node scripts/rc-readiness.mjs check-evidence \
@@ -139,10 +166,20 @@ node scripts/rc-readiness.mjs check-evidence \
   --expected-release-run-url "https://github.com/toodi0418/CMClient/actions/runs/$RELEASE_RUN_ID" \
   --expected-artifact-name "cmclient-supply-chain-unsigned-2.0.0-rc.1" \
   --expected-artifact-digest-sha256 "$ARTIFACT_DIGEST_SHA256" \
+  --expected-production-source-commit "$PRODUCTION_SOURCE_COMMIT" \
+  --expected-production-source-tree "$PRODUCTION_SOURCE_TREE" \
+  --expected-production-ci-run-url "https://github.com/toodi0418/CMClient/actions/runs/$PRODUCTION_CI_RUN_ID" \
+  --expected-production-release-run-url "https://github.com/toodi0418/CMClient/actions/runs/$PRODUCTION_RELEASE_RUN_ID" \
+  --expected-production-artifact-digest-sha256 "$PRODUCTION_ARTIFACT_DIGEST_SHA256" \
   --approval-identity "$APPROVER_IDENTITY" \
   --approval-at "$APPROVED_AT" \
   --approval-ref "$APPROVAL_REFERENCE"
 ```
+
+The validator derives `2.0.0`, `v2.0.0`, and
+`cmclient-supply-chain-attested` from the reviewed RC line and workflow
+contract. A final artifact cannot reuse the RC commit, an unsigned `dev`
+artifact, a different tag, or an unrelated workflow run.
 
 ## Machine evidence
 

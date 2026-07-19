@@ -103,6 +103,16 @@ const REQUIRED_DOCUMENT_SECTIONS = new Map([
       "Promotion gate",
     ],
   ],
+  [
+    "docs/testing/rc-field-validation.md",
+    [
+      "RC identity",
+      "Result records",
+      "Stable promotion",
+      "Machine evidence",
+      "Evidence hygiene",
+    ],
+  ],
   ["CHANGELOG.md", ["2.0.0-rc.1"]],
 ]);
 
@@ -164,6 +174,14 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
     ["precisionBits === 32", "GATEWAY_DOMAIN_DATA_UNAVAILABLE"],
   ],
   ["docs/releases/2.0.0-rc.1.md", ["SHA256SUMS", "P12-T05"]],
+  [
+    "docs/testing/rc-field-validation.md",
+    [
+      "productionIdentity",
+      "--expected-production-source-commit",
+      "cmclient-supply-chain-attested",
+    ],
+  ],
   ["CHANGELOG.md", ["2.0.0-rc.1"]],
 ]);
 

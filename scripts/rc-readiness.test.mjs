@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import {
   EXPECTED_PACKAGE_IDENTITIES,
   EXPECTED_RUST_IDENTITIES,
+  PRODUCTION_ARTIFACT_NAME,
   REQUIRED_CASE_IDS,
   REQUIRED_MODES,
   REQUIRED_TARGETS,
@@ -16,12 +17,14 @@ import {
   inspectReleaseCandidateSources,
   validateFieldValidationEvidence,
   validateFieldValidationPlan,
+  validateFieldValidationSourceVersion,
   validateReleaseCandidateSources,
 } from "./rc-readiness.mjs";
 
 const planPath = "docs/testing/rc-field-validation-plan.json";
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const runFile = promisify(execFile);
+const rootVersion = JSON.parse(await readFile("package.json", "utf8")).version;
 
 const identity = Object.freeze({
   releaseVersion: "2.0.0-rc.1",
@@ -40,10 +43,21 @@ const productionApproval = Object.freeze({
   reference: "approval://P12-T05/2026-07-20",
 });
 
+const productionIdentity = Object.freeze({
+  releaseVersion: "2.0.0",
+  tag: "v2.0.0",
+  sourceCommit: "d".repeat(40),
+  sourceTree: "e".repeat(40),
+  ciRunUrl: "https://github.com/toodi0418/CMClient/actions/runs/2001",
+  releaseRunUrl: "https://github.com/toodi0418/CMClient/actions/runs/2002",
+  artifactName: PRODUCTION_ARTIFACT_NAME,
+  artifactDigestSha256: "f".repeat(64),
+});
+
 test("release candidate sources expose one exact product manifest set", async () => {
   const result = await inspectReleaseCandidateSources();
   assert.deepEqual(result, {
-    version: "2.0.0-rc.1",
+    version: rootVersion,
     packageCount: EXPECTED_PACKAGE_IDENTITIES.length,
     rustPackageCount: EXPECTED_RUST_IDENTITIES.length,
   });
@@ -52,6 +66,10 @@ test("release candidate sources expose one exact product manifest set", async ()
 test("release candidate source validation rejects version, identity, and package drift", () => {
   const snapshot = sourceSnapshot();
   assert.equal(validateReleaseCandidateSources(snapshot).version, "2.0.0-rc.1");
+  assert.equal(
+    validateReleaseCandidateSources(sourceSnapshot("2.0.0")).version,
+    "2.0.0",
+  );
 
   assert.throws(
     () =>
@@ -116,6 +134,25 @@ test("release candidate source validation rejects version, identity, and package
         gatewayFallback: "2.0.0-dev.0",
       }),
     /RC_RUNTIME_VERSION_DRIFT/,
+  );
+});
+
+test("field plan remains bound to its RC while allowing only the matching stable source", () => {
+  assert.deepEqual(
+    validateFieldValidationSourceVersion("2.0.0-rc.1", "2.0.0-rc.1"),
+    {
+      rcVersion: "2.0.0-rc.1",
+      sourceVersion: "2.0.0-rc.1",
+      stableVersion: "2.0.0",
+    },
+  );
+  assert.equal(
+    validateFieldValidationSourceVersion("2.0.0-rc.1", "2.0.0").stableVersion,
+    "2.0.0",
+  );
+  assert.throws(
+    () => validateFieldValidationSourceVersion("2.0.0-rc.1", "2.0.1"),
+    /RC_FIELD_SOURCE_VERSION_INVALID/,
   );
 });
 
@@ -271,6 +308,18 @@ test("production promotion requires all executions and the exact P12-T05 approva
         gate: "production",
         expectedIdentity: identity,
       }),
+    /RC_FIELD_PRODUCTION_IDENTITY_MISSING/,
+  );
+
+  allReady.productionIdentity = productionIdentity;
+  assert.throws(
+    () =>
+      validateFieldValidationEvidence(plan, allReady, {
+        requirePromotionReady: true,
+        gate: "production",
+        expectedIdentity: identity,
+        expectedProductionIdentity: productionIdentity,
+      }),
     /RC_FIELD_PRODUCTION_APPROVAL_MISSING/,
   );
 
@@ -280,6 +329,7 @@ test("production promotion requires all executions and the exact P12-T05 approva
       requirePromotionReady: true,
       gate: "production",
       expectedIdentity: identity,
+      expectedProductionIdentity: productionIdentity,
       expectedProductionApproval: productionApproval,
     }),
   );
@@ -290,12 +340,42 @@ test("production promotion requires all executions and the exact P12-T05 approva
         requirePromotionReady: true,
         gate: "production",
         expectedIdentity: identity,
+        expectedProductionIdentity: {
+          ...productionIdentity,
+          sourceCommit: "0".repeat(40),
+        },
+        expectedProductionApproval: productionApproval,
+      }),
+    /RC_FIELD_PRODUCTION_IDENTITY_MISMATCH/,
+  );
+
+  assert.throws(
+    () =>
+      validateFieldValidationEvidence(plan, allReady, {
+        requirePromotionReady: true,
+        gate: "production",
+        expectedIdentity: identity,
+        expectedProductionIdentity: productionIdentity,
         expectedProductionApproval: {
           ...productionApproval,
           identity: "different-approver",
         },
       }),
     /RC_FIELD_PRODUCTION_APPROVAL_MISMATCH/,
+  );
+
+  const reusedRc = clone(allReady);
+  reusedRc.productionIdentity.sourceCommit = identity.sourceCommit;
+  assert.throws(
+    () => validateFieldValidationEvidence(plan, reusedRc),
+    /RC_FIELD_PRODUCTION_IDENTITY_NOT_PROMOTED/,
+  );
+
+  const wrongStableTag = clone(allReady);
+  wrongStableTag.productionIdentity.tag = "v2.0.1";
+  assert.throws(
+    () => validateFieldValidationEvidence(plan, wrongStableTag),
+    /RC_FIELD_PRODUCTION_IDENTITY_INVALID/,
   );
 });
 
@@ -321,14 +401,33 @@ test("CLI promotion flags bind RC identity and production approval", async () =>
     );
 
     markGatePassed(plan, evidence, "production");
+    evidence.productionIdentity = productionIdentity;
     evidence.productionApproval = productionApproval;
     await writeFile(evidencePath, JSON.stringify(evidence), "utf8");
+    await assert.rejects(
+      runReadinessCli([
+        "--input",
+        evidencePath,
+        "--promotion-ready",
+        "--production",
+        ...identityCliArgs(),
+        "--approval-identity",
+        productionApproval.identity,
+        "--approval-at",
+        productionApproval.approvedAt,
+        "--approval-ref",
+        productionApproval.reference,
+      ]),
+      (error) =>
+        error.stderr?.includes("missing --expected-production-source-commit"),
+    );
     const productionResult = await runReadinessCli([
       "--input",
       evidencePath,
       "--promotion-ready",
       "--production",
       ...identityCliArgs(),
+      ...productionIdentityCliArgs(),
       "--approval-identity",
       productionApproval.identity,
       "--approval-at",
@@ -367,17 +466,17 @@ test("malformed execution and approval timestamps return stable field codes", as
   );
 });
 
-function sourceSnapshot() {
+function sourceSnapshot(version = "2.0.0-rc.1") {
   return {
-    rootVersion: "2.0.0-rc.1",
+    rootVersion: version,
     packageVersions: new Map(
-      EXPECTED_PACKAGE_IDENTITIES.map((identity) => [identity, "2.0.0-rc.1"]),
+      EXPECTED_PACKAGE_IDENTITIES.map((identity) => [identity, version]),
     ),
     rustVersions: new Map(
-      EXPECTED_RUST_IDENTITIES.map((identity) => [identity, "2.0.0-rc.1"]),
+      EXPECTED_RUST_IDENTITIES.map((identity) => [identity, version]),
     ),
-    tauriVersion: "2.0.0-rc.1",
-    gatewayFallback: "2.0.0-rc.1",
+    tauriVersion: version,
+    gatewayFallback: version,
   };
 }
 
@@ -413,6 +512,21 @@ function identityCliArgs() {
     identity.artifactName,
     "--expected-artifact-digest-sha256",
     identity.artifactDigestSha256,
+  ];
+}
+
+function productionIdentityCliArgs() {
+  return [
+    "--expected-production-source-commit",
+    productionIdentity.sourceCommit,
+    "--expected-production-source-tree",
+    productionIdentity.sourceTree,
+    "--expected-production-ci-run-url",
+    productionIdentity.ciRunUrl,
+    "--expected-production-release-run-url",
+    productionIdentity.releaseRunUrl,
+    "--expected-production-artifact-digest-sha256",
+    productionIdentity.artifactDigestSha256,
   ];
 }
 
