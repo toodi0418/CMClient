@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
@@ -22,6 +22,7 @@ import {
 } from "./rc-readiness.mjs";
 
 const planPath = "docs/testing/rc-field-validation-plan.json";
+const readinessScriptPath = resolve("scripts/rc-readiness.mjs");
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const runFile = promisify(execFile);
 const rootVersion = JSON.parse(await readFile("package.json", "utf8")).version;
@@ -441,6 +442,56 @@ test("CLI promotion flags bind RC identity and production approval", async () =>
   }
 });
 
+test("CLI evidence validation keeps the RC plan valid after stable source promotion", async () => {
+  const plan = await readPlan();
+  const evidence = createPendingEvidence(plan, identity);
+  markGatePassed(plan, evidence, "production");
+  evidence.productionIdentity = productionIdentity;
+  evidence.productionApproval = productionApproval;
+  const directory = await mkdtemp(join(tmpdir(), "cmclient-stable-readiness-"));
+  const temporaryPlanPath = join(directory, "rc-plan.json");
+  const evidencePath = join(directory, "evidence.json");
+  const packagePath = join(directory, "package.json");
+  const productionArgs = [
+    "--input",
+    evidencePath,
+    "--promotion-ready",
+    "--production",
+    ...identityCliArgs(),
+    ...productionIdentityCliArgs(),
+    "--approval-identity",
+    productionApproval.identity,
+    "--approval-at",
+    productionApproval.approvedAt,
+    "--approval-ref",
+    productionApproval.reference,
+  ];
+
+  try {
+    await Promise.all([
+      writeFile(temporaryPlanPath, JSON.stringify(plan), "utf8"),
+      writeFile(evidencePath, JSON.stringify(evidence), "utf8"),
+      writeFile(packagePath, JSON.stringify({ version: "2.0.0" }), "utf8"),
+    ]);
+    const result = await runReadinessCli(productionArgs, {
+      cwd: directory,
+      planPath: temporaryPlanPath,
+    });
+    assert.deepEqual(JSON.parse(result.stdout), { resultCount: 129 });
+
+    await writeFile(packagePath, JSON.stringify({ version: "2.0.1" }), "utf8");
+    await assert.rejects(
+      runReadinessCli(productionArgs, {
+        cwd: directory,
+        planPath: temporaryPlanPath,
+      }),
+      (error) => error.stderr?.includes("RC_FIELD_SOURCE_VERSION_INVALID"),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("malformed execution and approval timestamps return stable field codes", async () => {
   const plan = await readPlan();
   const evidence = createPendingEvidence(plan, identity);
@@ -530,11 +581,20 @@ function productionIdentityCliArgs() {
   ];
 }
 
-function runReadinessCli(args) {
+function runReadinessCli(
+  args,
+  { cwd = process.cwd(), planPath: selectedPlanPath = planPath } = {},
+) {
   return runFile(
     process.execPath,
-    ["scripts/rc-readiness.mjs", "check-evidence", "--plan", planPath, ...args],
-    { cwd: process.cwd(), encoding: "utf8" },
+    [
+      readinessScriptPath,
+      "check-evidence",
+      "--plan",
+      selectedPlanPath,
+      ...args,
+    ],
+    { cwd, encoding: "utf8" },
   );
 }
 

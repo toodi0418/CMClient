@@ -85,7 +85,9 @@ node scripts/rc-readiness.mjs check-plan \
 `check-sources` accepts the declared RC or its matching stable version only.
 `check-plan` remains bound to the RC field plan when a release-only promotion
 commit changes the product declarations from `2.0.0-rc.1` to `2.0.0`; another
-version or release line fails closed.
+version or release line fails closed. `check-evidence` applies the same source
+version relation, so the RC evidence remains valid for the matching stable
+production gate without accepting a different release line.
 
 Validate a completed evidence file structurally:
 

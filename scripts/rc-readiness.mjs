@@ -755,7 +755,8 @@ async function main(args) {
   if (command === "check-evidence") {
     const plan = await readJson(option(args, "--plan"));
     const root = await readJson("package.json");
-    validateFieldValidationPlan(plan, root.version);
+    validateFieldValidationPlan(plan, plan.releaseVersion);
+    validateFieldValidationSourceVersion(plan.releaseVersion, root.version);
     const evidence = await readJson(option(args, "--input"));
     const requirePromotionReady = args.includes("--promotion-ready");
     const gate = args.includes("--production") ? "production" : "rc";
