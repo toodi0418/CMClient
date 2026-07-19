@@ -128,9 +128,9 @@ export async function collectNativeDesktopBundles({
       bundleRoot,
       BUNDLE_DIRECTORIES[artifact.bundle],
     );
-    const candidates = await listFiles(sourceDirectory);
-    const matches = candidates.filter((path) =>
-      path.endsWith(BUNDLE_EXTENSIONS[artifact.bundle]),
+    const matches = await listFinalBundleFiles(
+      sourceDirectory,
+      BUNDLE_EXTENSIONS[artifact.bundle],
     );
     if (matches.length !== 1) {
       throw new Error(
@@ -155,6 +155,31 @@ export async function collectNativeDesktopBundles({
     `${JSON.stringify(manifest, null, 2)}\n`,
   );
   return { directory: destination, manifest };
+}
+
+async function listFinalBundleFiles(directory, extension) {
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    throw new Error(`native Desktop bundle directory missing: ${directory}`);
+  }
+  const matches = [];
+  for (const entry of entries.sort((left, right) =>
+    compareCanonicalText(left.name, right.name),
+  )) {
+    if (!entry.name.endsWith(extension)) continue;
+    const path = join(directory, entry.name);
+    const metadata = await lstat(path);
+    if (metadata.isSymbolicLink()) {
+      throw new Error("native Desktop final bundle is a symlink");
+    }
+    if (!metadata.isFile()) {
+      throw new Error("native Desktop final bundle is not a regular file");
+    }
+    matches.push(path);
+  }
+  return matches;
 }
 
 export async function verifyNativeDesktopStage({ target, version, input }) {

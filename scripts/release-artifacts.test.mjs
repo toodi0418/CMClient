@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -294,6 +301,55 @@ test("native Desktop collector renames and verifies exact Tauri outputs", async 
       }),
     /staged files do not match canonical plan/,
   );
+});
+
+test("Linux native collector ignores AppDir internals but rejects a symlink final bundle", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "cmclient-native-linux-"));
+  const bundleRoot = join(root, "bundle");
+  const output = join(root, "output");
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await mkdir(join(bundleRoot, "deb"), { recursive: true });
+  await mkdir(join(bundleRoot, "appimage/CMClient.AppDir/usr/bin"), {
+    recursive: true,
+  });
+  await writeFile(join(bundleRoot, "deb/CMClient_fixture.deb"), "deb");
+  const appImage = join(bundleRoot, "appimage/CMClient_fixture.AppImage");
+  await writeFile(appImage, "appimage");
+  const internalTarget = join(
+    bundleRoot,
+    "appimage/CMClient.AppDir/usr/bin/cmclient",
+  );
+  await writeFile(internalTarget, "internal");
+  if (process.platform !== "win32") {
+    await symlink(
+      "usr/bin/cmclient",
+      join(bundleRoot, "appimage/CMClient.AppDir/AppRun"),
+    );
+  }
+
+  await assert.doesNotReject(() =>
+    collectNativeDesktopBundles({
+      target: "linux-x86_64",
+      version: "2.0.0-rc.1",
+      bundleRoot,
+      output,
+    }),
+  );
+
+  if (process.platform !== "win32") {
+    await rm(appImage);
+    await symlink("CMClient.AppDir/usr/bin/cmclient", appImage);
+    await assert.rejects(
+      () =>
+        collectNativeDesktopBundles({
+          target: "linux-x86_64",
+          version: "2.0.0-rc.1",
+          bundleRoot,
+          output,
+        }),
+      /final bundle is a symlink/,
+    );
+  }
 });
 
 test("bundled Desktop runtime verification requires the complete Agent composition", async (t) => {
