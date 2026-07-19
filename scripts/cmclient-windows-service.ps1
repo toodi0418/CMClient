@@ -1,9 +1,10 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("install", "uninstall", "start", "stop", "restart", "status", "render")]
+    [ValidateSet("install", "uninstall", "start", "stop", "restart", "status", "logs", "render")]
     [string]$Command,
     [string]$HostPath = (Join-Path $PSScriptRoot "..\bin\cmclient-service-host.exe"),
+    [string]$Lines = "200",
     [switch]$NoStart
 )
 
@@ -47,6 +48,40 @@ function Invoke-Sc([string[]]$Arguments) {
     & sc.exe @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "WINDOWS_SERVICE_SCM_FAILED"
+    }
+}
+
+$LineCount = 0
+if (-not [int]::TryParse($Lines, [ref]$LineCount) -or $LineCount -lt 1 -or $LineCount -gt 10000) {
+    throw "WINDOWS_SERVICE_LOG_LINES_INVALID"
+}
+
+function Show-ServiceLogs {
+    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    $logDirectory = Join-Path $programData "CMClient\logs"
+    $logFiles = @(
+        (Join-Path $logDirectory "service-host.jsonl"),
+        (Join-Path $logDirectory "agent.jsonl"),
+        (Join-Path $logDirectory "gateway.jsonl")
+    )
+    $availableLogs = @()
+
+    foreach ($logFile in $logFiles) {
+        if (Test-Path -LiteralPath $logFile) {
+            $item = Get-Item -LiteralPath $logFile -Force
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "WINDOWS_SERVICE_LOG_FILE_INVALID"
+            }
+            $availableLogs += $logFile
+        }
+    }
+
+    if ($availableLogs.Count -eq 0) {
+        throw "WINDOWS_SERVICE_LOGS_UNAVAILABLE"
+    }
+
+    foreach ($logFile in $availableLogs) {
+        Get-Content -LiteralPath $logFile -Tail $LineCount
     }
 }
 
@@ -97,4 +132,5 @@ switch ($Command) {
     "stop" { Stop-Service -Name $ServiceName }
     "restart" { Restart-Service -Name $ServiceName -Force }
     "status" { Get-Service -Name $ServiceName | Select-Object Name, DisplayName, Status, StartType | Format-Table -AutoSize }
+    "logs" { Show-ServiceLogs }
 }

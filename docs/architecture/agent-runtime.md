@@ -154,6 +154,29 @@ until the child survives a 30-second stable window. Stop and Agent teardown
 terminate and reap the child. Real subprocess tests prove crash/restart,
 deadline, stable-reset, stop, and drop behavior.
 
+## Service Logging
+
+Service deployments use application-owned JSONL under `CMCLIENT_LOG_DIR`:
+`agent.jsonl` for Agent output and `gateway.jsonl` for the supervised Gateway.
+The Windows SCM wrapper additionally uses `service-host.jsonl` for failures
+that occur before Agent can start. Every active file has a fixed byte ceiling,
+bounded retained-file rotation, restrictive permissions, and symlink/non-file
+rejection.
+
+The logging drain accepts a stdout record only when it is a bounded JSON object,
+recursively redacts sensitive field names, and writes the sanitized object.
+Child stderr is treated only as a stable uppercase error-code channel. Unknown,
+malformed, or oversized records become a generic stable code rather than raw
+text. Sink initialization and write failures also become stable supervisor
+error codes while both pipes continue to drain, so a broken log destination
+cannot deadlock process shutdown. Stop, restart, and drop join the drain workers
+and flush accepted records before returning.
+
+Platform service managers tail only these active application logs with a
+bounded line count. systemd may fall back to similarly bounded journal records
+before the files exist, but its manager exposes only stable codes; launchd
+routes unmanaged fallback stdout and stderr to `/dev/null`.
+
 Verified update archives are transient Agent cache data under
 `<cache_dir>/updates/staging`. They are selected from a signed manifest, streamed
 with an exact byte limit, SHA-256 verified, and atomically published by digest.

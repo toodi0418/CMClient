@@ -36,7 +36,7 @@ Options:
   --config-dir <absolute path>  Agent configuration directory
   --cache-dir <absolute path>   Agent cache directory
   --log-dir <absolute path>     Agent log directory
-  --lines <positive integer>    Lines for logs (default: 200)
+  --lines <1..10000>            Lines for logs (default: 200)
 
 This is a per-user LaunchAgent. It never accepts, exports, or writes credentials.
 `uninstall` removes only the plist and retains Agent configuration, data, cache, and logs.
@@ -57,7 +57,8 @@ validate_path() {
 }
 
 validate_positive_integer() {
-  if [[ ! "$1" =~ ^[1-9][0-9]*$ ]]; then
+  local value="$1"
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ || ${#value} -gt 5 ]] || (( 10#$value > 10000 )); then
     fail "LAUNCHD_LOG_LINES_INVALID"
   fi
 }
@@ -145,6 +146,26 @@ start_service() {
   "$LAUNCHCTL" kickstart -k "$(service_target)"
 }
 
+tail_application_logs() {
+  local log_files=()
+  local log_path
+  local log_name
+
+  for log_name in agent.jsonl gateway.jsonl; do
+    log_path="$LOG_DIR/$log_name"
+    if [[ -L "$log_path" ]]; then
+      fail "LAUNCHD_LOG_FILE_INVALID"
+    fi
+    if [[ -e "$log_path" ]]; then
+      [[ -f "$log_path" ]] || fail "LAUNCHD_LOG_FILE_INVALID"
+      log_files+=("$log_path")
+    fi
+  done
+
+  (( ${#log_files[@]} > 0 )) || fail "LAUNCHD_LOGS_UNAVAILABLE"
+  tail -n "$LOG_LINES" -- "${log_files[@]}"
+}
+
 COMMAND="${1:-}"
 if [[ -z "$COMMAND" || "$COMMAND" == "--help" || "$COMMAND" == "-h" ]]; then
   usage
@@ -175,7 +196,7 @@ case "$COMMAND" in
   stop) bootout ;;
   restart) "$LAUNCHCTL" kickstart -k "$(service_target)" ;;
   status) "$LAUNCHCTL" print "$(service_target)" ;;
-  logs) tail -n "$LOG_LINES" "$LOG_DIR/agent.stdout.log" "$LOG_DIR/agent.stderr.log" ;;
+  logs) tail_application_logs ;;
   render) render_plist ;;
   *) fail "LAUNCHD_USAGE_INVALID_COMMAND" ;;
 esac

@@ -47,7 +47,7 @@ Install options:
   --serial-group <name>          Existing group allowed to access serial devices
   --systemctl <absolute path>    Override for packaging tests
   --journalctl <absolute path>   Override for packaging tests
-  --lines <positive integer>     Lines for logs (default: 200)
+  --lines <1..10000>             Lines for logs (default: 200)
   --skip-user-setup              Packaging-test only: do not create or modify accounts
 
 The manager never accepts credentials or writes secret values. `uninstall`
@@ -78,7 +78,7 @@ validate_account_name() {
 
 validate_positive_integer() {
   local value="$1"
-  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ || ${#value} -gt 5 ]] || (( 10#$value > 10000 )); then
     fail "SYSTEMD_LOG_LINES_INVALID"
   fi
 }
@@ -268,7 +268,43 @@ run_systemctl() {
 }
 
 run_journalctl() {
-  run_privileged "$JOURNALCTL" --unit "$SERVICE_NAME" --no-pager --lines "$LOG_LINES"
+  # The journal is only an early-start fallback. Agent stderr is defined as a
+  # stable code stream; filtering here prevents accidental raw output from a
+  # failed or externally replaced executable from becoming manager output.
+  run_privileged "$JOURNALCTL" \
+    --unit "$SERVICE_NAME" \
+    --no-pager \
+    --lines "$LOG_LINES" \
+    --output cat |
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^[A-Z][A-Z0-9_]{2,127}$ ]]; then
+        printf '%s\n' "$line"
+      fi
+    done
+}
+
+tail_application_logs() {
+  local log_files=()
+  local log_path
+  local log_name
+
+  for log_name in agent.jsonl gateway.jsonl; do
+    log_path="$LOG_DIR/$log_name"
+    if [[ -L "$log_path" ]]; then
+      fail "SYSTEMD_LOG_FILE_INVALID"
+    fi
+    if [[ -e "$log_path" ]]; then
+      [[ -f "$log_path" ]] || fail "SYSTEMD_LOG_FILE_INVALID"
+      log_files+=("$log_path")
+    fi
+  done
+
+  if (( ${#log_files[@]} > 0 )); then
+    tail -n "$LOG_LINES" -- "${log_files[@]}"
+    return
+  fi
+
+  run_journalctl
 }
 
 COMMAND="${1:-}"
@@ -306,7 +342,7 @@ case "$COMMAND" in
   install) install_service ;;
   uninstall) uninstall_service ;;
   start|stop|restart|status|enable|disable) run_systemctl "$COMMAND" "$SERVICE_NAME" ;;
-  logs) run_journalctl ;;
+  logs) tail_application_logs ;;
   render) render_unit ;;
   *) fail "SYSTEMD_USAGE_INVALID_COMMAND" ;;
 esac

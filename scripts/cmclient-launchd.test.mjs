@@ -5,6 +5,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -80,6 +81,15 @@ launchdTest(
     assert.match(contents, /<string>io\.cmclient\.agent<\/string>/);
     assert.match(contents, new RegExp(`<string>${agentV1}<\\/string>`));
     assert.match(contents, /<key>KeepAlive<\/key>/);
+    assert.match(
+      contents,
+      /<key>StandardOutPath<\/key>\s*<string>\/dev\/null<\/string>/,
+    );
+    assert.match(
+      contents,
+      /<key>StandardErrorPath<\/key>\s*<string>\/dev\/null<\/string>/,
+    );
+    assert.doesNotMatch(contents, /agent\.(?:stdout|stderr)\.log/);
     assert.doesNotMatch(contents, /CALLMESH|API_KEY|PASSCODE|TOKEN/);
     assert.match(
       await readFile(calls, "utf8"),
@@ -115,4 +125,54 @@ launchdTest("launchd manager rejects unsafe executable paths", async () => {
     /LAUNCHD_PATH_INVALID/,
   );
   await rm(directory, { recursive: true, force: true });
+});
+
+launchdTest("launchd logs tail only bounded application JSONL", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cmclient-launchd-logs-"));
+  const home = join(directory, "home");
+  const logDir = join(directory, "logs");
+
+  try {
+    await mkdir(home, { recursive: true });
+    await mkdir(logDir, { recursive: true });
+    await writeFile(
+      join(logDir, "agent.jsonl"),
+      '{"code":"AGENT_OLD"}\n{"code":"AGENT_CURRENT"}\n',
+    );
+    await writeFile(
+      join(logDir, "gateway.jsonl"),
+      '{"code":"GATEWAY_OLD"}\n{"code":"GATEWAY_CURRENT"}\n',
+    );
+
+    const { stdout } = await runManager(
+      ["logs", "--log-dir", logDir, "--lines", "1"],
+      { HOME: home },
+    );
+    assert.match(stdout, /AGENT_CURRENT/);
+    assert.match(stdout, /GATEWAY_CURRENT/);
+    assert.doesNotMatch(stdout, /AGENT_OLD|GATEWAY_OLD/);
+
+    await rm(join(logDir, "agent.jsonl"));
+    await rm(join(logDir, "gateway.jsonl"));
+    await assert.rejects(
+      runManager(["logs", "--log-dir", logDir], { HOME: home }),
+      /LAUNCHD_LOGS_UNAVAILABLE/,
+    );
+    await assert.rejects(
+      runManager(["logs", "--log-dir", logDir, "--lines", "10001"], {
+        HOME: home,
+      }),
+      /LAUNCHD_LOG_LINES_INVALID/,
+    );
+
+    const externalLog = join(directory, "external.jsonl");
+    await writeFile(externalLog, '{"code":"MUST_NOT_BE_READ"}\n');
+    await symlink(externalLog, join(logDir, "agent.jsonl"));
+    await assert.rejects(
+      runManager(["logs", "--log-dir", logDir], { HOME: home }),
+      /LAUNCHD_LOG_FILE_INVALID/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

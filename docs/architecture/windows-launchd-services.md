@@ -46,8 +46,16 @@ without changing the deadline guarantee.
 powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 install `
   -HostPath "C:\Program Files\CMClient\current\bin\cmclient-service-host.exe"
 powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 status
+powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 logs -Lines 200
 powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 uninstall
 ```
+
+The `logs` action accepts between 1 and 10,000 lines and reads only regular,
+non-reparse-point application logs under `%ProgramData%\CMClient\logs`:
+`service-host.jsonl`, `agent.jsonl`, and `gateway.jsonl`. These are sanitized,
+size-bounded, retained JSONL files; the service manager never returns raw child
+stdout or stderr. A missing log set or an unsafe path fails with a stable
+manager error code.
 
 ## macOS
 
@@ -66,7 +74,10 @@ bash scripts/cmclient-launchd.sh uninstall
 ```
 
 The generated plist has `RunAtLoad`, restarts only an unsuccessful Agent exit,
-uses a five-second throttle, and writes bounded operational output to the
-user's Agent log directory. Its uninstall operation removes only the plist;
-configuration, data, cache, and logs remain available for reinstall and
-rollback.
+and uses a five-second throttle. launchd sends fallback stdout and stderr to
+`/dev/null`, preventing its own unbounded `agent.stdout.log` and
+`agent.stderr.log` files. Agent and Supervisor instead own sanitized,
+size-bounded `agent.jsonl` and `gateway.jsonl` files under the user's Agent log
+directory; `logs --lines N` accepts `1..10000` and tails only their active regular files. Its
+uninstall operation removes only the plist; configuration, data, cache, and
+logs remain available for reinstall and rollback.

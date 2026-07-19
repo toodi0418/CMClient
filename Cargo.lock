@@ -716,6 +716,7 @@ dependencies = [
  "chrono",
  "cmclient-agent-core",
  "cmclient-control-api",
+ "cmclient-runtime-logging",
  "cmclient-supervisor",
  "cmclient-updater",
  "ctrlc",
@@ -805,16 +806,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmclient-runtime-logging"
+version = "2.0.0-rc.1"
+dependencies = [
+ "libc",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "cmclient-service-host"
 version = "2.0.0-rc.1"
 dependencies = [
  "cmclient-control-api",
+ "cmclient-runtime-logging",
  "windows-service",
 ]
 
 [[package]]
 name = "cmclient-supervisor"
 version = "2.0.0-rc.1"
+dependencies = [
+ "cmclient-runtime-logging",
+]
 
 [[package]]
 name = "cmclient-updater"

@@ -9,6 +9,7 @@ rust-version.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cmclient-agent-core = { path = "../../crates/agent-core" }
 cmclient-control-api = { path = "../../crates/control-api" }
+cmclient-runtime-logging = { path = "../../crates/runtime-logging" }
 cmclient-supervisor = { path = "../../crates/supervisor" }
 cmclient-updater = { path = "../../crates/updater" }
 ctrlc = { version = "3.5", features = ["termination"] }

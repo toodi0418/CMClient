@@ -279,3 +279,78 @@ systemdTest(
     assert.match(workflow, /bash scripts\/cmclient-systemd-integration\.sh/);
   },
 );
+
+systemdTest(
+  "systemd logs prefer bounded application JSONL and sanitize journal fallback",
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmclient-systemd-logs-"));
+    const logDir = join(directory, "logs");
+    const journalctl = join(directory, "journalctl");
+    const journalCalls = join(directory, "journalctl-calls");
+
+    try {
+      await mkdir(logDir, { recursive: true });
+      await writeFile(
+        join(logDir, "agent.jsonl"),
+        '{"code":"AGENT_OLD"}\n{"code":"AGENT_CURRENT"}\n',
+      );
+      await writeFile(
+        join(logDir, "gateway.jsonl"),
+        '{"code":"GATEWAY_OLD"}\n{"code":"GATEWAY_CURRENT"}\n',
+      );
+      await writeFile(
+        journalctl,
+        `#!/usr/bin/env sh\nprintf '%s\\n' "$*" >> '${journalCalls}'\nprintf '%s\\n' 'AGENT_START_FAILED' 'raw secret must not escape'\n`,
+      );
+      await chmod(journalctl, 0o755);
+
+      const { stdout: applicationOutput } = await runManager([
+        "logs",
+        "--log-dir",
+        logDir,
+        "--journalctl",
+        journalctl,
+        "--lines",
+        "1",
+      ]);
+      assert.match(applicationOutput, /AGENT_CURRENT/);
+      assert.match(applicationOutput, /GATEWAY_CURRENT/);
+      assert.doesNotMatch(applicationOutput, /AGENT_OLD|GATEWAY_OLD/);
+      await assert.rejects(readFile(journalCalls, "utf8"));
+
+      await rm(join(logDir, "agent.jsonl"));
+      await rm(join(logDir, "gateway.jsonl"));
+      const { stdout: fallbackOutput } = await runManager([
+        "logs",
+        "--log-dir",
+        logDir,
+        "--unit-dir",
+        join(directory, "units"),
+        "--journalctl",
+        journalctl,
+        "--lines",
+        "17",
+        "--skip-user-setup",
+      ]);
+      assert.equal(fallbackOutput, "AGENT_START_FAILED\n");
+      assert.match(
+        await readFile(journalCalls, "utf8"),
+        /--unit cmclient-agent\.service --no-pager --lines 17 --output cat/,
+      );
+      await assert.rejects(
+        runManager(["logs", "--log-dir", logDir, "--lines", "10001"]),
+        /SYSTEMD_LOG_LINES_INVALID/,
+      );
+
+      const externalLog = join(directory, "external.jsonl");
+      await writeFile(externalLog, '{"code":"MUST_NOT_BE_READ"}\n');
+      await symlink(externalLog, join(logDir, "agent.jsonl"));
+      await assert.rejects(
+        runManager(["logs", "--log-dir", logDir]),
+        /SYSTEMD_LOG_FILE_INVALID/,
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);

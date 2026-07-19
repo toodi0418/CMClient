@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 cmclient-control-api = { path = "../../crates/control-api" }
+cmclient-runtime-logging = { path = "../../crates/runtime-logging" }
 windows-service = "0.8.1"
 
 [lints]

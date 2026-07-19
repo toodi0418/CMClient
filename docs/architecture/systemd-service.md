@@ -51,6 +51,14 @@ bash scripts/cmclient-systemd.sh restart
 bash scripts/cmclient-systemd.sh uninstall
 ```
 
+`logs --lines N` accepts `1..10000` and first tails at most `N` records from each available active
+application log, `/var/log/cmclient/agent.jsonl` and
+`/var/log/cmclient/gateway.jsonl`. The manager rejects symlinks and non-file
+entries. If neither application log exists during early startup, it reads at
+most `N` journal entries and emits only stable uppercase error codes; arbitrary
+raw journal messages never pass through this command. Agent owns JSONL
+sanitization, file permissions, size limits, and retained-file rotation.
+
 The service Control socket is `/var/lib/cmclient/control.sock`, not an
 administrator's per-user XDG socket. Root can operate the service instance with
 an explicit endpoint:

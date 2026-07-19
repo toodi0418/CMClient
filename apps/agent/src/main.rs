@@ -17,6 +17,7 @@ use cmclient_control_api::{
     RemoteControlAuth, RemoteControlAuthError, RemoteControlReplayGuard, UpdateControlJob,
     UpdateControlStatus, default_local_endpoint,
 };
+use cmclient_runtime_logging::{LogLevel, LogPolicy, StructuredLogSink};
 use cmclient_supervisor::{
     BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor, SupervisorEvent,
 };
@@ -46,6 +47,8 @@ const MAX_SSE_EVENT_BYTES: usize = 60 * 1024;
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GATEWAY_SSE_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const GATEWAY_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const AGENT_LOG_FILE: &str = "agent.jsonl";
+const GATEWAY_LOG_FILE: &str = "gateway.jsonl";
 
 struct AgentUpdateService {
     journal: UpdateJournalStore,
@@ -644,6 +647,7 @@ fn is_safe_sse_token(value: &str) -> bool {
 
 struct AgentController {
     supervisor: Mutex<Option<GatewaySupervisor>>,
+    runtime_log: Option<StructuredLogSink>,
     gateway: SocketAddr,
     management_web: Mutex<Option<ManagementWebService>>,
     management_web_shutdown: Mutex<Option<JoinHandle<Result<(), ManagementWebError>>>>,
@@ -698,6 +702,23 @@ impl Drop for SupervisorWorker {
 
 impl AgentController {
     fn from_config(config: &AgentConfig) -> Result<Self, ControlError> {
+        let mut initial_log_error_code = None;
+        let log_policy = match LogPolicy::from_environment() {
+            Ok(policy) => Some(policy),
+            Err(error) => {
+                initial_log_error_code = Some(String::from(error.code()));
+                None
+            }
+        };
+        let runtime_log = log_policy.and_then(|policy| {
+            match StructuredLogSink::open(&config.paths.log_dir, AGENT_LOG_FILE, "agent", policy) {
+                Ok(sink) => Some(sink),
+                Err(error) => {
+                    remember_initial_log_error(&mut initial_log_error_code, error.code());
+                    None
+                }
+            }
+        });
         let secrets =
             AgentSecretStore::runtime(&config.paths.data_dir).map_err(control_secret_error)?;
         let control_endpoint = default_local_endpoint(&config.paths.data_dir);
@@ -855,6 +876,21 @@ impl AgentController {
                     }
                 }
                 supervisor.set_environment(environment);
+                if let Some(policy) = log_policy {
+                    match StructuredLogSink::open(
+                        &config.paths.log_dir,
+                        GATEWAY_LOG_FILE,
+                        "gateway",
+                        policy,
+                    ) {
+                        Ok(sink) => supervisor
+                            .set_log_sink(sink)
+                            .map_err(|_| ControlError::CommandFailed)?,
+                        Err(error) => {
+                            remember_initial_log_error(&mut initial_log_error_code, error.code())
+                        }
+                    }
+                }
                 Ok(supervisor)
             })
             .transpose()?;
@@ -904,8 +940,9 @@ impl AgentController {
         } else {
             None
         };
-        Ok(Self {
+        let controller = Self {
             supervisor: Mutex::new(supervisor),
+            runtime_log,
             gateway: gateway_address(config.gateway_port),
             management_web: Mutex::new(management_web),
             management_web_shutdown: Mutex::new(None),
@@ -917,8 +954,10 @@ impl AgentController {
             updates,
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
-            latest_error_code: Mutex::new(None),
-        })
+            latest_error_code: Mutex::new(initial_log_error_code),
+        };
+        controller.log_agent_code(LogLevel::Info, "AGENT_RUNTIME_READY");
+        Ok(controller)
     }
 
     fn status(&self) -> Result<ControlStatus, ControlError> {
@@ -962,14 +1001,22 @@ impl AgentController {
                     )),
                 )
             });
-        let latest_error_code = match gateway {
-            GatewayControlStatus::Backoff => Some(String::from("GATEWAY_RESTART_BACKOFF")),
-            GatewayControlStatus::Degraded => Some(String::from("GATEWAY_HEALTH_DEGRADED")),
-            _ => self
-                .latest_error_code
-                .lock()
-                .map_err(|_| ControlError::CommandFailed)?
-                .clone(),
+        let remembered_error_code = self
+            .latest_error_code
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .clone();
+        let latest_error_code = if remembered_error_code
+            .as_deref()
+            .is_some_and(is_runtime_log_error)
+        {
+            remembered_error_code
+        } else {
+            match gateway {
+                GatewayControlStatus::Backoff => Some(String::from("GATEWAY_RESTART_BACKOFF")),
+                GatewayControlStatus::Degraded => Some(String::from("GATEWAY_HEALTH_DEGRADED")),
+                _ => remembered_error_code,
+            }
         };
         Ok(ControlStatus {
             schema_version: 2,
@@ -1086,6 +1133,7 @@ impl AgentController {
         if self.shutdown_requested.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.log_agent_code(LogLevel::Info, "AGENT_SHUTDOWN_REQUESTED");
         let endpoint = self.control_endpoint.clone();
         let _ = thread::Builder::new()
             .name(String::from("cmclient-control-shutdown-wake"))
@@ -1112,44 +1160,105 @@ impl AgentController {
     }
 
     fn remember_error_code(&self, code: &str) {
+        let log_error_code = self.write_agent_code(LogLevel::Error, code);
         if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
-            *latest_error_code = Some(String::from(code));
+            *latest_error_code = Some(String::from(log_error_code.unwrap_or(code)));
         }
     }
 
     fn clear_error(&self) {
         if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
-            *latest_error_code = None;
+            if latest_error_code
+                .as_deref()
+                .is_none_or(|code| !is_runtime_log_error(code))
+            {
+                *latest_error_code = None;
+            }
         }
+    }
+
+    fn log_agent_code(&self, level: LogLevel, code: &str) {
+        if let Some(error_code) = self.write_agent_code(level, code)
+            && let Ok(mut latest_error_code) = self.latest_error_code.lock()
+        {
+            *latest_error_code = Some(String::from(error_code));
+        }
+    }
+
+    fn write_agent_code(&self, level: LogLevel, code: &str) -> Option<&'static str> {
+        let sink = self.runtime_log.as_ref()?;
+        let write_error = sink.write_code(level, code).err().map(|error| error.code());
+        let latched_error = sink.take_error_code();
+        write_error.or(latched_error)
     }
 
     fn has_precise_supervisor_error(&self) -> bool {
         self.latest_error_code
             .lock()
             .is_ok_and(|latest_error_code| {
-                latest_error_code
-                    .as_deref()
-                    .is_some_and(|code| code.starts_with("GATEWAY_SUPERVISOR_"))
+                latest_error_code.as_deref().is_some_and(|code| {
+                    code.starts_with("GATEWAY_SUPERVISOR_") || is_runtime_log_error(code)
+                })
             })
     }
 
     fn stop_supervisor(&self) -> Result<bool, ControlError> {
-        let mut supervisor = self
-            .supervisor
-            .lock()
-            .map_err(|_| ControlError::CommandFailed)?;
-        if let Some(supervisor) = supervisor.as_mut() {
-            supervisor.stop().map_err(|_| ControlError::CommandFailed)?;
-            return Ok(true);
+        let (result, log_error_code) = {
+            let mut supervisor = self
+                .supervisor
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?;
+            let Some(supervisor) = supervisor.as_mut() else {
+                return Ok(false);
+            };
+            let result = supervisor.stop();
+            let log_error_code = supervisor.take_log_error_code();
+            (result, log_error_code)
+        };
+        if let Some(code) = log_error_code {
+            self.remember_error_code(code);
         }
-        Ok(false)
+        result.map_err(|error| {
+            self.remember_error_code(error.code());
+            ControlError::CommandFailed
+        })?;
+        self.log_agent_code(LogLevel::Info, "GATEWAY_SUPERVISOR_STOPPED");
+        Ok(true)
+    }
+
+    fn start_supervisor(&self) -> Result<bool, ControlError> {
+        self.ensure_resource_start_allowed()?;
+        let (result, log_error_code) = {
+            let mut supervisor = self
+                .supervisor
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?;
+            self.ensure_resource_start_allowed()?;
+            let Some(supervisor) = supervisor.as_mut() else {
+                return Ok(false);
+            };
+            let result = supervisor.start();
+            let log_error_code = supervisor.take_log_error_code();
+            (result, log_error_code)
+        };
+        if let Some(code) = log_error_code {
+            self.remember_error_code(code);
+        }
+        let event = result.map_err(|error| {
+            self.remember_error_code(error.code());
+            ControlError::CommandFailed
+        })?;
+        if matches!(event, SupervisorEvent::Started { .. }) {
+            self.log_agent_code(LogLevel::Info, "GATEWAY_SUPERVISOR_STARTED");
+        }
+        Ok(true)
     }
 
     fn tick_supervisor(&self) -> Result<(), ControlError> {
         if self.is_shutdown_requested() {
             return Ok(());
         }
-        let result = {
+        let (result, log_error_code) = {
             let mut supervisor = self
                 .supervisor
                 .lock()
@@ -1158,19 +1267,41 @@ impl AgentController {
                 return Ok(());
             }
             match supervisor.as_mut() {
-                Some(supervisor) => supervisor.tick().map(Some),
-                None => Ok(None),
+                Some(supervisor) => {
+                    let result = supervisor.tick().map(Some);
+                    let log_error_code = supervisor.take_log_error_code();
+                    (result, log_error_code)
+                }
+                None => (Ok(None), None),
             }
         };
+        if let Some(code) = log_error_code {
+            self.remember_error_code(code);
+        }
         match result {
-            Ok(Some(SupervisorEvent::Started { .. } | SupervisorEvent::Heartbeat { .. })) => {
+            Ok(Some(SupervisorEvent::Started { .. })) => {
                 if let Ok(mut latest_error_code) = self.latest_error_code.lock()
                     && latest_error_code
                         .as_deref()
-                        .is_some_and(|code| code.starts_with("GATEWAY_SUPERVISOR_"))
+                        .is_some_and(is_transient_supervisor_error)
                 {
                     *latest_error_code = None;
                 }
+                self.log_agent_code(LogLevel::Info, "GATEWAY_SUPERVISOR_STARTED");
+                Ok(())
+            }
+            Ok(Some(SupervisorEvent::Heartbeat { .. })) => {
+                if let Ok(mut latest_error_code) = self.latest_error_code.lock()
+                    && latest_error_code
+                        .as_deref()
+                        .is_some_and(is_transient_supervisor_error)
+                {
+                    *latest_error_code = None;
+                }
+                Ok(())
+            }
+            Ok(Some(SupervisorEvent::Exited { .. })) => {
+                self.log_agent_code(LogLevel::Warn, "GATEWAY_SUPERVISOR_EXITED");
                 Ok(())
             }
             Ok(_) => Ok(()),
@@ -1189,7 +1320,28 @@ fn shutdown_agent_runtime(
     supervisor_worker.stop();
     let supervisor_result = controller.stop_supervisor().map(|_| ());
     let management_web_result = controller.stop_management_web();
-    supervisor_result.and(management_web_result)
+    let result = supervisor_result.and(management_web_result);
+    if result.is_ok() {
+        controller.log_agent_code(LogLevel::Info, "AGENT_RUNTIME_STOPPED");
+    }
+    result
+}
+
+fn remember_initial_log_error(current: &mut Option<String>, code: &'static str) {
+    if current.is_none() {
+        *current = Some(String::from(code));
+    }
+}
+
+fn is_runtime_log_error(code: &str) -> bool {
+    code.starts_with("RUNTIME_LOG_")
+}
+
+fn is_transient_supervisor_error(code: &str) -> bool {
+    matches!(
+        code,
+        "GATEWAY_SUPERVISOR_SPAWN_FAILED" | "GATEWAY_SUPERVISOR_PROCESS_IO_FAILED"
+    )
 }
 
 impl ControlHandler for AgentController {
@@ -1197,18 +1349,9 @@ impl ControlHandler for AgentController {
         let result = match command {
             ControlCommand::Status => self.status(),
             ControlCommand::Start => {
-                self.ensure_resource_start_allowed()?;
-                let mut supervisor = self
-                    .supervisor
-                    .lock()
-                    .map_err(|_| ControlError::CommandFailed)?;
-                self.ensure_resource_start_allowed()?;
-                supervisor
-                    .as_mut()
-                    .ok_or(ControlError::CommandFailed)?
-                    .start()
-                    .map_err(|_| ControlError::CommandFailed)?;
-                drop(supervisor);
+                self.start_supervisor()?
+                    .then_some(())
+                    .ok_or(ControlError::CommandFailed)?;
                 self.status()
             }
             ControlCommand::Stop => {
@@ -1219,19 +1362,12 @@ impl ControlHandler for AgentController {
             }
             ControlCommand::Restart => {
                 self.ensure_resource_start_allowed()?;
-                {
-                    let mut supervisor = self
-                        .supervisor
-                        .lock()
-                        .map_err(|_| ControlError::CommandFailed)?;
-                    self.ensure_resource_start_allowed()?;
-                    let supervisor = supervisor.as_mut().ok_or(ControlError::CommandFailed)?;
-                    supervisor.stop().map_err(|_| ControlError::CommandFailed)?;
-                    self.ensure_resource_start_allowed()?;
-                    supervisor
-                        .start()
-                        .map_err(|_| ControlError::CommandFailed)?;
-                }
+                self.stop_supervisor()?
+                    .then_some(())
+                    .ok_or(ControlError::CommandFailed)?;
+                self.start_supervisor()?
+                    .then_some(())
+                    .ok_or(ControlError::CommandFailed)?;
                 self.status()
             }
             ControlCommand::ShutdownAgent => {
@@ -1244,9 +1380,7 @@ impl ControlHandler for AgentController {
         match &result {
             Ok(_) if !matches!(command, ControlCommand::Status) => self.clear_error(),
             Ok(_) => {}
-            Err(ControlError::CommandFailed)
-                if matches!(command, ControlCommand::Status)
-                    && self.has_precise_supervisor_error() => {}
+            Err(ControlError::CommandFailed) if self.has_precise_supervisor_error() => {}
             Err(error) => self.remember_error(error),
         }
         result
@@ -1846,17 +1980,20 @@ fn serve() -> ExitCode {
     let server = match ControlServer::bind(endpoint, control_handler) {
         Ok(server) => server,
         Err(error) => {
+            controller.remember_error(&error);
             eprintln!("{}", error.code());
             return ExitCode::from(EX_CONFIG);
         }
     };
     if let Err(error) = install_shutdown_signal_handler(Arc::clone(&controller)) {
+        controller.remember_error(&error);
         eprintln!("{}", error.code());
         return ExitCode::from(EX_CONFIG);
     }
     let mut supervisor_worker = match SupervisorWorker::start(Arc::clone(&controller)) {
         Ok(worker) => worker,
         Err(error) => {
+            controller.remember_error(&error);
             eprintln!("{}", error.code());
             return ExitCode::from(EX_CONFIG);
         }
@@ -1873,9 +2010,11 @@ fn serve() -> ExitCode {
     };
     let shutdown_error = shutdown_agent_runtime(&controller, &mut supervisor_worker).err();
     if let Some(error) = &serve_error {
+        controller.remember_error(error);
         eprintln!("{}", error.code());
     }
     if let Some(error) = shutdown_error {
+        controller.remember_error(&error);
         eprintln!("{}", error.code());
         return ExitCode::from(EX_CONFIG);
     }
@@ -2574,6 +2713,81 @@ mod tests {
                 .as_deref(),
             Some("GATEWAY_SUPERVISOR_SPAWN_FAILED")
         );
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn service_logs_agent_lifecycle_and_preserves_gateway_log_failures() {
+        let sequence = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should follow epoch")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-runtime-logging-{}-{sequence}",
+            std::process::id()
+        ));
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(log_dir.join("gateway.jsonl"))
+            .expect("unsafe gateway log fixture should create");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: log_dir.clone(),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                String::from("read _"),
+            ]),
+            gateway_port: 48_112,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            AgentController::from_config(&config).expect("controller should initialize");
+
+        let started = controller
+            .handle(ControlCommand::Start)
+            .expect("gateway should start without a logging sink");
+        assert_eq!(
+            started.latest_error_code.as_deref(),
+            Some("RUNTIME_LOG_FILE_UNAVAILABLE")
+        );
+        let heartbeat = controller
+            .handle(ControlCommand::Status)
+            .expect("healthy supervisor tick should succeed");
+        assert_eq!(
+            heartbeat.latest_error_code.as_deref(),
+            Some("RUNTIME_LOG_FILE_UNAVAILABLE")
+        );
+        let stopped = controller
+            .handle(ControlCommand::Stop)
+            .expect("gateway should stop");
+        assert_eq!(
+            stopped.latest_error_code.as_deref(),
+            Some("RUNTIME_LOG_FILE_UNAVAILABLE")
+        );
+
+        let agent_log =
+            std::fs::read_to_string(log_dir.join("agent.jsonl")).expect("agent log should read");
+        assert!(agent_log.contains("AGENT_RUNTIME_READY"));
+        assert!(agent_log.contains("GATEWAY_SUPERVISOR_STARTED"));
+        assert!(agent_log.contains("GATEWAY_SUPERVISOR_STOPPED"));
+        assert!(!agent_log.contains(data_dir.to_string_lossy().as_ref()));
+        for line in agent_log.lines() {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("agent log lines should be structured JSON");
+        }
+
+        drop(controller);
         std::fs::remove_dir_all(data_dir).expect("test directory should remove");
     }
 

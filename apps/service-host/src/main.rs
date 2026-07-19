@@ -1,4 +1,6 @@
 #[cfg(any(windows, test))]
+use std::ffi::OsStr;
+#[cfg(any(windows, test))]
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -12,6 +14,38 @@ fn agent_path_from_host(host: &Path) -> PathBuf {
     } else {
         "cmclient-agent"
     })
+}
+
+#[cfg(any(windows, test))]
+fn is_sensitive_environment_name(name: &OsStr) -> bool {
+    let normalized: String = name
+        .to_string_lossy()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    [
+        "apikey",
+        "authorization",
+        "passcode",
+        "password",
+        "secret",
+        "token",
+        "credential",
+        "cookie",
+        "session",
+        "privatekey",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+#[cfg(windows)]
+fn sensitive_process_environment_values() -> Vec<String> {
+    std::env::vars_os()
+        .filter(|(name, value)| !value.is_empty() && is_sensitive_environment_name(name))
+        .map(|(_, value)| value.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[cfg(any(windows, test))]
@@ -72,13 +106,17 @@ fn main() -> ExitCode {
 
 #[cfg(windows)]
 mod service {
-    use super::{SERVICE_NAME, agent_path_from_host, run_before_deadline};
+    use super::{
+        SERVICE_NAME, agent_path_from_host, run_before_deadline,
+        sensitive_process_environment_values,
+    };
     use cmclient_control_api::{ControlClient, default_local_endpoint};
+    use cmclient_runtime_logging::{ChildOutputCapture, LogLevel, LogPolicy, StructuredLogSink};
     use std::{
         ffi::OsString,
         io,
         path::PathBuf,
-        process::{Child, Command, Stdio},
+        process::{Child, Command, ExitStatus, Stdio},
         sync::mpsc,
         thread,
         time::{Duration, Instant},
@@ -98,6 +136,43 @@ mod service {
     const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
     const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
     const SERVICE_TRANSITION_WAIT_HINT: Duration = Duration::from_secs(60);
+
+    struct ManagedAgent {
+        child: Child,
+        capture: Option<ChildOutputCapture>,
+        log: StructuredLogSink,
+    }
+
+    impl ManagedAgent {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            self.child.try_wait()
+        }
+
+        fn finish_capture(&mut self) {
+            if let Some(capture) = self.capture.take()
+                && let Err(error) = capture.finish()
+            {
+                eprintln!("{}", error.code());
+                let _ = self.log.write_code(LogLevel::Error, error.code());
+            }
+        }
+
+        fn write_code(&self, code: &str) {
+            if let Err(error) = self.log.write_code(LogLevel::Info, code) {
+                eprintln!("{}", error.code());
+            }
+        }
+    }
+
+    impl Drop for ManagedAgent {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+            self.finish_capture();
+        }
+    }
 
     pub fn run() -> windows_service::Result<()> {
         service_dispatcher::start(SERVICE_NAME, ffi_service_main)
@@ -145,6 +220,8 @@ mod service {
         let mut exit_code = ServiceExitCode::NO_ERROR;
         loop {
             if let Some(status) = agent.try_wait()? {
+                agent.finish_capture();
+                agent.write_code("WINDOWS_SERVICE_AGENT_EXITED");
                 if !status.success() {
                     exit_code = ServiceExitCode::Win32(1);
                 }
@@ -152,6 +229,7 @@ mod service {
             }
             match shutdown_rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    agent.write_code("WINDOWS_SERVICE_STOP_REQUESTED");
                     set_status(
                         &status_handle,
                         ServiceState::StopPending,
@@ -159,6 +237,7 @@ mod service {
                         1,
                     )?;
                     stop_agent(&mut agent, &runtime_root)?;
+                    agent.write_code("WINDOWS_SERVICE_AGENT_STOPPED");
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -200,10 +279,21 @@ mod service {
         })
     }
 
-    fn start_agent(root: &std::path::Path) -> io::Result<Child> {
+    fn start_agent(root: &std::path::Path) -> io::Result<ManagedAgent> {
         let host = std::env::current_exe()?;
         let agent = agent_path_from_host(&host);
-        Command::new(agent)
+        let policy = LogPolicy::from_environment().map_err(runtime_log_io_error)?;
+        let log = StructuredLogSink::open(
+            root.join("logs"),
+            "service-host.jsonl",
+            "service-host",
+            policy,
+        )
+        .map_err(runtime_log_io_error)?;
+        log.write_code(LogLevel::Info, "WINDOWS_SERVICE_AGENT_STARTING")
+            .map_err(runtime_log_io_error)?;
+        let mut command = Command::new(agent);
+        command
             .arg("--serve")
             .env("HOME", root.join("home"))
             .env("USERPROFILE", root.join("home"))
@@ -212,16 +302,48 @@ mod service {
             .env("CMCLIENT_CACHE_DIR", root.join("cache"))
             .env("CMCLIENT_LOG_DIR", root.join("logs"))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = log.write_code(LogLevel::Error, "WINDOWS_SERVICE_AGENT_START_FAILED");
+                return Err(error);
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            terminate_failed_capture_start(&mut child);
+            let _ = log.write_code(LogLevel::Error, "RUNTIME_LOG_CAPTURE_STDOUT_MISSING");
+            return Err(io::Error::other("RUNTIME_LOG_CAPTURE_STDOUT_MISSING"));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            terminate_failed_capture_start(&mut child);
+            let _ = log.write_code(LogLevel::Error, "RUNTIME_LOG_CAPTURE_STDERR_MISSING");
+            return Err(io::Error::other("RUNTIME_LOG_CAPTURE_STDERR_MISSING"));
+        };
+        let capture = match log.capture(stdout, stderr, sensitive_process_environment_values()) {
+            Ok(capture) => capture,
+            Err(error) => {
+                terminate_failed_capture_start(&mut child);
+                let _ = log.write_code(LogLevel::Error, error.code());
+                return Err(runtime_log_io_error(error));
+            }
+        };
+        let managed = ManagedAgent {
+            child,
+            capture: Some(capture),
+            log,
+        };
+        managed.write_code("WINDOWS_SERVICE_AGENT_STARTED");
+        Ok(managed)
     }
 
-    fn stop_agent(agent: &mut Child, runtime_root: &std::path::Path) -> io::Result<()> {
+    fn stop_agent(agent: &mut ManagedAgent, runtime_root: &std::path::Path) -> io::Result<()> {
         let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
         let mut graceful_requested = false;
         while Instant::now() < deadline {
             if agent.try_wait()?.is_some() {
+                agent.finish_capture();
                 return Ok(());
             }
             if !graceful_requested {
@@ -241,13 +363,23 @@ mod service {
             };
             thread::sleep(remaining.min(SHUTDOWN_POLL_INTERVAL));
         }
-        match agent.kill() {
+        match agent.child.kill() {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
             Err(error) => return Err(error),
         }
-        let _ = agent.wait()?;
+        let _ = agent.child.wait()?;
+        agent.finish_capture();
         Ok(())
+    }
+
+    fn terminate_failed_capture_start(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn runtime_log_io_error(error: cmclient_runtime_logging::RuntimeLogError) -> io::Error {
+        io::Error::other(error.code())
     }
 
     fn program_data_directory() -> PathBuf {
@@ -261,8 +393,9 @@ mod service {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_path_from_host, run_before_deadline};
+    use super::{agent_path_from_host, is_sensitive_environment_name, run_before_deadline};
     use std::{
+        ffi::OsStr,
         path::Path,
         sync::mpsc,
         thread,
@@ -280,6 +413,25 @@ mod tests {
                 "cmclient-agent"
             })
         );
+    }
+
+    #[test]
+    fn identifies_only_secret_bearing_environment_names() {
+        for name in [
+            "CMCLIENT_CALLMESH_API_KEY",
+            "CMCLIENT_APRS_PASSCODE",
+            "CMCLIENT_MANAGEMENT_ADMIN_TOKEN",
+            "HTTP_AUTHORIZATION",
+        ] {
+            assert!(is_sensitive_environment_name(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "CMCLIENT_LOG_MAX_BYTES",
+            "CMCLIENT_DATA_DIR",
+            "CMCLIENT_GATEWAY_HOST",
+        ] {
+            assert!(!is_sensitive_environment_name(OsStr::new(name)), "{name}");
+        }
     }
 
     #[test]

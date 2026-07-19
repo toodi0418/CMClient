@@ -38,8 +38,8 @@
   <key>ThrottleInterval</key>
   <integer>5</integer>
   <key>StandardOutPath</key>
-  <string>@LOG_DIR@/agent.stdout.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>@LOG_DIR@/agent.stderr.log</string>
+  <string>/dev/null</string>
 </dict>
 </plist>
