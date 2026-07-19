@@ -71,6 +71,7 @@ describe("gateway API client", () => {
             state: "ready",
             updatedAt: "2026-07-18T00:00:00.000Z",
             activeMappingCount: 0,
+            provisionState: "unavailable",
           },
           mappings: [],
         });
@@ -78,7 +79,7 @@ describe("gateway API client", () => {
     });
 
     await expect(client.callmesh.overview()).resolves.toMatchObject({
-      status: { state: "ready" },
+      status: { state: "ready", provisionState: "unavailable" },
     });
     expect(url).toBe("/api/v1/callmesh");
   });

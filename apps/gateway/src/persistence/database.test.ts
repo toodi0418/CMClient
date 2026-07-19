@@ -44,7 +44,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT version FROM schema_migrations")
         .all(),
-    ).toHaveLength(13);
+    ).toHaveLength(14);
     for (const [table, primaryKey] of [
       [
         "node_position_state",
@@ -55,6 +55,8 @@ describe("GatewayDatabase", () => {
         ["mesh_network_id", "node_num", "callsign", "mapping_version"],
       ],
       ["aprs_delivery_high_water", ["mesh_network_id", "node_num", "callsign"]],
+      ["callmesh_sync_state", ["id"]],
+      ["callmesh_sync_history", ["mapping_hash"]],
     ] as const) {
       expect(
         database.connection
@@ -291,7 +293,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 13 });
+    ).toEqual({ version: 14 });
     expect(
       database.connection
         .prepare("SELECT * FROM aprs_delivery_high_water")
@@ -363,6 +365,113 @@ describe("GatewayDatabase", () => {
     expect(
       database.connection.prepare("PRAGMA foreign_key_check").all(),
     ).toEqual([]);
+    expect(database.integrityCheck()).toBe("ok");
+    database.close();
+  });
+
+  it("migrates v13 databases to a singleton CallMesh sync high-water", () => {
+    const database = new GatewayDatabase(
+      ":memory:",
+      gatewayMigrations.filter((migration) => migration.version <= 13),
+    );
+    expect(
+      database.connection
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'callmesh_sync_state'",
+        )
+        .get(),
+    ).toBeUndefined();
+
+    runMigrations(database.connection, gatewayMigrations);
+
+    expect(
+      database.connection
+        .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+        .get(),
+    ).toEqual({ version: 14 });
+    const firstFingerprint = "a".repeat(64);
+    const secondFingerprint = "b".repeat(64);
+    const insertState = database.connection.prepare(
+      "INSERT INTO callmesh_sync_state (id, active, mapping_hash, accepted_server_time, mappings_fingerprint, last_heartbeat_at, mapping_synced_at, provision_json, provision_expires_at, provision_fingerprint, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    insertState.run(
+      1,
+      1,
+      "mapping-current",
+      "2026-07-18T00:00:00.000Z",
+      firstFingerprint,
+      "2026-07-18T00:00:01.000Z",
+      "2026-07-18T00:00:01.000Z",
+      null,
+      null,
+      null,
+      "2026-07-18T00:00:01.000Z",
+    );
+    expect(() =>
+      insertState.run(
+        2,
+        1,
+        "mapping-other",
+        "2026-07-18T00:00:02.000Z",
+        secondFingerprint,
+        "2026-07-18T00:00:02.000Z",
+        "2026-07-18T00:00:02.000Z",
+        null,
+        null,
+        null,
+        "2026-07-18T00:00:02.000Z",
+      ),
+    ).toThrow();
+    database.connection
+      .prepare("UPDATE callmesh_sync_state SET active = 0 WHERE id = 1")
+      .run();
+    expect(
+      database.connection
+        .prepare("SELECT active FROM callmesh_sync_state WHERE id = 1")
+        .get(),
+    ).toEqual({ active: 0 });
+    expect(() =>
+      database.connection
+        .prepare("UPDATE callmesh_sync_state SET active = 2 WHERE id = 1")
+        .run(),
+    ).toThrow();
+    expect(() =>
+      database.connection
+        .prepare(
+          "UPDATE callmesh_sync_state SET provision_json = ?, provision_expires_at = NULL, provision_fingerprint = NULL WHERE id = 1",
+        )
+        .run('{"callsignBase":"N0CALL"}'),
+    ).toThrow();
+
+    const rememberHash = database.connection.prepare(
+      "INSERT INTO callmesh_sync_history (mapping_hash, first_server_time, last_server_time, mappings_fingerprint) VALUES (?, ?, ?, ?) ON CONFLICT(mapping_hash) DO UPDATE SET last_server_time = excluded.last_server_time WHERE excluded.last_server_time > callmesh_sync_history.last_server_time",
+    );
+    rememberHash.run(
+      "mapping-current",
+      "2026-07-18T00:00:00.000Z",
+      "2026-07-18T00:00:00.000Z",
+      firstFingerprint,
+    );
+    rememberHash.run(
+      "mapping-current",
+      "2026-07-18T00:00:03.000Z",
+      "2026-07-18T00:00:03.000Z",
+      secondFingerprint,
+    );
+    rememberHash.run(
+      "mapping-current",
+      "2026-07-17T23:59:59.000Z",
+      "2026-07-18T00:00:02.000Z",
+      secondFingerprint,
+    );
+    expect(
+      database.connection.prepare("SELECT * FROM callmesh_sync_history").get(),
+    ).toEqual({
+      mapping_hash: "mapping-current",
+      first_server_time: "2026-07-18T00:00:00.000Z",
+      last_server_time: "2026-07-18T00:00:03.000Z",
+      mappings_fingerprint: firstFingerprint,
+    });
     expect(database.integrityCheck()).toBe("ok");
     database.close();
   });
@@ -459,7 +568,7 @@ describe("GatewayDatabase", () => {
     expect(() =>
       runMigrations(database.connection, [
         {
-          version: 14,
+          version: 15,
           name: "broken",
           up(connection) {
             connection.exec(
@@ -472,7 +581,7 @@ describe("GatewayDatabase", () => {
     ).toThrow(DatabaseMigrationError);
     expect(
       database.connection
-        .prepare("SELECT version FROM schema_migrations WHERE version = 14")
+        .prepare("SELECT version FROM schema_migrations WHERE version = 15")
         .get(),
     ).toBeUndefined();
     expect(

@@ -237,7 +237,10 @@ describe("CallMesh contract", () => {
           state: "ready",
           updatedAt: "2026-07-18T00:00:00.000Z",
           activeMappingVersion: "mapping-1",
+          activeMappingHash: "hash-1",
           activeMappingCount: 1,
+          provisionState: "valid",
+          lastServerTime: "2026-07-18T00:00:00.000Z",
         },
         mappings: [
           {
@@ -256,6 +259,7 @@ describe("CallMesh contract", () => {
           state: "ready",
           updatedAt: "2026-07-18T00:00:00.000Z",
           activeMappingCount: 0,
+          provisionState: "unavailable",
           apiKey: "must-not-be-public",
         },
         mappings: [],

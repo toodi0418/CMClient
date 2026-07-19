@@ -1211,4 +1211,16 @@ export const gatewayMigrations: Migration[] = [
       );
     },
   },
+  {
+    version: 14,
+    name: "callmesh_sync_high_water",
+    up(database) {
+      database.exec(
+        "CREATE TABLE callmesh_sync_state (id INTEGER PRIMARY KEY CHECK (id = 1), active INTEGER NOT NULL CHECK (active IN (0, 1)), mapping_hash TEXT NOT NULL CHECK (length(mapping_hash) BETWEEN 1 AND 128), accepted_server_time TEXT NOT NULL, mappings_fingerprint TEXT NOT NULL CHECK (length(mappings_fingerprint) = 64), last_heartbeat_at TEXT NOT NULL, mapping_synced_at TEXT NOT NULL, provision_json TEXT, provision_expires_at TEXT, provision_fingerprint TEXT CHECK (provision_fingerprint IS NULL OR length(provision_fingerprint) = 64), updated_at TEXT NOT NULL, CHECK ((provision_json IS NULL AND provision_expires_at IS NULL AND provision_fingerprint IS NULL) OR (provision_json IS NOT NULL AND provision_expires_at IS NOT NULL AND provision_fingerprint IS NOT NULL)))",
+      );
+      database.exec(
+        "CREATE TABLE callmesh_sync_history (mapping_hash TEXT PRIMARY KEY CHECK (length(mapping_hash) BETWEEN 1 AND 128), first_server_time TEXT NOT NULL, last_server_time TEXT NOT NULL, mappings_fingerprint TEXT NOT NULL CHECK (length(mappings_fingerprint) = 64))",
+      );
+    },
+  },
 ];

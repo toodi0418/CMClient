@@ -1,11 +1,14 @@
 {
-  "mappings": [
+  "hash": "bWFwcGluZy8rPQ==",
+  "items": [
     {
-      "version": "mapping-2026-07",
-      "effectiveAt": "2026-07-18T00:00:00.000Z",
-      "meshNetworkId": "fixture-network",
-      "nodeNum": 42,
-      "callsign": "N0CALL-7"
+      "mesh_id_normalized": "!0000002a",
+      "aprs_callsign_base": "N0CALL",
+      "aprs_ssid": -7,
+      "aprs_enabled": true,
+      "symbol": "/>",
+      "aprs_symbol_overlay": null,
+      "aprs_comment": "Sanitized Legacy mapping fixture"
     }
   ]
 }

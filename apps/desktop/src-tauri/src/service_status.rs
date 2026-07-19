@@ -457,7 +457,8 @@ mod tests {
             Ok(json!({
                 "status": {
                     "state": "ready",
-                    "activeMappingCount": 3
+                    "activeMappingCount": 3,
+                    "provisionState": "valid"
                 },
                 "mappings": []
             })),
@@ -476,7 +477,11 @@ mod tests {
         let aprs_unavailable = project_aprs_callmesh(
             Err(String::from("CONTROL_TIMEOUT")),
             Ok(json!({
-                "status": { "state": "ready", "activeMappingCount": 1 },
+                "status": {
+                    "state": "ready",
+                    "activeMappingCount": 1,
+                    "provisionState": "valid"
+                },
                 "mappings": []
             })),
         );
@@ -536,7 +541,11 @@ mod tests {
                 "failedOutbox": 0
             })),
             Ok(json!({
-                "status": { "state": "checking", "activeMappingCount": 0 },
+                "status": {
+                    "state": "checking",
+                    "activeMappingCount": 0,
+                    "provisionState": "unavailable"
+                },
                 "mappings": []
             })),
             Ok(json!({

@@ -22,6 +22,13 @@ outbox rows and records the mapping version on new delivery watermarks. Legacy
 rows retain a null mapping version. Equal-time legacy events with different
 canonical identities always fail closed because `NULL/NULL` cannot prove that
 their mapping-derived sequence epochs are comparable.
+Migration 14 adds the singleton CallMesh synchronization snapshot and a durable
+mapping-hash history. The active mapping rows, accepted server time, mapping
+fingerprint, heartbeat receive time, and optional provision lease are replaced
+in the same transaction. Each hash keeps its immutable first server time and a
+monotonic last server time. The provision is normalized and stored without an
+APRS passcode; the history prevents a previously superseded mapping hash from
+becoming active after restart.
 The Job table stores a type, JSON execution input/result, stable error
 code/params, lifecycle timestamps, cancellation flag, and a partial unique
 `(type, idempotency_key)` index. Public APIs never return stored execution input

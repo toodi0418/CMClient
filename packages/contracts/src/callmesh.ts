@@ -10,6 +10,54 @@ export const CALLMESH_STATES = [
   "degraded",
 ] as const;
 
+export const CALLMESH_PROVISION_STATES = [
+  "unavailable",
+  "valid",
+  "expired",
+  "revoked",
+  "invalid",
+] as const;
+
+const APRS_PRINTABLE_CHARACTER = "^[ -~]$";
+
+export const CallMeshProvisionSchema = Type.Object(
+  {
+    callsignBase: Type.String({ pattern: "^[A-Z0-9]{1,6}$" }),
+    ssid: Type.Integer({ minimum: -15, maximum: 15 }),
+    symbolTable: Type.String({
+      minLength: 1,
+      maxLength: 1,
+      pattern: APRS_PRINTABLE_CHARACTER,
+    }),
+    symbolCode: Type.String({
+      minLength: 1,
+      maxLength: 1,
+      pattern: APRS_PRINTABLE_CHARACTER,
+    }),
+    symbolOverlay: Type.Optional(
+      Type.Union([
+        Type.String({
+          minLength: 1,
+          maxLength: 1,
+          pattern: APRS_PRINTABLE_CHARACTER,
+        }),
+        Type.Null(),
+      ]),
+    ),
+    comment: Type.Optional(
+      Type.String({ minLength: 1, maxLength: 80, pattern: "^[^\\r\\n]*$" }),
+    ),
+    latitude: Type.Optional(Type.Number({ minimum: -90, maximum: 90 })),
+    longitude: Type.Optional(Type.Number({ minimum: -180, maximum: 180 })),
+    txPowerW: Type.Optional(Type.Number({ minimum: 0, maximum: 10_000 })),
+    antennaGainDbi: Type.Optional(Type.Number({ minimum: -100, maximum: 100 })),
+    antennaHeightM: Type.Optional(
+      Type.Number({ minimum: 0, maximum: 100_000 }),
+    ),
+  },
+  { additionalProperties: false },
+);
+
 export const CallMeshMappingSchema = Type.Object(
   {
     version: Type.String({ minLength: 1, maxLength: 128 }),
@@ -29,7 +77,14 @@ export const CallMeshStatusSchema = Type.Object(
     activeMappingVersion: Type.Optional(
       Type.String({ minLength: 1, maxLength: 128 }),
     ),
+    activeMappingHash: Type.Optional(
+      Type.String({ minLength: 1, maxLength: 128 }),
+    ),
     activeMappingCount: Type.Integer({ minimum: 0 }),
+    provisionState: Type.Union(
+      CALLMESH_PROVISION_STATES.map((state) => Type.Literal(state)),
+    ),
+    lastServerTime: Type.Optional(Type.String({ pattern: UTC_ISO_TIMESTAMP })),
   },
   { additionalProperties: false },
 );
@@ -43,5 +98,6 @@ export const CallMeshOverviewSchema = Type.Object(
 );
 
 export type CallMeshMapping = Static<typeof CallMeshMappingSchema>;
+export type CallMeshProvision = Static<typeof CallMeshProvisionSchema>;
 export type CallMeshStatus = Static<typeof CallMeshStatusSchema>;
 export type CallMeshOverview = Static<typeof CallMeshOverviewSchema>;

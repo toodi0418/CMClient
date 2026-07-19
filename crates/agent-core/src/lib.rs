@@ -308,7 +308,7 @@ impl AgentConfig {
             .callmesh
             .map(|callmesh| {
                 let url = callmesh.url.trim();
-                if !is_https_url(url) {
+                if !is_https_origin(url) {
                     return Err(ConfigError::InvalidCallMesh);
                 }
                 Ok(CallMeshConfig {
@@ -484,12 +484,17 @@ fn single_printable_ascii(value: &str) -> Option<char> {
         .then_some(character)
 }
 
-fn is_https_url(value: &str) -> bool {
+fn is_https_origin(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("https://") else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty() && !authority.contains('@') && !authority.contains(char::is_whitespace)
+    let boundary = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(boundary);
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !authority.contains('\\')
+        && !authority.contains(char::is_whitespace)
+        && (suffix.is_empty() || suffix == "/")
 }
 
 impl RuntimePaths {
@@ -770,7 +775,7 @@ mod tests {
         );
         fs::write(
             &config_file,
-            "[callmesh]\nurl = \"https://api.example.invalid/v1\"\n",
+            "[callmesh]\nurl = \"https://callmesh.example.invalid/\"\n",
         )
         .expect("configuration should be written");
 
@@ -781,7 +786,16 @@ mod tests {
                 .callmesh
                 .expect("CallMesh configuration should exist")
                 .url,
-            "https://api.example.invalid/v1"
+            "https://callmesh.example.invalid/"
+        );
+        fs::write(
+            &config_file,
+            "[callmesh]\nurl = \"https://callmesh.example.invalid/v1\"\n",
+        )
+        .expect("configuration should be written");
+        assert_eq!(
+            AgentConfig::from_environment(&environment),
+            Err(ConfigError::InvalidCallMesh)
         );
         fs::write(
             &config_file,

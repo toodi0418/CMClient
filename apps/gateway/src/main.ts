@@ -6,7 +6,7 @@ import { createVerifiedGatewayBackup } from "./backup.js";
 import { DomainEventBus } from "./events.js";
 import { JobEngine } from "./jobs.js";
 import { GatewayDatabase } from "./persistence/database.js";
-import { CallMeshClient } from "./callmesh.js";
+import { callMeshOptionsFromEnvironment, CallMeshClient } from "./callmesh.js";
 import type { AprsGatewayRuntime } from "./aprs-runtime.js";
 import type { MeshGatewayRuntime } from "./mesh-runtime.js";
 import type { GatewayMaintenanceRuntime } from "./maintenance.js";
@@ -27,6 +27,7 @@ import {
   runCleanupPhases,
 } from "./shutdown.js";
 import { TcpMeshtasticTransport } from "./transport/tcp.js";
+import { compiledGatewayBuildVersion } from "./system.js";
 
 void runGateway().catch((error: unknown) => {
   process.stderr.write(`${runtimeErrorCode(error, "GATEWAY_MAIN_FAILED")}\n`);
@@ -150,13 +151,11 @@ async function runGateway(): Promise<void> {
     activeJobs.recover();
     context.throwIfShutdownRequested();
 
-    const callmeshUrl = process.env.CMCLIENT_CALLMESH_URL?.trim();
-    const callmeshApiKey = process.env.CMCLIENT_CALLMESH_API_KEY;
     const callmesh = new CallMeshClient(
-      {
-        baseUrl: callmeshUrl || "http://127.0.0.1:9",
-        ...(callmeshUrl && callmeshApiKey ? { apiKey: callmeshApiKey } : {}),
-      },
+      callMeshOptionsFromEnvironment(
+        process.env,
+        compiledGatewayBuildVersion(),
+      ),
       activeDatabase.callmeshMappings,
     );
     context.throwIfShutdownRequested();
@@ -165,10 +164,7 @@ async function runGateway(): Promise<void> {
       synchronizeCallMesh(callmesh, activeEvents),
     );
     context.throwIfShutdownRequested();
-    const verifiedMappings = () => {
-      const overview = callmesh.getOverview();
-      return overview.status.state === "ready" ? overview.mappings : [];
-    };
+    const verifiedMappings = () => callmesh.getMappingsForUse();
 
     proxy = await createConfiguredProxyRuntime(process.env, activeEvents);
     context.throwIfShutdownRequested();

@@ -38,6 +38,24 @@ local and APRS-monitor high-water checks, deterministic APRS encoding, and the
 durable outbox. Mapping conflicts, inadequate precision, untrusted ordering,
 and unmapped nodes do not enqueue an upload.
 
+## CallMesh runtime
+
+The isolated client uses the production Legacy contract at
+`https://callmesh.tmmarc.org`. It uses POST for
+`/api/v1/client/heartbeat`, followed only when requested or no local snapshot
+exists by `/api/v1/client/mappings`. Both requests use `X-API-Key` and the bounded
+`callmesh-client/<version> (<platform>; <architecture>)` agent; credentials are
+never placed in URLs, request diagnostics, events, or projections. Redirects
+are rejected and response bodies are incrementally limited to 512 KiB.
+
+Heartbeat, normalized mappings, server time, payload fingerprints, and the
+normalized provision are committed in one SQLite transaction. Mapping hashes
+are remembered as a durable no-downgrade high-water across restarts. A
+provision has a three-minute lease measured from the successful local receive
+time; revocation, expiry, clock rollback, schema conflict, or an untrusted
+revision makes it unavailable to APRS. Public status exposes only provision
+state, never callsign identity, symbols, comment, or a derived passcode.
+
 ## APRS runtime
 
 APRS is enabled only when Agent supplies a validated login callsign and an

@@ -194,6 +194,7 @@ describe("GatewayRuntime", () => {
             updatedAt: "2026-07-18T00:00:00.000Z",
             reasonCode: "CALLMESH_AUTH_INVALID",
             activeMappingCount: 0,
+            provisionState: "invalid",
           },
           mappings: [],
         }),

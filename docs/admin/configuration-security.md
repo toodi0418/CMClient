@@ -12,7 +12,7 @@ gateway_port = 4810
 management_web_enabled = true
 
 [callmesh]
-url = "https://api.callmesh.example/v1"
+url = "https://callmesh.tmmarc.org"
 
 [meshtastic]
 transport = "tcp"

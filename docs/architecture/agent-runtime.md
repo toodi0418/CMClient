@@ -51,15 +51,16 @@ bridge; the remote CLI reads the same value from `CMCLIENT_CONTROL_TOKEN` in its
 own process environment. Neither side accepts it as a command argument.
 
 CallMesh's non-secret endpoint is optional Agent configuration. Its URL must be
-HTTPS; at Gateway launch Agent drops inherited application configuration,
-retaining only launcher variables such as `PATH`/Windows runtime paths, and
-passes this URL plus a CallMesh API key only when that key is present in the
-Agent-selected secret backend. Gateway therefore cannot inherit a legacy API
-key from the parent shell.
+an exact HTTPS origin with no path, query, fragment, or embedded credential. At
+Gateway launch Agent drops inherited application configuration, retaining only
+launcher variables such as `PATH`/Windows runtime paths, and passes this URL
+plus a CallMesh API key only when that key is present in the Agent-selected
+secret backend. Gateway therefore cannot inherit a legacy API key from the
+parent shell.
 
 ```toml
 [callmesh]
-url = "https://api.callmesh.example/v1"
+url = "https://callmesh.tmmarc.org"
 ```
 
 Meshtastic, APRS, and Proxy operational settings are also strict non-secret

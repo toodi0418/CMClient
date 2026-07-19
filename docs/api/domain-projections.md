@@ -64,10 +64,13 @@ and stable last-error code. It never returns APRS Data. APRS upload requires
 
 `CallMeshOverview.status` is an object containing `state` (`unavailable`,
 `checking`, `ready`, or `degraded`), `updatedAt`, optional `reasonCode`, optional
-`activeMappingVersion`, and `activeMappingCount`. The separate `mappings` array
+`activeMappingVersion`, optional `activeMappingHash`, `activeMappingCount`,
+`provisionState`, and optional `lastServerTime`. The separate `mappings` array
 contains validated version, effective time, network, node, and callsign values.
-An API key is never part of this response. Invalid schema, credentials, or
-mapping conflicts clear the affected mapping state and fail closed.
+The API key and provision identity/configuration are never part of this
+response. Invalid schema, credentials, stale revisions, or mapping conflicts
+make the set ineligible for downstream use while retaining the last durable
+high-water needed to reject a later downgrade.
 
 ## Events snapshot
 

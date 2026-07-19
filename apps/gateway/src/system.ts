@@ -5,6 +5,10 @@ import {
 
 const COMPILED_BUILD_VERSION = "2.0.0-rc.1";
 
+export function compiledGatewayBuildVersion(): string {
+  return COMPILED_BUILD_VERSION;
+}
+
 export interface GatewaySystemState {
   build: BuildMetadata;
   capabilities: SystemCapabilities;

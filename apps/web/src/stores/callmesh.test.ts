@@ -17,6 +17,7 @@ describe("CallMesh store", () => {
             updatedAt: "2026-07-18T00:00:00.000Z",
             activeMappingVersion: "mapping-1",
             activeMappingCount: 1,
+            provisionState: "valid",
           },
           mappings: [
             {
@@ -35,6 +36,7 @@ describe("CallMesh store", () => {
     await callmesh.refresh();
 
     expect(callmesh.status?.state).toBe("ready");
+    expect(callmesh.status?.provisionState).toBe("valid");
     expect(callmesh.mappings).toHaveLength(1);
 
     setActivePinia(createPinia());
