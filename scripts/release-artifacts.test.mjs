@@ -100,7 +100,7 @@ test("canonical compositions encode complete product surfaces and constrained Do
   assert.deepEqual(DOCKER_COMPOSITION, {
     kind: "oci-image",
     updaterManaged: false,
-    services: ["gateway", "web"],
+    services: ["gateway", "web", "ingress"],
     excluded: ["agent", "cli", "desktop", "serviceHost"],
   });
 
@@ -220,6 +220,36 @@ test("stage CLI accepts repeated role-path input arguments", async (t) => {
   assert.equal(
     await readFile(join(output, "cli/linux-x86_64/bin/cmclient"), "utf8"),
     "fixture executable",
+  );
+});
+
+test("release entrypoints and Rust metadata keep the canonical CLI binary name", async () => {
+  const [artifactScript, supplyChainScript, cliManifest, workflow] =
+    await Promise.all([
+      readFile("scripts/release-artifacts.mjs", "utf8"),
+      readFile("scripts/release-supply-chain.mjs", "utf8"),
+      readFile("apps/cli/Cargo.toml", "utf8"),
+      readFile(".github/workflows/release-build.yml", "utf8"),
+    ]);
+
+  const platformSafeMainGuard =
+    /import\.meta\.url === pathToFileURL\(resolve\(process\.argv\[1\]\)\)\.href/;
+  for (const script of [artifactScript, supplyChainScript]) {
+    assert.match(script, platformSafeMainGuard);
+    assert.doesNotMatch(script, /`file:\/\/\$\{process\.argv\[1\]\}`/);
+  }
+
+  assert.match(
+    cliManifest,
+    /\[\[bin\]\]\s+name = "cmclient"\s+path = "src\/main\.rs"/,
+  );
+  assert.match(
+    workflow,
+    /inputs=\(--input "cli=\$rust_output\/cmclient\$executable_suffix"\)/,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /--input "cli=\$rust_output\/cmclient-cli\$executable_suffix"/,
   );
 });
 
@@ -353,6 +383,11 @@ test("release workflow builds each composition and gates the separate Docker sur
   assert.match(workflow, /packages=\(--package cmclient-cli\)/);
   assert.match(
     workflow,
+    /pnpm --config\.node-linker=hoisted --filter @cmclient\/gateway deploy \\\n\s+--prod --frozen-lockfile release-build-input\/gateway/,
+  );
+  assert.doesNotMatch(workflow, /--legacy/);
+  assert.match(
+    workflow,
     /headless\) packages\+=\(--package cmclient-agent --package cmclient-legacy-migration\)/,
   );
   assert.match(
@@ -377,10 +412,13 @@ test("release workflow builds each composition and gates the separate Docker sur
   }
   assert.match(workflow, /docker-composition:/);
   assert.match(workflow, /load-gate:[\s\S]*pnpm test:load/);
-  assert.match(workflow, /build:[\s\S]*needs: \[artifact-plan, load-gate\]/);
   assert.match(
     workflow,
-    /docker-composition:[\s\S]*needs: \[artifact-plan, load-gate\]/,
+    /build:[\s\S]*needs: \[artifact-plan, load-gate, security-gate\]/,
+  );
+  assert.match(
+    workflow,
+    /docker-composition:[\s\S]*needs: \[artifact-plan, load-gate, security-gate\]/,
   );
   assert.match(workflow, /os: macos-15\n\s+rust_target: aarch64-apple-darwin/);
   assert.match(

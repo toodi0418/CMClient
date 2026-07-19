@@ -25,8 +25,9 @@ executable. An explicit `agent.gateway_command` remains an operator override;
 an absolute `CMCLIENT_GATEWAY_ENTRYPOINT` and `CMCLIENT_WEB_ROOT` are available
 for controlled development or packaging layouts. A missing/invalid Web root
 fails listener startup instead of falling back to a placeholder page. The
-current packaged Gateway command invokes `node`, so Node.js 22 or newer must be
-present; release portability is verified separately from this config contract.
+current packaged Gateway command invokes `node`, so Node.js `^22.18.0` or
+`>=24.11.0` must be present; release portability is verified separately from
+this config contract.
 
 CallMesh keys, APRS passcodes, and administrative tokens do not belong in this
 file or in Agent command arguments. The Agent stores them in the operating
@@ -119,10 +120,13 @@ accepted as an Agent argument, retained in the audit trail, or returned through
 an API. Successful login issues a short-lived
 `Secure; HttpOnly; SameSite=Strict` session cookie and a separate CSRF token.
 All proxied API requests require a session; writes additionally require a
-matching allowed Origin and CSRF token. Login attempts are rate-limited per
-source address in memory. The bounded audit projection records only timestamp,
-action, and stable outcome code, never addresses, credentials, cookies, or
-tokens.
+matching allowed Origin and CSRF token. Login attempts reserve the per-source
+budget before password verification, and at most two Argon2 verifications run
+concurrently. Expired source windows and sessions are pruned; source windows
+are capped at 4,096 and live sessions at 1,024. Password PHC input must be
+Argon2id version 19 with bounded memory, iteration, and lane parameters. The
+bounded audit projection records only timestamp, action, and stable outcome
+code, never addresses, credentials, cookies, or tokens.
 
 The Agent injects `CMCLIENT_GATEWAY_HOST=127.0.0.1`, the configured non-zero
 `CMCLIENT_GATEWAY_PORT`, and its own `CMCLIENT_DATA_DIR` into the supervised

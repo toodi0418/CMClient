@@ -23,7 +23,7 @@ Legacy runtime paths, gitlinks, and retired direct dependencies.
 | Headless | Agent, CLI, migration tool, production Gateway, compiled Web, and locked protobuf corpus share one staged layout | A supported Node.js runtime is currently an external runtime prerequisite for Gateway | `scripts/release-artifacts.mjs`, `scripts/release-bundle-smoke.sh` |
 | systemd / launchd | The service manager starts the same Agent-owned Headless composition | Installers never accept or manufacture runtime credentials | `scripts/cmclient-systemd.sh`, `scripts/cmclient-launchd.sh` and their tests |
 | Windows Service | SCM Service Host supervises the adjacent Agent and carries the Windows Headless composition | The Service Host does not own Gateway domain logic | `apps/service-host`, `scripts/cmclient-windows-service.ps1`, packaging tests |
-| Docker | Constrained OCI deployment contains Gateway and Web | No Agent, CLI, Desktop, Service Host, serial ownership, or self-update | `Dockerfile`, `docker-compose.yml`, `scripts/docker.test.mjs`, `scripts/docker-smoke.sh` |
+| Docker | Constrained OCI deployment contains Gateway, Web, and a fixed-target Ingress proxy | No Agent, CLI, Desktop, Service Host, serial ownership, or self-update | `Dockerfile`, `docker-compose.yml`, `scripts/docker.test.mjs`, `scripts/docker-smoke.sh` |
 
 Canonical archive roles and paths are defined in
 [Release Artifact Composition](../architecture/release-artifacts.md). Supply
@@ -48,7 +48,8 @@ executable as a product surface.
 ## Release verification boundary
 
 The current portable composition does not embed Node.js. Its staged-bundle
-smoke therefore requires Node.js 22 or newer on the target. This is an explicit
+smoke therefore requires Node.js `^22.18.0` or `>=24.11.0` on the target. This
+is an explicit
 portable-runtime prerequisite and remaining release risk, not a claim that the
 archive is self-contained. Cross-platform workflow execution and the final
 runtime composition decision, Desktop installers, and final Desktop/Service

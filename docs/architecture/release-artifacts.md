@@ -22,19 +22,21 @@ the single executable that happened to start its build:
 | Headless | Agent, CLI, Legacy migration tool, production Gateway deployment, compiled Web, locked protobuf corpus, and the target's systemd or launchd support files |
 | Desktop | Desktop executable plus the complete Headless composition |
 | Windows Service | Service Host plus the complete Windows Headless composition and SCM manager |
-| Docker | Separate constrained OCI image containing Gateway and Web only |
+| Docker | Separate constrained OCI image running Gateway, Web, and a fixed-target Ingress proxy |
 
 The production Gateway directory contains its compiled `dist`, package
-metadata, and production `node_modules`; root `proto/` contains the locked
-Meshtastic schema corpus; the Web directory contains the Vite production
-output. Install-time `node_modules/.bin` links are not runtime
+metadata, and production `node_modules` deployed from the reviewed root lockfile
+with injected workspace packages; root `proto/` contains the locked Meshtastic
+schema corpus; the Web directory contains the Vite production output.
+Install-time `node_modules/.bin` links are not runtime
 inputs and are omitted so signed updater archives remain symlink-free. Linux
 and macOS service managers are carried by Headless and Desktop because those
 deployment modes execute the same Agent composition. The Windows Service Host
 is kept in the Windows-only Service archive and locates the adjacent Agent.
 
-Headless, Desktop, and Windows Service archives currently require Node.js 22
-or newer on the service account's `PATH`; the standalone CLI does not. The
+Headless, Desktop, and Windows Service archives currently require Node.js
+`^22.18.0` or `>=24.11.0` on the service account's `PATH`; the standalone CLI
+does not. The
 runtime smoke fails before starting the Agent when this prerequisite is not
 met. Service installations must therefore expose the same Node installation to
 systemd, launchd, or the Windows service account rather than relying on an
@@ -97,8 +99,9 @@ bounded resource gate is failing or was never run for that revision.
 Docker is a separately versioned deployment image, not an Agent-updater
 component. The release workflow runs its static restriction test and real
 compose smoke before binary supply-chain assembly can proceed. The image
-contains Gateway and Web only; it cannot contain Agent, CLI, Desktop, Service
-Host, or updater ownership, and it cannot self-update. The workflow verifies
+contains Gateway and Web application code plus the fixed Ingress proxy; it
+cannot contain Agent, CLI, Desktop, Service Host, or updater ownership, and it
+cannot self-update. The workflow verifies
 the image but does not publish it from ordinary `dev` or pull-request runs.
 
 The compose deployment and capability restrictions are documented in

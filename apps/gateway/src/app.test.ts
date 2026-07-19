@@ -45,7 +45,7 @@ describe("GatewayRuntime", () => {
     const app = createGatewayApp(logger);
     const response = await app.inject({
       method: "GET",
-      url: "/missing",
+      url: "/missing?token=audit-fixture-secret",
       headers: {
         "x-correlation-id": "sync-42",
       },
@@ -53,6 +53,10 @@ describe("GatewayRuntime", () => {
     expect(response.headers["x-trace-id"]).toMatch(/^[a-f0-9-]{36}$/);
     expect(logger.entries).toHaveLength(1);
     expect(logger.entries[0]).toMatchObject({ correlationId: "sync-42" });
+    expect(logger.entries[0]?.fields?.path).toBe("unmatched");
+    expect(JSON.stringify(logger.entries)).not.toContain(
+      "audit-fixture-secret",
+    );
     expect(
       redact({
         nested: {
@@ -279,7 +283,7 @@ describe("GatewayRuntime", () => {
       url: "/api/v1/diagnostics/integrity-check",
       headers: {
         "x-correlation-id": "diagnostics-42",
-        "idempotency-key": "diagnostics-key-42",
+        "idempotency-key": "fixture-fixture-fixture",
       },
     });
 
@@ -288,7 +292,7 @@ describe("GatewayRuntime", () => {
     expect(submissions).toEqual([
       {
         correlationId: "diagnostics-42",
-        idempotencyKey: "diagnostics-key-42",
+        idempotencyKey: "fixture-fixture-fixture",
       },
     ]);
     const invalid = await app.inject({

@@ -3,5 +3,11 @@ packages:
   - packages/*
 allowBuilds:
   '@serialport/bindings-cpp': true
-minimumReleaseAgeExclude:
-  - '@lucide/vue@1.25.0'
+overrides:
+  undici-types: 6.23.0
+minimumReleaseAge: 1440
+minimumReleaseAgeIgnoreMissingTime: false
+trustPolicy: no-downgrade
+trustLockfile: false
+blockExoticSubdeps: true
+injectWorkspacePackages: true

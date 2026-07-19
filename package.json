@@ -4,19 +4,22 @@
   "private": true,
   "packageManager": "pnpm@11.9.0",
   "engines": {
-    "node": ">=22.0.0",
+    "node": "^22.18.0 || >=24.11.0",
     "pnpm": ">=11.0.0"
   },
   "scripts": {
+    "audit:policy": "node scripts/security-audit.mjs",
+    "audit:dependencies:node": "pnpm audit --prod --audit-level high && pnpm audit --audit-level high && pnpm audit signatures",
     "format:check": "prettier --check .",
     "format:write": "prettier --write .",
     "lint": "eslint .",
     "typecheck": "pnpm --filter @cmclient/contracts run build && pnpm --recursive --if-present run typecheck",
     "build": "pnpm --recursive --if-present run build",
-    "test": "pnpm --filter @cmclient/contracts run build && pnpm run test:fixtures && pnpm run test:legacy-removal && pnpm run test:release-artifacts && pnpm run test:supply-chain && pnpm run test:systemd && pnpm run test:windows-service && pnpm run test:launchd && pnpm run test:docker && pnpm run test:load-contract && vitest run",
+    "test": "pnpm --filter @cmclient/contracts run build && pnpm run test:fixtures && pnpm run test:legacy-removal && pnpm run test:security-audit && pnpm run test:release-artifacts && pnpm run test:supply-chain && pnpm run test:systemd && pnpm run test:windows-service && pnpm run test:launchd && pnpm run test:docker && pnpm run test:load-contract && vitest run",
     "test:load": "node scripts/load-soak.mjs",
     "test:load-contract": "node --test scripts/load-soak.test.mjs",
     "test:legacy-removal": "node --test scripts/legacy-removal-scan.test.mjs",
+    "test:security-audit": "node --test scripts/security-audit.test.mjs",
     "test:release-artifacts": "node --test scripts/release-artifacts.test.mjs",
     "test:supply-chain": "node --test scripts/release-supply-chain.test.mjs",
     "test:systemd": "node --test scripts/cmclient-systemd.test.mjs",
@@ -30,12 +33,16 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.61.1",
-    "@types/node": "^26.1.1",
+    "@types/node": "22.20.1",
     "eslint": "^10.7.0",
     "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-vue": "^10.9.2",
+    "globals": "17.7.0",
     "prettier": "^3.9.5",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.64.0",
+    "vue-eslint-parser": "^10.4.1",
+    "yaml": "2.9.0",
     "vitest": "^4.1.10"
   }
 }

@@ -360,45 +360,135 @@ test("manifest creation rejects invalid publication inputs before signing", () =
   );
 });
 
-test("release workflow keeps provenance and signing outside ordinary CI permissions", async () => {
+test("release workflow pins actions and keeps checkout credentials disabled", async () => {
   const workflow = await readFile(
     ".github/workflows/release-build.yml",
     "utf8",
   );
-  const signingJob = workflow.slice(
-    workflow.indexOf("  sign-update-manifest:"),
-  );
+  assert.match(workflow, /deploy[\s\\]+--prod --frozen-lockfile/);
+  assert.doesNotMatch(workflow, /--legacy/);
 
+  const actionReferences = Array.from(
+    workflow.matchAll(/^\s*-?\s*uses:\s+([^\s#]+)/gm),
+    ([, reference]) => reference,
+  );
+  assert.ok(actionReferences.length > 0);
+  for (const reference of actionReferences) {
+    assert.match(reference, /^[^@\s]+@[a-f0-9]{40}$/);
+  }
+
+  for (const expected of [
+    "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+    "pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271",
+    "dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4",
+    "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
+    "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+  ]) {
+    assert.ok(
+      actionReferences.includes(expected),
+      `${expected} must be pinned`,
+    );
+  }
+
+  const checkoutBlocks = workflowStepBlocks(workflow).filter((block) =>
+    block.includes("uses: actions/checkout@"),
+  );
+  assert.ok(checkoutBlocks.length > 0);
+  for (const block of checkoutBlocks) {
+    assert.match(block, /persist-credentials: false/);
+  }
+
+  const buildUpload = workflowStepBlocks(workflowJob(workflow, "build")).find(
+    (block) => block.includes("uses: actions/upload-artifact@"),
+  );
+  assert.ok(buildUpload, "build job must upload the staged composition");
   assert.match(
-    workflow,
-    /anchore\/sbom-action@e22c389904149dbc22b58101806040fa8d37a610/,
+    buildUpload,
+    /include-hidden-files: true/,
+    "staged hidden paths listed by build-manifest.json must be uploaded",
+  );
+});
+
+test("release workflow gates provenance and signing behind immutable release inputs", async () => {
+  const workflow = await readFile(
+    ".github/workflows/release-build.yml",
+    "utf8",
+  );
+  const attestJob = workflowJob(workflow, "attest");
+  const signingJob = workflowJob(workflow, "sign-update-manifest");
+  const sbomStep = workflowStepBlocks(workflow).find((block) =>
+    block.includes("name: Generate staged-composition SBOM"),
+  );
+  assert.ok(sbomStep);
+
+  assert.doesNotMatch(workflow, /anchore\/sbom-action/);
+  assert.match(workflow, /scripts\/install-sbom-tool\.sh/);
+  assert.match(workflow, /syft" scan dir:release-build/);
+  const sbomInstaller = await readFile("scripts/install-sbom-tool.sh", "utf8");
+  assert.match(sbomInstaller, /SYFT_VERSION="1\.42\.3"/);
+  assert.match(
+    sbomInstaller,
+    /0d6be741479eddd2c8644a288990c04f3df0d609bbc1599a005532a9dff63509/,
   );
   assert.match(
     workflow,
-    /sigstore\/cosign-installer@b4da77ecad80ff9afe572690e3ce4a55a58e629c/,
+    /sigstore\/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6/,
   );
   assert.match(
     workflow,
-    /actions\/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45/,
+    /actions\/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373/,
   );
+  assert.match(sbomStep, /dir:release-build/);
+  assert.match(sbomStep, /spdx-json=release-dist/);
   assert.match(workflow, /cosign sign-blob --yes/);
   assert.match(workflow, /subject-checksums: release-dist\/SHA256SUMS/);
   assert.match(workflow, /id-token: write/);
   assert.match(workflow, /attestations: write/);
   assert.match(workflow, /secrets\.CMCLIENT_UPDATE_SIGNING_KEY/);
   assert.match(
-    workflow,
-    /github\.event_name == 'workflow_dispatch' && inputs\.attest/,
+    attestJob,
+    /github\.event_name == 'workflow_dispatch'[\s\S]*inputs\.attest[\s\S]*startsWith\(github\.ref, 'refs\/tags\/v'\)/,
   );
+  assert.match(attestJob, /environment: production-release/);
+  assert.match(
+    attestJob,
+    /\[\[ "\$GITHUB_REF" == "refs\/tags\/v\$version" \]\]/,
+  );
+  assert.ok(
+    attestJob.indexOf("RELEASE_TAG_VERSION_MISMATCH") <
+      attestJob.indexOf("cosign sign-blob"),
+    "exact tag validation must precede attestation signing",
+  );
+  assert.match(signingJob, /needs: \[supply-chain, attest\]/);
+  assert.match(
+    signingJob,
+    /github\.event_name == 'workflow_dispatch'[\s\S]*inputs\.attest[\s\S]*inputs\.release_base_url != ''[\s\S]*startsWith\(github\.ref, 'refs\/tags\/v'\)/,
+  );
+  assert.match(signingJob, /environment: production-release/);
+  assert.match(signingJob, /pattern: cmclient-supply-chain-attested/);
   assert.match(
     workflow,
     /RELEASE_BASE_URL: \$\{\{ inputs\.release_base_url \}\}/,
   );
   assert.match(workflow, /--release-base-url "\$RELEASE_BASE_URL"/);
-  assert.match(signingJob, /actions\/checkout@v4/);
-  assert.match(signingJob, /actions\/setup-node@v4/);
+  assert.match(
+    signingJob,
+    /actions\/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0/,
+  );
+  assert.match(
+    signingJob,
+    /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020/,
+  );
   assert.match(signingJob, /RELEASE_SIGNING_KEY_MISSING/);
   assert.match(signingJob, /release-supply-chain\.mjs verify/);
+  assert.match(
+    signingJob,
+    /\[\[ "\$GITHUB_REF" == "refs\/tags\/v\$version" \]\]/,
+  );
+  assert.match(signingJob, /cosign verify-blob/);
   assert.match(
     signingJob,
     /Sign canonical Agent manifest[\s\S]*CMCLIENT_UPDATE_SIGNING_KEY: \$\{\{ secrets\.CMCLIENT_UPDATE_SIGNING_KEY \}\}/,
@@ -411,6 +501,11 @@ test("release workflow keeps provenance and signing outside ordinary CI permissi
     ),
     /CMCLIENT_UPDATE_SIGNING_KEY:/,
   );
+  assert.ok(
+    signingJob.indexOf("cosign verify-blob") <
+      signingJob.indexOf("CMCLIENT_UPDATE_SIGNING_KEY:"),
+    "attestation verification must finish before the signing key is exposed",
+  );
   assert.doesNotMatch(
     workflow,
     /--release-base-url "\$\{\{ inputs\.release_base_url \}\}"/,
@@ -420,3 +515,24 @@ test("release workflow keeps provenance and signing outside ordinary CI permissi
     /CMCLIENT_UPDATE_SIGNING_KEY:\s+['"][A-Za-z0-9+/=]+/,
   );
 });
+
+function workflowJob(workflow, name) {
+  const match = new RegExp(`^ {2}${name}:\\s*$`, "m").exec(workflow);
+  assert.ok(match, `workflow job ${name} must exist`);
+  const start = match.index;
+  const rest = workflow.slice(start + match[0].length);
+  const next = rest.search(/^ {2}[a-zA-Z0-9_-]+:\s*$/m);
+  return next < 0
+    ? workflow.slice(start)
+    : workflow.slice(start, start + match[0].length + next);
+}
+
+function workflowStepBlocks(workflow) {
+  const lines = workflow.split("\n");
+  const starts = lines.flatMap((line, index) =>
+    /^ {6}- (?:name|uses):/.test(line) ? [index] : [],
+  );
+  return starts.map((start, index) =>
+    lines.slice(start, starts[index + 1] ?? lines.length).join("\n"),
+  );
+}

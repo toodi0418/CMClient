@@ -2695,7 +2695,7 @@ mod tests {
         )
         .expect("control server should bind");
         let server_thread = thread::spawn(move || server.serve_once());
-        let token = "0123456789abcdef0123456789abcdef";
+        let token = "test-token-test-token-test-token-0";
         let secrets = AgentSecretStore::memory();
         secrets
             .store(SecretKind::ManagementAdminToken, token)

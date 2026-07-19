@@ -9,7 +9,8 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 export const RELEASE_COMPONENTS = ["desktop", "headless", "cli", "service"];
 export const RELEASE_TARGETS = [
@@ -23,7 +24,7 @@ export const RELEASE_TARGETS = [
 export const DOCKER_COMPOSITION = Object.freeze({
   kind: "oci-image",
   updaterManaged: false,
-  services: ["gateway", "web"],
+  services: ["gateway", "web", "ingress"],
   excluded: ["agent", "cli", "desktop", "serviceHost"],
 });
 
@@ -469,7 +470,10 @@ async function main(argumentsList) {
   throw new Error("usage: release-artifacts.mjs <plan|stage|check-plan> ...");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
   main(process.argv.slice(2)).catch((error) => {
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;

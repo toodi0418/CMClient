@@ -168,7 +168,7 @@ export const ALLOWED_REMOVAL_EVIDENCE = new Map([
     [
       {
         code: "LEGACY_MAP_REFERENCE",
-        line: 49,
+        line: 73,
         count: 1,
         context: "    /TENMAN|TMAG_|AUTO_UPDATE|git clone|callmesh-client/i,",
       },

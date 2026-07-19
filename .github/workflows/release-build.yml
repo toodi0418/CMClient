@@ -40,17 +40,19 @@ jobs:
     name: Verify artifact plan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
       - name: Generate canonical artifact plan
         shell: bash
         run: |
           version="$(node -p "require('./package.json').version")"
           node scripts/release-artifacts.mjs plan --version "$version" --output release-build/artifact-plan.json
           node scripts/release-artifacts.mjs check-plan --input release-build/artifact-plan.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cmclient-release-artifact-plan
           path: release-build/artifact-plan.json
@@ -61,15 +63,17 @@ jobs:
     needs: artifact-plan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 11.9.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0
       - name: Install Agent native dependencies
         run: |
           sudo apt-get update
@@ -77,9 +81,42 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:load
 
+  security-gate:
+    name: Release dependency, secret, and policy gate
+    needs: artifact-plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm audit:policy
+      - run: pnpm audit --prod --audit-level high
+      - run: pnpm audit --audit-level high
+      - run: pnpm audit signatures
+      - name: Install pinned security audit tools
+        run: bash scripts/install-security-audit-tools.sh "$RUNNER_TEMP/cmclient-security-tools"
+      - name: Validate GitHub Actions workflows
+        run: |
+          "$RUNNER_TEMP/cmclient-security-tools/actionlint" .github/workflows/*.yml
+      - name: Scan the repository for secrets
+        run: |
+          "$RUNNER_TEMP/cmclient-security-tools/gitleaks" dir --redact --no-banner --no-color .
+      - name: Audit Rust dependencies
+        run: |
+          "$RUNNER_TEMP/cmclient-security-tools/cargo-audit" audit --deny unsound --ignore RUSTSEC-2024-0429
+
   build:
     name: ${{ matrix.component }} ${{ matrix.target }}
-    needs: [artifact-plan, load-gate]
+    needs: [artifact-plan, load-gate, security-gate]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -150,15 +187,17 @@ jobs:
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: 11.9.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0
       - name: Install Linux desktop and secret-store dependencies
         if: startsWith(matrix.target, 'linux-')
         shell: bash
@@ -189,7 +228,7 @@ jobs:
             pnpm --filter @cmclient/gateway run build
             pnpm --filter @cmclient/web run build
             pnpm --config.node-linker=hoisted --filter @cmclient/gateway deploy \
-              --legacy --prod release-build-input/gateway
+              --prod --frozen-lockfile release-build-input/gateway
           fi
       - name: Build canonical Rust inputs
         shell: bash
@@ -260,21 +299,24 @@ jobs:
           bash scripts/release-bundle-smoke.sh \
             "release-build/headless/${{ matrix.target }}" \
             "${{ matrix.target }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.stage.outputs.artifact }}
           path: release-build/
+          include-hidden-files: true
           if-no-files-found: error
 
   docker-composition:
-    name: Docker Gateway and Web composition
-    needs: [artifact-plan, load-gate]
+    name: Docker Gateway, Web, and Ingress composition
+    needs: [artifact-plan, load-gate, security-gate]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
       - name: Verify Docker excludes host-control components
         run: node --test scripts/docker.test.mjs
       - name: Build and exercise the constrained Docker deployment
@@ -285,11 +327,13 @@ jobs:
     needs: [build, docker-composition]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22
-      - uses: actions/download-artifact@v4
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: cmclient-build-*
           path: release-build
@@ -309,14 +353,14 @@ jobs:
             --output release-dist \
             --version "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Generate source SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
-        with:
-          path: .
-          format: spdx-json
-          output-file: release-dist/cmclient-${{ steps.release.outputs.version }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
+      - name: Install checksum-pinned SBOM tool
+        shell: bash
+        run: bash scripts/install-sbom-tool.sh "$RUNNER_TEMP/cmclient-sbom-tools"
+      - name: Generate staged-composition SBOM
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/cmclient-sbom-tools/syft" scan dir:release-build \
+            --output "spdx-json=release-dist/cmclient-${{ steps.release.outputs.version }}.spdx.json"
       - name: Finalize and verify supply-chain metadata
         shell: bash
         run: |
@@ -335,7 +379,7 @@ jobs:
             "release-dist/cmclient-headless-linux-x86_64-$version.tar.zst" \
             -C "$smoke_root"
           bash scripts/release-bundle-smoke.sh "$smoke_root" linux-x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cmclient-supply-chain-unsigned-${{ steps.release.outputs.version }}
           path: release-dist/
@@ -344,21 +388,39 @@ jobs:
   attest:
     name: Sign checksums and publish provenance
     needs: supply-chain
-    if: github.event_name == 'workflow_dispatch' && inputs.attest
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.attest &&
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    environment: production-release
     permissions:
       contents: read
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+      - name: Verify the exact immutable release tag
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          [[ "$GITHUB_REF" == "refs/tags/v$version" ]] || {
+            echo "RELEASE_TAG_VERSION_MISMATCH" >&2
+            exit 1
+          }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: cmclient-supply-chain-unsigned-*
           path: release-dist
           merge-multiple: true
-      - uses: sigstore/cosign-installer@b4da77ecad80ff9afe572690e3ce4a55a58e629c # v3.9.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v2.5.2
+          cosign-release: v3.1.2
       - name: Create keyless checksum signature bundle
         shell: bash
         run: |
@@ -366,10 +428,10 @@ jobs:
             --bundle release-dist/SHA256SUMS.sigstore.json \
             release-dist/SHA256SUMS
       - name: Attest archive and SBOM checksums
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-checksums: release-dist/SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cmclient-supply-chain-attested
           path: release-dist/
@@ -377,26 +439,45 @@ jobs:
 
   sign-update-manifest:
     name: Sign Agent update manifest
-    needs: supply-chain
-    if: github.event_name == 'workflow_dispatch' && inputs.release_base_url != ''
+    needs: [supply-chain, attest]
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.attest &&
+      inputs.release_base_url != '' &&
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    environment: production-release
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22
-      - uses: actions/download-artifact@v4
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          pattern: cmclient-supply-chain-unsigned-*
+          node-version: 22.23.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cmclient-supply-chain-attested
           path: release-dist
           merge-multiple: true
-      - name: Verify release input before exposing the signing key
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.2
+      - name: Verify immutable tag, release input, and attestation before exposing the signing key
         shell: bash
         run: |
           version="$(node -p "require('./package.json').version")"
+          [[ "$GITHUB_REF" == "refs/tags/v$version" ]] || {
+            echo "RELEASE_TAG_VERSION_MISMATCH" >&2
+            exit 1
+          }
           node scripts/release-supply-chain.mjs verify \
             --output release-dist \
             --version "$version"
+          cosign verify-blob \
+            --bundle release-dist/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release-build.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            release-dist/SHA256SUMS
       - name: Sign canonical Agent manifest without exposing the private key
         shell: bash
         env:
@@ -424,7 +505,7 @@ jobs:
             --release-base-url "$RELEASE_BASE_URL" \
             --signing-key-id "$RELEASE_SIGNING_KEY_ID" \
             --private-key-env CMCLIENT_UPDATE_SIGNING_KEY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cmclient-signed-update-manifest
           path: release-dist/update-manifest.json

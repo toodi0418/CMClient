@@ -278,7 +278,7 @@ export function createGatewayApp(
         : {}),
       fields: {
         method: request.method,
-        path: request.routeOptions.url ?? request.url,
+        path: request.routeOptions.url ?? "unmatched",
         statusCode: reply.statusCode,
       },
     });

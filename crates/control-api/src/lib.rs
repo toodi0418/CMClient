@@ -1668,8 +1668,7 @@ mod windows {
             );
             request.zeroize();
             write_result?;
-            let mut response = Vec::new();
-            read_to_end_until(&mut stream, &mut response, deadline_after(self.timeout)?)?;
+            let response = read_http_response(&mut stream, deadline_after(self.timeout)?)?;
             let separator = response
                 .windows(4)
                 .position(|window| window == b"\r\n\r\n")
@@ -1734,7 +1733,14 @@ mod windows {
                 return Err(ControlError::InvalidHttp);
             }
             response.extend_from_slice(&chunk[..count]);
-            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            if let Some(header_end) = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            {
+                if header_end > 8 * 1024 {
+                    return Err(ControlError::ResponseTooLarge);
+                }
                 return Ok(response);
             }
             if response.len() > 8 * 1024 {
@@ -1750,6 +1756,15 @@ mod windows {
     ) -> Result<usize, ControlError> {
         loop {
             match stream.read(buffer) {
+                Ok(0) => {
+                    if Instant::now() >= deadline {
+                        return Err(ControlError::Timeout);
+                    }
+                    if stream.peer_creds().is_err() {
+                        return Ok(0);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
                 Ok(count) => return Ok(count),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
@@ -1769,7 +1784,15 @@ mod windows {
     ) -> Result<(), ControlError> {
         while !bytes.is_empty() {
             match stream.write(bytes) {
-                Ok(0) => return Err(ControlError::Io),
+                Ok(0) => {
+                    if Instant::now() >= deadline {
+                        return Err(ControlError::Timeout);
+                    }
+                    if stream.peer_creds().is_err() {
+                        return Err(ControlError::Io);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
                 Ok(count) => bytes = &bytes[count..],
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
@@ -1783,21 +1806,50 @@ mod windows {
         Ok(())
     }
 
-    fn read_to_end_until(
-        stream: &mut Stream,
-        response: &mut Vec<u8>,
-        deadline: Instant,
-    ) -> Result<(), ControlError> {
+    fn read_http_response(stream: &mut Stream, deadline: Instant) -> Result<Vec<u8>, ControlError> {
+        const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+        let mut response = Vec::new();
         let mut chunk = [0_u8; 4096];
         loop {
             let count = read_until(stream, &mut chunk, deadline)?;
             if count == 0 {
-                return Ok(());
+                return Err(ControlError::InvalidHttp);
             }
             response.extend_from_slice(&chunk[..count]);
             if response.len() > MAX_CONTROL_RESPONSE_WIRE_BYTES {
                 return Err(ControlError::ResponseTooLarge);
             }
+            let Some(header_end) = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                if response.len() > MAX_RESPONSE_HEADER_BYTES {
+                    return Err(ControlError::ResponseTooLarge);
+                }
+                continue;
+            };
+            if header_end > MAX_RESPONSE_HEADER_BYTES {
+                return Err(ControlError::ResponseTooLarge);
+            }
+            let header = std::str::from_utf8(&response[..header_end])
+                .map_err(|_| ControlError::InvalidHttp)?;
+            let response_length = header_end
+                .checked_add(content_length(header)?)
+                .ok_or(ControlError::ResponseTooLarge)?;
+            if response_length > MAX_CONTROL_RESPONSE_WIRE_BYTES {
+                return Err(ControlError::ResponseTooLarge);
+            }
+            while response.len() < response_length {
+                let count = read_until(stream, &mut chunk, deadline)?;
+                if count == 0 {
+                    return Err(ControlError::InvalidHttp);
+                }
+                let remaining = response_length - response.len();
+                response.extend_from_slice(&chunk[..count.min(remaining)]);
+            }
+            response.truncate(response_length);
+            return Ok(response);
         }
     }
 
@@ -1866,10 +1918,15 @@ mod windows {
     mod tests {
         use super::{ControlClient, ControlServer};
         use crate::{
-            ControlEndpoint, ControlStatus, GatewayControlStatus, ManagementWebControlStatus,
-            StaticControlHandler,
+            ControlEndpoint, ControlError, ControlStatus, GatewayControlStatus,
+            ManagementWebControlStatus, StaticControlHandler,
         };
-        use std::sync::Arc;
+        use interprocess::local_socket::{Listener, ListenerOptions, Stream, prelude::*};
+        use std::{
+            io::{Read, Write},
+            sync::Arc,
+            time::{Duration, Instant},
+        };
 
         fn status() -> ControlStatus {
             ControlStatus {
@@ -1884,12 +1941,48 @@ mod windows {
             }
         }
 
+        fn endpoint(label: &str) -> ControlEndpoint {
+            ControlEndpoint::named_pipe(format!(
+                r"\\.\pipe\cmclient-control-{label}-{}",
+                uuid::Uuid::new_v4().simple()
+            ))
+        }
+
+        fn listener(endpoint: &ControlEndpoint) -> Listener {
+            let ControlEndpoint::NamedPipe(path) = endpoint else {
+                panic!("test endpoint must be a named pipe");
+            };
+            ListenerOptions::new()
+                .name(super::pipe_name(path).expect("pipe name should be valid"))
+                .create_sync()
+                .expect("named pipe should bind")
+        }
+
+        fn read_request(stream: &mut Stream) {
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2_048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).expect("request should read");
+                assert_ne!(count, 0, "client should send a complete request");
+                request.extend_from_slice(&chunk[..count]);
+            }
+        }
+
+        fn write_status(stream: &mut Stream, value: &ControlStatus) {
+            let body = serde_json::to_vec(value).expect("status should serialize");
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .expect("response header should write");
+            stream.write_all(&body).expect("response body should write");
+        }
+
         #[test]
         fn serves_status_over_a_private_named_pipe() {
-            let endpoint = ControlEndpoint::named_pipe(format!(
-                r"\\.\pipe\cmclient-control-test-{}",
-                std::process::id()
-            ));
+            let endpoint = endpoint("roundtrip");
             let server = ControlServer::bind(
                 endpoint.clone(),
                 Arc::new(StaticControlHandler::new(status())),
@@ -1902,6 +1995,58 @@ mod windows {
                 .join()
                 .expect("server thread should join")
                 .expect("server should serve request");
+        }
+
+        #[test]
+        fn waits_for_a_delayed_named_pipe_response_without_treating_zero_as_eof() {
+            let endpoint = endpoint("delayed");
+            let listener = listener(&endpoint);
+            let expected = status();
+            let response = expected.clone();
+            let server_thread = std::thread::spawn(move || {
+                let mut stream = listener.accept().expect("client should connect");
+                read_request(&mut stream);
+                std::thread::sleep(Duration::from_millis(75));
+                write_status(&mut stream, &response);
+            });
+            let client = ControlClient::new_with_timeout(endpoint, Duration::from_secs(2))
+                .expect("client should initialize");
+            assert_eq!(
+                client.status().expect("delayed status should load"),
+                expected
+            );
+            server_thread.join().expect("server thread should join");
+        }
+
+        #[test]
+        fn times_out_while_a_named_pipe_peer_remains_connected_without_a_response() {
+            let endpoint = endpoint("timeout");
+            let listener = listener(&endpoint);
+            let server_thread = std::thread::spawn(move || {
+                let mut stream = listener.accept().expect("client should connect");
+                read_request(&mut stream);
+                std::thread::sleep(Duration::from_millis(250));
+            });
+            let client = ControlClient::new_with_timeout(endpoint, Duration::from_millis(50))
+                .expect("client should initialize");
+            assert_eq!(client.status(), Err(ControlError::Timeout));
+            server_thread.join().expect("server thread should join");
+        }
+
+        #[test]
+        fn observes_named_pipe_peer_closure_without_waiting_for_the_timeout() {
+            let endpoint = endpoint("closed");
+            let listener = listener(&endpoint);
+            let server_thread = std::thread::spawn(move || {
+                let mut stream = listener.accept().expect("client should connect");
+                read_request(&mut stream);
+            });
+            let client = ControlClient::new_with_timeout(endpoint, Duration::from_secs(2))
+                .expect("client should initialize");
+            let started = Instant::now();
+            assert_eq!(client.status(), Err(ControlError::InvalidHttp));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            server_thread.join().expect("server thread should join");
         }
     }
 }
@@ -2041,6 +2186,10 @@ pub fn default_local_endpoint(data_dir: &Path) -> ControlEndpoint {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::ControlEndpoint;
+    #[cfg(unix)]
+    use super::default_unix_socket;
     #[cfg(unix)]
     use super::{
         ControlClient, ControlError, ControlHandler, ControlSecretKind, ControlServer,
@@ -2048,13 +2197,15 @@ mod tests {
         UpdateControlStatus,
     };
     use super::{
-        ControlEndpoint, ControlStatus, GatewayControlStatus, ManagementWebControlStatus,
-        RemoteControlAuthError, RemoteControlReplayGuard, StaticControlHandler,
-        default_unix_socket, is_local_endpoint, sign_remote_control_request,
+        ControlStatus, GatewayControlStatus, ManagementWebControlStatus, RemoteControlAuthError,
+        RemoteControlReplayGuard, StaticControlHandler, is_local_endpoint,
+        sign_remote_control_request,
     };
+    use std::sync::Arc;
     #[cfg(unix)]
     use std::{
         collections::BTreeMap,
+        path::PathBuf,
         sync::{Mutex, mpsc},
     };
 
@@ -2077,8 +2228,6 @@ mod tests {
         drop(replacement);
         assert_eq!(limiter.active(), 0);
     }
-    use std::{path::PathBuf, sync::Arc};
-
     fn status() -> ControlStatus {
         ControlStatus {
             schema_version: 2,
@@ -2225,9 +2374,11 @@ mod tests {
 
     #[test]
     fn recognizes_local_endpoint_forms() {
+        #[cfg(unix)]
         assert!(is_local_endpoint(&default_unix_socket(
             PathBuf::from("/tmp/cmclient").as_path()
         )));
+        #[cfg(windows)]
         assert!(is_local_endpoint(&ControlEndpoint::named_pipe(
             r"\\.\pipe\cmclient-control"
         )));
@@ -2235,7 +2386,7 @@ mod tests {
 
     #[test]
     fn signs_scoped_remote_requests_and_rejects_replay_or_expiry() {
-        let token = "0123456789abcdef0123456789abcdef";
+        let token = "test-token-test-token-test-token-0";
         let auth =
             sign_remote_control_request(token, "POST", "/api/v1/control/restart", b"", 1_000)
                 .expect("request should sign");
@@ -2267,7 +2418,7 @@ mod tests {
     #[test]
     fn binds_remote_signatures_to_method_path_body_scope_and_token() {
         let auth = sign_remote_control_request(
-            "0123456789abcdef0123456789abcdef",
+            "test-token-test-token-test-token-0",
             "PUT",
             "/api/v1/control/secrets/aprs-passcode",
             b"secret-value",
@@ -2277,25 +2428,25 @@ mod tests {
         let guard = RemoteControlReplayGuard::default();
         for (token, method, path, body) in [
             (
-                "abcdef0123456789abcdef0123456789",
+                "other-token-other-token-other-00",
                 "PUT",
                 "/api/v1/control/secrets/aprs-passcode",
                 b"secret-value".as_slice(),
             ),
             (
-                "0123456789abcdef0123456789abcdef",
+                "test-token-test-token-test-token-0",
                 "POST",
                 "/api/v1/control/secrets/aprs-passcode",
                 b"secret-value".as_slice(),
             ),
             (
-                "0123456789abcdef0123456789abcdef",
+                "test-token-test-token-test-token-0",
                 "PUT",
                 "/api/v1/control/secrets/callmesh-api-key",
                 b"secret-value".as_slice(),
             ),
             (
-                "0123456789abcdef0123456789abcdef",
+                "test-token-test-token-test-token-0",
                 "PUT",
                 "/api/v1/control/secrets/aprs-passcode",
                 b"changed".as_slice(),

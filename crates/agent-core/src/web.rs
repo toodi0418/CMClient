@@ -1,7 +1,10 @@
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use rustls::{
+    ServerConfig, ServerConnection, StreamOwned,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
 use std::{
     collections::BTreeMap,
-    io::{self, BufReader, Read, Write},
+    io::{self, Read, Write},
     net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
@@ -1100,21 +1103,16 @@ fn write_response_header(
 }
 
 fn load_tls_config(config: &ManagementTlsConfig) -> Result<Arc<ServerConfig>, ManagementWebError> {
-    let certificate_file = std::fs::File::open(&config.certificate_path)
+    let certificates = CertificateDer::pem_file_iter(&config.certificate_path)
         .map_err(|_| ManagementWebError::TlsConfiguration)?;
-    let mut certificate_reader = BufReader::new(certificate_file);
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+    let certificates = certificates
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ManagementWebError::TlsConfiguration)?;
     if certificates.is_empty() {
         return Err(ManagementWebError::TlsConfiguration);
     }
-    let key_file = std::fs::File::open(&config.private_key_path)
+    let key = PrivateKeyDer::from_pem_file(&config.private_key_path)
         .map_err(|_| ManagementWebError::TlsConfiguration)?;
-    let mut key_reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|_| ManagementWebError::TlsConfiguration)?
-        .ok_or(ManagementWebError::TlsConfiguration)?;
     ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, key)

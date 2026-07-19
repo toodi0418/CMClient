@@ -51,10 +51,11 @@ services:
     depends_on:
       gateway:
         condition: service_healthy
-    ports:
-      - "127.0.0.1:${CMCLIENT_WEB_PORT:-8080}:8080"
+    expose:
+      - "8080"
     networks:
       - cmclient-internal
+      - cmclient-web
     read_only: true
     tmpfs:
       - /tmp:mode=1777,noexec,nosuid,size=32m
@@ -76,10 +77,49 @@ services:
       retries: 10
       start_period: 10s
 
+  ingress:
+    image: "${CMCLIENT_IMAGE:-cmclient:local}"
+    command: ["ingress"]
+    init: true
+    restart: unless-stopped
+    environment:
+      CMCLIENT_INGRESS_PORT: "8080"
+    depends_on:
+      web:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${CMCLIENT_WEB_PORT:-8080}:8080"
+    networks:
+      - cmclient-web
+      - cmclient-ingress
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    pids_limit: 64
+    mem_limit: 128m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
 volumes:
   cmclient-data:
 
 networks:
   cmclient-internal:
     internal: true
+  cmclient-web:
+    internal: true
+  cmclient-ingress:
   cmclient-egress:

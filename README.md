@@ -9,7 +9,7 @@ in this repository.
 
 Required toolchains:
 
-- Node.js 22 or newer
+- Node.js `^22.18.0` or `>=24.11.0`
 - pnpm 11 or newer
 - the Rust toolchain pinned by `rust-toolchain.toml`
 
@@ -26,6 +26,18 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
+Run the repository and Node dependency security gates separately when changing
+dependencies, workflows, or release composition:
+
+```bash
+pnpm audit:policy
+pnpm audit:dependencies:node
+```
+
+The pinned secret and Rust dependency audit commands, current results, and the
+only time-bounded advisory exception are recorded in the
+[P12 release security audit](docs/security/release-audit.md).
+
 Run the management Web end-to-end suite separately:
 
 ```bash
@@ -38,6 +50,7 @@ pnpm test:e2e:web
 - [Agent runtime](docs/architecture/agent-runtime.md)
 - [Gateway runtime](docs/architecture/gateway-runtime.md)
 - [Release artifacts](docs/architecture/release-artifacts.md)
+- [Release security audit](docs/security/release-audit.md)
 - [Feature parity evidence](docs/testing/feature-parity.md)
 
 Release candidates, installation instructions, upgrade procedures, and final

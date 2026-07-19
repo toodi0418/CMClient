@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "waivers": [
+    {
+      "advisory": "RUSTSEC-2024-0429",
+      "package": "glib",
+      "version": "0.18.5",
+      "transitiveRoot": "tauri",
+      "expiresOn": "2026-10-19",
+      "reason": "Tauri Linux GTK transitive dependency; CMClient does not use the affected VariantStrIter API"
+    }
+  ]
+}

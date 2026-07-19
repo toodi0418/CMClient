@@ -14,7 +14,58 @@ trap cleanup EXIT
 CMCLIENT_IMAGE="${image}" CMCLIENT_WEB_PORT="${port}" "${compose[@]}" config --quiet
 CMCLIENT_IMAGE="${image}" CMCLIENT_WEB_PORT="${port}" "${compose[@]}" up --build --detach
 
-url="http://127.0.0.1:${port}"
+published_port="$("${compose[@]}" port ingress 8080)"
+if [[ ! "${published_port}" =~ ^127\.0\.0\.1:[0-9]+$ ]]; then
+  "${compose[@]}" ps --all
+  echo "DOCKER_WEB_PUBLISHED_PORT_INVALID" >&2
+  exit 1
+fi
+url="http://${published_port}"
+
+service_networks() {
+  local service="$1"
+  local container
+  container="$("${compose[@]}" ps --quiet "${service}")"
+  docker inspect \
+    --format '{{range $name, $network := .NetworkSettings.Networks}}{{printf "%s " $name}}{{end}}' \
+    "${container}"
+}
+
+assert_network_topology() {
+  local service="$1"
+  local expected_count="$2"
+  local expected_internal="$3"
+  local count=0
+  local internal_count=0
+  local network
+  for network in $(service_networks "${service}"); do
+    count=$((count + 1))
+    if [[ "$(docker network inspect --format '{{.Internal}}' "${network}")" == "true" ]]; then
+      internal_count=$((internal_count + 1))
+    fi
+  done
+  if [[ "${count}" -ne "${expected_count}" || "${internal_count}" -ne "${expected_internal}" ]]; then
+    echo "DOCKER_SERVICE_NETWORK_TOPOLOGY_INVALID:${service}" >&2
+    exit 1
+  fi
+}
+
+assert_ingress_gateway_isolation() {
+  if "${compose[@]}" exec --no-TTY ingress node --input-type=module --eval '
+    try {
+      await fetch("http://gateway:8081/api/v1/system/health", {
+        signal: AbortSignal.timeout(2_000),
+      });
+      process.exit(0);
+    } catch {
+      process.exit(1);
+    }
+  '; then
+    echo "DOCKER_INGRESS_GATEWAY_ISOLATION_FAILED" >&2
+    exit 1
+  fi
+}
+
 verify_application() {
   if CMCLIENT_SMOKE_URL="${url}" node --input-type=module --eval '
     const response = await fetch(`${process.env.CMCLIENT_SMOKE_URL}/api/v1/system/capabilities`);
@@ -34,17 +85,22 @@ verify_application() {
 }
 
 wait_for_application() {
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 45); do
     if verify_application; then
       return 0
     fi
     sleep 2
   done
+  "${compose[@]}" ps --all
   "${compose[@]}" logs --no-color
   return 1
 }
 
 wait_for_application
+assert_network_topology gateway 2 1
+assert_network_topology web 2 2
+assert_network_topology ingress 2 1
+assert_ingress_gateway_isolation
 "${compose[@]}" exec --no-TTY gateway node --input-type=module --eval '
   const schema = await import("/app/gateway/dist/protobuf/schema.js");
   const loaded = await schema.loadMeshtasticSchema();
@@ -56,6 +112,8 @@ wait_for_application
 '
 CMCLIENT_IMAGE="${image}" CMCLIENT_WEB_PORT="${port}" "${compose[@]}" up --detach --force-recreate
 wait_for_application
+assert_network_topology web 2 2
+assert_ingress_gateway_isolation
 "${compose[@]}" exec --no-TTY gateway node --input-type=module --eval '
   import { readFileSync } from "node:fs";
   if (readFileSync("/var/lib/cmclient/packaging-lifecycle-sentinel", "utf8") !== "must survive recreate") {

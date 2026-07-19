@@ -4,6 +4,7 @@ import { createServer, request as createRequest } from "node:http";
 import { extname, isAbsolute, relative, resolve } from "node:path";
 
 const DEFAULT_WEB_UPSTREAM = "http://gateway:8081";
+const DEFAULT_INGRESS_UPSTREAM = "http://web:8080";
 const STATIC_RESPONSE_HEADERS = {
   "referrer-policy": "same-origin",
   "x-content-type-options": "nosniff",
@@ -37,11 +38,19 @@ export function gatewayEnvironment(environment = process.env) {
 }
 
 export function parseWebUpstream(value = DEFAULT_WEB_UPSTREAM) {
+  return parseInternalUpstream(value, "DOCKER_WEB_UPSTREAM_INVALID");
+}
+
+export function parseIngressUpstream(value = DEFAULT_INGRESS_UPSTREAM) {
+  return parseInternalUpstream(value, "DOCKER_INGRESS_UPSTREAM_INVALID");
+}
+
+function parseInternalUpstream(value, errorCode) {
   let upstream;
   try {
     upstream = new URL(value);
   } catch {
-    throw new Error("DOCKER_WEB_UPSTREAM_INVALID");
+    throw new Error(errorCode);
   }
   if (
     upstream.protocol !== "http:" ||
@@ -52,7 +61,7 @@ export function parseWebUpstream(value = DEFAULT_WEB_UPSTREAM) {
     upstream.pathname !== "/" ||
     upstream.search
   ) {
-    throw new Error("DOCKER_WEB_UPSTREAM_INVALID");
+    throw new Error(errorCode);
   }
   return upstream;
 }
@@ -101,7 +110,9 @@ export function createWebServer({ webRoot, upstream }) {
       requestUrl.pathname === "/api" ||
       requestUrl.pathname.startsWith("/api/")
     ) {
-      proxyGatewayRequest(incoming, outgoing, parsedUpstream, requestUrl);
+      proxyHttpRequest(incoming, outgoing, parsedUpstream, requestUrl, {
+        unavailableCode: "GATEWAY_PROXY_UNAVAILABLE",
+      });
       return;
     }
     void serveStaticFile(incoming, outgoing, webRoot, requestUrl.pathname);
@@ -118,29 +129,62 @@ export async function startWebServer({
     throw new Error("DOCKER_WEB_LISTEN_CONFIGURATION_INVALID");
   }
   const server = createWebServer({ webRoot, upstream });
-  await new Promise((resolvePromise, reject) => {
-    server.once("error", reject);
-    server.listen({ host, port }, () => {
-      server.off("error", reject);
-      resolvePromise();
-    });
-  });
+  await listen(server, host, port);
   return server;
 }
 
-function proxyGatewayRequest(incoming, outgoing, upstream, requestUrl) {
-  const gatewayUrl = new URL(
+export function createIngressServer({
+  upstream = DEFAULT_INGRESS_UPSTREAM,
+} = {}) {
+  const parsedUpstream = parseIngressUpstream(upstream);
+  return createServer((incoming, outgoing) => {
+    const requestUrl = new URL(incoming.url || "/", "http://cmclient-ingress");
+    proxyHttpRequest(incoming, outgoing, parsedUpstream, requestUrl, {
+      unavailableCode: "INGRESS_PROXY_UNAVAILABLE",
+    });
+  });
+}
+
+export async function startIngressServer({
+  host = "0.0.0.0",
+  port = 8080,
+} = {}) {
+  if (!Number.isInteger(port) || port < 0 || port > 65_535) {
+    throw new Error("DOCKER_INGRESS_LISTEN_CONFIGURATION_INVALID");
+  }
+  const server = createIngressServer();
+  await listen(server, host, port);
+  return server;
+}
+
+function proxyHttpRequest(
+  incoming,
+  outgoing,
+  upstream,
+  requestUrl,
+  { unavailableCode },
+) {
+  const upstreamUrl = new URL(
     `${requestUrl.pathname}${requestUrl.search}`,
     upstream,
   );
   const requestHeaders = selectHeaders(incoming.headers, REQUEST_HEADER_NAMES);
+  let activeUpstreamResponse;
   const upstreamRequest = createRequest(
-    gatewayUrl,
+    upstreamUrl,
     {
       headers: requestHeaders,
       method: incoming.method,
     },
     (upstreamResponse) => {
+      activeUpstreamResponse = upstreamResponse;
+      upstreamResponse.once("aborted", rejectRequest);
+      upstreamResponse.once("error", rejectRequest);
+      upstreamResponse.once("close", () => {
+        if (!upstreamResponse.complete) {
+          rejectRequest();
+        }
+      });
       const responseHeaders = {
         ...STATIC_RESPONSE_HEADERS,
         ...selectHeaders(upstreamResponse.headers, RESPONSE_HEADER_NAMES),
@@ -149,14 +193,39 @@ function proxyGatewayRequest(incoming, outgoing, upstream, requestUrl) {
       upstreamResponse.pipe(outgoing);
     },
   );
+  const destroyUpstream = () => {
+    activeUpstreamResponse?.destroy();
+    upstreamRequest.destroy();
+  };
   const rejectRequest = () => {
+    destroyUpstream();
+    if (incoming.aborted || outgoing.destroyed) {
+      return;
+    }
     if (!outgoing.headersSent) {
-      writeJson(outgoing, 502, { code: "GATEWAY_PROXY_UNAVAILABLE" });
+      writeJson(outgoing, 502, { code: unavailableCode });
+    } else {
+      outgoing.destroy();
     }
   };
   upstreamRequest.once("error", rejectRequest);
-  incoming.once("aborted", () => upstreamRequest.destroy());
+  incoming.once("aborted", destroyUpstream);
+  outgoing.once("close", () => {
+    if (!outgoing.writableFinished) {
+      destroyUpstream();
+    }
+  });
   incoming.pipe(upstreamRequest);
+}
+
+async function listen(server, host, port) {
+  await new Promise((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen({ host, port }, () => {
+      server.off("error", reject);
+      resolvePromise();
+    });
+  });
 }
 
 async function serveStaticFile(incoming, outgoing, webRoot, pathname) {

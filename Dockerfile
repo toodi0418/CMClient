@@ -17,7 +17,7 @@ RUN pnpm install --frozen-lockfile \
     && pnpm --filter @cmclient/contracts run build \
     && pnpm --filter @cmclient/gateway run build \
     && pnpm --filter @cmclient/web run build \
-    && pnpm --filter @cmclient/gateway deploy --legacy --prod /opt/cmclient/gateway
+    && pnpm --filter @cmclient/gateway deploy --prod --frozen-lockfile /opt/cmclient/gateway
 
 FROM node:22-bookworm-slim AS runtime
 
