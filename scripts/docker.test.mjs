@@ -154,6 +154,11 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
   assert.match(releaseWorkflow, /release-supply-chain\.mjs stage-docker/);
   assert.match(releaseWorkflow, /--target "\$\{\{ matrix\.target \}\}"/);
   assert.match(releaseWorkflow, /release-supply-chain\.mjs include-docker/);
+  assert.match(releaseWorkflow, /--compose docker-compose\.yml/);
+  assert.match(
+    releaseWorkflow,
+    /--file "release-dist\/cmclient-docker-compose-\$version\.yml" \\\n\s+config --quiet/,
+  );
   assert.match(releaseWorkflow, /pattern: cmclient-docker-oci-\*/);
   assert.match(
     releaseWorkflow,

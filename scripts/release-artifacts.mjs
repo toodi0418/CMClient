@@ -150,6 +150,18 @@ export function dockerArtifactPlan(version) {
   });
 }
 
+export function dockerComposeArtifactPlan(version) {
+  assertVersion(version);
+  return {
+    component: "docker",
+    kind: "compose-descriptor",
+    version,
+    sourcePath: "docker-compose.yml",
+    fileName: `cmclient-docker-compose-${version}.yml`,
+    updaterManaged: false,
+  };
+}
+
 export function releaseComposition(component, target) {
   assertComponent(component);
   assertTarget(target);
@@ -190,7 +202,7 @@ export function releaseComposition(component, target) {
 
 export function releasePlanDocument(version) {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     version,
     artifacts: releaseArtifactPlan(version).map((artifact) => ({
       ...artifact,
@@ -199,6 +211,7 @@ export function releasePlanDocument(version) {
     nativeDesktop: nativeDesktopArtifactPlan(version),
     docker: {
       ...DOCKER_COMPOSITION,
+      compose: dockerComposeArtifactPlan(version),
       artifacts: dockerArtifactPlan(version),
     },
   };

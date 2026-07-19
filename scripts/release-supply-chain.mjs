@@ -22,6 +22,7 @@ import {
   archiveForTarget,
   DOCKER_COMPOSITION,
   dockerArtifactPlan as canonicalDockerArtifactPlan,
+  dockerComposeArtifactPlan as canonicalDockerComposeArtifactPlan,
   nativeDesktopArtifactPlan,
   releaseArtifactName,
   releaseArtifactPlan,
@@ -95,6 +96,7 @@ export async function stageDockerArtifact({
 }
 
 export async function includeDockerArtifact({
+  compose,
   input,
   output,
   sourceSha,
@@ -102,6 +104,20 @@ export async function includeDockerArtifact({
 }) {
   assertSourceSha(sourceSha);
   const plans = dockerArtifactPlans(version);
+  const composePlan = canonicalDockerComposeArtifactPlan(version);
+  if (typeof compose !== "string") {
+    throw new Error("RELEASE_DOCKER_COMPOSE_INVALID");
+  }
+  const composeSource = resolve(compose);
+  let composeSourceMetadata;
+  try {
+    composeSourceMetadata = await lstat(composeSource);
+  } catch {
+    throw new Error("RELEASE_DOCKER_COMPOSE_INVALID");
+  }
+  if (!composeSourceMetadata.isFile() || composeSourceMetadata.size < 1) {
+    throw new Error("RELEASE_DOCKER_COMPOSE_INVALID");
+  }
   const inputRoot = resolve(input);
   const entries = (await readdir(inputRoot, { withFileTypes: true }))
     .map((entry) => `${entry.isFile() ? "file" : "other"}:${entry.name}`)
@@ -141,7 +157,8 @@ export async function includeDockerArtifact({
   if (
     index.version !== version ||
     index.sourceSha !== undefined ||
-    index.dockerImages !== undefined
+    index.dockerImages !== undefined ||
+    index.dockerCompose !== undefined
   ) {
     throw new Error("RELEASE_DOCKER_INDEX_INVALID");
   }
@@ -152,10 +169,22 @@ export async function includeDockerArtifact({
     );
     await writeJson(join(outputRoot, docker.metadataFileName), docker);
   }
+  const composePath = join(outputRoot, composePlan.fileName);
+  await copyFile(composeSource, composePath);
+  await chmod(composePath, 0o644);
+  const composeMetadata = await lstat(composePath);
+  const dockerCompose = {
+    schemaVersion: 1,
+    ...composePlan,
+    sourceSha,
+    sha256: await sha256File(composePath),
+    sizeBytes: composeMetadata.size,
+  };
   index.sourceSha = sourceSha;
   index.dockerImages = dockerImages;
+  index.dockerCompose = dockerCompose;
   await writeJson(join(outputRoot, "release-index.json"), index);
-  return dockerImages;
+  return { dockerCompose, dockerImages };
 }
 
 async function assertDockerMetadata({
@@ -205,6 +234,47 @@ async function assertDockerMetadata({
     inspected.createdAt !== docker.createdAt
   ) {
     throw new Error("RELEASE_DOCKER_METADATA_INVALID");
+  }
+}
+
+async function assertDockerComposeMetadata({
+  composePath,
+  dockerCompose,
+  plan,
+  sourceSha,
+}) {
+  const expectedKeys = [
+    "schemaVersion",
+    ...Object.keys(plan),
+    "sourceSha",
+    "sha256",
+    "sizeBytes",
+  ].sort(compareCanonicalText);
+  if (
+    !dockerCompose ||
+    JSON.stringify(Object.keys(dockerCompose).sort(compareCanonicalText)) !==
+      JSON.stringify(expectedKeys) ||
+    dockerCompose.schemaVersion !== 1 ||
+    Object.entries(plan).some(([key, value]) => dockerCompose[key] !== value) ||
+    dockerCompose.sourceSha !== sourceSha ||
+    !SHA256.test(dockerCompose.sha256) ||
+    !Number.isSafeInteger(dockerCompose.sizeBytes) ||
+    dockerCompose.sizeBytes < 1
+  ) {
+    throw new Error("RELEASE_DOCKER_COMPOSE_INVALID");
+  }
+  let metadata;
+  try {
+    metadata = await lstat(composePath);
+  } catch {
+    throw new Error("RELEASE_DOCKER_COMPOSE_INVALID");
+  }
+  if (
+    !metadata.isFile() ||
+    metadata.size !== dockerCompose.sizeBytes ||
+    (await sha256File(composePath)) !== dockerCompose.sha256
+  ) {
+    throw new Error("RELEASE_DOCKER_COMPOSE_INVALID");
   }
 }
 
@@ -416,7 +486,7 @@ export async function assembleReleaseArtifacts({ input, output, version }) {
       version,
     });
     const index = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       version,
       artifacts,
       nativeDesktop,
@@ -494,6 +564,7 @@ export async function finalizeChecksums({ output }) {
       image.fileName,
       image.metadataFileName,
     ]),
+    ...(index.dockerCompose ? [index.dockerCompose.fileName] : []),
     ...sbomNames,
     "release-index.json",
   ].sort();
@@ -588,19 +659,21 @@ export async function verifyReleaseOutput({ output, sourceSha, version }) {
     }
     if (
       !Array.isArray(index.dockerImages) ||
-      index.dockerImages.length !== dockerArtifactPlans(version).length
+      index.dockerImages.length !== dockerArtifactPlans(version).length ||
+      !index.dockerCompose
     ) {
       throw new Error("RELEASE_DOCKER_INDEX_INVALID");
     }
   }
-  if (index.dockerImages !== undefined) {
+  if (index.dockerImages !== undefined || index.dockerCompose !== undefined) {
     if (!SOURCE_SHA.test(index.sourceSha)) {
       throw new Error("RELEASE_INDEX_SOURCE_SHA_INVALID");
     }
     const dockerPlan = dockerArtifactPlans(version);
     if (
       !Array.isArray(index.dockerImages) ||
-      index.dockerImages.length !== dockerPlan.length
+      index.dockerImages.length !== dockerPlan.length ||
+      !index.dockerCompose
     ) {
       throw new Error("RELEASE_DOCKER_INDEX_INVALID");
     }
@@ -634,6 +707,13 @@ export async function verifyReleaseOutput({ output, sourceSha, version }) {
         throw new Error("RELEASE_DOCKER_METADATA_INVALID");
       }
     }
+    const composePlan = canonicalDockerComposeArtifactPlan(version);
+    await assertDockerComposeMetadata({
+      composePath: join(outputRoot, composePlan.fileName),
+      dockerCompose: index.dockerCompose,
+      plan: composePlan,
+      sourceSha: sourceSha ?? index.sourceSha,
+    });
   }
 
   const expectedChecksums = await expectedChecksumEntries(outputRoot, index);
@@ -1003,7 +1083,7 @@ async function readReleaseIndex(outputRoot) {
     throw new Error("RELEASE_INDEX_INVALID");
   }
   if (
-    index?.schemaVersion !== 2 ||
+    index?.schemaVersion !== 3 ||
     !Array.isArray(index.artifacts) ||
     !Array.isArray(index.nativeDesktop) ||
     (index.sourceSha !== undefined && !SOURCE_SHA.test(index.sourceSha)) ||
@@ -1024,6 +1104,7 @@ async function expectedChecksumEntries(outputRoot, index) {
         image.fileName,
         image.metadataFileName,
       ]),
+      ...(index.dockerCompose ? [index.dockerCompose.fileName] : []),
       ...sboms,
       "release-index.json",
     ]
@@ -1064,6 +1145,7 @@ async function assertExactReleaseOutputEntries(outputRoot, index) {
       image.fileName,
       image.metadataFileName,
     ]),
+    ...(index.dockerCompose ? [index.dockerCompose.fileName] : []),
     ...(await exactSbomNames(outputRoot, index)),
     "release-index.json",
     "SHA256SUMS",
@@ -1314,6 +1396,7 @@ async function main(argumentsList) {
   }
   if (command === "include-docker") {
     await includeDockerArtifact({
+      compose: argumentValue(argumentsList, "--compose"),
       input: argumentValue(argumentsList, "--input"),
       output: argumentValue(argumentsList, "--output"),
       sourceSha: argumentValue(argumentsList, "--source-sha"),

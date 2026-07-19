@@ -524,11 +524,19 @@ jobs:
             --output release-dist \
             --version "$version"
           node scripts/release-supply-chain.mjs include-docker \
+            --compose docker-compose.yml \
             --input release-docker \
             --output release-dist \
             --source-sha "$GITHUB_SHA" \
             --version "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Validate released Docker Compose descriptor
+        shell: bash
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          CMCLIENT_IMAGE="cmclient:$version" docker compose \
+            --file "release-dist/cmclient-docker-compose-$version.yml" \
+            config --quiet
       - name: Install checksum-pinned SBOM tool
         shell: bash
         run: bash scripts/install-sbom-tool.sh "$RUNNER_TEMP/cmclient-sbom-tools"

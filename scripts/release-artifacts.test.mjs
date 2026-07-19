@@ -11,6 +11,7 @@ import {
   NATIVE_DESKTOP_BUNDLES,
   RELEASE_TARGETS,
   dockerArtifactPlan,
+  dockerComposeArtifactPlan,
   nativeDesktopArtifactName,
   nativeDesktopArtifactPlan,
   releaseArtifactName,
@@ -117,10 +118,15 @@ test("canonical compositions encode complete product surfaces and constrained Do
   });
 
   const document = releasePlanDocument("2.0.0");
-  assert.equal(document.schemaVersion, 3);
-  const { artifacts: dockerArtifacts, ...dockerComposition } = document.docker;
+  assert.equal(document.schemaVersion, 4);
+  const {
+    artifacts: dockerArtifacts,
+    compose: dockerCompose,
+    ...dockerComposition
+  } = document.docker;
   assert.deepEqual(dockerComposition, DOCKER_COMPOSITION);
   assert.deepEqual(dockerArtifacts, dockerArtifactPlan("2.0.0"));
+  assert.deepEqual(dockerCompose, dockerComposeArtifactPlan("2.0.0"));
   assert.equal(document.artifacts[0].contents[0].role, "desktop");
   assert.deepEqual(document.nativeDesktop, nativeDesktopArtifactPlan("2.0.0"));
 });
@@ -161,6 +167,17 @@ test("Docker artifact plan covers native x64 and ARM64 without Agent updater own
       },
     ],
   );
+});
+
+test("Docker Compose descriptor is versioned and excluded from Agent updates", () => {
+  assert.deepEqual(dockerComposeArtifactPlan("2.0.0-rc.1"), {
+    component: "docker",
+    kind: "compose-descriptor",
+    version: "2.0.0-rc.1",
+    sourcePath: "docker-compose.yml",
+    fileName: "cmclient-docker-compose-2.0.0-rc.1.yml",
+    updaterManaged: false,
+  });
 });
 
 test("native Desktop plan covers installer formats on every supported target", () => {

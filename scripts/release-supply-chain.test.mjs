@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,6 +17,7 @@ import { promisify } from "node:util";
 
 import {
   nativeDesktopArtifactPlan,
+  dockerComposeArtifactPlan,
   releaseArtifactPlan,
   releaseComposition,
   stageBuild,
@@ -48,7 +50,7 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   await stageFixture(input, plan, version, "fixture");
 
   const index = await assembleReleaseArtifacts({ input, output, version });
-  assert.equal(index.schemaVersion, 2);
+  assert.equal(index.schemaVersion, 3);
   assert.equal(index.artifacts.length, plan.length);
   assert.equal(
     index.nativeDesktop.length,
@@ -331,7 +333,9 @@ test("assembler rejects files outside the canonical staged composition", async (
 test("Docker OCI staging binds the image digest to version and source SHA", async (t) => {
   const version = "2.0.0-dev.0";
   const root = await mkdtemp(join(tmpdir(), "cmclient-docker-oci-"));
+  const compose = join(root, "docker-compose.yml");
   t.after(() => rm(root, { force: true, recursive: true }));
+  await writeFile(compose, "services:\n  gateway:\n    image: cmclient:test\n");
   for (const plan of dockerArtifactPlans(version)) {
     const archive = await createOciFixture(join(root, plan.target), {
       architecture: plan.architecture,
@@ -399,6 +403,7 @@ test("Docker OCI staging binds the image digest to version and source SHA", asyn
   await assert.rejects(
     () =>
       includeDockerArtifact({
+        compose,
         input: incompleteInput,
         output: join(root, "unused-output"),
         sourceSha,
@@ -406,6 +411,32 @@ test("Docker OCI staging binds the image digest to version and source SHA", asyn
       }),
     /RELEASE_DOCKER_INPUT_INVALID/,
   );
+});
+
+test("Docker Compose inclusion rejects missing, empty, and symlink inputs", async (t) => {
+  const version = "2.0.0-dev.0";
+  const root = await mkdtemp(join(tmpdir(), "cmclient-docker-compose-"));
+  const empty = join(root, "empty.yml");
+  const source = join(root, "source.yml");
+  const link = join(root, "link.yml");
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await writeFile(empty, "");
+  await writeFile(source, "services: {}\n");
+  await symlink(source, link);
+
+  for (const compose of [join(root, "missing.yml"), empty, link]) {
+    await assert.rejects(
+      () =>
+        includeDockerArtifact({
+          compose,
+          input: root,
+          output: root,
+          sourceSha,
+          version,
+        }),
+      /RELEASE_DOCKER_COMPOSE_INVALID/,
+    );
+  }
 });
 
 test("supply-chain checksums cover every archive and generated SBOM", async (t) => {
@@ -444,8 +475,12 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
   );
   await writeFile(
     join(output, "release-index.json"),
-    `${JSON.stringify({ schemaVersion: 2, version, artifacts, nativeDesktop }, null, 2)}\n`,
+    `${JSON.stringify({ schemaVersion: 3, version, artifacts, nativeDesktop }, null, 2)}\n`,
   );
+  const compose = join(root, "docker-compose.yml");
+  const composeContents =
+    "services:\n  gateway:\n    image: ${CMCLIENT_IMAGE:-cmclient:local}\n";
+  await writeFile(compose, composeContents);
   const dockerInput = join(root, "docker-input");
   await mkdir(dockerInput, { recursive: true });
   const dockerPlans = dockerArtifactPlans(version);
@@ -478,6 +513,7 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
     );
   }
   await includeDockerArtifact({
+    compose,
     input: dockerInput,
     output,
     sourceSha,
@@ -486,7 +522,7 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
   const checksums = await finalizeChecksums({ output });
   assert.equal(
     checksums.length,
-    plan.length + nativeDesktopArtifactPlan(version).length + 8,
+    plan.length + nativeDesktopArtifactPlan(version).length + 9,
   );
   assert.match(
     checksumFileContents(checksums),
@@ -494,6 +530,10 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
   );
   assert.match(checksumFileContents(checksums), /\.oci\.tar/);
   assert.match(checksumFileContents(checksums), /\.metadata\.json/);
+  assert.match(
+    checksumFileContents(checksums),
+    /\*cmclient-docker-compose-2\.0\.0-dev\.0\.yml/,
+  );
   assert.match(checksumFileContents(checksums), /\.AppImage/);
   assert.match(checksumFileContents(checksums), /\.setup\.exe/);
   assert.match(checksumFileContents(checksums), /\*release-index\.json/);
@@ -507,6 +547,26 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
   );
   await assert.doesNotReject(() =>
     verifyReleaseOutput({ output, sourceSha, version }),
+  );
+  const composePlan = dockerComposeArtifactPlan(version);
+  assert.equal(
+    await readFile(join(output, composePlan.fileName), "utf8"),
+    composeContents,
+  );
+  const releaseIndex = JSON.parse(
+    await readFile(join(output, "release-index.json"), "utf8"),
+  );
+  assert.deepEqual(
+    {
+      fileName: releaseIndex.dockerCompose.fileName,
+      sourceSha: releaseIndex.dockerCompose.sourceSha,
+      updaterManaged: releaseIndex.dockerCompose.updaterManaged,
+    },
+    {
+      fileName: composePlan.fileName,
+      sourceSha,
+      updaterManaged: false,
+    },
   );
   await assert.rejects(
     () => verifyReleaseOutput({ output, sourceSha: "f".repeat(40), version }),
@@ -525,6 +585,20 @@ test("supply-chain checksums cover every archive and generated SBOM", async (t) 
     /RELEASE_INDEX_SOURCE_SHA_INVALID/,
   );
   await writeFile(indexPath, canonicalIndex);
+
+  const releasedComposePath = join(output, composePlan.fileName);
+  await rm(releasedComposePath);
+  await assert.rejects(
+    () => verifyReleaseOutput({ output, sourceSha, version }),
+    /RELEASE_DOCKER_COMPOSE_INVALID/,
+  );
+  await writeFile(releasedComposePath, composeContents);
+  await writeFile(releasedComposePath, `${composeContents}# tampered\n`);
+  await assert.rejects(
+    () => verifyReleaseOutput({ output, sourceSha, version }),
+    /RELEASE_DOCKER_COMPOSE_INVALID/,
+  );
+  await writeFile(releasedComposePath, composeContents);
 
   const armSbomPath = join(output, dockerPlans[1].sbomFileName);
   const armSbom = await readFile(armSbomPath);
