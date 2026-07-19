@@ -106,6 +106,20 @@ test("secret scan rejects generated artifacts and dependency hooks", () => {
   }
 });
 
+test("secret scan does not skip provider credentials in NUL-containing entries", () => {
+  const githubToken = ["gh", "p_", "n".repeat(36)].join("");
+  const input = Buffer.concat([
+    Buffer.from(`binary prefix\0${githubToken}`),
+    Buffer.from([0]),
+  ]);
+
+  assert.ok(
+    violationCodes(scanSecretEntry("docs/malformed.md", input)).has(
+      "SECRET_GITHUB_TOKEN",
+    ),
+  );
+});
+
 test("workflow audit accepts a SHA-pinned checkout with disabled credential persistence", () => {
   const result = auditWorkflow(".github/workflows/good.yml", workflow());
 

@@ -122,9 +122,6 @@ export function scanSecretEntry(path, bytes) {
   if (FORBIDDEN_RESOLUTION_HOOK_PATHS.some((pattern) => pattern.test(path))) {
     violations.push({ code: "DEPENDENCY_RESOLUTION_HOOK_FORBIDDEN", path });
   }
-  if (bytes.includes(0)) {
-    return violations;
-  }
   const text = bytes.toString("utf8").normalize("NFKC");
   for (const [code, pattern] of SECRET_PATTERNS) {
     for (const match of text.matchAll(pattern)) {
