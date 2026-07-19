@@ -259,6 +259,21 @@ impl StructuredLogSink {
         Stderr: Read + Send + 'static,
         Secrets: IntoIterator<Item = String>,
     {
+        self.capture_inner(stdout, stderr, secrets, None)
+    }
+
+    fn capture_inner<Stdout, Stderr, Secrets>(
+        &self,
+        stdout: Stdout,
+        stderr: Stderr,
+        secrets: Secrets,
+        writer_gate: Option<Receiver<()>>,
+    ) -> Result<ChildOutputCapture, RuntimeLogError>
+    where
+        Stdout: Read + Send + 'static,
+        Stderr: Read + Send + 'static,
+        Secrets: IntoIterator<Item = String>,
+    {
         let secrets = Arc::new(secret_needles(secrets));
         let (record_sender, record_receiver) = mpsc::sync_channel(CAPTURE_QUEUE_CAPACITY);
         let mut reader_handles = Vec::with_capacity(2);
@@ -270,6 +285,9 @@ impl StructuredLogSink {
             .name(String::from("cmclient-log-writer"))
             .spawn(move || {
                 if writer_ready.recv().is_ok() {
+                    if let Some(gate) = writer_gate {
+                        let _ = gate.recv();
+                    }
                     capture_writer(record_receiver, &writer_sink);
                 }
             }) {
@@ -1273,20 +1291,29 @@ mod tests {
     fn queue_full_drops_records_but_drains_and_joins_large_streams() {
         let directory = temporary_directory("queue-full");
         let sink = test_sink(&directory, "gateway.jsonl", 1024 * 1024, 256);
+        let (release_writer, writer_gate) = mpsc::channel();
         let line = b"{\"level\":\"info\",\"message\":\"burst\",\"traceId\":\"trace-burst\"}\n";
-        let mut stdout = Vec::with_capacity(line.len() * 100_000);
-        for _ in 0..100_000 {
+        let mut stdout = Vec::with_capacity(line.len() * 2_048);
+        for _ in 0..2_048 {
             stdout.extend_from_slice(line);
         }
         assert!(stdout.len() > 64 * 1024);
         let started = Instant::now();
         let capture = sink
-            .capture(
+            .capture_inner(
                 Cursor::new(stdout),
                 Cursor::new(Vec::<u8>::new()),
                 Vec::new(),
+                Some(writer_gate),
             )
             .expect("capture should start");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.latched_error().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let saturation_error = sink.latched_error();
+        release_writer.send(()).expect("writer gate should release");
+        assert_eq!(saturation_error, Some(RuntimeLogError::QueueFull));
         assert_eq!(
             capture.finish(),
             Err(RuntimeLogError::QueueFull),
