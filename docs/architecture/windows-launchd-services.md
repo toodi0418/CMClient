@@ -22,8 +22,10 @@ the service deadline.
 absolute paths under `%ProgramData%\CMClient` for data, configuration, cache,
 and logs. The manager accepts only the service-host path and operational
 actions; it never accepts or writes a CallMesh key, APRS passcode, token, or
-signing key. Re-running install updates the SCM executable target. Uninstall removes the SCM registration only and retains
-`%ProgramData%\CMClient`.
+signing key. `CMClientAgent` is the fixed singleton SCM identity shared by the
+manager and the compiled service host; there is no service-name override.
+Re-running install updates that registration's executable target. Uninstall
+removes the SCM registration only and retains `%ProgramData%\CMClient`.
 
 The private Agent Control API is the local named pipe
 `\\.\pipe\cmclient-control`. It uses the default LocalService security

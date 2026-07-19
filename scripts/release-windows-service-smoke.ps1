@@ -20,8 +20,7 @@ function Invoke-ServiceManager([string]$Manager, [string]$Command, [string]$Host
         "-ExecutionPolicy", "Bypass",
         "-File", $Manager,
         $Command,
-        "-HostPath", $HostPath,
-        "-ServiceName", $ServiceName
+        "-HostPath", $HostPath
     )
     if ($NoStart) {
         $arguments += "-NoStart"

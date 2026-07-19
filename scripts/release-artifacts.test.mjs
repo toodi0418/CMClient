@@ -1002,6 +1002,7 @@ test("staged and final Windows Service archives share the real SCM launch gate",
     serviceSmoke,
     /Invoke-ServiceManager \$manager "install" \$hostPath -NoStart/,
   );
+  assert.doesNotMatch(serviceSmoke, /-ServiceName/);
   assert.match(serviceSmoke, /Start-Service -Name \$ServiceName/);
   assert.match(serviceSmoke, /--json status/);
   assert.match(serviceSmoke, /--json start/);

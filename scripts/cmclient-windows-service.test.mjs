@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 test("Windows service manager registers the service host without credential arguments", async () => {
-  const script = await readFile("scripts/cmclient-windows-service.ps1", "utf8");
+  const [script, serviceHost] = await Promise.all([
+    readFile("scripts/cmclient-windows-service.ps1", "utf8"),
+    readFile("apps/service-host/src/main.rs", "utf8"),
+  ]);
 
   assert.match(script, /cmclient-service-host\.exe/);
   assert.match(script, /--service/);
@@ -12,9 +15,11 @@ test("Windows service manager registers the service host without credential argu
     script,
     /ValidateSet\("install", "uninstall", "start", "stop", "restart", "status", "render"\)/,
   );
-  assert.match(script, /\[string\]\$ServiceName = "CMClientAgent"/);
-  assert.match(script, /function Assert-SafeServiceName/);
-  assert.match(script, /WINDOWS_SERVICE_NAME_INVALID/);
+  assert.match(script, /\$ServiceName = "CMClientAgent"/);
+  assert.match(serviceHost, /const SERVICE_NAME: &str = "CMClientAgent";/);
+  assert.doesNotMatch(script, /\[string\]\$ServiceName/);
+  assert.doesNotMatch(script, /function Assert-SafeServiceName/);
+  assert.doesNotMatch(script, /WINDOWS_SERVICE_NAME_INVALID/);
   assert.doesNotMatch(
     script,
     /CALLMESH_API_KEY|APRS_PASSCODE|MANAGEMENT_ADMIN_TOKEN|password=/i,
@@ -65,9 +70,12 @@ test("Windows service path validation remains compatible with Windows PowerShell
 test("Windows lifecycle smoke creates and rechecks its retained-state sentinel", async () => {
   const workflow = await readFile(".github/workflows/ci.yml", "utf8");
   const lifecycleStart = workflow.indexOf(
-    "Exercise isolated Windows Service install, upgrade, and uninstall",
+    "Exercise canonical Windows Service install, upgrade, start, and uninstall",
   );
-  const lifecycleEnd = workflow.indexOf("\n  docker-smoke:", lifecycleStart);
+  const lifecycleEnd = workflow.indexOf(
+    "\n  linux-systemd-smoke:",
+    lifecycleStart,
+  );
   const lifecycle = workflow.slice(lifecycleStart, lifecycleEnd);
 
   assert.ok(lifecycleStart >= 0);
@@ -102,4 +110,21 @@ test("Windows lifecycle smoke creates and rechecks its retained-state sentinel",
   assert.ok(installIndex < uninstallIndex);
   assert.ok(uninstallIndex < finalCheckIndex);
   assert.doesNotMatch(lifecycle, /Set-Content\s+-NoNewline\s+\$state/);
+  assert.match(lifecycle, /\$serviceName = "CMClientAgent"/);
+  assert.match(lifecycle, /WINDOWS_CANONICAL_SERVICE_NAME_IN_USE/);
+  assert.doesNotMatch(lifecycle, /CMClientAgentPackage/);
+  assert.doesNotMatch(lifecycle, /-ServiceName/);
+  assert.match(lifecycle, /\$programDataIsolated = \$false/);
+  const isolateIndex = lifecycle.indexOf("$programDataIsolated = $true");
+  const cleanupIndex = lifecycle.indexOf("if ($programDataIsolated) {");
+  assert.ok(isolateIndex >= 0);
+  assert.ok(cleanupIndex > isolateIndex);
+  assert.match(
+    lifecycle.slice(cleanupIndex),
+    /if \(\$programDataIsolated\) \{[\s\S]*Remove-Item -Recurse -Force \$programDataRoot[\s\S]*if \(\$programDataMoved\) \{ Move-Item/,
+  );
+  assert.match(lifecycle, /Start-Service -Name \$serviceName/);
+  assert.match(lifecycle, /\\\\\.\\pipe\\cmclient-control/);
+  assert.match(lifecycle, /\$controlStatus\.agent -ne "running"/);
+  assert.match(lifecycle, /\$agent\.ExecutablePath -ne \$agentV2/);
 });
