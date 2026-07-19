@@ -1,6 +1,6 @@
 use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::access::{ManagementAccessController, ManagementAccessError};
-use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind};
+use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind, SecretStoreError};
 use cmclient_agent_core::web::{
     ManagementTlsConfig, ManagementWebApiHandler, ManagementWebConfig, ManagementWebError,
     ManagementWebListener, ManagementWebRequest, ManagementWebService, ManagementWebStream,
@@ -471,6 +471,7 @@ fn write_remote_control_error(
 
 const fn remote_control_error_status(error: &ControlError) -> &'static str {
     match error {
+        ControlError::SecretValueInvalid => "400 Bad Request",
         ControlError::Authentication => "401 Unauthorized",
         ControlError::Timeout => "504 Gateway Timeout",
         ControlError::InvalidHttp | ControlError::ResponseTooLarge => "502 Bad Gateway",
@@ -697,7 +698,8 @@ impl Drop for SupervisorWorker {
 
 impl AgentController {
     fn from_config(config: &AgentConfig) -> Result<Self, ControlError> {
-        let secrets = AgentSecretStore::platform();
+        let secrets =
+            AgentSecretStore::runtime(&config.paths.data_dir).map_err(control_secret_error)?;
         let control_endpoint = default_local_endpoint(&config.paths.data_dir);
         let remote_replay = Arc::new(RemoteControlReplayGuard::default());
         let gateway_command = resolve_gateway_command(config);
@@ -743,7 +745,7 @@ impl AgentController {
                     environment.insert(String::from("CMCLIENT_CALLMESH_URL"), callmesh.url.clone());
                     if let Some(api_key) = secrets
                         .read(SecretKind::CallMeshApiKey)
-                        .map_err(|_| ControlError::CommandFailed)?
+                        .map_err(control_secret_error)?
                     {
                         environment.insert(
                             String::from("CMCLIENT_CALLMESH_API_KEY"),
@@ -792,7 +794,7 @@ impl AgentController {
                 if let Some(aprs) = &config.aprs {
                     let passcode = secrets
                         .read(SecretKind::AprsPasscode)
-                        .map_err(|_| ControlError::CommandFailed)?;
+                        .map_err(control_secret_error)?;
                     environment.insert(
                         String::from("CMCLIENT_APRS_ENABLED"),
                         passcode.is_some().to_string(),
@@ -1286,13 +1288,13 @@ impl ControlHandler for AgentController {
     fn store_secret(&self, kind: ControlSecretKind, value: &str) -> Result<(), ControlError> {
         self.secrets
             .store(secret_kind(kind), value)
-            .map_err(|_| ControlError::CommandFailed)
+            .map_err(control_secret_error)
     }
 
     fn remove_secret(&self, kind: ControlSecretKind) -> Result<bool, ControlError> {
         self.secrets
             .remove(secret_kind(kind))
-            .map_err(|_| ControlError::CommandFailed)
+            .map_err(control_secret_error)
     }
 }
 
@@ -1676,6 +1678,13 @@ const fn secret_kind(kind: ControlSecretKind) -> SecretKind {
     }
 }
 
+const fn control_secret_error(error: SecretStoreError) -> ControlError {
+    match error {
+        SecretStoreError::InvalidValue => ControlError::SecretValueInvalid,
+        SecretStoreError::Unavailable => ControlError::SecretStoreUnavailable,
+    }
+}
+
 fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
@@ -1766,13 +1775,20 @@ fn serve_web_once() -> ExitCode {
         eprintln!("{}", error.code());
         return ExitCode::from(EX_CONFIG);
     }
+    let secrets = match AgentSecretStore::runtime(&config.paths.data_dir) {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            eprintln!("{}", error.code());
+            return ExitCode::from(EX_CONFIG);
+        }
+    };
     let listener = match ManagementWebListener::bind_with_api_handler(
         &web_config,
         Arc::new(AgentManagementWebApi {
             updates,
             access: management_access,
             control_endpoint: default_local_endpoint(&config.paths.data_dir),
-            secrets: AgentSecretStore::platform(),
+            secrets,
             remote_replay: Arc::new(RemoteControlReplayGuard::default()),
         }),
     ) {
@@ -2826,6 +2842,16 @@ mod tests {
         assert_eq!(
             remote_control_error_status(&cmclient_control_api::ControlError::Timeout),
             "504 Gateway Timeout"
+        );
+        assert_eq!(
+            remote_control_error_status(&cmclient_control_api::ControlError::SecretValueInvalid),
+            "400 Bad Request"
+        );
+        assert_eq!(
+            remote_control_error_status(
+                &cmclient_control_api::ControlError::SecretStoreUnavailable
+            ),
+            "503 Service Unavailable"
         );
         gateway_thread.join().expect("gateway should join");
     }

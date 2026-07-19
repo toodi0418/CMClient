@@ -13,6 +13,7 @@ CONFIG_DIR="${CMCLIENT_CONFIG_DIR:-/etc/cmclient}"
 DATA_DIR="${CMCLIENT_DATA_DIR:-/var/lib/cmclient}"
 CACHE_DIR="${CMCLIENT_CACHE_DIR:-/var/cache/cmclient}"
 LOG_DIR="${CMCLIENT_LOG_DIR:-/var/log/cmclient}"
+SECRET_STORE_KEY=""
 SERVICE_USER="${CMCLIENT_SERVICE_USER:-cmclient}"
 SERVICE_GROUP="${CMCLIENT_SERVICE_GROUP:-cmclient}"
 SERIAL_GROUP="${CMCLIENT_SERIAL_GROUP:-}"
@@ -50,7 +51,8 @@ Install options:
   --skip-user-setup              Packaging-test only: do not create or modify accounts
 
 The manager never accepts credentials or writes secret values. `uninstall`
-removes the unit only; Agent configuration, data, cache, and logs are retained.
+removes the unit only; Agent configuration, the service wrapping key, data,
+cache, and logs are retained.
 EOF
 }
 
@@ -139,6 +141,52 @@ prepare_directories() {
   install_directory "$LOG_DIR" 0750
 }
 
+ensure_secret_store_key() {
+  local key_size
+  if run_privileged test -e "$SECRET_STORE_KEY" || run_privileged test -L "$SECRET_STORE_KEY"; then
+    if ! run_privileged test -f "$SECRET_STORE_KEY" || run_privileged test -L "$SECRET_STORE_KEY"; then
+      fail "SYSTEMD_SECRET_STORE_KEY_INVALID"
+    fi
+    key_size="$(run_privileged wc -c "$SECRET_STORE_KEY" | awk '{print $1}')"
+    if [[ "$key_size" != "32" ]]; then
+      fail "SYSTEMD_SECRET_STORE_KEY_INVALID"
+    fi
+    if [[ "$SKIP_USER_SETUP" == "1" ]]; then
+      chmod 0600 "$SECRET_STORE_KEY"
+    else
+      run_privileged chown root:root "$SECRET_STORE_KEY"
+      run_privileged chmod 0600 "$SECRET_STORE_KEY"
+    fi
+    return
+  fi
+
+  if run_privileged test -e "$DATA_DIR/secrets" || run_privileged test -L "$DATA_DIR/secrets"; then
+    if ! run_privileged test -d "$DATA_DIR/secrets" || run_privileged test -L "$DATA_DIR/secrets"; then
+      fail "SYSTEMD_SECRET_STORE_DIRECTORY_INVALID"
+    fi
+    local existing_secret_entry
+    if ! existing_secret_entry="$(run_privileged find "$DATA_DIR/secrets" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
+      fail "SYSTEMD_SECRET_STORE_SCAN_FAILED"
+    fi
+    if [[ -n "$existing_secret_entry" ]]; then
+      fail "SYSTEMD_SECRET_STORE_KEY_MISSING"
+    fi
+  fi
+
+  (
+    local temporary_key
+    temporary_key="$(mktemp)"
+    trap 'rm -f "$temporary_key"' EXIT
+    chmod 0600 "$temporary_key"
+    dd if=/dev/urandom of="$temporary_key" bs=32 count=1 status=none
+    if [[ "$SKIP_USER_SETUP" == "1" ]]; then
+      install -m 0600 "$temporary_key" "$SECRET_STORE_KEY"
+    else
+      run_privileged install -o root -g root -m 0600 "$temporary_key" "$SECRET_STORE_KEY"
+    fi
+  )
+}
+
 render_unit() {
   local working_directory
   local supplementary_group_line="# No serial supplementary group requested"
@@ -157,6 +205,7 @@ render_unit() {
     -e "s|@DATA_DIR@|$DATA_DIR|g" \
     -e "s|@CACHE_DIR@|$CACHE_DIR|g" \
     -e "s|@LOG_DIR@|$LOG_DIR|g" \
+    -e "s|@SECRET_STORE_KEY@|$SECRET_STORE_KEY|g" \
     "$TEMPLATE_PATH"
 }
 
@@ -167,6 +216,7 @@ validate_configuration() {
   validate_path "$DATA_DIR"
   validate_path "$CACHE_DIR"
   validate_path "$LOG_DIR"
+  validate_path "$SECRET_STORE_KEY"
   validate_account_name "$SERVICE_USER"
   validate_account_name "$SERVICE_GROUP"
   if [[ -n "$SERIAL_GROUP" ]]; then
@@ -190,6 +240,7 @@ install_service() {
   fi
   ensure_service_account
   prepare_directories
+  ensure_secret_store_key
   local temporary_unit
   temporary_unit="$(mktemp)"
   trap 'rm -f "$temporary_unit"' RETURN
@@ -245,6 +296,8 @@ while [[ $# -gt 0 ]]; do
     *) fail "SYSTEMD_USAGE_INVALID_ARGUMENT" ;;
   esac
 done
+
+SECRET_STORE_KEY="$CONFIG_DIR/secret-store.key"
 
 require_linux
 validate_configuration

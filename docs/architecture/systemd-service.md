@@ -30,9 +30,17 @@ group) when installing the unit.
 
 The manager requires systemd and root or `sudo` for its normal `/etc` install.
 It never accepts API keys, APRS passcodes, tokens, or a signing key in an
-argument or environment file. Runtime credentials belong to the service
-account's supported OS credential backend; if that backend is unavailable, the
-Agent fails closed rather than falling back to plaintext configuration.
+argument or environment file. A non-login service account has no user-session
+Secret Service, so the installer creates one random, root-only 32-byte wrapping
+key at `/etc/cmclient/secret-store.key` and passes it to Agent with systemd
+`LoadCredential`. Actual runtime secrets still enter only through the Agent
+Control API. Agent stores XChaCha20-Poly1305 authenticated ciphertext under
+`/var/lib/cmclient/secrets`; the root-only key and service-owned ciphertext are
+separate at rest, and neither value appears in the unit or process environment.
+Agent and its supervised Gateway remain one service-account trust boundary:
+the credential mount is not a sandbox against hostile code running inside that
+same unit. Agent still passes only enabled integration secrets in the Gateway
+environment and never passes the Management admin token.
 
 ```bash
 bash scripts/cmclient-systemd.sh install \
@@ -43,11 +51,37 @@ bash scripts/cmclient-systemd.sh restart
 bash scripts/cmclient-systemd.sh uninstall
 ```
 
+The service Control socket is `/var/lib/cmclient/control.sock`, not an
+administrator's per-user XDG socket. Root can operate the service instance with
+an explicit endpoint:
+
+```bash
+sudo /opt/cmclient/current/bin/cmclient \
+  --endpoint unix:///var/lib/cmclient/control.sock status
+sudo /opt/cmclient/current/bin/cmclient \
+  --endpoint unix:///var/lib/cmclient/control.sock secret set aprs-passcode
+```
+
+The socket is mode `0600`; an ordinary interactive user cannot connect. A
+CallMesh or APRS secret is copied into the Gateway environment only when the
+whole Agent starts, so restart `cmclient-agent.service` after changing either
+one. The Management admin token is read for each remote request and takes
+effect immediately.
+
 `install` is repeatable and regenerates the unit from
 `packaging/systemd/cmclient-agent.service.in`. It creates missing runtime
 directories but does not write `agent.toml`; package installation or the
 administrator owns the non-secret Agent configuration. A supplied config file
 must be readable by the `cmclient` group, for example `root:cmclient` with mode
 `0640`. `uninstall` disables and removes only the unit. It deliberately retains
-configuration, data, cache, and logs so a clean reinstall or rollback cannot
-destroy user state.
+configuration (including the wrapping key), data, cache, and logs so a clean
+reinstall or rollback cannot destroy user state. Reinstalling preserves the
+same key. If ciphertext exists but the key is missing, installation fails with
+`SYSTEMD_SECRET_STORE_KEY_MISSING`; Agent rejects a missing, malformed, or
+tampered store with `AGENT_SECRET_STORE_UNAVAILABLE` rather than replacing the
+key or treating the secret as absent.
+
+CI runs `scripts/cmclient-systemd-integration.sh` only on Ubuntu 22.04 with
+systemd 249. The smoke installs the real unit, exercises `LoadCredential` and
+the dedicated Unix Control socket, writes encrypted secret state, preserves the
+wrapping key across reinstall, and proves decryption after a service restart.

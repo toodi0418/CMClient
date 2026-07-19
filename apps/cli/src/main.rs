@@ -334,10 +334,46 @@ impl RemoteControlClient {
         let response = request.send().map_err(map_remote_error)?;
         match response.status().as_u16() {
             200 | 202 => Ok(response),
-            401 | 403 => Err(ControlError::Authentication),
-            408 | 504 => Err(ControlError::Timeout),
-            _ => Err(ControlError::CommandFailed),
+            _ => Err(read_remote_control_error(response)),
         }
+    }
+}
+
+fn read_remote_control_error(response: reqwest::blocking::Response) -> ControlError {
+    const MAX_REMOTE_ERROR_BYTES: u64 = 8 * 1024;
+    let status = response.status().as_u16();
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REMOTE_ERROR_BYTES)
+    {
+        return ControlError::ResponseTooLarge;
+    }
+    let mut body = Vec::new();
+    if response
+        .take(MAX_REMOTE_ERROR_BYTES + 1)
+        .read_to_end(&mut body)
+        .is_err()
+    {
+        return ControlError::Io;
+    }
+    if body.len() as u64 > MAX_REMOTE_ERROR_BYTES {
+        return ControlError::ResponseTooLarge;
+    }
+    remote_control_error(status, &body)
+}
+
+fn remote_control_error(status: u16, body: &[u8]) -> ControlError {
+    let code = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("code")?.as_str().map(str::to_owned));
+    if let Some(error) = code.as_deref().and_then(ControlError::from_code) {
+        return error;
+    }
+    match status {
+        401 | 403 => ControlError::Authentication,
+        408 | 504 => ControlError::Timeout,
+        413 => ControlError::ResponseTooLarge,
+        _ => ControlError::CommandFailed,
     }
 }
 
@@ -1336,7 +1372,10 @@ fn control_error_exit(error: ControlError) -> ProcessExitCode {
         | ControlError::EndpointAlreadyInUse => ExitCode::Connection,
         ControlError::Timeout => ExitCode::Timeout,
         ControlError::Authentication => ExitCode::Authentication,
-        ControlError::CommandFailed | ControlError::ResourceExhausted => ExitCode::OperationFailed,
+        ControlError::CommandFailed
+        | ControlError::ResourceExhausted
+        | ControlError::SecretStoreUnavailable
+        | ControlError::SecretValueInvalid => ExitCode::OperationFailed,
         ControlError::InvalidHttp | ControlError::ResponseTooLarge => ExitCode::OperationFailed,
     };
     ProcessExitCode::from(code.as_u8())
@@ -1347,7 +1386,7 @@ mod tests {
     use super::{
         Cli, EventOutput, RemoteControlClient, control_error_exit, doctor_is_degraded,
         event_matches_output, normalize_secret_input, parse_remote_sse_block, parse_secret_kind,
-        projection_control_path, read_bounded_sse_line, update_summary,
+        projection_control_path, read_bounded_sse_line, remote_control_error, update_summary,
     };
     use clap::CommandFactory;
     use cmclient_cli_client::ExitCode;
@@ -1462,6 +1501,18 @@ mod tests {
         assert_eq!(
             projection_control_path(GatewayProjection::CallMesh),
             "/api/v1/control/gateway/callmesh"
+        );
+        assert_eq!(
+            remote_control_error(503, br#"{"code":"AGENT_SECRET_STORE_UNAVAILABLE"}"#),
+            ControlError::SecretStoreUnavailable
+        );
+        assert_eq!(
+            remote_control_error(400, br#"{"code":"AGENT_SECRET_VALUE_INVALID"}"#),
+            ControlError::SecretValueInvalid
+        );
+        assert_eq!(
+            remote_control_error(401, br#"{"code":"UNKNOWN"}"#),
+            ControlError::Authentication
         );
         assert_eq!(
             parse_remote_sse_block(&[

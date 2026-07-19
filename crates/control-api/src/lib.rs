@@ -208,24 +208,17 @@ fn error_from_http_response(head: &[u8], body: &[u8]) -> ControlError {
     let code = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| value.get("code")?.as_str().map(str::to_owned));
-    match code.as_deref() {
-        Some("CONTROL_ENDPOINT_ALREADY_IN_USE") => ControlError::EndpointAlreadyInUse,
-        Some("CONTROL_ENDPOINT_UNSUPPORTED") => ControlError::UnsupportedEndpoint,
-        Some("CONTROL_IO_FAILED") => ControlError::Io,
-        Some("CONTROL_HTTP_INVALID") => ControlError::InvalidHttp,
-        Some("CONTROL_RESPONSE_TOO_LARGE") => ControlError::ResponseTooLarge,
-        Some("CONTROL_TIMEOUT") => ControlError::Timeout,
-        Some("CONTROL_RESOURCE_EXHAUSTED") => ControlError::ResourceExhausted,
-        Some("CONTROL_AUTHENTICATION_FAILED") => ControlError::Authentication,
-        Some("CONTROL_COMMAND_FAILED") => ControlError::CommandFailed,
-        _ if head.starts_with(b"HTTP/1.1 401") || head.starts_with(b"HTTP/1.1 403") => {
-            ControlError::Authentication
-        }
-        _ if head.starts_with(b"HTTP/1.1 408") || head.starts_with(b"HTTP/1.1 504") => {
-            ControlError::Timeout
-        }
-        _ if head.starts_with(b"HTTP/1.1 413") => ControlError::ResponseTooLarge,
-        _ => ControlError::CommandFailed,
+    if let Some(error) = code.as_deref().and_then(ControlError::from_code) {
+        return error;
+    }
+    if head.starts_with(b"HTTP/1.1 401") || head.starts_with(b"HTTP/1.1 403") {
+        ControlError::Authentication
+    } else if head.starts_with(b"HTTP/1.1 408") || head.starts_with(b"HTTP/1.1 504") {
+        ControlError::Timeout
+    } else if head.starts_with(b"HTTP/1.1 413") {
+        ControlError::ResponseTooLarge
+    } else {
+        ControlError::CommandFailed
     }
 }
 
@@ -460,10 +453,29 @@ pub enum ControlError {
     Timeout,
     ResourceExhausted,
     Authentication,
+    SecretStoreUnavailable,
+    SecretValueInvalid,
     CommandFailed,
 }
 
 impl ControlError {
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "CONTROL_ENDPOINT_ALREADY_IN_USE" => Some(Self::EndpointAlreadyInUse),
+            "CONTROL_ENDPOINT_UNSUPPORTED" => Some(Self::UnsupportedEndpoint),
+            "CONTROL_IO_FAILED" => Some(Self::Io),
+            "CONTROL_HTTP_INVALID" => Some(Self::InvalidHttp),
+            "CONTROL_RESPONSE_TOO_LARGE" => Some(Self::ResponseTooLarge),
+            "CONTROL_TIMEOUT" => Some(Self::Timeout),
+            "CONTROL_RESOURCE_EXHAUSTED" => Some(Self::ResourceExhausted),
+            "CONTROL_AUTHENTICATION_FAILED" => Some(Self::Authentication),
+            "AGENT_SECRET_STORE_UNAVAILABLE" => Some(Self::SecretStoreUnavailable),
+            "AGENT_SECRET_VALUE_INVALID" => Some(Self::SecretValueInvalid),
+            "CONTROL_COMMAND_FAILED" => Some(Self::CommandFailed),
+            _ => None,
+        }
+    }
+
     pub const fn code(&self) -> &'static str {
         match self {
             Self::EndpointAlreadyInUse => "CONTROL_ENDPOINT_ALREADY_IN_USE",
@@ -474,6 +486,8 @@ impl ControlError {
             Self::Timeout => "CONTROL_TIMEOUT",
             Self::ResourceExhausted => "CONTROL_RESOURCE_EXHAUSTED",
             Self::Authentication => "CONTROL_AUTHENTICATION_FAILED",
+            Self::SecretStoreUnavailable => "AGENT_SECRET_STORE_UNAVAILABLE",
+            Self::SecretValueInvalid => "AGENT_SECRET_VALUE_INVALID",
             Self::CommandFailed => "CONTROL_COMMAND_FAILED",
         }
     }
@@ -733,11 +747,11 @@ fn json_response<T: Serialize>(value: T) -> Result<ControlResponse, ControlError
 
 fn error_response(error: ControlError) -> Result<ControlResponse, ControlError> {
     let status = match &error {
-        ControlError::InvalidHttp => 400,
+        ControlError::InvalidHttp | ControlError::SecretValueInvalid => 400,
         ControlError::Authentication => 401,
         ControlError::ResponseTooLarge => 413,
         ControlError::Timeout => 504,
-        ControlError::ResourceExhausted => 503,
+        ControlError::ResourceExhausted | ControlError::SecretStoreUnavailable => 503,
         _ => 500,
     };
     serde_json::to_vec(&serde_json::json!({ "code": error.code() }))
@@ -2281,6 +2295,24 @@ mod tests {
         drop(second);
         drop(replacement);
         assert_eq!(limiter.active(), 0);
+    }
+
+    #[test]
+    fn preserves_stable_secret_store_errors_across_http_control() {
+        assert_eq!(
+            super::error_from_http_response(
+                b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
+                br#"{"code":"AGENT_SECRET_STORE_UNAVAILABLE"}"#,
+            ),
+            super::ControlError::SecretStoreUnavailable
+        );
+        assert_eq!(
+            super::error_from_http_response(
+                b"HTTP/1.1 400 Bad Request\r\n\r\n",
+                br#"{"code":"AGENT_SECRET_VALUE_INVALID"}"#,
+            ),
+            super::ControlError::SecretValueInvalid
+        );
     }
     fn status() -> ControlStatus {
         ControlStatus {

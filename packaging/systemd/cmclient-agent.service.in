@@ -18,6 +18,8 @@ Environment="CMCLIENT_DATA_DIR=@DATA_DIR@"
 Environment="CMCLIENT_CONFIG_DIR=@CONFIG_DIR@"
 Environment="CMCLIENT_CACHE_DIR=@CACHE_DIR@"
 Environment="CMCLIENT_LOG_DIR=@LOG_DIR@"
+Environment="CMCLIENT_SYSTEMD_SECRET_STORE=1"
+LoadCredential=cmclient-secret-store-key:@SECRET_STORE_KEY@
 ExecStartPre=@AGENT_BINARY@ --check-config
 ExecStart=@AGENT_BINARY@ --serve
 Restart=on-failure

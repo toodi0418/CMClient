@@ -30,11 +30,17 @@ current packaged Gateway command invokes `node`, so Node.js `^22.18.0` or
 this config contract.
 
 CallMesh keys, APRS passcodes, and administrative tokens do not belong in this
-file or in Agent command arguments. The Agent stores them in the operating
-system credential store (Keychain on macOS, Credential Manager on Windows, or
-Secret Service on Linux). `cmclient secret set <kind>` reads a single value from
-standard input and forwards it over the private Control API; its response never
-contains the value. Supported kinds are `callmesh-api-key`, `aprs-passcode`, and
+file or in Agent command arguments. Interactive Agent sessions use the operating
+system credential store: Keychain on macOS, Credential Manager on Windows, and
+Secret Service on Linux. The packaged Linux systemd service cannot depend on a
+user-session D-Bus service, so it instead receives a root-owned wrapping key
+through systemd `LoadCredential` and keeps authenticated ciphertext under its
+private data directory. The service fails closed when either half is missing or
+invalid; see [systemd Agent Service](./systemd-service.md).
+
+`cmclient secret set <kind>` reads a single value from standard input and
+forwards it over the private Control API; its response never contains the value.
+Supported kinds are `callmesh-api-key`, `aprs-passcode`, and
 `management-admin-token`. Update signing private keys are deliberately not a
 runtime secret kind: release signing remains outside the product runtime.
 
@@ -47,9 +53,9 @@ own process environment. Neither side accepts it as a command argument.
 CallMesh's non-secret endpoint is optional Agent configuration. Its URL must be
 HTTPS; at Gateway launch Agent drops inherited application configuration,
 retaining only launcher variables such as `PATH`/Windows runtime paths, and
-passes this URL plus a CallMesh API key only when that key is present in the OS
-credential store. Gateway therefore cannot inherit a legacy API key from the
-parent shell.
+passes this URL plus a CallMesh API key only when that key is present in the
+Agent-selected secret backend. Gateway therefore cannot inherit a legacy API
+key from the parent shell.
 
 ```toml
 [callmesh]
@@ -89,8 +95,8 @@ allow_lan = false
 ```
 
 Agent clears inherited application configuration before it passes this
-validated configuration, the data path, and only the required OS-stored secrets
-to Gateway. The small launcher allowlist retains `PATH` and required Windows
+validated configuration, the data path, and only the required Agent-owned
+secrets to Gateway. The small launcher allowlist retains `PATH` and required Windows
 runtime paths so the configured process can start. Gateway then owns transport,
 protobuf/domain persistence, Position and APRS processing, CallMesh, Proxy,
 retention, Jobs, and domain SSE. See

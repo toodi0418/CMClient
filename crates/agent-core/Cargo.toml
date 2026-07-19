@@ -10,6 +10,7 @@ test-support = []
 
 [dependencies]
 argon2 = "0.5"
+chacha20poly1305 = "0.10.1"
 fs2 = "0.4"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -18,6 +19,9 @@ toml = "0.9"
 rustls = "0.23"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true
