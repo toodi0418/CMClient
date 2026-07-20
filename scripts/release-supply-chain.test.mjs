@@ -41,6 +41,12 @@ import {
 const runFile = promisify(execFile);
 const sourceSha = "0123456789abcdef0123456789abcdef01234567";
 
+function tarArguments(argumentsList) {
+  return process.platform === "win32"
+    ? ["--force-local", ...argumentsList]
+    : argumentsList;
+}
+
 test("assembler creates every updater-safe archive from canonical staged inputs", async (t) => {
   const version = "2.0.0-dev.0";
   const root = await mkdtemp(join(tmpdir(), "cmclient-release-assembly-"));
@@ -96,10 +102,10 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
       component === "desktop" && target === "darwin-aarch64",
   );
   assert.ok(desktopArchive);
-  const { stdout: desktopListing } = await runFile("tar", [
-    "-tf",
-    join(output, desktopArchive.fileName),
-  ]);
+  const { stdout: desktopListing } = await runFile(
+    "tar",
+    tarArguments(["-tf", join(output, desktopArchive.fileName)]),
+  );
   const desktopEntries = new Set(desktopListing.trim().split("\n"));
   for (const expected of [
     "bin/cmclient-desktop",
@@ -125,10 +131,10 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   );
   assert.ok(portableArchive);
   const portableIndex = plan.indexOf(portableArchive);
-  const { stdout: portableListing } = await runFile("tar", [
-    "-tf",
-    join(output, portableArchive.fileName),
-  ]);
+  const { stdout: portableListing } = await runFile(
+    "tar",
+    tarArguments(["-tf", join(output, portableArchive.fileName)]),
+  );
   assert.deepEqual(portableListing.trim().split("\n").sort(), [
     "bin/cmclient",
     "metadata/build-manifest.json",
@@ -138,12 +144,11 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   const portableV2 = join(root, "portable-v2");
   const retainedData = join(root, "user-data", "retained-state");
   await mkdir(portableV1, { recursive: true });
-  await runFile("tar", [
-    "-xf",
-    join(output, portableArchive.fileName),
-    "-C",
-    portableV1,
-  ]);
+  await runFile(
+    "tar",
+    tarArguments(["-xf", join(output, portableArchive.fileName)]),
+    { cwd: portableV1 },
+  );
   assert.equal(
     await readFile(join(portableV1, "bin/cmclient"), "utf8"),
     `fixture-${portableIndex}-cli`,
@@ -168,12 +173,11 @@ test("assembler creates every updater-safe archive from canonical staged inputs"
   );
   assert.ok(upgradeArchive);
   await mkdir(portableV2, { recursive: true });
-  await runFile("tar", [
-    "-xf",
-    join(upgradeOutput, upgradeArchive.fileName),
-    "-C",
-    portableV2,
-  ]);
+  await runFile(
+    "tar",
+    tarArguments(["-xf", join(upgradeOutput, upgradeArchive.fileName)]),
+    { cwd: portableV2 },
+  );
   await rm(portableV1, { force: true, recursive: true });
   assert.equal(
     await readFile(join(portableV2, "bin/cmclient"), "utf8"),
@@ -424,9 +428,8 @@ test("Docker Compose inclusion rejects missing, empty, and symlink inputs", asyn
   t.after(() => rm(root, { force: true, recursive: true }));
   await writeFile(empty, "");
   await writeFile(source, "services: {}\n");
-  await symlink(source, link);
 
-  for (const compose of [join(root, "missing.yml"), empty, link]) {
+  for (const compose of [join(root, "missing.yml"), empty]) {
     await assert.rejects(
       () =>
         includeDockerArtifact({
@@ -439,6 +442,33 @@ test("Docker Compose inclusion rejects missing, empty, and symlink inputs", asyn
       /RELEASE_DOCKER_COMPOSE_INVALID/,
     );
   }
+
+  await t.test("rejects a symlink input", async (t) => {
+    try {
+      await symlink(source, link);
+    } catch (error) {
+      if (
+        process.platform === "win32" &&
+        (error?.code === "EPERM" ||
+          /operation not permitted/iu.test(String(error?.message)))
+      ) {
+        t.skip("Windows symlink privilege is unavailable");
+        return;
+      }
+      throw error;
+    }
+    await assert.rejects(
+      () =>
+        includeDockerArtifact({
+          compose: link,
+          input: root,
+          output: root,
+          sourceSha,
+          version,
+        }),
+      /RELEASE_DOCKER_COMPOSE_INVALID/,
+    );
+  });
 });
 
 test("supply-chain checksums cover every archive and generated SBOM", async (t) => {
@@ -1336,15 +1366,11 @@ async function createOciFixture(
   await writeFile(join(layout, "index.json"), JSON.stringify(index));
   await writeFile(join(layout, "oci-layout"), '{"imageLayoutVersion":"1.0.0"}');
   const archive = join(root, "cmclient.oci.tar");
-  await runFile("tar", [
-    "-cf",
-    archive,
-    "-C",
-    layout,
-    "oci-layout",
-    "index.json",
-    "blobs",
-  ]);
+  await runFile(
+    "tar",
+    tarArguments(["-cf", archive, "oci-layout", "index.json", "blobs"]),
+    { cwd: layout },
+  );
   return archive;
 }
 

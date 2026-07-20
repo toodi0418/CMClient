@@ -22,12 +22,9 @@ tcp_host = "127.0.0.1"
 tcp_port = 4403
 
 [aprs]
-login_callsign = "N0CALL-7"
-host = "rotate.aprs2.net"
+host = "asia.aprs2.net"
 port = 14580
 destination = "APCM20"
-symbol_table = "/"
-symbol_code = ">"
 
 [proxy]
 upstream_host = "127.0.0.1"
@@ -42,13 +39,22 @@ Meshtastic `transport` is either `tcp` or `serial`, never both. Serial requires
 a non-empty, control-character-free platform device identifier of at most 4096
 bytes, such as `/dev/ttyUSB0` or `COM3`; it is not required to be an absolute
 filesystem path. `serial_baud_rate` is a positive integer and defaults to
-115200. APRS passcode, CallMesh key, and the Management admin token are separate
-Agent-selected backend entries:
+115200. CallMesh provisions the APRS identity, and Gateway derives the runtime
+passcode locally. The APRS section above is limited to optional
+endpoint/destination overrides. Existing
+`login_callsign`, `symbol_table`, `symbol_code`, and `comment` fields from rc.1
+are accepted only so an upgrade can start; Agent ignores them, never injects
+them, and administrators must remove them. Other unknown fields, including an
+inline passcode, are rejected. CallMesh key and the Management admin token remain
+separate Agent-selected backend entries. The
+control/API `aprs-passcode` name is retained only to remove values left by an
+older installation. Setting it returns `CONTROL_SECRET_KIND_DEPRECATED`; Agent
+does not read or inject an old stored value when launching APRS.
 
 ```bash
 cmclient secret set callmesh-api-key
-cmclient secret set aprs-passcode
 cmclient secret set management-admin-token
+cmclient secret remove aprs-passcode # upgraded installations only
 ```
 
 Those commands use the interactive user's default Control socket. For the
@@ -84,10 +90,11 @@ the manager environment; if neither source is present, field mode stays off.
 
 Storage and removal complete immediately, but runtime consumers have different
 refresh boundaries. Agent reads `management-admin-token` for every remote
-Control request, so that value changes immediately. It copies the CallMesh key
-and APRS passcode into the supervised Gateway environment when Agent starts;
-`cmclient restart` restarts only that Gateway and reuses the snapshot. After
-setting or removing either Gateway credential, restart the entire Agent or its
+Control request, so that value changes immediately. At Gateway launch Agent
+copies only the CallMesh key and the validated transport/endpoint overrides;
+CallMesh-provisioned APRS identity and credential handling stay inside the
+Gateway contract. `cmclient restart` restarts only that Gateway and reuses the
+snapshot. After changing the CallMesh key, restart the entire Agent or its
 platform service. An interactive Agent must likewise be terminated and
 relaunched.
 

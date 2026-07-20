@@ -11,6 +11,7 @@ import type {
 } from "@cmclient/contracts";
 
 import { AprsRemoteHighWaterStore } from "./aprs-monitor.js";
+import type { AprsRuntimeState } from "./aprs-identity.js";
 import { encodeAprsPosition } from "./aprs-position.js";
 import { DomainEventBus } from "./events.js";
 import {
@@ -40,14 +41,11 @@ export interface MeshGatewayRuntimeOptions {
   database: GatewayDatabase;
   eventBus: DomainEventBus;
   gatewayId: string;
-  mappingProvider?: () => readonly CallMeshMapping[];
   meshNetworkId: string;
   transport: MeshtasticTransport;
   aprs?: {
-    comment?: string;
     destination?: string;
-    symbolCode?: string;
-    symbolTable?: string;
+    stateProvider?: () => AprsRuntimeState | undefined;
   };
   clock?: () => Date;
   idFactory?: () => string;
@@ -75,7 +73,6 @@ export class MeshGatewayRuntimeError extends Error {
 export class MeshGatewayRuntime {
   private readonly clock: () => Date;
   private readonly idFactory: () => string;
-  private readonly mappingProvider: () => readonly CallMeshMapping[];
   private readonly stopTimeoutMs: number;
   private readonly domainStore: MeshDomainStore;
   private readonly duplicateDetector: PositionDuplicateDetector;
@@ -92,9 +89,6 @@ export class MeshGatewayRuntime {
     validateRuntimeIdentity(options.meshNetworkId, options.gatewayId);
     this.clock = options.clock ?? (() => new Date());
     this.idFactory = options.idFactory ?? randomUUID;
-    this.mappingProvider =
-      options.mappingProvider ??
-      (() => options.database.callmeshMappings.list());
     this.stopTimeoutMs = options.stopTimeoutMs ?? 10_000;
     if (
       !Number.isInteger(this.stopTimeoutMs) ||
@@ -352,8 +346,18 @@ export class MeshGatewayRuntime {
       this.publishDecision(duplicate.decision);
     }
 
+    const aprsState = this.options.aprs?.stateProvider?.();
+    if (!this.options.aprs?.stateProvider || !aprsState) {
+      const decision = this.recordDecision(
+        positionObservation,
+        duplicate.event,
+        "APRS_PROVISION_UNAVAILABLE",
+      );
+      return { event: duplicate.event, decision, outboxCreated: false };
+    }
+
     const mapping = selectActiveMapping(
-      this.mappingProvider(),
+      aprsState.mappings,
       duplicate.event.meshNetworkId,
       duplicate.event.nodeNum,
       observation.serverIngestedAt,
@@ -415,14 +419,13 @@ export class MeshGatewayRuntime {
       return { event: duplicate.event, decision, outboxCreated: false };
     }
 
+    const aprsIdentity = aprsState.identity;
     const encoded = encodeAprsPosition(validation.event, {
       source: target.callsign,
       destination: this.options.aprs?.destination ?? "APCM20",
-      symbolTable: this.options.aprs?.symbolTable ?? "/",
-      symbolCode: this.options.aprs?.symbolCode ?? ">",
-      ...(this.options.aprs?.comment
-        ? { comment: this.options.aprs.comment }
-        : {}),
+      symbolTable: aprsIdentity.effectiveSymbolTable,
+      symbolCode: aprsIdentity.symbolCode,
+      ...(aprsIdentity.comment ? { comment: aprsIdentity.comment } : {}),
     });
     let enqueued:
       ReturnType<GatewayDatabase["aprsOutbox"]["enqueue"]> | undefined;
@@ -438,6 +441,7 @@ export class MeshGatewayRuntime {
             canonicalEventId: acceptedEvent.id,
             data: encoded.data,
             now: observation.serverIngestedAt,
+            provisionFingerprint: aprsState.provisionFingerprint,
             order: {
               meshNetworkId: acceptedEvent.meshNetworkId,
               nodeNum: acceptedEvent.nodeNum,
@@ -509,15 +513,15 @@ export class MeshGatewayRuntime {
     observation: PositionObservation,
     event: PositionCanonicalEvent,
     code: PositionDecisionCode,
-    target: PositionMappingTarget,
+    target?: PositionMappingTarget,
   ): PositionDecision {
     const digest = createHash("sha256")
       .update(
         [
           observation.id,
           event.id,
-          target.callsign,
-          target.mappingVersion,
+          target?.callsign ?? "",
+          target?.mappingVersion ?? "",
           code,
         ].join("\u0000"),
       )
@@ -529,10 +533,12 @@ export class MeshGatewayRuntime {
       canonicalEventId: event.id,
       code,
       decidedAt: observation.serverIngestedAt,
-      parameters: {
-        callsign: target.callsign,
-        mappingVersion: target.mappingVersion,
-      },
+      parameters: target
+        ? {
+            callsign: target.callsign,
+            mappingVersion: target.mappingVersion,
+          }
+        : {},
     });
     this.publishDecision(decision);
     return decision;

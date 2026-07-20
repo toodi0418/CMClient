@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -244,9 +244,9 @@ test("Tauri release config embeds the complete portable Desktop composition", ()
   assert.equal(config.bundle.createUpdaterArtifacts, false);
   assert.equal(config.bundle.windows.allowDowngrades, false);
   assert.equal(Object.values(config.bundle.resources)[0], "cmclient-runtime/");
-  assert.match(
-    Object.keys(config.bundle.resources)[0],
-    /release-build\/desktop\/windows-x86_64\/$/,
+  assert.equal(
+    resolve(Object.keys(config.bundle.resources)[0]),
+    resolve("release-build/desktop/windows-x86_64"),
   );
   assert.ok(config.bundle.icon.some((path) => path.endsWith("icon.ico")));
   assert.ok(config.bundle.icon.some((path) => path.endsWith("icon.icns")));
@@ -404,26 +404,34 @@ test("Linux native collector ignores AppDir internals but rejects a symlink fina
 test("bundled Desktop runtime verification requires the complete Agent composition", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "cmclient-native-runtime-"));
   t.after(() => rm(root, { force: true, recursive: true }));
-  const inputs = await createCompositionInputs(root, "desktop", "linux-x86_64");
+  const target =
+    process.platform === "win32" ? "windows-x86_64" : "linux-x86_64";
+  const inputs = await createCompositionInputs(root, "desktop", target);
   const { stagedDirectory } = await stageBuild({
     component: "desktop",
-    target: "linux-x86_64",
+    target,
     version: "2.0.0-rc.1",
     inputs,
     output: join(root, "stage"),
   });
   await assert.doesNotReject(() =>
     verifyBundledDesktopRuntime({
-      target: "linux-x86_64",
+      target,
       version: "2.0.0-rc.1",
       input: stagedDirectory,
     }),
   );
-  await rm(join(stagedDirectory, "bin/cmclient-agent"));
+  await rm(
+    join(
+      stagedDirectory,
+      "bin",
+      target.startsWith("windows-") ? "cmclient-agent.exe" : "cmclient-agent",
+    ),
+  );
   await assert.rejects(
     () =>
       verifyBundledDesktopRuntime({
-        target: "linux-x86_64",
+        target,
         version: "2.0.0-rc.1",
         input: stagedDirectory,
       }),

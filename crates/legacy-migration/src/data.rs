@@ -1755,7 +1755,11 @@ fn create_backup_and_apply(
         .map_err(|_| LegacyDataError::ImportInProgress)?;
     let data_version_before = data_version(&connection)?;
     snapshot_database(&connection, backup)?;
-    let backup_handle = File::open(backup).map_err(|_| LegacyDataError::BackupFailed)?;
+    let backup_handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(backup)
+        .map_err(|_| LegacyDataError::BackupFailed)?;
     verify_private_file(&backup_handle, LegacyDataError::BackupFailed)?;
     backup_handle
         .sync_all()
@@ -2156,7 +2160,10 @@ fn replace_unusable_target(target: &Path, backup: &Path) -> Result<(), LegacyDat
         let _ = fs::remove_file(&candidate);
         return Err(LegacyDataError::RollbackFailed);
     }
-    File::open(&candidate)
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&candidate)
         .and_then(|file| file.sync_all())
         .map_err(|_| LegacyDataError::RollbackFailed)?;
 

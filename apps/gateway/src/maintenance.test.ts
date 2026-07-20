@@ -12,6 +12,8 @@ import {
   createCanonicalPositionEvent,
 } from "./position";
 
+const PROVISION_FINGERPRINT = "a".repeat(64);
+
 describe("GatewayMaintenanceRuntime", () => {
   it("removes telemetry incrementally without deleting retained history", () => {
     const database = new GatewayDatabase(":memory:");
@@ -259,13 +261,18 @@ describe("GatewayMaintenanceRuntime", () => {
       canonicalEventId: deliveredEvent.id,
       data: "N2CALL-7>APCM20:delivered",
       now: expiredAt,
+      provisionFingerprint: PROVISION_FINGERPRINT,
     });
     if (!deliveredResult.entry) {
       throw new Error("fixture delivered outbox was suppressed");
     }
     const deliveredOutbox = deliveredResult.entry;
     database.aprsOutbox.claimDue(expiredAt, 1);
-    database.aprsOutbox.markSent(deliveredOutbox.id, expiredAt);
+    database.aprsOutbox.markSent(
+      deliveredOutbox.id,
+      expiredAt,
+      PROVISION_FINGERPRINT,
+    );
     const activeOutboxEvent = insertPositionHistory(
       database,
       "retained-outbox",
@@ -277,6 +284,7 @@ describe("GatewayMaintenanceRuntime", () => {
       canonicalEventId: activeOutboxEvent.id,
       data: "N1CALL-7>APCM20:retained",
       now: expiredAt,
+      provisionFingerprint: PROVISION_FINGERPRINT,
     });
     const events = new DomainEventBus({
       eventIdFactory: (() => {

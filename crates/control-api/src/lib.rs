@@ -292,6 +292,8 @@ pub struct DiagnosticsControlBundle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlSecretKind {
     CallMeshApiKey,
+    /// Legacy APRS passcodes remain addressable only for removal. New values
+    /// are rejected by the Control router with `CONTROL_SECRET_KIND_DEPRECATED`.
     AprsPasscode,
     ManagementAdminToken,
 }
@@ -453,6 +455,7 @@ pub enum ControlError {
     Timeout,
     ResourceExhausted,
     Authentication,
+    SecretKindDeprecated,
     SecretStoreUnavailable,
     SecretValueInvalid,
     CommandFailed,
@@ -469,6 +472,7 @@ impl ControlError {
             "CONTROL_TIMEOUT" => Some(Self::Timeout),
             "CONTROL_RESOURCE_EXHAUSTED" => Some(Self::ResourceExhausted),
             "CONTROL_AUTHENTICATION_FAILED" => Some(Self::Authentication),
+            "CONTROL_SECRET_KIND_DEPRECATED" => Some(Self::SecretKindDeprecated),
             "AGENT_SECRET_STORE_UNAVAILABLE" => Some(Self::SecretStoreUnavailable),
             "AGENT_SECRET_VALUE_INVALID" => Some(Self::SecretValueInvalid),
             "CONTROL_COMMAND_FAILED" => Some(Self::CommandFailed),
@@ -486,6 +490,7 @@ impl ControlError {
             Self::Timeout => "CONTROL_TIMEOUT",
             Self::ResourceExhausted => "CONTROL_RESOURCE_EXHAUSTED",
             Self::Authentication => "CONTROL_AUTHENTICATION_FAILED",
+            Self::SecretKindDeprecated => "CONTROL_SECRET_KIND_DEPRECATED",
             Self::SecretStoreUnavailable => "AGENT_SECRET_STORE_UNAVAILABLE",
             Self::SecretValueInvalid => "AGENT_SECRET_VALUE_INVALID",
             Self::CommandFailed => "CONTROL_COMMAND_FAILED",
@@ -651,6 +656,9 @@ impl ControlRouter {
             ["PUT", path, "HTTP/1.1"] | ["PUT", path, "HTTP/1.0"]
                 if path.starts_with("/api/v1/control/secrets/") =>
             {
+                if is_legacy_aprs_passcode_path(path) {
+                    return error_response(ControlError::SecretKindDeprecated);
+                }
                 let kind = path
                     .strip_prefix("/api/v1/control/secrets/")
                     .and_then(ControlSecretKind::from_path_segment)
@@ -739,6 +747,11 @@ fn validated_body<'a>(head: &str, body: &'a str) -> Result<&'a str, ControlError
     Ok(body)
 }
 
+fn is_legacy_aprs_passcode_path(path: &str) -> bool {
+    path.strip_prefix("/api/v1/control/secrets/")
+        .is_some_and(|kind| kind == "aprs-passcode")
+}
+
 fn json_response<T: Serialize>(value: T) -> Result<ControlResponse, ControlError> {
     serde_json::to_vec(&value)
         .map(|body| ControlResponse::Json { status: 200, body })
@@ -749,6 +762,7 @@ fn error_response(error: ControlError) -> Result<ControlResponse, ControlError> 
     let status = match &error {
         ControlError::InvalidHttp | ControlError::SecretValueInvalid => 400,
         ControlError::Authentication => 401,
+        ControlError::SecretKindDeprecated => 410,
         ControlError::ResponseTooLarge => 413,
         ControlError::Timeout => 504,
         ControlError::ResourceExhausted | ControlError::SecretStoreUnavailable => 503,
@@ -920,6 +934,7 @@ mod unix {
             200 => "OK",
             400 => "Bad Request",
             401 => "Unauthorized",
+            410 => "Gone",
             413 => "Content Too Large",
             503 => "Service Unavailable",
             404 => "Not Found",
@@ -1442,6 +1457,7 @@ mod windows {
             200 => "OK",
             400 => "Bad Request",
             401 => "Unauthorized",
+            410 => "Gone",
             413 => "Content Too Large",
             503 => "Service Unavailable",
             404 => "Not Found",
@@ -2254,28 +2270,26 @@ pub fn default_local_endpoint(data_dir: &Path) -> ControlEndpoint {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
+    #[cfg(any(unix, windows))]
     use super::ControlEndpoint;
     #[cfg(unix)]
     use super::default_unix_socket;
+    #[cfg(any(unix, windows))]
+    use super::{ControlClient, ControlServer};
+    use super::{
+        ControlError, ControlHandler, ControlSecretKind, ControlStatus, GatewayControlStatus,
+        ManagementWebControlStatus, RemoteControlAuthError, RemoteControlReplayGuard,
+        StaticControlHandler, is_local_endpoint, sign_remote_control_request,
+    };
     #[cfg(unix)]
     use super::{
-        ControlClient, ControlError, ControlHandler, ControlSecretKind, ControlServer,
         ControlUpdateEvent, DiagnosticsControlBundle, GatewayProjection, UpdateControlJob,
         UpdateControlStatus,
     };
-    use super::{
-        ControlStatus, GatewayControlStatus, ManagementWebControlStatus, RemoteControlAuthError,
-        RemoteControlReplayGuard, StaticControlHandler, is_local_endpoint,
-        sign_remote_control_request,
-    };
     use std::sync::Arc;
+    use std::sync::Mutex;
     #[cfg(unix)]
-    use std::{
-        collections::BTreeMap,
-        path::PathBuf,
-        sync::{Mutex, mpsc},
-    };
+    use std::{collections::BTreeMap, path::PathBuf, sync::mpsc};
 
     #[test]
     fn bounds_and_releases_control_connection_slots() {
@@ -2324,6 +2338,137 @@ mod tests {
             management_web_url: Some(String::from("http://127.0.0.1:7080")),
             uptime_seconds: 1,
             latest_error_code: None,
+        }
+    }
+
+    struct LegacyAprsSecretHandler {
+        present: Mutex<bool>,
+        store_attempts: Mutex<usize>,
+    }
+
+    impl ControlHandler for LegacyAprsSecretHandler {
+        fn handle(&self, _command: super::ControlCommand) -> Result<ControlStatus, ControlError> {
+            Ok(status())
+        }
+
+        fn store_secret(&self, _kind: ControlSecretKind, _value: &str) -> Result<(), ControlError> {
+            *self
+                .store_attempts
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)? += 1;
+            Ok(())
+        }
+
+        fn remove_secret(&self, kind: ControlSecretKind) -> Result<bool, ControlError> {
+            assert_eq!(kind, ControlSecretKind::AprsPasscode);
+            let mut present = self
+                .present
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?;
+            let was_present = *present;
+            *present = false;
+            Ok(was_present)
+        }
+    }
+
+    #[test]
+    fn legacy_aprs_passcode_can_only_be_removed_through_local_control() {
+        let handler = Arc::new(LegacyAprsSecretHandler {
+            present: Mutex::new(true),
+            store_attempts: Mutex::new(0),
+        });
+        let router = super::ControlRouter::new(handler.clone());
+
+        let put = router
+            .route(
+                "PUT /api/v1/control/secrets/aprs-passcode HTTP/1.1\r\nhost: localhost\r\ncontent-length: 8\r\n\r\nignored",
+            )
+            .expect("deprecated set should produce a response");
+        assert!(matches!(
+            put,
+            super::ControlResponse::Json {
+                status: 410,
+                body
+            } if body == br#"{"code":"CONTROL_SECRET_KIND_DEPRECATED"}"#
+        ));
+        assert_eq!(
+            *handler
+                .store_attempts
+                .lock()
+                .expect("store counter should lock"),
+            0
+        );
+
+        let delete = router
+            .route(
+                "DELETE /api/v1/control/secrets/aprs-passcode HTTP/1.1\r\nhost: localhost\r\ncontent-length: 0\r\n\r\n",
+            )
+            .expect("deprecated remove should dispatch");
+        assert!(matches!(
+            delete,
+            super::ControlResponse::Json {
+                status: 200,
+                body
+            } if body == br#"{"stored":true}"#
+        ));
+        assert!(!*handler.present.lock().expect("secret state should lock"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn deprecated_aprs_passcode_round_trips_through_the_platform_control_transport() {
+        let handler = Arc::new(LegacyAprsSecretHandler {
+            present: Mutex::new(true),
+            store_attempts: Mutex::new(0),
+        });
+        let (endpoint, cleanup_directory) = deprecated_secret_endpoint();
+        let server = ControlServer::bind(endpoint.clone(), handler.clone())
+            .expect("platform Control server should bind");
+        let server_thread = std::thread::spawn(move || server.serve_once());
+        let client =
+            ControlClient::new(endpoint).expect("platform Control client should initialize");
+
+        assert_eq!(
+            client.store_secret(ControlSecretKind::AprsPasscode, "ignored"),
+            Err(ControlError::SecretKindDeprecated)
+        );
+        server_thread
+            .join()
+            .expect("Control server thread should join")
+            .expect("Control server should write the deprecated response");
+        assert_eq!(
+            *handler
+                .store_attempts
+                .lock()
+                .expect("store counter should lock"),
+            0
+        );
+        if let Some(directory) = cleanup_directory {
+            std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn deprecated_secret_endpoint() -> (ControlEndpoint, Option<std::path::PathBuf>) {
+        #[cfg(unix)]
+        {
+            let directory = std::env::temp_dir().join(format!(
+                "cmclient-control-deprecated-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+            return (default_unix_socket(&directory), Some(directory));
+        }
+        #[cfg(windows)]
+        {
+            (
+                ControlEndpoint::named_pipe(format!(
+                    r"\\.\pipe\cmclient-control-deprecated-{}",
+                    uuid::Uuid::new_v4().simple()
+                )),
+                None,
+            )
         }
     }
 
@@ -2506,7 +2651,7 @@ mod tests {
         let auth = sign_remote_control_request(
             "test-token-test-token-test-token-0",
             "PUT",
-            "/api/v1/control/secrets/aprs-passcode",
+            "/api/v1/control/secrets/management-admin-token",
             b"secret-value",
             1_000,
         )
@@ -2516,13 +2661,13 @@ mod tests {
             (
                 "other-token-other-token-other-00",
                 "PUT",
-                "/api/v1/control/secrets/aprs-passcode",
+                "/api/v1/control/secrets/management-admin-token",
                 b"secret-value".as_slice(),
             ),
             (
                 "test-token-test-token-test-token-0",
                 "POST",
-                "/api/v1/control/secrets/aprs-passcode",
+                "/api/v1/control/secrets/management-admin-token",
                 b"secret-value".as_slice(),
             ),
             (
@@ -2534,7 +2679,7 @@ mod tests {
             (
                 "test-token-test-token-test-token-0",
                 "PUT",
-                "/api/v1/control/secrets/aprs-passcode",
+                "/api/v1/control/secrets/management-admin-token",
                 b"changed".as_slice(),
             ),
         ] {

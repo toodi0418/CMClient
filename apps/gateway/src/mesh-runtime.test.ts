@@ -6,6 +6,10 @@ import type {
 } from "@cmclient/contracts";
 
 import { DomainEventBus } from "./events";
+import {
+  deriveAprsRuntimeIdentity,
+  type AprsRuntimeState,
+} from "./aprs-identity";
 import { MeshGatewayRuntime } from "./mesh-runtime";
 import { GatewayDatabase } from "./persistence/database";
 import { MeshtasticApplicationDecoder } from "./protobuf/application";
@@ -16,6 +20,8 @@ import type {
   TransportEvent,
   TransportEventListener,
 } from "./transport/types";
+
+const PROVISION_FINGERPRINT = "a".repeat(64);
 
 describe("MeshGatewayRuntime", () => {
   it("routes a transport frame through persistence, SSE events, ordering, and APRS outbox", async () => {
@@ -75,13 +81,14 @@ describe("MeshGatewayRuntime", () => {
     expect(
       database.connection
         .prepare(
-          "SELECT mapping_version, sequence_epoch, sequence_number FROM aprs_outbox",
+          "SELECT mapping_version, sequence_epoch, sequence_number, provision_fingerprint FROM aprs_outbox",
         )
         .get(),
     ).toEqual({
       mapping_version: "mapping-v1",
       sequence_epoch: 0,
       sequence_number: 7,
+      provision_fingerprint: PROVISION_FINGERPRINT,
     });
     const queued = database.aprsOutbox.find(
       database.aprsOutbox.list(10)[0]!.id,
@@ -148,6 +155,49 @@ describe("MeshGatewayRuntime", () => {
     ).toEqual([]);
 
     await runtime.stop();
+    database.close();
+  });
+
+  it("records a reachable fail-closed decision when the provision is revoked or expired", async () => {
+    const database = new GatewayDatabase(":memory:");
+    database.callmeshMappings.replace([
+      {
+        version: "mapping-v1",
+        effectiveAt: "2026-07-18T00:00:00.000Z",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        callsign: "N0CALL-7",
+      },
+    ]);
+    const schema = await loadMeshtasticSchema();
+    const runtime = createRuntime(
+      database,
+      schema,
+      new FixtureTransport(),
+      new DomainEventBus({ eventIdFactory: sequentialFactory("event") }),
+      () => undefined,
+    );
+
+    const result = runtime.ingestFrame({
+      kind: "frame",
+      frame: positionFrame(schema, 32),
+      receivedAt: "2026-07-18T00:00:05.000Z",
+      sessionConnectedAt: "2026-07-18T00:00:01.000Z",
+    });
+
+    expect(result.position).toMatchObject({
+      decision: { code: "APRS_PROVISION_UNAVAILABLE", parameters: {} },
+      outboxCreated: false,
+    });
+    expect(database.aprsOutbox.list(10)).toEqual([]);
+    expect(
+      database.connection
+        .prepare("SELECT code, parameters FROM position_decisions")
+        .get(),
+    ).toEqual({
+      code: "APRS_PROVISION_UNAVAILABLE",
+      parameters: "{}",
+    });
     database.close();
   });
 
@@ -507,6 +557,17 @@ function createRuntime(
   schema: MeshtasticSchema,
   transport: MeshtasticTransport,
   events: DomainEventBus,
+  stateProvider: () => AprsRuntimeState | undefined = () => ({
+    mappings: database.callmeshMappings.list(),
+    mappingsFingerprint: "b".repeat(64),
+    identity: deriveAprsRuntimeIdentity({
+      callsignBase: "TEST01",
+      ssid: -7,
+      symbolTable: "/",
+      symbolCode: ">",
+    }),
+    provisionFingerprint: PROVISION_FINGERPRINT,
+  }),
 ): MeshGatewayRuntime {
   return new MeshGatewayRuntime({
     applicationDecoder: new MeshtasticApplicationDecoder(schema),
@@ -516,6 +577,7 @@ function createRuntime(
     gatewayId: "fixture-gateway",
     meshNetworkId: "fixture-network",
     transport,
+    aprs: { stateProvider },
     clock: () => new Date("2026-07-18T00:00:10.000Z"),
     idFactory: sequentialFactory("observation"),
   });

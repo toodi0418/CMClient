@@ -20,6 +20,15 @@ const target = {
   meshNetworkId: "fixture-network",
   nodeNum: 42,
 };
+const PROVISION_FINGERPRINT = "a".repeat(64);
+const ROTATED_PROVISION_FINGERPRINT = "b".repeat(64);
+
+function authorization(
+  loginLine: string,
+  provisionFingerprint = PROVISION_FINGERPRINT,
+) {
+  return () => ({ loginLine, provisionFingerprint });
+}
 
 describe("APRS-IS monitor", () => {
   it("filters mapped callsigns and advances an isolated remote high-water", () => {
@@ -112,18 +121,171 @@ describe("AprsIsRxClient", () => {
     const client = new AprsIsRxClient({
       host: "127.0.0.1",
       port: address.port,
-      loginLine: "user N0CALL pass -1 vers CMClient 2.0",
-      filterExpression: "b/N0CALL-7",
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      provisionFingerprint: PROVISION_FINGERPRINT,
+      filterExpression: "b/TEST01-7",
     });
 
     const session = await client.connect((line) => received.push(line));
     await waitFor(() => loginLines.length === 1 && received.length === 1);
 
     expect(loginLines).toEqual([
-      "user N0CALL pass -1 vers CMClient 2.0 filter b/N0CALL-7",
+      "user TEST01 pass 11111 vers CMClient 2.0 filter b/TEST01-7",
     ]);
     expect(received).toEqual([encode(event("2026-07-18T00:00:35.000Z"))]);
     await session.close();
+    await close(server);
+  });
+
+  it("resolves a rotated login provider before every monitor connection", async () => {
+    const sessions: string[][] = [];
+    const server = net.createServer((socket) => {
+      const lines: string[] = [];
+      sessions.push(lines);
+      let buffer = "";
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8");
+        const parts = buffer.split("\r\n");
+        buffer = parts.pop() ?? "";
+        lines.push(...parts.filter(Boolean));
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const firstClient = new AprsIsRxClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      provisionFingerprint: PROVISION_FINGERPRINT,
+      filterExpression: "b/TEST01-7",
+    });
+
+    const first = await firstClient.connect(() => undefined);
+    await waitFor(() => sessions.length === 1 && sessions[0]!.length === 1);
+    await first.close();
+    const secondClient = new AprsIsRxClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user AB12CD-7 pass 22222 vers CMClient 2.0",
+        ROTATED_PROVISION_FINGERPRINT,
+      ),
+      provisionFingerprint: ROTATED_PROVISION_FINGERPRINT,
+      filterExpression: "b/TEST01-7",
+    });
+    const second = await secondClient.connect(() => undefined);
+    await waitFor(() => sessions.length === 2 && sessions[1]!.length === 1);
+    await second.close();
+
+    expect(sessions.map((lines) => lines[0])).toEqual([
+      "user TEST01 pass 11111 vers CMClient 2.0 filter b/TEST01-7",
+      "user AB12CD-7 pass 22222 vers CMClient 2.0 filter b/TEST01-7",
+    ]);
+    await close(server);
+  });
+
+  it.each([
+    ["revoked", undefined],
+    [
+      "rotated",
+      {
+        loginLine: "user AB12CD-7 pass 22222 vers CMClient 2.0",
+        provisionFingerprint: ROTATED_PROVISION_FINGERPRINT,
+      },
+    ],
+  ] as const)(
+    "revalidates a provision that is %s while the monitor connection opens",
+    async (_case, changedAuthorization) => {
+      let connections = 0;
+      const lines: string[] = [];
+      const server = net.createServer((socket) => {
+        connections += 1;
+        socket.on("data", (chunk: Buffer) => {
+          lines.push(chunk.toString("utf8"));
+        });
+      });
+      server.listen({ host: "127.0.0.1", port: 0 });
+      await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("fixture APRS server did not bind");
+      }
+      let providerCalls = 0;
+      const client = new AprsIsRxClient({
+        host: "127.0.0.1",
+        port: address.port,
+        authorizationProvider: () => {
+          providerCalls += 1;
+          return providerCalls === 1
+            ? {
+                loginLine: "user TEST01 pass 11111 vers CMClient 2.0",
+                provisionFingerprint: PROVISION_FINGERPRINT,
+              }
+            : changedAuthorization;
+        },
+        provisionFingerprint: PROVISION_FINGERPRINT,
+        filterExpression: "b/TEST01-7",
+      });
+
+      await expect(client.connect(() => undefined)).rejects.toMatchObject({
+        code: "APRS_PROVISION_UNAVAILABLE",
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(connections).toBe(1);
+      expect(providerCalls).toBe(2);
+      expect(lines).toEqual([]);
+      await close(server);
+    },
+  );
+
+  it("rejects invalid login providers before opening a monitor socket", async () => {
+    let connections = 0;
+    const server = net.createServer(() => {
+      connections += 1;
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const providers = [
+      () => undefined,
+      () => {
+        throw new Error("fixture provider failure");
+      },
+      authorization("user TEST01 pass 11111\r\nuser injected"),
+      authorization("x".repeat(513)),
+      authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+        ROTATED_PROVISION_FINGERPRINT,
+      ),
+    ];
+
+    for (const authorizationProvider of providers) {
+      const client = new AprsIsRxClient({
+        host: "127.0.0.1",
+        port: address.port,
+        authorizationProvider,
+        provisionFingerprint: PROVISION_FINGERPRINT,
+        filterExpression: "b/TEST01-7",
+      });
+      await expect(client.connect(() => undefined)).rejects.toMatchObject({
+        code: "APRS_PROVISION_UNAVAILABLE",
+      });
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(connections).toBe(0);
     await close(server);
   });
 
@@ -153,7 +315,10 @@ describe("AprsIsRxClient", () => {
     const client = new AprsIsRxClient({
       host: "127.0.0.1",
       port: address.port,
-      loginLine: "user N0CALL pass -1 vers CMClient 2.0",
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      provisionFingerprint: PROVISION_FINGERPRINT,
       filterExpression: "b/N0CALL-7",
     });
     const processed: string[] = [];
@@ -208,7 +373,10 @@ describe("AprsIsRxClient", () => {
     const client = new AprsIsRxClient({
       host: "127.0.0.1",
       port: address.port,
-      loginLine: "user N0CALL pass -1 vers CMClient 2.0",
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      provisionFingerprint: PROVISION_FINGERPRINT,
       filterExpression: "b/N0CALL-7",
     });
 
@@ -238,7 +406,10 @@ describe("AprsIsRxClient", () => {
     const client = new AprsIsRxClient({
       host: "127.0.0.1",
       port: address.port,
-      loginLine: "user N0CALL pass -1 vers CMClient 2.0",
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      provisionFingerprint: PROVISION_FINGERPRINT,
       filterExpression: "b/N0CALL-7",
       closeTimeoutMs: 25,
     });

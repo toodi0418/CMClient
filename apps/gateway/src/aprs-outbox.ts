@@ -4,6 +4,12 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { AprsOutboxEntry as PublicAprsOutboxEntry } from "@cmclient/contracts";
 
+import {
+  PROVISION_FINGERPRINT_PATTERN,
+  type AprsAuthorizationProvider,
+  type AprsConnectionAuthorization,
+} from "./aprs-identity.js";
+
 export type AprsOutboxStatus = "queued" | "sending" | "sent" | "failed";
 
 export interface AprsOutboxEntry extends PublicAprsOutboxEntry {
@@ -14,6 +20,7 @@ export interface AprsOutboxEntry extends PublicAprsOutboxEntry {
   eventTime?: string;
   sequenceEpoch?: number;
   sequenceNumber?: number;
+  provisionFingerprint?: string;
 }
 
 export interface AprsOrderSnapshot {
@@ -30,6 +37,7 @@ export interface EnqueueAprsInput {
   canonicalEventId: string;
   data: string;
   now: string;
+  provisionFingerprint: string;
   order?: AprsOrderSnapshot;
 }
 
@@ -40,12 +48,17 @@ export interface EnqueueAprsResult {
 }
 
 export interface AprsTransport {
-  send(data: string): Promise<void>;
+  send(data: string, provisionFingerprint: string): Promise<void>;
 }
 
 export interface AprsRetryOptions {
   initialDelayMs?: number;
   maximumDelayMs?: number;
+}
+
+export interface AprsOutboxWorkerOptions extends AprsRetryOptions {
+  authorizationProvider: () => string | undefined;
+  clock?: () => Date;
 }
 
 interface OrderSnapshot {
@@ -66,6 +79,15 @@ export class AprsOutboxError extends Error {
   }
 }
 
+export class AprsAuthorizationError extends Error {
+  readonly code = "APRS_PROVISION_UNAVAILABLE";
+
+  constructor() {
+    super("APRS_PROVISION_UNAVAILABLE");
+    this.name = "AprsAuthorizationError";
+  }
+}
+
 export class AprsOutboxRepository {
   constructor(private readonly database: DatabaseSync) {}
 
@@ -75,7 +97,8 @@ export class AprsOutboxRepository {
       !input.canonicalEventId.trim() ||
       !input.data.trim() ||
       /[\r\n]/.test(input.data) ||
-      !isTimestamp(input.now)
+      !isTimestamp(input.now) ||
+      !PROVISION_FINGERPRINT_PATTERN.test(input.provisionFingerprint)
     ) {
       throw new AprsOutboxError();
     }
@@ -125,7 +148,7 @@ export class AprsOutboxRepository {
         );
       this.database
         .prepare(
-          "INSERT OR IGNORE INTO aprs_outbox (id, callsign, canonical_event_id, data, status, attempts, next_attempt_at, last_error_code, created_at, updated_at, mesh_network_id, node_num, mapping_version, event_time, sequence_epoch, sequence_number) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT OR IGNORE INTO aprs_outbox (id, callsign, canonical_event_id, data, status, attempts, next_attempt_at, last_error_code, created_at, updated_at, mesh_network_id, node_num, mapping_version, event_time, sequence_epoch, sequence_number, provision_fingerprint) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run(
           id,
@@ -143,6 +166,7 @@ export class AprsOutboxRepository {
           snapshot.eventTime!,
           snapshot.sequenceEpoch ?? null,
           snapshot.sequenceNumber ?? null,
+          input.provisionFingerprint,
         );
       this.database.exec("RELEASE aprs_outbox_enqueue");
       savepointOpen = false;
@@ -218,6 +242,7 @@ export class AprsOutboxRepository {
     id: string,
     now: string,
     retryDelayMs: number,
+    currentProvisionFingerprint: string | undefined,
   ):
     | { authorized: true; entry: AprsOutboxEntry }
     | { authorized: false; entry?: AprsOutboxEntry } {
@@ -235,6 +260,18 @@ export class AprsOutboxRepository {
       const entry = this.required(id);
       if (entry.status !== "sending") {
         throw new AprsOutboxError();
+      }
+      if (
+        !entry.provisionFingerprint ||
+        !PROVISION_FINGERPRINT_PATTERN.test(
+          currentProvisionFingerprint ?? "",
+        ) ||
+        entry.provisionFingerprint !== currentProvisionFingerprint
+      ) {
+        this.database.prepare("DELETE FROM aprs_outbox WHERE id = ?").run(id);
+        this.database.exec("COMMIT");
+        transactionOpen = false;
+        return { authorized: false };
       }
       const order = this.evaluateSendOrder(entry);
       if (order === "stale") {
@@ -260,14 +297,28 @@ export class AprsOutboxRepository {
     }
   }
 
-  markSent(id: string, now: string): AprsOutboxEntry {
-    if (!isTimestamp(now)) {
+  markSent(
+    id: string,
+    now: string,
+    provisionFingerprint: string,
+  ): AprsOutboxEntry {
+    if (
+      !isTimestamp(now) ||
+      !PROVISION_FINGERPRINT_PATTERN.test(provisionFingerprint)
+    ) {
       throw new AprsOutboxError();
     }
     let transactionOpen = false;
     try {
       this.database.exec("BEGIN IMMEDIATE");
       transactionOpen = true;
+      const current = this.required(id);
+      if (
+        current.status !== "sending" ||
+        current.provisionFingerprint !== provisionFingerprint
+      ) {
+        throw new AprsOutboxError();
+      }
       this.database
         .prepare(
           "UPDATE aprs_outbox SET status = 'sent', sent_at = ?, updated_at = ?, last_error_code = NULL WHERE id = ? AND status = 'sending'",
@@ -364,6 +415,14 @@ export class AprsOutboxRepository {
       )
       .run(now, now);
     return Number(result.changes);
+  }
+
+  discard(id: string): void {
+    try {
+      this.database.prepare("DELETE FROM aprs_outbox WHERE id = ?").run(id);
+    } catch {
+      throw new AprsOutboxError();
+    }
   }
 
   find(id: string): AprsOutboxEntry | undefined {
@@ -702,7 +761,7 @@ export class AprsOutboxWorker {
   constructor(
     private readonly repository: AprsOutboxRepository,
     private readonly transport: AprsTransport,
-    options: AprsRetryOptions & { clock?: () => Date } = {},
+    private readonly options: AprsOutboxWorkerOptions,
   ) {
     this.clock = options.clock ?? (() => new Date());
     this.retry = {
@@ -740,10 +799,14 @@ export class AprsOutboxWorker {
     const results: AprsOutboxEntry[] = [];
     for (const entry of entries) {
       const retryDelayMs = retryDelay(entry.attempts + 1, this.retry);
+      const currentFingerprint = resolveCurrentProvisionFingerprint(
+        this.options.authorizationProvider,
+      );
       const authorization = this.repository.prepareSend(
         entry.id,
         this.clock().toISOString(),
         retryDelayMs,
+        currentFingerprint,
       );
       if (!authorization.authorized) {
         if (authorization.entry) {
@@ -752,14 +815,34 @@ export class AprsOutboxWorker {
         continue;
       }
       try {
-        await this.transport.send(authorization.entry.data);
+        const provisionFingerprint = authorization.entry.provisionFingerprint;
+        if (!provisionFingerprint) {
+          this.repository.discard(authorization.entry.id);
+          continue;
+        }
+        await this.transport.send(
+          authorization.entry.data,
+          provisionFingerprint,
+        );
         results.push(
           this.repository.markSent(
             authorization.entry.id,
             this.clock().toISOString(),
+            provisionFingerprint,
           ),
         );
-      } catch {
+      } catch (error) {
+        const current = resolveCurrentProvisionFingerprint(
+          this.options.authorizationProvider,
+        );
+        if (
+          error instanceof AprsAuthorizationError ||
+          !authorization.entry.provisionFingerprint ||
+          current !== authorization.entry.provisionFingerprint
+        ) {
+          this.repository.discard(authorization.entry.id);
+          continue;
+        }
         const failed = this.repository.markFailed(
           authorization.entry.id,
           this.clock().toISOString(),
@@ -786,7 +869,7 @@ export class AprsIsTcpClient implements AprsTransport {
     private readonly options: {
       host: string;
       port: number;
-      loginLine: string;
+      authorizationProvider: AprsAuthorizationProvider;
       timeoutMs?: number;
     },
   ) {
@@ -795,8 +878,7 @@ export class AprsIsTcpClient implements AprsTransport {
       !Number.isInteger(options.port) ||
       options.port < 1 ||
       options.port > 65_535 ||
-      !options.loginLine.trim() ||
-      /[\r\n]/.test(options.loginLine) ||
+      typeof options.authorizationProvider !== "function" ||
       (options.timeoutMs !== undefined &&
         (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0))
     ) {
@@ -804,21 +886,40 @@ export class AprsIsTcpClient implements AprsTransport {
     }
   }
 
-  async send(data: string): Promise<void> {
-    if (!data.trim() || /[\r\n]/.test(data)) {
+  async send(data: string, provisionFingerprint: string): Promise<void> {
+    if (
+      !data.trim() ||
+      /[\r\n]/.test(data) ||
+      !PROVISION_FINGERPRINT_PATTERN.test(provisionFingerprint)
+    ) {
       throw new AprsOutboxError();
     }
+    resolveAuthorization(
+      this.options.authorizationProvider,
+      provisionFingerprint,
+    );
     const socket = net.createConnection({
       host: this.options.host,
       port: this.options.port,
     });
     try {
       await onceConnected(socket, this.options.timeoutMs ?? 10_000);
-      await write(socket, `${this.options.loginLine}\r\n`);
+      const authorization = resolveAuthorization(
+        this.options.authorizationProvider,
+        provisionFingerprint,
+      );
+      await write(socket, `${authorization.loginLine}\r\n`);
+      resolveAuthorization(
+        this.options.authorizationProvider,
+        provisionFingerprint,
+      );
       await write(socket, `${data}\r\n`);
       socket.end();
-    } catch {
+    } catch (error) {
       socket.destroy();
+      if (error instanceof AprsAuthorizationError) {
+        throw error;
+      }
       throw new AprsOutboxError();
     }
   }
@@ -855,6 +956,51 @@ function write(socket: Socket, value: string): Promise<void> {
   return new Promise((resolve, reject) =>
     socket.write(value, (error) => (error ? reject(error) : resolve())),
   );
+}
+
+const MAX_APRS_LOGIN_LINE_BYTES = 512;
+
+function resolveAuthorization(
+  provider: AprsAuthorizationProvider,
+  expectedProvisionFingerprint: string,
+): AprsConnectionAuthorization {
+  let authorization: AprsConnectionAuthorization | undefined;
+  try {
+    authorization = provider();
+  } catch {
+    throw new AprsAuthorizationError();
+  }
+  if (
+    !authorization ||
+    authorization.provisionFingerprint !== expectedProvisionFingerprint ||
+    !PROVISION_FINGERPRINT_PATTERN.test(authorization.provisionFingerprint) ||
+    !isValidLoginLine(authorization.loginLine)
+  ) {
+    throw new AprsAuthorizationError();
+  }
+  return authorization;
+}
+
+function isValidLoginLine(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    !/[\r\n]/.test(value) &&
+    Buffer.byteLength(value, "utf8") <= MAX_APRS_LOGIN_LINE_BYTES
+  );
+}
+
+function resolveCurrentProvisionFingerprint(
+  provider: () => string | undefined,
+): string | undefined {
+  try {
+    const fingerprint = provider();
+    return fingerprint && PROVISION_FINGERPRINT_PATTERN.test(fingerprint)
+      ? fingerprint
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function toEntry(row: Record<string, unknown>): AprsOutboxEntry {
@@ -894,6 +1040,10 @@ function toEntry(row: Record<string, unknown>): AprsOutboxEntry {
       : {}),
     ...(typeof sequenceEpoch === "number" ? { sequenceEpoch } : {}),
     ...(typeof sequenceNumber === "number" ? { sequenceNumber } : {}),
+    ...(typeof row.provision_fingerprint === "string" &&
+    PROVISION_FINGERPRINT_PATTERN.test(row.provision_fingerprint)
+      ? { provisionFingerprint: row.provision_fingerprint }
+      : {}),
     ...(typeof row.last_error_code === "string"
       ? { lastErrorCode: row.last_error_code }
       : {}),

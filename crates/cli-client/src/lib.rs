@@ -59,10 +59,24 @@ mod tests {
     #[test]
     fn parses_only_supported_control_endpoints() {
         assert_eq!(parse_endpoint("local"), Ok(ControlEndpointSpec::Local));
+        #[cfg(unix)]
         assert_eq!(
             parse_endpoint("unix:///tmp/cmclient.sock"),
             Ok(ControlEndpointSpec::UnixSocket("/tmp/cmclient.sock".into()))
         );
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                parse_endpoint("unix:///tmp/cmclient.sock"),
+                Err(ExitCode::Validation)
+            );
+            assert_eq!(
+                parse_endpoint(r"\\.\pipe\cmclient-control"),
+                Ok(ControlEndpointSpec::NamedPipe(String::from(
+                    r"\\.\pipe\cmclient-control"
+                )))
+            );
+        }
         assert_eq!(
             parse_endpoint("http://127.0.0.1"),
             Err(ExitCode::Validation)

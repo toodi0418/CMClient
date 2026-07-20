@@ -119,8 +119,23 @@ describe("CallMesh client", () => {
       symbolOverlay: null,
       comment: "Sanitized fixture",
     });
+    expect(client.getAprsState()).toEqual({
+      mappings: [normalizedMapping()],
+      mappingsFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+      provision: {
+        callsignBase: "N0CALL",
+        ssid: -7,
+        symbolTable: "/",
+        symbolCode: ">",
+        symbolOverlay: null,
+        comment: "Sanitized fixture",
+      },
+      provisionFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
     expect(JSON.stringify(first)).not.toContain("Sanitized fixture");
     expect(JSON.stringify(first)).not.toContain("callsignBase");
+    expect(JSON.stringify(first)).not.toContain("passcode");
+    expect(JSON.stringify(first)).not.toContain("provisionFingerprint");
     expect(database.callmeshMappings.loadSnapshot()).toMatchObject({
       active: true,
       mappingHash: recordedMappings.hash,
@@ -148,6 +163,7 @@ describe("CallMesh client", () => {
       mappings: [],
     });
     expect(withoutKey.getProvision()).toBeUndefined();
+    expect(withoutKey.getAprsState()).toBeUndefined();
     expect(requests).toEqual([
       expectedRequest("/api/v1/client/heartbeat", {
         local_hash: null,
@@ -515,6 +531,18 @@ describe("CallMesh client", () => {
     expect(transient.getOverview().status.provisionState).toBe("expired");
     expect(transient.getProvision()).toBeUndefined();
     expect(transient.getMappingsForUse()).toEqual([]);
+    expect(transient.getAprsState()).toBeUndefined();
+    const restartedExpired = new CallMeshClient(
+      {
+        ...clientOptions(async () => new Response(null, { status: 503 })),
+        clock: () => new Date(now),
+      },
+      database.callmeshMappings,
+    );
+    expect(restartedExpired.getOverview().status.provisionState).toBe(
+      "expired",
+    );
+    expect(restartedExpired.getAprsState()).toBeUndefined();
     database.close();
   });
 

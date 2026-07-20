@@ -128,6 +128,7 @@ struct PlatformSecretBackend;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretBackendKind {
     Platform,
+    #[cfg(unix)]
     Plaintext,
     Service,
     Memory,
@@ -560,9 +561,13 @@ impl AgentSecretStore {
         let plaintext_path =
             std::env::var_os(PLAINTEXT_SECRET_FILE_ENVIRONMENT).filter(|path| !path.is_empty());
         #[cfg(target_os = "linux")]
-        let systemd_mode = std::env::var_os(SYSTEMD_SECRET_STORE_ENVIRONMENT);
+        let systemd_mode_value = std::env::var_os(SYSTEMD_SECRET_STORE_ENVIRONMENT);
         #[cfg(target_os = "linux")]
-        let credentials_directory = std::env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY);
+        let credentials_directory_value = std::env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY);
+        #[cfg(target_os = "linux")]
+        let systemd_mode = systemd_mode_value.as_deref();
+        #[cfg(target_os = "linux")]
+        let credentials_directory = credentials_directory_value.as_deref();
         #[cfg(not(target_os = "linux"))]
         let systemd_mode: Option<&OsStr> = None;
         #[cfg(not(target_os = "linux"))]
@@ -570,8 +575,8 @@ impl AgentSecretStore {
         Self::from_runtime_environment(
             data_dir,
             plaintext_path.as_deref(),
-            systemd_mode.as_deref(),
-            credentials_directory.as_deref(),
+            systemd_mode,
+            credentials_directory,
         )
     }
 
@@ -941,12 +946,9 @@ mod tests {
         AgentSecretStore, SecretBackend, SecretBackendKind, SecretKind, SecretStoreError,
         ServiceSecretBackend, VAULT_MAGIC,
     };
-    use std::{
-        ffi::OsStr,
-        fs,
-        path::{Path, PathBuf},
-        sync::Arc,
-    };
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    use std::{ffi::OsStr, fs, path::Path, sync::Arc};
     use uuid::Uuid;
     use zeroize::Zeroizing;
 

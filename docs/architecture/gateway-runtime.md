@@ -58,12 +58,16 @@ state, never callsign identity, symbols, comment, or a derived passcode.
 
 ## APRS runtime
 
-APRS is enabled only when Agent supplies a validated login callsign and an
-Agent-selected passcode. The runtime performs an immediate outbox flush and
-APRS-monitor refresh, then repeats both on bounded configured intervals. The
-monitor filter is rebuilt from active mappings. Duplicate callsign targets are
-treated as `CALLMESH_MAPPING_CONFLICT` and fail closed without opening a monitor
-session.
+Agent supplies only APRS enablement plus optional endpoint and destination
+overrides. Gateway owns the default `asia.aprs2.net:14580` endpoint and obtains
+callsign/SSID, symbol, comment, and a derived runtime passcode from the current
+valid CallMesh provision. A missing, revoked, expired, stale, or conflicting
+provision stops APRS authorization and fails closed; static identity/passcode
+environment values are rejected. The runtime performs an immediate outbox
+flush and APRS-monitor refresh, then repeats both on bounded configured
+intervals. The monitor filter is rebuilt from active mappings. Duplicate
+callsign targets are treated as `CALLMESH_MAPPING_CONFLICT` and fail closed
+without opening a monitor session.
 
 `GET /api/v1/aprs` returns the schema-backed runtime projection:
 

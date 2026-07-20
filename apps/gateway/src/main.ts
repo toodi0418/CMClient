@@ -164,7 +164,7 @@ async function runGateway(): Promise<void> {
       synchronizeCallMesh(callmesh, activeEvents),
     );
     context.throwIfShutdownRequested();
-    const verifiedMappings = () => callmesh.getMappingsForUse();
+    const verifiedAprsState = () => callmesh.getAprsState();
 
     proxy = await createConfiguredProxyRuntime(process.env, activeEvents);
     context.throwIfShutdownRequested();
@@ -181,7 +181,7 @@ async function runGateway(): Promise<void> {
       process.env,
       activeDatabase,
       activeEvents,
-      verifiedMappings,
+      verifiedAprsState,
     );
     aprs?.start();
     context.throwIfShutdownRequested();
@@ -189,7 +189,7 @@ async function runGateway(): Promise<void> {
       process.env,
       activeDatabase,
       activeEvents,
-      verifiedMappings,
+      verifiedAprsState,
     );
     context.throwIfShutdownRequested();
     mesh?.start();

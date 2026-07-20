@@ -102,9 +102,11 @@ Linux follows XDG data/config/cache directories under `~/.local/share`,
 `~/.config`, and `~/.cache`. Logs default below the data directory. Absolute
 `CMCLIENT_*_DIR` overrides are allowed; relative overrides fail closed.
 
-Never put API keys, APRS passcodes, browser passwords, or update signing keys
-in `agent.toml`, a command argument, or a diagnostic bundle. Use
-`cmclient secret set <kind>` with standard input.
+Never put API keys, APRS credentials, browser passwords, or update signing keys
+in `agent.toml`, a command argument, or a diagnostic bundle. Use standard input
+to set only the CallMesh API key or Management admin token. APRS identity comes
+from a valid CallMesh provision, and Gateway derives its runtime passcode
+locally; neither is a static user-set secret.
 
 For installation, upgrade, uninstall retention, and service registration see
 [Deployment](../admin/deployment.md). For the day-to-day Web and CLI workflow

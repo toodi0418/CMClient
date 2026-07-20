@@ -30,7 +30,8 @@ GET /api/v1/control/events/recent
 GET /api/v1/control/events
 POST /api/v1/control/database/integrity-check
 POST /api/v1/control/backups
-PUT /api/v1/control/secrets/{callmesh-api-key|aprs-passcode|management-admin-token}
+PUT /api/v1/control/secrets/{callmesh-api-key|management-admin-token}
+PUT /api/v1/control/secrets/aprs-passcode (deprecated; always 410)
 DELETE /api/v1/control/secrets/{callmesh-api-key|aprs-passcode|management-admin-token}
 ```
 
@@ -116,7 +117,10 @@ environment, database content, packet data, credentials, or log payloads.
 
 The secret routes never pass through Gateway. `PUT` accepts a single UTF-8 value
 in its request body (maximum 4096 bytes, no control characters) and stores it in
-the Agent-selected secret backend. Interactive sessions normally use the
+the Agent-selected secret backend. `aprs-passcode` is the one removal-only
+legacy name: local and remote `PUT` return HTTP 410 with
+`CONTROL_SECRET_KIND_DEPRECATED` without dispatching the value, while `DELETE`
+removes any value left by an older installation. Interactive sessions normally use the
 platform credential store; controlled Unix/macOS field runtimes can instead
 select a strict external `0600` plaintext file with
 `CMCLIENT_PLAINTEXT_SECRET_FILE`. The packaged systemd service uses its

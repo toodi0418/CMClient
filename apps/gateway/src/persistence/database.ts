@@ -1223,4 +1223,13 @@ export const gatewayMigrations: Migration[] = [
       );
     },
   },
+  {
+    version: 15,
+    name: "aprs_outbox_provision_authorization",
+    up(database) {
+      database.exec(
+        "ALTER TABLE aprs_outbox ADD COLUMN provision_fingerprint TEXT CHECK (provision_fingerprint IS NULL OR (length(provision_fingerprint) = 64 AND provision_fingerprint NOT GLOB '*[^a-f0-9]*'))",
+      );
+    },
+  },
 ];

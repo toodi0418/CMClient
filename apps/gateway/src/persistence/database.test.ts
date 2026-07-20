@@ -16,6 +16,8 @@ import {
 } from "../position";
 import { AprsOutboxWorker } from "../aprs-outbox";
 
+const PROVISION_FINGERPRINT = "a".repeat(64);
+
 function databasePath(name: string): string {
   return join(tmpdir(), `cmclient-gateway-${process.pid}-${name}.sqlite`);
 }
@@ -44,7 +46,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT version FROM schema_migrations")
         .all(),
-    ).toHaveLength(14);
+    ).toHaveLength(15);
     for (const [table, primaryKey] of [
       [
         "node_position_state",
@@ -293,7 +295,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 14 });
+    ).toEqual({ version: 15 });
     expect(
       database.connection
         .prepare("SELECT * FROM aprs_delivery_high_water")
@@ -311,7 +313,7 @@ describe("GatewayDatabase", () => {
     expect(
       database.connection
         .prepare(
-          "SELECT id, mesh_network_id, node_num, mapping_version, event_time, sequence_epoch, sequence_number FROM aprs_outbox ORDER BY id",
+          "SELECT id, mesh_network_id, node_num, mapping_version, event_time, sequence_epoch, sequence_number, provision_fingerprint FROM aprs_outbox ORDER BY id",
         )
         .all(),
     ).toEqual([
@@ -323,6 +325,7 @@ describe("GatewayDatabase", () => {
         event_time: "2026-07-18T00:00:00.000Z",
         sequence_epoch: 0,
         sequence_number: 10,
+        provision_fingerprint: null,
       },
       {
         id: "outbox-queued",
@@ -332,6 +335,7 @@ describe("GatewayDatabase", () => {
         event_time: "2026-07-18T00:00:01.000Z",
         sequence_epoch: 1,
         sequence_number: 1,
+        provision_fingerprint: null,
       },
       {
         id: "outbox-second",
@@ -341,6 +345,7 @@ describe("GatewayDatabase", () => {
         event_time: "2026-07-18T00:00:00.000Z",
         sequence_epoch: 0,
         sequence_number: 11,
+        provision_fingerprint: null,
       },
     ]);
     let reenqueues = 0;
@@ -388,7 +393,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 14 });
+    ).toEqual({ version: 15 });
     const firstFingerprint = "a".repeat(64);
     const secondFingerprint = "b".repeat(64);
     const insertState = database.connection.prepare(
@@ -529,22 +534,15 @@ describe("GatewayDatabase", () => {
             sends += 1;
           },
         },
-        { clock: () => new Date("2026-07-18T00:00:02.000Z") },
+        {
+          authorizationProvider: () => PROVISION_FINGERPRINT,
+          clock: () => new Date("2026-07-18T00:00:02.000Z"),
+        },
       ).flush(),
-    ).resolves.toMatchObject([
-      {
-        id: "legacy-pending",
-        status: "failed",
-        lastErrorCode: "APRS_ORDER_UNPROVEN",
-      },
-    ]);
+    ).resolves.toEqual([]);
     expect(sends).toBe(0);
+    expect(database.aprsOutbox.find("legacy-pending")).toBeUndefined();
     expect(database.aprsOutbox.deleteSuperseded(10)).toBe(0);
-
-    database.connection
-      .prepare("UPDATE aprs_outbox SET status = 'sending' WHERE id = ?")
-      .run("legacy-pending");
-    database.aprsOutbox.markSent("legacy-pending", "2026-07-18T00:00:03.000Z");
     expect(
       database.connection
         .prepare(
@@ -558,7 +556,6 @@ describe("GatewayDatabase", () => {
     expect(
       database.aprsOutbox.deleteSentBefore("2027-01-01T00:00:00.000Z", 10),
     ).toBe(1);
-    expect(database.aprsOutbox.find("legacy-pending")?.status).toBe("sent");
     expect(database.integrityCheck()).toBe("ok");
     database.close();
   });
@@ -568,7 +565,7 @@ describe("GatewayDatabase", () => {
     expect(() =>
       runMigrations(database.connection, [
         {
-          version: 15,
+          version: 16,
           name: "broken",
           up(connection) {
             connection.exec(
@@ -581,7 +578,7 @@ describe("GatewayDatabase", () => {
     ).toThrow(DatabaseMigrationError);
     expect(
       database.connection
-        .prepare("SELECT version FROM schema_migrations WHERE version = 15")
+        .prepare("SELECT version FROM schema_migrations WHERE version = 16")
         .get(),
     ).toBeUndefined();
     expect(

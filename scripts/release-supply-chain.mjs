@@ -52,6 +52,12 @@ const PLATFORM_TRUST = Object.freeze({
   provenance: "checksum-provenance",
 });
 
+function tarArguments(argumentsList) {
+  return process.platform === "win32"
+    ? ["--force-local", ...argumentsList]
+    : argumentsList;
+}
+
 export function dockerArtifactPlans(version) {
   return canonicalDockerArtifactPlan(version);
 }
@@ -1037,7 +1043,7 @@ async function createArchive({ archive, archivePath, entries, cwd }) {
   if (process.platform !== "linux") {
     const tarPath = join(cwd, ".cmclient-release.tar");
     try {
-      await run("tar", ["-cf", tarPath, ...entries], cwd);
+      await run("tar", tarArguments(["-cf", tarPath, ...entries]), cwd);
       await run(
         "zstd",
         ["--quiet", "--force", "-19", "-o", archivePath, tarPath],
@@ -1050,7 +1056,7 @@ async function createArchive({ archive, archivePath, entries, cwd }) {
   }
   await run(
     "tar",
-    [
+    tarArguments([
       "--zstd",
       "--sort=name",
       "--mtime=@0",
@@ -1060,7 +1066,7 @@ async function createArchive({ archive, archivePath, entries, cwd }) {
       "-cf",
       archivePath,
       ...entries,
-    ],
+    ]),
     cwd,
   );
 }
@@ -1791,11 +1797,10 @@ async function sha256File(path) {
 
 async function readTarOutput(archivePath, argumentsList) {
   try {
-    return await runCapture("tar", [
-      argumentsList[0],
-      archivePath,
-      ...argumentsList.slice(1),
-    ]);
+    return await runCapture(
+      "tar",
+      tarArguments([argumentsList[0], archivePath, ...argumentsList.slice(1)]),
+    );
   } catch {
     throw new Error("RELEASE_DOCKER_OCI_INVALID");
   }

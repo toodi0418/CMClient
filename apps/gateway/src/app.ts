@@ -49,10 +49,13 @@ import {
   type GatewaySystemState,
 } from "./system.js";
 import {
+  DEFAULT_SSE_FRAME_MAX_BYTES,
   DomainEventBus,
   formatSseEvent,
   formatSseHeartbeat,
 } from "./events.js";
+
+const SSE_HTTP_HIGH_WATER_MARK_BYTES = DEFAULT_SSE_FRAME_MAX_BYTES + 4 * 1024;
 
 export interface GatewayJobApi {
   get(jobId: string): JobDetail | undefined;
@@ -248,7 +251,10 @@ export function createGatewayApp(
   if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
     throw new GatewayConfigurationError();
   }
-  const app = Fastify({ logger: false });
+  const app = Fastify({
+    logger: false,
+    http: { highWaterMark: SSE_HTTP_HIGH_WATER_MARK_BYTES },
+  });
   const sseSessions = new Set<GatewaySseSessionCloser>();
   app.decorate("eventBus", eventBus);
   app.decorateRequest("traceId", "");

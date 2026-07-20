@@ -1,10 +1,14 @@
 import { hostname } from "node:os";
 
-import type { CallMeshMapping } from "@cmclient/contracts";
-
 import { AprsIsRxClient, type AprsIsRxSession } from "./aprs-monitor.js";
 import { AprsIsTcpClient, AprsOutboxWorker } from "./aprs-outbox.js";
 import { AprsGatewayRuntime } from "./aprs-runtime.js";
+import {
+  connectionAuthorization,
+  deriveAprsRuntimeState,
+  type AprsRuntimeState,
+} from "./aprs-identity.js";
+import type { CallMeshAprsState } from "./callmesh.js";
 import { DomainEventBus } from "./events.js";
 import { MeshGatewayRuntime } from "./mesh-runtime.js";
 import {
@@ -28,6 +32,8 @@ export class GatewayRuntimeConfigurationError extends Error {
     this.name = "GatewayRuntimeConfigurationError";
   }
 }
+
+export type AprsStateProvider = () => AprsRuntimeState | undefined;
 
 export function createConfiguredGatewayMaintenanceRuntime(
   environment: Record<string, string | undefined>,
@@ -121,7 +127,7 @@ export async function createConfiguredMeshGatewayRuntime(
   environment: Record<string, string | undefined>,
   database: GatewayDatabase,
   eventBus: DomainEventBus,
-  mappingProvider?: () => readonly CallMeshMapping[],
+  aprsStateProvider?: () => CallMeshAprsState | undefined,
 ): Promise<MeshGatewayRuntime | undefined> {
   const kind =
     environment.CMCLIENT_MESHTASTIC_TRANSPORT?.trim().toLowerCase() ||
@@ -183,8 +189,12 @@ export async function createConfiguredMeshGatewayRuntime(
     gatewayId,
     meshNetworkId,
     transport,
-    ...(mappingProvider ? { mappingProvider } : {}),
-    aprs: parseAprsEncodingOptions(environment),
+    aprs: {
+      ...parseAprsEncodingOptions(environment),
+      ...(aprsStateProvider
+        ? { stateProvider: createAprsRuntimeStateProvider(aprsStateProvider) }
+        : {}),
+    },
   });
 }
 
@@ -192,59 +202,51 @@ export function createConfiguredAprsGatewayRuntime(
   environment: Record<string, string | undefined>,
   database: GatewayDatabase,
   eventBus: DomainEventBus,
-  mappingProvider?: () => readonly CallMeshMapping[],
+  aprsStateProvider?: () => CallMeshAprsState | undefined,
 ): AprsGatewayRuntime | undefined {
-  const callsign = environment.CMCLIENT_APRS_LOGIN_CALLSIGN?.trim();
-  const passcode = environment.CMCLIENT_APRS_PASSCODE?.trim();
+  rejectStaticAprsIdentity(environment);
   const explicitlyEnabled = parseOptionalBoolean(
     environment.CMCLIENT_APRS_ENABLED,
   );
-  const enabled = explicitlyEnabled ?? Boolean(callsign || passcode);
+  const enabled = explicitlyEnabled ?? false;
   if (!enabled) {
     return undefined;
   }
-  if (
-    !callsign ||
-    !/^[A-Z0-9]{1,6}(?:-[0-9]{1,2})?$/.test(callsign) ||
-    !passcode ||
-    !/^\d{1,5}$/.test(passcode) ||
-    Number(passcode) > 32_767
-  ) {
+  if (!aprsStateProvider) {
     throw new GatewayRuntimeConfigurationError(
-      "APRS_CREDENTIAL_CONFIGURATION_INVALID",
+      "APRS_PROVISION_CONFIGURATION_REQUIRED",
     );
   }
-  const host = boundedText(
-    environment.CMCLIENT_APRS_HOST?.trim() || "rotate.aprs2.net",
-    255,
-    "APRS_ENDPOINT_CONFIGURATION_INVALID",
-  );
-  const port = parsePort(
-    environment.CMCLIENT_APRS_PORT,
-    14_580,
-    "APRS_ENDPOINT_CONFIGURATION_INVALID",
-  );
-  const timeoutMs = parsePositiveInteger(
-    environment.CMCLIENT_APRS_TIMEOUT_MS,
-    10_000,
-    "APRS_ENDPOINT_CONFIGURATION_INVALID",
-  );
-  const loginLine = `user ${callsign} pass ${passcode} vers CMClient 2.0`;
+  const stateProvider = createAprsRuntimeStateProvider(aprsStateProvider);
+  const authorizationProvider = connectionAuthorization(stateProvider);
+  const { host, port, timeoutMs } = parseAprsEndpointOptions(environment);
   const worker = new AprsOutboxWorker(
     database.aprsOutbox,
-    new AprsIsTcpClient({ host, port, loginLine, timeoutMs }),
+    new AprsIsTcpClient({
+      host,
+      port,
+      authorizationProvider,
+      timeoutMs,
+    }),
+    {
+      authorizationProvider: () => stateProvider()?.provisionFingerprint,
+      clock: () => new Date(),
+      initialDelayMs: 1_000,
+      maximumDelayMs: 60_000,
+    },
   );
   return new AprsGatewayRuntime({
     database,
     eventBus,
-    ...(mappingProvider ? { mappingProvider } : {}),
+    stateProvider,
     outbox: worker,
-    monitorClientFactory: (filterExpression) => ({
+    monitorClientFactory: (filterExpression, provisionFingerprint) => ({
       connect: (onLine: (line: string) => void): Promise<AprsIsRxSession> =>
         new AprsIsRxClient({
           host,
           port,
-          loginLine,
+          authorizationProvider,
+          provisionFingerprint: provisionFingerprint ?? "",
           filterExpression,
           timeoutMs,
         }).connect(onLine),
@@ -264,33 +266,69 @@ export function createConfiguredAprsGatewayRuntime(
 
 export function parseAprsEncodingOptions(
   environment: Record<string, string | undefined>,
-): {
-  comment?: string;
-  destination: string;
-  symbolCode: string;
-  symbolTable: string;
-} {
+): { destination: string } {
   const destination = environment.CMCLIENT_APRS_DESTINATION?.trim() || "APCM20";
-  const symbolTable = environment.CMCLIENT_APRS_SYMBOL_TABLE ?? "/";
-  const symbolCode = environment.CMCLIENT_APRS_SYMBOL_CODE ?? ">";
-  const comment = environment.CMCLIENT_APRS_COMMENT?.trim();
-  if (
-    !/^[A-Z0-9]{1,6}$/.test(destination) ||
-    !/^[ -~]$/.test(symbolTable) ||
-    !/^[ -~]$/.test(symbolCode) ||
-    (comment !== undefined &&
-      (comment.length === 0 || comment.length > 80 || /[\r\n]/.test(comment)))
-  ) {
+  if (!/^[A-Z0-9]{1,6}$/.test(destination)) {
     throw new GatewayRuntimeConfigurationError(
       "APRS_ENCODING_CONFIGURATION_INVALID",
     );
   }
+  return { destination };
+}
+
+export function parseAprsEndpointOptions(
+  environment: Record<string, string | undefined>,
+): { host: string; port: number; timeoutMs: number } {
   return {
-    destination,
-    symbolTable,
-    symbolCode,
-    ...(comment ? { comment } : {}),
+    host: boundedText(
+      environment.CMCLIENT_APRS_HOST?.trim() || "asia.aprs2.net",
+      255,
+      "APRS_ENDPOINT_CONFIGURATION_INVALID",
+    ),
+    port: parsePort(
+      environment.CMCLIENT_APRS_PORT,
+      14_580,
+      "APRS_ENDPOINT_CONFIGURATION_INVALID",
+    ),
+    timeoutMs: parsePositiveInteger(
+      environment.CMCLIENT_APRS_TIMEOUT_MS,
+      10_000,
+      "APRS_ENDPOINT_CONFIGURATION_INVALID",
+    ),
   };
+}
+
+function createAprsRuntimeStateProvider(
+  provider: () => CallMeshAprsState | undefined,
+): AprsStateProvider {
+  return () => {
+    const state = provider();
+    if (!state) {
+      return undefined;
+    }
+    try {
+      return deriveAprsRuntimeState(state);
+    } catch {
+      return undefined;
+    }
+  };
+}
+
+function rejectStaticAprsIdentity(
+  environment: Record<string, string | undefined>,
+): void {
+  const forbidden = [
+    "CMCLIENT_APRS_LOGIN_CALLSIGN",
+    "CMCLIENT_APRS_PASSCODE",
+    "CMCLIENT_APRS_SYMBOL_TABLE",
+    "CMCLIENT_APRS_SYMBOL_CODE",
+    "CMCLIENT_APRS_COMMENT",
+  ];
+  if (forbidden.some((name) => environment[name]?.trim())) {
+    throw new GatewayRuntimeConfigurationError(
+      "APRS_STATIC_IDENTITY_FORBIDDEN",
+    );
+  }
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {

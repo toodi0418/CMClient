@@ -733,10 +733,10 @@ fn manage_secret(
 ) -> ProcessExitCode {
     let (kind, result) = match command {
         SecretCommand::Set { kind } => {
-            let kind = match parse_secret_kind(&kind) {
+            let kind = match parse_secret_kind_for_set(&kind) {
                 Some(kind) => kind,
                 None => {
-                    eprintln!("CLI_SECRET_KIND_INVALID");
+                    eprintln!("{}", secret_kind_error(&kind));
                     return ProcessExitCode::from(ExitCode::Validation.as_u8());
                 }
             };
@@ -755,7 +755,7 @@ fn manage_secret(
             let kind = match parse_secret_kind(&kind) {
                 Some(kind) => kind,
                 None => {
-                    eprintln!("CLI_SECRET_KIND_INVALID");
+                    eprintln!("{}", secret_kind_error(&kind));
                     return ProcessExitCode::from(ExitCode::Validation.as_u8());
                 }
             };
@@ -792,6 +792,18 @@ fn parse_secret_kind(value: &str) -> Option<ControlSecretKind> {
         "aprs-passcode" => Some(ControlSecretKind::AprsPasscode),
         "management-admin-token" => Some(ControlSecretKind::ManagementAdminToken),
         _ => None,
+    }
+}
+
+fn parse_secret_kind_for_set(value: &str) -> Option<ControlSecretKind> {
+    (value != "aprs-passcode").then(|| parse_secret_kind(value))?
+}
+
+fn secret_kind_error(value: &str) -> &'static str {
+    if value == "aprs-passcode" {
+        "CLI_SECRET_KIND_DEPRECATED"
+    } else {
+        "CLI_SECRET_KIND_INVALID"
     }
 }
 
@@ -1372,6 +1384,7 @@ fn control_error_exit(error: ControlError) -> ProcessExitCode {
         | ControlError::EndpointAlreadyInUse => ExitCode::Connection,
         ControlError::Timeout => ExitCode::Timeout,
         ControlError::Authentication => ExitCode::Authentication,
+        ControlError::SecretKindDeprecated => ExitCode::Validation,
         ControlError::CommandFailed
         | ControlError::ResourceExhausted
         | ControlError::SecretStoreUnavailable
@@ -1386,7 +1399,8 @@ mod tests {
     use super::{
         Cli, EventOutput, RemoteControlClient, control_error_exit, doctor_is_degraded,
         event_matches_output, normalize_secret_input, parse_remote_sse_block, parse_secret_kind,
-        projection_control_path, read_bounded_sse_line, remote_control_error, update_summary,
+        parse_secret_kind_for_set, projection_control_path, read_bounded_sse_line,
+        remote_control_error, secret_kind_error, update_summary,
     };
     use clap::CommandFactory;
     use cmclient_cli_client::ExitCode;
@@ -1431,7 +1445,14 @@ mod tests {
     #[test]
     fn accepts_only_named_secret_kinds_and_single_line_standard_input() {
         assert!(parse_secret_kind("callmesh-api-key").is_some());
+        assert!(parse_secret_kind("aprs-passcode").is_some());
+        assert!(parse_secret_kind_for_set("aprs-passcode").is_none());
         assert!(parse_secret_kind("private-signing-key").is_none());
+        assert_eq!(
+            secret_kind_error("aprs-passcode"),
+            "CLI_SECRET_KIND_DEPRECATED"
+        );
+        assert_eq!(secret_kind_error("unknown"), "CLI_SECRET_KIND_INVALID");
         assert_eq!(
             normalize_secret_input(String::from("secret-from-stdin\r\n")),
             Some(String::from("secret-from-stdin"))

@@ -7,7 +7,7 @@ use cmclient_agent_core::web::{
     gateway_health,
 };
 use cmclient_agent_core::{
-    AgentConfig, AgentLease, MeshtasticConnectionConfig, ensure_runtime_directories,
+    AgentConfig, AgentLease, AprsConfig, MeshtasticConnectionConfig, ensure_runtime_directories,
 };
 use cmclient_control_api::{
     ControlClient, ControlCommand, ControlEndpoint, ControlError, ControlHandler,
@@ -260,6 +260,10 @@ impl AgentManagementWebApi {
             write_remote_control_auth_error(client, error)?;
             return Ok(true);
         }
+        if request.method == "PUT" && is_legacy_aprs_passcode_path(&request.path) {
+            write_remote_control_error(client, &ControlError::SecretKindDeprecated)?;
+            return Ok(true);
+        }
         let control = match ControlClient::new_with_timeout(
             self.control_endpoint.clone(),
             Duration::from_secs(30),
@@ -358,6 +362,9 @@ fn dispatch_remote_control(
             control.gateway_projection(GatewayProjection::Backup)
         }
         ("PUT", path) if path.starts_with("/api/v1/control/secrets/") => {
+            if is_legacy_aprs_passcode_path(path) {
+                return write_remote_control_error(client, &ControlError::SecretKindDeprecated);
+            }
             let Some(kind) = remote_secret_kind(path) else {
                 write_management_json(
                     client,
@@ -414,6 +421,11 @@ fn remote_secret_kind(path: &str) -> Option<ControlSecretKind> {
         "management-admin-token" => Some(ControlSecretKind::ManagementAdminToken),
         _ => None,
     }
+}
+
+fn is_legacy_aprs_passcode_path(path: &str) -> bool {
+    path.strip_prefix("/api/v1/control/secrets/")
+        .is_some_and(|kind| kind == "aprs-passcode")
 }
 
 fn write_remote_control_event_stream(
@@ -476,6 +488,7 @@ const fn remote_control_error_status(error: &ControlError) -> &'static str {
     match error {
         ControlError::SecretValueInvalid => "400 Bad Request",
         ControlError::Authentication => "401 Unauthorized",
+        ControlError::SecretKindDeprecated => "410 Gone",
         ControlError::Timeout => "504 Gateway Timeout",
         ControlError::InvalidHttp | ControlError::ResponseTooLarge => "502 Bad Gateway",
         _ => "503 Service Unavailable",
@@ -700,6 +713,25 @@ impl Drop for SupervisorWorker {
     }
 }
 
+fn apply_aprs_environment(environment: &mut BTreeMap<String, String>, aprs: Option<&AprsConfig>) {
+    let Some(aprs) = aprs else {
+        return;
+    };
+    environment.insert(String::from("CMCLIENT_APRS_ENABLED"), String::from("true"));
+    if let Some(host) = &aprs.host {
+        environment.insert(String::from("CMCLIENT_APRS_HOST"), host.clone());
+    }
+    if let Some(port) = aprs.port {
+        environment.insert(String::from("CMCLIENT_APRS_PORT"), port.to_string());
+    }
+    if let Some(destination) = &aprs.destination {
+        environment.insert(
+            String::from("CMCLIENT_APRS_DESTINATION"),
+            destination.clone(),
+        );
+    }
+}
+
 impl AgentController {
     fn from_config(config: &AgentConfig) -> Result<Self, ControlError> {
         let secrets =
@@ -819,44 +851,7 @@ impl AgentController {
                         }
                     }
                 }
-                if let Some(aprs) = &config.aprs {
-                    let passcode = secrets
-                        .read(SecretKind::AprsPasscode)
-                        .map_err(control_secret_error)?;
-                    environment.insert(
-                        String::from("CMCLIENT_APRS_ENABLED"),
-                        passcode.is_some().to_string(),
-                    );
-                    if let Some(passcode) = passcode {
-                        environment.insert(
-                            String::from("CMCLIENT_APRS_LOGIN_CALLSIGN"),
-                            aprs.login_callsign.clone(),
-                        );
-                        environment.insert(
-                            String::from("CMCLIENT_APRS_PASSCODE"),
-                            passcode.expose_secret().to_owned(),
-                        );
-                        environment.insert(String::from("CMCLIENT_APRS_HOST"), aprs.host.clone());
-                        environment
-                            .insert(String::from("CMCLIENT_APRS_PORT"), aprs.port.to_string());
-                        environment.insert(
-                            String::from("CMCLIENT_APRS_DESTINATION"),
-                            aprs.destination.clone(),
-                        );
-                        environment.insert(
-                            String::from("CMCLIENT_APRS_SYMBOL_TABLE"),
-                            aprs.symbol_table.to_string(),
-                        );
-                        environment.insert(
-                            String::from("CMCLIENT_APRS_SYMBOL_CODE"),
-                            aprs.symbol_code.to_string(),
-                        );
-                        if let Some(comment) = &aprs.comment {
-                            environment
-                                .insert(String::from("CMCLIENT_APRS_COMMENT"), comment.clone());
-                        }
-                    }
-                }
+                apply_aprs_environment(&mut environment, config.aprs.as_ref());
                 if let Some(proxy) = &config.proxy {
                     environment
                         .insert(String::from("CMCLIENT_PROXY_ENABLED"), String::from("true"));
@@ -1427,6 +1422,9 @@ impl ControlHandler for AgentController {
     }
 
     fn store_secret(&self, kind: ControlSecretKind, value: &str) -> Result<(), ControlError> {
+        if kind == ControlSecretKind::AprsPasscode {
+            return Err(ControlError::SecretKindDeprecated);
+        }
         self.secrets
             .store(secret_kind(kind), value)
             .map_err(control_secret_error)
@@ -1798,7 +1796,7 @@ impl Drop for GatewayEventBridgeTestGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 fn active_gateway_event_bridge_count() -> usize {
     ACTIVE_GATEWAY_EVENT_BRIDGES.load(Ordering::Acquire)
 }
@@ -2097,24 +2095,33 @@ fn bundled_root() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        AgentConfig, AgentController, AgentSecretStore, ControlHandler, ManagementWebRequest,
+        SecretKind, apply_aprs_environment, compiled_build_channel, compiled_build_commit,
+        dispatch_remote_control,
+    };
     #[cfg(not(target_os = "windows"))]
     use super::{
-        AgentConfig, AgentController, AgentManagementWebApi, AgentSecretStore, AgentUpdateService,
-        ControlCommand, ControlHandler, GatewayControlStatus, ManagementWebApiHandler,
-        ManagementWebControlStatus, ManagementWebRequest, ManagementWebService,
-        RemoteControlReplayGuard, SecretKind, SupervisorWorker, active_gateway_event_bridge_count,
+        AgentManagementWebApi, AgentUpdateService, ControlCommand, GatewayControlStatus,
+        ManagementWebApiHandler, ManagementWebControlStatus, ManagementWebService,
+        RemoteControlReplayGuard, SupervisorWorker, active_gateway_event_bridge_count,
         bridge_gateway_event_stream, bridge_gateway_events_with_read_poll, default_local_endpoint,
         gateway_heartbeat, gateway_json_projection, read_bounded_gateway_sse_line,
         remote_control_error_status, shutdown_agent_runtime, try_forward_gateway_event,
         unix_now_seconds,
     };
-    use super::{compiled_build_channel, compiled_build_commit};
     #[cfg(not(target_os = "windows"))]
     use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use cmclient_agent_core::{AprsConfig, RuntimePaths};
     #[cfg(not(target_os = "windows"))]
     use cmclient_agent_core::{
-        CallMeshConfig, RuntimePaths,
+        CallMeshConfig,
         access::{LanAccessConfig, ManagementAccessController},
+    };
+    use cmclient_control_api::{
+        ControlClient as CrossPlatformControlClient, ControlEndpoint, ControlError,
+        ControlHandler as CrossPlatformControlHandler, ControlSecretKind,
+        ControlServer as CrossPlatformControlServer, ControlStatus as CrossPlatformControlStatus,
     };
     #[cfg(not(target_os = "windows"))]
     use cmclient_control_api::{
@@ -2127,18 +2134,21 @@ mod tests {
     use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewaySupervisor};
     #[cfg(not(target_os = "windows"))]
     use cmclient_updater::{PersistentUpdateJob, UpdatePhase};
-    #[cfg(not(target_os = "windows"))]
     use std::{
         collections::BTreeMap,
-        io::{Cursor, Read, Write},
+        io::Cursor,
+        sync::{Arc, Mutex},
+        thread,
+    };
+    #[cfg(not(target_os = "windows"))]
+    use std::{
+        io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
         path::PathBuf,
         sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
-        thread,
         time::{Duration, Instant},
     };
 
@@ -2150,6 +2160,216 @@ mod tests {
             commit == "unknown"
                 || (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
         );
+    }
+
+    #[test]
+    fn aprs_environment_contains_only_enablement_and_operator_overrides() {
+        let mut environment = BTreeMap::new();
+        apply_aprs_environment(
+            &mut environment,
+            Some(&AprsConfig {
+                host: None,
+                port: None,
+                destination: None,
+            }),
+        );
+        assert_eq!(
+            environment,
+            BTreeMap::from([(String::from("CMCLIENT_APRS_ENABLED"), String::from("true"),)])
+        );
+
+        apply_aprs_environment(
+            &mut environment,
+            Some(&AprsConfig {
+                host: Some(String::from("operator.aprs.example")),
+                port: Some(14_580),
+                destination: Some(String::from("APCM20")),
+            }),
+        );
+        assert_eq!(
+            environment.get("CMCLIENT_APRS_HOST").map(String::as_str),
+            Some("operator.aprs.example")
+        );
+        assert_eq!(
+            environment.get("CMCLIENT_APRS_PORT").map(String::as_str),
+            Some("14580")
+        );
+        assert_eq!(
+            environment
+                .get("CMCLIENT_APRS_DESTINATION")
+                .map(String::as_str),
+            Some("APCM20")
+        );
+        for forbidden in [
+            "CMCLIENT_APRS_LOGIN_CALLSIGN",
+            "CMCLIENT_APRS_PASSCODE",
+            "CMCLIENT_APRS_SYMBOL_TABLE",
+            "CMCLIENT_APRS_SYMBOL_CODE",
+            "CMCLIENT_APRS_COMMENT",
+        ] {
+            assert!(
+                !environment.contains_key(forbidden),
+                "Agent must not inject {forbidden}",
+            );
+        }
+    }
+
+    #[test]
+    fn controller_rejects_new_aprs_passcodes_but_removes_a_legacy_value() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-legacy-aprs-cleanup-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::AprsPasscode, "synthetic-legacy-passcode")
+            .expect("legacy fixture should be seeded directly");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: directory.clone(),
+                config_dir: directory.join("config"),
+                cache_dir: directory.join("cache"),
+                log_dir: directory.join("logs"),
+            },
+            config_file: directory.join("agent.toml"),
+            gateway_command: None,
+            gateway_port: 48_121,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = AgentController::from_config_with_secrets(&config, secrets.clone())
+            .expect("controller should initialize");
+
+        assert_eq!(
+            controller.store_secret(ControlSecretKind::AprsPasscode, "replacement"),
+            Err(ControlError::SecretKindDeprecated),
+        );
+        assert!(
+            controller
+                .remove_secret(ControlSecretKind::AprsPasscode)
+                .expect("legacy value should be removable")
+        );
+        assert!(
+            secrets
+                .read(SecretKind::AprsPasscode)
+                .expect("secret backend should remain readable")
+                .is_none()
+        );
+
+        drop(controller);
+        std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    struct LegacyRemoteSecretHandler {
+        present: Mutex<bool>,
+    }
+
+    impl CrossPlatformControlHandler for LegacyRemoteSecretHandler {
+        fn handle(
+            &self,
+            _command: super::ControlCommand,
+        ) -> Result<CrossPlatformControlStatus, ControlError> {
+            Err(ControlError::CommandFailed)
+        }
+
+        fn store_secret(&self, _kind: ControlSecretKind, _value: &str) -> Result<(), ControlError> {
+            panic!("deprecated APRS passcode must not reach secret storage")
+        }
+
+        fn remove_secret(&self, kind: ControlSecretKind) -> Result<bool, ControlError> {
+            assert_eq!(kind, ControlSecretKind::AprsPasscode);
+            let mut present = self
+                .present
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?;
+            let was_present = *present;
+            *present = false;
+            Ok(was_present)
+        }
+    }
+
+    fn cross_platform_control_endpoint() -> ControlEndpoint {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock should follow epoch")
+                .as_nanos(),
+        );
+        #[cfg(windows)]
+        {
+            ControlEndpoint::named_pipe(format!(r"\\.\pipe\cmclient-aprs-cleanup-{unique}"))
+        }
+        #[cfg(not(windows))]
+        {
+            ControlEndpoint::unix(
+                std::env::temp_dir().join(format!("cmclient-aprs-cleanup-{unique}.sock")),
+            )
+        }
+    }
+
+    #[test]
+    fn remote_control_rejects_legacy_aprs_set_but_forwards_cleanup() {
+        let endpoint = cross_platform_control_endpoint();
+        let control = CrossPlatformControlClient::new(endpoint.clone())
+            .expect("control client should initialize");
+        let remote_addr = "127.0.0.1:48100"
+            .parse()
+            .expect("remote fixture address should parse");
+
+        let mut put_response = Cursor::new(Vec::new());
+        dispatch_remote_control(
+            &mut put_response,
+            &ManagementWebRequest {
+                method: String::from("PUT"),
+                path: String::from("/api/v1/control/secrets/aprs-passcode"),
+                headers: BTreeMap::new(),
+                body: b"ignored".to_vec(),
+                remote_addr,
+            },
+            &control,
+        )
+        .expect("deprecated remote set should respond");
+        let put_response = String::from_utf8(put_response.into_inner())
+            .expect("remote set response should be UTF-8");
+        assert!(put_response.starts_with("HTTP/1.1 410 Gone"));
+        assert!(put_response.contains("CONTROL_SECRET_KIND_DEPRECATED"));
+
+        let handler = Arc::new(LegacyRemoteSecretHandler {
+            present: Mutex::new(true),
+        });
+        let server = CrossPlatformControlServer::bind(endpoint, handler.clone())
+            .expect("control server should bind");
+        let server_thread = thread::spawn(move || server.serve_once());
+        let mut delete_response = Cursor::new(Vec::new());
+        dispatch_remote_control(
+            &mut delete_response,
+            &ManagementWebRequest {
+                method: String::from("DELETE"),
+                path: String::from("/api/v1/control/secrets/aprs-passcode"),
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+                remote_addr,
+            },
+            &control,
+        )
+        .expect("legacy remote cleanup should respond");
+        server_thread
+            .join()
+            .expect("control server thread should join")
+            .expect("control server should serve cleanup");
+        let delete_response = String::from_utf8(delete_response.into_inner())
+            .expect("remote cleanup response should be UTF-8");
+        assert!(delete_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(delete_response.contains(r#"{"stored":true}"#));
+        assert!(!*handler.present.lock().expect("secret state should lock"));
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -2189,6 +2409,77 @@ mod tests {
             }),
             meshtastic: None,
             aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = AgentController::from_config_with_secrets(&config, secrets)
+            .expect("controller should initialize");
+
+        controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_mut()
+            .expect("supervisor should be configured")
+            .start()
+            .expect("gateway fixture should start");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "gateway fixture did not report");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker should read"),
+            "ok",
+        );
+        controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_mut()
+            .expect("supervisor should be configured")
+            .stop()
+            .expect("gateway fixture should stop");
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn configured_aprs_forwards_only_operator_endpoint_overrides() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-aprs-boundary-{}",
+            std::process::id(),
+        ));
+        let marker = data_dir.join("gateway-environment");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let secrets = AgentSecretStore::memory();
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![
+                String::from("sh"),
+                String::from("-c"),
+                format!(
+                    "if [ \"$CMCLIENT_APRS_ENABLED\" = \"true\" ] && [ \"$CMCLIENT_APRS_HOST\" = \"asia.aprs2.net\" ] && [ \"$CMCLIENT_APRS_PORT\" = \"14580\" ] && [ \"$CMCLIENT_APRS_DESTINATION\" = \"APCM20\" ] && [ \"${{CMCLIENT_APRS_LOGIN_CALLSIGN+x}}\" != x ] && [ \"${{CMCLIENT_APRS_PASSCODE+x}}\" != x ] && [ \"${{CMCLIENT_APRS_SYMBOL_TABLE+x}}\" != x ] && [ \"${{CMCLIENT_APRS_SYMBOL_CODE+x}}\" != x ] && [ \"${{CMCLIENT_APRS_COMMENT+x}}\" != x ]; then printf ok > '{}'; else printf rejected > '{}'; fi; read _",
+                    marker.display(),
+                    marker.display(),
+                ),
+            ]),
+            gateway_port: 48_121,
+            callmesh: None,
+            meshtastic: None,
+            aprs: Some(AprsConfig {
+                host: Some(String::from("asia.aprs2.net")),
+                port: Some(14_580),
+                destination: Some(String::from("APCM20")),
+            }),
             proxy: None,
             management_web_enabled: false,
             management_lan: None,

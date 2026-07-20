@@ -32,6 +32,18 @@ export interface CallMeshSyncSnapshot {
   mappings: CallMeshMapping[];
 }
 
+/**
+ * The only state shape that production APRS/Mesh wiring is allowed to consume.
+ * Mappings and the lease are returned from one synchronous read so a refresh
+ * cannot pair a mapping from one lease with credentials from another lease.
+ */
+export interface CallMeshAprsState {
+  readonly mappings: CallMeshMapping[];
+  readonly mappingsFingerprint: string;
+  readonly provision: CallMeshProvision;
+  readonly provisionFingerprint: string;
+}
+
 export interface CallMeshHistoryHighWater {
   mappingHash: string;
   lastServerTime: string;
@@ -453,6 +465,26 @@ export class CallMeshClient {
       this.provision
       ? { ...this.provision }
       : undefined;
+  }
+
+  getAprsState(): CallMeshAprsState | undefined {
+    if (
+      !this.activeStateEligible ||
+      this.currentProvisionState() !== "valid" ||
+      !this.provision ||
+      !this.provisionFingerprint ||
+      !this.mappingsFingerprint ||
+      !FINGERPRINT_PATTERN.test(this.provisionFingerprint) ||
+      !FINGERPRINT_PATTERN.test(this.mappingsFingerprint)
+    ) {
+      return undefined;
+    }
+    return {
+      mappings: this.mappings.map((mapping) => ({ ...mapping })),
+      mappingsFingerprint: this.mappingsFingerprint,
+      provision: { ...this.provision },
+      provisionFingerprint: this.provisionFingerprint,
+    };
   }
 
   getMappingsForUse(): CallMeshMapping[] {

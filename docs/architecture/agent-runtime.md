@@ -29,8 +29,8 @@ current packaged Gateway command invokes `node`, so Node.js `^22.18.0` or
 `>=24.11.0` must be present; release portability is verified separately from
 this config contract.
 
-CallMesh keys, APRS passcodes, and administrative tokens do not belong in this
-file or in Agent command arguments. Interactive Agent sessions use the operating
+CallMesh keys, CallMesh-derived APRS credentials, and administrative tokens do
+not belong in this file or in Agent command arguments. Interactive Agent sessions use the operating
 system credential store: Keychain on macOS, Credential Manager on Windows, and
 Secret Service on Linux. The packaged Linux systemd service cannot depend on a
 user-session D-Bus service, so it instead receives a root-owned wrapping key
@@ -59,9 +59,11 @@ cmclient-agent --serve
 
 `cmclient secret set <kind>` reads a single value from standard input and
 forwards it over the private Control API; its response never contains the value.
-Supported kinds are `callmesh-api-key`, `aprs-passcode`, and
-`management-admin-token`. Update signing private keys are deliberately not a
-runtime secret kind: release signing remains outside the product runtime.
+Settable kinds are `callmesh-api-key` and `management-admin-token`. The legacy
+`aprs-passcode` name is removal-only so upgraded installations can run
+`cmclient secret remove aprs-passcode`; attempts to set it fail with
+`CONTROL_SECRET_KIND_DEPRECATED`. Update signing private keys are deliberately
+not a runtime secret kind: release signing remains outside the product runtime.
 
 `management-admin-token` is the shared secret for remote CLI HMAC control, not
 the browser login password or session. Provision at least 32 random printable
@@ -83,10 +85,16 @@ url = "https://callmesh.tmmarc.org"
 ```
 
 Meshtastic, APRS, and Proxy operational settings are also strict non-secret
-Agent configuration. TCP and Serial are mutually exclusive. APRS configuration
-does not contain the passcode: store that separately with
-`cmclient secret set aprs-passcode`. Without a stored passcode Agent starts the
-Gateway with APRS disabled rather than passing an empty credential.
+Agent configuration. TCP and Serial are mutually exclusive. CallMesh supplies
+the provisioned APRS callsign/SSID, symbol, and comment to the Gateway, which
+derives the runtime passcode locally. Agent APRS configuration can only provide
+optional operator overrides for the APRS endpoint and destination. For rc.1
+upgrade compatibility,
+known `login_callsign`, `symbol_table`, `symbol_code`, and `comment` fields are
+parsed but ignored and must be removed; they are never injected. Other unknown
+fields and inline passcodes remain invalid. The `aprs-passcode` compatibility
+route and CLI name permit deletion only; Agent rejects new values and never
+reads or injects an old stored value for APRS launch.
 
 ```toml
 [meshtastic]
@@ -97,13 +105,9 @@ tcp_host = "127.0.0.1"
 tcp_port = 4403
 
 [aprs]
-login_callsign = "N0CALL-7"
-host = "rotate.aprs2.net"
+host = "asia.aprs2.net"
 port = 14580
 destination = "APCM20"
-symbol_table = "/"
-symbol_code = ">"
-comment = "CMClient"
 
 [proxy]
 upstream_host = "127.0.0.1"

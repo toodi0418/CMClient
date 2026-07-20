@@ -8,13 +8,14 @@ use crate::access::{LanAccessConfig, ManagementAccessController};
 use fs2::FileExt;
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     env,
     fmt::{Display, Formatter},
     fs,
     fs::OpenOptions,
     net::IpAddr,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -65,13 +66,12 @@ pub enum MeshtasticConnectionConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsConfig {
-    pub login_callsign: String,
-    pub host: String,
-    pub port: u16,
-    pub destination: String,
-    pub symbol_table: char,
-    pub symbol_code: char,
-    pub comment: Option<String>,
+    /// Optional operator endpoint override; identity comes from CallMesh.
+    pub host: Option<String>,
+    /// Optional operator endpoint override; the Gateway owns the default.
+    pub port: Option<u16>,
+    /// Optional operator destination override; the Gateway owns the default.
+    pub destination: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +104,36 @@ pub struct AgentState {
 pub struct AgentLease {
     lock_file: fs::File,
     state_file: PathBuf,
+    _process_guard: ProcessLocalLease,
+}
+
+struct ProcessLocalLease {
+    lock_path: PathBuf,
+}
+
+static PROCESS_LOCAL_LEASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+impl ProcessLocalLease {
+    fn acquire(lock_path: PathBuf) -> Result<Self, InstanceError> {
+        let active = PROCESS_LOCAL_LEASES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut active = active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(lock_path.clone()) {
+            return Err(InstanceError::AlreadyRunning);
+        }
+        Ok(Self { lock_path })
+    }
+}
+
+impl Drop for ProcessLocalLease {
+    fn drop(&mut self) {
+        let active = PROCESS_LOCAL_LEASES.get_or_init(|| Mutex::new(HashSet::new()));
+        active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.lock_path);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,13 +232,17 @@ struct MeshtasticSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AprsSection {
-    login_callsign: String,
     host: Option<String>,
     port: Option<u16>,
     destination: Option<String>,
-    symbol_table: Option<String>,
-    symbol_code: Option<String>,
-    comment: Option<String>,
+    #[serde(rename = "login_callsign")]
+    _legacy_login_callsign: Option<String>,
+    #[serde(rename = "symbol_table")]
+    _legacy_symbol_table: Option<String>,
+    #[serde(rename = "symbol_code")]
+    _legacy_symbol_code: Option<String>,
+    #[serde(rename = "comment")]
+    _legacy_comment: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,36 +418,22 @@ fn parse_meshtastic_config(section: MeshtasticSection) -> Result<MeshtasticConfi
 }
 
 fn parse_aprs_config(section: AprsSection) -> Result<AprsConfig, ConfigError> {
-    let host = section
+    if section
         .host
-        .unwrap_or_else(|| String::from("rotate.aprs2.net"));
-    let port = section.port.unwrap_or(14_580);
-    let destination = section
-        .destination
-        .unwrap_or_else(|| String::from("APCM20"));
-    let symbol_table = single_printable_ascii(section.symbol_table.as_deref().unwrap_or("/"))
-        .ok_or(ConfigError::InvalidAprs)?;
-    let symbol_code = single_printable_ascii(section.symbol_code.as_deref().unwrap_or(">"))
-        .ok_or(ConfigError::InvalidAprs)?;
-    if !is_aprs_callsign(&section.login_callsign)
-        || !is_endpoint_host(&host)
-        || port == 0
-        || !is_aprs_destination(&destination)
+        .as_ref()
+        .is_some_and(|host| !is_endpoint_host(host))
+        || section.port.is_some_and(|port| port == 0)
         || section
-            .comment
+            .destination
             .as_ref()
-            .is_some_and(|comment| comment.is_empty() || !is_bounded_text(comment, 80))
+            .is_some_and(|destination| !is_aprs_destination(destination))
     {
         return Err(ConfigError::InvalidAprs);
     }
     Ok(AprsConfig {
-        login_callsign: section.login_callsign,
-        host,
-        port,
-        destination,
-        symbol_table,
-        symbol_code,
-        comment: section.comment,
+        host: section.host,
+        port: section.port,
+        destination: section.destination,
     })
 }
 
@@ -456,32 +476,11 @@ fn is_endpoint_host(value: &str) -> bool {
     is_bounded_text(value, 255) && !value.contains(char::is_whitespace)
 }
 
-fn is_aprs_callsign(value: &str) -> bool {
-    let (base, ssid) = value
-        .split_once('-')
-        .map_or((value, None), |(base, ssid)| (base, Some(ssid)));
-    (1..=6).contains(&base.len())
-        && base
-            .chars()
-            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
-        && ssid.is_none_or(|ssid| {
-            (1..=2).contains(&ssid.len())
-                && ssid.chars().all(|character| character.is_ascii_digit())
-        })
-}
-
 fn is_aprs_destination(value: &str) -> bool {
     (1..=6).contains(&value.len())
         && value
             .chars()
             .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
-}
-
-fn single_printable_ascii(value: &str) -> Option<char> {
-    let mut characters = value.chars();
-    let character = characters.next()?;
-    (characters.next().is_none() && character.is_ascii() && !character.is_ascii_control())
-        .then_some(character)
 }
 
 fn is_https_origin(value: &str) -> bool {
@@ -593,7 +592,10 @@ pub fn ensure_runtime_directories(paths: &RuntimePaths) -> Result<(), ConfigErro
 impl AgentLease {
     pub fn acquire(paths: &RuntimePaths) -> Result<(Self, AgentState), InstanceError> {
         fs::create_dir_all(&paths.data_dir).map_err(|_| InstanceError::Io)?;
-        let lock_path = paths.data_dir.join("agent.lock");
+        let canonical_data_dir =
+            fs::canonicalize(&paths.data_dir).map_err(|_| InstanceError::Io)?;
+        let lock_path = canonical_data_dir.join("agent.lock");
+        let process_guard = ProcessLocalLease::acquire(lock_path.clone())?;
         let lock_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -617,12 +619,13 @@ impl AgentLease {
                 .map_err(|_| InstanceError::Io)?
                 .as_secs(),
         };
-        let state_file = paths.data_dir.join("agent-state.json");
+        let state_file = canonical_data_dir.join("agent-state.json");
         write_state(&state_file, &state)?;
         Ok((
             Self {
                 lock_file,
                 state_file,
+                _process_guard: process_guard,
             },
             state,
         ))
@@ -666,36 +669,42 @@ mod tests {
     };
     use std::{collections::BTreeMap, fs, path::PathBuf};
 
+    fn fixture_home() -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from(r"C:\fixture\home")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/fixture/home")
+        }
+    }
+
     fn environment() -> BTreeMap<String, String> {
-        BTreeMap::from([(String::from("HOME"), String::from("/fixture/home"))])
+        BTreeMap::from([(
+            String::from("HOME"),
+            fixture_home().to_string_lossy().into_owned(),
+        )])
     }
 
     #[test]
     fn uses_standard_platform_paths() {
         let paths = RuntimePaths::from_environment(&environment()).expect("paths should load");
+        let home = fixture_home();
         if cfg!(target_os = "macos") {
             assert_eq!(
                 paths.data_dir,
-                PathBuf::from("/fixture/home/Library/Application Support/CMClient")
+                home.join("Library/Application Support/CMClient")
             );
             assert_eq!(
                 paths.config_dir,
-                PathBuf::from("/fixture/home/Library/Application Support/CMClient")
+                home.join("Library/Application Support/CMClient")
             );
         } else if cfg!(target_os = "windows") {
-            assert_eq!(
-                paths.data_dir,
-                PathBuf::from("/fixture/home/AppData/Roaming/CMClient")
-            );
+            assert_eq!(paths.data_dir, home.join("AppData/Roaming/CMClient"));
         } else {
-            assert_eq!(
-                paths.data_dir,
-                PathBuf::from("/fixture/home/.local/share/cmclient")
-            );
-            assert_eq!(
-                paths.config_dir,
-                PathBuf::from("/fixture/home/.config/cmclient")
-            );
+            assert_eq!(paths.data_dir, home.join(".local/share/cmclient"));
+            assert_eq!(paths.config_dir, home.join(".config/cmclient"));
         }
         assert_eq!(paths.log_dir, paths.data_dir.join("logs"));
     }
@@ -827,13 +836,9 @@ tcp_host = "192.0.2.10"
 tcp_port = 4403
 
 [aprs]
-login_callsign = "N0CALL-7"
-host = "rotate.aprs2.net"
+host = "asia.aprs2.net"
 port = 14580
 destination = "APCM20"
-symbol_table = "/"
-symbol_code = ">"
-comment = "CMClient"
 
 [proxy]
 upstream_host = "192.0.2.10"
@@ -868,13 +873,9 @@ allowlist = ["192.0.2.20"]
         assert_eq!(
             config.aprs,
             Some(AprsConfig {
-                login_callsign: String::from("N0CALL-7"),
-                host: String::from("rotate.aprs2.net"),
-                port: 14_580,
-                destination: String::from("APCM20"),
-                symbol_table: '/',
-                symbol_code: '>',
-                comment: Some(String::from("CMClient")),
+                host: Some(String::from("asia.aprs2.net")),
+                port: Some(14_580),
+                destination: Some(String::from("APCM20")),
             })
         );
         assert_eq!(
@@ -890,15 +891,49 @@ allowlist = ["192.0.2.20"]
             })
         );
 
+        fs::write(&config_file, "[aprs]\n").expect("Gateway-owned APRS defaults should be written");
+        assert_eq!(
+            AgentConfig::from_environment(&environment)
+                .expect("empty APRS override section should load")
+                .aprs,
+            Some(AprsConfig {
+                host: None,
+                port: None,
+                destination: None,
+            })
+        );
+
         fs::write(
             &config_file,
-            "[aprs]\nlogin_callsign = \"N0CALL-7\"\npasscode = \"12345\"\n",
+            r#"[aprs]
+host = "asia.aprs2.net"
+login_callsign = "N0CALL-7"
+symbol_table = "/"
+symbol_code = ">"
+comment = "legacy comment"
+"#,
         )
-        .expect("invalid configuration should be written");
+        .expect("legacy-compatible configuration should be written");
         assert_eq!(
-            AgentConfig::from_environment(&environment),
-            Err(ConfigError::InvalidConfig)
+            AgentConfig::from_environment(&environment)
+                .expect("known legacy APRS fields should be ignored")
+                .aprs,
+            Some(AprsConfig {
+                host: Some(String::from("asia.aprs2.net")),
+                port: None,
+                destination: None,
+            })
         );
+
+        for field in ["passcode", "unknown_field"] {
+            fs::write(&config_file, format!("[aprs]\n{field} = \"fixture\"\n"))
+                .expect("unknown configuration should be written");
+            assert_eq!(
+                AgentConfig::from_environment(&environment),
+                Err(ConfigError::InvalidConfig),
+                "unknown APRS field {field} must not be accepted",
+            );
+        }
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 
@@ -940,20 +975,27 @@ allowlist = ["192.0.2.20"]
     fn accepts_only_a_complete_non_loopback_management_lan_configuration() {
         let directory =
             std::env::temp_dir().join(format!("cmclient-agent-lan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("temporary directory should exist");
         let config_file = directory.join("agent.toml");
+        let certificate_path = directory.join("certificate.pem");
+        let private_key_path = directory.join("private-key.pem");
         fs::write(
             &config_file,
-            r#"[management_lan]
+            format!(
+                r#"[management_lan]
 bind = "127.0.0.1"
 port = 7443
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$Y21jbGllbnQtYWNjZXNzLWZpeHR1cmU$mlUCFMgY1I8EWPxA0OXMpw"
 allowed_origins = ["https://cmclient.example"]
 session_ttl_seconds = 3600
 audit_capacity = 32
-certificate_path = "/fixture/certificate.pem"
-private_key_path = "/fixture/private-key.pem"
+certificate_path = '{}'
+private_key_path = '{}'
 "#,
+                certificate_path.display(),
+                private_key_path.display(),
+            ),
         )
         .expect("configuration should be written");
         let mut environment = environment();
@@ -965,16 +1007,20 @@ private_key_path = "/fixture/private-key.pem"
         assert!(AgentConfig::from_environment(&environment).is_err());
         fs::write(
             &config_file,
-            r#"[management_lan]
+            format!(
+                r#"[management_lan]
 bind = "192.168.1.10"
 port = 7443
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$Y21jbGllbnQtYWNjZXNzLWZpeHR1cmU$dpMi7KyBMZbZy6JnUqumeIrRr43snfWb1zJ6H5D2myg"
 allowed_origins = ["https://cmclient.example"]
 session_ttl_seconds = 3600
 audit_capacity = 32
-certificate_path = "/fixture/certificate.pem"
-private_key_path = "/fixture/private-key.pem"
+certificate_path = '{}'
+private_key_path = '{}'
 "#,
+                certificate_path.display(),
+                private_key_path.display(),
+            ),
         )
         .expect("configuration should be written");
         let config =
@@ -993,6 +1039,7 @@ private_key_path = "/fixture/private-key.pem"
     fn writes_and_clears_diagnostic_state_with_the_lease() {
         let directory =
             std::env::temp_dir().join(format!("cmclient-agent-lease-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
         let paths = RuntimePaths {
             data_dir: directory.clone(),
             config_dir: directory.join("config"),
@@ -1013,6 +1060,39 @@ private_key_path = "/fixture/private-key.pem"
             AgentLease::read_state(&paths).expect("state should load"),
             None
         );
+        let (replacement, _) =
+            AgentLease::acquire(&paths).expect("dropped lease should release process guard");
+        drop(replacement);
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn releases_the_process_guard_when_lease_initialization_fails() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-lease-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let paths = RuntimePaths {
+            data_dir: directory.clone(),
+            config_dir: directory.join("config"),
+            cache_dir: directory.join("cache"),
+            log_dir: directory.join("logs"),
+        };
+        let blocked_temporary_state =
+            directory.join(format!("agent-state.{}.tmp", std::process::id()));
+        fs::create_dir(&blocked_temporary_state).expect("blocked state fixture should exist");
+
+        assert!(matches!(
+            AgentLease::acquire(&paths),
+            Err(InstanceError::Io)
+        ));
+
+        fs::remove_dir(&blocked_temporary_state).expect("blocked state fixture should remove");
+        let (lease, _) = AgentLease::acquire(&paths)
+            .expect("failed initialization must release process and file locks");
+        drop(lease);
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 }

@@ -30,7 +30,10 @@ it through the Agent-selected backend; `secret remove <kind>` removes it.
 Secret values are never accepted as command arguments, printed, or returned as
 JSON. A controlled Unix/macOS no-Keychain runtime selects its external
 owner-only file when Agent starts; the CLI receives no file path or value
-option.
+option. New values are limited to `callmesh-api-key` and
+`management-admin-token`. The legacy `aprs-passcode` kind is accepted only by
+`secret remove` so upgrades can delete an obsolete stored value; trying to set
+it returns `CLI_SECRET_KIND_DEPRECATED` with validation exit code 5.
 
 `logs --follow`, `events --follow`, and `update --follow` use bounded SSE
 parsing, reconnect after transient disconnects, and exit cleanly on Ctrl+C.

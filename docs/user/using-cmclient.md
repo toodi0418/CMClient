@@ -63,9 +63,15 @@ Secrets are read from standard input and never appear in shell history:
 
 ```bash
 printf '%s\n' "$CALLMESH_KEY" | cmclient secret set callmesh-api-key
-printf '%s\n' "$APRS_PASSCODE" | cmclient secret set aprs-passcode
+cmclient secret remove aprs-passcode # cleanup for upgraded installations only
 cmclient secret remove management-admin-token
 ```
+
+CallMesh provisions the APRS callsign, symbol, and comment; Gateway derives the
+runtime passcode locally. CMClient does not accept a static APRS passcode; a
+`secret set` attempt for the legacy name fails with
+`CLI_SECRET_KIND_DEPRECATED`. The removal command above
+remains so an upgrade can delete a value stored by an older release.
 
 For remote control, provision `management-admin-token` in the Agent's secret
 store, then provide the same value to the remote CLI only through that calling

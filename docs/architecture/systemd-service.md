@@ -67,14 +67,16 @@ an explicit endpoint:
 sudo /opt/cmclient/current/bin/cmclient \
   --endpoint unix:///var/lib/cmclient/control.sock status
 sudo /opt/cmclient/current/bin/cmclient \
-  --endpoint unix:///var/lib/cmclient/control.sock secret set aprs-passcode
+  --endpoint unix:///var/lib/cmclient/control.sock secret set callmesh-api-key
 ```
 
 The socket is mode `0600`; an ordinary interactive user cannot connect. A
-CallMesh or APRS secret is copied into the Gateway environment only when the
-whole Agent starts, so restart `cmclient-agent.service` after changing either
-one. The Management admin token is read for each remote request and takes
-effect immediately.
+CallMesh key is copied into the Gateway environment only when the whole Agent
+starts, so restart `cmclient-agent.service` after changing it. A valid CallMesh
+provision supplies APRS identity and credential inside Gateway; Agent never
+accepts or injects a static APRS passcode. An older stored value can only be
+deleted with `secret remove aprs-passcode`. The Management admin token is read
+for each remote request and takes effect immediately.
 
 `install` is repeatable and regenerates the unit from
 `packaging/systemd/cmclient-agent.service.in`. It creates missing runtime

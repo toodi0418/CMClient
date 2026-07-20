@@ -3,6 +3,12 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { PositionCanonicalEvent } from "@cmclient/contracts";
 
+import {
+  PROVISION_FINGERPRINT_PATTERN,
+  type AprsAuthorizationProvider,
+  type AprsConnectionAuthorization,
+} from "./aprs-identity.js";
+
 const DEFAULT_SESSION_CLOSE_TIMEOUT_MS = 5_000;
 
 export interface AprsMonitorTarget {
@@ -40,6 +46,15 @@ export class AprsMonitorError extends Error {
 
   constructor() {
     super("APRS_MONITOR_INVALID");
+  }
+}
+
+export class AprsMonitorAuthorizationError extends Error {
+  readonly code = "APRS_PROVISION_UNAVAILABLE";
+
+  constructor() {
+    super("APRS_PROVISION_UNAVAILABLE");
+    this.name = "AprsMonitorAuthorizationError";
   }
 }
 
@@ -199,7 +214,8 @@ export class AprsIsRxClient {
     private readonly options: {
       host: string;
       port: number;
-      loginLine: string;
+      authorizationProvider: AprsAuthorizationProvider;
+      provisionFingerprint: string;
       filterExpression: string;
       timeoutMs?: number;
       closeTimeoutMs?: number;
@@ -210,8 +226,8 @@ export class AprsIsRxClient {
       !Number.isInteger(options.port) ||
       options.port < 1 ||
       options.port > 65_535 ||
-      !options.loginLine.trim() ||
-      /[\r\n]/.test(options.loginLine) ||
+      typeof options.authorizationProvider !== "function" ||
+      !PROVISION_FINGERPRINT_PATTERN.test(options.provisionFingerprint) ||
       !isFilterExpression(options.filterExpression) ||
       (options.timeoutMs !== undefined &&
         (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) ||
@@ -227,15 +243,23 @@ export class AprsIsRxClient {
     onLine: (line: string) => void,
     onLineError: (error: unknown) => void = () => undefined,
   ): Promise<AprsIsRxSession> {
+    resolveAuthorization(
+      this.options.authorizationProvider,
+      this.options.provisionFingerprint,
+    );
     const socket = net.createConnection({
       host: this.options.host,
       port: this.options.port,
     });
     try {
       await onceConnected(socket, this.options.timeoutMs ?? 10_000);
+      const authorization = resolveAuthorization(
+        this.options.authorizationProvider,
+        this.options.provisionFingerprint,
+      );
       await write(
         socket,
-        `${this.options.loginLine} filter ${this.options.filterExpression}\r\n`,
+        `${authorization.loginLine} filter ${this.options.filterExpression}\r\n`,
       );
       attachLineReader(socket, onLine, onLineError);
       return {
@@ -245,8 +269,11 @@ export class AprsIsRxClient {
             this.options.closeTimeoutMs ?? DEFAULT_SESSION_CLOSE_TIMEOUT_MS,
           ),
       };
-    } catch {
+    } catch (error) {
       socket.destroy();
+      if (error instanceof AprsMonitorAuthorizationError) {
+        throw error;
+      }
       throw new AprsMonitorError();
     }
   }
@@ -412,6 +439,38 @@ function onceConnected(socket: Socket, timeoutMs: number): Promise<void> {
 function write(socket: Socket, value: string): Promise<void> {
   return new Promise((resolve, reject) =>
     socket.write(value, (error) => (error ? reject(error) : resolve())),
+  );
+}
+
+const MAX_APRS_LOGIN_LINE_BYTES = 512;
+
+function resolveAuthorization(
+  provider: AprsAuthorizationProvider,
+  expectedProvisionFingerprint: string,
+): AprsConnectionAuthorization {
+  let authorization: AprsConnectionAuthorization | undefined;
+  try {
+    authorization = provider();
+  } catch {
+    throw new AprsMonitorAuthorizationError();
+  }
+  if (
+    !authorization ||
+    authorization.provisionFingerprint !== expectedProvisionFingerprint ||
+    !PROVISION_FINGERPRINT_PATTERN.test(authorization.provisionFingerprint) ||
+    !isValidLoginLine(authorization.loginLine)
+  ) {
+    throw new AprsMonitorAuthorizationError();
+  }
+  return authorization;
+}
+
+function isValidLoginLine(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    !/[\r\n]/.test(value) &&
+    Buffer.byteLength(value, "utf8") <= MAX_APRS_LOGIN_LINE_BYTES
   );
 }
 

@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { AprsIsRxSession } from "./aprs-monitor";
 import type { AprsOutboxEntry } from "./aprs-outbox";
+import {
+  deriveAprsRuntimeIdentity,
+  type AprsRuntimeState,
+} from "./aprs-identity";
 import { AprsGatewayRuntime } from "./aprs-runtime";
 import { DomainEventBus } from "./events";
 import { GatewayDatabase } from "./persistence/database";
@@ -230,6 +234,189 @@ describe("AprsGatewayRuntime", () => {
     database.close();
   });
 
+  it("reruns a queued monitor refresh with one atomic rotated state", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let state = aprsState("a", "N0CALL-7", 42);
+    const firstSession = deferred<AprsIsRxSession>();
+    const firstConnectStarted = deferred<void>();
+    const filters: string[] = [];
+    const fingerprints: string[] = [];
+    let connections = 0;
+    let closes = 0;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: new DomainEventBus({ eventIdFactory: sequentialFactory() }),
+      stateProvider: () => state,
+      outbox: { flush: async () => [] },
+      monitorClientFactory: (filter, provisionFingerprint) => {
+        filters.push(filter);
+        fingerprints.push(provisionFingerprint ?? "");
+        return {
+          connect: () => {
+            connections += 1;
+            if (connections === 1) {
+              firstConnectStarted.resolve();
+              return firstSession.promise;
+            }
+            return Promise.resolve({
+              close: async () => {
+                closes += 1;
+              },
+            });
+          },
+        };
+      },
+    });
+
+    const firstRefresh = runtime.refreshMonitor();
+    await firstConnectStarted.promise;
+    state = aprsState("b", "N1CALL-7", 7);
+    const queuedRefresh = runtime.refreshMonitor();
+    expect(queuedRefresh).toBe(firstRefresh);
+    firstSession.resolve({
+      close: async () => {
+        closes += 1;
+      },
+    });
+
+    await firstRefresh;
+    expect(connections).toBe(2);
+    expect(closes).toBe(1);
+    expect(filters).toEqual(["b/N0CALL-7", "b/N1CALL-7"]);
+    expect(fingerprints).toEqual(["a".repeat(64), "b".repeat(64)]);
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "connected",
+      mappedCallsigns: 1,
+    });
+
+    await runtime.stop();
+    expect(closes).toBe(2);
+    database.close();
+  });
+
+  it("revalidates a revoked state before publishing monitor connected", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let state: AprsRuntimeState | undefined = aprsState("a", "N0CALL-7", 42);
+    const eventTypes: string[] = [];
+    const events = new DomainEventBus({ eventIdFactory: sequentialFactory() });
+    events.subscribe((event) => eventTypes.push(event.type));
+    let closes = 0;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: events,
+      stateProvider: () => state,
+      outbox: { flush: async () => [] },
+      monitorClientFactory: () => ({
+        connect: async () => {
+          state = undefined;
+          return {
+            close: async () => {
+              closes += 1;
+            },
+          };
+        },
+      }),
+    });
+
+    await runtime.refreshMonitor();
+
+    expect(closes).toBe(1);
+    expect(eventTypes).not.toContain("aprs.monitor.connected");
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "idle",
+      mappedCallsigns: 0,
+      lastErrorCode: "APRS_PROVISION_UNAVAILABLE",
+    });
+    database.close();
+  });
+
+  it.each(["revoked", "rotated", "expired"] as const)(
+    "invalidates an established monitor before a post-connect %s line can persist",
+    async (change) => {
+      const database = new GatewayDatabase(":memory:");
+      let state: AprsRuntimeState | undefined = aprsState("a", "N0CALL-7", 42);
+      let expired = false;
+      let onLine: ((line: string) => void) | undefined;
+      let connections = 0;
+      let closes = 0;
+      const filters: string[] = [];
+      const eventTypes: string[] = [];
+      const events = new DomainEventBus({
+        eventIdFactory: sequentialFactory(),
+      });
+      events.subscribe((event) => eventTypes.push(event.type));
+      const runtime = new AprsGatewayRuntime({
+        database,
+        eventBus: events,
+        stateProvider: () => (expired ? undefined : state),
+        outbox: { flush: async () => [] },
+        monitorClientFactory: (filter) => {
+          filters.push(filter);
+          return {
+            connect: async (listener) => {
+              connections += 1;
+              onLine = listener;
+              return {
+                close: async () => {
+                  closes += 1;
+                },
+              };
+            },
+          };
+        },
+      });
+
+      await runtime.refreshMonitor();
+      const staleListener = onLine;
+      if (!staleListener) {
+        throw new Error("fixture monitor listener was not connected");
+      }
+      if (change === "rotated") {
+        state = aprsState("b", "N1CALL-7", 7);
+      } else if (change === "expired") {
+        expired = true;
+      } else {
+        state = undefined;
+      }
+
+      expect(() =>
+        staleListener(
+          "N0CALL-7>APCM20:/180000z2502.85N/12131.05E> CM2/abcdef123456",
+        ),
+      ).not.toThrow();
+      await waitFor(() =>
+        change === "rotated"
+          ? connections === 2 &&
+            closes === 1 &&
+            runtime.status().monitorStatus === "connected"
+          : closes === 1 && runtime.status().monitorStatus === "idle",
+      );
+
+      expect(
+        database.connection
+          .prepare("SELECT * FROM aprs_remote_high_water")
+          .all(),
+      ).toEqual([]);
+      expect(eventTypes).not.toContain("aprs.monitor.observed");
+      expect(filters).toEqual(
+        change === "rotated" ? ["b/N0CALL-7", "b/N1CALL-7"] : ["b/N0CALL-7"],
+      );
+      expect(runtime.status()).toMatchObject(
+        change === "rotated"
+          ? { monitorStatus: "connected", mappedCallsigns: 1 }
+          : {
+              monitorStatus: "idle",
+              mappedCallsigns: 0,
+              lastErrorCode: "APRS_PROVISION_UNAVAILABLE",
+            },
+      );
+
+      await runtime.stop();
+      expect(closes).toBe(change === "rotated" ? 2 : 1);
+      database.close();
+    },
+  );
+
   it("closes a monitor session that connects after stop begins", async () => {
     const database = new GatewayDatabase(":memory:");
     database.callmeshMappings.replace([
@@ -378,7 +565,7 @@ describe("AprsGatewayRuntime", () => {
     }
   });
 
-  it("releases every monitor session across repeated start-stop cycles", async () => {
+  it("releases every queued monitor session across repeated start-stop cycles", async () => {
     const database = new GatewayDatabase(":memory:");
     database.callmeshMappings.replace([
       mapping("fixture-network-a", 42, "N0CALL-7"),
@@ -410,7 +597,8 @@ describe("AprsGatewayRuntime", () => {
       }),
     });
 
-    for (let index = 0; index < 32; index += 1) {
+    const cycles = 32;
+    for (let index = 0; index < cycles; index += 1) {
       runtime.start();
       await Promise.all([runtime.flushNow(), runtime.refreshMonitor()]);
       await runtime.stop();
@@ -421,12 +609,12 @@ describe("AprsGatewayRuntime", () => {
       });
     }
 
-    expect(connections).toBe(32);
+    expect(connections).toBe(cycles * 2);
     expect(closes).toBe(connections);
-    expect(flushes).toBe(32);
+    expect(flushes).toBe(cycles);
     await Promise.all([runtime.flushNow(), runtime.refreshMonitor()]);
-    expect(connections).toBe(32);
-    expect(flushes).toBe(32);
+    expect(connections).toBe(cycles * 2);
+    expect(flushes).toBe(cycles);
     database.close();
   });
 });
@@ -456,6 +644,25 @@ function outboxEntry(status: "sent" | "failed"): AprsOutboxEntry {
   };
 }
 
+function aprsState(
+  fingerprintCharacter: string,
+  callsign: string,
+  nodeNum: number,
+): AprsRuntimeState {
+  const fingerprint = fingerprintCharacter.repeat(64);
+  return {
+    mappings: [mapping("fixture-network-a", nodeNum, callsign)],
+    mappingsFingerprint: fingerprint,
+    identity: deriveAprsRuntimeIdentity({
+      callsignBase: fingerprintCharacter === "a" ? "TEST01" : "AB12CD",
+      ssid: -7,
+      symbolTable: "/",
+      symbolCode: ">",
+    }),
+    provisionFingerprint: fingerprint,
+  };
+}
+
 function sequentialFactory(): () => string {
   let index = 0;
   return () => `event-${++index}`;
@@ -470,4 +677,14 @@ function deferred<T>(): {
     resolve = settle;
   });
   return { promise, resolve };
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error("fixture condition was not reached");
 }

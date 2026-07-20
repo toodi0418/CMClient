@@ -396,21 +396,78 @@ describe("GatewayRuntime", () => {
       throw new Error("Gateway did not bind a TCP address");
     }
 
-    const stream = await openSse(address.port, "/api/v1/events", "missing");
-    const body = await readUntil(stream.response, ": heartbeat\n\n");
-    const frame = body.slice(0, body.indexOf(": heartbeat\n\n"));
+    let stream: Awaited<ReturnType<typeof openSse>> | undefined;
+    try {
+      stream = await openSse(address.port, "/api/v1/events", "missing");
+      const body = await readUntil(stream.response, ": heartbeat\n\n");
+      const frame = body.slice(0, body.indexOf(": heartbeat\n\n"));
 
-    expect(Buffer.byteLength(frame, "utf8")).toBeLessThanOrEqual(
-      DEFAULT_SSE_FRAME_MAX_BYTES,
+      expect(Buffer.byteLength(frame, "utf8")).toBeLessThanOrEqual(
+        DEFAULT_SSE_FRAME_MAX_BYTES,
+      );
+      expect(frame).toContain("id: oversized-event");
+      expect(events.metricsSnapshot.subscriberCount).toBe(1);
+      expect(logger.entries).not.toContainEqual(
+        expect.objectContaining({ fields: { reason: "SSE_FRAME_TOO_LARGE" } }),
+      );
+      expect(logger.entries).not.toContainEqual(
+        expect.objectContaining({ fields: { reason: "SSE_SLOW_CONSUMER" } }),
+      );
+    } finally {
+      stream?.request.destroy();
+      stream?.response.destroy();
+      await app.close();
+    }
+  });
+
+  it("closes a replay client when bounded SSE buffering is exhausted", async () => {
+    let sequence = 0;
+    const logger = new MemoryLogger();
+    const events = new DomainEventBus({
+      eventIdFactory: () => `burst-${++sequence}`,
+    });
+    const sample = "x".repeat(
+      DEFAULT_EVENT_PAYLOAD_MAX_BYTES -
+        Buffer.byteLength('{"sample":""}', "utf8"),
     );
-    expect(frame).toContain("id: oversized-event");
-    expect(events.metricsSnapshot.subscriberCount).toBe(1);
-    expect(logger.entries).not.toContainEqual(
-      expect.objectContaining({ fields: { reason: "SSE_FRAME_TOO_LARGE" } }),
-    );
-    stream.request.destroy();
-    stream.response.destroy();
-    await app.close();
+    for (let index = 0; index < 32; index += 1) {
+      events.publish({
+        type: "gateway.load_sample",
+        source: "gateway",
+        payload: { sample },
+      });
+    }
+    const app = createGatewayApp(logger, undefined, events);
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Gateway did not bind a TCP address");
+    }
+
+    let stream: Awaited<ReturnType<typeof openSse>> | undefined;
+    try {
+      stream = await openSse(address.port, "/api/v1/events", "missing");
+      const responseClosed = stream.response.destroyed
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            stream?.response.once("error", () => resolve());
+            stream?.response.once("close", () => resolve());
+          });
+      await settlesWithin(responseClosed, 1_000);
+
+      expect(events.metricsSnapshot.subscriberCount).toBe(0);
+      expect(logger.entries).toContainEqual(
+        expect.objectContaining({
+          level: "warn",
+          message: "gateway.sse_client_closed",
+          fields: { reason: "SSE_SLOW_CONSUMER" },
+        }),
+      );
+    } finally {
+      stream?.request.destroy();
+      stream?.response.destroy();
+      await app.close();
+    }
   });
 
   it("rejects excess SSE subscribers with a stable 503 before streaming", async () => {

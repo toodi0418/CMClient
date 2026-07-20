@@ -10,6 +10,7 @@ import {
   type AprsIsRxSession,
 } from "./aprs-monitor.js";
 import type { AprsOutboxEntry } from "./aprs-outbox.js";
+import type { AprsRuntimeState } from "./aprs-identity.js";
 import { DomainEventBus } from "./events.js";
 import { selectActiveMapping } from "./mesh-runtime.js";
 import { GatewayDatabase } from "./persistence/database.js";
@@ -30,8 +31,11 @@ export interface AprsMonitorClient {
 export interface AprsGatewayRuntimeOptions {
   database: GatewayDatabase;
   eventBus: DomainEventBus;
-  mappingProvider?: () => readonly CallMeshMapping[];
-  monitorClientFactory: (filterExpression: string) => AprsMonitorClient;
+  stateProvider?: () => AprsRuntimeState | undefined;
+  monitorClientFactory: (
+    filterExpression: string,
+    provisionFingerprint?: string,
+  ) => AprsMonitorClient;
   outbox: AprsOutboxFlusher;
   clock?: () => Date;
   flushIntervalMs?: number;
@@ -58,7 +62,6 @@ class AprsMonitorSessionCloseError extends Error {
 
 export class AprsGatewayRuntime {
   private readonly clock: () => Date;
-  private readonly mappingProvider: () => readonly CallMeshMapping[];
   private readonly flushIntervalMs: number;
   private readonly monitorRefreshIntervalMs: number;
   private flushTimer: NodeJS.Timeout | undefined;
@@ -67,6 +70,7 @@ export class AprsGatewayRuntime {
   private monitorToken: object | undefined;
   private flushOperation: Promise<void> | undefined;
   private monitorRefreshOperation: Promise<void> | undefined;
+  private monitorRefreshQueued = false;
   private stopOperation: Promise<void> | undefined;
   private lifecycleGeneration = 0;
   private lifecycleStopped = false;
@@ -78,9 +82,6 @@ export class AprsGatewayRuntime {
 
   constructor(private readonly options: AprsGatewayRuntimeOptions) {
     this.clock = options.clock ?? (() => new Date());
-    this.mappingProvider =
-      options.mappingProvider ??
-      (() => options.database.callmeshMappings.list());
     this.flushIntervalMs = positiveInterval(options.flushIntervalMs ?? 5_000);
     this.monitorRefreshIntervalMs = positiveInterval(
       options.monitorRefreshIntervalMs ?? 60_000,
@@ -128,6 +129,7 @@ export class AprsGatewayRuntime {
     this.lifecycleGeneration += 1;
     this.started = false;
     this.restartAfterStop = false;
+    this.monitorRefreshQueued = false;
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = undefined;
@@ -200,6 +202,9 @@ export class AprsGatewayRuntime {
 
   private async runFlush(generation: number): Promise<void> {
     try {
+      if (this.options.stateProvider && !this.readState()) {
+        this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";
+      }
       const entries = await this.options.outbox.flush();
       if (!this.isGenerationActive(generation)) {
         return;
@@ -233,16 +238,24 @@ export class AprsGatewayRuntime {
       return Promise.resolve();
     }
     if (this.monitorRefreshOperation) {
+      this.monitorRefreshQueued = true;
       return this.monitorRefreshOperation;
     }
     const generation = this.lifecycleGeneration;
-    const operation = this.runMonitorRefresh(generation);
+    const operation = this.runMonitorRefreshLoop(generation);
     this.monitorRefreshOperation = operation;
     void operation.then(
       () => this.completeMonitorRefresh(operation),
       () => this.completeMonitorRefresh(operation),
     );
     return operation;
+  }
+
+  private async runMonitorRefreshLoop(generation: number): Promise<void> {
+    do {
+      this.monitorRefreshQueued = false;
+      await this.runMonitorRefresh(generation);
+    } while (this.monitorRefreshQueued && this.isGenerationActive(generation));
   }
 
   private async runMonitorRefresh(generation: number): Promise<void> {
@@ -258,7 +271,15 @@ export class AprsGatewayRuntime {
       if (!this.isGenerationActive(generation)) {
         return;
       }
-      const targets = activeTargets(this.mappingProvider(), this.clock());
+      const state = this.readState();
+      if (this.options.stateProvider && !state) {
+        this.setProvisionUnavailable();
+        return;
+      }
+      const targets = activeTargets(
+        state?.mappings ?? this.options.database.callmeshMappings.list(),
+        this.clock(),
+      );
       this.mappedCallsigns = targets.length;
       if (targets.length === 0) {
         this.monitorStatus = "idle";
@@ -282,6 +303,7 @@ export class AprsGatewayRuntime {
       );
       const client = this.options.monitorClientFactory(
         monitor.filterExpression(),
+        state?.provisionFingerprint,
       );
       const token = {};
       this.monitorToken = token;
@@ -312,6 +334,10 @@ export class AprsGatewayRuntime {
         ) {
           return;
         }
+        if (!this.isStateCurrent(state)) {
+          this.invalidateMonitorState(generation, token);
+          return;
+        }
         try {
           const receivedAt = this.clock().toISOString();
           const result = monitor.observeLine(line, receivedAt);
@@ -326,7 +352,11 @@ export class AprsGatewayRuntime {
                 }
               : {}),
           });
-          if (callbackFailed && result.kind !== "ignored") {
+          if (
+            callbackFailed &&
+            result.kind !== "ignored" &&
+            this.isStateCurrent(state)
+          ) {
             callbackFailed = false;
             this.monitorStatus = "connected";
             this.lastErrorCode = undefined;
@@ -342,11 +372,19 @@ export class AprsGatewayRuntime {
         await closeMonitorSession(session);
         return;
       }
+      if (!this.isStateCurrent(state)) {
+        await closeMonitorSession(session);
+        if (this.isGenerationActive(generation)) {
+          this.setProvisionUnavailable();
+        }
+        return;
+      }
       this.monitorSession = session;
       if (callbackFailed) {
         return;
       }
       this.monitorStatus = "connected";
+      this.lastErrorCode = undefined;
       this.publish("aprs.monitor.connected", {
         mappedCallsigns: targets.length,
       });
@@ -358,6 +396,10 @@ export class AprsGatewayRuntime {
         return;
       }
       this.monitorToken = undefined;
+      if (this.options.stateProvider && !this.readState()) {
+        this.setProvisionUnavailable();
+        return;
+      }
       this.monitorStatus = "error";
       this.lastErrorCode = stableErrorCode(
         error,
@@ -403,6 +445,61 @@ export class AprsGatewayRuntime {
     if (this.monitorRefreshOperation === operation) {
       this.monitorRefreshOperation = undefined;
     }
+  }
+
+  private readState(): AprsRuntimeState | undefined {
+    try {
+      return this.options.stateProvider?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isStateCurrent(state: AprsRuntimeState | undefined): boolean {
+    if (!this.options.stateProvider) {
+      return true;
+    }
+    const current = this.readState();
+    return Boolean(
+      state &&
+      current &&
+      current.provisionFingerprint === state.provisionFingerprint &&
+      current.mappingsFingerprint === state.mappingsFingerprint,
+    );
+  }
+
+  private invalidateMonitorState(generation: number, token: object): void {
+    if (!this.isGenerationActive(generation) || this.monitorToken !== token) {
+      return;
+    }
+    this.monitorToken = undefined;
+    this.monitorStatus = "idle";
+    this.mappedCallsigns = 0;
+    this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";
+    try {
+      this.publish("aprs.monitor.idle", {
+        code: this.lastErrorCode,
+        mappedCallsigns: 0,
+      });
+    } catch {
+      // This method runs inside a socket EventEmitter callback.
+    }
+    try {
+      void this.refreshMonitor().catch(() => undefined);
+    } catch {
+      // Keep authorization invalidation contained to the socket callback.
+    }
+  }
+
+  private setProvisionUnavailable(): void {
+    this.monitorToken = undefined;
+    this.monitorStatus = "idle";
+    this.mappedCallsigns = 0;
+    this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";
+    this.publish("aprs.monitor.idle", {
+      code: this.lastErrorCode,
+      mappedCallsigns: 0,
+    });
   }
 
   private isGenerationActive(generation: number): boolean {

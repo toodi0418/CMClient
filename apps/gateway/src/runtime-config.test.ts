@@ -8,7 +8,20 @@ import {
   createConfiguredGatewayMaintenanceRuntime,
   createConfiguredMeshGatewayRuntime,
   parseAprsEncodingOptions,
+  parseAprsEndpointOptions,
 } from "./runtime-config";
+
+const aprsState = {
+  mappings: [],
+  mappingsFingerprint: "a".repeat(64),
+  provision: {
+    callsignBase: "TEST01",
+    ssid: -7,
+    symbolTable: "/",
+    symbolCode: ">",
+  },
+  provisionFingerprint: "b".repeat(64),
+};
 
 describe("Gateway production runtime configuration", () => {
   it("rejects invalid bounded maintenance retention settings", () => {
@@ -123,22 +136,12 @@ describe("Gateway production runtime configuration", () => {
     database.close();
   });
 
-  it("requires complete APRS credentials and accepts an explicit disable", () => {
+  it("requires CallMesh APRS state and rejects static identity settings", () => {
     const database = new GatewayDatabase(":memory:");
     const events = new DomainEventBus();
 
     expect(
       createConfiguredAprsGatewayRuntime({}, database, events),
-    ).toBeUndefined();
-    expect(
-      createConfiguredAprsGatewayRuntime(
-        {
-          CMCLIENT_APRS_ENABLED: "false",
-          CMCLIENT_APRS_LOGIN_CALLSIGN: "N0CALL-7",
-        },
-        database,
-        events,
-      ),
     ).toBeUndefined();
     expect(() =>
       createConfiguredAprsGatewayRuntime(
@@ -148,31 +151,46 @@ describe("Gateway production runtime configuration", () => {
       ),
     ).toThrowError(
       expect.objectContaining({
-        code: "APRS_CREDENTIAL_CONFIGURATION_INVALID",
+        code: "APRS_PROVISION_CONFIGURATION_REQUIRED",
       }),
     );
     expect(
       createConfiguredAprsGatewayRuntime(
         {
           CMCLIENT_APRS_ENABLED: "true",
-          CMCLIENT_APRS_LOGIN_CALLSIGN: "N0CALL-7",
-          CMCLIENT_APRS_PASSCODE: "12345",
         },
         database,
         events,
+        () => aprsState,
       ),
     ).toBeDefined();
+    expect(() =>
+      createConfiguredAprsGatewayRuntime(
+        {
+          CMCLIENT_APRS_ENABLED: "false",
+          CMCLIENT_APRS_LOGIN_CALLSIGN: "N0CALL-7",
+        },
+        database,
+        events,
+        () => aprsState,
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "APRS_STATIC_IDENTITY_FORBIDDEN" }),
+    );
     database.close();
   });
 
   it("validates deterministic APRS encoder settings before ingest starts", () => {
     expect(parseAprsEncodingOptions({})).toEqual({
       destination: "APCM20",
-      symbolCode: ">",
-      symbolTable: "/",
     });
     expect(() =>
-      parseAprsEncodingOptions({ CMCLIENT_APRS_COMMENT: "bad\ncomment" }),
+      parseAprsEncodingOptions({ CMCLIENT_APRS_DESTINATION: "bad-value" }),
     ).toThrowError(GatewayRuntimeConfigurationError);
+    expect(parseAprsEndpointOptions({})).toEqual({
+      host: "asia.aprs2.net",
+      port: 14_580,
+      timeoutMs: 10_000,
+    });
   });
 });
