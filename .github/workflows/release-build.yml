@@ -17,7 +17,7 @@ on:
         required: false
         default: dev
         type: choice
-        options: [stable, beta, dev]
+        options: [stable, candidate, dev]
       minimum_agent_version:
         description: Minimum Agent SemVer for an explicitly signed manifest
         required: false
@@ -423,10 +423,13 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           case "$version" in
             *-dev.*) build_channel="dev" ;;
-            *-*) build_channel="beta" ;;
+            *-*) build_channel="candidate" ;;
             *) build_channel="stable" ;;
           esac
           source_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          source_tree="$(git rev-parse "$GITHUB_SHA^{tree}")"
+          target_architecture="${{ matrix.target }}"
+          target_architecture="${target_architecture#linux-}"
           created_at="$(date -u --date="@$source_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
           archive="docker-build/cmclient.oci.tar"
           builder="cmclient-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${{ matrix.target }}"
@@ -444,7 +447,9 @@ jobs:
             --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \
             --build-arg "CMCLIENT_BUILD_VERSION=$version" \
             --build-arg "CMCLIENT_BUILD_COMMIT=$GITHUB_SHA" \
+            --build-arg "CMCLIENT_BUILD_TREE=$source_tree" \
             --build-arg "CMCLIENT_BUILD_CHANNEL=$build_channel" \
+            --build-arg "CMCLIENT_TARGET_ARCHITECTURE=$target_architecture" \
             --label "org.opencontainers.image.created=$created_at" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
@@ -1163,7 +1168,7 @@ jobs:
           if-no-files-found: error
 
   sign-update-manifest:
-    name: Sign Agent update manifest
+    name: Sign unified CMClient update manifest
     needs: [attest]
     if: >-
       github.event_name == 'workflow_dispatch' &&
@@ -1205,7 +1210,7 @@ jobs:
             --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release-build.yml@$GITHUB_REF" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             release-dist/SHA256SUMS
-      - name: Sign canonical Agent manifest without exposing the private key
+      - name: Sign canonical unified CMClient manifest without exposing the private key
         shell: bash
         env:
           CMCLIENT_UPDATE_SIGNING_KEY: ${{ secrets.CMCLIENT_UPDATE_SIGNING_KEY }}

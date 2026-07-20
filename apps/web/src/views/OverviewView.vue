@@ -45,7 +45,7 @@ const gatewayMessage = computed(() => {
     <div class="overview-strip" :aria-label="t('shell.operations')">
       <div>
         <span>{{ t("dashboard.version") }}</span>
-        <strong>{{ gateway.status?.build.version ?? "--" }}</strong>
+        <strong>{{ gateway.status?.identity.identity.version ?? "--" }}</strong>
       </div>
       <div>
         <span>{{ t("dashboard.eventConnection") }}</span>

@@ -4,9 +4,9 @@ use cmclient_cli_client::{ExitCode, parse_endpoint};
 use cmclient_control_api::{
     ControlClient, ControlEndpoint, ControlError, ControlSecretKind, ControlSecretReceipt,
     ControlStatus, ControlUpdateEvent, ControlUpdateEventStream, DiagnosticsControlBundle,
-    GatewayControlStatus, GatewayProjection, REMOTE_CONTROL_NONCE_HEADER,
+    GatewayControlStatus, GatewayProjection, InternalComponent, REMOTE_CONTROL_NONCE_HEADER,
     REMOTE_CONTROL_SCOPE_HEADER, REMOTE_CONTROL_TIMESTAMP_HEADER, UpdateControlStatus,
-    default_local_endpoint, sign_remote_control_request,
+    compiled_component_identity, default_local_endpoint, sign_remote_control_request,
 };
 use serde_json::{Value, json};
 use std::{
@@ -583,13 +583,30 @@ fn run(cli: Cli) -> ProcessExitCode {
     } = cli;
     let style = OutputStyle::new(no_color);
     if matches!(&command, Command::Version) {
+        let identity = match compiled_component_identity(InternalComponent::CommandMode) {
+            Ok(identity) => identity,
+            Err(_) => {
+                eprintln!("BUILD_IDENTITY_INVALID");
+                return ProcessExitCode::from(ExitCode::OperationFailed.as_u8());
+            }
+        };
         if json {
-            println!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION"));
+            match serde_json::to_string(&identity) {
+                Ok(value) => println!("{value}"),
+                Err(_) => {
+                    return ProcessExitCode::from(ExitCode::OperationFailed.as_u8());
+                }
+            }
         } else if !quiet {
             println!(
-                "{} {}",
-                style.heading("cmclient"),
-                env!("CARGO_PKG_VERSION")
+                "{} {} ({}, {}/{}, {}/{})",
+                style.heading(&identity.identity.product),
+                identity.identity.version,
+                identity.identity.channel.as_str(),
+                identity.identity.target.os.as_str(),
+                identity.identity.target.architecture.as_str(),
+                identity.identity.target.profile.as_str(),
+                identity.identity.target.package_profile.as_str(),
             );
         }
         return ProcessExitCode::SUCCESS;
@@ -1406,7 +1423,8 @@ mod tests {
     use cmclient_cli_client::ExitCode;
     use cmclient_control_api::{
         ControlError, ControlStatus, DiagnosticsControlBundle, GatewayControlStatus,
-        GatewayProjection, ManagementWebControlStatus, UpdateControlJob, UpdateControlStatus,
+        GatewayProjection, InternalComponent, ManagementWebControlStatus, UpdateControlJob,
+        UpdateControlStatus, compiled_component_identity,
     };
     use serde_json::json;
     use std::{io::Cursor, process::ExitCode as ProcessExitCode, time::Duration};
@@ -1572,9 +1590,9 @@ mod tests {
             ProcessExitCode::from(ExitCode::Authentication.as_u8())
         );
         let status = ControlStatus {
-            schema_version: 2,
+            schema_version: 3,
             agent: String::from("running"),
-            agent_version: String::from("2.0.0-test"),
+            identity: compiled_component_identity(InternalComponent::Agent).unwrap(),
             gateway: GatewayControlStatus::Stopped,
             management_web: ManagementWebControlStatus::Running,
             management_web_url: Some(String::from("http://127.0.0.1:7080")),
@@ -1582,8 +1600,8 @@ mod tests {
             latest_error_code: None,
         };
         let mut diagnostics = DiagnosticsControlBundle {
-            schema_version: 1,
-            agent_version: String::from("2.0.0-test"),
+            schema_version: 2,
+            identity: compiled_component_identity(InternalComponent::Agent).unwrap(),
             gateway: GatewayControlStatus::Stopped,
             management_web: ManagementWebControlStatus::Running,
             latest_error_code: None,

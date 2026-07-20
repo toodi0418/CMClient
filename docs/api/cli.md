@@ -13,7 +13,9 @@ validation, 6 operation failure, 7 partial/degraded, and 8 timeout. The command
 surface is `status`, `start`, `stop`, `restart`, `version`, `logs`, `events`,
 `doctor`, `web`, `meshtastic`, `nodes`, `positions`, `aprs`, `proxy`, `update`,
 `backup`, `diagnostics`, `secret`, and `database`. `version` has no Agent
-dependency; all other runtime commands use the Control API. `doctor` returns 7
+dependency and returns the command-mode component plus the complete product,
+source, channel, and target identity; all other runtime commands use the
+Control API. `doctor` returns 7
 when the combined status/diagnostic projection is degraded. Backup and database
 commands return persistent Job acceptance rather than touching SQLite.
 

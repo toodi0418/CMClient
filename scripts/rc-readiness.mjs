@@ -87,6 +87,7 @@ export const EXPECTED_RUST_IDENTITIES = Object.freeze([
   "cmclient-cli-client:crates/cli-client/Cargo.toml",
   "cmclient-control-api:crates/control-api/Cargo.toml",
   "cmclient-legacy-migration:crates/legacy-migration/Cargo.toml",
+  "cmclient-product-identity:crates/product-identity/Cargo.toml",
   "cmclient-runtime-logging:crates/runtime-logging/Cargo.toml",
   "cmclient-supervisor:crates/supervisor/Cargo.toml",
   "cmclient-updater:crates/updater/Cargo.toml",

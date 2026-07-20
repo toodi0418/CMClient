@@ -1,33 +1,30 @@
 import { Type, type Static } from "@sinclair/typebox";
 
-export const BUILD_CHANNELS = ["stable", "beta", "dev"] as const;
-export const PLATFORM_IDS = ["darwin", "linux", "windows", "unknown"] as const;
+import { ComponentIdentityReportSchema } from "./identity.js";
+
 export const CAPABILITY_KEYS = [
   "managementWeb",
-  "update",
-  "tray",
+  "commandMode",
+  "graphicalMode",
+  "loginAutostart",
   "serial",
-  "service",
-  "autoStart",
-  "docker",
+  "nativeUpdate",
+  "dockerPullRecreateUpdate",
+  "localControl",
   "remoteDispatch",
 ] as const;
 
-const BuildChannelSchema = Type.Union(
-  BUILD_CHANNELS.map((channel) => Type.Literal(channel)),
-);
-const PlatformSchema = Type.Union(
-  PLATFORM_IDS.map((platform) => Type.Literal(platform)),
-);
+export const CAPABILITY_REASON_CODES = [
+  "owned_by_agent",
+  "owned_by_graphical_mode",
+  "not_configured",
+  "unavailable_in_docker",
+  "unavailable_in_native",
+  "not_enabled",
+] as const;
 
-export const BuildMetadataSchema = Type.Object(
-  {
-    version: Type.String({ minLength: 1 }),
-    commit: Type.String({ minLength: 1 }),
-    channel: BuildChannelSchema,
-    builtAt: Type.Optional(Type.String({ format: "date-time" })),
-  },
-  { additionalProperties: false },
+const CapabilityReasonCodeSchema = Type.Union(
+  CAPABILITY_REASON_CODES.map((reason) => Type.Literal(reason)),
 );
 
 export const SystemHealthSchema = Type.Object(
@@ -37,8 +34,9 @@ export const SystemHealthSchema = Type.Object(
 
 export const SystemStatusSchema = Type.Object(
   {
+    schemaVersion: Type.Literal(2),
     health: Type.Literal("ok"),
-    build: BuildMetadataSchema,
+    identity: ComponentIdentityReportSchema,
   },
   { additionalProperties: false },
 );
@@ -51,7 +49,7 @@ export const CapabilityStateSchema = Type.Union([
   Type.Object(
     {
       available: Type.Literal(false),
-      reasonCode: Type.String({ minLength: 1 }),
+      reasonCode: CapabilityReasonCodeSchema,
     },
     { additionalProperties: false },
   ),
@@ -59,18 +57,18 @@ export const CapabilityStateSchema = Type.Union([
 
 export const SystemCapabilitiesSchema = Type.Object(
   {
-    schemaVersion: Type.Literal(1),
-    platform: PlatformSchema,
-    build: BuildMetadataSchema,
+    schemaVersion: Type.Literal(2),
+    identity: ComponentIdentityReportSchema,
     capabilities: Type.Object(
       {
         managementWeb: CapabilityStateSchema,
-        update: CapabilityStateSchema,
-        tray: CapabilityStateSchema,
+        commandMode: CapabilityStateSchema,
+        graphicalMode: CapabilityStateSchema,
+        loginAutostart: CapabilityStateSchema,
         serial: CapabilityStateSchema,
-        service: CapabilityStateSchema,
-        autoStart: CapabilityStateSchema,
-        docker: CapabilityStateSchema,
+        nativeUpdate: CapabilityStateSchema,
+        dockerPullRecreateUpdate: CapabilityStateSchema,
+        localControl: CapabilityStateSchema,
         remoteDispatch: CapabilityStateSchema,
       },
       { additionalProperties: false },
@@ -79,10 +77,8 @@ export const SystemCapabilitiesSchema = Type.Object(
   { additionalProperties: false },
 );
 
-export type BuildChannel = (typeof BUILD_CHANNELS)[number];
-export type PlatformId = (typeof PLATFORM_IDS)[number];
 export type CapabilityKey = (typeof CAPABILITY_KEYS)[number];
-export type BuildMetadata = Static<typeof BuildMetadataSchema>;
+export type CapabilityReasonCode = (typeof CAPABILITY_REASON_CODES)[number];
 export type SystemHealth = Static<typeof SystemHealthSchema>;
 export type SystemStatus = Static<typeof SystemStatusSchema>;
 export type CapabilityState = Static<typeof CapabilityStateSchema>;

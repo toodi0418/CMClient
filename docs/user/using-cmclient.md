@@ -26,7 +26,7 @@ operate a Meshtastic transport, or perform privileged lifecycle work directly.
 
 Every view distinguishes unavailable, degraded, and empty data. A missing
 Gateway does not become a fake success state. `remoteDispatch` is intentionally
-disabled (`REMOTE_DISPATCH_NOT_ENABLED`) and has no send action in this RC.
+disabled (`not_enabled`) and has no send action in this RC.
 
 ## Desktop supervisor
 

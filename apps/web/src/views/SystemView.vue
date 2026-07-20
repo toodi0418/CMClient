@@ -46,20 +46,25 @@ const capabilityRows = computed(() =>
       <dl v-else-if="gateway.status" class="facts-grid">
         <div>
           <dt>{{ t("system.platform") }}</dt>
-          <dd>{{ gateway.capabilities?.platform ?? "--" }}</dd>
+          <dd>
+            {{ gateway.status.identity.identity.target.os }} /
+            {{ gateway.status.identity.identity.target.architecture }} /
+            {{ gateway.status.identity.identity.target.profile }} /
+            {{ gateway.status.identity.identity.target.packageProfile }}
+          </dd>
         </div>
         <div>
           <dt>{{ t("system.version") }}</dt>
-          <dd>{{ gateway.status.build.version }}</dd>
+          <dd>{{ gateway.status.identity.identity.version }}</dd>
         </div>
         <div>
           <dt>{{ t("system.channel") }}</dt>
-          <dd>{{ gateway.status.build.channel }}</dd>
+          <dd>{{ gateway.status.identity.identity.channel }}</dd>
         </div>
         <div>
           <dt>{{ t("system.commit") }}</dt>
           <dd>
-            <code>{{ gateway.status.build.commit }}</code>
+            <code>{{ gateway.status.identity.identity.sourceCommit }}</code>
           </dd>
         </div>
       </dl>

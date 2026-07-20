@@ -7,7 +7,8 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@cmclient/contracts": "workspace:*"
+    "@cmclient/contracts": "workspace:*",
+    "@sinclair/typebox": "^0.34.52"
   },
   "scripts": {
     "typecheck": "tsc --noEmit --project tsconfig.json"

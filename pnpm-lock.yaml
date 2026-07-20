@@ -54,6 +54,9 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@cmclient/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@lucide/vue':
         specifier: ^1.25.0
         version: 1.25.0(vue@3.5.40(typescript@5.9.3))
@@ -179,6 +182,9 @@ importers:
       '@cmclient/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@sinclair/typebox':
+        specifier: ^0.34.52
+        version: 0.34.52
 
   packages/contracts:
     dependencies:

@@ -2,7 +2,7 @@
 //!
 //! The manifest format is deliberately small and stable. Later updater stages
 //! download and install a bundle only after this boundary authenticates the
-//! manifest and selects an exact component/target pair.
+//! manifest and selects an exact unified-product target.
 
 use std::{
     error::Error,
@@ -14,69 +14,24 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+use cmclient_product_identity::{ProductTarget, ReleaseIdentity};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
 
 /// Stable workspace identity for the updater boundary.
 pub const COMPONENT: &str = "updater";
 
 /// The only manifest schema understood by this release line.
-pub const MANIFEST_SCHEMA_VERSION: u8 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u8 = 2;
 
 const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Conservative extraction ceiling for one signed update archive.
 pub const DEFAULT_MAX_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// Release channels supported by the updater.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum UpdateChannel {
-    /// Production releases.
-    Stable,
-    /// Opt-in preview releases.
-    Beta,
-    /// Development releases.
-    Dev,
-}
-
-/// Platform target encoded in an update bundle.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum UpdateTarget {
-    /// Apple Silicon macOS.
-    #[serde(rename = "darwin-aarch64")]
-    DarwinAarch64,
-    /// Intel macOS.
-    #[serde(rename = "darwin-x86_64")]
-    DarwinX86_64,
-    /// ARM64 Linux.
-    #[serde(rename = "linux-aarch64")]
-    LinuxAarch64,
-    /// x86_64 Linux.
-    #[serde(rename = "linux-x86_64")]
-    LinuxX86_64,
-    /// x86_64 Windows.
-    #[serde(rename = "windows-x86_64")]
-    WindowsX86_64,
-}
-
-/// Installable product surface represented by a bundle.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum UpdateComponent {
-    /// Tauri desktop supervisor distribution.
-    Desktop,
-    /// Agent-only headless distribution.
-    Headless,
-    /// Command line client distribution.
-    Cli,
-    /// Managed service distribution.
-    Service,
-}
 
 /// Archive encoding used by a bundle.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -89,14 +44,12 @@ pub enum UpdateArchive {
     Zip,
 }
 
-/// A component-specific, platform-specific release archive.
+/// A target-specific unified-product release archive.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateBundle {
-    /// Product surface this archive installs.
-    pub component: UpdateComponent,
-    /// Target platform this archive supports.
-    pub target: UpdateTarget,
+    /// Exact native distribution this archive updates.
+    pub target: ProductTarget,
     /// Archive encoding used to stage this archive.
     pub archive: UpdateArchive,
     /// HTTPS-only immutable bundle URL.
@@ -112,11 +65,10 @@ pub struct UpdateBundle {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateManifest {
     /// Protocol version for this document.
+    #[serde(deserialize_with = "deserialize_manifest_schema_version")]
     pub schema_version: u8,
-    /// Requested release channel.
-    pub channel: UpdateChannel,
-    /// Release SemVer.
-    pub version: String,
+    /// Immutable product and source identity shared by every bundle.
+    pub release: ReleaseIdentity,
     /// UTC publish timestamp using `YYYY-MM-DDTHH:MM:SS.mmmZ`.
     pub published_at: String,
     /// Minimum compatible Agent SemVer.
@@ -152,14 +104,18 @@ pub struct SignedUpdateManifest {
 pub enum UpdateManifestError {
     /// The payload is for a newer or incompatible manifest protocol.
     UnsupportedSchemaVersion,
-    /// A SemVer field is malformed.
+    /// The embedded release identity is malformed or is not CMClient.
+    InvalidReleaseIdentity,
+    /// The minimum compatible Agent SemVer is malformed.
     InvalidVersion,
     /// The UTC timestamp does not follow the wire format.
     InvalidPublishedAt,
     /// The manifest does not contain an installable archive.
     MissingBundles,
-    /// More than one bundle targets the same component/platform pair.
+    /// More than one bundle targets the same native distribution.
     DuplicateBundle,
+    /// A bundle is not for an exact supported native distribution.
+    InvalidBundleTarget,
     /// A bundle URL is not an allowed HTTPS URL.
     InvalidBundleUrl,
     /// A bundle checksum is not a lowercase SHA-256 hex value.
@@ -176,7 +132,7 @@ pub enum UpdateManifestError {
     InvalidSignatureLength,
     /// The manifest signature cannot be authenticated.
     SignatureVerificationFailed,
-    /// The requested component/platform pair is not in this release.
+    /// The requested target is not in this release.
     BundleNotFound,
     /// Serializing a validated manifest unexpectedly failed.
     CanonicalizationFailed,
@@ -187,10 +143,12 @@ impl UpdateManifestError {
     pub const fn code(self) -> &'static str {
         match self {
             Self::UnsupportedSchemaVersion => "UPDATE_MANIFEST_SCHEMA_UNSUPPORTED",
+            Self::InvalidReleaseIdentity => "UPDATE_MANIFEST_RELEASE_IDENTITY_INVALID",
             Self::InvalidVersion => "UPDATE_MANIFEST_VERSION_INVALID",
             Self::InvalidPublishedAt => "UPDATE_MANIFEST_PUBLISHED_AT_INVALID",
             Self::MissingBundles => "UPDATE_MANIFEST_BUNDLES_MISSING",
             Self::DuplicateBundle => "UPDATE_MANIFEST_BUNDLE_DUPLICATE",
+            Self::InvalidBundleTarget => "UPDATE_MANIFEST_BUNDLE_TARGET_INVALID",
             Self::InvalidBundleUrl => "UPDATE_MANIFEST_BUNDLE_URL_INVALID",
             Self::InvalidBundleDigest => "UPDATE_MANIFEST_BUNDLE_DIGEST_INVALID",
             Self::InvalidBundleSize => "UPDATE_MANIFEST_BUNDLE_SIZE_INVALID",
@@ -213,15 +171,29 @@ impl fmt::Display for UpdateManifestError {
 
 impl Error for UpdateManifestError {}
 
+fn deserialize_manifest_schema_version<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u8::deserialize(deserializer)?;
+    if version != MANIFEST_SCHEMA_VERSION {
+        return Err(D::Error::custom(
+            "unsupported update manifest schema version",
+        ));
+    }
+    Ok(version)
+}
+
 impl UpdateManifest {
     /// Checks invariant fields before a manifest is signed or trusted.
     pub fn validate(&self) -> Result<(), UpdateManifestError> {
         if self.schema_version != MANIFEST_SCHEMA_VERSION {
             return Err(UpdateManifestError::UnsupportedSchemaVersion);
         }
-        if Version::parse(&self.version).is_err()
-            || Version::parse(&self.minimum_agent_version).is_err()
-        {
+        self.release
+            .validate()
+            .map_err(|_| UpdateManifestError::InvalidReleaseIdentity)?;
+        if Version::parse(&self.minimum_agent_version).is_err() {
             return Err(UpdateManifestError::InvalidVersion);
         }
         if !is_utc_millisecond_timestamp(&self.published_at) {
@@ -232,6 +204,9 @@ impl UpdateManifest {
         }
 
         for (index, bundle) in self.bundles.iter().enumerate() {
+            if !bundle.target.is_native_distribution() {
+                return Err(UpdateManifestError::InvalidBundleTarget);
+            }
             if !is_https_url(&bundle.url) {
                 return Err(UpdateManifestError::InvalidBundleUrl);
             }
@@ -241,9 +216,10 @@ impl UpdateManifest {
             if bundle.size_bytes == 0 {
                 return Err(UpdateManifestError::InvalidBundleSize);
             }
-            if self.bundles[..index].iter().any(|previous| {
-                previous.component == bundle.component && previous.target == bundle.target
-            }) {
+            if self.bundles[..index]
+                .iter()
+                .any(|previous| previous.target == bundle.target)
+            {
                 return Err(UpdateManifestError::DuplicateBundle);
             }
         }
@@ -257,16 +233,12 @@ impl UpdateManifest {
         serde_json::to_vec(self).map_err(|_| UpdateManifestError::CanonicalizationFailed)
     }
 
-    /// Finds the single archive usable by an installed product surface.
-    pub fn bundle_for(
-        &self,
-        component: UpdateComponent,
-        target: UpdateTarget,
-    ) -> Result<&UpdateBundle, UpdateManifestError> {
+    /// Finds the single archive usable by an exact installed distribution.
+    pub fn bundle_for(&self, target: ProductTarget) -> Result<&UpdateBundle, UpdateManifestError> {
         self.validate()?;
         self.bundles
             .iter()
-            .find(|bundle| bundle.component == component && bundle.target == target)
+            .find(|bundle| bundle.target == target)
             .ok_or(UpdateManifestError::BundleNotFound)
     }
 }
@@ -388,10 +360,8 @@ pub struct UpdateStageRequest<'a> {
     pub expected_signing_key_id: &'a str,
     /// Locally configured trusted Ed25519 public key.
     pub verifying_key: &'a VerifyingKey,
-    /// Installed product surface to update.
-    pub component: UpdateComponent,
-    /// Current platform target.
-    pub target: UpdateTarget,
+    /// Exact native distribution target selected from local product identity.
+    pub target: ProductTarget,
     /// Agent-owned OS cache directory.
     pub cache_dir: &'a Path,
 }
@@ -401,10 +371,8 @@ pub struct UpdateStageRequest<'a> {
 pub struct StagedBundle {
     /// Absolute path to the verified archive in the Agent cache.
     pub path: PathBuf,
-    /// Product surface represented by the staged archive.
-    pub component: UpdateComponent,
-    /// Platform supported by the staged archive.
-    pub target: UpdateTarget,
+    /// Exact native distribution supported by the staged archive.
+    pub target: ProductTarget,
     /// Archive encoding used by the staged archive.
     pub archive: UpdateArchive,
     /// Authenticated lowercase SHA-256 digest.
@@ -485,7 +453,7 @@ pub fn stage_verified_bundle(
         .verify(request.expected_signing_key_id, request.verifying_key)
         .map_err(UpdateStageError::Manifest)?;
     let bundle = manifest
-        .bundle_for(request.component, request.target)
+        .bundle_for(request.target)
         .map_err(UpdateStageError::Manifest)?
         .clone();
 
@@ -567,7 +535,6 @@ pub fn stage_verified_bundle(
 fn staged_bundle(path: PathBuf, bundle: UpdateBundle, reused: bool) -> StagedBundle {
     StagedBundle {
         path,
-        component: bundle.component,
         target: bundle.target,
         archive: bundle.archive,
         sha256: bundle.sha256,
@@ -1685,12 +1652,15 @@ mod tests {
     use super::{
         ActiveRelease, BundleResponse, BundleTransport, DEFAULT_MAX_UNPACKED_BYTES,
         MANIFEST_SCHEMA_VERSION, SignatureAlgorithm, SignedUpdateManifest, StagedBundle,
-        UpdateArchive, UpdateBundle, UpdateChannel, UpdateComponent, UpdateInstallError,
-        UpdateInstallRequest, UpdateJournalStore, UpdateLifecycle, UpdateLogEntry, UpdateManifest,
-        UpdateManifestError, UpdatePhase, UpdateProgress, UpdateRollbackPlan, UpdateStageError,
-        UpdateStageRequest, UpdateTarget, install_verified_release, read_active_release,
-        recover_interrupted_update, rollback_update, set_active_release, sha256_hex,
-        stage_verified_bundle,
+        UpdateArchive, UpdateBundle, UpdateInstallError, UpdateInstallRequest, UpdateJournalStore,
+        UpdateLifecycle, UpdateLogEntry, UpdateManifest, UpdateManifestError, UpdatePhase,
+        UpdateProgress, UpdateRollbackPlan, UpdateStageError, UpdateStageRequest,
+        install_verified_release, read_active_release, recover_interrupted_update, rollback_update,
+        set_active_release, sha256_hex, stage_verified_bundle,
+    };
+    use cmclient_product_identity::{
+        PackageProfile, ProductTarget, ReleaseChannel, ReleaseIdentity, RuntimeProfile,
+        TargetArchitecture, TargetOperatingSystem,
     };
     use ed25519_dalek::{SigningKey, VerifyingKey};
     use std::{
@@ -1705,19 +1675,38 @@ mod tests {
         SigningKey::from_bytes(&[7; 32])
     }
 
+    fn target() -> ProductTarget {
+        ProductTarget {
+            os: TargetOperatingSystem::Macos,
+            architecture: TargetArchitecture::Universal,
+            profile: RuntimeProfile::Native,
+            package_profile: PackageProfile::Dmg,
+        }
+    }
+
+    fn release() -> ReleaseIdentity {
+        ReleaseIdentity {
+            schema_version: 1,
+            product: "CMClient".to_owned(),
+            version: "2.0.0-dev.1".to_owned(),
+            source_commit: "1".repeat(40),
+            source_tree: "2".repeat(40),
+            channel: ReleaseChannel::Dev,
+        }
+    }
+
     fn manifest() -> UpdateManifest {
         UpdateManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
-            channel: UpdateChannel::Dev,
-            version: "2.0.0-dev.1".to_owned(),
+            release: release(),
             published_at: "2026-07-18T02:40:00.000Z".to_owned(),
             minimum_agent_version: "2.0.0-dev.0".to_owned(),
             bundles: vec![UpdateBundle {
-                component: UpdateComponent::Desktop,
-                target: UpdateTarget::DarwinAarch64,
+                target: target(),
                 archive: UpdateArchive::TarZst,
-                url: "https://releases.example.invalid/cmclient/2.0.0-dev.1/darwin-aarch64.tar.zst"
-                    .to_owned(),
+                url:
+                    "https://releases.example.invalid/cmclient/2.0.0-dev.1/macos-universal.tar.zst"
+                        .to_owned(),
                 sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_owned(),
                 size_bytes: 4_096,
@@ -1790,8 +1779,7 @@ mod tests {
             signed_manifest,
             expected_signing_key_id: "release-2026",
             verifying_key,
-            component: UpdateComponent::Desktop,
-            target: UpdateTarget::DarwinAarch64,
+            target: target(),
             cache_dir,
         }
     }
@@ -1800,8 +1788,7 @@ mod tests {
         let bytes = fs::read(path).unwrap();
         StagedBundle {
             path: path.to_path_buf(),
-            component: UpdateComponent::Desktop,
-            target: UpdateTarget::DarwinAarch64,
+            target: target(),
             archive,
             sha256: sha256_hex(&bytes),
             size_bytes: bytes.len() as u64,
@@ -1940,7 +1927,7 @@ mod tests {
         assert_eq!(signed.signature_algorithm, SignatureAlgorithm::Ed25519);
         assert_eq!(
             String::from_utf8(signed.manifest.canonical_bytes().unwrap()).unwrap(),
-            r#"{"schemaVersion":1,"channel":"dev","version":"2.0.0-dev.1","publishedAt":"2026-07-18T02:40:00.000Z","minimumAgentVersion":"2.0.0-dev.0","bundles":[{"component":"desktop","target":"darwin-aarch64","archive":"tar.zst","url":"https://releases.example.invalid/cmclient/2.0.0-dev.1/darwin-aarch64.tar.zst","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","sizeBytes":4096}]}"#
+            r#"{"schemaVersion":2,"release":{"schemaVersion":1,"product":"CMClient","version":"2.0.0-dev.1","sourceCommit":"1111111111111111111111111111111111111111","sourceTree":"2222222222222222222222222222222222222222","channel":"dev"},"publishedAt":"2026-07-18T02:40:00.000Z","minimumAgentVersion":"2.0.0-dev.0","bundles":[{"target":{"os":"macos","architecture":"universal","profile":"native","packageProfile":"dmg"},"archive":"tar.zst","url":"https://releases.example.invalid/cmclient/2.0.0-dev.1/macos-universal.tar.zst","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","sizeBytes":4096}]}"#
         );
         assert_eq!(
             signed
@@ -1992,21 +1979,53 @@ mod tests {
             duplicate.validate(),
             Err(UpdateManifestError::DuplicateBundle)
         );
+
+        let mut source_bundle = manifest();
+        source_bundle.bundles[0].target.package_profile = PackageProfile::Workspace;
+        assert_eq!(
+            source_bundle.validate(),
+            Err(UpdateManifestError::InvalidBundleTarget)
+        );
+
+        let mut invalid_release = manifest();
+        invalid_release.release.product = "OtherProduct".to_owned();
+        assert_eq!(
+            invalid_release.validate(),
+            Err(UpdateManifestError::InvalidReleaseIdentity)
+        );
+
+        let windows_setup = ProductTarget {
+            os: TargetOperatingSystem::Windows,
+            architecture: TargetArchitecture::X86_64,
+            profile: RuntimeProfile::Native,
+            package_profile: PackageProfile::Setup,
+        };
+        assert_eq!(
+            manifest().bundle_for(windows_setup),
+            Err(UpdateManifestError::BundleNotFound)
+        );
     }
 
     #[test]
-    fn rejects_unknown_wire_fields_during_deserialization() {
-        let document = r#"{
-            "schemaVersion": 1,
-            "channel": "dev",
-            "version": "2.0.0-dev.1",
-            "publishedAt": "2026-07-18T02:40:00.000Z",
-            "minimumAgentVersion": "2.0.0-dev.0",
-            "bundles": [],
-            "unexpected": true
-        }"#;
+    fn serde_rejects_legacy_schema_channel_and_component_selectors() {
+        let valid = serde_json::to_value(manifest()).unwrap();
 
-        assert!(serde_json::from_str::<UpdateManifest>(document).is_err());
+        let mut schema_v1 = valid.clone();
+        schema_v1["schemaVersion"] = serde_json::Value::from(1);
+        assert!(serde_json::from_value::<UpdateManifest>(schema_v1).is_err());
+
+        let mut beta = valid.clone();
+        beta["release"]["channel"] = serde_json::Value::from("beta");
+        assert!(serde_json::from_value::<UpdateManifest>(beta).is_err());
+
+        for component in ["desktop", "headless", "cli", "service"] {
+            let mut legacy = valid.clone();
+            legacy["bundles"][0]
+                .as_object_mut()
+                .unwrap()
+                .insert("component".to_owned(), serde_json::Value::from(component));
+            assert!(serde_json::from_value::<UpdateManifest>(legacy).is_err());
+        }
     }
 
     #[test]
@@ -2034,6 +2053,7 @@ mod tests {
                 .join(format!("{}.bundle", sha256_hex(bytes)))
         );
         assert_eq!(fs::read(&staged.path).unwrap(), bytes);
+        assert_eq!(staged.target, target());
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
         let _ = fs::remove_dir_all(cache_dir);
     }
@@ -2046,7 +2066,7 @@ mod tests {
         let mut signed =
             SignedUpdateManifest::sign(manifest_for(bytes), "release-2026".to_owned(), &key)
                 .unwrap();
-        signed.manifest.version = "2.0.0-dev.2".to_owned();
+        signed.manifest.release.version = "2.0.0-dev.2".to_owned();
         let transport = FixtureTransport::bytes(bytes);
         let cache_dir = stage_directory("tampered-manifest");
 

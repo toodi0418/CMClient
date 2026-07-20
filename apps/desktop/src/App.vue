@@ -12,6 +12,7 @@ import {
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { ComponentIdentityReport } from "@cmclient/contracts";
 
 import { runWindowControl, type WindowControlAction } from "./window-controls";
 import {
@@ -26,14 +27,14 @@ type GatewayStatus =
 type ManagementWebStatus = "disabled" | "running";
 type AgentCommand = "start" | "stop" | "restart" | "enable_web" | "disable_web";
 interface ControlStatus {
-  schema_version: number;
+  schemaVersion: number;
   agent: string;
-  agent_version: string;
+  identity: ComponentIdentityReport;
   gateway: GatewayStatus;
-  management_web: ManagementWebStatus;
-  management_web_url: string | null;
-  uptime_seconds: number;
-  latest_error_code: string | null;
+  managementWeb: ManagementWebStatus;
+  managementWebUrl: string | null;
+  uptimeSeconds: number;
+  latestErrorCode: string | null;
 }
 interface UpdateControlJob {
   id: string;
@@ -71,15 +72,15 @@ const windowControlTarget = appWindow
   : undefined;
 const gatewayLabel = computed(() => status.value?.gateway ?? "stopped");
 const managementWebLabel = computed(
-  () => status.value?.management_web ?? "disabled",
+  () => status.value?.managementWeb ?? "disabled",
 );
 const coreLabel = computed(() =>
   status.value?.agent === "running" ? "running" : "stopped",
 );
 const activeErrorCode = computed(
-  () => errorCode.value ?? status.value?.latest_error_code,
+  () => errorCode.value ?? status.value?.latestErrorCode,
 );
-const uptimeLabel = computed(() => formatUptime(status.value?.uptime_seconds));
+const uptimeLabel = computed(() => formatUptime(status.value?.uptimeSeconds));
 const meshtasticState = computed(
   () => serviceStatus.value?.meshtastic.state ?? "starting",
 );
@@ -353,7 +354,9 @@ onUnmounted(() => {
           <p class="eyebrow">LOCAL SUPERVISOR</p>
           <h1>CMClient</h1>
         </div>
-        <span class="agent-version">{{ status?.agent_version ?? "--" }}</span>
+        <span class="agent-version">{{
+          status?.identity.identity.version ?? "--"
+        }}</span>
       </div>
       <div class="status-lights" aria-label="Runtime status">
         <div class="status-light" :data-state="coreLabel">
@@ -397,7 +400,7 @@ onUnmounted(() => {
       <dl>
         <div>
           <dt>Agent version</dt>
-          <dd>{{ status?.agent_version ?? "checking" }}</dd>
+          <dd>{{ status?.identity.identity.version ?? "checking" }}</dd>
         </div>
         <div>
           <dt>Uptime</dt>

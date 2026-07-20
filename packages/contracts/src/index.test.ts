@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 
 import { TypeCompiler } from "@sinclair/typebox/compiler";
 
 import {
   DomainEventSchema,
+  ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
   JobDetailSchema,
   JOB_STATUSES,
@@ -16,6 +18,8 @@ import {
   PositionCanonicalEventSchema,
   PositionDecisionSchema,
   PositionObservationSchema,
+  ProductIdentitySchema,
+  ProductTargetSchema,
   ProxyStatusSchema,
   RemoteDispatchTaskSchema,
   SystemCapabilitiesSchema,
@@ -26,6 +30,29 @@ import {
   UpdateControlStatusSchema,
   UpdateManifestSchema,
 } from "./index";
+
+const releaseIdentity = {
+  schemaVersion: 1 as const,
+  product: "CMClient" as const,
+  version: "2.0.0-dev.1",
+  sourceCommit: "a".repeat(40),
+  sourceTree: "b".repeat(40),
+  channel: "dev" as const,
+};
+
+const gatewayIdentity = {
+  schemaVersion: 1 as const,
+  component: "gateway" as const,
+  identity: {
+    ...releaseIdentity,
+    target: {
+      os: "linux" as const,
+      architecture: "x86_64" as const,
+      profile: "native" as const,
+      packageProfile: "workspace" as const,
+    },
+  },
+};
 
 describe("remote dispatch contract", () => {
   it("defines the later feature without a removed compatibility shape", () => {
@@ -63,15 +90,18 @@ describe("remote dispatch contract", () => {
 
 describe("signed update manifest contract", () => {
   const manifest = {
-    schemaVersion: 1,
-    channel: "dev",
-    version: "2.0.0-dev.1",
+    schemaVersion: 2,
+    release: releaseIdentity,
     publishedAt: "2026-07-18T02:40:00.000Z",
     minimumAgentVersion: "2.0.0-dev.0",
     bundles: [
       {
-        component: "desktop",
-        target: "darwin-aarch64",
+        target: {
+          os: "macos",
+          architecture: "universal",
+          profile: "native",
+          packageProfile: "dmg",
+        },
         archive: "tar.zst",
         url: "https://releases.example.invalid/cmclient/2.0.0-dev.1/darwin-aarch64.tar.zst",
         sha256:
@@ -99,7 +129,17 @@ describe("signed update manifest contract", () => {
     expect(
       check.Check({
         ...manifest,
-        bundles: [{ ...manifest.bundles[0], target: "linux-riscv64" }],
+        bundles: [
+          {
+            ...manifest.bundles[0],
+            target: {
+              os: "linux",
+              architecture: "riscv64",
+              profile: "native",
+              packageProfile: "appimage",
+            },
+          },
+        ],
       }),
     ).toBe(false);
     expect(
@@ -117,6 +157,71 @@ describe("signed update manifest contract", () => {
             url: "http://releases.example.invalid/archive",
           },
         ],
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects every removed public component selector", () => {
+    const check = TypeCompiler.Compile(UpdateManifestSchema);
+    for (const component of ["desktop", "headless", "cli", "service"]) {
+      expect(
+        check.Check({
+          ...manifest,
+          bundles: [{ ...manifest.bundles[0], component }],
+        }),
+      ).toBe(false);
+    }
+    expect(check.Check({ ...manifest, channel: "beta" })).toBe(false);
+  });
+});
+
+describe("unified product identity contract", () => {
+  it("accepts the shared TypeScript and Rust wire fixture", () => {
+    const fixture = JSON.parse(
+      readFileSync(
+        new URL(
+          "../../../test/fixtures/unified-product-identity.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as unknown;
+    expect(
+      TypeCompiler.Compile(ComponentIdentityReportSchema).Check(fixture),
+    ).toBe(true);
+  });
+
+  it("accepts only CMClient identities on supported target tuples", () => {
+    const identity = TypeCompiler.Compile(ProductIdentitySchema);
+    const target = TypeCompiler.Compile(ProductTargetSchema);
+
+    expect(identity.Check(gatewayIdentity.identity)).toBe(true);
+    expect(
+      identity.Check({
+        ...gatewayIdentity.identity,
+        sourceTree: `sha256:${"c".repeat(64)}`,
+      }),
+    ).toBe(true);
+    expect(
+      identity.Check({ ...gatewayIdentity.identity, product: "CMClient CLI" }),
+    ).toBe(false);
+    expect(
+      identity.Check({ ...gatewayIdentity.identity, sourceCommit: "unknown" }),
+    ).toBe(false);
+    expect(
+      target.Check({
+        os: "windows",
+        architecture: "aarch64",
+        profile: "native",
+        packageProfile: "setup",
+      }),
+    ).toBe(false);
+    expect(
+      target.Check({
+        os: "windows",
+        architecture: "x86_64",
+        profile: "docker",
+        packageProfile: "oci",
       }),
     ).toBe(false);
   });
@@ -170,43 +275,49 @@ describe("system capabilities contract", () => {
     const check = TypeCompiler.Compile(SystemCapabilitiesSchema);
     expect(
       check.Check({
-        schemaVersion: 1,
-        platform: "linux",
-        build: { version: "2.0.0-dev.0", commit: "abc123", channel: "dev" },
+        schemaVersion: 2,
+        identity: gatewayIdentity,
         capabilities: {
-          managementWeb: { available: true },
-          update: { available: true },
-          tray: {
+          managementWeb: { available: false, reasonCode: "owned_by_agent" },
+          commandMode: { available: false, reasonCode: "owned_by_agent" },
+          graphicalMode: {
             available: false,
-            reasonCode: "CAPABILITY_UNAVAILABLE_PLATFORM",
+            reasonCode: "owned_by_graphical_mode",
           },
+          loginAutostart: { available: false, reasonCode: "owned_by_agent" },
           serial: { available: true },
-          service: { available: true },
-          autoStart: { available: true },
-          docker: { available: true },
+          nativeUpdate: { available: false, reasonCode: "owned_by_agent" },
+          dockerPullRecreateUpdate: {
+            available: false,
+            reasonCode: "unavailable_in_native",
+          },
+          localControl: { available: false, reasonCode: "owned_by_agent" },
           remoteDispatch: {
             available: false,
-            reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
+            reasonCode: "not_enabled",
           },
         },
       }),
     ).toBe(true);
     expect(
       check.Check({
-        schemaVersion: 1,
-        platform: "linux",
-        build: { version: "2.0.0-dev.0", commit: "abc123", channel: "dev" },
+        schemaVersion: 2,
+        identity: gatewayIdentity,
         capabilities: {
-          managementWeb: { available: true },
-          update: { available: true },
-          tray: { available: false },
+          managementWeb: { available: false, reasonCode: "owned_by_agent" },
+          commandMode: { available: false, reasonCode: "owned_by_agent" },
+          graphicalMode: { available: false },
+          loginAutostart: { available: false, reasonCode: "owned_by_agent" },
           serial: { available: true },
-          service: { available: true },
-          autoStart: { available: true },
-          docker: { available: true },
+          nativeUpdate: { available: false, reasonCode: "owned_by_agent" },
+          dockerPullRecreateUpdate: {
+            available: false,
+            reasonCode: "unavailable_in_native",
+          },
+          localControl: { available: false, reasonCode: "owned_by_agent" },
           remoteDispatch: {
             available: false,
-            reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
+            reasonCode: "not_enabled",
           },
         },
       }),
@@ -220,8 +331,9 @@ describe("system status contract", () => {
 
     expect(
       check.Check({
+        schemaVersion: 2,
         health: "ok",
-        build: { version: "2.0.0-dev.0", commit: "abc123", channel: "dev" },
+        identity: gatewayIdentity,
       }),
     ).toBe(true);
     expect(check.Check({ health: "degraded" })).toBe(false);

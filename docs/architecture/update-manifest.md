@@ -1,27 +1,24 @@
 # Update Manifest Trust Boundary
 
-The Agent owns the manifest verification boundary before an update job enters
-`downloading`. It validates the protocol schema, strict SemVer values, UTC
-timestamp, exact component/target uniqueness, HTTPS transport, SHA-256 shape,
-and bundle size before it asks a downloader to fetch anything.
+The Agent verifies signed manifest schema v2 before an update job enters
+`downloading`. It validates the unified release identity, strict SemVer values,
+UTC timestamp, exact native target uniqueness, HTTPS transport, SHA-256 shape,
+and bundle size before opening a network stream.
 
-An update uses one configured, trusted Ed25519 public key selected by its known
-key identifier. The remote key identifier is compared to that local selection;
-it cannot redirect verification to an arbitrary key. Signing private keys stay
-outside the product runtime and must never be supplied through a Control API,
-CLI option, job payload, diagnostic bundle, or application log.
+One configured Ed25519 public key is selected locally by its known identifier.
+Remote metadata cannot redirect verification to an arbitrary key. Signing
+private keys never enter Control, CLI input, a job payload, diagnostics, or a
+runtime log.
 
-The signed bytes are `serde_json` compact serialization of `UpdateManifest` in
-the protocol field order. This is intentionally defined by the Rust Agent,
-which is the verifier and executor. `@cmclient/contracts` mirrors the public
-wire shape for clients, while duplicate component/target checks and Ed25519
-verification remain Agent-only trust decisions.
+The signed bytes are compact `serde_json` serialization of `UpdateManifest` in
+protocol field order. The Rust Agent is the verifier/executor and
+`@cmclient/contracts` mirrors the same public wire; the shared golden identity
+fixture guards cross-language drift. The manifest has no product-component
+selector. Bundle selection is by one exact native `ProductTarget`, while Docker
+OCI is intentionally unavailable to this updater.
 
-P09-T02 consumes the selected bundle by streaming it to staging, verifying its
-SHA-256 against the authenticated manifest, and retaining it only after both
-checks complete. The production HTTP client follows no redirects, accepts only
-successful responses, compares any declared Content-Length to the signed size,
-and rejects an underflow or overflow while streaming. Staging uses the
-Agent-owned OS cache path at `cache_dir/updates/staging`; it never writes into
-the data or configuration directories. A completed archive is named only by its
-validated SHA-256, synced before publication, and revalidated before reuse.
+The selected archive streams to Agent-owned staging, is checked against the
+authenticated size and SHA-256, and is retained only after both checks pass.
+The production client follows no redirects and rejects status, length,
+underflow, overflow, traversal, or extraction-limit failures. A staged archive
+is revalidated before reuse and before the runtime is stopped.

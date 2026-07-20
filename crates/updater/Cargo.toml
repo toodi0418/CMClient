@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22"
+cmclient-product-identity = { path = "../product-identity" }
 ed25519-dalek = "3"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 semver = "1"

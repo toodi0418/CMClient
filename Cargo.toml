@@ -8,6 +8,7 @@ members = [
   "crates/cli-client",
   "crates/control-api",
   "crates/legacy-migration",
+  "crates/product-identity",
   "crates/runtime-logging",
   "crates/supervisor",
   "crates/updater"

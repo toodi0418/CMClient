@@ -1,28 +1,33 @@
 # Signed Update Manifest Contract
 
-The Rust Agent is the only component that consumes and executes an update.
-Gateway, Web, Desktop, and CLI may display the Agent-owned update projection,
-but this RC exposes no public "start update" route. They never download an
-unverified archive or select a signing key. An update can be initiated only by
-the later Agent-owned release/update control flow after its signed manifest is
-available.
-
-The release service returns this JSON document:
+The Rust Agent is the only component that authenticates, downloads, and stages
+a native update. Other modes display its bounded status; they do not select a
+key or download an unverified archive.
 
 ```json
 {
   "manifest": {
-    "schemaVersion": 1,
-    "channel": "stable",
-    "version": "2.0.1",
+    "schemaVersion": 2,
+    "release": {
+      "schemaVersion": 1,
+      "product": "CMClient",
+      "version": "2.0.1",
+      "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceTree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "channel": "stable"
+    },
     "publishedAt": "2026-07-18T02:40:00.000Z",
     "minimumAgentVersion": "2.0.0",
     "bundles": [
       {
-        "component": "desktop",
-        "target": "darwin-aarch64",
+        "target": {
+          "os": "macos",
+          "architecture": "universal",
+          "profile": "native",
+          "packageProfile": "dmg"
+        },
         "archive": "tar.zst",
-        "url": "https://releases.example.invalid/cmclient/2.0.1/cmclient-desktop-darwin-aarch64-2.0.1.tar.zst",
+        "url": "https://releases.example.invalid/cmclient/2.0.1/macos-universal.tar.zst",
         "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "sizeBytes": 4096
       }
@@ -34,30 +39,14 @@ The release service returns this JSON document:
 }
 ```
 
-`manifest` is serialized as compact UTF-8 JSON in the declared field order and
-that exact byte sequence is signed with Ed25519. The signature does not cover
-the outer metadata. The Agent accepts a document only when `signingKeyId`
-equals its locally configured trusted key identifier and verification succeeds
-with that corresponding public key.
+Compact UTF-8 `manifest` JSON in declared field order is the Ed25519 signed
+payload. `signingKeyId` must equal the locally selected trusted key identifier.
+All fields are mandatory and reject unknown properties. The release identity,
+SemVer values, UTC millisecond timestamp, HTTPS URL, lowercase SHA-256, nonzero
+size, and unique native distribution target are validated before networking.
 
-The release workflow accepts the offline private key only as a base64-encoded
-PKCS#8 Ed25519 GitHub secret, reconstructs this exact canonical payload, and
-emits unpadded standard Base64 for `signature`. It never exposes the key to the
-Agent, Gateway, CLI, Desktop, command arguments, logs, or release artifacts.
-
-All fields are mandatory and reject unknown properties. `version` and
-`minimumAgentVersion` are strict SemVer. `publishedAt` is UTC with millisecond
-precision. A bundle is HTTPS only, has one lowercase 64-character SHA-256
-digest, a non-zero size, and is unique for its `(component, target)` pair.
-
-| Field | Values |
-| --- | --- |
-| `channel` | `stable`, `beta`, `dev` |
-| `component` | `desktop`, `headless`, `cli`, `service` |
-| `target` | `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64`, `linux-x86_64`, `windows-x86_64` |
-| `archive` | `tar.zst`, `zip` |
-
-Docker images are not in-place update bundles. The RC workflow exposes OCI
-archives as downloadable, source-bound workflow artifacts; it does not push a
-registry image or put Docker in the Agent manifest. Operators import and
-upgrade them with Docker tooling, never through Gateway or the Agent updater.
+There is no component selector. `desktop`, `headless`, `cli`, and `service`,
+manifest schema v1, and the old `beta` channel all fail deserialization or
+validation. A bundle targets the one installed CMClient product. Docker targets
+are also rejected because Docker update is the operator-owned pull/recreate
+workflow, never native Agent staging.

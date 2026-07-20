@@ -439,21 +439,26 @@ test("bundled Desktop runtime verification requires the complete Agent compositi
   );
 });
 
-test("release targets remain identical to the shared signed-update contract", async () => {
-  const updateContract = await readFile(
-    "packages/contracts/src/update.ts",
-    "utf8",
-  );
-  const match = updateContract.match(
-    /export const UPDATE_TARGETS = \[([\s\S]*?)\] as const;/,
-  );
-  assert.ok(match, "UPDATE_TARGETS must be declared in the shared contract");
-  const contractTargets = Array.from(
-    match[1].matchAll(/"([^"]+)"/g),
-    ([, target]) => target,
-  );
+test("legacy artifact targets cannot become unified update selectors", async () => {
+  const [updateContract, identityContract] = await Promise.all([
+    readFile("packages/contracts/src/update.ts", "utf8"),
+    readFile("packages/contracts/src/identity.ts", "utf8"),
+  ]);
 
-  assert.deepEqual(RELEASE_TARGETS, contractTargets);
+  assert.match(updateContract, /target: NativeDistributionTargetSchema/);
+  assert.doesNotMatch(
+    updateContract,
+    /UPDATE_TARGETS|UpdateComponent|component:/,
+  );
+  for (const target of RELEASE_TARGETS) {
+    assert.doesNotMatch(updateContract, new RegExp(`"${target}"`));
+  }
+  for (const packageProfile of ["setup", "dmg", "appimage"]) {
+    assert.match(
+      identityContract,
+      new RegExp(`packageProfile: Type\\.Literal\\("${packageProfile}"\\)`),
+    );
+  }
 });
 
 test("release artifact plan rejects unsupported values and non-SemVer versions", () => {

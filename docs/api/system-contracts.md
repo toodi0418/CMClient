@@ -1,27 +1,38 @@
-# System Version And Capabilities Contract
+# Unified Product Identity And Capability Contract
 
-`@cmclient/contracts` defines the schema-versioned payload shared by Agent,
-Gateway, Web, Desktop, and CLI for system version and capabilities. Gateway
-exposes this contract at `/api/v1/system/version` and
-`/api/v1/system/capabilities`.
+`@cmclient/contracts` and `cmclient-product-identity` define the same wire
+contract for Agent, Gateway, Web, graphical mode, command mode, and updater.
 
-`build` always identifies the version, source commit, and release channel.
-`builtAt` is present only when the build pipeline supplies a verified UTC
-timestamp. Development builds do not invent a build time.
+```text
+ReleaseIdentity v1
+  product = CMClient
+  version = strict SemVer
+  sourceCommit = lowercase 40-character Git commit ID
+  sourceTree = Git tree ID, or sha256 content identity for a dirty workspace
+  channel = dev | candidate | stable
 
-Every key in `capabilities` is mandatory. A capability with `available: false`
-must include a stable `reasonCode`, such as
-`CAPABILITY_UNAVAILABLE_PLATFORM` or `CAPABILITY_UNAVAILABLE_DOCKER`. Clients
-use these fields to hide or explain unavailable controls rather than guessing
-from the operating system.
+ProductTarget
+  profile = native | docker
+  os / architecture / packageProfile = one supported exact tuple
 
-`remoteDispatch` is a required capability key even though its first-phase
-contract is intentionally disabled. Gateway returns `available: false` with
-`REMOTE_DISPATCH_NOT_ENABLED`; clients must not infer availability from the
-presence of a route or task schema. The shared dispatch task/status schema does
-not create a compatibility path for removed sharing or command features.
+ComponentIdentityReport v1
+  component + ProductIdentity
+```
 
-The capability owner is part of the reason code: Desktop owns tray behavior,
-Agent owns lifecycle/update/Web behavior, and Docker owns only its constrained
-Gateway/Web/Ingress surface. A client must hide an unavailable action instead
-of rendering a button that cannot be executed.
+Supported targets are closed: Windows x86-64 workspace/Setup; macOS x86-64 or
+ARM64 workspace and Universal DMG; Linux x86-64 or ARM64 workspace/AppImage;
+and Linux x86-64 or ARM64 Docker OCI. Windows ARM64, macOS Docker, native OCI,
+and mismatched package profiles fail validation. A Universal DMG component
+reports `universal/dmg`; the CPU that executed it belongs in qualification
+evidence, not product identity.
+
+The capability keys are `managementWeb`, `commandMode`, `graphicalMode`,
+`loginAutostart`, `serial`, `nativeUpdate`, `dockerPullRecreateUpdate`,
+`localControl`, and `remoteDispatch`. False states accept only the closed reason
+set from the schema, including the exact Docker reason
+`unavailable_in_docker`. Unknown keys, unknown reasons, and incomplete false
+states fail validation.
+
+Clients use the identity nested in status/capabilities and do not maintain a
+second platform or profile field. That prevents a payload from claiming, for
+example, a native identity and Docker capabilities at the same time.

@@ -2,7 +2,7 @@ import {
   ApiErrorSchema,
   AprsOutboxEntryListSchema,
   AprsRuntimeStatusSchema,
-  BuildMetadataSchema,
+  ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
   JobAcceptedSchema,
   JobDetailSchema,
@@ -15,7 +15,7 @@ import {
   SystemCapabilitiesSchema,
   SystemHealthSchema,
   SystemStatusSchema,
-  type BuildMetadata,
+  type ComponentIdentityReport,
   type CallMeshOverview,
   type ApiError,
   type AprsOutboxEntryList,
@@ -155,7 +155,10 @@ export class GatewayApiClient {
     health: () =>
       this.request<SystemHealth>("/system/health", SystemHealthSchema),
     version: () =>
-      this.request<BuildMetadata>("/system/version", BuildMetadataSchema),
+      this.request<ComponentIdentityReport>(
+        "/system/version",
+        ComponentIdentityReportSchema,
+      ),
     capabilities: () =>
       this.request<SystemCapabilities>(
         "/system/capabilities",
@@ -320,7 +323,7 @@ function telemetryPath(query: TelemetryRangeQuery): string {
 
 export type GatewaySystemApi = {
   health: () => Promise<SystemHealth>;
-  version: () => Promise<BuildMetadata>;
+  version: () => Promise<ComponentIdentityReport>;
   capabilities: () => Promise<SystemCapabilities>;
   status: () => Promise<SystemStatus>;
 };

@@ -51,14 +51,16 @@ value-bearing route, and secret `DELETE` requires an empty body.
 Requests are capped at 8 KiB and JSON responses at 2 MiB. Control SSE events
 are capped at 60 KiB, the connection pool is capped at 64 concurrent requests
 or streams, and every operation keeps a bounded deadline. Control payloads use
-the Rust serde contract; lifecycle fields are snake_case while the nested
-update projection follows the shared `UpdateControlStatus` field names. A
+camelCase Rust serde contracts; the nested update projection follows the shared
+`UpdateControlStatus` field names. A
 transport or size violation maps to a stable `CONTROL_*` error rather than a
 raw parser message.
 
-Lifecycle status routes return the schema version, Agent version/state, Gateway
-lifecycle, Management Web listener state and its loopback URL (only when
-running), uptime, and the latest stable error code. The enable/disable commands
+Lifecycle status schema v3 returns the Agent component identity/state, Gateway
+lifecycle, Management Web listener state and its URL (only when running),
+uptime, and the latest stable error code. The identity contains the exact shared
+CMClient version, commit, tree/content digest, channel, and target. The
+`agentVersion`-only schema v2 shape is rejected. The enable/disable commands
 control only the optional loopback Management Web listener; the private Control
 API remains available in both states. This bounded endpoint exists to support
 local Agent control, CLI, and Desktop operations while Gateway is unavailable.

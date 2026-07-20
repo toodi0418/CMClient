@@ -956,14 +956,18 @@ test("platform-signed native bytes are re-finalized before checksums and provena
   const privateKeyBase64 = privateKey
     .export({ format: "der", type: "pkcs8" })
     .toString("base64");
-  await runFile(process.execPath, signManifestArguments, {
-    encoding: "utf8",
-    env: { ...process.env, CMCLIENT_TEST_SIGNING_KEY: privateKeyBase64 },
-  });
-  assert.equal(
-    JSON.parse(await readFile(updateManifest, "utf8")).manifest.version,
-    version,
+  await assert.rejects(
+    () =>
+      runFile(process.execPath, signManifestArguments, {
+        encoding: "utf8",
+        env: { ...process.env, CMCLIENT_TEST_SIGNING_KEY: "" },
+      }),
+    (error) => {
+      assert.match(error.stderr, /RELEASE_UNIFIED_UPDATE_INPUT_REQUIRED/);
+      return true;
+    },
   );
+  await assert.rejects(() => readFile(updateManifest, "utf8"), /ENOENT/);
 
   await writeFile(
     join(output, `cmclient-platform-signing-${targets[0]}-${version}.json`),
@@ -993,24 +997,38 @@ test("platform-signed native bytes are re-finalized before checksums and provena
 });
 
 test("signed update manifest is exact Ed25519 canonical payload data", () => {
-  const version = "2.0.0-dev.0";
-  const plan = releaseArtifactPlan(version);
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const signed = createSignedUpdateManifest({
-    artifacts: plan.map((artifact, index) => ({
-      ...artifact,
-      sha256: `${index.toString(16).padStart(2, "0")}`.repeat(32),
-      sizeBytes: index + 1,
-    })),
-    channel: "dev",
+    artifacts: [
+      {
+        target: {
+          os: "macos",
+          architecture: "universal",
+          profile: "native",
+          packageProfile: "dmg",
+        },
+        fileName: "macos-universal.tar.zst",
+        archive: "tar.zst",
+        sha256:
+          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        sizeBytes: 4096,
+      },
+    ],
     minimumAgentVersion: "2.0.0-dev.0",
     privateKeyBase64: privateKey
       .export({ format: "der", type: "pkcs8" })
       .toString("base64"),
-    publishedAt: "2026-07-18T08:00:00.000Z",
-    releaseBaseUrl: "https://releases.example.invalid/cmclient/2.0.0-dev.0",
+    publishedAt: "2026-07-18T02:40:00.000Z",
+    release: {
+      schemaVersion: 1,
+      product: "CMClient",
+      version: "2.0.0-dev.1",
+      sourceCommit: "1".repeat(40),
+      sourceTree: "2".repeat(40),
+      channel: "dev",
+    },
+    releaseBaseUrl: "https://releases.example.invalid/cmclient/2.0.0-dev.1",
     signingKeyId: "release-2026",
-    version,
   });
 
   assert.equal(signed.signatureAlgorithm, "ed25519");
@@ -1026,33 +1044,46 @@ test("signed update manifest is exact Ed25519 canonical payload data", () => {
   );
   const canonical = canonicalUpdateManifest(signed.manifest).toString("utf8");
   assert.equal(canonical, JSON.stringify(signed.manifest));
-  assert.match(
+  assert.equal(
     canonical,
-    /^\{"schemaVersion":1,"channel":"dev","version":"2\.0\.0-dev\.0","publishedAt":"2026-07-18T08:00:00\.000Z","minimumAgentVersion":"2\.0\.0-dev\.0","bundles":\[/,
+    '{"schemaVersion":2,"release":{"schemaVersion":1,"product":"CMClient","version":"2.0.0-dev.1","sourceCommit":"1111111111111111111111111111111111111111","sourceTree":"2222222222222222222222222222222222222222","channel":"dev"},"publishedAt":"2026-07-18T02:40:00.000Z","minimumAgentVersion":"2.0.0-dev.0","bundles":[{"target":{"os":"macos","architecture":"universal","profile":"native","packageProfile":"dmg"},"archive":"tar.zst","url":"https://releases.example.invalid/cmclient/2.0.0-dev.1/macos-universal.tar.zst","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","sizeBytes":4096}]}',
   );
-  assert.match(
-    canonical,
-    /\{"component":"desktop","target":"darwin-aarch64","archive":"tar\.zst","url":"https:\/\/releases\.example\.invalid\/cmclient\/2\.0\.0-dev\.0\/cmclient-desktop-darwin-aarch64-2\.0\.0-dev\.0\.tar\.zst","sha256":"(?:00){32}","sizeBytes":1\}/,
-  );
+  assert.doesNotMatch(canonical, /"component"\s*:/);
+  assert.doesNotMatch(canonical, /"(?:desktop|headless|cli|service)"/);
 });
 
 test("manifest creation rejects invalid publication inputs before signing", () => {
   const { privateKey } = generateKeyPairSync("ed25519");
-  const options = {
-    artifacts: releaseArtifactPlan("2.0.0").map((artifact) => ({
-      ...artifact,
-      sha256: "a".repeat(64),
-      sizeBytes: 1,
-    })),
+  const release = {
+    schemaVersion: 1,
+    product: "CMClient",
+    version: "2.0.0",
+    sourceCommit: sourceSha,
+    sourceTree: "1".repeat(40),
     channel: "stable",
+  };
+  const artifact = {
+    target: {
+      os: "windows",
+      architecture: "x86_64",
+      profile: "native",
+      packageProfile: "setup",
+    },
+    fileName: "cmclient-setup.zip",
+    archive: "zip",
+    sha256: "a".repeat(64),
+    sizeBytes: 1,
+  };
+  const options = {
+    artifacts: [artifact],
     minimumAgentVersion: "2.0.0",
     privateKeyBase64: privateKey
       .export({ format: "der", type: "pkcs8" })
       .toString("base64"),
     publishedAt: "2026-07-18T08:00:00.000Z",
+    release,
     releaseBaseUrl: "https://releases.example.invalid/cmclient/2.0.0",
     signingKeyId: "release-2026",
-    version: "2.0.0",
   };
 
   assert.throws(
@@ -1070,6 +1101,63 @@ test("manifest creation rejects invalid publication inputs before signing", () =
   assert.throws(
     () => createSignedUpdateManifest({ ...options, publishedAt: "2026-07-18" }),
     /RELEASE_MANIFEST_PUBLISHED_AT_INVALID/,
+  );
+  for (const component of ["desktop", "headless", "cli", "service"]) {
+    assert.throws(
+      () =>
+        createSignedUpdateManifest({
+          ...options,
+          artifacts: [{ ...artifact, component }],
+        }),
+      /RELEASE_MANIFEST_ARTIFACTS_INVALID/,
+    );
+  }
+  assert.throws(
+    () =>
+      createSignedUpdateManifest({
+        ...options,
+        release: { ...release, channel: "beta" },
+      }),
+    /RELEASE_MANIFEST_RELEASE_IDENTITY_INVALID/,
+  );
+  assert.throws(
+    () =>
+      createSignedUpdateManifest({
+        ...options,
+        release: { ...release, sourceTree: "unknown" },
+      }),
+    /RELEASE_MANIFEST_RELEASE_IDENTITY_INVALID/,
+  );
+  assert.throws(
+    () =>
+      createSignedUpdateManifest({
+        ...options,
+        artifacts: [{ ...artifact, target: "windows-x86_64" }],
+      }),
+    /RELEASE_MANIFEST_ARTIFACTS_INVALID/,
+  );
+  assert.throws(
+    () =>
+      createSignedUpdateManifest({
+        ...options,
+        artifacts: [
+          {
+            ...artifact,
+            target: { ...artifact.target, architecture: "aarch64" },
+          },
+        ],
+      }),
+    /RELEASE_MANIFEST_ARTIFACTS_INVALID/,
+  );
+
+  const signed = createSignedUpdateManifest(options);
+  assert.throws(
+    () =>
+      canonicalUpdateManifest({
+        ...signed.manifest,
+        schemaVersion: 1,
+      }),
+    /RELEASE_MANIFEST_INVALID/,
   );
 });
 
@@ -1172,6 +1260,8 @@ test("release workflow gates provenance and signing behind immutable release inp
   assert.match(sbomStep, /dir:release-build/);
   assert.match(sbomStep, /spdx-json=release-dist/);
   assert.match(workflow, /cosign sign-blob --yes/);
+  assert.match(workflow, /options: \[stable, candidate, dev\]/);
+  assert.doesNotMatch(workflow, /options: \[[^\]]*beta/);
   assert.match(workflow, /subject-checksums: release-dist\/SHA256SUMS/);
   assert.match(workflow, /id-token: write/);
   assert.match(workflow, /attestations: write/);
@@ -1274,13 +1364,15 @@ test("release workflow gates provenance and signing behind immutable release inp
   assert.match(signingJob, /cosign verify-blob/);
   assert.match(
     signingJob,
-    /Sign canonical Agent manifest[\s\S]*CMCLIENT_UPDATE_SIGNING_KEY: \$\{\{ secrets\.CMCLIENT_UPDATE_SIGNING_KEY \}\}/,
+    /Sign canonical unified CMClient manifest[\s\S]*CMCLIENT_UPDATE_SIGNING_KEY: \$\{\{ secrets\.CMCLIENT_UPDATE_SIGNING_KEY \}\}/,
   );
   assert.doesNotMatch(signingJob, /if:.*secrets\.CMCLIENT_UPDATE_SIGNING_KEY/);
   assert.doesNotMatch(
     signingJob.slice(
       0,
-      signingJob.indexOf("      - name: Sign canonical Agent manifest"),
+      signingJob.indexOf(
+        "      - name: Sign canonical unified CMClient manifest",
+      ),
     ),
     /CMCLIENT_UPDATE_SIGNING_KEY:/,
   );
@@ -1315,7 +1407,7 @@ async function createOciFixture(
         Env: [
           `CMCLIENT_BUILD_VERSION=${version}`,
           `CMCLIENT_BUILD_COMMIT=${revision}`,
-          `CMCLIENT_BUILD_CHANNEL=${version.includes("-dev.") ? "dev" : version.includes("-") ? "beta" : "stable"}`,
+          `CMCLIENT_BUILD_CHANNEL=${version.includes("-dev.") ? "dev" : version.includes("-") ? "candidate" : "stable"}`,
         ],
         Labels: {
           "org.opencontainers.image.created": createdAt,

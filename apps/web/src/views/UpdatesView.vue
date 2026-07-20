@@ -11,7 +11,7 @@ const gateway = useGatewayStore();
 const updates = useUpdatesStore();
 const { locale, t } = useI18n();
 const updateCapability = computed(
-  () => gateway.capabilities?.capabilities.update,
+  () => gateway.capabilities?.capabilities.nativeUpdate,
 );
 const job = computed(() => updates.status?.job);
 const phase = computed(() => job.value?.phase ?? "idle");
@@ -155,11 +155,11 @@ onUnmounted(() => updates.stop());
       <dl class="facts-grid">
         <div>
           <dt>{{ t("updates.currentVersion") }}</dt>
-          <dd>{{ gateway.status?.build.version ?? "--" }}</dd>
+          <dd>{{ gateway.status?.identity.identity.version ?? "--" }}</dd>
         </div>
         <div>
           <dt>{{ t("updates.channel") }}</dt>
-          <dd>{{ gateway.status?.build.channel ?? "--" }}</dd>
+          <dd>{{ gateway.status?.identity.identity.channel ?? "--" }}</dd>
         </div>
         <div>
           <dt>{{ t("updates.owner") }}</dt>

@@ -12,10 +12,11 @@ use cmclient_agent_core::{
 use cmclient_control_api::{
     ControlClient, ControlCommand, ControlEndpoint, ControlError, ControlHandler,
     ControlSecretKind, ControlServer, ControlStatus, ControlUpdateEvent, ControlUpdateEventStream,
-    DiagnosticsControlBundle, GatewayControlStatus, GatewayProjection, ManagementWebControlStatus,
-    REMOTE_CONTROL_NONCE_HEADER, REMOTE_CONTROL_SCOPE_HEADER, REMOTE_CONTROL_TIMESTAMP_HEADER,
-    RemoteControlAuth, RemoteControlAuthError, RemoteControlReplayGuard, UpdateControlJob,
-    UpdateControlStatus, default_local_endpoint,
+    DiagnosticsControlBundle, GatewayControlStatus, GatewayProjection, InternalComponent,
+    ManagementWebControlStatus, REMOTE_CONTROL_NONCE_HEADER, REMOTE_CONTROL_SCOPE_HEADER,
+    REMOTE_CONTROL_TIMESTAMP_HEADER, RemoteControlAuth, RemoteControlAuthError,
+    RemoteControlReplayGuard, UpdateControlJob, UpdateControlStatus, compiled_component_identity,
+    default_local_endpoint,
 };
 use cmclient_runtime_logging::{LogLevel, LogPolicy, StructuredLogSink};
 use cmclient_supervisor::{
@@ -659,6 +660,7 @@ fn is_safe_sse_token(value: &str) -> bool {
 }
 
 struct AgentController {
+    identity: cmclient_control_api::ComponentIdentityReport,
     supervisor: Mutex<Option<GatewaySupervisor>>,
     runtime_log: Option<StructuredLogSink>,
     gateway: SocketAddr,
@@ -743,6 +745,8 @@ impl AgentController {
         config: &AgentConfig,
         secrets: AgentSecretStore,
     ) -> Result<Self, ControlError> {
+        let identity = compiled_component_identity(InternalComponent::Agent)
+            .map_err(|_| ControlError::CommandFailed)?;
         let mut initial_log_error_code = None;
         let log_policy = match LogPolicy::from_environment() {
             Ok(policy) => Some(policy),
@@ -778,15 +782,35 @@ impl AgentController {
                     (String::from("CMCLIENT_SUPERVISED"), String::from("1")),
                     (
                         String::from("CMCLIENT_BUILD_VERSION"),
-                        String::from(env!("CARGO_PKG_VERSION")),
+                        identity.identity.version.clone(),
                     ),
                     (
                         String::from("CMCLIENT_BUILD_COMMIT"),
-                        compiled_build_commit(),
+                        identity.identity.source_commit.clone(),
+                    ),
+                    (
+                        String::from("CMCLIENT_BUILD_TREE"),
+                        identity.identity.source_tree.clone(),
                     ),
                     (
                         String::from("CMCLIENT_BUILD_CHANNEL"),
-                        String::from(compiled_build_channel()),
+                        String::from(identity.identity.channel.as_str()),
+                    ),
+                    (
+                        String::from("CMCLIENT_RUNTIME_PROFILE"),
+                        String::from(identity.identity.target.profile.as_str()),
+                    ),
+                    (
+                        String::from("CMCLIENT_PACKAGE_PROFILE"),
+                        String::from(identity.identity.target.package_profile.as_str()),
+                    ),
+                    (
+                        String::from("CMCLIENT_TARGET_OS"),
+                        String::from(identity.identity.target.os.as_str()),
+                    ),
+                    (
+                        String::from("CMCLIENT_TARGET_ARCHITECTURE"),
+                        String::from(identity.identity.target.architecture.as_str()),
                     ),
                     (
                         String::from("CMCLIENT_GATEWAY_HOST"),
@@ -943,6 +967,7 @@ impl AgentController {
             None
         };
         let controller = Self {
+            identity,
             supervisor: Mutex::new(supervisor),
             runtime_log,
             gateway: gateway_address(config.gateway_port),
@@ -1021,9 +1046,9 @@ impl AgentController {
             }
         };
         Ok(ControlStatus {
-            schema_version: 2,
+            schema_version: 3,
             agent: String::from("running"),
-            agent_version: String::from(env!("CARGO_PKG_VERSION")),
+            identity: self.identity.clone(),
             gateway,
             management_web,
             management_web_url,
@@ -1400,8 +1425,8 @@ impl ControlHandler for AgentController {
         let status = self.status()?;
         let update = self.updates.status()?;
         Ok(DiagnosticsControlBundle {
-            schema_version: 1,
-            agent_version: status.agent_version,
+            schema_version: 2,
+            identity: status.identity,
             gateway: status.gateway,
             management_web: status.management_web,
             latest_error_code: status.latest_error_code,
@@ -2034,23 +2059,6 @@ fn gateway_address(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-fn compiled_build_commit() -> String {
-    option_env!("CMCLIENT_BUILD_COMMIT")
-        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .unwrap_or("unknown")
-        .to_owned()
-}
-
-fn compiled_build_channel() -> &'static str {
-    if env!("CARGO_PKG_VERSION").contains("-dev.") {
-        "dev"
-    } else if env!("CARGO_PKG_VERSION").contains('-') {
-        "beta"
-    } else {
-        "stable"
-    }
-}
-
 fn resolve_static_web_root() -> PathBuf {
     if let Some(path) = std::env::var_os("CMCLIENT_WEB_ROOT") {
         return PathBuf::from(path);
@@ -2096,8 +2104,8 @@ fn bundled_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, AgentController, AgentSecretStore, ControlHandler, ManagementWebRequest,
-        SecretKind, apply_aprs_environment, compiled_build_channel, compiled_build_commit,
+        AgentConfig, AgentController, AgentSecretStore, ControlHandler, InternalComponent,
+        ManagementWebRequest, SecretKind, apply_aprs_environment, compiled_component_identity,
         dispatch_remote_control,
     };
     #[cfg(not(target_os = "windows"))]
@@ -2153,12 +2161,16 @@ mod tests {
     };
 
     #[test]
-    fn derives_release_candidate_identity_for_the_gateway_child() {
-        assert_eq!(compiled_build_channel(), "beta");
-        let commit = compiled_build_commit();
+    fn derives_exact_workspace_identity_for_the_gateway_child() {
+        let report = compiled_component_identity(InternalComponent::Agent).unwrap();
+        assert_eq!(report.identity.product, "CMClient");
+        assert_eq!(report.identity.channel.as_str(), "dev");
+        report.validate().unwrap();
+        assert_eq!(report.identity.source_commit.len(), 40);
         assert!(
-            commit == "unknown"
-                || (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            report.identity.source_tree.len() == 40
+                || (report.identity.source_tree.len() == 71
+                    && report.identity.source_tree.starts_with("sha256:"))
         );
     }
 
@@ -3321,9 +3333,9 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("test directory should exist");
         let endpoint = default_local_endpoint(&data_dir);
         let status = ControlStatus {
-            schema_version: 2,
+            schema_version: 3,
             agent: String::from("running"),
-            agent_version: String::from("2.0.0-test"),
+            identity: compiled_component_identity(InternalComponent::Agent).unwrap(),
             gateway: GatewayControlStatus::Running,
             management_web: ManagementWebControlStatus::Running,
             management_web_url: Some(String::from("https://cmclient.example")),
@@ -3373,7 +3385,9 @@ mod tests {
 
         let allowed = invoke_management_api(Arc::clone(&api), request.clone());
         assert!(allowed.starts_with("HTTP/1.1 200 OK"));
-        assert!(allowed.contains(r#""agent_version":"2.0.0-test""#));
+        assert!(allowed.contains(r#""product":"CMClient""#));
+        assert!(allowed.contains(r#""component":"agent""#));
+        assert!(!allowed.contains("agentVersion"));
         server_thread
             .join()
             .expect("control server thread should join")

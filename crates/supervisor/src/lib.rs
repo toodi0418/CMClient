@@ -696,8 +696,27 @@ mod tests {
             matches!(event, SupervisorEvent::Started { .. })
         });
 
-        // Deliberately do not poll while the child crosses the stable window and exits.
-        thread::sleep(Duration::from_millis(300));
+        // Wait for the OS process to exit without advancing supervisor state. The next tick
+        // must therefore be the first supervisor observation after the stable window.
+        let exit_deadline = Instant::now() + Duration::from_secs(2);
+        while supervisor
+            .child
+            .as_mut()
+            .expect("child should still be supervised")
+            .try_wait()
+            .expect("child status should be readable")
+            .is_none()
+        {
+            assert!(Instant::now() < exit_deadline, "child exit timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            supervisor
+                .started_at
+                .expect("child start should be tracked")
+                .elapsed()
+                >= stable_window
+        );
         assert_eq!(
             supervisor.tick().expect("exit should be observed"),
             SupervisorEvent::Exited {

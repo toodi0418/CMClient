@@ -150,7 +150,7 @@ verify each JSON report before starting Agent.
 | `JOB_INTERRUPTED_BY_RESTART` | A non-terminal Job was interrupted | Inspect the persisted Job; resubmit only if its operation is safe |
 | `UPDATE_ROLLBACK_FAILED` | Update recovery did not complete | Preserve the journal/backups and stop automatic retries |
 | `REMOTE_CONTROL_NONCE_REPLAY` | HMAC nonce was already used | Generate a fresh nonce and check clock synchronization |
-| `CAPABILITY_UNAVAILABLE_DOCKER` | Host-only capability is unavailable in Docker | Use a Host Agent for serial/service/update operations |
+| `unavailable_in_docker` | Native-only capability is unavailable in Docker | Use the applicable native mode or the Docker operator workflow |
 
 Never “fix” a stable error by weakening validation, exposing a raw Gateway
 port, or copying a credential into a log. Preserve the trace ID and sanitized

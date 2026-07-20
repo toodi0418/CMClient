@@ -765,6 +765,7 @@ version = "2.0.0-rc.1"
 name = "cmclient-control-api"
 version = "2.0.0-rc.1"
 dependencies = [
+ "cmclient-product-identity",
  "hmac",
  "interprocess",
  "serde",
@@ -806,6 +807,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmclient-product-identity"
+version = "2.0.0-rc.1"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "cmclient-runtime-logging"
 version = "2.0.0-rc.1"
 dependencies = [
@@ -835,6 +846,7 @@ name = "cmclient-updater"
 version = "2.0.0-rc.1"
 dependencies = [
  "base64 0.22.1",
+ "cmclient-product-identity",
  "ed25519-dalek",
  "reqwest",
  "semver",

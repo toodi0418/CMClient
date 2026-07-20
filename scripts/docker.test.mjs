@@ -50,6 +50,10 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
     /CMCLIENT_BUILD_VERSION=\$\{CMCLIENT_BUILD_VERSION\}/,
   );
   assert.match(dockerfile, /CMCLIENT_BUILD_COMMIT=\$\{CMCLIENT_BUILD_COMMIT\}/);
+  assert.match(dockerfile, /CMCLIENT_BUILD_TREE=\$\{CMCLIENT_BUILD_TREE\}/);
+  assert.match(dockerfile, /CMCLIENT_RUNTIME_PROFILE=docker/);
+  assert.match(dockerfile, /CMCLIENT_PACKAGE_PROFILE=oci/);
+  assert.match(dockerfile, /CMCLIENT_TARGET_OS=linux/);
   assert.equal(
     (
       dockerfile.match(
@@ -59,8 +63,10 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
     2,
   );
   assert.match(entrypoint, /env: gatewayEnvironment\(\)/);
-  assert.match(runtime, /CMCLIENT_DEPLOYMENT_MODE: "docker"/);
-  assert.match(compose, /CMCLIENT_DEPLOYMENT_MODE: docker/);
+  assert.match(runtime, /CMCLIENT_RUNTIME_PROFILE: "docker"/);
+  assert.match(runtime, /CMCLIENT_PACKAGE_PROFILE: "oci"/);
+  assert.match(compose, /CMCLIENT_RUNTIME_PROFILE: docker/);
+  assert.match(compose, /CMCLIENT_PACKAGE_PROFILE: oci/);
   assert.match(compose, /CMCLIENT_GATEWAY_HOST: 0\.0\.0\.0/);
   assert.match(compose, /cmclient-internal:\n {4}internal: true/);
   assert.match(compose, /cmclient-web:\n {4}internal: true/);
@@ -144,7 +150,15 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
   );
   assert.match(
     releaseWorkflow,
+    /--build-arg "CMCLIENT_BUILD_TREE=\$source_tree"/,
+  );
+  assert.match(
+    releaseWorkflow,
     /--build-arg "CMCLIENT_BUILD_CHANNEL=\$build_channel"/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /--build-arg "CMCLIENT_TARGET_ARCHITECTURE=\$target_architecture"/,
   );
   assert.match(
     releaseWorkflow,

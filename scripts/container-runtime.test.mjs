@@ -248,12 +248,13 @@ test("container ingress rejects alternate targets and fails closed when Web is u
 test("container runtime forces Docker mode and validates its internal upstream", () => {
   assert.deepEqual(
     gatewayEnvironment({
-      CMCLIENT_DEPLOYMENT_MODE: "desktop",
+      CMCLIENT_RUNTIME_PROFILE: "native",
       CMCLIENT_GATEWAY_HOST: "127.0.0.1",
       CMCLIENT_GATEWAY_PORT: "9191",
     }),
     {
-      CMCLIENT_DEPLOYMENT_MODE: "docker",
+      CMCLIENT_RUNTIME_PROFILE: "docker",
+      CMCLIENT_PACKAGE_PROFILE: "oci",
       CMCLIENT_GATEWAY_HOST: "0.0.0.0",
       CMCLIENT_GATEWAY_PORT: "9191",
     },

@@ -1,9 +1,22 @@
 import { expect, test, type Page } from "@playwright/test";
 
-const build = {
-  version: "2.0.0-e2e",
-  commit: "e2e-fixture",
-  channel: "dev",
+const identity = {
+  schemaVersion: 1,
+  component: "gateway",
+  identity: {
+    schemaVersion: 1,
+    product: "CMClient",
+    version: "2.0.0-e2e",
+    sourceCommit: "a".repeat(40),
+    sourceTree: "b".repeat(40),
+    channel: "dev",
+    target: {
+      os: "linux",
+      architecture: "x86_64",
+      profile: "native",
+      packageProfile: "workspace",
+    },
+  },
 };
 const updateStatus = {
   schemaVersion: 1,
@@ -65,7 +78,7 @@ test("settings and update status remain usable on desktop", async ({
   await expect(workspace.getByText("下載中", { exact: true })).toBeVisible();
   await expect(workspace.getByText("512 KiB / 1 MiB")).toBeVisible();
   await expect(workspace.getByText("UPDATE_SIGNATURE_VERIFIED")).toBeVisible();
-  await expect(workspace.getByText("CAPABILITY_OWNED_BY_AGENT")).toBeVisible();
+  await expect(workspace.getByText("owned_by_agent")).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });
 
@@ -247,7 +260,7 @@ test("remote dispatch stays visibly fail-closed behind its capability", async ({
   await expect(
     page.getByRole("heading", { name: "Dispatch service status" }),
   ).toBeVisible();
-  await expect(page.getByText("REMOTE_DISPATCH_NOT_ENABLED")).toBeVisible();
+  await expect(page.getByText("not_enabled")).toBeVisible();
 });
 
 test("LAN management login unlocks protected commands with the CSRF token", async ({
@@ -262,7 +275,7 @@ test("LAN management login unlocks protected commands with the CSRF token", asyn
       contentType: "application/json",
       body: JSON.stringify(
         authenticated
-          ? { health: "ok", build }
+          ? { schemaVersion: 2, health: "ok", identity }
           : { code: "MANAGEMENT_SESSION_INVALID" },
       ),
     }),
@@ -343,37 +356,31 @@ async function mockGateway(page: Page): Promise<void> {
   await page.route("**/api/v1/system/status", (route) =>
     route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify({ health: "ok", build }),
+      body: JSON.stringify({ schemaVersion: 2, health: "ok", identity }),
     }),
   );
   await page.route("**/api/v1/system/capabilities", (route) =>
     route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({
-        schemaVersion: 1,
-        platform: "linux",
-        build,
+        schemaVersion: 2,
+        identity,
         capabilities: {
-          managementWeb: {
+          managementWeb: { available: false, reasonCode: "owned_by_agent" },
+          commandMode: { available: false, reasonCode: "owned_by_agent" },
+          graphicalMode: {
             available: false,
-            reasonCode: "CAPABILITY_OWNED_BY_AGENT",
+            reasonCode: "owned_by_graphical_mode",
           },
-          update: { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
-          tray: { available: false, reasonCode: "CAPABILITY_OWNED_BY_DESKTOP" },
-          serial: { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
-          service: {
+          loginAutostart: { available: false, reasonCode: "owned_by_agent" },
+          serial: { available: false, reasonCode: "not_configured" },
+          nativeUpdate: { available: false, reasonCode: "owned_by_agent" },
+          dockerPullRecreateUpdate: {
             available: false,
-            reasonCode: "CAPABILITY_OWNED_BY_AGENT",
+            reasonCode: "unavailable_in_native",
           },
-          autoStart: {
-            available: false,
-            reasonCode: "CAPABILITY_OWNED_BY_AGENT",
-          },
-          docker: { available: true },
-          remoteDispatch: {
-            available: false,
-            reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
-          },
+          localControl: { available: false, reasonCode: "owned_by_agent" },
+          remoteDispatch: { available: false, reasonCode: "not_enabled" },
         },
       }),
     }),

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cmclient-product-identity = { path = "../product-identity" }
 hmac = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

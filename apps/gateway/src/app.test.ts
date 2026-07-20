@@ -27,14 +27,14 @@ describe("GatewayRuntime", () => {
   it("allows a wildcard bind only for the constrained Docker runtime", () => {
     expect(
       parseGatewayListenOptions({
-        CMCLIENT_DEPLOYMENT_MODE: "docker",
+        CMCLIENT_RUNTIME_PROFILE: "docker",
         CMCLIENT_GATEWAY_HOST: "0.0.0.0",
         CMCLIENT_GATEWAY_PORT: "8081",
       }),
     ).toEqual({ host: "0.0.0.0", port: 8081 });
     expect(() =>
       parseGatewayListenOptions({
-        CMCLIENT_DEPLOYMENT_MODE: "desktop",
+        CMCLIENT_RUNTIME_PROFILE: "native",
         CMCLIENT_GATEWAY_HOST: "0.0.0.0",
       }),
     ).toThrow(GatewayConfigurationError);
@@ -81,22 +81,34 @@ describe("GatewayRuntime", () => {
 
   it("serves schema-backed system endpoints", async () => {
     const app = createGatewayApp(new MemoryLogger());
-    const [health, version, capabilities, aprs] = await Promise.all([
+    const [health, version, capabilities, status, aprs] = await Promise.all([
       app.inject("/api/v1/system/health"),
       app.inject("/api/v1/system/version"),
       app.inject("/api/v1/system/capabilities"),
+      app.inject("/api/v1/system/status"),
       app.inject("/api/v1/aprs"),
     ]);
     expect(health.json()).toEqual({ status: "ok" });
     expect(version.json()).toMatchObject({
-      version: "2.0.0-rc.1",
-      channel: "beta",
+      component: "gateway",
+      identity: {
+        product: "CMClient",
+        version: "2.0.0-rc.1",
+        channel: "dev",
+        target: { profile: "native", packageProfile: "workspace" },
+      },
     });
     expect(capabilities.json()).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
+      identity: version.json(),
       capabilities: {
-        serial: { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
+        serial: { available: false, reasonCode: "not_configured" },
       },
+    });
+    expect(status.json()).toEqual({
+      schemaVersion: 2,
+      health: "ok",
+      identity: version.json(),
     });
     expect(aprs.json()).toEqual({
       configured: false,

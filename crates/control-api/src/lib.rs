@@ -1,5 +1,10 @@
 //! Local Agent control API over Unix sockets or Windows named pipes.
 
+pub use cmclient_product_identity::{
+    ComponentIdentityReport, IdentityError, InternalComponent, PackageProfile, ProductIdentity,
+    ProductTarget, ReleaseChannel, ReleaseIdentity, RuntimeProfile, TargetArchitecture,
+    TargetOperatingSystem, compiled_component_identity,
+};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -239,10 +244,11 @@ impl ControlEndpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControlStatus {
     pub schema_version: u8,
     pub agent: String,
-    pub agent_version: String,
+    pub identity: ComponentIdentityReport,
     pub gateway: GatewayControlStatus,
     pub management_web: ManagementWebControlStatus,
     pub management_web_url: Option<String>,
@@ -281,7 +287,7 @@ pub struct UpdateControlStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiagnosticsControlBundle {
     pub schema_version: u8,
-    pub agent_version: String,
+    pub identity: ComponentIdentityReport,
     pub gateway: GatewayControlStatus,
     pub management_web: ManagementWebControlStatus,
     pub latest_error_code: Option<String>,
@@ -1322,6 +1328,7 @@ mod windows {
 
     const MAX_REQUEST_BYTES: usize = 8 * 1024;
     const CONTROL_SERVER_IO_TIMEOUT: Duration = Duration::from_secs(30);
+    const CONTROL_PIPE_WRITE_CHUNK_BYTES: usize = 256;
 
     pub struct ControlServer {
         listener: Listener,
@@ -1813,7 +1820,8 @@ mod windows {
         deadline: Instant,
     ) -> Result<(), ControlError> {
         while !bytes.is_empty() {
-            match stream.write(bytes) {
+            let chunk_length = bytes.len().min(CONTROL_PIPE_WRITE_CHUNK_BYTES);
+            match stream.write(&bytes[..chunk_length]) {
                 Ok(0) => {
                     if Instant::now() >= deadline {
                         return Err(ControlError::Timeout);
@@ -1945,8 +1953,8 @@ mod windows {
     mod tests {
         use super::{ControlClient, ControlServer};
         use crate::{
-            ControlEndpoint, ControlError, ControlStatus, GatewayControlStatus,
-            ManagementWebControlStatus, StaticControlHandler,
+            ControlEndpoint, ControlError, ControlStatus, GatewayControlStatus, InternalComponent,
+            ManagementWebControlStatus, StaticControlHandler, compiled_component_identity,
         };
         use interprocess::local_socket::{Listener, ListenerOptions, Stream, prelude::*};
         use std::{
@@ -1957,9 +1965,9 @@ mod windows {
 
         fn status() -> ControlStatus {
             ControlStatus {
-                schema_version: 2,
+                schema_version: 3,
                 agent: String::from("running"),
-                agent_version: String::from("2.0.0-dev.0"),
+                identity: compiled_component_identity(InternalComponent::Agent).unwrap(),
                 gateway: GatewayControlStatus::Running,
                 management_web: ManagementWebControlStatus::Disabled,
                 management_web_url: None,
@@ -2022,6 +2030,48 @@ mod windows {
                 .join()
                 .expect("server thread should join")
                 .expect("server should serve request");
+        }
+
+        #[test]
+        fn transfers_more_than_one_named_pipe_buffer() {
+            let endpoint = endpoint("multi-buffer");
+            let listener = listener(&endpoint);
+            let expected = vec![b'x'; 2 * 1024];
+            let server_payload = expected.clone();
+            let server_thread = std::thread::spawn(move || {
+                let mut stream = listener.accept().expect("client should connect");
+                stream
+                    .set_nonblocking(true)
+                    .expect("server stream should become nonblocking");
+                super::write_all_until(
+                    &mut stream,
+                    &server_payload,
+                    super::deadline_after(Duration::from_secs(2)).unwrap(),
+                )
+            });
+
+            let ControlEndpoint::NamedPipe(path) = &endpoint else {
+                panic!("test endpoint must be a named pipe");
+            };
+            let mut stream =
+                Stream::connect(super::pipe_name(path).unwrap()).expect("client should connect");
+            stream
+                .set_nonblocking(true)
+                .expect("client stream should become nonblocking");
+            let deadline = super::deadline_after(Duration::from_secs(2)).unwrap();
+            let mut received = Vec::new();
+            let mut chunk = [0_u8; 256];
+            while received.len() < expected.len() {
+                let count = super::read_until(&mut stream, &mut chunk, deadline)
+                    .expect("payload should arrive before the deadline");
+                received.extend_from_slice(&chunk[..count]);
+            }
+
+            assert_eq!(received, expected);
+            server_thread
+                .join()
+                .expect("server thread should join")
+                .expect("server should write the complete payload");
         }
 
         #[test]
@@ -2278,8 +2328,9 @@ mod tests {
     use super::{ControlClient, ControlServer};
     use super::{
         ControlError, ControlHandler, ControlSecretKind, ControlStatus, GatewayControlStatus,
-        ManagementWebControlStatus, RemoteControlAuthError, RemoteControlReplayGuard,
-        StaticControlHandler, is_local_endpoint, sign_remote_control_request,
+        InternalComponent, ManagementWebControlStatus, RemoteControlAuthError,
+        RemoteControlReplayGuard, StaticControlHandler, compiled_component_identity,
+        is_local_endpoint, sign_remote_control_request,
     };
     #[cfg(unix)]
     use super::{
@@ -2330,15 +2381,40 @@ mod tests {
     }
     fn status() -> ControlStatus {
         ControlStatus {
-            schema_version: 2,
+            schema_version: 3,
             agent: String::from("running"),
-            agent_version: String::from("2.0.0-dev.0"),
+            identity: compiled_component_identity(InternalComponent::Agent).unwrap(),
             gateway: GatewayControlStatus::Running,
             management_web: ManagementWebControlStatus::Running,
             management_web_url: Some(String::from("http://127.0.0.1:7080")),
             uptime_seconds: 1,
             latest_error_code: None,
         }
+    }
+
+    #[test]
+    fn control_status_requires_the_v3_component_identity_wire() {
+        let current = status();
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["schemaVersion"], 3);
+        assert_eq!(encoded["identity"]["component"], "agent");
+        assert!(encoded.get("agentVersion").is_none());
+        assert_eq!(
+            serde_json::from_value::<ControlStatus>(encoded).unwrap(),
+            current
+        );
+
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "agent": "running",
+            "agent_version": "2.0.0-rc.1",
+            "gateway": "running",
+            "management_web": "running",
+            "management_web_url": null,
+            "uptime_seconds": 1,
+            "latest_error_code": null
+        });
+        assert!(serde_json::from_value::<ControlStatus>(legacy).is_err());
     }
 
     struct LegacyAprsSecretHandler {
@@ -2502,8 +2578,8 @@ mod tests {
 
         fn diagnostics_bundle(&self) -> Result<DiagnosticsControlBundle, ControlError> {
             Ok(DiagnosticsControlBundle {
-                schema_version: 1,
-                agent_version: String::from("2.0.0-dev.0"),
+                schema_version: 2,
+                identity: compiled_component_identity(InternalComponent::Agent).unwrap(),
                 gateway: GatewayControlStatus::Running,
                 management_web: ManagementWebControlStatus::Running,
                 latest_error_code: Some(String::from("GATEWAY_HEALTH_DEGRADED")),

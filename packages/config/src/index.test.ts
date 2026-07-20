@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseBuildMetadata, parseRuntimeConfig } from "./index";
+import { parseProductIdentity, parseRuntimeConfig } from "./index";
 
 describe("parseRuntimeConfig", () => {
   it("uses safe defaults for invalid ports", () => {
@@ -20,23 +20,70 @@ describe("parseRuntimeConfig", () => {
   });
 });
 
-describe("parseBuildMetadata", () => {
-  it("uses CI metadata without treating it as runtime configuration", () => {
+describe("parseProductIdentity", () => {
+  it("uses one exact build and target identity", () => {
     expect(
-      parseBuildMetadata(
+      parseProductIdentity(
         {
           CMCLIENT_BUILD_VERSION: "2.0.0",
-          CMCLIENT_BUILD_COMMIT: "deadbeef",
-          CMCLIENT_BUILD_TIMESTAMP: "2030-01-02T03:04:05.000Z",
-          CMCLIENT_RELEASE_CHANNEL: "beta",
+          CMCLIENT_BUILD_COMMIT: "a".repeat(40),
+          CMCLIENT_BUILD_TREE: "b".repeat(40),
+          CMCLIENT_BUILD_CHANNEL: "candidate",
+          CMCLIENT_TARGET_OS: "windows",
+          CMCLIENT_TARGET_ARCHITECTURE: "x86_64",
+          CMCLIENT_RUNTIME_PROFILE: "native",
+          CMCLIENT_PACKAGE_PROFILE: "setup",
         },
-        { version: "2.0.0-dev.0", commit: "unknown" },
+        {
+          version: "2.0.0-dev.0",
+          sourceCommit: "c".repeat(40),
+          sourceTree: "d".repeat(40),
+          channel: "dev",
+          target: {
+            os: "linux",
+            architecture: "x86_64",
+            profile: "native",
+            packageProfile: "workspace",
+          },
+        },
       ),
     ).toEqual({
+      schemaVersion: 1,
+      product: "CMClient",
       version: "2.0.0",
-      commit: "deadbeef",
-      channel: "beta",
-      builtAt: "2030-01-02T03:04:05.000Z",
+      sourceCommit: "a".repeat(40),
+      sourceTree: "b".repeat(40),
+      channel: "candidate",
+      target: {
+        os: "windows",
+        architecture: "x86_64",
+        profile: "native",
+        packageProfile: "setup",
+      },
     });
+  });
+
+  it("rejects legacy beta and unsupported Windows ARM64 identities", () => {
+    const defaults = {
+      version: "2.0.0-dev.0",
+      sourceCommit: "a".repeat(40),
+      sourceTree: "b".repeat(40),
+      channel: "dev" as const,
+      target: {
+        os: "windows" as const,
+        architecture: "x86_64" as const,
+        profile: "native" as const,
+        packageProfile: "workspace" as const,
+      },
+    };
+    expect(() =>
+      parseProductIdentity({ CMCLIENT_BUILD_CHANNEL: "beta" }, defaults),
+    ).toThrow("BUILD_IDENTITY_INVALID");
+    expect(() =>
+      parseProductIdentity(
+        { CMCLIENT_TARGET_ARCHITECTURE: "aarch64" },
+        defaults,
+      ),
+    ).toThrow("BUILD_IDENTITY_INVALID");
   });
 });

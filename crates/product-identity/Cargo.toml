@@ -1,0 +1,19 @@
+[package]
+name = "cmclient-product-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[lints]
+workspace = true

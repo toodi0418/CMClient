@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "component": "gateway",
+  "identity": {
+    "schemaVersion": 1,
+    "product": "CMClient",
+    "version": "2.0.0-dev.1",
+    "sourceCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceTree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "channel": "dev",
+    "target": {
+      "os": "linux",
+      "architecture": "x86_64",
+      "profile": "native",
+      "packageProfile": "workspace"
+    }
+  }
+}

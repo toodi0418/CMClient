@@ -8,7 +8,7 @@ import {
   ApiErrorSchema,
   AprsOutboxEntryListSchema,
   AprsRuntimeStatusSchema,
-  BuildMetadataSchema,
+  ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
   DomainEventListSchema,
   JobAcceptedSchema,
@@ -330,9 +330,9 @@ export function createGatewayApp(
   app.get(
     "/api/v1/system/version",
     {
-      schema: { response: { 200: BuildMetadataSchema } },
+      schema: { response: { 200: ComponentIdentityReportSchema } },
     },
-    async () => system.build,
+    async () => system.identity,
   );
   app.get(
     "/api/v1/system/capabilities",
@@ -348,7 +348,11 @@ export function createGatewayApp(
         response: { 200: SystemStatusSchema },
       },
     },
-    async () => ({ health: "ok", build: system.build }),
+    async () => ({
+      schemaVersion: 2,
+      health: "ok",
+      identity: system.identity,
+    }),
   );
   app.get<{ Querystring: ListQuery }>(
     "/api/v1/nodes",

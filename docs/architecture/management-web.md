@@ -96,7 +96,7 @@ The Logs page is a bounded, in-memory view of the current SSE session, not a
 claim of persisted audit history.
 
 Remote Dispatch is represented by a shared contract and required capability
-key only. Gateway reports `REMOTE_DISPATCH_NOT_ENABLED`, and the Web route
+key only. Gateway reports `not_enabled`, and the Web route
 renders that unavailable state without a send action. It is not a compatibility
 surface for any removed sharing or command feature.
 

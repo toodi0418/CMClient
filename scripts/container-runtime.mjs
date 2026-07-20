@@ -31,7 +31,8 @@ const RESPONSE_HEADER_NAMES = [
 export function gatewayEnvironment(environment = process.env) {
   return {
     ...environment,
-    CMCLIENT_DEPLOYMENT_MODE: "docker",
+    CMCLIENT_RUNTIME_PROFILE: "docker",
+    CMCLIENT_PACKAGE_PROFILE: "oci",
     CMCLIENT_GATEWAY_HOST: "0.0.0.0",
     CMCLIENT_GATEWAY_PORT: environment.CMCLIENT_GATEWAY_PORT?.trim() || "8081",
   };

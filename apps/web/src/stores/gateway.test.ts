@@ -10,27 +10,50 @@ import type {
 
 import { createGatewayStore, type GatewayClients } from "./gateway";
 
+const identity = {
+  schemaVersion: 1 as const,
+  component: "gateway" as const,
+  identity: {
+    schemaVersion: 1 as const,
+    product: "CMClient" as const,
+    version: "2.0.0-dev.0",
+    sourceCommit: "a".repeat(40),
+    sourceTree: "b".repeat(40),
+    channel: "dev" as const,
+    target: {
+      os: "linux" as const,
+      architecture: "x86_64" as const,
+      profile: "native" as const,
+      packageProfile: "workspace" as const,
+    },
+  },
+};
+
 const status: SystemStatus = {
+  schemaVersion: 2,
   health: "ok",
-  build: { version: "2.0.0-dev.0", commit: "fixture", channel: "dev" },
+  identity,
 };
 
 const capabilities: SystemCapabilities = {
-  schemaVersion: 1,
-  platform: "linux",
-  build: status.build,
+  schemaVersion: 2,
+  identity,
   capabilities: {
-    managementWeb: { available: true },
-    update: { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
-    tray: { available: false, reasonCode: "CAPABILITY_OWNED_BY_DESKTOP" },
-    serial: { available: false, reasonCode: "CAPABILITY_NOT_CONFIGURED" },
-    service: { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
-    autoStart: { available: false, reasonCode: "CAPABILITY_OWNED_BY_AGENT" },
-    docker: { available: true },
-    remoteDispatch: {
+    managementWeb: { available: false, reasonCode: "owned_by_agent" },
+    commandMode: { available: false, reasonCode: "owned_by_agent" },
+    graphicalMode: {
       available: false,
-      reasonCode: "REMOTE_DISPATCH_NOT_ENABLED",
+      reasonCode: "owned_by_graphical_mode",
     },
+    loginAutostart: { available: false, reasonCode: "owned_by_agent" },
+    serial: { available: false, reasonCode: "not_configured" },
+    nativeUpdate: { available: false, reasonCode: "owned_by_agent" },
+    dockerPullRecreateUpdate: {
+      available: false,
+      reasonCode: "unavailable_in_native",
+    },
+    localControl: { available: false, reasonCode: "owned_by_agent" },
+    remoteDispatch: { available: false, reasonCode: "not_enabled" },
   },
 };
 
@@ -53,7 +76,7 @@ describe("gateway store", () => {
     expect(gateway.status).toEqual(status);
     expect(gateway.capabilities?.capabilities.serial).toEqual({
       available: false,
-      reasonCode: "CAPABILITY_NOT_CONFIGURED",
+      reasonCode: "not_configured",
     });
     expect(gateway.eventConnection).toBe("open");
     expect(gateway.lastEventType).toBe("gateway.ready");
@@ -95,7 +118,7 @@ function createFakeClients(
     api: {
       system: {
         health: async () => ({ status: "ok" }),
-        version: async () => status.build,
+        version: async () => identity,
         status: overrides.status ?? (async () => status),
         capabilities: async () => capabilities,
       },

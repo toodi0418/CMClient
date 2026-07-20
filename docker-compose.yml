@@ -8,7 +8,8 @@ services:
     init: true
     restart: unless-stopped
     environment:
-      CMCLIENT_DEPLOYMENT_MODE: docker
+      CMCLIENT_RUNTIME_PROFILE: docker
+      CMCLIENT_PACKAGE_PROFILE: oci
       CMCLIENT_GATEWAY_HOST: 0.0.0.0
       CMCLIENT_GATEWAY_PORT: "8081"
       CMCLIENT_DATA_DIR: /var/lib/cmclient

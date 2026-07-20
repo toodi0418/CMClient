@@ -31,17 +31,19 @@ const themeOptions = [
 ];
 
 const runtimeCapabilities = computed(() =>
-  ["managementWeb", "update"]
+  ["managementWeb", "nativeUpdate"]
     .map((key) => ({
       key,
       capability:
-        gateway.capabilities?.capabilities[key as "managementWeb" | "update"],
+        gateway.capabilities?.capabilities[
+          key as "managementWeb" | "nativeUpdate"
+        ],
     }))
     .filter(
       (
         row,
       ): row is {
-        key: "managementWeb" | "update";
+        key: "managementWeb" | "nativeUpdate";
         capability: NonNullable<typeof row.capability>;
       } => Boolean(row.capability),
     ),

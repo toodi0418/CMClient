@@ -19,12 +19,10 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 
 import {
-  archiveForTarget,
   DOCKER_COMPOSITION,
   dockerArtifactPlan as canonicalDockerArtifactPlan,
   dockerComposeArtifactPlan as canonicalDockerComposeArtifactPlan,
   nativeDesktopArtifactPlan,
-  releaseArtifactName,
   releaseArtifactPlan,
   releaseComposition,
 } from "./release-artifacts.mjs";
@@ -33,12 +31,15 @@ import {
   verifyNativeDesktopStage,
 } from "./desktop-native-bundles.mjs";
 
-const CHANNELS = new Set(["stable", "beta", "dev"]);
+const PRODUCT_NAME = "CMClient";
+const CHANNELS = new Set(["dev", "candidate", "stable"]);
+const UPDATE_ARCHIVES = new Set(["tar.zst", "zip"]);
 const SEMVER =
-  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const OCI_DIGEST = /^sha256:([a-f0-9]{64})$/;
 const SOURCE_SHA = /^[a-f0-9]{40}$/;
+const SOURCE_TREE = /^(?:[a-f0-9]{40}|sha256:[a-f0-9]{64})$/;
 const SIGNING_KEY_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const UTC_MILLISECONDS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const EPOCH = new Date(0);
@@ -398,7 +399,7 @@ function buildChannel(version) {
   return version.includes("-dev.")
     ? "dev"
     : version.includes("-")
-      ? "beta"
+      ? "candidate"
       : "stable";
 }
 
@@ -943,13 +944,23 @@ export function canonicalUpdateManifest(manifest) {
   return Buffer.from(
     JSON.stringify({
       schemaVersion: manifest.schemaVersion,
-      channel: manifest.channel,
-      version: manifest.version,
+      release: {
+        schemaVersion: manifest.release.schemaVersion,
+        product: manifest.release.product,
+        version: manifest.release.version,
+        sourceCommit: manifest.release.sourceCommit,
+        sourceTree: manifest.release.sourceTree,
+        channel: manifest.release.channel,
+      },
       publishedAt: manifest.publishedAt,
       minimumAgentVersion: manifest.minimumAgentVersion,
       bundles: manifest.bundles.map((bundle) => ({
-        component: bundle.component,
-        target: bundle.target,
+        target: {
+          os: bundle.target.os,
+          architecture: bundle.target.architecture,
+          profile: bundle.target.profile,
+          packageProfile: bundle.target.packageProfile,
+        },
         archive: bundle.archive,
         url: bundle.url,
         sha256: bundle.sha256,
@@ -962,18 +973,16 @@ export function canonicalUpdateManifest(manifest) {
 
 export function createSignedUpdateManifest({
   artifacts,
-  channel,
   minimumAgentVersion,
   privateKeyBase64,
   publishedAt,
+  release,
   releaseBaseUrl,
   signingKeyId,
-  version,
 }) {
-  assertVersion(version);
   assertVersion(minimumAgentVersion);
-  if (!CHANNELS.has(channel)) {
-    throw new Error("RELEASE_MANIFEST_CHANNEL_INVALID");
+  if (!isReleaseIdentity(release)) {
+    throw new Error("RELEASE_MANIFEST_RELEASE_IDENTITY_INVALID");
   }
   if (
     !UTC_MILLISECONDS.test(publishedAt) ||
@@ -985,40 +994,46 @@ export function createSignedUpdateManifest({
     throw new Error("RELEASE_MANIFEST_SIGNING_KEY_ID_INVALID");
   }
   const baseUrl = normalizeReleaseBaseUrl(releaseBaseUrl);
-  const expectedPlan = releaseArtifactPlan(version);
-  const artifactsByName = new Map(
-    artifacts.map((artifact) => [artifact.fileName, artifact]),
-  );
-  if (artifactsByName.size !== expectedPlan.length) {
+  if (!Array.isArray(artifacts) || artifacts.length === 0) {
     throw new Error("RELEASE_MANIFEST_ARTIFACTS_INVALID");
   }
 
-  const bundles = expectedPlan.map((planned) => {
-    const artifact = artifactsByName.get(planned.fileName);
+  const seenFileNames = new Set();
+  const seenTargets = new Set();
+  const bundles = artifacts.map((artifact) => {
+    const targetKey = updateTargetKey(artifact?.target);
     if (
-      !artifact ||
-      artifact.component !== planned.component ||
-      artifact.target !== planned.target ||
-      artifact.archive !== planned.archive ||
+      !hasExactKeys(artifact, [
+        "target",
+        "fileName",
+        "archive",
+        "sha256",
+        "sizeBytes",
+      ]) ||
+      !isNativeDistributionTarget(artifact.target) ||
+      !isSafeUpdateFileName(artifact.fileName) ||
+      seenFileNames.has(artifact.fileName) ||
+      seenTargets.has(targetKey) ||
+      !UPDATE_ARCHIVES.has(artifact.archive) ||
       !SHA256.test(artifact.sha256) ||
       !Number.isSafeInteger(artifact.sizeBytes) ||
       artifact.sizeBytes < 1
     ) {
       throw new Error("RELEASE_MANIFEST_ARTIFACTS_INVALID");
     }
+    seenFileNames.add(artifact.fileName);
+    seenTargets.add(targetKey);
     return {
-      component: planned.component,
-      target: planned.target,
-      archive: planned.archive,
-      url: new URL(planned.fileName, baseUrl).toString(),
+      target: artifact.target,
+      archive: artifact.archive,
+      url: new URL(artifact.fileName, baseUrl).toString(),
       sha256: artifact.sha256,
       sizeBytes: artifact.sizeBytes,
     };
   });
   const manifest = {
-    schemaVersion: 1,
-    channel,
-    version,
+    schemaVersion: 2,
+    release,
     publishedAt,
     minimumAgentVersion,
     bundles,
@@ -1668,9 +1683,15 @@ function parseChecksumFile(content) {
 
 function assertUpdateManifest(manifest) {
   if (
-    manifest?.schemaVersion !== 1 ||
-    !CHANNELS.has(manifest.channel) ||
-    !SEMVER.test(manifest.version) ||
+    !hasExactKeys(manifest, [
+      "schemaVersion",
+      "release",
+      "publishedAt",
+      "minimumAgentVersion",
+      "bundles",
+    ]) ||
+    manifest.schemaVersion !== 2 ||
+    !isReleaseIdentity(manifest.release) ||
     !SEMVER.test(manifest.minimumAgentVersion) ||
     !UTC_MILLISECONDS.test(manifest.publishedAt) ||
     new Date(manifest.publishedAt).toISOString() !== manifest.publishedAt ||
@@ -1679,34 +1700,77 @@ function assertUpdateManifest(manifest) {
   ) {
     throw new Error("RELEASE_MANIFEST_INVALID");
   }
-  const expectedPlan = releaseArtifactPlan(manifest.version);
-  if (manifest.bundles.length !== expectedPlan.length) {
-    throw new Error("RELEASE_MANIFEST_INVALID");
-  }
   const seen = new Set();
   for (const bundle of manifest.bundles) {
-    let name;
-    try {
-      name = releaseArtifactName({
-        component: bundle.component,
-        target: bundle.target,
-        version: manifest.version,
-      });
-    } catch {
-      throw new Error("RELEASE_MANIFEST_INVALID");
-    }
+    const targetKey = updateTargetKey(bundle?.target);
     if (
-      archiveForTarget(bundle.target) !== bundle.archive ||
+      !hasExactKeys(bundle, [
+        "target",
+        "archive",
+        "url",
+        "sha256",
+        "sizeBytes",
+      ]) ||
+      !isNativeDistributionTarget(bundle.target) ||
+      !UPDATE_ARCHIVES.has(bundle.archive) ||
       !isHttpsUrl(bundle.url) ||
       !SHA256.test(bundle.sha256) ||
       !Number.isSafeInteger(bundle.sizeBytes) ||
       bundle.sizeBytes < 1 ||
-      seen.has(name)
+      seen.has(targetKey)
     ) {
       throw new Error("RELEASE_MANIFEST_INVALID");
     }
-    seen.add(name);
+    seen.add(targetKey);
   }
+}
+
+function isReleaseIdentity(value) {
+  return (
+    hasExactKeys(value, [
+      "schemaVersion",
+      "product",
+      "version",
+      "sourceCommit",
+      "sourceTree",
+      "channel",
+    ]) &&
+    value.schemaVersion === 1 &&
+    value.product === PRODUCT_NAME &&
+    SEMVER.test(value.version) &&
+    SOURCE_SHA.test(value.sourceCommit) &&
+    SOURCE_TREE.test(value.sourceTree) &&
+    CHANNELS.has(value.channel)
+  );
+}
+
+function isNativeDistributionTarget(value) {
+  if (
+    !hasExactKeys(value, ["os", "architecture", "profile", "packageProfile"]) ||
+    value.profile !== "native"
+  ) {
+    return false;
+  }
+  return (
+    (value.os === "windows" &&
+      value.architecture === "x86_64" &&
+      value.packageProfile === "setup") ||
+    (value.os === "macos" &&
+      value.architecture === "universal" &&
+      value.packageProfile === "dmg") ||
+    (value.os === "linux" &&
+      ["x86_64", "aarch64"].includes(value.architecture) &&
+      value.packageProfile === "appimage")
+  );
+}
+
+function updateTargetKey(value) {
+  return JSON.stringify([
+    value?.profile,
+    value?.os,
+    value?.architecture,
+    value?.packageProfile,
+  ]);
 }
 
 function privateKeyFromBase64(value) {
@@ -1749,6 +1813,14 @@ function normalizeReleaseBaseUrl(value) {
 }
 
 function isHttpsUrl(value) {
+  if (
+    typeof value !== "string" ||
+    [...value].some((character) => /\s/u.test(character)) ||
+    value.includes("@") ||
+    value.includes("#")
+  ) {
+    return false;
+  }
   try {
     const url = new URL(value);
     return (
@@ -1760,6 +1832,10 @@ function isHttpsUrl(value) {
   } catch {
     return false;
   }
+}
+
+function isSafeUpdateFileName(value) {
+  return isSafeArtifactFileName(value) && /^[A-Za-z0-9._-]+$/u.test(value);
 }
 
 function assertVersion(value) {
@@ -1951,22 +2027,35 @@ async function main(argumentsList) {
       sourceSha: unverifiedIndex.sourceSha,
       version: unverifiedIndex.version,
     });
+    if (
+      !SOURCE_TREE.test(index.sourceTree) ||
+      !Array.isArray(index.unifiedNativeUpdates) ||
+      index.unifiedNativeUpdates.length === 0
+    ) {
+      throw new Error("RELEASE_UNIFIED_UPDATE_INPUT_REQUIRED");
+    }
     const privateKeyBase64 = process.env[privateKeyEnvironment];
     if (!privateKeyBase64) {
       throw new Error("RELEASE_SIGNING_KEY_UNAVAILABLE");
     }
     const signed = createSignedUpdateManifest({
-      artifacts: index.artifacts,
-      channel: argumentValue(argumentsList, "--channel"),
+      artifacts: index.unifiedNativeUpdates,
       minimumAgentVersion: argumentValue(
         argumentsList,
         "--minimum-agent-version",
       ),
       privateKeyBase64,
       publishedAt: argumentValue(argumentsList, "--published-at"),
+      release: {
+        schemaVersion: 1,
+        product: PRODUCT_NAME,
+        version: index.version,
+        sourceCommit: index.sourceSha,
+        sourceTree: index.sourceTree,
+        channel: argumentValue(argumentsList, "--channel"),
+      },
       releaseBaseUrl: argumentValue(argumentsList, "--release-base-url"),
       signingKeyId: argumentValue(argumentsList, "--signing-key-id"),
-      version: index.version,
     });
     await writeJson(argumentValue(argumentsList, "--output"), signed);
     return;
