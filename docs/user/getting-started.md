@@ -1,5 +1,9 @@
 # Getting Started
 
+> Historical P12 snapshot. Where this file conflicts with
+> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
+> history rather than the current install or release contract.
+
 CMClient 2.0 RC.1 is a local Agent, not a cloud account. Choose the product
 surface that matches the host:
 

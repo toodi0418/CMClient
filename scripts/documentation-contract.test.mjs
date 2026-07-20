@@ -32,6 +32,24 @@ test("documentation covers production routes, events, artifacts, and local links
   assert.deepEqual(await checkDocumentation(), []);
 });
 
+test("rejects obsolete public product claims in the authoritative contract", async () => {
+  await withFixture(async (root) => {
+    const relativePath = "docs/architecture/CMCLIENT_2_OVERVIEW.md";
+    const path = join(root, relativePath);
+    const source = await readFile(path, "utf8");
+    const claim = "Every target builds `desktop`, `headless`, and `cli`";
+    await writeFile(path, `${source}\n${claim}.\n`);
+
+    const errors = await checkDocumentation(root);
+    assert.ok(
+      errors.includes(
+        `authoritative unified contract contains obsolete claim: ${relativePath} -> ${claim}`,
+      ),
+      errors.join("\n"),
+    );
+  });
+});
+
 test("rejects a documented path when its Gateway or Agent method is wrong", async () => {
   await withFixture(async (root) => {
     await replaceInFile(

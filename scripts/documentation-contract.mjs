@@ -13,6 +13,47 @@ import {
 
 const REQUIRED_DOCUMENT_SECTIONS = new Map([
   [
+    "docs/READ_ORDER.md",
+    [
+      "Current Target Contract",
+      "Implementation Detail",
+      "Historical Snapshots",
+      "Branch And Release Boundary",
+    ],
+  ],
+  [
+    "docs/architecture/CMCLIENT_2_OVERVIEW.md",
+    [
+      "One Product",
+      "Runtime Ownership",
+      "Shared Invariants",
+      "Deployment Profiles",
+    ],
+  ],
+  [
+    "docs/architecture/runtime-onboarding.md",
+    [
+      "State Root",
+      "Plaintext Secrets",
+      "Setup And Reset",
+      "Web Access",
+      "Backup And Update State",
+    ],
+  ],
+  [
+    "docs/architecture/release-artifacts.md",
+    [
+      "Public Install Set",
+      "Self-contained Composition",
+      "Candidate Identity",
+      "Release Boundary",
+    ],
+  ],
+  [
+    "docs/architecture/docker-deployment.md",
+    ["Composition", "Access And Setup", "Lifecycle And Update"],
+  ],
+  [
     "docs/user/getting-started.md",
     [
       "Verify an artifact",
@@ -117,6 +158,36 @@ const REQUIRED_DOCUMENT_SECTIONS = new Map([
 ]);
 
 const REQUIRED_DOCUMENT_TOKENS = new Map([
+  ["docs/READ_ORDER.md", ["`dev`", "`main`", "Historical Snapshots"]],
+  [
+    "docs/architecture/CMCLIENT_2_OVERVIEW.md",
+    ["cmclient --background", "setup_safe", "precision_bits === 32"],
+  ],
+  [
+    "docs/architecture/runtime-onboarding.md",
+    [
+      "secrets.json",
+      "setupGeneration",
+      "docker compose exec -T cmclient cmclient setup-code",
+    ],
+  ],
+  [
+    "docs/architecture/release-artifacts.md",
+    [
+      "CMClient-Setup.exe",
+      "runtimeCandidate",
+      "distributionCandidate",
+      "x86-64 only",
+    ],
+  ],
+  [
+    "docs/architecture/docker-deployment.md",
+    [
+      "init: true",
+      "tini is PID 1",
+      "docker compose exec -T cmclient cmclient setup-code",
+    ],
+  ],
   [
     "docs/user/getting-started.md",
     ["SHA256SUMS", "cmclient-agent --serve", "CMCLIENT_IMAGE"],
@@ -187,6 +258,21 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
 
 const REQUIRED_DOCUMENTS = [...REQUIRED_DOCUMENT_SECTIONS.keys()];
 
+const AUTHORITATIVE_UNIFIED_DOCUMENTS = [
+  "docs/READ_ORDER.md",
+  "docs/architecture/CMCLIENT_2_OVERVIEW.md",
+  "docs/architecture/runtime-onboarding.md",
+  "docs/architecture/release-artifacts.md",
+  "docs/architecture/docker-deployment.md",
+];
+
+const OBSOLETE_UNIFIED_CLAIMS = [
+  "Every target builds `desktop`, `headless`, and `cli`",
+  "Agent is PID 1 and directly supervises",
+  "Do not set Compose `init: true`",
+  "unix:///var/lib/cmclient/control.sock",
+];
+
 const MARKDOWN_SCAN_EXCLUDED_DIRECTORIES = new Set([
   ".git",
   ".pnpm-store",
@@ -234,6 +320,7 @@ export async function checkDocumentation(repositoryRoot = resolve(".")) {
   }
 
   checkReadmeIndex(contents.get("README.md") ?? "", errors);
+  checkUnifiedProductContract(contents, errors);
 
   const documentedRoutes = extractDocumentedRoutes(
     [...contents.values()].join("\n"),
@@ -322,6 +409,19 @@ export async function checkDocumentation(repositoryRoot = resolve(".")) {
 
   await checkLocalMarkdownLinks(repositoryRoot, contents, errors);
   return errors;
+}
+
+function checkUnifiedProductContract(contents, errors) {
+  for (const relativePath of AUTHORITATIVE_UNIFIED_DOCUMENTS) {
+    const documentation = contents.get(relativePath) ?? "";
+    for (const claim of OBSOLETE_UNIFIED_CLAIMS) {
+      if (documentation.includes(claim)) {
+        errors.push(
+          `authoritative unified contract contains obsolete claim: ${relativePath} -> ${claim}`,
+        );
+      }
+    }
+  }
 }
 
 async function listMarkdownFiles(repositoryRoot, directory = repositoryRoot) {

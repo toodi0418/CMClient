@@ -1,46 +1,48 @@
-# CMClient 2.0 Repository Agent Rules
+# CMClient 2.0 Repository Rules
 
-本 Repository 的主要開發分支是 `dev`，目前正在從 Legacy 全面重構為 CMClient 2.0。
+Read [docs/READ_ORDER.md](docs/READ_ORDER.md) before changing this Repository.
+The workspace task graph and checkpoint scripts govern task execution; this
+file defines Repository-local architecture and Git boundaries.
 
-## 必須遵守
+## Product Contract
 
-- 回覆與交接使用繁體中文；程式識別字、API、schema 使用英文。
-- 先閱讀 Repository 內 `docs/architecture/`、`docs/api/`、`docs/events/`、`docs/position-aprs/` 與目前任務相關文件。
-- 不直接搬 Legacy Electron、raw HTTP、TENMAN/TENMAP、舊 updater 或舊 `@cm` Bot。
-- Web、Desktop、CLI 都透過 Rust Agent；Gateway 專注 Meshtastic/APRS domain。
-- 所有長操作使用 persistent async Job，所有即時狀態使用 SSE。
-- 每個 Mesh Node／APRS callsign 獨立維護位置狀態。
-- 位置主要依可信 GPS event time 排序，不能用到達順序取代。
-- 相同 Mesh event 必須產生相同 APRS Data；Gateway observation 不得進 Data。
-- 不確定位置新舊時不上傳 APRS。
-- 只在 `precision_bits === 32` 時上傳位置。
-- TCP Proxy 必須 protocol-aware，禁止 raw socket pipe。
-- 不提交 secrets、`.env`、資料庫、log、binary、tar 或本機產物。
-- 每個變更必須有測試，lint/typecheck/test 通過。
-- 禁止 force push、禁止直接推 main、禁止空 commit。
+- CMClient is one public product. Graphical and command operation are modes,
+  while Agent and Gateway are internal components.
+- The full management experience is Web. The Tauri graphical mode is a small
+  status, tray, and control surface.
+- Native packages include graphical mode, command mode, Web, Agent, Gateway,
+  and a pinned private Node runtime. Docker omits graphical mode only.
+- Mutable state resolves below `~/.cmclient` on every platform. Runtime secrets
+  use only `secrets.json`; do not use Keychain, Credential Manager/DPAPI,
+  Secret Service, or the legacy systemd vault.
+- Web, graphical mode, and command mode use Agent-owned APIs. They never touch
+  SQLite, secrets, or Meshtastic directly.
+- Agent owns Control IPC, Web admission, setup, process supervision, backup,
+  update, and rollback. Gateway owns Meshtastic, CallMesh, APRS, Proxy, domain
+  persistence, Jobs, and events.
+- Preserve deterministic APRS and position invariants, `precision_bits === 32`,
+  fail-closed ordering, one shared Meshtastic upstream, and protocol-aware
+  multi-client Proxy behavior.
 
-## 目標目錄
+## Git And Claims
 
-```text
-apps/web
-apps/desktop
-apps/gateway
-apps/agent
-apps/cli
-packages/ui
-packages/theme
-packages/contracts
-packages/api-client
-packages/event-client
-packages/config
-packages/validation
-packages/i18n
-packages/testing
-crates/agent-core
-crates/control-api
-crates/cli-client
-crates/updater
-crates/supervisor
-```
+- Work only on `dev` and push coherent task checkpoints to `origin/dev`.
+- Never force push or rewrite pushed history.
+- Do not modify or push `main` without a new explicit user approval naming the
+  exact operation. This Goal grants no such approval.
+- Do not tag, sign with production credentials, publish, or create a formal
+  release without a separate explicit approval.
+- Windows release support is x86-64 only. Never claim an untested target,
+  production signature, real device, or external service result.
+- Keep secrets, private identity, raw captures, databases, and generated
+  campaign output out of Git.
 
-完整跨工作階段計畫位於本機外層 AI Workspace，不應複製進 Repository。
+## Change Quality
+
+- Follow existing Rust, TypeScript, Vue, Tauri, SQLite, HTTP/SSE, and Job
+  boundaries.
+- Add regression coverage before fixing a reproduced defect.
+- Run formatting, lint, typecheck, tests, documentation contracts, and the
+  relevant package/runtime gate. Do not weaken checks to make a task pass.
+- Current P12 documents are retained snapshots. Do not treat them as the active
+  install or release contract where `docs/READ_ORDER.md` marks them historical.

@@ -7,25 +7,6 @@ const SCANNER_PATH = "scripts/legacy-removal-scan.mjs";
 
 export const ALLOWED_REMOVAL_EVIDENCE = new Map([
   [
-    "AGENTS.md",
-    [
-      {
-        code: "LEGACY_MAP_REFERENCE",
-        line: 9,
-        count: 2,
-        context:
-          "- 不直接搬 Legacy Electron、raw HTTP、TENMAN/TENMAP、舊 updater 或舊 `@cm` Bot。",
-      },
-      {
-        code: "LEGACY_BOT_REFERENCE",
-        line: 9,
-        count: 1,
-        context:
-          "- 不直接搬 Legacy Electron、raw HTTP、TENMAN/TENMAP、舊 updater 或舊 `@cm` Bot。",
-      },
-    ],
-  ],
-  [
     "crates/legacy-migration/src/lib.rs",
     [
       {
@@ -90,14 +71,14 @@ export const ALLOWED_REMOVAL_EVIDENCE = new Map([
     [
       {
         code: "LEGACY_MAP_REFERENCE",
-        line: 109,
+        line: 113,
         count: 2,
         context:
           "TENMAN and TENMAP sharing, their environment/configuration/database/UI paths,",
       },
       {
         code: "LEGACY_BOT_REFERENCE",
-        line: 110,
+        line: 114,
         count: 1,
         context:
           "and the old `@cm` Bot are removed without a compatibility layer. Remote Message",

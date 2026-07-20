@@ -1,5 +1,9 @@
 # Using CMClient
 
+> Historical P12 snapshot. Where this file conflicts with
+> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
+> history rather than the current install or release contract.
+
 The Management Web shell is a projection client. It does not open SQLite,
 operate a Meshtastic transport, or perform privileged lifecycle work directly.
 

@@ -1,9 +1,37 @@
 # CMClient 2.0
 
-This `dev` branch contains the CMClient 2.0 implementation. The product is
-split into a Rust Agent and CLI, a Fastify Gateway, a Vue management Web app,
-and a small Tauri Desktop supervisor. Runtime state and secrets are not stored
-in this repository.
+CMClient is one product with graphical mode, command mode, the full management
+Web, a Rust Agent, and a TypeScript Gateway. Agent and Gateway are internal
+components, not separate products. The Repository is currently transitioning
+the existing P12 implementation to this unified contract; documents marked as
+historical describe the previous package model and must not be read as current
+release choices.
+
+Read [Documentation authority](docs/READ_ORDER.md) first.
+
+## Target Product
+
+- `cmclient` with no arguments opens graphical mode.
+- `cmclient <command>` uses command mode through the resident Agent.
+- `cmclient --background` starts the resident core without a window.
+- The Web UI contains every setup and operational workflow. Graphical mode is a
+  compact status/tray/control surface with an Open Web action.
+- Native packages contain the private Node/Gateway runtime and need no system
+  Node or npm. Docker contains everything except graphical mode.
+- Mutable state is under `~/.cmclient`; `secrets.json` is the only runtime secret
+  backend.
+
+The planned public install set is exactly:
+
+| Target | Install object |
+| --- | --- |
+| Windows x86-64 only | `CMClient-Setup.exe` |
+| macOS Intel + Apple Silicon | one Universal `CMClient.dmg` |
+| Linux x86-64 / ARM64 | one `CMClient-<arch>.AppImage` per CPU |
+| Docker amd64 / arm64 | one OCI index plus Compose |
+
+There are no separate Desktop, Headless, CLI, Service, MSI, DEB, or portable
+downloads in the target release contract.
 
 ## Development
 
@@ -12,8 +40,6 @@ Required toolchains:
 - Node.js `^22.18.0` or `>=24.11.0`
 - pnpm 11 or newer
 - the Rust toolchain pinned by `rust-toolchain.toml`
-
-Install dependencies and run the repository gates:
 
 ```bash
 pnpm install --frozen-lockfile
@@ -26,43 +52,35 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-Run the repository and Node dependency security gates separately when changing
-dependencies, workflows, or release composition:
+Additional gates:
 
 ```bash
 pnpm audit:policy
 pnpm audit:dependencies:node
-```
-
-The pinned secret and Rust dependency audit commands, current results, and the
-only time-bounded advisory exception are recorded in the
-[P12 release security audit](docs/security/release-audit.md).
-
-Run the management Web end-to-end suite separately:
-
-```bash
 pnpm test:e2e:web
 ```
 
 ## Documentation
 
-- [Architecture overview](docs/architecture/CMCLIENT_2_OVERVIEW.md)
+- [Documentation authority](docs/READ_ORDER.md)
+- [Unified architecture](docs/architecture/CMCLIENT_2_OVERVIEW.md)
+- [Runtime and onboarding](docs/architecture/runtime-onboarding.md)
+- [Release objects](docs/architecture/release-artifacts.md)
+- [Docker target](docs/architecture/docker-deployment.md)
 - [Agent runtime](docs/architecture/agent-runtime.md)
 - [Gateway runtime](docs/architecture/gateway-runtime.md)
-- [Release artifacts](docs/architecture/release-artifacts.md)
-- [Release security audit](docs/security/release-audit.md)
-- [Feature parity evidence](docs/testing/feature-parity.md)
-- [RC field validation](docs/testing/rc-field-validation.md)
-- [Getting started](docs/user/getting-started.md)
-- [Using CMClient](docs/user/using-cmclient.md)
-- [Administrator deployment](docs/admin/deployment.md)
-- [Configuration and security](docs/admin/configuration-security.md)
+- [API reference](docs/api/README.md)
+- [Domain projections](docs/api/domain-projections.md)
+- [Getting started snapshot](docs/user/getting-started.md)
+- [Using CMClient snapshot](docs/user/using-cmclient.md)
+- [Deployment snapshot](docs/admin/deployment.md)
+- [Configuration and security snapshot](docs/admin/configuration-security.md)
 - [Operations](docs/admin/operations.md)
 - [Developer guide](docs/developer/README.md)
-- [API reference](docs/api/README.md)
-- [Domain projection API](docs/api/domain-projections.md)
-- [RC release notes](docs/releases/2.0.0-rc.1.md)
+- [RC field-validation snapshot](docs/testing/rc-field-validation.md)
+- [P12 RC snapshot](docs/releases/2.0.0-rc.1.md)
 - [Changelog](CHANGELOG.md)
 
-The RC documentation describes installation, upgrade, operations, API
-boundaries, and the field-validation evidence required before promotion.
+Implementation work is exclusively on `dev`. `main` may be modified only after
+a new explicit user approval naming the exact operation; no such approval is
+part of the current Goal.

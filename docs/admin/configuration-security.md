@@ -1,5 +1,9 @@
 # Configuration and Security
 
+> Historical P12 snapshot. Where this file conflicts with
+> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
+> history rather than the current install or release contract.
+
 The Agent accepts a strict, `deny_unknown_fields` `agent.toml`. Runtime paths
 must be absolute. Keep executable/configuration paths separate from persistent
 data and never put secret values in this file.

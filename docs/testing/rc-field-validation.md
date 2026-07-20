@@ -1,5 +1,9 @@
 # RC Field Validation
 
+> Historical P12 snapshot. Where this file conflicts with
+> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
+> history rather than the current install or release contract.
+
 `docs/testing/rc-field-validation-plan.json` is the executable CMClient
 `2.0.0-rc.1` field-test scope. It covers every release target and deployment
 mode. This document defines how an operator records results without putting

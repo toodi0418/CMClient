@@ -1,5 +1,9 @@
 # Retained Feature Parity Audit
 
+> Historical P12 snapshot. Where this file conflicts with
+> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
+> history rather than the current install or release contract.
+
 This P11 audit compares the retained behaviours in
 [`legacy-feature-matrix.md`](../legacy-feature-matrix.md) with their CMClient
 2.0 owners and test surfaces. Parity means preserving the supported behaviour,

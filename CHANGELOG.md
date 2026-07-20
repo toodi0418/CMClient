@@ -1,5 +1,9 @@
 # Changelog
 
+> Historical P12 snapshot. Where this file conflicts with
+> [Documentation Authority](docs/READ_ORDER.md), it is implementation/evidence
+> history rather than the current install or release contract.
+
 ## 2.0.0-rc.1
 
 The first CMClient 2.0 release candidate introduces the Agent/Gateway/Web/

@@ -1,5 +1,9 @@
 # Deployment
 
+> Historical P12 snapshot. Where this file conflicts with
+> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
+> history rather than the current install or release contract.
+
 CMClient has one runtime composition and several launch surfaces. A native
 Desktop installer is a packaging format, not a second Agent implementation.
 All complete Desktop, Headless, and Service bundles contain Agent, CLI,
