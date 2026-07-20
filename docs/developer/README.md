@@ -31,7 +31,10 @@ pnpm test:e2e:web
 
 A standalone repository checkout has no repository-local `verify.sh`; run the
 commands above directly. The surrounding AI development workspace, when used,
-provides its own `scripts/verify.sh` wrapper. Release-specific checks include
+provides `scripts/verify.sh` and thin task-state wrappers. Their implementation
+source of truth is the Repository `scripts/` directory; mutable task, candidate,
+evidence, and campaign ledgers stay in the workspace. See
+[Task state recovery](task-state-recovery.md). Release-specific checks include
 policy/secret/dependency audits, load/resource tests, native package smoke, OCI
 import smoke, SBOM/checksum verification, and final Windows SCM lifecycle
 validation.

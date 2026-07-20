@@ -114,6 +114,18 @@ const REQUIRED_DOCUMENT_SECTIONS = new Map([
     ],
   ],
   [
+    "docs/developer/task-state-recovery.md",
+    [
+      "State Ownership And Canonical Graph",
+      "State Invariants",
+      "Checkpoint Reconciliation",
+      "Repair Task Protocol",
+      "Completion Inputs",
+      "Completion Gate",
+      "Recovery Examples",
+    ],
+  ],
+  [
     "docs/api/README.md",
     [
       "Error envelopes",
@@ -235,6 +247,26 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
   [
     "docs/developer/README.md",
     ["cargo test --workspace --locked", "Release Build Matrix"],
+  ],
+  [
+    "docs/developer/task-state-recovery.md",
+    [
+      "Validation: passed",
+      "checkpointBaseCommit",
+      "repairOf",
+      "--affected-case",
+      "exit 20",
+      "cmclient-unified-candidate/v1",
+      "cmclient-unified-evidence/v1",
+      "invalidationReruns",
+      "--candidate <sha256-digest>",
+      "--exclude-task P17-T07",
+      "--write-precheck-attestation",
+      "state/GOAL_PRECHECK.json",
+      "toodi0418/CMClient",
+      "NO_READY_TASK",
+      "origin/dev",
+    ],
   ],
   [
     "docs/api/README.md",

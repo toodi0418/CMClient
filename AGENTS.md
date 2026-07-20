@@ -1,7 +1,9 @@
 # CMClient 2.0 Repository Rules
 
 Read [docs/READ_ORDER.md](docs/READ_ORDER.md) before changing this Repository.
-The workspace task graph and checkpoint scripts govern task execution; this
+The workspace owns mutable task/campaign state and invokes thin wrappers. The
+Repository `scripts/` implementations and committed unified graph lock govern
+task transitions, repair, reconciliation, checkpointing, and completion; this
 file defines Repository-local architecture and Git boundaries.
 
 ## Product Contract

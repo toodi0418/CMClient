@@ -77,6 +77,7 @@ pnpm test:e2e:web
 - [Configuration and security snapshot](docs/admin/configuration-security.md)
 - [Operations](docs/admin/operations.md)
 - [Developer guide](docs/developer/README.md)
+- [Task state recovery](docs/developer/task-state-recovery.md)
 - [RC field-validation snapshot](docs/testing/rc-field-validation.md)
 - [P12 RC snapshot](docs/releases/2.0.0-rc.1.md)
 - [Changelog](CHANGELOG.md)
