@@ -172,7 +172,7 @@ jobs:
       - run: cargo test -p cmclient-agent --locked
       - run: cargo test -p cmclient-cli --locked
       - run: cargo test -p cmclient-service-host --locked
-      - run: cargo build -p cmclient-service-host --locked
+      - run: cargo build -p cmclient-agent -p cmclient-cli -p cmclient-service-host --locked
       - name: Render Windows service registration without creating it
         shell: powershell
         run: |
@@ -233,7 +233,7 @@ jobs:
               if ($LASTEXITCODE -eq 0) {
                 try {
                   $candidate = $statusJson | ConvertFrom-Json
-                  if ($candidate.agent -eq "running" -and $candidate.management_web -eq "disabled") { $controlStatus = $candidate }
+                  if ($candidate.agent -eq "running" -and $candidate.managementWeb -eq "disabled") { $controlStatus = $candidate }
                 }
                 catch {}
               }

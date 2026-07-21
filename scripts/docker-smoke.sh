@@ -78,8 +78,8 @@ verify_application() {
     if (!response.ok) process.exit(1);
     const body = await response.json();
     const capabilities = body.capabilities;
-    if (capabilities.docker.available !== true) process.exit(1);
-    if (capabilities.update.reasonCode !== "CAPABILITY_UNAVAILABLE_DOCKER") process.exit(1);
+    if (capabilities.dockerPullRecreateUpdate.available !== true) process.exit(1);
+    if (capabilities.nativeUpdate.reasonCode !== "unavailable_in_docker") process.exit(1);
     if (process.env.CMCLIENT_EXPECTED_VERSION) {
       const versionResponse = await fetch(`${process.env.CMCLIENT_SMOKE_URL}/api/v1/system/version`);
       if (!versionResponse.ok) process.exit(1);

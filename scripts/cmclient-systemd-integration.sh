@@ -130,7 +130,7 @@ assert_control_status() {
   for attempt in $(seq 1 15); do
     if status_json="$("$CLI_BINARY" --json --endpoint "unix://$CONTROL_SOCKET" status 2>/dev/null)" \
       && [[ "$status_json" == *'"agent":"running"'* ]] \
-      && [[ "$status_json" == *'"management_web":"disabled"'* ]]; then
+      && [[ "$status_json" == *'"managementWeb":"disabled"'* ]]; then
       return 0
     fi
     sleep 1

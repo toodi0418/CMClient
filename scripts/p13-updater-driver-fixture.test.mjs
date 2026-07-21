@@ -30,6 +30,30 @@ test("committed hidden Tauri updater fixture is internally pinned", async () => 
   assert.deepEqual(await checkFixture(repositoryRoot), []);
 });
 
+test("fixture source digests are stable across CRLF and LF checkouts", async () => {
+  const documents = await readFixtureDocuments(repositoryRoot);
+  const windowsDocuments = { ...documents };
+  for (const name of [
+    "cargoToml",
+    "cargoLock",
+    "config",
+    "main",
+    "hooks",
+    "lab",
+  ]) {
+    windowsDocuments[name] = documents[name]
+      .replace(/\r\n?/g, "\n")
+      .replace(/\n/g, "\r\n");
+  }
+  const errors = validateFixtureDocuments(windowsDocuments);
+  assert.deepEqual(
+    errors.filter((entry) =>
+      entry.startsWith("P13_UPDATER_FIXTURE_FILE_DIGEST_DRIFT"),
+    ),
+    [],
+  );
+});
+
 test("fixture validator rejects preview or custom updater drivers", async () => {
   const documents = await readFixtureDocuments(repositoryRoot);
   const errors = validateFixtureDocuments({
@@ -157,11 +181,22 @@ test("runner redirects every generated path below a disjoint campaign", () => {
 test("fixture child profile and cache paths stay below campaign without inherited credentials", () => {
   const campaignRoot = resolve(repositoryRoot, "..", "p13-fixture-campaign");
   const paths = campaignPaths(repositoryRoot, campaignRoot);
+  const parentHome = resolve(repositoryRoot, "..", "runner-home");
   const credentialName = "CMCLIENT_CALLMESH_API_KEY";
   const original = process.env[credentialName];
   process.env[credentialName] = "redaction-fixture-value";
   try {
-    const environment = childEnvironment(paths);
+    const environment = childEnvironment(
+      paths,
+      {},
+      {
+        ...process.env,
+        HOME: parentHome,
+        USERPROFILE: "",
+        RUSTUP_HOME: "",
+        RUSTUP_TOOLCHAIN: "",
+      },
+    );
     assert.equal(environment[credentialName], undefined);
     for (const name of [
       "CARGO_HOME",
@@ -178,6 +213,36 @@ test("fixture child profile and cache paths stay below campaign without inherite
     ]) {
       assert.equal(isCampaignPath(campaignRoot, environment[name]), true, name);
     }
+    assert.equal(environment.RUSTUP_HOME, resolve(parentHome, ".rustup"));
+    assert.equal(environment.RUSTUP_TOOLCHAIN, "1.96.0");
+
+    const explicitRustupHome = resolve(parentHome, "toolchains");
+    const explicit = childEnvironment(
+      paths,
+      {},
+      {
+        ...process.env,
+        HOME: parentHome,
+        RUSTUP_HOME: explicitRustupHome,
+        RUSTUP_TOOLCHAIN: "1.96.0-test-target",
+      },
+    );
+    assert.equal(explicit.RUSTUP_HOME, explicitRustupHome);
+    assert.equal(explicit.RUSTUP_TOOLCHAIN, "1.96.0-test-target");
+    assert.throws(
+      () =>
+        childEnvironment(
+          paths,
+          {},
+          {
+            ...process.env,
+            HOME: "",
+            USERPROFILE: "",
+            RUSTUP_HOME: "",
+          },
+        ),
+      /P13_UPDATER_RUSTUP_HOME_INVALID/,
+    );
   } finally {
     if (original === undefined) delete process.env[credentialName];
     else process.env[credentialName] = original;

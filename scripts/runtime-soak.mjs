@@ -2,7 +2,7 @@ import { readdirSync } from "node:fs";
 import http from "node:http";
 import { dirname, resolve } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_CYCLES = 12;
@@ -78,13 +78,17 @@ export function runtimeSoakConfiguration(environment = process.env) {
   };
 }
 
+export function runtimeModuleUrl(path) {
+  return pathToFileURL(resolve(path)).href;
+}
+
 export async function runRuntimeSoak(config = runtimeSoakConfiguration()) {
   if (typeof globalThis.gc !== "function") {
     throw new Error("runtime soak requires node --expose-gc");
   }
   const [{ createGatewayApp }, { DomainEventBus }] = await Promise.all([
-    import(resolve(root, "apps/gateway/dist/app.js")),
-    import(resolve(root, "apps/gateway/dist/events.js")),
+    import(runtimeModuleUrl(resolve(root, "apps/gateway/dist/app.js"))),
+    import(runtimeModuleUrl(resolve(root, "apps/gateway/dist/events.js"))),
   ]);
   const eventBus = new DomainEventBus({
     bufferSize: REPLAY_BUFFER_SIZE,

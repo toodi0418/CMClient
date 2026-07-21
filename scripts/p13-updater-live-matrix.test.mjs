@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -29,12 +29,14 @@ test("updater matrix resolves each input path independently", () => {
 });
 
 test("updater helper environment carries no inherited credentials", () => {
+  const campaignRoot = "X:/p13-updater-driver";
+  const expectedRoot = resolve(campaignRoot);
   const credentialName = "CMCLIENT_CALLMESH_API_KEY";
   const original = process.env[credentialName];
   process.env[credentialName] = "must-not-cross-helper-boundary";
   try {
     const environment = helperEnvironment({
-      campaignRoot: "X:/p13-updater-driver",
+      campaignRoot,
       endpoint: "https://127.0.0.1:9443/manifest/valid",
       publicKey: "public-fixture-key",
       caFile: "X:/p13-updater-driver/tls/certificate.pem",
@@ -57,9 +59,11 @@ test("updater helper environment carries no inherited credentials", () => {
       "APPDATA",
       "LOCALAPPDATA",
     ]) {
+      const nested = relative(expectedRoot, environment[name]);
       assert.equal(
-        environment[name].startsWith("X:\\p13-updater-driver"),
+        nested !== "" && !nested.startsWith("..") && !isAbsolute(nested),
         true,
+        name,
       );
     }
   } finally {

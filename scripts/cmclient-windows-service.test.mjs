@@ -150,6 +150,12 @@ test("Windows lifecycle smoke creates and rechecks its retained-state sentinel",
   );
   assert.match(lifecycle, /Start-Service -Name \$serviceName/);
   assert.match(lifecycle, /\\\\\.\\pipe\\cmclient-control/);
+  assert.match(lifecycle, /\$candidate\.managementWeb -eq "disabled"/);
+  assert.doesNotMatch(lifecycle, /\$candidate\.management_web/);
+  assert.match(
+    workflow,
+    /cargo build -p cmclient-agent -p cmclient-cli -p cmclient-service-host --locked/,
+  );
   assert.match(lifecycle, /\$controlStatus\.agent -ne "running"/);
   assert.match(lifecycle, /\$agent\.ExecutablePath -ne \$agentV2/);
 });

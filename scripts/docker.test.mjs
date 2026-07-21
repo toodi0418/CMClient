@@ -115,6 +115,12 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
   assert.match(smoke, /up\+=\(--no-build\)/);
   assert.match(smoke, /recreate\+=\(--no-build\)/);
   assert.match(smoke, /api\/v1\/system\/version/);
+  assert.match(smoke, /capabilities\.dockerPullRecreateUpdate\.available/);
+  assert.match(
+    smoke,
+    /capabilities\.nativeUpdate\.reasonCode !== "unavailable_in_docker"/,
+  );
+  assert.doesNotMatch(smoke, /capabilities\.(?:docker|update)\./);
   assert.match(smoke, /CMCLIENT_EXPECTED_COMMIT/);
   assert.match(smoke, /docker-compose\.yml/);
   assert.match(smoke, /port ingress 8080/);

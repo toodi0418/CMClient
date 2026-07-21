@@ -3,7 +3,8 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -16,6 +17,7 @@ import {
 } from "./load-soak.mjs";
 import {
   replayBufferTarget,
+  runtimeModuleUrl,
   runtimeSoakConfiguration,
 } from "./runtime-soak.mjs";
 
@@ -151,6 +153,13 @@ test("runtime soak exposes explicit RSS, FD, subscriber, and event-loop gates", 
     requestsPerCycle: 50,
     rssGrowthLimitBytes: 64 * 1024 * 1024,
   });
+});
+
+test("runtime soak converts platform paths to file URLs", () => {
+  const modulePath = resolve("apps/gateway/dist/app.js");
+  const moduleUrl = runtimeModuleUrl(modulePath);
+  assert.equal(new URL(moduleUrl).protocol, "file:");
+  assert.equal(fileURLToPath(moduleUrl), modulePath);
 });
 
 test("runtime iterations share one process and replay capacity fills incrementally", () => {

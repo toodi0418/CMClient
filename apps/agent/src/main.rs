@@ -2605,7 +2605,7 @@ mod tests {
             .expect("sanitized diagnostics should build");
         let serialized =
             serde_json::to_string(&diagnostics).expect("sanitized diagnostics should serialize");
-        assert_eq!(diagnostics.schema_version, 1);
+        assert_eq!(diagnostics.schema_version, 2);
         assert!(!serialized.contains("/tmp/cmclient-agent-health"));
         assert!(!serialized.contains("gateway_command"));
 

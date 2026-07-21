@@ -257,28 +257,33 @@ systemdTest(
   },
 );
 
-systemdTest(
-  "CI exercises systemd 249 credentials and the dedicated Control socket",
-  async () => {
-    const integration = await readFile(
-      "scripts/cmclient-systemd-integration.sh",
-      "utf8",
-    );
-    const workflow = await readFile(".github/workflows/ci.yml", "utf8");
-    const integrationMode = (
-      await stat("scripts/cmclient-systemd-integration.sh")
-    ).mode;
+test("CI exercises systemd 249 credentials and the dedicated Control socket", async () => {
+  const integration = await readFile(
+    "scripts/cmclient-systemd-integration.sh",
+    "utf8",
+  );
+  const workflow = await readFile(".github/workflows/ci.yml", "utf8");
+  const { stdout: integrationIndex } = await execute("git", [
+    "ls-files",
+    "--stage",
+    "--",
+    "scripts/cmclient-systemd-integration.sh",
+  ]);
 
-    assert.notEqual(integrationMode & 0o111, 0);
-    assert.match(integration, /EXPECTED_SYSTEMD_VERSION="249"/);
-    assert.match(integration, /CREDENTIALS_DIRECTORY=/);
-    assert.match(integration, /unix:\/\/\$CONTROL_SOCKET/);
-    assert.match(integration, /systemctl restart "\$SERVICE_NAME"/);
-    assert.match(workflow, /linux-systemd-smoke:/);
-    assert.match(workflow, /runs-on: ubuntu-22\.04/);
-    assert.match(workflow, /bash scripts\/cmclient-systemd-integration\.sh/);
-  },
-);
+  assert.match(
+    integrationIndex,
+    /^100755 [a-f0-9]{40,64} 0\tscripts\/cmclient-systemd-integration\.sh\s*$/,
+  );
+  assert.match(integration, /EXPECTED_SYSTEMD_VERSION="249"/);
+  assert.match(integration, /CREDENTIALS_DIRECTORY=/);
+  assert.match(integration, /unix:\/\/\$CONTROL_SOCKET/);
+  assert.match(integration, /"managementWeb":"disabled"/);
+  assert.doesNotMatch(integration, /"management_web":"disabled"/);
+  assert.match(integration, /systemctl restart "\$SERVICE_NAME"/);
+  assert.match(workflow, /linux-systemd-smoke:/);
+  assert.match(workflow, /runs-on: ubuntu-22\.04/);
+  assert.match(workflow, /bash scripts\/cmclient-systemd-integration\.sh/);
+});
 
 systemdTest(
   "systemd logs prefer bounded application JSONL and sanitize journal fallback",

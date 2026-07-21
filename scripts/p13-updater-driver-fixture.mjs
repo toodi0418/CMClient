@@ -103,6 +103,10 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function canonicalText(value) {
+  return value.replace(/\r\n?/g, "\n");
+}
+
 function error(code, detail) {
   return `${code}${detail ? `: ${detail}` : ""}`;
 }
@@ -357,7 +361,7 @@ export function validateFixtureDocuments(documents) {
       hooks: documents.hooks,
       lab: documents.lab,
     })) {
-      if (fixtureLock.files?.[name] !== sha256(contents ?? "")) {
+      if (fixtureLock.files?.[name] !== sha256(canonicalText(contents ?? ""))) {
         errors.push(error("P13_UPDATER_FIXTURE_FILE_DIGEST_DRIFT", name));
       }
     }
@@ -457,15 +461,27 @@ async function prepareCampaignSource(repositoryRoot, paths) {
   return fixtureRoot;
 }
 
-export function childEnvironment(paths, additions = {}) {
+export function childEnvironment(
+  paths,
+  additions = {},
+  sourceEnvironment = process.env,
+) {
   const inherited = Object.fromEntries(
-    Object.entries(process.env).filter(
+    Object.entries(sourceEnvironment).filter(
       ([name]) =>
         !/api.?key|authorization|cookie|credential|pass(code|word)?|private.?key|secret|session|token/i.test(
           name,
         ),
     ),
   );
+  const parentHome =
+    sourceEnvironment.USERPROFILE?.trim() || sourceEnvironment.HOME?.trim();
+  const rustupHome =
+    sourceEnvironment.RUSTUP_HOME?.trim() ||
+    (parentHome ? resolve(parentHome, ".rustup") : "");
+  if (!rustupHome || !isAbsolute(rustupHome)) {
+    throw new Error("P13_UPDATER_RUSTUP_HOME_INVALID");
+  }
   return {
     ...inherited,
     CI: "true",
@@ -480,6 +496,8 @@ export function childEnvironment(paths, additions = {}) {
     LOCALAPPDATA: paths.localAppData,
     XDG_CACHE_HOME: paths.cache,
     XDG_CONFIG_HOME: resolve(paths.home, ".config"),
+    RUSTUP_HOME: resolve(rustupHome),
+    RUSTUP_TOOLCHAIN: sourceEnvironment.RUSTUP_TOOLCHAIN?.trim() || "1.96.0",
     CMCLIENT_CAMPAIGN_ROOT: resolve(paths.root, ".."),
     ...additions,
   };
