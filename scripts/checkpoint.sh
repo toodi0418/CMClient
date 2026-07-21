@@ -41,7 +41,12 @@ reconcile_checkpoint() {
     --commits "$WORKSPACE_ROOT/state/COMMITS.md"
     --remote "$CMCLIENT_REMOTE"
     --branch "$CMCLIENT_BRANCH"
+    --graph-lock "$SCRIPT_DIR/unified-task-graph-lock.json"
+    --license-provenance "$WORKSPACE_ROOT/state/LICENSE_PROVENANCE.json"
   )
+  if [[ -n "${CMCLIENT_GRAPH_UPGRADE_OPERATION_ID:-}" ]]; then
+    reconcile_args+=(--graph-upgrade-operation-id "$CMCLIENT_GRAPH_UPGRADE_OPERATION_ID")
+  fi
   if [[ "$CMCLIENT_AUTO_PUSH" == "1" ]]; then
     reconcile_args+=(--push-local)
   fi
@@ -90,27 +95,20 @@ if [[ -z "$(git -C "$REPO_DIR" status --porcelain)" ]]; then
 fi
 
 PRE_COMMIT_HEAD="$(git -C "$REPO_DIR" rev-parse HEAD)"
-"$CMCLIENT_PYTHON3" - "$WORKSPACE_ROOT/state/TASKS.json" "$TASK" "$PRE_COMMIT_HEAD" <<'PY'
-import json, sys
-tasks = json.load(open(sys.argv[1], encoding="utf-8"))["tasks"]
-task = next((item for item in tasks if item["id"] == sys.argv[2]), None)
-if task is None:
-    raise SystemExit("Task ID is not in state")
-if task["status"] == "done":
-    raise SystemExit("Task is already done")
-if task["status"] != "in_progress":
-    raise SystemExit(f"Task must be in_progress before checkpoint: {task['status']}")
-status = {item["id"]: item["status"] for item in tasks}
-missing = [dep for dep in task.get("dependsOn", []) if status.get(dep) != "done"]
-if missing:
-    raise SystemExit("Task dependencies are not done: " + ", ".join(missing))
-checkpoint_base = task.get("checkpointBaseCommit")
-if checkpoint_base != sys.argv[3]:
-    raise SystemExit(
-        "Task checkpointBaseCommit does not match pre-commit HEAD: "
-        f"{checkpoint_base!r} != {sys.argv[3]}"
-    )
-PY
+WORKFLOW_VALIDATION_ARGS=(
+  "$TASK"
+  --validate-checkpoint
+  --expected-head "$PRE_COMMIT_HEAD"
+  --state "$WORKSPACE_ROOT/state/TASKS.json"
+  --graph-lock "$SCRIPT_DIR/unified-task-graph-lock.json"
+  --license-provenance "$WORKSPACE_ROOT/state/LICENSE_PROVENANCE.json"
+)
+if [[ -n "${CMCLIENT_GRAPH_UPGRADE_OPERATION_ID:-}" ]]; then
+  WORKFLOW_VALIDATION_ARGS+=(
+    --graph-upgrade-operation-id "$CMCLIENT_GRAPH_UPGRADE_OPERATION_ID"
+  )
+fi
+PRE_VERIFY_WORKFLOW="$("$CMCLIENT_PYTHON3" "$SCRIPT_DIR/task-state.py" "${WORKFLOW_VALIDATION_ARGS[@]}")"
 
 if git -C "$REPO_DIR" log --all --format='%s' | grep -Fx -- "$SUBJECT" >/dev/null 2>&1; then
   die "Commit subject already exists: $SUBJECT"
@@ -129,6 +127,9 @@ stage_intended_paths
 
 [[ "$(git -C "$REPO_DIR" rev-parse HEAD)" == "$PRE_COMMIT_HEAD" ]] ||
   die "Repository HEAD changed during checkpoint verification"
+POST_VERIFY_WORKFLOW="$("$CMCLIENT_PYTHON3" "$SCRIPT_DIR/task-state.py" "${WORKFLOW_VALIDATION_ARGS[@]}")"
+[[ "$POST_VERIFY_WORKFLOW" == "$PRE_VERIFY_WORKFLOW" ]] ||
+  die "Task state, graph lock, or license provenance changed during checkpoint verification"
 
 collect_changed_paths
 NEW_PATHS=()
@@ -175,8 +176,20 @@ if [[ "$CMCLIENT_AUTO_PUSH" != "1" ]]; then
 fi
 
 if ! git -C "$REPO_DIR" push "$CMCLIENT_REMOTE" "HEAD:$CMCLIENT_BRANCH"; then
-  "$CMCLIENT_PYTHON3" "$SCRIPT_DIR/task-state.py" "$TASK" blocked \
-    --commit "$COMMIT" --note "Checkpoint commit exists locally; push failed and must be retried without a new commit"
+  task_state_args=(
+    "$TASK" blocked
+    --commit "$COMMIT"
+    --note "Checkpoint commit exists locally; push failed and must be retried without a new commit"
+    --state "$WORKSPACE_ROOT/state/TASKS.json"
+    --graph-lock "$SCRIPT_DIR/unified-task-graph-lock.json"
+    --license-provenance "$WORKSPACE_ROOT/state/LICENSE_PROVENANCE.json"
+  )
+  if [[ -n "${CMCLIENT_GRAPH_UPGRADE_OPERATION_ID:-}" ]]; then
+    task_state_args+=(
+      --graph-upgrade-operation-id "$CMCLIENT_GRAPH_UPGRADE_OPERATION_ID"
+    )
+  fi
+  "$CMCLIENT_PYTHON3" "$SCRIPT_DIR/task-state.py" "${task_state_args[@]}"
   "$CMCLIENT_PYTHON3" - "$WORKSPACE_ROOT/state/HANDOVER.md" "$NOW" "$TASK" "$COMMIT" "$SUBJECT" <<'PY'
 from pathlib import Path
 import sys

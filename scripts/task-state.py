@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,13 +29,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("task")
     parser.add_argument(
-        "status", choices=["pending", "in_progress", "blocked", "done", "skipped"]
+        "status",
+        nargs="?",
+        choices=["pending", "in_progress", "blocked", "done", "skipped"],
     )
     parser.add_argument("--commit")
     parser.add_argument("--note")
     parser.add_argument("--state", type=Path)
     parser.add_argument("--repo", type=Path)
     parser.add_argument("--checkpoint-base-commit")
+    parser.add_argument("--graph-lock", type=Path)
+    parser.add_argument("--license-provenance", type=Path)
+    parser.add_argument("--graph-upgrade-operation-id")
+    parser.add_argument("--validate-checkpoint", action="store_true")
+    parser.add_argument("--expected-head")
     return parser.parse_args()
 
 
@@ -41,6 +50,32 @@ def main() -> int:
     library = load_library()
     args = parse_args()
     state_path = args.state or library.DEFAULT_STATE_PATH
+    graph_lock_path = args.graph_lock or library.DEFAULT_GRAPH_LOCK_PATH
+    operation_id = args.graph_upgrade_operation_id or os.environ.get(
+        "CMCLIENT_GRAPH_UPGRADE_OPERATION_ID"
+    )
+
+    if args.validate_checkpoint:
+        if args.status is not None:
+            raise library.TaskStateError(
+                "status is not allowed with --validate-checkpoint"
+            )
+        if args.expected_head is None:
+            raise library.TaskStateError(
+                "--expected-head is required with --validate-checkpoint"
+            )
+        snapshot = library.checkpoint_readiness_snapshot(
+            state_path,
+            args.task,
+            args.expected_head,
+            graph_lock_path=graph_lock_path,
+            license_path=args.license_provenance,
+            graph_upgrade_operation_id=operation_id,
+        )
+        print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.status is None:
+        raise library.TaskStateError("status is required")
 
     def mutation(state: dict) -> tuple[str, str]:
         checkpoint_base = args.checkpoint_base_commit
@@ -78,7 +113,13 @@ def main() -> int:
             checkpoint_base_commit=checkpoint_base,
         )
 
-    _, (old_status, new_status) = library.mutate_state(state_path, mutation)
+    _, (old_status, new_status) = library.mutate_state(
+        state_path,
+        mutation,
+        graph_lock_path=graph_lock_path,
+        license_path=args.license_provenance,
+        graph_upgrade_operation_id=operation_id,
+    )
     print(f"{args.task}: {old_status} -> {new_status}")
     return 0
 

@@ -20,6 +20,10 @@ Read [Documentation authority](docs/READ_ORDER.md) first.
   Node or npm. Docker contains everything except graphical mode.
 - Mutable state is under `~/.cmclient`; `secrets.json` is the only runtime secret
   backend.
+- Every release profile uses the official hosted CallMesh service at
+  `https://callmesh.tmmarc.org` as its only production provision and mapping
+  authority. CMClient does not ship a CallMesh server or support production
+  endpoint and local mapping overrides.
 
 The planned public install set is exactly:
 
@@ -63,6 +67,7 @@ pnpm test:e2e:web
 ## Documentation
 
 - [Documentation authority](docs/READ_ORDER.md)
+- [License and source provenance](docs/architecture/license-provenance.md)
 - [Unified architecture](docs/architecture/CMCLIENT_2_OVERVIEW.md)
 - [Runtime and onboarding](docs/architecture/runtime-onboarding.md)
 - [Release objects](docs/architecture/release-artifacts.md)
@@ -85,3 +90,12 @@ pnpm test:e2e:web
 Implementation work is exclusively on `dev`. `main` may be modified only after
 a new explicit user approval naming the exact operation; no such approval is
 part of the current Goal.
+
+## License
+
+The CMClient client is licensed under `GPL-3.0-only`; see [LICENSE](LICENSE).
+Third-party attributions and retained notices are in [NOTICE](NOTICE), and the
+exact Meshtastic schema and dependency audit is documented in
+[license provenance](docs/architecture/license-provenance.md). The separately
+operated CallMesh HTTPS service is not linked into or distributed with this
+client.

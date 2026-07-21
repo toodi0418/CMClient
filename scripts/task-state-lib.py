@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterator, TypeVar
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,23 @@ WORKSPACE_ROOT = Path(
 ).resolve()
 DEFAULT_STATE_PATH = WORKSPACE_ROOT / "state/TASKS.json"
 DEFAULT_REPO_PATH = REPOSITORY_ROOT
+DEFAULT_GRAPH_LOCK_PATH = Path(__file__).with_name("unified-task-graph-lock.json")
+GRAPH_LOCK_SCHEMA = "cmclient-unified-task-graph-lock/v2"
+LICENSE_PROVENANCE_SCHEMA = "cmclient-license-provenance/v1"
+GRAPH_UPGRADE_JOURNAL_SCHEMA = "cmclient-graph-upgrade-journal/v1"
+GRAPH_UPGRADE_PHASES = {
+    "prepared",
+    "validated",
+    "history-recorded",
+    "workspace-staged",
+    "repository-staged",
+    "state-committed",
+    "self-tested",
+    "checkpointed",
+    "pushed",
+    "complete",
+}
+GRAPH_UPGRADE_STATUSES = {"running", "blocked", "complete"}
 # Historical P12 repair tasks used a single lowercase suffix. Preserve those
 # immutable IDs while allocating every new repair from the numeric sequence.
 TASK_ID_PATTERN = re.compile(r"^(P\d{2})-T(\d{2})(?:[a-z])?$")
@@ -33,6 +51,49 @@ CHECKPOINT_SUBJECT_PATTERN = re.compile(
 )
 ALLOWED_STATUSES = {"pending", "in_progress", "blocked", "done", "skipped"}
 TERMINAL_STATUSES = {"done", "skipped"}
+LOCKED_TASK_FIELDS = (
+    "phase",
+    "title",
+    "required",
+    "manualGate",
+    "kind",
+    "scope",
+    "candidateReset",
+    "acceptance",
+)
+GRAPH_PAYLOAD_FIELDS = (
+    "tasks",
+    "historicalSupersessions",
+    "v2CoverageMap",
+    "licenseGate",
+    "repositoryIdentity",
+    "targetPlatforms",
+    "callMeshServiceModel",
+    "candidateIdentity",
+    "completionChecker",
+    "repairProtocol",
+)
+ACTIVE_GRAPH_FIELDS = (
+    "id",
+    "version",
+    "source",
+    "sourceSha256",
+    "sourceBaseline",
+    "branch",
+    "completionTask",
+    "manualReleaseTask",
+    "importedAt",
+    "completedHistorySha256",
+    "supersededTaskIds",
+    "historicalSupersessions",
+    "v2CoverageMap",
+    "licenseGate",
+    "targetPlatforms",
+    "callMeshServiceModel",
+    "candidateIdentity",
+    "completionChecker",
+    "repairProtocol",
+)
 ALLOWED_REPAIR_CASES = {
     "FULL_VERIFY",
     "SECRET_SCAN",
@@ -56,6 +117,40 @@ class TaskStateError(ValueError):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def canonical_sha256(value: object) -> str:
+    return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalized_task_value(task: dict[str, Any], field: str) -> object:
+    if field == "required":
+        return task.get(field, True)
+    if field in {"manualGate", "candidateReset"}:
+        return task.get(field, False)
+    return task.get(field)
+
+
+def task_definition(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": task.get("id"),
+        **{field: _normalized_task_value(task, field) for field in LOCKED_TASK_FIELDS},
+        "dependsOn": copy.deepcopy(task.get("dependsOn", [])),
+    }
 
 
 def _parse_timestamp(value: object, label: str) -> datetime:
@@ -235,6 +330,349 @@ def atomic_write_json(state_path: Path, value: dict) -> None:
                 os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _load_document(path: Path, label: str) -> dict[str, Any]:
+    path = Path(path)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise TaskStateError(f"cannot read {label} {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise TaskStateError(f"{label} root must be an object: {path}")
+    return value
+
+
+def _upgrade_journal_path(state_path: Path) -> Path:
+    return Path(state_path).with_name("GRAPH_UPGRADE.json")
+
+
+def validate_upgrade_journal_guard(
+    state_path: Path,
+    operation_id: str | None = None,
+) -> None:
+    journal_path = _upgrade_journal_path(state_path)
+    if not journal_path.exists():
+        return
+    journal = _load_document(journal_path, "graph upgrade journal")
+    if journal.get("schema") != GRAPH_UPGRADE_JOURNAL_SCHEMA:
+        raise TaskStateError("graph upgrade journal schema is invalid")
+    expected = journal.get("operationId")
+    if not isinstance(expected, str) or not expected:
+        raise TaskStateError("graph upgrade journal operationId is invalid")
+    status = journal.get("status")
+    phase = journal.get("phase")
+    if status not in GRAPH_UPGRADE_STATUSES:
+        raise TaskStateError("graph upgrade journal status is invalid")
+    if phase not in GRAPH_UPGRADE_PHASES:
+        raise TaskStateError("graph upgrade journal phase is invalid")
+    status_complete = status == "complete"
+    phase_complete = phase == "complete"
+    if status_complete != phase_complete:
+        raise TaskStateError("graph upgrade journal is only half complete")
+    if status_complete and phase_complete:
+        return
+    if operation_id != expected:
+        raise TaskStateError(
+            "GRAPH_UPGRADE_IN_PROGRESS: normal task workflow is paused until recovery"
+        )
+
+
+def _require_sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or not CANDIDATE_SHA256_PATTERN.fullmatch(value):
+        raise TaskStateError(f"{label} must be a lowercase SHA-256 digest")
+    if value != value.lower():
+        raise TaskStateError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _require_nonempty_collection(value: object, label: str) -> None:
+    if not isinstance(value, (list, dict)) or not value:
+        raise TaskStateError(f"{label} must be a non-empty array or object")
+
+
+def validate_license_provenance(
+    graph_lock: dict[str, Any],
+    evidence: dict[str, Any],
+) -> None:
+    gate = graph_lock.get("licenseGate")
+    if not isinstance(gate, dict):
+        raise TaskStateError("graph lock licenseGate must be an object")
+    owner = gate.get("ownerDecision")
+    if not isinstance(owner, dict):
+        raise TaskStateError("graph lock license ownerDecision must be an object")
+    if (
+        owner.get("status") != "approved"
+        or owner.get("route") != "GPL-3.0-only"
+        or owner.get("publicDevPushPermitted") is not True
+    ):
+        raise TaskStateError("graph lock GPL-3.0-only license decision is not approved")
+    if gate.get("evidencePath") != "state/LICENSE_PROVENANCE.json":
+        raise TaskStateError("graph lock license evidence path is not canonical")
+
+    required = gate.get("requiredFields")
+    if not isinstance(required, list) or not all(
+        isinstance(field, str) and field for field in required
+    ):
+        raise TaskStateError("graph lock license requiredFields is invalid")
+    missing = [field for field in required if field not in evidence]
+    if missing:
+        raise TaskStateError(
+            "license provenance is missing required fields: " + ", ".join(missing)
+        )
+    if evidence.get("schema") != LICENSE_PROVENANCE_SCHEMA:
+        raise TaskStateError(
+            f"license provenance schema must be {LICENSE_PROVENANCE_SCHEMA}"
+        )
+    if (
+        evidence.get("status") != owner.get("status")
+        or evidence.get("route") != owner.get("route")
+        or evidence.get("publicDevPushPermitted") is not True
+        or evidence.get("approvedAt") != owner.get("approvedAt")
+        or evidence.get("approvalReference") != owner.get("approvalReference")
+    ):
+        raise TaskStateError("license provenance disagrees with the owner decision")
+    for field in ("exactSources", "sourceDigests", "licenses", "notices"):
+        _require_nonempty_collection(evidence.get(field), f"license provenance {field}")
+
+    digests = evidence.get("sourceDigests")
+    digest_values = list(digests.values()) if isinstance(digests, dict) else digests
+    if not isinstance(digest_values, list) or not digest_values:
+        raise TaskStateError("license provenance sourceDigests is invalid")
+    for index, digest in enumerate(digest_values):
+        if isinstance(digest, dict):
+            digest = digest.get("sha256")
+        _require_sha256(digest, f"license provenance sourceDigests[{index}]")
+
+
+def _historical_completed_tasks(
+    state: dict[str, Any], first_active_phase: str
+) -> list[dict[str, Any]]:
+    tasks = state.get("tasks")
+    assert isinstance(tasks, list)
+    boundary = next(
+        (
+            index
+            for index, task in enumerate(tasks)
+            if isinstance(task, dict)
+            and isinstance(task.get("id"), str)
+            and task["id"].startswith(f"{first_active_phase}-")
+        ),
+        None,
+    )
+    if boundary is None:
+        raise TaskStateError(f"task state has no {first_active_phase} graph boundary")
+    return [
+        task
+        for task in tasks[:boundary]
+        if isinstance(task, dict) and task.get("status") == "done"
+    ]
+
+
+def validate_state_against_graph_lock(
+    state: dict[str, Any],
+    graph_lock: dict[str, Any],
+    license_provenance: dict[str, Any],
+) -> dict[str, dict]:
+    by_id = validate_task_graph(state)
+    if graph_lock.get("schema") != GRAPH_LOCK_SCHEMA:
+        raise TaskStateError(f"graph lock schema must be {GRAPH_LOCK_SCHEMA}")
+    active = state.get("activeGraph")
+    if not isinstance(active, dict):
+        raise TaskStateError("state.activeGraph must be an object")
+    if active.get("id") != "unified-product" or active.get("version") != 2:
+        raise TaskStateError("active graph must be unified-product@2")
+    if graph_lock.get("id") != "unified-product" or graph_lock.get("version") != 2:
+        raise TaskStateError("committed graph lock must be unified-product@2")
+    if active.get("branch") != "dev" or graph_lock.get("branch") != "dev":
+        raise TaskStateError("active graph and graph lock branch must be dev")
+
+    historical = graph_lock.get("historicalSupersessions")
+    if not isinstance(historical, list):
+        raise TaskStateError("graph lock historicalSupersessions must be an array")
+    historical_ids: list[str] = []
+    for index, item in enumerate(historical):
+        if not isinstance(item, dict) or item.get("graphVersion") != 1:
+            raise TaskStateError(
+                f"historicalSupersessions[{index}] must retain graphVersion 1"
+            )
+        old_id = item.get("old")
+        replacements = item.get("new")
+        if (
+            not isinstance(old_id, str)
+            or old_id in historical_ids
+            or not isinstance(replacements, list)
+            or not replacements
+            or len(replacements) != len(set(replacements))
+            or not all(isinstance(value, str) for value in replacements)
+            or not isinstance(item.get("reason"), str)
+            or not item["reason"]
+        ):
+            raise TaskStateError(f"historicalSupersessions[{index}] is invalid")
+        historical_ids.append(old_id)
+        task = by_id.get(old_id)
+        if not isinstance(task, dict):
+            raise TaskStateError(f"historical supersession task is missing: {old_id}")
+        if (
+            task.get("status") != "skipped"
+            or task.get("supersededBy") != replacements
+            or task.get("supersession")
+            != {
+                "graphId": graph_lock.get("id"),
+                "graphVersion": 1,
+                "reason": item["reason"],
+            }
+        ):
+            raise TaskStateError(f"historical supersession drift: {old_id}")
+
+    expected_active_values: dict[str, object] = {
+        field: graph_lock.get(field) for field in ACTIVE_GRAPH_FIELDS
+    }
+    expected_active_values["supersededTaskIds"] = historical_ids
+    for field, expected in expected_active_values.items():
+        if active.get(field) != expected:
+            raise TaskStateError(
+                f"activeGraph.{field} does not match the committed graph lock"
+            )
+    _parse_timestamp(active.get("importedAt"), "activeGraph.importedAt")
+    _require_sha256(active.get("sourceSha256"), "activeGraph.sourceSha256")
+    normalize_git_object(active.get("sourceBaseline"), "activeGraph.sourceBaseline")
+
+    first_active_phase = graph_lock.get("firstActivePhase")
+    if first_active_phase != "P13":
+        raise TaskStateError("graph lock firstActivePhase must be P13")
+    completed_history = _historical_completed_tasks(state, first_active_phase)
+    expected_history = _require_sha256(
+        graph_lock.get("completedHistorySha256"),
+        "graph lock completedHistorySha256",
+    )
+    if canonical_sha256(completed_history) != expected_history:
+        raise TaskStateError("completed historical task state differs from graph lock")
+
+    locked_tasks = graph_lock.get("tasks")
+    if not isinstance(locked_tasks, list) or not locked_tasks:
+        raise TaskStateError("graph lock tasks must be a non-empty array")
+    declared_count = graph_lock.get("taskDefinitionCount")
+    if declared_count is not None and declared_count != len(locked_tasks):
+        raise TaskStateError("graph lock taskDefinitionCount is incorrect")
+    locked_by_id: dict[str, dict[str, Any]] = {}
+    for index, definition in enumerate(locked_tasks):
+        if not isinstance(definition, dict) or not isinstance(definition.get("id"), str):
+            raise TaskStateError(f"graph lock tasks[{index}] is invalid")
+        task_id = definition["id"]
+        if task_id in locked_by_id:
+            raise TaskStateError(f"graph lock contains duplicate task: {task_id}")
+        if set(definition) != {"id", *LOCKED_TASK_FIELDS, "dependsOn"}:
+            raise TaskStateError(f"graph lock task definition fields are invalid: {task_id}")
+        locked_by_id[task_id] = definition
+
+    for task_id, definition in locked_by_id.items():
+        task = by_id.get(task_id)
+        if task is None:
+            raise TaskStateError(f"locked active task is missing: {task_id}")
+        for field in LOCKED_TASK_FIELDS:
+            if _normalized_task_value(task, field) != definition.get(field):
+                raise TaskStateError(f"locked task field changed: {task_id}.{field}")
+        original_dependencies = definition.get("dependsOn")
+        dependencies = task.get("dependsOn")
+        if not isinstance(original_dependencies, list) or not isinstance(dependencies, list):
+            raise TaskStateError(f"locked task dependencies are invalid: {task_id}")
+        if dependencies[: len(original_dependencies)] != original_dependencies:
+            raise TaskStateError(f"locked task original dependencies changed: {task_id}")
+        for repair_id in dependencies[len(original_dependencies) :]:
+            repair = by_id.get(repair_id)
+            if (
+                not isinstance(repair, dict)
+                or repair.get("repairOf") != task_id
+                or repair.get("required", True) is not True
+                or repair.get("candidateReset") is not True
+                or repair.get("status") != "done"
+            ):
+                raise TaskStateError(
+                    f"locked task has an invalid appended repair dependency: "
+                    f"{task_id} -> {repair_id}"
+                )
+
+    for task_id, task in by_id.items():
+        phase = task.get("phase")
+        if task_id in locked_by_id or not isinstance(phase, str) or phase < "P13":
+            continue
+        if (
+            task.get("repairOf") not in locked_by_id
+            or task.get("required", True) is not True
+            or task.get("kind") != "fix"
+            or task.get("candidateReset") is not True
+        ):
+            raise TaskStateError(f"extra active task is not a valid repair: {task_id}")
+
+    coverage = graph_lock.get("v2CoverageMap")
+    if not isinstance(coverage, list):
+        raise TaskStateError("graph lock v2CoverageMap must be an array")
+    coverage_ids: list[str] = []
+    for index, item in enumerate(coverage):
+        if not isinstance(item, dict):
+            raise TaskStateError(f"v2CoverageMap[{index}] is invalid")
+        legacy_id = item.get("legacyTask")
+        targets = item.get("v2Tasks")
+        if (
+            not isinstance(legacy_id, str)
+            or legacy_id in coverage_ids
+            or not isinstance(targets, list)
+            or not targets
+            or len(targets) != len(set(targets))
+            or not all(target in locked_by_id for target in targets)
+            or not isinstance(item.get("reason"), str)
+            or not item["reason"]
+        ):
+            raise TaskStateError(f"v2CoverageMap[{index}] is invalid")
+        coverage_ids.append(legacy_id)
+    if set(coverage_ids) != set(historical_ids):
+        raise TaskStateError(
+            "v2CoverageMap legacy tasks differ from historical supersessions"
+        )
+
+    identity = graph_lock.get("repositoryIdentity")
+    if not isinstance(identity, dict):
+        raise TaskStateError("graph lock repositoryIdentity must be an object")
+    if (
+        identity.get("branch") != "dev"
+        or identity.get("protectedBranch") != "main"
+        or identity.get("sourceBaseline") != graph_lock.get("sourceBaseline")
+        or not isinstance(identity.get("origin"), str)
+        or not identity["origin"]
+    ):
+        raise TaskStateError("graph lock repositoryIdentity is invalid")
+
+    callmesh = graph_lock.get("callMeshServiceModel")
+    if not isinstance(callmesh, dict) or (
+        callmesh.get("productionBaseUrl") != "https://callmesh.tmmarc.org"
+        or callmesh.get("productionAuthority") != "official-hosted-only"
+        or callmesh.get("selfHosting") is not False
+        or callmesh.get("productionEndpointOverride") is not False
+        or callmesh.get("localMappingOverride") is not False
+        or callmesh.get("mappingAuthority") != "CallMesh-only"
+    ):
+        raise TaskStateError("graph lock CallMesh service model is invalid")
+
+    payload = {field: graph_lock.get(field) for field in GRAPH_PAYLOAD_FIELDS}
+    if canonical_sha256(payload) != _require_sha256(
+        graph_lock.get("graphSha256"), "graph lock graphSha256"
+    ):
+        raise TaskStateError("graph lock graphSha256 does not match canonical payload")
+    validate_license_provenance(graph_lock, license_provenance)
+    return by_id
+
+
+def workflow_snapshot(
+    state: dict[str, Any],
+    graph_lock_path: Path,
+    license_path: Path,
+) -> dict[str, str]:
+    return {
+        "stateSha256": canonical_sha256(state),
+        "graphLockSha256": sha256_file(graph_lock_path),
+        "licenseProvenanceSha256": sha256_file(license_path),
+    }
 
 
 def task_index(state: dict) -> dict[str, dict]:
@@ -514,28 +952,113 @@ def validate_task_graph(state: dict) -> dict[str, dict]:
     return by_id
 
 
-def read_validated_state(state_path: Path = DEFAULT_STATE_PATH) -> dict:
+def read_validated_state(
+    state_path: Path = DEFAULT_STATE_PATH,
+    *,
+    graph_lock_path: Path = DEFAULT_GRAPH_LOCK_PATH,
+    license_path: Path | None = None,
+    graph_upgrade_operation_id: str | None = None,
+) -> dict:
+    state_path = Path(state_path)
+    graph_lock_path = Path(graph_lock_path)
+    license_path = Path(license_path or state_path.with_name("LICENSE_PROVENANCE.json"))
     with state_lock(state_path):
+        validate_upgrade_journal_guard(state_path, graph_upgrade_operation_id)
         state = load_json(state_path)
-        validate_task_graph(state)
+        graph_lock = _load_document(graph_lock_path, "unified task graph lock")
+        license_provenance = _load_document(license_path, "license provenance")
+        validate_state_against_graph_lock(state, graph_lock, license_provenance)
         return copy.deepcopy(state)
 
 
 def mutate_state(
     state_path: Path,
     mutation: Callable[[dict], T],
+    *,
+    graph_lock_path: Path = DEFAULT_GRAPH_LOCK_PATH,
+    license_path: Path | None = None,
+    graph_upgrade_operation_id: str | None = None,
 ) -> tuple[dict, T]:
     """Validate, mutate, validate again, then atomically persist under one lock."""
 
+    state_path = Path(state_path)
+    graph_lock_path = Path(graph_lock_path)
+    license_path = Path(license_path or state_path.with_name("LICENSE_PROVENANCE.json"))
     with state_lock(state_path):
+        validate_upgrade_journal_guard(state_path, graph_upgrade_operation_id)
         state = load_json(state_path)
-        validate_task_graph(state)
+        graph_lock = _load_document(graph_lock_path, "unified task graph lock")
+        license_provenance = _load_document(license_path, "license provenance")
+        validate_state_against_graph_lock(state, graph_lock, license_provenance)
+        expected_contract = workflow_snapshot(state, graph_lock_path, license_path)
         original = copy.deepcopy(state)
         result = mutation(state)
-        validate_task_graph(state)
+        repeated_lock = _load_document(graph_lock_path, "unified task graph lock")
+        repeated_license = _load_document(license_path, "license provenance")
+        if sha256_file(graph_lock_path) != expected_contract["graphLockSha256"]:
+            raise TaskStateError("graph lock changed during task-state mutation")
+        if (
+            sha256_file(license_path)
+            != expected_contract["licenseProvenanceSha256"]
+        ):
+            raise TaskStateError("license provenance changed during task-state mutation")
+        validate_state_against_graph_lock(state, repeated_lock, repeated_license)
         if state != original:
             atomic_write_json(state_path, state)
         return copy.deepcopy(state), result
+
+
+def checkpoint_readiness_snapshot(
+    state_path: Path,
+    task_id: str,
+    expected_head: str,
+    *,
+    graph_lock_path: Path = DEFAULT_GRAPH_LOCK_PATH,
+    license_path: Path | None = None,
+    graph_upgrade_operation_id: str | None = None,
+) -> dict[str, str]:
+    state_path = Path(state_path)
+    graph_lock_path = Path(graph_lock_path)
+    license_path = Path(license_path or state_path.with_name("LICENSE_PROVENANCE.json"))
+    expected_head = normalize_git_object(expected_head, "checkpoint expected HEAD")
+    with state_lock(state_path):
+        validate_upgrade_journal_guard(state_path, graph_upgrade_operation_id)
+        state = load_json(state_path)
+        graph_lock = _load_document(graph_lock_path, "unified task graph lock")
+        license_provenance = _load_document(license_path, "license provenance")
+        by_id = validate_state_against_graph_lock(
+            state, graph_lock, license_provenance
+        )
+        task = by_id.get(task_id)
+        if task is None:
+            raise TaskStateError(f"unknown task: {task_id}")
+        if task.get("status") != "in_progress":
+            raise TaskStateError(
+                f"task must be in_progress before checkpoint: {task.get('status')}"
+            )
+        unfinished = [
+            dependency
+            for dependency in task.get("dependsOn", [])
+            if by_id[dependency].get("status") != "done"
+        ]
+        if unfinished:
+            raise TaskStateError(
+                "task dependencies are not done: " + ", ".join(unfinished)
+            )
+        checkpoint_base = normalize_git_object(
+            task.get("checkpointBaseCommit"),
+            f"task {task_id}.checkpointBaseCommit",
+        )
+        if checkpoint_base != expected_head:
+            raise TaskStateError(
+                "task checkpointBaseCommit does not match pre-commit HEAD: "
+                f"{checkpoint_base} != {expected_head}"
+            )
+        return {
+            "task": task_id,
+            "checkpointBaseCommit": checkpoint_base,
+            **workflow_snapshot(state, graph_lock_path, license_path),
+        }
 
 
 def _dependencies_done(task: dict, by_id: dict[str, dict]) -> bool:

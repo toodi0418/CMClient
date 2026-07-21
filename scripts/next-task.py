@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,13 +28,24 @@ def load_library():
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", type=Path)
+    parser.add_argument("--graph-lock", type=Path)
+    parser.add_argument("--license-provenance", type=Path)
+    parser.add_argument("--graph-upgrade-operation-id")
     return parser.parse_args()
 
 
 def main() -> int:
     library = load_library()
     args = parse_args()
-    state = library.read_validated_state(args.state or library.DEFAULT_STATE_PATH)
+    state = library.read_validated_state(
+        args.state or library.DEFAULT_STATE_PATH,
+        graph_lock_path=args.graph_lock or library.DEFAULT_GRAPH_LOCK_PATH,
+        license_path=args.license_provenance,
+        graph_upgrade_operation_id=(
+            args.graph_upgrade_operation_id
+            or os.environ.get("CMCLIENT_GRAPH_UPGRADE_OPERATION_ID")
+        ),
+    )
     task = library.next_ready_task(state)
     if task is None:
         # This sentinel means only that scheduling cannot currently select work.

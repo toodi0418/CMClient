@@ -8,14 +8,20 @@ authority when two documents conflict.
 
 1. Repository [AGENTS.md](../AGENTS.md) for architecture, Git, security, and
    claim boundaries.
-2. [Unified architecture](architecture/CMCLIENT_2_OVERVIEW.md).
-3. [Runtime and onboarding](architecture/runtime-onboarding.md).
-4. [Release objects](architecture/release-artifacts.md).
-5. [Docker target](architecture/docker-deployment.md).
+2. [License and source provenance](architecture/license-provenance.md).
+3. [Unified architecture](architecture/CMCLIENT_2_OVERVIEW.md).
+4. [Runtime and onboarding](architecture/runtime-onboarding.md).
+5. [Release objects](architecture/release-artifacts.md).
+6. [Docker target](architecture/docker-deployment.md).
 
 These files define the approved target even while owning P13-P16 tasks are still
 implementing it. They must state transition status honestly and may not claim an
 unimplemented package or runtime result.
+
+The committed `scripts/unified-task-graph-lock.json` is the machine authority
+for active P13-P17 definitions. Workspace task state may add only validated
+repair tasks; license, CallMesh service, historical supersession, coverage, and
+completion metadata may not drift from that lock.
 
 ## Implementation Detail
 

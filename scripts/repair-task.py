@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -28,6 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", type=Path)
     parser.add_argument("--repo", type=Path)
+    parser.add_argument("--graph-lock", type=Path)
+    parser.add_argument("--license-provenance", type=Path)
+    parser.add_argument("--graph-upgrade-operation-id")
     commands = parser.add_subparsers(dest="command", required=True)
 
     start = commands.add_parser("start")
@@ -39,12 +43,26 @@ def parse_args() -> argparse.Namespace:
     start.add_argument("--checkpoint-base-commit")
     start.add_argument("--state", dest="command_state", type=Path)
     start.add_argument("--repo", dest="command_repo", type=Path)
+    start.add_argument("--graph-lock", dest="command_graph_lock", type=Path)
+    start.add_argument(
+        "--license-provenance", dest="command_license_provenance", type=Path
+    )
+    start.add_argument(
+        "--graph-upgrade-operation-id", dest="command_graph_upgrade_operation_id"
+    )
 
     resume = commands.add_parser("resume")
     resume.add_argument("parent")
     resume.add_argument("repair")
     resume.add_argument("--note")
     resume.add_argument("--state", dest="command_state", type=Path)
+    resume.add_argument("--graph-lock", dest="command_graph_lock", type=Path)
+    resume.add_argument(
+        "--license-provenance", dest="command_license_provenance", type=Path
+    )
+    resume.add_argument(
+        "--graph-upgrade-operation-id", dest="command_graph_upgrade_operation_id"
+    )
 
     resolve = commands.add_parser("resolve")
     resolve.add_argument("repair")
@@ -55,6 +73,13 @@ def parse_args() -> argparse.Namespace:
         required=True,
     )
     resolve.add_argument("--state", dest="command_state", type=Path)
+    resolve.add_argument("--graph-lock", dest="command_graph_lock", type=Path)
+    resolve.add_argument(
+        "--license-provenance", dest="command_license_provenance", type=Path
+    )
+    resolve.add_argument(
+        "--graph-upgrade-operation-id", dest="command_graph_upgrade_operation_id"
+    )
     return parser.parse_args()
 
 
@@ -62,6 +87,15 @@ def main() -> int:
     library = load_library()
     args = parse_args()
     state_path = args.command_state or args.state or library.DEFAULT_STATE_PATH
+    graph_lock_path = (
+        args.command_graph_lock or args.graph_lock or library.DEFAULT_GRAPH_LOCK_PATH
+    )
+    license_path = args.command_license_provenance or args.license_provenance
+    operation_id = (
+        args.command_graph_upgrade_operation_id
+        or args.graph_upgrade_operation_id
+        or os.environ.get("CMCLIENT_GRAPH_UPGRADE_OPERATION_ID")
+    )
 
     if args.command == "start":
         checkpoint_base = library.repository_checkpoint_base(
@@ -103,7 +137,13 @@ def main() -> int:
                 args.candidate_identity,
             )
 
-    _, task = library.mutate_state(state_path, mutation)
+    _, task = library.mutate_state(
+        state_path,
+        mutation,
+        graph_lock_path=graph_lock_path,
+        license_path=license_path,
+        graph_upgrade_operation_id=operation_id,
+    )
     print(json.dumps(task, ensure_ascii=False, indent=2))
     return 0
 

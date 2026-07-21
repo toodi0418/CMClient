@@ -96,6 +96,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote", default="origin", help="Git remote name")
     parser.add_argument("--branch", default="dev", help="Expected branch name")
     parser.add_argument(
+        "--graph-lock",
+        type=Path,
+        default=Path(__file__).with_name("unified-task-graph-lock.json"),
+    )
+    parser.add_argument("--license-provenance", type=Path)
+    parser.add_argument("--graph-upgrade-operation-id")
+    parser.add_argument(
         "--push-local",
         "--push",
         dest="push_local",
@@ -398,9 +405,20 @@ def find_task(state: dict, task_id: str) -> dict:
     return matches[0]
 
 
-def validate_state_graph(state: dict, target_id: str) -> dict:
+def validate_state_graph(
+    state: dict,
+    target_id: str,
+    graph_lock: dict | None = None,
+    license_provenance: dict | None = None,
+) -> dict:
     try:
-        by_id = task_state_library().validate_task_graph(state)
+        library = task_state_library()
+        if graph_lock is None or license_provenance is None:
+            by_id = library.validate_task_graph(state)
+        else:
+            by_id = library.validate_state_against_graph_lock(
+                state, graph_lock, license_provenance
+            )
     except (TypeError, ValueError) as error:
         raise ReconcileError(f"task graph invariant failed: {error}") from error
 
@@ -535,10 +553,34 @@ def reconcile(args: argparse.Namespace) -> dict[str, object]:
     repo = args.repo.resolve()
     state_path = args.state.resolve()
     commits_path = args.commits.resolve()
+    graph_lock_path = args.graph_lock.resolve()
+    license_path = (
+        args.license_provenance.resolve()
+        if args.license_provenance is not None
+        else state_path.with_name("LICENSE_PROVENANCE.json")
+    )
+    operation_id = args.graph_upgrade_operation_id or os.environ.get(
+        "CMCLIENT_GRAPH_UPGRADE_OPERATION_ID"
+    )
     validate_repo(args.git, repo, args.branch)
     if not args.no_fetch:
         fetch_remote_branch(args.git, repo, args.remote, args.branch)
     commit = find_checkpoint_commit(args.git, repo, args.task)
+    library = task_state_library()
+    with library.state_lock(state_path):
+        library.validate_upgrade_journal_guard(state_path, operation_id)
+        state = load_state(state_path)
+        graph_lock = library._load_document(
+            graph_lock_path, "unified task graph lock"
+        )
+        license_provenance = library._load_document(
+            license_path, "license provenance"
+        )
+        validate_state_graph(state, args.task, graph_lock, license_provenance)
+        expected_state_digest = library.canonical_sha256(state)
+        expected_graph_lock_digest = library.sha256_file(graph_lock_path)
+        expected_license_digest = library.sha256_file(license_path)
+
     pushed = ensure_remote_commit(
         args.git,
         repo,
@@ -552,8 +594,8 @@ def reconcile(args: argparse.Namespace) -> dict[str, object]:
     expected_head = git_output(args.git, repo, "rev-parse", "HEAD")
     expected_remote = git_output(args.git, repo, "rev-parse", tracked_ref)
 
-    library = task_state_library()
     with library.state_lock(state_path):
+        library.validate_upgrade_journal_guard(state_path, operation_id)
         validate_repo(args.git, repo, args.branch)
         current_head = git_output(args.git, repo, "rev-parse", "HEAD")
         current_remote = git_output(args.git, repo, "rev-parse", tracked_ref)
@@ -574,7 +616,23 @@ def reconcile(args: argparse.Namespace) -> dict[str, object]:
             raise ReconcileError("checkpoint identity changed during reconciliation")
 
         state = load_state(state_path)
+        if library.canonical_sha256(state) != expected_state_digest:
+            raise ReconcileError("task state changed during reconciliation")
+        if library.sha256_file(graph_lock_path) != expected_graph_lock_digest:
+            raise ReconcileError("graph lock changed during reconciliation")
+        if library.sha256_file(license_path) != expected_license_digest:
+            raise ReconcileError("license provenance changed during reconciliation")
+        graph_lock = library._load_document(
+            graph_lock_path, "unified task graph lock"
+        )
+        license_provenance = library._load_document(
+            license_path, "license provenance"
+        )
+        validate_state_graph(state, args.task, graph_lock, license_provenance)
         new_state, state_changed = reconciled_state(state, args.task, commit)
+        library.validate_state_against_graph_lock(
+            new_state, graph_lock, license_provenance
+        )
         current_log = commits_path.read_text(encoding="utf-8") if commits_path.exists() else ""
         new_log, log_changed = commit_log_update(current_log, args.task, commit)
 

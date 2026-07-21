@@ -9,7 +9,10 @@ import { checkDocumentation } from "./documentation-contract.mjs";
 const REPOSITORY_ROOT = resolve(".");
 const FIXTURE_PATHS = [
   "AGENTS.md",
+  "Cargo.toml",
   "CHANGELOG.md",
+  "LICENSE",
+  "NOTICE",
   "README.md",
   "apps/README.md",
   "apps/agent/src/main.rs",
@@ -30,6 +33,101 @@ const FIXTURE_PATHS = [
 
 test("documentation covers production routes, events, artifacts, and local links", async () => {
   assert.deepEqual(await checkDocumentation(), []);
+});
+
+test("rejects altered GPL license bytes and manifest license drift", async () => {
+  await withFixture(async (root) => {
+    const licensePath = join(root, "LICENSE");
+    const license = await readFile(licensePath, "utf8");
+    await writeFile(licensePath, `${license}\n`);
+    await replaceInFile(
+      root,
+      "Cargo.toml",
+      'license = "GPL-3.0-only"',
+      'license = "MIT"',
+    );
+    await replaceInFile(
+      root,
+      "package.json",
+      '"license": "GPL-3.0-only"',
+      '"license": "MIT"',
+    );
+
+    const errors = await checkDocumentation(root);
+    assert.ok(
+      errors.some((error) =>
+        error.startsWith("root LICENSE SHA-256 is invalid:"),
+      ),
+      errors.join("\n"),
+    );
+    assert.ok(
+      errors.includes(
+        "Cargo workspace license must be GPL-3.0-only: received MIT",
+      ),
+      errors.join("\n"),
+    );
+    assert.ok(
+      errors.includes(
+        "package.json license must be GPL-3.0-only: received MIT",
+      ),
+      errors.join("\n"),
+    );
+  });
+});
+
+test("rejects notice, provenance, and hosted CallMesh contract drift", async () => {
+  await withFixture(async (root) => {
+    await replaceInFile(
+      root,
+      "NOTICE",
+      "7f1110dd7737c7884012cc899862f9d7427b9c51",
+      "0000000000000000000000000000000000000000",
+    );
+    await replaceInFile(
+      root,
+      "docs/architecture/license-provenance.md",
+      "ce3d3f9376b9a2552fc22c7d962ee9b25ebeda9e748301284be730fbff21b8f1",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    await replaceInFile(
+      root,
+      "README.md",
+      "only production provision",
+      "one optional production provision",
+    );
+    await replaceInFile(
+      root,
+      "README.md",
+      "or support production",
+      "but does support production",
+    );
+
+    const errors = await checkDocumentation(root);
+    assert.ok(
+      errors.includes(
+        "NOTICE license provenance is missing: 7f1110dd7737c7884012cc899862f9d7427b9c51",
+      ),
+      errors.join("\n"),
+    );
+    assert.ok(
+      errors.includes(
+        "required documentation content is missing: docs/architecture/license-provenance.md -> ce3d3f9376b9a2552fc22c7d962ee9b25ebeda9e748301284be730fbff21b8f1",
+      ),
+      errors.join("\n"),
+    );
+    assert.ok(
+      errors.includes(
+        "README hosted CallMesh contract is missing: only production provision and mapping authority",
+      ),
+      errors.join("\n"),
+    );
+    assert.ok(
+      errors.includes(
+        "README hosted CallMesh contract is missing: CMClient does not ship a CallMesh server or support production endpoint and local mapping overrides.",
+      ),
+      errors.join("\n"),
+    );
+  });
 });
 
 test("rejects obsolete public product claims in the authoritative contract", async () => {

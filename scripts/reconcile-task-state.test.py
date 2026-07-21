@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from v2_graph_test_fixture import write_v2_contract
+
 
 SCRIPT = Path(__file__).with_name("reconcile-task-state.py")
 TASK = "P13-T02"
@@ -31,6 +33,8 @@ class ReconcileFixture:
         self.repo = root / "repo"
         self.state = root / "state" / "TASKS.json"
         self.commits = root / "state" / "COMMITS.md"
+        self.graph_lock = root / "unified-task-graph-lock.json"
+        self.license_provenance = root / "state" / "LICENSE_PROVENANCE.json"
         self.git("init", "--bare", str(self.remote), cwd=root)
         self.git("init", str(self.repo), cwd=root)
         self.git("config", "user.name", "CMClient Test", cwd=self.repo)
@@ -102,9 +106,7 @@ class ReconcileFixture:
         dependency_status: str = "done",
     ) -> None:
         self.state.parent.mkdir(parents=True, exist_ok=True)
-        self.state.write_text(
-            json.dumps(
-                {
+        payload = {
                     "schemaVersion": 2,
                     "tasks": [
                         {
@@ -131,11 +133,14 @@ class ReconcileFixture:
                             "notes": [],
                         }
                     ],
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+                }
+        write_v2_contract(
+            payload,
+            state_path=self.state,
+            graph_lock_path=self.graph_lock,
+            license_path=self.license_provenance,
+            source_baseline=self.base,
+            origin=str(self.remote),
         )
 
     def checkpoint(
@@ -185,6 +190,10 @@ class ReconcileFixture:
                 "origin",
                 "--branch",
                 "dev",
+                "--graph-lock",
+                str(self.graph_lock),
+                "--license-provenance",
+                str(self.license_provenance),
                 *extra,
             ],
             stdout=subprocess.PIPE,
@@ -253,6 +262,32 @@ class ReconcileTaskStateTests(unittest.TestCase):
         remote_sha = self.fx.git("rev-parse", "origin/dev", cwd=self.fx.repo)
         self.assertEqual(remote_sha, sha)
         self.assertEqual(self.fx.task()["commit"], sha)
+
+    def test_blocked_push_failure_recovers_the_exact_local_checkpoint(self) -> None:
+        sha = self.fx.checkpoint()
+        self.fx.write_state(status="blocked", commit=sha)
+        recovered = self.fx.run("--push-local")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(self.fx.task()["status"], "done")
+        self.assertEqual(self.fx.task()["commit"], sha)
+        self.assertEqual(
+            self.fx.git("rev-parse", "refs/heads/dev", cwd=self.fx.remote), sha
+        )
+
+    def test_graph_drift_is_rejected_before_local_checkpoint_push(self) -> None:
+        self.fx.checkpoint()
+        graph_lock = json.loads(self.fx.graph_lock.read_text(encoding="utf-8"))
+        graph_lock["callMeshServiceModel"]["localMappingOverride"] = True
+        self.fx.graph_lock.write_text(
+            json.dumps(graph_lock, indent=2) + "\n", encoding="utf-8"
+        )
+        rejected = self.fx.run("--push-local")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("activeGraph.callMeshServiceModel", rejected.stderr)
+        self.assertEqual(
+            self.fx.git("rev-parse", "refs/heads/dev", cwd=self.fx.remote),
+            self.fx.base,
+        )
 
     def test_checkpoint_parent_must_match_recorded_base(self) -> None:
         (self.fx.repo / "intervening.txt").write_text(

@@ -1,0 +1,33 @@
+CMClient
+Copyright CMClient contributors
+
+The CMClient client is distributed under GPL-3.0-only. See LICENSE.
+
+Meshtastic protocol definitions
+--------------------------------
+
+This distribution contains 41 unmodified files under proto/meshtastic from:
+
+  https://github.com/meshtastic/protobufs
+  commit 7f1110dd7737c7884012cc899862f9d7427b9c51
+  tree   760145a5f860ebd521f574d54caba0f39a7a64d6
+
+Meshtastic declares that source as GPL-3.0 and includes the GNU GPL version 3
+license text. CMClient conservatively distributes the combined client under
+GPL-3.0-only. The upstream revision contains no separate NOTICE file.
+
+Before 2026-07-21, CMClient Cargo metadata declared MIT. Existing contributor
+copyrights and permissions remain preserved in Repository history; the current
+combined client distribution is governed by GPL-3.0-only.
+
+Apache ECharts
+--------------
+
+Apache ECharts
+Copyright 2017-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (https://www.apache.org/).
+
+Other third-party components retain their own license terms and notices. Exact
+target inventories are generated with the release SBOM and license scan.

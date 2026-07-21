@@ -53,11 +53,11 @@ RECONCILE_LIB = Path(__file__).with_name("reconcile-task-state.py")
 DEFAULT_GRAPH_LOCK = Path(__file__).with_name("unified-task-graph-lock.json")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 GIT_OBJECT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
-GRAPH_LOCK_SCHEMA = "cmclient-unified-task-graph-lock/v1"
+GRAPH_LOCK_SCHEMA = "cmclient-unified-task-graph-lock/v2"
 CANDIDATE_SCHEMA = "cmclient-unified-candidate/v1"
 EVIDENCE_SCHEMA = "cmclient-unified-evidence/v1"
 INVALIDATION_RERUN_SCHEMA = "cmclient-invalidation-reruns/v1"
-PRECHECK_ATTESTATION_SCHEMA = "cmclient-goal-precheck/v1"
+PRECHECK_ATTESTATION_SCHEMA = "cmclient-goal-precheck/v2"
 FIRST_ACTIVE_PHASE = "P13"
 GITHUB_RUN_URL_RE = re.compile(
     r"^https://github\.com/toodi0418/CMClient/actions/runs/(?P<run>[1-9][0-9]*)$"
@@ -110,7 +110,7 @@ CAMPAIGN_CLEANUP_PATHS = (
     "evidence",
     "updateLab",
 )
-REQUIRED_QUALIFICATION_GATES = tuple(f"TG-{number:02d}" for number in range(1, 13))
+REQUIRED_QUALIFICATION_GATES = tuple(f"TG-{number:02d}" for number in range(1, 15))
 REQUIRED_SUBCASES = {
     "SUPPLY_CHAIN": {"CHECKSUMS", "SBOM", "PROVENANCE", "UPDATE_MANIFEST"},
     "LIVE_DATA": {
@@ -264,6 +264,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence", type=Path, default=WORKSPACE_ROOT / "state/EVIDENCE.json")
     parser.add_argument("--graph-lock", type=Path, default=DEFAULT_GRAPH_LOCK)
     parser.add_argument(
+        "--license-provenance",
+        type=Path,
+        default=WORKSPACE_ROOT / "state/LICENSE_PROVENANCE.json",
+    )
+    parser.add_argument(
         "--precheck-attestation",
         type=Path,
         default=WORKSPACE_ROOT / "state/GOAL_PRECHECK.json",
@@ -386,6 +391,7 @@ def precheck_file_bindings(
     candidate_path: Path,
     evidence_path: Path,
     graph_lock_path: Path,
+    license_provenance_path: Path,
     gate: Gate,
 ) -> dict[str, str] | None:
     bindings: dict[str, str] = {}
@@ -393,13 +399,14 @@ def precheck_file_bindings(
         ("candidateSha256", candidate_path),
         ("evidenceSha256", evidence_path),
         ("graphLockSha256", graph_lock_path),
+        ("licenseProvenanceSha256", license_provenance_path),
         ("checkerSha256", Path(__file__)),
     ):
         try:
             bindings[name] = sha256_file(path)
         except OSError as error:
             gate.error(f"cannot hash pre-check input {path}: {error}")
-    return bindings if len(bindings) == 4 else None
+    return bindings if len(bindings) == 5 else None
 
 
 def build_precheck_attestation(
@@ -537,8 +544,20 @@ def task_lock_value(task: dict[str, Any], field: str) -> object:
 
 
 def check_graph_lock(
-    state: dict[str, Any], active: dict[str, Any], lock: dict[str, Any], gate: Gate
+    state: dict[str, Any],
+    active: dict[str, Any],
+    lock: dict[str, Any],
+    task_state: ModuleType,
+    license_provenance: dict[str, Any],
+    gate: Gate,
 ) -> None:
+    try:
+        task_state.validate_state_against_graph_lock(
+            state, lock, license_provenance
+        )
+    except (TypeError, ValueError) as error:
+        gate.error(f"v2 graph contract failed: {error}")
+        return
     gate.require(
         lock.get("schema") == GRAPH_LOCK_SCHEMA,
         f"graph lock schema must be {GRAPH_LOCK_SCHEMA}",
@@ -562,7 +581,11 @@ def check_graph_lock(
         )
     parse_time(active.get("importedAt"), "activeGraph.importedAt", gate)
     for field in (
+        "historicalSupersessions",
+        "v2CoverageMap",
+        "licenseGate",
         "targetPlatforms",
+        "callMeshServiceModel",
         "candidateIdentity",
         "completionChecker",
         "repairProtocol",
@@ -575,6 +598,18 @@ def check_graph_lock(
     gate.require(
         first_active_phase == FIRST_ACTIVE_PHASE,
         f"graph lock firstActivePhase must be {FIRST_ACTIVE_PHASE}",
+    )
+    gate.require(
+        lock.get("taskDefinitionCount") == 57,
+        "graph lock taskDefinitionCount must be 57",
+    )
+    gate.require(
+        lock.get("canonicalPayloadFields") == list(task_state.GRAPH_PAYLOAD_FIELDS),
+        "graph lock canonicalPayloadFields differ from the v2 contract",
+    )
+    gate.require(
+        lock.get("activeGraphFields") == list(task_state.ACTIVE_GRAPH_FIELDS),
+        "graph lock activeGraphFields differ from the v2 contract",
     )
 
     tasks = state.get("tasks")
@@ -623,18 +658,12 @@ def check_graph_lock(
             gate.error(f"graph lock contains duplicate task: {task_id}")
         locked_by_id[task_id] = definition
 
-    supersessions = lock.get("supersessions")
+    supersessions = lock.get("historicalSupersessions")
     if not isinstance(supersessions, list):
-        gate.error("graph lock supersessions must be an array")
+        gate.error("graph lock historicalSupersessions must be an array")
         supersessions = []
     graph_payload = {
-        "tasks": locked_tasks,
-        "supersessions": supersessions,
-        "repositoryIdentity": lock.get("repositoryIdentity"),
-        "targetPlatforms": lock.get("targetPlatforms"),
-        "candidateIdentity": lock.get("candidateIdentity"),
-        "completionChecker": lock.get("completionChecker"),
-        "repairProtocol": lock.get("repairProtocol"),
+        field: lock.get(field) for field in task_state.GRAPH_PAYLOAD_FIELDS
     }
     gate.require(
         normalize_sha256(lock.get("graphSha256"))
@@ -642,8 +671,9 @@ def check_graph_lock(
         "graph lock graphSha256 does not match its canonical definitions",
     )
     gate.require(
-        isinstance(lock.get("repositoryIdentity"), str)
-        and bool(lock["repositoryIdentity"]),
+        isinstance(lock.get("repositoryIdentity"), dict)
+        and isinstance(lock["repositoryIdentity"].get("origin"), str)
+        and bool(lock["repositoryIdentity"]["origin"]),
         "graph lock repositoryIdentity is missing",
     )
 
@@ -709,7 +739,7 @@ def check_graph_lock(
     locked_superseded_ids: list[str] = []
     for index, item in enumerate(supersessions):
         if not isinstance(item, dict) or not isinstance(item.get("old"), str):
-            gate.error(f"graph lock supersessions[{index}] is invalid")
+            gate.error(f"graph lock historicalSupersessions[{index}] is invalid")
             continue
         old_id = item["old"]
         locked_superseded_ids.append(old_id)
@@ -719,7 +749,8 @@ def check_graph_lock(
             and task.get("supersededBy") == item.get("new")
             and isinstance(task.get("supersession"), dict)
             and task["supersession"].get("graphId") == lock.get("id")
-            and task["supersession"].get("graphVersion") == lock.get("version")
+            and task["supersession"].get("graphVersion") == 1
+            and item.get("graphVersion") == 1
             and task["supersession"].get("reason") == item.get("reason"),
             f"supersession mapping differs from graph lock: {old_id}",
         )
@@ -727,6 +758,26 @@ def check_graph_lock(
         active.get("supersededTaskIds") == locked_superseded_ids,
         "activeGraph.supersededTaskIds differs from graph lock",
     )
+    coverage = lock.get("v2CoverageMap")
+    if isinstance(coverage, list):
+        for item in coverage:
+            if not isinstance(item, dict) or not isinstance(item.get("v2Tasks"), list):
+                continue
+            for target_id in item["v2Tasks"]:
+                target = state_by_id.get(target_id)
+                if not isinstance(target, dict):
+                    continue
+                if target.get("required", True):
+                    gate.require(
+                        target.get("status") == "done",
+                        f"required v2 coverage target is incomplete: {target_id}",
+                    )
+                else:
+                    gate.require(
+                        target.get("manualGate") is True
+                        and target.get("status") in {"pending", "done"},
+                        f"optional v2 coverage target is invalid: {target_id}",
+                    )
 
 
 def read_structured_checkpoint_history(
@@ -1113,7 +1164,7 @@ def validate_image_list(
 
 def check_task_state(
     state: dict[str, Any], excluded: list[str], repo: Path,
-    graph_lock: dict[str, Any], gate: Gate
+    graph_lock: dict[str, Any], license_provenance: dict[str, Any], gate: Gate
 ) -> tuple[str | None, set[str]]:
     active = state.get("activeGraph")
     if not isinstance(active, dict):
@@ -1128,7 +1179,9 @@ def check_task_state(
     except (ValueError, TypeError) as error:
         gate.error(f"task graph invariant failed: {error}")
         return active.get("branch") if isinstance(active.get("branch"), str) else None, set()
-    check_graph_lock(state, active, graph_lock, gate)
+    check_graph_lock(
+        state, active, graph_lock, task_state, license_provenance, gate
+    )
 
     branch = active.get("branch")
     gate.require(branch == "dev", "active graph branch must be dev")
@@ -2067,7 +2120,7 @@ def check_evidence(
         )
         gate.require(
             gates == set(REQUIRED_QUALIFICATION_GATES),
-            "TESTABILITY_GATES must cover exactly TG-01 through TG-12",
+            "TESTABILITY_GATES must cover exactly TG-01 through TG-14",
         )
 
     for case_id, required_subcases in REQUIRED_SUBCASES.items():
@@ -2281,6 +2334,9 @@ def main() -> int:
     evidence = load_json(args.evidence, "evidence", gate)
     campaign = load_json(args.campaign, "campaign", gate)
     graph_lock = load_json(args.graph_lock, "graph lock", gate)
+    license_provenance = load_json(
+        args.license_provenance, "license provenance", gate
+    )
     precheck_attestation = (
         None
         if args.exclude_task
@@ -2306,10 +2362,15 @@ def main() -> int:
     freeze_at: datetime | None = None
     candidate_digest: str | None = None
     precheck_repo_head: str | None = None
-    repository_identity = (
+    repository_identity_document = (
         graph_lock.get("repositoryIdentity")
         if isinstance(graph_lock, dict)
-        and isinstance(graph_lock.get("repositoryIdentity"), str)
+        and isinstance(graph_lock.get("repositoryIdentity"), dict)
+        else {}
+    )
+    repository_identity = (
+        normalize_remote_identity(repository_identity_document.get("origin", ""))
+        if isinstance(repository_identity_document.get("origin"), str)
         else ""
     )
     campaign_id = check_campaign(campaign, gate) if campaign is not None else None
@@ -2319,6 +2380,8 @@ def main() -> int:
         scan_secret_values(campaign, "campaign", gate)
     if precheck_attestation is not None:
         scan_secret_values(precheck_attestation, "pre-check attestation", gate)
+    if license_provenance is not None:
+        scan_secret_values(license_provenance, "license provenance", gate)
 
     if candidate is not None:
         scan_secret_values(candidate, "candidate", gate)
@@ -2339,9 +2402,18 @@ def main() -> int:
         except OSError as error:
             gate.error(f"cannot hash candidate JSON {args.candidate}: {error}")
 
-    if state is not None and graph_lock is not None:
+    if (
+        state is not None
+        and graph_lock is not None
+        and license_provenance is not None
+    ):
         branch, _ = check_task_state(
-            state, args.exclude_task, args.repo, graph_lock, gate
+            state,
+            args.exclude_task,
+            args.repo,
+            graph_lock,
+            license_provenance,
+            gate,
         )
     check_repo(args.repo, branch, source_commit, gate, repository_identity)
     check_candidate_against_repo(args.repo, source_commit, source_tree, gate)
@@ -2368,7 +2440,11 @@ def main() -> int:
             )
 
     file_bindings = precheck_file_bindings(
-        args.candidate, args.evidence, args.graph_lock, gate
+        args.candidate,
+        args.evidence,
+        args.graph_lock,
+        args.license_provenance,
+        gate,
     )
     if args.exclude_task:
         ok_head, head = git(args.repo, "rev-parse", "HEAD")
@@ -2448,6 +2524,7 @@ def main() -> int:
             "candidate": str(args.candidate),
             "evidence": str(args.evidence),
             "graphLock": str(args.graph_lock),
+            "licenseProvenance": str(args.license_provenance),
             "precheckAttestation": str(args.precheck_attestation),
             "repositoryIdentity": repository_identity,
             "excludedTasks": args.exclude_task,

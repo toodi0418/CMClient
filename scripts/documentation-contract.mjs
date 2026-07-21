@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -52,6 +53,15 @@ const REQUIRED_DOCUMENT_SECTIONS = new Map([
   [
     "docs/architecture/docker-deployment.md",
     ["Composition", "Access And Setup", "Lifecycle And Update"],
+  ],
+  [
+    "docs/architecture/license-provenance.md",
+    [
+      "Approved Client Route",
+      "Meshtastic Corpus",
+      "Dependency Inventory",
+      "Invalidation And Release Gate",
+    ],
   ],
   [
     "docs/user/getting-started.md",
@@ -201,6 +211,23 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
     ],
   ],
   [
+    "docs/architecture/license-provenance.md",
+    [
+      "https://github.com/meshtastic/protobufs",
+      "7f1110dd7737c7884012cc899862f9d7427b9c51",
+      "760145a5f860ebd521f574d54caba0f39a7a64d6",
+      "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+      "762fc01e0e6520b03487c6cc7b4afbafeadc39f10a66fa17def966e9ea428602",
+      "ce3d3f9376b9a2552fc22c7d962ee9b25ebeda9e748301284be730fbff21b8f1",
+      "91d9a6b87f834b20edde0341f97c20eac8deab044ed4fdd82b81fe402d1d73e1",
+      "99207257e14da5b216e65b9863c11dfcde7fdb58403be094cd93a9ec66fdbca3",
+      "b62d86a78088d0ec37f0a409ca2435e7d26ba4833fdd030ee89db39cbb09cc7a",
+      "1a46ec827117d651b449faf536c353763f642de4550537361358a93b5a22b281",
+      "d491d358344f842685c1b1585970999db65fe30ecf7ef3867af8814f4016c016",
+      "https://callmesh.tmmarc.org",
+    ],
+  ],
+  [
     "docs/user/getting-started.md",
     ["SHA256SUMS", "cmclient-agent --serve", "CMCLIENT_IMAGE"],
   ],
@@ -327,6 +354,24 @@ const HTTP_METHODS = new Set([
 ]);
 const EVENT_TYPE_PATTERN = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
 const AGENT_SYNTHETIC_EVENT_TYPES = new Set(["gateway.heartbeat"]);
+const PROJECT_LICENSE = "GPL-3.0-only";
+const GPL_V3_LICENSE_SHA256 =
+  "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986";
+const LICENSE_NOTICE_TOKENS = [
+  "https://github.com/meshtastic/protobufs",
+  "7f1110dd7737c7884012cc899862f9d7427b9c51",
+  "760145a5f860ebd521f574d54caba0f39a7a64d6",
+  "41 unmodified files",
+  "GPL-3.0-only",
+  "no separate NOTICE file",
+  "Apache ECharts",
+];
+const HOSTED_CALLMESH_README_TOKENS = [
+  "official hosted CallMesh service",
+  "https://callmesh.tmmarc.org",
+  "only production provision and mapping authority",
+  "CMClient does not ship a CallMesh server or support production endpoint and local mapping overrides.",
+];
 
 export async function checkDocumentation(repositoryRoot = resolve(".")) {
   const errors = [];
@@ -353,6 +398,11 @@ export async function checkDocumentation(repositoryRoot = resolve(".")) {
 
   checkReadmeIndex(contents.get("README.md") ?? "", errors);
   checkUnifiedProductContract(contents, errors);
+  await checkLicenseAndProvenanceContract(
+    repositoryRoot,
+    contents.get("README.md") ?? "",
+    errors,
+  );
 
   const documentedRoutes = extractDocumentedRoutes(
     [...contents.values()].join("\n"),
@@ -454,6 +504,90 @@ function checkUnifiedProductContract(contents, errors) {
       }
     }
   }
+}
+
+async function checkLicenseAndProvenanceContract(
+  repositoryRoot,
+  readme,
+  errors,
+) {
+  let license;
+  try {
+    license = await readFile(join(repositoryRoot, "LICENSE"));
+  } catch {
+    errors.push("missing license contract: LICENSE");
+  }
+  if (license) {
+    const digest = createHash("sha256").update(license).digest("hex");
+    if (digest !== GPL_V3_LICENSE_SHA256) {
+      errors.push(
+        `root LICENSE SHA-256 is invalid: expected ${GPL_V3_LICENSE_SHA256}, received ${digest}`,
+      );
+    }
+  }
+
+  let cargoManifest;
+  try {
+    cargoManifest = await readFile(join(repositoryRoot, "Cargo.toml"), "utf8");
+  } catch {
+    errors.push("missing license contract: Cargo.toml");
+  }
+  if (cargoManifest !== undefined) {
+    const workspacePackage = tomlSection(cargoManifest, "workspace.package");
+    const declaredLicense = workspacePackage?.match(
+      /^\s*license\s*=\s*"([^"]+)"\s*$/m,
+    )?.[1];
+    if (declaredLicense !== PROJECT_LICENSE) {
+      errors.push(
+        `Cargo workspace license must be ${PROJECT_LICENSE}: received ${declaredLicense ?? "missing"}`,
+      );
+    }
+  }
+
+  let packageManifest;
+  try {
+    packageManifest = JSON.parse(
+      await readFile(join(repositoryRoot, "package.json"), "utf8"),
+    );
+  } catch {
+    errors.push("missing or invalid license contract: package.json");
+  }
+  if (packageManifest && packageManifest.license !== PROJECT_LICENSE) {
+    errors.push(
+      `package.json license must be ${PROJECT_LICENSE}: received ${packageManifest.license ?? "missing"}`,
+    );
+  }
+
+  let notice;
+  try {
+    notice = await readFile(join(repositoryRoot, "NOTICE"), "utf8");
+  } catch {
+    errors.push("missing license contract: NOTICE");
+  }
+  if (notice !== undefined) {
+    for (const token of LICENSE_NOTICE_TOKENS) {
+      if (!notice.includes(token)) {
+        errors.push(`NOTICE license provenance is missing: ${token}`);
+      }
+    }
+  }
+
+  const normalizedReadme = readme.replace(/\s+/g, " ");
+  for (const token of HOSTED_CALLMESH_README_TOKENS) {
+    if (!normalizedReadme.includes(token)) {
+      errors.push(`README hosted CallMesh contract is missing: ${token}`);
+    }
+  }
+}
+
+function tomlSection(manifest, sectionName) {
+  const lines = manifest.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === `[${sectionName}]`);
+  if (start === -1) return undefined;
+  const end = lines.findIndex(
+    (line, index) => index > start && line.trim().startsWith("["),
+  );
+  return lines.slice(start + 1, end === -1 ? undefined : end).join("\n");
 }
 
 async function listMarkdownFiles(repositoryRoot, directory = repositoryRoot) {

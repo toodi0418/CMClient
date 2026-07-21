@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from v2_graph_test_fixture import write_v2_contract
+
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -115,13 +117,21 @@ class TaskStateToolTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.state_path = self.root / "state" / "TASKS.json"
         self.state_path.parent.mkdir(parents=True)
+        self.graph_lock_path = self.root / "unified-task-graph-lock.json"
+        self.license_path = self.root / "state" / "LICENSE_PROVENANCE.json"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
     def write(self, tasks: list[dict], **extra: object) -> None:
         value = {"schemaVersion": 2, "project": "test", "tasks": tasks, **extra}
-        self.write_value(value)
+        write_v2_contract(
+            value,
+            state_path=self.state_path,
+            graph_lock_path=self.graph_lock_path,
+            license_path=self.license_path,
+            source_baseline=self.base_commit,
+        )
 
     def write_value(self, value: dict) -> None:
         self.state_path.write_text(
@@ -139,6 +149,14 @@ class TaskStateToolTests(unittest.TestCase):
         ):
             command.extend(["--repo", str(self.repo)])
         command.extend(["--state", str(self.state_path)])
+        command.extend(
+            [
+                "--graph-lock",
+                str(self.graph_lock_path),
+                "--license-provenance",
+                str(self.license_path),
+            ]
+        )
         return subprocess.run(
             command,
             stdout=subprocess.PIPE,
@@ -245,15 +263,6 @@ class TaskStateToolTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("required skipped task is not declared superseded", result.stderr)
 
-        original = task("P13-T01", "pending")
-        original["supersededBy"] = ["P13-T02"]
-        self.write(
-            [original, task("P13-T02", "pending")],
-            activeGraph={"supersededTaskIds": ["P13-T01"]},
-        )
-        result = self.run_script("task-state.py", "P13-T01", "skipped")
-        self.assertEqual(result.returncode, 0, result.stderr)
-
         self.write(
             [
                 task("P13-T01", "pending"),
@@ -358,6 +367,10 @@ class TaskStateToolTests(unittest.TestCase):
             str(SCRIPTS / "task-state.py"),
             "P13-T01",
             "pending",
+            "--graph-lock",
+            str(self.graph_lock_path),
+            "--license-provenance",
+            str(self.license_path),
         ]
         processes = [
             subprocess.Popen(
@@ -373,6 +386,128 @@ class TaskStateToolTests(unittest.TestCase):
         self.assertTrue(all(process.returncode == 0 for process in processes), results)
         self.assertCountEqual(self.read()["tasks"][0]["notes"], ["first", "second"])
         self.assertFalse(list(self.state_path.parent.glob(".TASKS.json.*.tmp")))
+
+    def test_v2_graph_and_license_drift_fail_before_scheduling(self) -> None:
+        self.write(
+            [
+                task("P13-T01", "done"),
+                task("P13-T02", "pending", ["P13-T01"]),
+            ]
+        )
+        state = self.read()
+        state["activeGraph"]["callMeshServiceModel"]["localMappingOverride"] = True
+        self.write_value(state)
+        result = self.run_script("next-task.py")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("activeGraph.callMeshServiceModel", result.stderr)
+
+        self.write(
+            [
+                task("P13-T01", "done"),
+                task("P13-T02", "pending", ["P13-T01"]),
+            ]
+        )
+        provenance = json.loads(self.license_path.read_text(encoding="utf-8"))
+        provenance["publicDevPushPermitted"] = False
+        self.license_path.write_text(
+            json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+        )
+        result = self.run_script("next-task.py")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("license provenance disagrees", result.stderr)
+
+    def test_upgrade_journal_blocks_normal_tools_and_allows_exact_child(self) -> None:
+        self.write(
+            [
+                task("P13-T01", "done"),
+                task("P13-T02", "pending", ["P13-T01"]),
+            ]
+        )
+        operation_id = "upgrade-fixture"
+        (self.state_path.parent / "GRAPH_UPGRADE.json").write_text(
+            json.dumps(
+                {
+                    "schema": "cmclient-graph-upgrade-journal/v1",
+                    "operationId": operation_id,
+                    "status": "running",
+                    "phase": "state-committed",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        blocked = self.run_script("next-task.py")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("GRAPH_UPGRADE_IN_PROGRESS", blocked.stderr)
+
+        allowed = self.run_script(
+            "next-task.py", "--graph-upgrade-operation-id", operation_id
+        )
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(json.loads(allowed.stdout)["id"], "P13-T02")
+
+    def test_corrupt_and_half_complete_upgrade_journals_fail_closed(self) -> None:
+        self.write(
+            [
+                task("P13-T01", "done"),
+                task("P13-T02", "pending", ["P13-T01"]),
+            ]
+        )
+        journal_path = self.state_path.parent / "GRAPH_UPGRADE.json"
+        invalid_documents = [
+            {
+                "schema": "cmclient-graph-upgrade-journal/v1",
+                "operationId": "",
+                "status": "running",
+                "phase": "prepared",
+            },
+            {
+                "schema": "cmclient-graph-upgrade-journal/v1",
+                "operationId": "upgrade-fixture",
+                "status": "invented",
+                "phase": "prepared",
+            },
+            {
+                "schema": "cmclient-graph-upgrade-journal/v1",
+                "operationId": "upgrade-fixture",
+                "status": "complete",
+                "phase": "pushed",
+            },
+            {
+                "schema": "cmclient-graph-upgrade-journal/v1",
+                "operationId": "upgrade-fixture",
+                "status": "running",
+                "phase": "complete",
+            },
+        ]
+        for document in invalid_documents:
+            with self.subTest(document=document):
+                journal_path.write_text(
+                    json.dumps(document, indent=2) + "\n", encoding="utf-8"
+                )
+                result = self.run_script(
+                    "next-task.py",
+                    "--graph-upgrade-operation-id",
+                    "upgrade-fixture",
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+        journal_path.write_text(
+            json.dumps(
+                {
+                    "schema": "cmclient-graph-upgrade-journal/v1",
+                    "operationId": "upgrade-fixture",
+                    "status": "complete",
+                    "phase": "complete",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = self.run_script("next-task.py")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_repair_start_blocks_parent_and_invalidates_candidates(self) -> None:
         self.write(

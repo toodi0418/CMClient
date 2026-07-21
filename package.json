@@ -1,6 +1,7 @@
 {
   "name": "cmclient",
   "version": "2.0.0-rc.1",
+  "license": "GPL-3.0-only",
   "private": true,
   "packageManager": "pnpm@11.9.0",
   "engines": {

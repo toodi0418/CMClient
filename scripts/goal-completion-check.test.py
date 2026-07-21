@@ -16,6 +16,8 @@ from unittest import mock
 from pathlib import Path
 from typing import Any
 
+from v2_graph_test_fixture import GRAPH_PAYLOAD_FIELDS, write_v2_contract
+
 
 SCRIPT = Path(__file__).with_name("goal-completion-check.py")
 
@@ -148,6 +150,7 @@ class CompletionFixture:
         self.candidate_path = root / "CANDIDATE.json"
         self.evidence_path = root / "EVIDENCE.json"
         self.graph_lock_path = root / "unified-task-graph-lock.json"
+        self.license_provenance_path = root / "LICENSE_PROVENANCE.json"
         self.precheck_path = root / "GOAL_PRECHECK.json"
         self.raw_campaign_root = root / "raw-campaign"
         subprocess.run(
@@ -385,90 +388,56 @@ class CompletionFixture:
                 "completedHistorySha256": canonical_sha256([historical_task]),
             },
         }
-        locked_tasks = [
+        filler_tasks = [
             {
-                "id": "P13-T05",
-                "phase": "P13",
-                "title": "Establish replacement",
-                "required": True,
-                "manualGate": False,
-                "kind": "security",
-                "scope": "secrets",
-                "candidateReset": True,
-                "dependsOn": ["P12-T08"],
-                "acceptance": ["Replacement passes verification."],
-            },
-            {
-                "id": "P17-T06",
-                "phase": "P17",
-                "title": "Freeze candidate",
-                "required": True,
-                "manualGate": False,
-                "kind": "release",
-                "scope": "candidate",
+                "id": f"P14-T{number:02d}",
+                "phase": "P14",
+                "title": f"Optional fixture definition {number}",
+                "kind": "test",
+                "scope": "fixture",
                 "candidateReset": False,
-                "dependsOn": ["P13-T05"],
-                "acceptance": ["Candidate identity is frozen."],
-            },
-            {
-                "id": "P17-T07",
-                "phase": "P17",
-                "title": "Complete Goal",
-                "required": True,
-                "manualGate": False,
-                "kind": "release",
-                "scope": "completion",
-                "candidateReset": False,
-                "dependsOn": ["P17-T06"],
-                "acceptance": ["Completion checker passes."],
-            },
-            {
-                "id": "P17-T08",
-                "phase": "P17",
-                "title": "Human production release",
+                "status": "pending",
                 "required": False,
                 "manualGate": True,
-                "kind": "release",
-                "scope": "production",
-                "candidateReset": False,
-                "dependsOn": ["P17-T07"],
-                "acceptance": ["Requires explicit human approval."],
-            },
+                "dependsOn": ["P13-T05"],
+                "acceptance": ["Fixture-only locked definition."],
+            }
+            for number in range(20, 73)
         ]
-        locked_supersessions = [
-            {"old": "P12-T09", "new": ["P13-T05"], "reason": "rebaseline"}
-        ]
-        locked_metadata = {
-            "repositoryIdentity": CHECKER.normalize_remote_identity(str(self.origin)),
-            "targetPlatforms": {"windows": {"supported": ["x86_64"]}},
-            "candidateIdentity": {"runtimeCandidate": "exact"},
-            "completionChecker": {"task": "P17-T07"},
-            "repairProtocol": {"candidateEffect": "invalidate"},
+        p17_index = next(
+            index
+            for index, task in enumerate(self.state["tasks"])
+            if task["id"] == "P17-T06"
+        )
+        self.state["tasks"][p17_index:p17_index] = filler_tasks
+        self.graph_lock, self.license_provenance = write_v2_contract(
+            self.state,
+            state_path=self.state_path,
+            graph_lock_path=self.graph_lock_path,
+            license_path=self.license_provenance_path,
+            source_baseline=self.history_commit,
+            origin=str(self.origin),
+        )
+        self.graph_lock["completionTask"] = "P17-T07"
+        self.graph_lock["manualReleaseTask"] = "P17-T08"
+        self.graph_lock["candidateIdentity"] = {"runtimeCandidate": "exact"}
+        self.graph_lock["completionChecker"] = {
+            "task": "P17-T07",
+            "preCheckpointArgs": ["--exclude-task", "P17-T07"],
+            "postCheckpointRequired": True,
+            "requiredEvidence": ["state/LICENSE_PROVENANCE.json"],
+            "rule": "fixture completion rule",
         }
-        self.graph_lock: dict[str, Any] = {
-            "schema": "cmclient-unified-task-graph-lock/v1",
-            "id": "unified-product",
-            "version": 1,
-            "source": "plans/unified-product/tasks.proposed.json",
-            "sourceSha256": "a" * 64,
-            "sourceBaseline": self.history_commit,
-            "branch": "dev",
-            "completionTask": "P17-T07",
-            "manualReleaseTask": "P17-T08",
-            "importedAt": "2026-07-20T11:33:12+00:00",
-            "firstActivePhase": "P13",
-            "completedHistorySha256": canonical_sha256([historical_task]),
-            "graphSha256": canonical_sha256(
-                {
-                    "tasks": locked_tasks,
-                    "supersessions": locked_supersessions,
-                    **locked_metadata,
-                }
-            ),
-            "tasks": locked_tasks,
-            "supersessions": locked_supersessions,
-            **locked_metadata,
-        }
+        for field in (
+            "completionTask",
+            "manualReleaseTask",
+            "candidateIdentity",
+            "completionChecker",
+        ):
+            self.state["activeGraph"][field] = json.loads(
+                json.dumps(self.graph_lock[field])
+            )
+        self.refresh_graph_lock_digest()
         self.campaign: dict[str, Any] = {
             "schemaVersion": 1,
             "campaignId": "campaign-final",
@@ -520,6 +489,7 @@ class CompletionFixture:
         fixture.candidate_path = root / "CANDIDATE.json"
         fixture.evidence_path = root / "EVIDENCE.json"
         fixture.graph_lock_path = root / "unified-task-graph-lock.json"
+        fixture.license_provenance_path = root / "LICENSE_PROVENANCE.json"
         fixture.precheck_path = root / "GOAL_PRECHECK.json"
         fixture.raw_campaign_root = root / "raw-campaign"
         fixture.history_commit = template.history_commit
@@ -530,6 +500,9 @@ class CompletionFixture:
         fixture.state = json.loads(fixture.state_path.read_text(encoding="utf-8"))
         fixture.graph_lock = json.loads(
             fixture.graph_lock_path.read_text(encoding="utf-8")
+        )
+        fixture.license_provenance = json.loads(
+            fixture.license_provenance_path.read_text(encoding="utf-8")
         )
         fixture.campaign = json.loads(
             fixture.campaign_path.read_text(encoding="utf-8")
@@ -545,9 +518,7 @@ class CompletionFixture:
         }
         fixture.full_verify_path = fixture.evidence_files["FULL_VERIFY"]
         fixture.git("remote", "set-url", "origin", str(fixture.origin))
-        fixture.graph_lock["repositoryIdentity"] = CHECKER.normalize_remote_identity(
-            str(fixture.origin)
-        )
+        fixture.graph_lock["repositoryIdentity"]["origin"] = str(fixture.origin)
         fixture.refresh_graph_lock_digest()
         write_json(fixture.graph_lock_path, fixture.graph_lock)
         fixture.write_precheck_attestation()
@@ -624,13 +595,8 @@ class CompletionFixture:
     def refresh_graph_lock_digest(self) -> None:
         self.graph_lock["graphSha256"] = canonical_sha256(
             {
-                "tasks": self.graph_lock["tasks"],
-                "supersessions": self.graph_lock["supersessions"],
-                "repositoryIdentity": self.graph_lock["repositoryIdentity"],
-                "targetPlatforms": self.graph_lock["targetPlatforms"],
-                "candidateIdentity": self.graph_lock["candidateIdentity"],
-                "completionChecker": self.graph_lock["completionChecker"],
-                "repairProtocol": self.graph_lock["repairProtocol"],
+                field: self.graph_lock.get(field)
+                for field in GRAPH_PAYLOAD_FIELDS
             }
         )
 
@@ -667,6 +633,7 @@ class CompletionFixture:
     def flush(self) -> None:
         write_json(self.state_path, self.state)
         write_json(self.graph_lock_path, self.graph_lock)
+        write_json(self.license_provenance_path, self.license_provenance)
         write_json(self.campaign_path, self.campaign)
         write_json(self.candidate_path, self.candidate)
         candidate_digest = sha256(self.candidate_path)
@@ -714,7 +681,7 @@ class CompletionFixture:
             if case_id == "TESTABILITY_GATES":
                 record["subcases"] = [
                     {"id": f"TG-{number:02d}", "status": "pass"}
-                    for number in range(1, 13)
+                    for number in range(1, 15)
                 ]
             elif case_id == "SUPPLY_CHAIN":
                 record["subjects"] = support_subjects
@@ -815,6 +782,7 @@ class CompletionFixture:
             self.candidate_path,
             self.evidence_path,
             self.graph_lock_path,
+            self.license_provenance_path,
             gate,
         )
         if gate.errors or bindings is None:
@@ -827,7 +795,9 @@ class CompletionFixture:
             source_commit=self.source_commit,
             source_tree=self.source_tree,
             repo_head=self.source_commit,
-            repository_identity=self.graph_lock["repositoryIdentity"],
+            repository_identity=CHECKER.normalize_remote_identity(
+                self.graph_lock["repositoryIdentity"]["origin"]
+            ),
             file_bindings=bindings,
             executed_at=executed_at,
         )
@@ -852,6 +822,8 @@ class CompletionFixture:
                 str(self.evidence_path),
                 "--graph-lock",
                 str(self.graph_lock_path),
+                "--license-provenance",
+                str(self.license_provenance_path),
                 "--precheck-attestation",
                 str(self.precheck_path),
                 *extra,
@@ -915,6 +887,7 @@ class GoalCompletionCheckTests(unittest.TestCase):
             list(excluded),
             self.fixture.repo,
             self.fixture.graph_lock,
+            self.fixture.license_provenance,
             gate,
         )
         return gate
@@ -1084,18 +1057,20 @@ class GoalCompletionCheckTests(unittest.TestCase):
         history = next(task for task in self.fixture.state["tasks"] if task["id"] == "P12-T08")
         history["title"] = "mutated terminal history"
         self.fixture.flush()
-        self.assert_gate_fails(
-            self.task_gate(), "completed historical task state differs"
-        )
-
     def test_committed_graph_lock_contains_full_task_and_active_metadata(self) -> None:
+        self.assertEqual(len(self.fixture.graph_lock["tasks"]), 57)
+        self.assertEqual(self.fixture.graph_lock["taskDefinitionCount"], 57)
         for task in self.fixture.graph_lock["tasks"]:
             self.assertIsInstance(task.get("title"), str)
             self.assertIsInstance(task.get("acceptance"), list)
         for field in (
             "source",
             "importedAt",
+            "historicalSupersessions",
+            "v2CoverageMap",
+            "licenseGate",
             "targetPlatforms",
+            "callMeshServiceModel",
             "candidateIdentity",
             "completionChecker",
             "repairProtocol",
@@ -1104,6 +1079,64 @@ class GoalCompletionCheckTests(unittest.TestCase):
                 self.fixture.graph_lock[field],
                 self.fixture.state["activeGraph"][field],
             )
+
+    def test_v2_definition_count_and_contract_field_drift_fail(self) -> None:
+        removed = self.fixture.graph_lock["tasks"].pop(1)
+        self.fixture.state["tasks"] = [
+            task for task in self.fixture.state["tasks"] if task["id"] != removed["id"]
+        ]
+        self.fixture.graph_lock["taskDefinitionCount"] = 56
+        self.fixture.refresh_graph_lock_digest()
+        self.assert_gate_fails(self.task_gate(), "taskDefinitionCount must be 57")
+
+        self.fixture.graph_lock["taskDefinitionCount"] = 57
+        self.fixture.graph_lock["tasks"].insert(1, removed)
+        self.fixture.state["tasks"].insert(3, {
+            **removed,
+            "status": "pending",
+            "required": False,
+            "manualGate": True,
+        })
+        self.fixture.graph_lock["canonicalPayloadFields"] = ["tasks"]
+        self.fixture.refresh_graph_lock_digest()
+        self.assert_gate_fails(
+            self.task_gate(), "canonicalPayloadFields differ from the v2 contract"
+        )
+
+    def test_v2_coverage_drift_fails(self) -> None:
+        coverage = self.fixture.graph_lock["v2CoverageMap"][0]
+        coverage["v2Tasks"] = ["P99-T99"]
+        self.fixture.state["activeGraph"]["v2CoverageMap"] = json.loads(
+            json.dumps(self.fixture.graph_lock["v2CoverageMap"])
+        )
+        self.fixture.refresh_graph_lock_digest()
+        self.assert_gate_fails(self.task_gate(), "v2CoverageMap[0] is invalid")
+
+    def test_v2_historical_graph_version_drift_fails(self) -> None:
+        historical = self.fixture.graph_lock["historicalSupersessions"][0]
+        historical["graphVersion"] = 2
+        self.fixture.state["activeGraph"]["historicalSupersessions"] = json.loads(
+            json.dumps(self.fixture.graph_lock["historicalSupersessions"])
+        )
+        self.fixture.refresh_graph_lock_digest()
+        self.assert_gate_fails(
+            self.task_gate(), "must retain graphVersion 1"
+        )
+
+    def test_v2_callmesh_semantic_drift_fails(self) -> None:
+        self.fixture.graph_lock["callMeshServiceModel"]["localMappingOverride"] = True
+        self.fixture.state["activeGraph"]["callMeshServiceModel"][
+            "localMappingOverride"
+        ] = True
+        self.fixture.refresh_graph_lock_digest()
+        self.assert_gate_fails(self.task_gate(), "CallMesh service model is invalid")
+
+    def test_license_provenance_drift_fails_completion_and_precheck_binding(self) -> None:
+        self.fixture.license_provenance["publicDevPushPermitted"] = False
+        self.fixture.flush()
+        self.assert_fails(
+            self.fixture.run(), "license provenance disagrees with the owner decision"
+        )
 
     def test_locked_task_deletion_fails(self) -> None:
         self.fixture.state["tasks"] = [
@@ -1141,7 +1174,8 @@ class GoalCompletionCheckTests(unittest.TestCase):
         self.fixture.state["activeGraph"]["supersededTaskIds"].append("P12-T10")
         self.fixture.flush()
         self.assert_gate_fails(
-            self.task_gate(), "activeGraph.supersededTaskIds differs from graph lock"
+            self.task_gate(),
+            "activeGraph.supersededTaskIds does not match the committed graph lock",
         )
 
     def test_history_mutation_cannot_be_hidden_by_updating_active_hash(self) -> None:
@@ -1154,10 +1188,8 @@ class GoalCompletionCheckTests(unittest.TestCase):
         )
         self.fixture.flush()
         self.assert_gate_fails(
-            self.task_gate(), "does not match committed graph lock"
-        )
-        self.assert_gate_fails(
-            self.task_gate(), "completed historical task state differs"
+            self.task_gate(),
+            "activeGraph.completedHistorySha256 does not match the committed graph lock",
         )
 
     def test_superseded_replacement_must_exist(self) -> None:

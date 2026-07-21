@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from v2_graph_test_fixture import write_v2_contract
+
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 TASK = "P13-T02"
@@ -87,6 +89,9 @@ if [[ -n "${CMCLIENT_TEST_VERIFY_CREATE:-}" ]]; then
 fi
 if [[ -n "${CMCLIENT_TEST_VERIFY_APPEND:-}" ]]; then
   printf 'verified\n' >> "$REPO_DIR/$CMCLIENT_TEST_VERIFY_APPEND"
+fi
+if [[ -n "${CMCLIENT_TEST_VERIFY_TOUCH_GRAPH_LOCK:-}" ]]; then
+  printf '\n' >> "$WORKSPACE_ROOT/scripts/unified-task-graph-lock.json"
 fi
 exit "${CMCLIENT_TEST_VERIFY_STATUS:-0}"
 """,
@@ -170,8 +175,13 @@ exit "${CMCLIENT_TEST_VERIFY_STATUS:-0}"
                 },
             ],
         }
-        (self.state / "TASKS.json").write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        write_v2_contract(
+            payload,
+            state_path=self.state / "TASKS.json",
+            graph_lock_path=self.scripts / "unified-task-graph-lock.json",
+            license_path=self.state / "LICENSE_PROVENANCE.json",
+            source_baseline=base,
+            origin=str(self.remote),
         )
 
     def write_workspace_ledgers(self) -> None:
@@ -376,6 +386,19 @@ class CheckpointShellE2ETests(unittest.TestCase):
         self.assertEqual(self.fx.git("rev-parse", "HEAD", cwd=self.fx.repo), self.fx.base)
         self.assertEqual(self.fx.target()["status"], "in_progress")
 
+        self.fx.reset()
+        (self.fx.repo / "feature.txt").write_text(
+            "graph drift\n", encoding="utf-8"
+        )
+        drifted = self.fx.checkpoint(CMCLIENT_TEST_VERIFY_TOUCH_GRAPH_LOCK="1")
+        self.assertNotEqual(drifted.returncode, 0)
+        self.assertIn(
+            "Task state, graph lock, or license provenance changed", drifted.stderr
+        )
+        self.assertEqual(
+            self.fx.git("rev-parse", "HEAD", cwd=self.fx.repo), self.fx.base
+        )
+
     def test_dirty_repository_never_recovers_or_duplicates_checkpoint(self) -> None:
         sha = self.fx.manual_checkpoint(push=False)
         (self.fx.repo / "unrelated dirty.txt").write_text("dirty\n", encoding="utf-8")
@@ -390,6 +413,68 @@ class CheckpointShellE2ETests(unittest.TestCase):
 
 
 class StartSessionLinkedWorktreeE2ETest(unittest.TestCase):
+    def test_half_complete_graph_upgrade_journal_stops_before_doctor(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cmclient corrupt shell ") as temporary:
+            fx = ShellWorkspace(Path(temporary))
+            (fx.state / "GRAPH_UPGRADE.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "cmclient-graph-upgrade-journal/v1",
+                        "operationId": "upgrade-shell-fixture",
+                        "status": "complete",
+                        "phase": "pushed",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = fx.run_script("start-session.sh")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("half complete", result.stderr)
+            self.assertNotIn("Next executable task", result.stdout)
+
+    def test_incomplete_graph_upgrade_is_resumed_before_normal_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cmclient upgrade shell ") as temporary:
+            fx = ShellWorkspace(Path(temporary))
+            journal = fx.state / "GRAPH_UPGRADE.json"
+            journal.write_text(
+                json.dumps(
+                    {
+                        "schema": "cmclient-graph-upgrade-journal/v1",
+                        "operationId": "upgrade-shell-fixture",
+                        "status": "running",
+                        "phase": "checkpointed",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (fx.scripts / "upgrade-unified-task-graph-v2.py").write_text(
+                """from pathlib import Path
+import json
+
+root = Path(__file__).resolve().parents[1]
+journal_path = root / "state/GRAPH_UPGRADE.json"
+journal = json.loads(journal_path.read_text(encoding="utf-8"))
+journal["status"] = "complete"
+journal["phase"] = "complete"
+journal_path.write_text(json.dumps(journal, indent=2) + "\\n", encoding="utf-8")
+(root / "state/UPGRADE_RESUMED").write_text("yes\\n", encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
+
+            result = fx.run_script("start-session.sh")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (fx.state / "UPGRADE_RESUMED").read_text(encoding="utf-8"),
+                "yes\n",
+            )
+            completed = json.loads(journal.read_text(encoding="utf-8"))
+            self.assertEqual(completed["phase"], "complete")
+
     def test_linked_worktree_git_file_is_detected_and_synced(self) -> None:
         with tempfile.TemporaryDirectory(prefix="cmclient linked shell ") as temporary:
             root = Path(temporary)
