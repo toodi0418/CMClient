@@ -158,10 +158,14 @@ Argon2id version 19 with bounded memory, iteration, and lane parameters. The
 bounded audit projection records only timestamp, action, and stable outcome
 code, never addresses, credentials, cookies, or tokens.
 
-The Agent injects `CMCLIENT_GATEWAY_HOST=127.0.0.1`, the configured non-zero
-`CMCLIENT_GATEWAY_PORT`, and its own `CMCLIENT_DATA_DIR` into the supervised
-Gateway process. This keeps the Gateway data store and the Agent's health/proxy
-endpoint aligned without exposing a Gateway listener to the LAN.
+The Agent delivers a bounded memory-only bootstrap frame through the supervised
+Gateway's inherited private pipe; the frame carries the startup nonce and
+capability, never a listener address or a secret-bearing environment value.
+Gateway validates that frame before opening its data store, atomically binds
+`127.0.0.1:0`, and returns the OS-assigned port, child PID, and nonce through the
+same private channel. The Agent publishes a session only after validating that
+ready frame, so there is no fixed-port probe or release/rebind window and no
+Gateway listener is exposed to the LAN.
 
 Agent also marks only its child as `CMCLIENT_SUPERVISED=1` and owns a private
 stdin shutdown pipe. Stop, restart, OS termination, and service teardown send a

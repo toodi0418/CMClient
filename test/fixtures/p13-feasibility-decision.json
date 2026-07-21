@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "decisionId": "p13-windows-gateway-bootstrap-and-updater-bounds",
+  "repairTask": "P13-T12",
+  "status": "accepted-for-fixture-implementation",
+  "authoritativeDocuments": [
+    "docs/architecture/agent-runtime.md",
+    "docs/architecture/gateway-runtime.md",
+    "docs/architecture/CMCLIENT_2_OVERVIEW.md"
+  ],
+  "node": {
+    "version": "24.18.0",
+    "releaseDate": "2026-06-23",
+    "lts": "Krypton",
+    "npmVersion": "11.16.0",
+    "releaseIndexUrl": "https://nodejs.org/dist/index.json",
+    "releaseDirectoryUrl": "https://nodejs.org/dist/v24.18.0/",
+    "checksumsUrl": "https://nodejs.org/dist/v24.18.0/SHASUMS256.txt",
+    "windowsX64Archive": {
+      "url": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-win-x64.zip",
+      "sha256": "0ae68406b42d7725661da979b1403ec9926da205c6770827f33aac9d8f26e821",
+      "sizeBytes": 37176245
+    },
+    "officialFacts": [
+      {
+        "id": "windows-listen-fd-unsupported",
+        "url": "https://nodejs.org/download/release/v24.18.0/docs/api/net.html#serverlistenhandle-backlog-callback",
+        "statement": "Listening on a file descriptor is not supported on Windows."
+      },
+      {
+        "id": "windows-ipc-socket-send-unsupported",
+        "url": "https://nodejs.org/download/release/v24.18.0/docs/api/child_process.html#subprocesssendmessage-sendhandle-options-callback",
+        "statement": "Sending IPC sockets is not supported on Windows."
+      },
+      {
+        "id": "port-zero-is-os-assigned",
+        "url": "https://nodejs.org/download/release/v24.18.0/docs/api/net.html#serverlistenport-host-backlog-callback",
+        "statement": "When port is 0, the operating system assigns an arbitrary unused port that is available after the listening event."
+      }
+    ]
+  },
+  "gatewayBootstrap": {
+    "decision": "gateway-child-atomic-loopback-bind",
+    "forbiddenDesigns": [
+      "agent-prebound-listener-inherited-by-node",
+      "windows-inherited-file-descriptor-listen",
+      "windows-ipc-socket-handoff",
+      "agent-release-then-gateway-rebind",
+      "fixed-port-fallback-after-bind-race"
+    ],
+    "bind": {
+      "owner": "gateway-child",
+      "host": "127.0.0.1",
+      "requestedPort": 0,
+      "atomicThroughReady": true,
+      "readyOnlyAfterListening": true
+    },
+    "privateChannel": {
+      "transport": "inherited-private-pipe",
+      "encoding": "u32be-length-prefixed-utf8-json",
+      "maxFrameBytes": 4096,
+      "readyDeadlineMs": 5000,
+      "bootstrapDirection": "agent-to-gateway",
+      "readyDirection": "gateway-to-agent",
+      "bootstrapRequiredFields": [
+        "schemaVersion",
+        "type",
+        "startupNonce",
+        "capability"
+      ],
+      "readyRequiredFields": [
+        "schemaVersion",
+        "type",
+        "pid",
+        "startupNonce",
+        "host",
+        "port"
+      ],
+      "forbiddenCarriers": ["argv", "environment", "disk", "logs"]
+    },
+    "failurePolicy": {
+      "oversizeOrMalformedFrame": "fail-startup",
+      "timeoutOrEarlyExit": "fail-startup",
+      "wrongPidNonceHostOrPort": "fail-startup",
+      "portTakeoverFallback": false,
+      "capabilityReflection": false
+    }
+  },
+  "updaterDownloadBounds": {
+    "selectedDriver": "pending-P13-T05",
+    "previewRiskApproval": null,
+    "officialTauri": {
+      "crate": "tauri-plugin-updater",
+      "version": "2.10.1",
+      "sourceUrl": "https://docs.rs/tauri-plugin-updater/2.10.1/src/tauri_plugin_updater/updater.rs.html",
+      "behavior": "The download path accumulates response chunks in one in-memory byte vector before signature verification.",
+      "builtInMaximumBytes": false,
+      "progressCallbackCanAbort": false
+    },
+    "cargoPackager": {
+      "crate": "cargo-packager-updater",
+      "version": "0.2.3",
+      "sourceUrl": "https://docs.rs/cargo-packager-updater/0.2.3/src/cargo_packager_updater/lib.rs.html",
+      "maturity": "public-preview",
+      "behavior": "The download path copies the response into one in-memory byte vector before signature verification.",
+      "builtInMaximumBytes": false,
+      "progressCallbackCanAbort": false
+    },
+    "formatCompatibility": {
+      "tauriV1CompatibleWindowsArtifact": "*.nsis.zip",
+      "officialTauriConsumesNsisZip": true,
+      "cargoPackagerExpectedWindowsNsisArtifact": "raw-exe",
+      "cargoPackagerConsumesNsisZip": false,
+      "noConversionOrRepackAllowed": true,
+      "cargoPackagerSelected": false,
+      "cargoPackagerDecision": "rejected-exact-format-incompatible",
+      "officialTauriSourceUrl": "https://github.com/tauri-apps/plugins-workspace/blob/updater-v2.10.1/plugins/updater/src/updater.rs",
+      "cargoPackagerSourceUrl": "https://github.com/crabnebula-dev/cargo-packager/blob/cargo-packager-updater-v0.2.3/crates/updater/src/lib.rs"
+    },
+    "requiredMitigation": {
+      "owner": "external-updater-helper-supervisor",
+      "hardResourceCap": true,
+      "boundedDeadline": true,
+      "contentLengthAloneIsSufficient": false,
+      "oversizeResult": "terminate-helper-and-keep-current-install",
+      "customDownloadCryptoArchiveFallback": false
+    }
+  }
+}

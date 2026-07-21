@@ -1,10 +1,12 @@
 # Gateway Production Runtime
 
 The supervised TypeScript Gateway is the production owner of Meshtastic and
-APRS domain work. Agent passes a loopback listen address, shared data directory,
-validated operational configuration, and only the Agent-selected secrets required
-by enabled integrations. Gateway does not read Agent configuration, manage a
-service, or update itself.
+APRS domain work. Agent passes only a bounded bootstrap frame through a private
+inherited channel, plus the absolute Agent-owned data paths and validated
+operational configuration required by the runtime. Gateway validates bootstrap,
+atomically binds `127.0.0.1:0`, and reports its port, PID, and startup nonce back
+through that channel. It never reads Agent configuration, manages a service, or
+updates itself.
 
 ## Startup and shutdown
 

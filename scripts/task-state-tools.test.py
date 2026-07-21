@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import subprocess
@@ -11,7 +12,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from v2_graph_test_fixture import write_v2_contract
+from v2_graph_test_fixture import (
+    P13_T05_NEW_ACCEPTANCE,
+    P13_T10_NEW_ACCEPTANCE,
+    p13_t12_definition_amendments,
+    write_v2_contract,
+)
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -123,7 +129,13 @@ class TaskStateToolTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def write(self, tasks: list[dict], **extra: object) -> None:
+    def write(
+        self,
+        tasks: list[dict],
+        *,
+        definition_amendments: list[dict] | None = None,
+        **extra: object,
+    ) -> None:
         value = {"schemaVersion": 2, "project": "test", "tasks": tasks, **extra}
         write_v2_contract(
             value,
@@ -131,6 +143,7 @@ class TaskStateToolTests(unittest.TestCase):
             graph_lock_path=self.graph_lock_path,
             license_path=self.license_path,
             source_baseline=self.base_commit,
+            definition_amendments=definition_amendments,
         )
 
     def write_value(self, value: dict) -> None:
@@ -164,6 +177,64 @@ class TaskStateToolTests(unittest.TestCase):
             text=True,
             encoding="utf-8",
             check=False,
+        )
+
+    def write_p13_t12_amendment_fixture(self) -> None:
+        started_at = "2026-07-21T07:55:31+00:00"
+        invalidation = {
+            "invalidatedAt": started_at,
+            "repairOf": "P13-T05",
+            "runtimeCandidate": True,
+            "distributionCandidate": True,
+            "affectedCases": ["TESTABILITY_GATES"],
+            "resolvedByCandidate": None,
+            "resolvedAt": None,
+        }
+        parent = task("P13-T05", "blocked", ["P13-T04"])
+        parent.update(
+            {
+                "acceptance": copy.deepcopy(P13_T05_NEW_ACCEPTANCE),
+                "candidateReset": True,
+                "blockedByRepair": "P13-T12",
+                "blockedAt": started_at,
+                "blockReason": "audited fixture repair",
+            }
+        )
+        downstream = task("P13-T10", "pending", ["P13-T04"])
+        downstream["acceptance"] = copy.deepcopy(P13_T10_NEW_ACCEPTANCE)
+        repair = task("P13-T12", "in_progress", ["P13-T04"])
+        repair.update(
+            {
+                "kind": "fix",
+                "candidateReset": True,
+                "repairOf": "P13-T05",
+                "affectedCases": ["TESTABILITY_GATES"],
+                "startedAt": started_at,
+                "candidateInvalidation": copy.deepcopy(invalidation),
+            }
+        )
+        self.write(
+            [task("P13-T04", "done"), parent, downstream, repair],
+            definition_amendments=p13_t12_definition_amendments(),
+            candidateInvalidations=[
+                {"repairTask": "P13-T12", **copy.deepcopy(invalidation)}
+            ],
+        )
+
+    def rewrite_amendment_contract(self, mutation) -> None:
+        state = self.read()
+        graph_lock = json.loads(self.graph_lock_path.read_text(encoding="utf-8"))
+        mutation(graph_lock["definitionAmendments"][0])
+        state["activeGraph"]["definitionAmendments"] = copy.deepcopy(
+            graph_lock["definitionAmendments"]
+        )
+        graph_lock["graphSha256"] = LIB.canonical_sha256(
+            {field: graph_lock.get(field) for field in LIB.GRAPH_PAYLOAD_FIELDS}
+        )
+        self.write_value(state)
+        self.graph_lock_path.write_text(
+            json.dumps(graph_lock, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
 
     def mark_reconciled(self, task_id: str) -> str:
@@ -415,6 +486,60 @@ class TaskStateToolTests(unittest.TestCase):
         result = self.run_script("next-task.py")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("license provenance disagrees", result.stderr)
+
+    def test_audited_definition_amendment_binds_repair_and_canonical_values(self) -> None:
+        self.write_p13_t12_amendment_fixture()
+        state = self.read()
+        graph_lock = json.loads(self.graph_lock_path.read_text(encoding="utf-8"))
+        license_provenance = json.loads(
+            self.license_path.read_text(encoding="utf-8")
+        )
+        LIB.validate_state_against_graph_lock(state, graph_lock, license_provenance)
+
+        self.rewrite_amendment_contract(
+            lambda record: record.__setitem__(
+                "oldValueSha256", "0" * 64
+            )
+        )
+        with self.assertRaisesRegex(
+            LIB.TaskStateError, "oldValueSha256 is not canonical"
+        ):
+            LIB.validate_state_against_graph_lock(
+                self.read(),
+                json.loads(self.graph_lock_path.read_text(encoding="utf-8")),
+                license_provenance,
+            )
+
+        self.write_p13_t12_amendment_fixture()
+        self.rewrite_amendment_contract(
+            lambda record: record["evidence"][0].update(
+                {
+                    "source": "https://example.invalid/not-official",
+                }
+            )
+        )
+        with self.assertRaisesRegex(
+            LIB.TaskStateError, "not an approved official source"
+        ):
+            LIB.validate_state_against_graph_lock(
+                self.read(),
+                json.loads(self.graph_lock_path.read_text(encoding="utf-8")),
+                license_provenance,
+            )
+
+        self.write_p13_t12_amendment_fixture()
+        state = self.read()
+        repair = next(item for item in state["tasks"] if item["id"] == "P13-T12")
+        repair["status"] = "pending"
+        self.write_value(state)
+        with self.assertRaisesRegex(
+            LIB.TaskStateError, "active or completed P13-T12 repair"
+        ):
+            LIB.validate_state_against_graph_lock(
+                state,
+                json.loads(self.graph_lock_path.read_text(encoding="utf-8")),
+                license_provenance,
+            )
 
     def test_upgrade_journal_blocks_normal_tools_and_allows_exact_child(self) -> None:
         self.write(

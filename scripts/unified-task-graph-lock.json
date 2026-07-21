@@ -3,7 +3,7 @@
   "id": "unified-product",
   "version": 2,
   "source": "plans/unified-product/tasks.proposed.json",
-  "sourceSha256": "0fef84eb636b7baf7bdcaaea2f2ea04e36a84c5d216ab51234fef0d5d31b45e8",
+  "sourceSha256": "c649d16996b6d715ca0b225ae2f29424c181868600d606b6994e9c4227471c6f",
   "sourceBaseline": "b3fec2b344bda3b11d0a15d2bad381f7d926114e",
   "branch": "dev",
   "completionTask": "P17-T07",
@@ -23,7 +23,8 @@
     "callMeshServiceModel",
     "candidateIdentity",
     "completionChecker",
-    "repairProtocol"
+    "repairProtocol",
+    "definitionAmendments"
   ],
   "activeGraphFields": [
     "id",
@@ -44,7 +45,8 @@
     "callMeshServiceModel",
     "candidateIdentity",
     "completionChecker",
-    "repairProtocol"
+    "repairProtocol",
+    "definitionAmendments"
   ],
   "historicalRule": "P12 skipped task fields and graphVersion 1 mappings are compared to the immutable v1 snapshot, never to the meaning of reused v2 task IDs.",
   "coverageRule": "Every v2CoverageMap target must exist in the locked v2 definitions and coverage/license/CallMesh-service-model drift fails the completion checker.",
@@ -135,7 +137,7 @@
         "A minimal independently built Tauri fixture uses createUpdaterArtifacts=v1Compatible so Tauri directly emits test-signed NSIS, app.tar.gz and AppImage-compatible updater payloads without conversion/repacking; a same-runner local HTTPS lab proves exact-format check/download/signature/install behavior.",
         "A clean Windows standard-user fixture proves currentUser NSIS, offline/per-user WebView2, PATH/autostart hooks, repair and upgrade without UAC before P14 work proceeds.",
         "A hidden official Tauri helper is the preferred route and is accepted only after proving exact headless AppHandle/check/download/install/relaunch, helper lifetime and replacement behavior. Public-preview cargo-packager-updater can be selected only with an explicit P13 owner risk acceptance and the same complete qualification; the final-product route cannot be deferred to P17-T08.",
-        "Gateway proves a fresh memory-only Agent bootstrap capability delivered through an inherited private pipe, never argv/env/disk/log, and an Agent-prebound inherited loopback listener. Agent strips/overwrites any client capability header, Gateway rejects direct/spoofed requests on every HTTP/SSE/health route, responses never reflect it, and child identity/port-race tests pass.",
+        "Gateway proves a fresh memory-only Agent bootstrap capability delivered through an inherited private pipe, never argv/env/disk/log. After validating that bounded bootstrap frame, Gateway atomically binds 127.0.0.1:0 itself and reports the bound port, child PID and instance nonce only through the inherited private channel; fixed-port probing, release/rebind and unsupported Windows descriptor passing are forbidden. Agent strips/overwrites any client capability header, Gateway rejects direct/spoofed requests on every HTTP/SSE/health route, responses never reflect it, and child identity/port-takeover tests pass.",
         "Wrong key, bit flip, wrong target, oversize, timeout, downgrade, helper/installer death, port takeover and direct-Gateway bypass regressions pass before state/setup/backup work continues; state/UPDATER_DRIVER.json binds the final driver/version/maturity/evidence and any preview-risk approval, with no unproven fallback or custom archive/crypto path."
       ]
     },
@@ -219,7 +221,7 @@
       "dependsOn": ["P13-T07", "P13-T08", "P13-T09"],
       "acceptance": [
         "Axum/Tower serves static Web and Agent-owned setup/lifecycle/update SSE; Fastify @fastify/sse serves Gateway domain/job SSE only, and Agent streaming proxy preserves separate event-ID/replay namespaces and authorization.",
-        "Agent pre-binds and passes the Gateway loopback listener, verifies child identity, strips/overwrites every client-supplied capability header, and injects the per-start memory-only capability only after authorization. Gateway rejects direct/spoofed HTTP/SSE/health requests, never reflects the capability, and port-race/bypass regressions pass.",
+        "Agent validates the Gateway bootstrap ready frame (OS-assigned port, child identity, and instance nonce), strips/overwrites every client-supplied capability header, and injects the per-start memory-only capability only after authorization. Gateway atomically binds 127.0.0.1:0 after bootstrap, rejects direct/spoofed HTTP/SSE/health requests, never reflects the capability, and port-takeover/bypass regressions pass; fixed-port probing, release/rebind, and unsupported Windows descriptor passing are forbidden.",
         "IPv4/IPv6 wildcard bind with deterministic bind-conflict policy, Host allowlist, no wildcard CORS, default loopback admission, authenticated LAN optional CIDR, Docker-always-auth, Origin/CSRF, generation/session revocation, rate limit, HTTP-LAN warning and redacted audit tests pass.",
         "The handwritten HTTP parser/static/TLS/session/rate-limit implementation is absent and no second auth authority exists in Gateway."
       ]
@@ -1197,5 +1199,77 @@
     "resume": "After repair checkpoint and push, add the repair as a parent dependency and resume the parent.",
     "candidateEffect": "Invalidate runtime and distribution candidates and rerun affected plus final cases."
   },
-  "graphSha256": "e599538aad46ec243036b0afe0245afcc71c71307a522e967a99cc5826e6f696"
+  "graphSha256": "65232cd3930d32db6653ce03dd824e37e4f36dd2dd884fe7f5a0510f70be01ea",
+  "definitionAmendments": [
+    {
+      "schema": "cmclient-task-definition-amendment/v1",
+      "task": "P13-T05",
+      "repairTask": "P13-T12",
+      "field": "acceptance",
+      "oldValue": [
+        "Exact Tauri CLI/core/plugin, cargo-packager-updater and fixture dependency versions, lockfile hashes, sources and licenses are frozen before testing.",
+        "A minimal independently built Tauri fixture uses createUpdaterArtifacts=v1Compatible so Tauri directly emits test-signed NSIS, app.tar.gz and AppImage-compatible updater payloads without conversion/repacking; a same-runner local HTTPS lab proves exact-format check/download/signature/install behavior.",
+        "A clean Windows standard-user fixture proves currentUser NSIS, offline/per-user WebView2, PATH/autostart hooks, repair and upgrade without UAC before P14 work proceeds.",
+        "A hidden official Tauri helper is the preferred route and is accepted only after proving exact headless AppHandle/check/download/install/relaunch, helper lifetime and replacement behavior. Public-preview cargo-packager-updater can be selected only with an explicit P13 owner risk acceptance and the same complete qualification; the final-product route cannot be deferred to P17-T08.",
+        "Gateway proves a fresh memory-only Agent bootstrap capability delivered through an inherited private pipe, never argv/env/disk/log, and an Agent-prebound inherited loopback listener. Agent strips/overwrites any client capability header, Gateway rejects direct/spoofed requests on every HTTP/SSE/health route, responses never reflect it, and child identity/port-race tests pass.",
+        "Wrong key, bit flip, wrong target, oversize, timeout, downgrade, helper/installer death, port takeover and direct-Gateway bypass regressions pass before state/setup/backup work continues; state/UPDATER_DRIVER.json binds the final driver/version/maturity/evidence and any preview-risk approval, with no unproven fallback or custom archive/crypto path."
+      ],
+      "oldValueSha256": "8fdefb18da2932f5d7b0c7e950aca3cd5315e68fc13bad72b7028476806f4d98",
+      "newValue": [
+        "Exact Tauri CLI/core/plugin, cargo-packager-updater and fixture dependency versions, lockfile hashes, sources and licenses are frozen before testing.",
+        "A minimal independently built Tauri fixture uses createUpdaterArtifacts=v1Compatible so Tauri directly emits test-signed NSIS, app.tar.gz and AppImage-compatible updater payloads without conversion/repacking; a same-runner local HTTPS lab proves exact-format check/download/signature/install behavior.",
+        "A clean Windows standard-user fixture proves currentUser NSIS, offline/per-user WebView2, PATH/autostart hooks, repair and upgrade without UAC before P14 work proceeds.",
+        "A hidden official Tauri helper is the preferred route and is accepted only after proving exact headless AppHandle/check/download/install/relaunch, helper lifetime and replacement behavior. Public-preview cargo-packager-updater can be selected only with an explicit P13 owner risk acceptance and the same complete qualification; the final-product route cannot be deferred to P17-T08.",
+        "Gateway proves a fresh memory-only Agent bootstrap capability delivered through an inherited private pipe, never argv/env/disk/log. After validating that bounded bootstrap frame, Gateway atomically binds 127.0.0.1:0 itself and reports the bound port, child PID and instance nonce only through the inherited private channel; fixed-port probing, release/rebind and unsupported Windows descriptor passing are forbidden. Agent strips/overwrites any client capability header, Gateway rejects direct/spoofed requests on every HTTP/SSE/health route, responses never reflect it, and child identity/port-takeover tests pass.",
+        "Wrong key, bit flip, wrong target, oversize, timeout, downgrade, helper/installer death, port takeover and direct-Gateway bypass regressions pass before state/setup/backup work continues; state/UPDATER_DRIVER.json binds the final driver/version/maturity/evidence and any preview-risk approval, with no unproven fallback or custom archive/crypto path."
+      ],
+      "newValueSha256": "310fc79c9bb1869e9f0b308052f29cf1d947e395026ee82c8bfe684c04bbfb0a",
+      "reason": "Node 24.18.0 does not support adopting a file-descriptor TCP listener or passing sockets through child stdio on Windows. Atomic child port-zero bind plus a private ready frame preserves the no-takeover invariant without a native libuv bridge or release/rebind fallback.",
+      "decision": "atomic-child-bind",
+      "evidence": [
+        {
+          "source": "https://nodejs.org/download/release/v24.18.0/docs/api/net.html#serverlistenhandle-backlog-callback",
+          "finding": "Listening on a file descriptor is not supported on Windows."
+        },
+        {
+          "source": "https://nodejs.org/download/release/v24.18.0/docs/api/child_process.html#subprocesssendmessage-sendhandle-options-callback",
+          "finding": "Sending IPC sockets is not supported on Windows."
+        }
+      ],
+      "recordedAt": "2026-07-21T08:00:00Z"
+    },
+    {
+      "schema": "cmclient-task-definition-amendment/v1",
+      "task": "P13-T10",
+      "repairTask": "P13-T12",
+      "field": "acceptance",
+      "oldValue": [
+        "Axum/Tower serves static Web and Agent-owned setup/lifecycle/update SSE; Fastify @fastify/sse serves Gateway domain/job SSE only, and Agent streaming proxy preserves separate event-ID/replay namespaces and authorization.",
+        "Agent pre-binds and passes the Gateway loopback listener, verifies child identity, strips/overwrites every client-supplied capability header, and injects the per-start memory-only capability only after authorization. Gateway rejects direct/spoofed HTTP/SSE/health requests, never reflects the capability, and port-race/bypass regressions pass.",
+        "IPv4/IPv6 wildcard bind with deterministic bind-conflict policy, Host allowlist, no wildcard CORS, default loopback admission, authenticated LAN optional CIDR, Docker-always-auth, Origin/CSRF, generation/session revocation, rate limit, HTTP-LAN warning and redacted audit tests pass.",
+        "The handwritten HTTP parser/static/TLS/session/rate-limit implementation is absent and no second auth authority exists in Gateway."
+      ],
+      "oldValueSha256": "3f052516e955fbf3d31da553b2f516d926d9182826a9de751713851af2d8e575",
+      "newValue": [
+        "Axum/Tower serves static Web and Agent-owned setup/lifecycle/update SSE; Fastify @fastify/sse serves Gateway domain/job SSE only, and Agent streaming proxy preserves separate event-ID/replay namespaces and authorization.",
+        "Agent validates the Gateway bootstrap ready frame (OS-assigned port, child identity, and instance nonce), strips/overwrites every client-supplied capability header, and injects the per-start memory-only capability only after authorization. Gateway atomically binds 127.0.0.1:0 after bootstrap, rejects direct/spoofed HTTP/SSE/health requests, never reflects the capability, and port-takeover/bypass regressions pass; fixed-port probing, release/rebind, and unsupported Windows descriptor passing are forbidden.",
+        "IPv4/IPv6 wildcard bind with deterministic bind-conflict policy, Host allowlist, no wildcard CORS, default loopback admission, authenticated LAN optional CIDR, Docker-always-auth, Origin/CSRF, generation/session revocation, rate limit, HTTP-LAN warning and redacted audit tests pass.",
+        "The handwritten HTTP parser/static/TLS/session/rate-limit implementation is absent and no second auth authority exists in Gateway."
+      ],
+      "newValueSha256": "e09bcf76d2e3753fb3842b642bd50984580df90aeadb13c3270cc1dd09f2d057",
+      "reason": "Node 24.18.0 does not support adopting a file-descriptor TCP listener or passing sockets through child stdio on Windows. Atomic child port-zero bind plus a private ready frame preserves the no-takeover invariant without a native libuv bridge or release/rebind fallback.",
+      "decision": "atomic-child-bind",
+      "evidence": [
+        {
+          "source": "https://nodejs.org/download/release/v24.18.0/docs/api/net.html#serverlistenhandle-backlog-callback",
+          "finding": "Listening on a file descriptor is not supported on Windows."
+        },
+        {
+          "source": "https://nodejs.org/download/release/v24.18.0/docs/api/child_process.html#subprocesssendmessage-sendhandle-options-callback",
+          "finding": "Sending IPC sockets is not supported on Windows."
+        }
+      ],
+      "recordedAt": "2026-07-21T08:00:00Z"
+    }
+  ]
 }

@@ -589,6 +589,7 @@ def check_graph_lock(
         "candidateIdentity",
         "completionChecker",
         "repairProtocol",
+        "definitionAmendments",
     ):
         gate.require(
             active.get(field) == lock.get(field),

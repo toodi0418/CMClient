@@ -1074,6 +1074,7 @@ class GoalCompletionCheckTests(unittest.TestCase):
             "candidateIdentity",
             "completionChecker",
             "repairProtocol",
+            "definitionAmendments",
         ):
             self.assertEqual(
                 self.fixture.graph_lock[field],
@@ -1101,6 +1102,18 @@ class GoalCompletionCheckTests(unittest.TestCase):
         self.fixture.refresh_graph_lock_digest()
         self.assert_gate_fails(
             self.task_gate(), "canonicalPayloadFields differ from the v2 contract"
+        )
+
+    def test_definition_amendment_is_checked_by_completion_gate(self) -> None:
+        self.fixture.graph_lock["definitionAmendments"] = [{"task": "P13-T06"}]
+        self.fixture.state["activeGraph"]["definitionAmendments"] = json.loads(
+            json.dumps(self.fixture.graph_lock["definitionAmendments"])
+        )
+        self.fixture.refresh_graph_lock_digest()
+        self.fixture.flush()
+        self.assert_gate_fails(
+            self.task_gate(),
+            "graph lock definitionAmendments must contain exactly two audited records",
         )
 
     def test_v2_coverage_drift_fails(self) -> None:

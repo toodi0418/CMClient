@@ -27,6 +27,7 @@ DEFAULT_GRAPH_LOCK_PATH = Path(__file__).with_name("unified-task-graph-lock.json
 GRAPH_LOCK_SCHEMA = "cmclient-unified-task-graph-lock/v2"
 LICENSE_PROVENANCE_SCHEMA = "cmclient-license-provenance/v1"
 GRAPH_UPGRADE_JOURNAL_SCHEMA = "cmclient-graph-upgrade-journal/v1"
+DEFINITION_AMENDMENT_SCHEMA = "cmclient-task-definition-amendment/v1"
 GRAPH_UPGRADE_PHASES = {
     "prepared",
     "validated",
@@ -72,6 +73,7 @@ GRAPH_PAYLOAD_FIELDS = (
     "candidateIdentity",
     "completionChecker",
     "repairProtocol",
+    "definitionAmendments",
 )
 ACTIVE_GRAPH_FIELDS = (
     "id",
@@ -93,6 +95,45 @@ ACTIVE_GRAPH_FIELDS = (
     "candidateIdentity",
     "completionChecker",
     "repairProtocol",
+    "definitionAmendments",
+)
+
+DEFINITION_AMENDMENT_FIELDS = (
+    "schema",
+    "task",
+    "repairTask",
+    "field",
+    "oldValue",
+    "oldValueSha256",
+    "newValue",
+    "newValueSha256",
+    "reason",
+    "decision",
+    "evidence",
+    "recordedAt",
+)
+P13_AMENDMENT_EVIDENCE = {
+    "https://nodejs.org/download/release/v24.18.0/docs/api/net.html#serverlistenhandle-backlog-callback": (
+        "Listening on a file descriptor is not supported on Windows."
+    ),
+    "https://nodejs.org/download/release/v24.18.0/docs/api/child_process.html#subprocesssendmessage-sendhandle-options-callback": (
+        "Sending IPC sockets is not supported on Windows."
+    ),
+}
+# These digests bind the audited before/after acceptance arrays, rather than
+# allowing an arbitrary text rewrite to be hidden behind a self-consistent
+# amendment record.
+P13_T05_OLD_ACCEPTANCE_SHA256 = (
+    "8fdefb18da2932f5d7b0c7e950aca3cd5315e68fc13bad72b7028476806f4d98"
+)
+P13_T05_NEW_ACCEPTANCE_SHA256 = (
+    "310fc79c9bb1869e9f0b308052f29cf1d947e395026ee82c8bfe684c04bbfb0a"
+)
+P13_T10_OLD_ACCEPTANCE_SHA256 = (
+    "3f052516e955fbf3d31da553b2f516d926d9182826a9de751713851af2d8e575"
+)
+P13_T10_NEW_ACCEPTANCE_SHA256 = (
+    "e09bcf76d2e3753fb3842b642bd50984580df90aeadb13c3270cc1dd09f2d057"
 )
 ALLOWED_REPAIR_CASES = {
     "FULL_VERIFY",
@@ -391,6 +432,182 @@ def _require_nonempty_collection(value: object, label: str) -> None:
         raise TaskStateError(f"{label} must be a non-empty array or object")
 
 
+def _validate_definition_amendments(
+    graph_lock: dict[str, Any],
+    active: dict[str, Any],
+    by_id: dict[str, dict],
+    locked_by_id: dict[str, dict[str, Any]],
+) -> None:
+    """Validate the audited graph-v2 definition amendments.
+
+    Definition changes are part of the canonical graph payload.  A record is
+    therefore not an override: it must identify the repair that authorized the
+    change, bind both complete values by digest, and match the value present in
+    both the locked definition and active state.
+    """
+
+    amendments = graph_lock.get("definitionAmendments")
+    if not isinstance(amendments, list):
+        raise TaskStateError("graph lock definitionAmendments must be an array")
+    if active.get("definitionAmendments") != amendments:
+        raise TaskStateError(
+            "activeGraph.definitionAmendments does not match the committed graph lock"
+    )
+    if not amendments:
+        return
+    if len(amendments) != 2:
+        raise TaskStateError(
+            "graph lock definitionAmendments must contain exactly two audited records"
+        )
+
+    expected_digests = {
+        "P13-T05": (
+            P13_T05_OLD_ACCEPTANCE_SHA256,
+            P13_T05_NEW_ACCEPTANCE_SHA256,
+        ),
+        "P13-T10": (
+            P13_T10_OLD_ACCEPTANCE_SHA256,
+            P13_T10_NEW_ACCEPTANCE_SHA256,
+        ),
+    }
+    records_by_task: dict[str, dict[str, Any]] = {}
+    for record_index, record in enumerate(amendments):
+        label = f"definitionAmendments[{record_index}]"
+        if not isinstance(record, dict) or set(record) != set(
+            DEFINITION_AMENDMENT_FIELDS
+        ):
+            raise TaskStateError(f"{label} fields are invalid")
+        if record.get("schema") != DEFINITION_AMENDMENT_SCHEMA:
+            raise TaskStateError(
+                f"{label}.schema must be {DEFINITION_AMENDMENT_SCHEMA}"
+            )
+
+        task_id = record.get("task")
+        if task_id not in expected_digests or task_id in records_by_task:
+            raise TaskStateError(
+                f"{label}.task must uniquely identify audited P13-T05 or P13-T10"
+            )
+        if record.get("repairTask") != "P13-T12":
+            raise TaskStateError(f"{label}.repairTask must be P13-T12")
+        if record.get("field") != "acceptance":
+            raise TaskStateError(f"{label}.field must be acceptance")
+
+        old_value = record.get("oldValue")
+        new_value = record.get("newValue")
+        if not isinstance(old_value, list) or not all(
+            isinstance(value, str) for value in old_value
+        ):
+            raise TaskStateError(f"{label}.oldValue must be a string array")
+        if not isinstance(new_value, list) or not all(
+            isinstance(value, str) for value in new_value
+        ):
+            raise TaskStateError(f"{label}.newValue must be a string array")
+        if old_value == new_value:
+            raise TaskStateError(f"{label} oldValue and newValue must differ")
+
+        old_digest = _require_sha256(
+            record.get("oldValueSha256"), f"{label}.oldValueSha256"
+        )
+        new_digest = _require_sha256(
+            record.get("newValueSha256"), f"{label}.newValueSha256"
+        )
+        if canonical_sha256(old_value) != old_digest:
+            raise TaskStateError(f"{label}.oldValueSha256 is not canonical")
+        if canonical_sha256(new_value) != new_digest:
+            raise TaskStateError(f"{label}.newValueSha256 is not canonical")
+        expected_old_digest, expected_new_digest = expected_digests[task_id]
+        if old_digest != expected_old_digest:
+            raise TaskStateError(f"{label} old acceptance digest is not audited")
+        if new_digest != expected_new_digest:
+            raise TaskStateError(f"{label} new acceptance digest is not audited")
+
+        reason = record.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise TaskStateError(f"{label}.reason must be non-empty")
+        if record.get("decision") != "atomic-child-bind":
+            raise TaskStateError(f"{label}.decision must be atomic-child-bind")
+        _parse_timestamp(record.get("recordedAt"), f"{label}.recordedAt")
+
+        evidence = record.get("evidence")
+        if not isinstance(evidence, list) or len(evidence) != len(
+            P13_AMENDMENT_EVIDENCE
+        ):
+            raise TaskStateError(
+                f"{label}.evidence must contain the two official Node sources"
+            )
+        observed_sources: set[str] = set()
+        for evidence_index, item in enumerate(evidence):
+            evidence_label = f"{label}.evidence[{evidence_index}]"
+            if not isinstance(item, dict) or set(item) != {"source", "finding"}:
+                raise TaskStateError(f"{evidence_label} is invalid")
+            source = item.get("source")
+            if source not in P13_AMENDMENT_EVIDENCE:
+                raise TaskStateError(
+                    f"{evidence_label} is not an approved official source"
+                )
+            if item.get("finding") != P13_AMENDMENT_EVIDENCE[source]:
+                raise TaskStateError(f"{evidence_label} finding is not approved")
+            observed_sources.add(source)
+        if observed_sources != set(P13_AMENDMENT_EVIDENCE):
+            raise TaskStateError(f"{label} is missing an official source")
+
+        target = by_id.get(task_id)
+        locked_target = locked_by_id.get(task_id)
+        if not isinstance(target, dict) or not isinstance(locked_target, dict):
+            raise TaskStateError(f"{label} requires state and lock for {task_id}")
+        if locked_target.get("acceptance") != new_value or _normalized_task_value(
+            target, "acceptance"
+        ) != new_value:
+            raise TaskStateError(
+                f"{label}.newValue does not match {task_id} acceptance"
+            )
+        records_by_task[task_id] = record
+
+    if set(records_by_task) != set(expected_digests):
+        raise TaskStateError(
+            "definitionAmendments must contain P13-T05 and P13-T10 exactly once"
+        )
+
+    parent = by_id.get("P13-T05")
+    repair = by_id.get("P13-T12")
+    if not isinstance(parent, dict) or not isinstance(repair, dict):
+        raise TaskStateError("definitionAmendments require P13-T05 and P13-T12 state")
+    if (
+        repair.get("repairOf") != "P13-T05"
+        or repair.get("required", True) is not True
+        or repair.get("kind") != "fix"
+        or repair.get("candidateReset") is not True
+        or repair.get("affectedCases") != ["TESTABILITY_GATES"]
+        or repair.get("status") not in {"in_progress", "done"}
+    ):
+        raise TaskStateError(
+            "definitionAmendments are not tied to an active or completed P13-T12 repair"
+        )
+
+    if repair.get("status") == "in_progress":
+        if parent.get("status") != "blocked" or parent.get("blockedByRepair") != "P13-T12":
+            raise TaskStateError(
+                "in-progress P13-T12 amendment requires blocked P13-T05 parent"
+            )
+    elif parent.get("status") == "blocked":
+        if parent.get("blockedByRepair") != "P13-T12":
+            raise TaskStateError(
+                "blocked P13-T05 parent must identify P13-T12 amendment repair"
+            )
+    elif parent.get("status") in {"in_progress", "done"}:
+        dependencies = parent.get("dependsOn")
+        if (
+            not isinstance(dependencies, list)
+            or dependencies.count("P13-T12") != 1
+            or parent.get("lastRepairTask") != "P13-T12"
+        ):
+            raise TaskStateError(
+                "resumed P13-T05 parent must incorporate completed P13-T12 repair"
+            )
+    else:
+        raise TaskStateError("P13-T05 has an invalid status for its definition amendment")
+
+
 def validate_license_provenance(
     graph_lock: dict[str, Any],
     evidence: dict[str, Any],
@@ -565,6 +782,8 @@ def validate_state_against_graph_lock(
         if set(definition) != {"id", *LOCKED_TASK_FIELDS, "dependsOn"}:
             raise TaskStateError(f"graph lock task definition fields are invalid: {task_id}")
         locked_by_id[task_id] = definition
+
+    _validate_definition_amendments(graph_lock, active, by_id, locked_by_id)
 
     for task_id, definition in locked_by_id.items():
         task = by_id.get(task_id)
