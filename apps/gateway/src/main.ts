@@ -28,13 +28,23 @@ import {
 } from "./shutdown.js";
 import { TcpMeshtasticTransport } from "./transport/tcp.js";
 import { compiledGatewayBuildVersion } from "./system.js";
+import {
+  readGatewayBootstrap,
+  writeGatewayReady,
+  type GatewayBootstrapFrame,
+} from "./bootstrap.js";
+import { ConsoleStructuredLogger } from "./observability.js";
 
 void runGateway().catch((error: unknown) => {
   process.stderr.write(`${runtimeErrorCode(error, "GATEWAY_MAIN_FAILED")}\n`);
-  process.exitCode = 1;
+  process.exit(1);
 });
 
 async function runGateway(): Promise<void> {
+  const supervised = process.env.CMCLIENT_SUPERVISED === "1";
+  const bootstrap: GatewayBootstrapFrame | undefined = supervised
+    ? await readGatewayBootstrap(process.stdin)
+    : undefined;
   let database: GatewayDatabase | undefined;
   let events: DomainEventBus | undefined;
   let jobs: JobEngine | undefined;
@@ -93,7 +103,7 @@ async function runGateway(): Promise<void> {
 
   process.once("SIGINT", terminateAfterShutdown);
   process.once("SIGTERM", terminateAfterShutdown);
-  if (process.env.CMCLIENT_SUPERVISED === "1") {
+  if (supervised) {
     const supervisorInput = createGatewaySupervisorShutdownInput(
       terminateAfterShutdown,
     );
@@ -159,7 +169,9 @@ async function runGateway(): Promise<void> {
       activeDatabase.callmeshMappings,
     );
     context.throwIfShutdownRequested();
-    const listenOptions = parseGatewayListenOptions(process.env);
+    const listenOptions = bootstrap
+      ? { host: "127.0.0.1", port: 0 }
+      : parseGatewayListenOptions(process.env);
     await callmeshRefresh.run(() =>
       synchronizeCallMesh(callmesh, activeEvents),
     );
@@ -197,7 +209,7 @@ async function runGateway(): Promise<void> {
 
     runtime = new GatewayRuntime(
       listenOptions,
-      undefined,
+      bootstrap ? new ConsoleStructuredLogger(process.stderr) : undefined,
       undefined,
       activeEvents,
       {
@@ -244,9 +256,13 @@ async function runGateway(): Promise<void> {
             failedOutbox: 0,
           },
       },
+      bootstrap ? { capability: bootstrap.capability } : undefined,
     );
     context.throwIfShutdownRequested();
-    await runtime.start();
+    const readyAddress = await runtime.start();
+    if (bootstrap) {
+      writeGatewayReady(process.stdout, bootstrap, readyAddress);
+    }
     context.throwIfShutdownRequested();
 
     callmeshTimer = setInterval(() => {

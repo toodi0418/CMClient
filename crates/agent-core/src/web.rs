@@ -4,6 +4,7 @@ use rustls::{
 };
 use std::{
     collections::BTreeMap,
+    fmt,
     io::{self, Read, Write},
     net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -21,16 +22,37 @@ const GATEWAY_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROXY_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECTION_LIMIT_BODY: &str = r#"{"code":"MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED"}"#;
+const GATEWAY_CAPABILITY_HEADER: &str = "x-cmclient-gateway-capability";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ManagementWebConfig {
     pub enabled: bool,
     pub bind: IpAddr,
     pub port: u16,
     pub gateway: SocketAddr,
+    pub gateway_capability: Option<String>,
     pub allow_lan: bool,
     pub tls: Option<ManagementTlsConfig>,
     pub static_web_root: Option<PathBuf>,
+}
+
+impl fmt::Debug for ManagementWebConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagementWebConfig")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("gateway", &self.gateway)
+            .field(
+                "gateway_capability",
+                &self.gateway_capability.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("allow_lan", &self.allow_lan)
+            .field("tls", &self.tls)
+            .field("static_web_root", &self.static_web_root)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +68,7 @@ impl Default for ManagementWebConfig {
             bind: IpAddr::from([127, 0, 0, 1]),
             port: 7080,
             gateway: SocketAddr::from(([127, 0, 0, 1], 4810)),
+            gateway_capability: None,
             allow_lan: false,
             tls: None,
             static_web_root: None,
@@ -113,6 +136,7 @@ impl ManagementWebRequest {
 pub struct ManagementWebListener {
     listener: TcpListener,
     gateway: SocketAddr,
+    gateway_capability: Option<String>,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     tls: Option<Arc<ServerConfig>>,
     static_web_root: Option<PathBuf>,
@@ -364,6 +388,13 @@ impl ManagementWebListener {
         {
             return Err(ManagementWebError::NonLoopbackBind);
         }
+        if config
+            .gateway_capability
+            .as_deref()
+            .is_some_and(|value| !valid_gateway_capability(value))
+        {
+            return Err(ManagementWebError::InvalidHttp);
+        }
         let listener = TcpListener::bind(SocketAddr::new(config.bind, config.port))
             .map_err(|_| ManagementWebError::Io)?;
         let tls = config.tls.as_ref().map(load_tls_config).transpose()?;
@@ -381,6 +412,7 @@ impl ManagementWebListener {
         Ok(Self {
             listener,
             gateway: config.gateway,
+            gateway_capability: config.gateway_capability.clone(),
             api_handler,
             tls,
             static_web_root,
@@ -422,6 +454,7 @@ impl ManagementWebListener {
             stream,
             remote_addr,
             self.gateway,
+            self.gateway_capability.clone(),
             self.api_handler.clone(),
             self.tls.clone(),
             self.static_web_root.clone(),
@@ -485,6 +518,7 @@ impl ManagementWebListener {
             Err(ConnectionRegistrationError::Io) => return Err(ManagementWebError::Io),
         };
         let gateway = self.gateway;
+        let gateway_capability = self.gateway_capability.clone();
         let api_handler = self.api_handler.clone();
         let tls = self.tls.clone();
         let static_web_root = self.static_web_root.clone();
@@ -496,6 +530,7 @@ impl ManagementWebListener {
                     stream,
                     remote_addr,
                     gateway,
+                    gateway_capability,
                     api_handler,
                     tls,
                     static_web_root,
@@ -534,6 +569,7 @@ fn serve_connection(
     mut client: TcpStream,
     remote_addr: SocketAddr,
     gateway: SocketAddr,
+    gateway_capability: Option<String>,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     tls: Option<Arc<ServerConfig>>,
     static_web_root: Option<PathBuf>,
@@ -553,6 +589,7 @@ fn serve_connection(
             &mut stream,
             remote_addr,
             gateway,
+            gateway_capability.as_deref(),
             api_handler,
             static_web_root.as_deref(),
             &running,
@@ -562,6 +599,7 @@ fn serve_connection(
         &mut client,
         remote_addr,
         gateway,
+        gateway_capability.as_deref(),
         api_handler,
         static_web_root.as_deref(),
         &running,
@@ -572,6 +610,7 @@ fn serve_http_connection(
     client: &mut dyn ManagementWebStream,
     remote_addr: SocketAddr,
     gateway: SocketAddr,
+    gateway_capability: Option<&str>,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     static_web_root: Option<&Path>,
     running: &AtomicBool,
@@ -615,7 +654,7 @@ fn serve_http_connection(
     }
     let routed_path = request_path(&request_context.path);
     if routed_path == "/api" || routed_path.starts_with("/api/") {
-        return proxy_api(client, gateway, &request, running);
+        return proxy_api(client, gateway, gateway_capability, &request, running);
     }
     if let Some(static_web_root) = static_web_root {
         return serve_static_web(client, &request_context, static_web_root);
@@ -787,6 +826,7 @@ fn static_content_type(path: &Path) -> &'static str {
 fn proxy_api(
     client: &mut dyn ManagementWebStream,
     gateway: SocketAddr,
+    gateway_capability: Option<&str>,
     request: &[u8],
     running: &AtomicBool,
 ) -> Result<(), ManagementWebError> {
@@ -807,7 +847,7 @@ fn proxy_api(
     upstream
         .set_write_timeout(Some(GATEWAY_TIMEOUT))
         .map_err(|_| ManagementWebError::Io)?;
-    let request = with_connection_close(request)?;
+    let request = with_gateway_headers(request, gateway_capability)?;
     if upstream.write_all(&request).is_err() {
         return write_response(
             client,
@@ -1014,7 +1054,10 @@ fn content_length(header: &[u8]) -> Result<usize, ManagementWebError> {
     Ok(length.unwrap_or(0))
 }
 
-fn with_connection_close(request: &[u8]) -> Result<Vec<u8>, ManagementWebError> {
+fn with_gateway_headers(
+    request: &[u8],
+    gateway_capability: Option<&str>,
+) -> Result<Vec<u8>, ManagementWebError> {
     let header_end = header_end(request).ok_or(ManagementWebError::InvalidHttp)?;
     let header =
         std::str::from_utf8(&request[..header_end]).map_err(|_| ManagementWebError::InvalidHttp)?;
@@ -1024,12 +1067,11 @@ fn with_connection_close(request: &[u8]) -> Result<Vec<u8>, ManagementWebError> 
     let mut rewritten = String::new();
     for (index, line) in header.split("\r\n").enumerate() {
         if index > 0
-            && (line
-                .split_once(':')
-                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("connection"))
-                || line
-                    .split_once(':')
-                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("proxy-connection")))
+            && line.split_once(':').is_some_and(|(name, _)| {
+                name.eq_ignore_ascii_case("connection")
+                    || name.eq_ignore_ascii_case("proxy-connection")
+                    || name.eq_ignore_ascii_case(GATEWAY_CAPABILITY_HEADER)
+            })
         {
             continue;
         }
@@ -1037,9 +1079,26 @@ fn with_connection_close(request: &[u8]) -> Result<Vec<u8>, ManagementWebError> 
         rewritten.push_str("\r\n");
     }
     rewritten.push_str("connection: close\r\n\r\n");
+    if let Some(capability) = gateway_capability {
+        if !valid_gateway_capability(capability) {
+            return Err(ManagementWebError::InvalidHttp);
+        }
+        let insertion = rewritten.len() - 2;
+        rewritten.insert_str(
+            insertion,
+            &format!("{GATEWAY_CAPABILITY_HEADER}: {capability}\r\n"),
+        );
+    }
     let mut rewritten = rewritten.into_bytes();
     rewritten.extend_from_slice(&request[header_end..]);
     Ok(rewritten)
+}
+
+fn valid_gateway_capability(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn header_end(request: &[u8]) -> Option<usize> {
@@ -1125,8 +1184,27 @@ mod tests {
     use super::{
         ActiveConnectionRegistry, ConnectionRegistrationError, ManagementWebApiHandler,
         ManagementWebConfig, ManagementWebError, ManagementWebListener, ManagementWebService,
-        ManagementWebStream, gateway_health,
+        ManagementWebStream, gateway_health, with_gateway_headers,
     };
+
+    #[test]
+    fn strips_client_gateway_capabilities_and_injects_one_agent_value() {
+        let capability = "a".repeat(64);
+        let request = b"POST /api/v1/jobs HTTP/1.1\r\nhost: localhost\r\nX-CMClient-Gateway-Capability: spoofed\r\nconnection: keep-alive\r\ncontent-length: 4\r\n\r\nbody";
+        let rewritten =
+            with_gateway_headers(request, Some(&capability)).expect("request should rewrite");
+        let rewritten = String::from_utf8(rewritten).expect("request should remain UTF-8");
+
+        assert!(!rewritten.contains("spoofed"));
+        assert!(!rewritten.contains("keep-alive"));
+        assert_eq!(
+            rewritten.matches("x-cmclient-gateway-capability:").count(),
+            1
+        );
+        assert!(rewritten.contains(&format!("x-cmclient-gateway-capability: {capability}\r\n")));
+        assert!(rewritten.ends_with("\r\n\r\nbody"));
+        assert!(with_gateway_headers(request, Some(&"A".repeat(64))).is_err());
+    }
     use std::{
         fs,
         io::{Read, Write},

@@ -106,6 +106,8 @@ activate_windows_campaign_toolchain() {
   export npm_config_confirm_modules_purge="false"
   export XDG_CACHE_HOME="$campaign_windows/cache"
   export CARGO_HOME="$campaign_windows/dependencies/cargo"
+  export CARGO_CACHE_AUTO_CLEAN_FREQUENCY="never"
+  export CARGO_NET_OFFLINE="true"
   export RUSTUP_HOME="$toolchain_windows/tooling/rustup"
   export RUSTUP_TOOLCHAIN="1.96.0-x86_64-pc-windows-gnu"
   export CARGO_TARGET_DIR="$campaign_windows/build/cargo-msvc"

@@ -19,8 +19,15 @@ export interface StructuredLogger {
 }
 
 export class ConsoleStructuredLogger implements StructuredLogger {
+  constructor(
+    private readonly output: Pick<
+      NodeJS.WritableStream,
+      "write"
+    > = process.stdout,
+  ) {}
+
   log(entry: LogEntry): void {
-    process.stdout.write(`${JSON.stringify(redact(entry))}\n`);
+    this.output.write(`${JSON.stringify(redact(entry))}\n`);
   }
 }
 

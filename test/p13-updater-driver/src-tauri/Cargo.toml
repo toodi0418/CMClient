@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "cmclient-p13-updater-fixture"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.85"
+publish = false
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls-no-provider"] }
+serde_json = { version = "=1.0.151" }
+tauri = { version = "=2.11.5", features = [] }
+tauri-plugin-updater = { version = "=2.10.1" }
+url = { version = "=2.5.8" }
+
+[lints.rust]
+unsafe_code = "forbid"

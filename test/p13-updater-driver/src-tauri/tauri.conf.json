@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CMClient P13 Updater Fixture",
+  "version": "0.1.0",
+  "identifier": "io.cmclient.fixture.p13-updater",
+  "mainBinaryName": "cmclient-p13-updater-fixture",
+  "build": {
+    "frontendDist": "../web"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": "v1Compatible",
+    "useLocalToolsDir": true,
+    "icon": [
+      "../../../apps/desktop/src-tauri/icons/icon.png",
+      "../../../apps/desktop/src-tauri/icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "windows/hooks.nsh"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://127.0.0.1:9443/manifest/valid"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUwNDRGMjkwRjg2MDhCRDAKUldUUWkyRDRrUEpFNEQ4SmdwcU5PaXl6R2ZRUUNvUnhIaVkwVUltV0NMaEx6VTkrWVhpT0ZqeEEK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 2,
+  "selectedDriver": "tauri-plugin-updater",
+  "selectedDriverMaturity": "official-maintained",
+  "previewRiskApproval": null,
+  "artifactMode": "v1Compatible",
+  "dependencies": {
+    "npm": {
+      "@tauri-apps/cli": {
+        "version": "2.11.4",
+        "integrity": "sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ==",
+        "source": "https://registry.npmjs.org/",
+        "license": "Apache-2.0 OR MIT"
+      }
+    },
+    "cargo": {
+      "tauri-build": {
+        "version": "2.6.3",
+        "checksum": "bc9ce40b16101cb6ea63d3e221567affd1c3a9205f95d7bc574941a10636b632",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "license": "Apache-2.0 OR MIT"
+      },
+      "tauri": {
+        "version": "2.11.5",
+        "checksum": "667b20e2726d572dea2de7370da16e188eb06008faf9a92fab7cdc46791190b5",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "license": "Apache-2.0 OR MIT"
+      },
+      "tauri-plugin-updater": {
+        "version": "2.10.1",
+        "checksum": "806d9dac662c2e4594ff03c647a552f2c9bd544e7d0f683ec58f872f952ce4af",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "license": "Apache-2.0 OR MIT"
+      },
+      "reqwest": {
+        "version": "0.13.4",
+        "checksum": "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "license": "MIT OR Apache-2.0"
+      },
+      "serde_json": {
+        "version": "1.0.151",
+        "checksum": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "license": "MIT OR Apache-2.0"
+      },
+      "url": {
+        "version": "2.5.8",
+        "checksum": "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "license": "MIT OR Apache-2.0"
+      }
+    }
+  },
+  "driverComparison": {
+    "name": "cargo-packager-updater",
+    "version": "0.2.3",
+    "checksum": "eec09acab5c2227aba2e592d431708305bdeb6d507703f6cd8983fb57b6c5ef7",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "license": "Apache-2.0 OR MIT",
+    "maturity": "public-preview",
+    "selected": false,
+    "riskApprovalRequired": true,
+    "riskApproval": null,
+    "disposition": "not-selected-while-official-driver-qualifies"
+  },
+  "files": {
+    "cargoToml": "81ecf40b94ded2cea5767c28a9aa31ad38f3a95e5d323dfd7e4d426c1e08e826",
+    "cargoLock": "294e40d2ac0309c942c6cbc80b466f53f9f92dfeb4caef20bdeb83e3b38442a0",
+    "config": "c0b412612bc9c9b79e3589422f0f3b79c3bbf2c57a599c1e5c940f2329dfcf58",
+    "main": "f09f65b0bcb9f5018937e080e868cac926c0b7e05190bb01f475b502331debb6",
+    "hooks": "c0f888d84235c85338074ef5de60bb1cda30f4e3a79bfacffc121d6d802f84a8",
+    "lab": "2052078e1236022c2c274984f1659df7e8b6a35d7e32c451971355b538513227"
+  }
+}

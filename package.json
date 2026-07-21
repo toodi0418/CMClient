@@ -26,7 +26,7 @@
     "test:supply-chain": "node --test scripts/release-supply-chain.test.mjs",
     "test:rc-readiness": "node --test scripts/rc-readiness.test.mjs",
     "test:documentation": "node --test scripts/documentation-contract.test.mjs",
-    "test:p13-feasibility": "node --test scripts/p13-feasibility-decision.test.mjs",
+    "test:p13-feasibility": "node --test scripts/p13-feasibility-decision.test.mjs scripts/p13-gateway-bootstrap-lab.test.mjs scripts/p13-updater-driver-fixture.test.mjs scripts/p13-updater-artifact-evidence.test.mjs scripts/p13-updater-live-matrix.test.mjs scripts/p13-updater-windows-install-lab.test.mjs scripts/p13-nsis-path-hooks.test.mjs",
     "rc:check": "node scripts/rc-readiness.mjs check-sources && node scripts/rc-readiness.mjs check-plan --input docs/testing/rc-field-validation-plan.json",
     "test:systemd": "node --test scripts/cmclient-systemd.test.mjs",
     "test:windows-service": "node --test scripts/cmclient-windows-service.test.mjs",

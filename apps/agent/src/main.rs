@@ -946,6 +946,7 @@ impl AgentController {
                     private_key_path: lan.private_key_path.clone(),
                 }),
             static_web_root: Some(resolve_static_web_root()),
+            gateway_capability: None,
         };
         let updates = Arc::new(AgentUpdateService::new(&config.paths.data_dir)?);
         updates.recover()?;
@@ -1917,6 +1918,7 @@ fn serve_web_once() -> ExitCode {
                 private_key_path: lan.private_key_path.clone(),
             }),
         static_web_root: Some(resolve_static_web_root()),
+        gateway_capability: None,
     };
     let management_access = match config.management_lan.as_ref() {
         Some(lan) => match ManagementAccessController::new(lan.access.clone()) {

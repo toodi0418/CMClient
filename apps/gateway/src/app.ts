@@ -54,6 +54,11 @@ import {
   formatSseEvent,
   formatSseHeartbeat,
 } from "./events.js";
+import {
+  GATEWAY_CAPABILITY_HEADER,
+  gatewayCapabilityMatches,
+  isGatewayCapability,
+} from "./bootstrap.js";
 
 const SSE_HTTP_HIGH_WATER_MARK_BYTES = DEFAULT_SSE_FRAME_MAX_BYTES + 4 * 1024;
 
@@ -124,6 +129,10 @@ export interface GatewaySseOptions {
   heartbeatIntervalMs?: number;
 }
 
+export interface GatewayAccessOptions {
+  capability?: string;
+}
+
 type GatewaySseSessionCloser = (reason: string) => void;
 
 interface JobIdParams {
@@ -148,6 +157,14 @@ interface IdempotencyHeaders {
 
 export class GatewayConfigurationError extends Error {
   readonly code = "GATEWAY_LISTEN_CONFIGURATION_INVALID";
+}
+
+export class GatewayAccessConfigurationError extends Error {
+  readonly code = "GATEWAY_CAPABILITY_CONFIGURATION_INVALID";
+
+  constructor() {
+    super("GATEWAY_CAPABILITY_CONFIGURATION_INVALID");
+  }
 }
 
 export function parseGatewayListenOptions(
@@ -193,6 +210,7 @@ export class GatewayRuntime {
     proxy?: GatewayProxyReadApi,
     meshtastic?: GatewayMeshtasticReadApi,
     aprs?: GatewayAprsReadApi,
+    access?: GatewayAccessOptions,
   ) {
     this.options = options;
     this.app = createGatewayApp(
@@ -206,6 +224,7 @@ export class GatewayRuntime {
       proxy,
       meshtastic,
       aprs,
+      access,
     );
   }
 
@@ -246,10 +265,17 @@ export function createGatewayApp(
   proxy?: GatewayProxyReadApi,
   meshtastic?: GatewayMeshtasticReadApi,
   aprs?: GatewayAprsReadApi,
+  access: GatewayAccessOptions = {},
 ): FastifyInstance {
   const heartbeatIntervalMs = sseOptions.heartbeatIntervalMs ?? 15_000;
   if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
     throw new GatewayConfigurationError();
+  }
+  if (
+    access.capability !== undefined &&
+    !isGatewayCapability(access.capability)
+  ) {
+    throw new GatewayAccessConfigurationError();
   }
   const app = Fastify({
     logger: false,
@@ -264,6 +290,20 @@ export function createGatewayApp(
     }
   });
   app.addHook("onRequest", (request, reply, done) => {
+    if (
+      access.capability !== undefined &&
+      !gatewayCapabilityMatches(
+        request.headers[GATEWAY_CAPABILITY_HEADER],
+        access.capability,
+      )
+    ) {
+      reply
+        .header("cache-control", "no-store")
+        .code(403)
+        .send({ code: "GATEWAY_CAPABILITY_REJECTED" });
+      return;
+    }
+    delete request.headers[GATEWAY_CAPABILITY_HEADER];
     request.traceId = resolveTraceId(request.headers["x-trace-id"]);
     const correlationId = resolveCorrelationId(
       request.headers["x-correlation-id"],

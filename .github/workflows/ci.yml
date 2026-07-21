@@ -94,12 +94,15 @@ jobs:
           - name: Linux
             os: ubuntu-latest
             install_tauri_dependencies: true
+            updater_bundle: appimage
           - name: macOS
             os: macos-latest
             install_tauri_dependencies: false
+            updater_bundle: app
           - name: Windows
             os: windows-latest
             install_tauri_dependencies: false
+            updater_bundle: nsis
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -127,6 +130,31 @@ jobs:
             libxdo-dev \
             patchelf
       - run: pnpm install --frozen-lockfile
+      - name: Verify updater fixture contract
+        run: node scripts/p13-updater-driver-fixture.mjs verify
+      - name: Test updater fixture Rust helper
+        shell: bash
+        env:
+          CMCLIENT_CAMPAIGN_ROOT: ${{ runner.temp }}/cmclient-p13-fixture
+        run: node scripts/p13-updater-driver-fixture.mjs cargo-test
+      - name: Probe hidden updater AppHandle on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CMCLIENT_CAMPAIGN_ROOT: ${{ runner.temp }}/cmclient-p13-fixture
+        run: xvfb-run -a node scripts/p13-updater-driver-fixture.mjs probe
+      - name: Probe hidden updater AppHandle
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          CMCLIENT_CAMPAIGN_ROOT: ${{ runner.temp }}/cmclient-p13-fixture
+        run: node scripts/p13-updater-driver-fixture.mjs probe
+      - name: Build target-native updater fixture
+        shell: bash
+        env:
+          CMCLIENT_CAMPAIGN_ROOT: ${{ runner.temp }}/cmclient-p13-fixture
+          CMCLIENT_P13_FIXTURE_VERSION: 0.1.0
+        run: node scripts/p13-updater-driver-fixture.mjs build ${{ matrix.updater_bundle }}
       - run: pnpm --filter @cmclient/desktop run build
       - run: cargo test -p cmclient-desktop --locked
       - run: cargo build -p cmclient-desktop --locked

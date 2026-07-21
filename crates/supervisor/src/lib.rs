@@ -1,10 +1,14 @@
 //! Process supervision primitives owned by the Rust Agent.
 
 use cmclient_runtime_logging::{ChildOutputCapture, RuntimeLogError, StructuredLogSink};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{ErrorKind, Write},
+    fmt,
+    io::{ErrorKind, Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     process::{Child, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -19,12 +23,65 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(40);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_COMMAND: &[u8] = b"CMCLIENT_SHUTDOWN\n";
+pub const GATEWAY_PRIVATE_FRAME_MAX_BYTES: usize = 4096;
+pub const DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(5);
+const GATEWAY_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
+const GATEWAY_CAPABILITY_HEADER: &str = "x-cmclient-gateway-capability";
+const GATEWAY_HEALTH_PATH: &str = "/api/v1/system/health";
 const INHERITED_RUNTIME_ENVIRONMENT_NAMES: [&str; 4] = ["PATH", "SystemRoot", "WINDIR", "ComSpec"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayCommand {
     pub program: String,
     pub arguments: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GatewayReady {
+    pub pid: u32,
+    pub address: SocketAddr,
+    pub startup_nonce: String,
+    pub capability: String,
+}
+
+impl fmt::Debug for GatewayReady {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayReady")
+            .field("pid", &self.pid)
+            .field("address", &self.address)
+            .field("startup_nonce", &"[REDACTED]")
+            .field("capability", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewayBootstrapFrame {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    startup_nonce: String,
+    capability: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GatewayReadyFrame {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    frame_type: String,
+    pid: u32,
+    startup_nonce: String,
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayHealthResponse {
+    status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +142,10 @@ pub enum SupervisorError {
     SpawnFailed,
     ProcessIoFailed,
     LoggingFailed(&'static str),
+    BootstrapInvalid,
+    BootstrapTimeout,
+    BootstrapIoFailed,
+    BootstrapProbeFailed,
 }
 
 impl SupervisorError {
@@ -95,6 +156,10 @@ impl SupervisorError {
             Self::SpawnFailed => "GATEWAY_SUPERVISOR_SPAWN_FAILED",
             Self::ProcessIoFailed => "GATEWAY_SUPERVISOR_PROCESS_IO_FAILED",
             Self::LoggingFailed(code) => code,
+            Self::BootstrapInvalid => "GATEWAY_SUPERVISOR_BOOTSTRAP_INVALID",
+            Self::BootstrapTimeout => "GATEWAY_SUPERVISOR_BOOTSTRAP_TIMEOUT",
+            Self::BootstrapIoFailed => "GATEWAY_SUPERVISOR_BOOTSTRAP_IO_FAILED",
+            Self::BootstrapProbeFailed => "GATEWAY_SUPERVISOR_BOOTSTRAP_PROBE_FAILED",
         }
     }
 }
@@ -111,6 +176,9 @@ pub struct GatewaySupervisor {
     restart_not_before: Option<Instant>,
     stable_window: Duration,
     started_at: Option<Instant>,
+    private_bootstrap: bool,
+    bootstrap_deadline: Duration,
+    ready: Option<GatewayReady>,
 }
 
 impl GatewaySupervisor {
@@ -150,6 +218,9 @@ impl GatewaySupervisor {
             restart_not_before: None,
             stable_window,
             started_at: None,
+            private_bootstrap: false,
+            bootstrap_deadline: DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE,
+            ready: None,
         })
     }
 
@@ -166,6 +237,18 @@ impl GatewaySupervisor {
 
     pub fn set_environment(&mut self, environment: BTreeMap<String, String>) {
         self.environment.extend(environment);
+    }
+
+    pub fn enable_private_bootstrap(&mut self) -> Result<(), SupervisorError> {
+        if self.child.is_some() {
+            return Err(SupervisorError::ProcessIoFailed);
+        }
+        self.private_bootstrap = true;
+        Ok(())
+    }
+
+    pub fn gateway_ready(&self) -> Option<&GatewayReady> {
+        self.ready.as_ref()
     }
 
     pub fn set_log_sink(&mut self, sink: StructuredLogSink) -> Result<(), SupervisorError> {
@@ -219,12 +302,13 @@ impl GatewaySupervisor {
 
     fn spawn_child(&mut self) -> Result<SupervisorEvent, SupervisorError> {
         let capture_output = self.log_sink.is_some();
+        let private_bootstrap = self.private_bootstrap;
         let child = Command::new(&self.command.program)
             .args(&self.command.arguments)
             .env_clear()
             .envs(&self.environment)
             .stdin(Stdio::piped())
-            .stdout(if capture_output {
+            .stdout(if capture_output || private_bootstrap {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -242,7 +326,21 @@ impl GatewaySupervisor {
                 return Err(SupervisorError::SpawnFailed);
             }
         };
-        if let Err(error) = self.capture_child_output(&mut child) {
+        let ready = if private_bootstrap {
+            match perform_private_bootstrap(&mut child, self.bootstrap_deadline) {
+                Ok(ready) => Some(ready),
+                Err(error) => {
+                    let observed_at = Instant::now();
+                    let _ = terminate_child(&mut child);
+                    self.register_failure(observed_at);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = self.capture_child_output(&mut child, private_bootstrap, ready.as_ref())
+        {
             let observed_at = Instant::now();
             if terminate_child(&mut child).is_err() {
                 self.child = Some(child);
@@ -253,6 +351,7 @@ impl GatewaySupervisor {
             return Err(error);
         }
         let pid = child.id();
+        self.ready = ready;
         self.child = Some(child);
         self.restart_not_before = None;
         self.started_at = Some(Instant::now());
@@ -281,6 +380,7 @@ impl GatewaySupervisor {
             }
             Some(status) => {
                 self.child = None;
+                self.ready = None;
                 self.finish_output_capture();
                 if survived_stable_window {
                     self.failed_attempts = 0;
@@ -313,27 +413,42 @@ impl GatewaySupervisor {
             self.child = Some(child);
             return Err(SupervisorError::ProcessIoFailed);
         }
+        self.ready = None;
         self.finish_output_capture();
         self.reset_tracking();
         Ok(SupervisorEvent::Stopped)
     }
 
-    fn capture_child_output(&mut self, child: &mut Child) -> Result<(), SupervisorError> {
+    fn capture_child_output(
+        &mut self,
+        child: &mut Child,
+        stdout_reserved: bool,
+        ready: Option<&GatewayReady>,
+    ) -> Result<(), SupervisorError> {
         let Some(sink) = self.log_sink.clone() else {
             return Ok(());
         };
-        let stdout = child.stdout.take().ok_or_else(|| {
-            let code = RuntimeLogError::CaptureReadFailed.code();
-            self.remember_log_error_code(code);
-            SupervisorError::LoggingFailed(code)
-        })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             let code = RuntimeLogError::CaptureReadFailed.code();
             self.remember_log_error_code(code);
             SupervisorError::LoggingFailed(code)
         })?;
-        let secrets = sensitive_environment_values(&self.environment);
-        self.output_capture = Some(sink.capture(stdout, stderr, secrets).map_err(|error| {
+        let mut secrets = sensitive_environment_values(&self.environment);
+        if let Some(ready) = ready {
+            secrets.push(ready.capability.clone());
+            secrets.push(ready.startup_nonce.clone());
+        }
+        let capture = if stdout_reserved {
+            sink.capture(std::io::empty(), stderr, secrets)
+        } else {
+            let stdout = child.stdout.take().ok_or_else(|| {
+                let code = RuntimeLogError::CaptureReadFailed.code();
+                self.remember_log_error_code(code);
+                SupervisorError::LoggingFailed(code)
+            })?;
+            sink.capture(stdout, stderr, secrets)
+        };
+        self.output_capture = Some(capture.map_err(|error| {
             let code = error.code();
             self.remember_log_error_code(code);
             SupervisorError::LoggingFailed(code)
@@ -366,7 +481,243 @@ impl GatewaySupervisor {
         self.failed_attempts = 0;
         self.restart_not_before = None;
         self.started_at = None;
+        self.ready = None;
     }
+}
+
+fn perform_private_bootstrap(
+    child: &mut Child,
+    deadline: Duration,
+) -> Result<GatewayReady, SupervisorError> {
+    if deadline.is_zero() || deadline > Duration::from_secs(30) {
+        return Err(SupervisorError::BootstrapInvalid);
+    }
+    let bootstrap_deadline = Instant::now()
+        .checked_add(deadline)
+        .ok_or(SupervisorError::BootstrapInvalid)?;
+    let startup_nonce = uuid::Uuid::new_v4().simple().to_string();
+    let capability = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let bootstrap = GatewayBootstrapFrame {
+        schema_version: 1,
+        frame_type: "gateway.bootstrap",
+        startup_nonce: startup_nonce.clone(),
+        capability: capability.clone(),
+    };
+    let encoded = encode_private_frame(&bootstrap)?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or(SupervisorError::BootstrapIoFailed)?
+        .write_all(&encoded)
+        .and_then(|()| {
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("child stdin unavailable"))?
+                .flush()
+        })
+        .map_err(|_| SupervisorError::BootstrapIoFailed)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or(SupervisorError::BootstrapIoFailed)?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name(String::from("cmclient-gateway-bootstrap"))
+        .spawn(move || {
+            let _ = sender.send(read_private_frame(&mut stdout));
+        })
+        .map_err(|_| SupervisorError::BootstrapIoFailed)?;
+    let bytes = receiver
+        .recv_timeout(remaining_until(bootstrap_deadline)?)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => SupervisorError::BootstrapTimeout,
+            mpsc::RecvTimeoutError::Disconnected => SupervisorError::BootstrapIoFailed,
+        })??;
+    let ready = validate_gateway_ready(&bytes, child.id(), startup_nonce, capability)?;
+    probe_gateway_health(&ready, remaining_until(bootstrap_deadline)?)?;
+    Ok(ready)
+}
+
+fn validate_gateway_ready(
+    bytes: &[u8],
+    child_pid: u32,
+    startup_nonce: String,
+    capability: String,
+) -> Result<GatewayReady, SupervisorError> {
+    let ready: GatewayReadyFrame =
+        serde_json::from_slice(bytes).map_err(|_| SupervisorError::BootstrapInvalid)?;
+    if ready.schema_version != 1
+        || ready.frame_type != "gateway.ready"
+        || ready.pid != child_pid
+        || ready.startup_nonce != startup_nonce
+        || ready.host != "127.0.0.1"
+        || ready.port == 0
+    {
+        return Err(SupervisorError::BootstrapInvalid);
+    }
+    Ok(GatewayReady {
+        pid: ready.pid,
+        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ready.port),
+        startup_nonce,
+        capability,
+    })
+}
+
+fn probe_gateway_health(ready: &GatewayReady, timeout: Duration) -> Result<(), SupervisorError> {
+    if timeout.is_zero()
+        || ready.capability.len() != 64
+        || !ready
+            .capability
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SupervisorError::BootstrapProbeFailed);
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(SupervisorError::BootstrapTimeout)?;
+    let mut stream = TcpStream::connect_timeout(&ready.address, remaining_until(deadline)?)
+        .map_err(map_probe_io_error)?;
+    stream
+        .set_write_timeout(Some(remaining_until(deadline)?))
+        .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
+    let request = format!(
+        "GET {GATEWAY_HEALTH_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{GATEWAY_CAPABILITY_HEADER}: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        ready.address.port(),
+        ready.capability
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(map_probe_io_error)?;
+
+    let mut response = Vec::with_capacity(512);
+    let mut chunk = [0_u8; 512];
+    loop {
+        if validate_gateway_health_response(&response)? {
+            return Ok(());
+        }
+        if response.len() == GATEWAY_HEALTH_RESPONSE_MAX_BYTES {
+            return Err(SupervisorError::BootstrapProbeFailed);
+        }
+        stream
+            .set_read_timeout(Some(remaining_until(deadline)?))
+            .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
+        let count = stream.read(&mut chunk).map_err(map_probe_io_error)?;
+        if count == 0 {
+            return Err(SupervisorError::BootstrapProbeFailed);
+        }
+        if response.len().saturating_add(count) > GATEWAY_HEALTH_RESPONSE_MAX_BYTES {
+            return Err(SupervisorError::BootstrapProbeFailed);
+        }
+        response.extend_from_slice(&chunk[..count]);
+    }
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, SupervisorError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(SupervisorError::BootstrapTimeout)
+}
+
+fn map_probe_io_error(error: std::io::Error) -> SupervisorError {
+    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+        SupervisorError::BootstrapTimeout
+    } else {
+        SupervisorError::BootstrapProbeFailed
+    }
+}
+
+fn validate_gateway_health_response(response: &[u8]) -> Result<bool, SupervisorError> {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return Ok(false);
+    };
+    let header = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
+    let mut lines = header.split("\r\n");
+    let mut status = lines
+        .next()
+        .ok_or(SupervisorError::BootstrapProbeFailed)?
+        .split_ascii_whitespace();
+    let version = status.next().ok_or(SupervisorError::BootstrapProbeFailed)?;
+    let code = status.next().ok_or(SupervisorError::BootstrapProbeFailed)?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") || code != "200" {
+        return Err(SupervisorError::BootstrapProbeFailed);
+    }
+
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or(SupervisorError::BootstrapProbeFailed)?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(SupervisorError::BootstrapProbeFailed);
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(SupervisorError::BootstrapProbeFailed);
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| SupervisorError::BootstrapProbeFailed)?,
+            );
+        }
+    }
+    let content_length = content_length.ok_or(SupervisorError::BootstrapProbeFailed)?;
+    let body_start = header_end + 4;
+    let response_length = body_start
+        .checked_add(content_length)
+        .filter(|length| *length <= GATEWAY_HEALTH_RESPONSE_MAX_BYTES)
+        .ok_or(SupervisorError::BootstrapProbeFailed)?;
+    if response.len() < response_length {
+        return Ok(false);
+    }
+    if response.len() != response_length {
+        return Err(SupervisorError::BootstrapProbeFailed);
+    }
+    let health: GatewayHealthResponse = serde_json::from_slice(&response[body_start..])
+        .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
+    if health.status != "ok" {
+        return Err(SupervisorError::BootstrapProbeFailed);
+    }
+    Ok(true)
+}
+
+fn encode_private_frame(value: &impl Serialize) -> Result<Vec<u8>, SupervisorError> {
+    let body = serde_json::to_vec(value).map_err(|_| SupervisorError::BootstrapInvalid)?;
+    let length = u32::try_from(body.len()).map_err(|_| SupervisorError::BootstrapInvalid)?;
+    if body.is_empty() || body.len() > GATEWAY_PRIVATE_FRAME_MAX_BYTES {
+        return Err(SupervisorError::BootstrapInvalid);
+    }
+    let mut frame = Vec::with_capacity(body.len() + 4);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+fn read_private_frame(reader: &mut impl Read) -> Result<Vec<u8>, SupervisorError> {
+    let mut prefix = [0_u8; 4];
+    reader
+        .read_exact(&mut prefix)
+        .map_err(|_| SupervisorError::BootstrapIoFailed)?;
+    let length = usize::try_from(u32::from_be_bytes(prefix))
+        .map_err(|_| SupervisorError::BootstrapInvalid)?;
+    if length == 0 || length > GATEWAY_PRIVATE_FRAME_MAX_BYTES {
+        return Err(SupervisorError::BootstrapInvalid);
+    }
+    let mut body = vec![0_u8; length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|_| SupervisorError::BootstrapIoFailed)?;
+    Ok(body)
 }
 
 impl Drop for GatewaySupervisor {
@@ -458,14 +809,162 @@ fn is_sensitive_environment_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor, SupervisorError,
-        SupervisorEvent, inherited_runtime_environment_from,
+        BackoffPolicy, GATEWAY_CAPABILITY_HEADER, GATEWAY_PRIVATE_FRAME_MAX_BYTES,
+        GatewayBootstrapFrame, GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor,
+        SupervisorError, SupervisorEvent, encode_private_frame, inherited_runtime_environment_from,
+        probe_gateway_health, read_private_frame, validate_gateway_ready,
     };
+
+    #[test]
+    fn private_bootstrap_frames_are_bounded_and_ready_identity_is_exact() {
+        let nonce = "a".repeat(32);
+        let capability = "b".repeat(64);
+        let encoded = encode_private_frame(&GatewayBootstrapFrame {
+            schema_version: 1,
+            frame_type: "gateway.bootstrap",
+            startup_nonce: nonce.clone(),
+            capability: capability.clone(),
+        })
+        .expect("bootstrap should encode");
+        assert_eq!(
+            usize::try_from(u32::from_be_bytes(encoded[..4].try_into().unwrap())).unwrap(),
+            encoded.len() - 4
+        );
+        let body = read_private_frame(&mut encoded.as_slice()).expect("frame should decode");
+        assert_eq!(body, encoded[4..]);
+
+        let ready = serde_json::json!({
+            "schemaVersion": 1,
+            "type": "gateway.ready",
+            "pid": 42,
+            "startupNonce": nonce,
+            "host": "127.0.0.1",
+            "port": 49152
+        });
+        let ready = validate_gateway_ready(
+            &serde_json::to_vec(&ready).unwrap(),
+            42,
+            "a".repeat(32),
+            capability.clone(),
+        )
+        .expect("ready frame should validate");
+        assert_eq!(ready.pid, 42);
+        assert_eq!(ready.address, "127.0.0.1:49152".parse().unwrap());
+        assert_eq!(ready.capability, capability);
+        let ready_debug = format!("{ready:?}");
+        assert!(!ready_debug.contains(&ready.capability));
+        assert!(!ready_debug.contains(&ready.startup_nonce));
+        assert_eq!(ready_debug.matches("[REDACTED]").count(), 2);
+
+        let mut oversized = Vec::from(
+            u32::try_from(GATEWAY_PRIVATE_FRAME_MAX_BYTES + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        oversized.resize(8, 0);
+        assert!(matches!(
+            read_private_frame(&mut oversized.as_slice()),
+            Err(SupervisorError::BootstrapInvalid)
+        ));
+    }
+
+    #[test]
+    fn private_ready_rejects_wrong_pid_nonce_endpoint_and_unknown_fields() {
+        let base = serde_json::json!({
+            "schemaVersion": 1,
+            "type": "gateway.ready",
+            "pid": 42,
+            "startupNonce": "a".repeat(32),
+            "host": "127.0.0.1",
+            "port": 49152
+        });
+        for mutation in ["pid", "nonce", "host", "port", "unknown"] {
+            let mut value = base.clone();
+            match mutation {
+                "pid" => value["pid"] = serde_json::json!(43),
+                "nonce" => value["startupNonce"] = serde_json::json!("c".repeat(32)),
+                "host" => value["host"] = serde_json::json!("0.0.0.0"),
+                "port" => value["port"] = serde_json::json!(0),
+                "unknown" => value["capability"] = serde_json::json!("reflected"),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                validate_gateway_ready(
+                    &serde_json::to_vec(&value).unwrap(),
+                    42,
+                    "a".repeat(32),
+                    "b".repeat(64),
+                ),
+                Err(SupervisorError::BootstrapInvalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn capability_health_probe_accepts_the_exact_gateway_contract() {
+        let capability = "b".repeat(64);
+        let (address, server) = spawn_capability_gate_server(capability.clone());
+        let ready = GatewayReady {
+            pid: 42,
+            address,
+            startup_nonce: "a".repeat(32),
+            capability,
+        };
+
+        probe_gateway_health(&ready, Duration::from_secs(2))
+            .expect("capability-gated health should validate");
+        server.join().expect("probe server should finish");
+    }
+
+    #[test]
+    fn capability_health_probe_rejects_an_unrelated_live_loopback_port() {
+        let capability = "c".repeat(64);
+        let unrelated_capability = "d".repeat(64);
+        let (address, server) = spawn_capability_gate_server(unrelated_capability);
+        let ready = GatewayReady {
+            pid: 42,
+            address,
+            startup_nonce: "e".repeat(32),
+            capability,
+        };
+
+        assert_eq!(
+            probe_gateway_health(&ready, Duration::from_secs(2)),
+            Err(SupervisorError::BootstrapProbeFailed)
+        );
+        server.join().expect("unrelated probe server should finish");
+    }
+
+    #[test]
+    fn health_probe_failure_diagnostics_do_not_reflect_capability_or_response() {
+        let capability = "c".repeat(64);
+        let reflected = format!(r#"{{"code":"denied","detail":"{capability}"}}"#);
+        let (address, server) = spawn_probe_server(
+            capability.clone(),
+            String::from("403 Forbidden"),
+            reflected.clone(),
+        );
+        let ready = GatewayReady {
+            pid: 42,
+            address,
+            startup_nonce: "d".repeat(32),
+            capability: capability.clone(),
+        };
+
+        let error = probe_gateway_health(&ready, Duration::from_secs(2))
+            .expect_err("rejected health should fail bootstrap");
+        server.join().expect("probe server should finish");
+        let diagnostic = format!("{error:?}:{}", error.code());
+        assert_eq!(error, SupervisorError::BootstrapProbeFailed);
+        assert!(!diagnostic.contains(&capability));
+        assert!(!diagnostic.contains(&reflected));
+    }
     use cmclient_runtime_logging::{LogPolicy, MIN_LOG_MAX_BYTES, StructuredLogSink};
     use std::{
         collections::BTreeMap,
         env, fs,
-        io::{BufRead, Write},
+        io::{BufRead, Read, Write},
+        net::{Ipv4Addr, SocketAddr, TcpListener},
         path::PathBuf,
         process, thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -952,6 +1451,88 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (files, contents)
+    }
+
+    fn spawn_probe_server(
+        expected_capability: String,
+        status: String,
+        body: String,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("probe fixture should bind loopback");
+        let address = listener
+            .local_addr()
+            .expect("probe fixture address should resolve");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("probe request should connect");
+            let request = read_probe_request(&mut stream);
+            assert_eq!(
+                capability_headers(&request),
+                vec![expected_capability.as_str()]
+            );
+            assert!(request.starts_with("GET /api/v1/system/health HTTP/1.1\r\n"));
+            write_probe_response(&mut stream, &status, &body);
+        });
+        (address, server)
+    }
+
+    fn spawn_capability_gate_server(
+        server_capability: String,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("capability gate fixture should bind loopback");
+        let address = listener
+            .local_addr()
+            .expect("capability gate fixture address should resolve");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health probe should connect");
+            let request = read_probe_request(&mut stream);
+            let authorized = capability_headers(&request) == vec![server_capability.as_str()];
+            if authorized {
+                write_probe_response(&mut stream, "200 OK", r#"{"status":"ok"}"#);
+            } else {
+                write_probe_response(
+                    &mut stream,
+                    "403 Forbidden",
+                    r#"{"code":"GATEWAY_CAPABILITY_REJECTED"}"#,
+                );
+            }
+        });
+        (address, server)
+    }
+
+    fn read_probe_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("probe fixture timeout should configure");
+        let mut request = Vec::with_capacity(512);
+        let mut chunk = [0_u8; 256];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).expect("probe request should read");
+            assert_ne!(count, 0, "probe request ended before headers");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 4096, "probe request must remain bounded");
+        }
+        String::from_utf8(request).expect("probe request should be ASCII")
+    }
+
+    fn capability_headers(request: &str) -> Vec<&str> {
+        request
+            .split("\r\n")
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(GATEWAY_CAPABILITY_HEADER))
+            .map(|(_, value)| value.trim())
+            .collect()
+    }
+
+    fn write_probe_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("probe response should write");
+        stream.flush().expect("probe response should flush");
     }
 
     fn fixture_command() -> GatewayCommand {

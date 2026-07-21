@@ -3,6 +3,7 @@ import { request, type IncomingMessage } from "node:http";
 import { describe, expect, it } from "vitest";
 
 import {
+  GatewayAccessConfigurationError,
   GatewayConfigurationError,
   GatewayRuntime,
   createGatewayApp,
@@ -16,6 +17,7 @@ import {
 } from "./events";
 import { JobEngine, JobQueueFullError } from "./jobs";
 import { GatewayDatabase } from "./persistence/database";
+import { GATEWAY_CAPABILITY_HEADER } from "./bootstrap";
 
 describe("GatewayRuntime", () => {
   it("fails closed for a non-loopback bind", () => {
@@ -119,6 +121,78 @@ describe("GatewayRuntime", () => {
       failedOutbox: 0,
     });
     await app.close();
+  });
+
+  it("rejects direct and spoofed access on health, HTTP, SSE, and unmatched routes", async () => {
+    const capability = "c".repeat(64);
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      undefined,
+      {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { capability },
+    );
+    for (const url of [
+      "/api/v1/system/health",
+      "/api/v1/nodes",
+      "/api/v1/events",
+      "/missing",
+    ]) {
+      const direct = await app.inject({ method: "GET", url });
+      expect(direct.statusCode, url).toBe(403);
+      expect(direct.json()).toEqual({ code: "GATEWAY_CAPABILITY_REJECTED" });
+
+      const spoofed = await app.inject({
+        method: "GET",
+        url,
+        headers: { [GATEWAY_CAPABILITY_HEADER]: "d".repeat(64) },
+      });
+      expect(spoofed.statusCode, url).toBe(403);
+
+      const nonAscii = await app.inject({
+        method: "GET",
+        url,
+        headers: { [GATEWAY_CAPABILITY_HEADER]: "\u00e9".repeat(64) },
+      });
+      expect(nonAscii.statusCode, url).toBe(403);
+    }
+
+    const accepted = await app.inject({
+      method: "GET",
+      url: "/api/v1/system/health",
+      headers: { [GATEWAY_CAPABILITY_HEADER]: capability },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json()).toEqual({ status: "ok" });
+    expect(JSON.stringify(accepted.headers)).not.toContain(capability);
+    expect(accepted.body).not.toContain(capability);
+    await app.close();
+  });
+
+  it("rejects malformed private capability configuration instead of disabling the gate", () => {
+    for (const capability of ["", "g".repeat(64), "c".repeat(63)]) {
+      expect(() =>
+        createGatewayApp(
+          new MemoryLogger(),
+          undefined,
+          undefined,
+          {},
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { capability },
+        ),
+      ).toThrow(GatewayAccessConfigurationError);
+    }
   });
 
   it("serves bounded domain list projections and fails closed without persistence", async () => {
