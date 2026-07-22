@@ -1,183 +1,314 @@
-import { describe, it } from "node:test";
-import { ok, rejects, strictEqual, throws } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   PhysicalWriteGuard,
   PhysicalWriteGuardError,
-} from "./physical-guard.js";
+  type PhysicalWriteGuardOptions,
+} from "./physical-guard";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((path) => rm(path, { recursive: true, force: true })),
+  );
+});
 
 describe("PhysicalWriteGuard", () => {
-  it("test mode permits unrestricted writes", async () => {
+  it("leaves non-physical transports unrestricted", () => {
     const guard = new PhysicalWriteGuard({ physicalProfile: false });
 
-    await guard.checkConnectionAttempt();
-    await guard.checkConfigRequest(123);
-    await guard.checkConfigRequest(456); // Duplicate allowed in test mode
-    guard.rejectWrite("admin_message"); // Any packet type allowed
+    guard.acquireSession(0);
+    guard.authorizeConfigRequest(0, new Uint8Array());
+    guard.rejectApplicationWrite();
+    guard.accountIncomingBytes(Number.MAX_SAFE_INTEGER);
+    guard.accountIncomingFrames(Number.MAX_SAFE_INTEGER);
+    guard.releaseSession();
   });
 
-  it("physical mode permits exactly one config request per session", async () => {
-    const guard = new PhysicalWriteGuard({
-      physicalProfile: true,
-      sessionNonce: 12345,
-    });
+  it("permits one correlated config request and permanently rejects application writes", async () => {
+    const fixture = await guardFixture();
+    const guard = fixture.guard();
 
-    await guard.checkConfigRequest(12345);
-
-    await rejects(
-      () => guard.checkConfigRequest(12345),
-      (err: Error) => {
-        ok(err instanceof PhysicalWriteGuardError);
-        strictEqual(err.code, "PHYSICAL_GUARD_DUPLICATE_CONFIG_REQUEST");
-        return true;
-      },
+    guard.acquireSession(12_345);
+    guard.authorizeConfigRequest(12_345, wantConfig(12_345));
+    expectCode(
+      () => guard.authorizeConfigRequest(12_345, wantConfig(12_345)),
+      "PHYSICAL_GUARD_DUPLICATE_CONFIG_REQUEST",
     );
+    expectCode(
+      () => guard.rejectApplicationWrite(),
+      "PHYSICAL_GUARD_WRITER_DISABLED",
+    );
+    guard.recordConfigSuccess();
+    guard.releaseSession();
   });
 
-  it("physical mode rejects mismatched nonce", async () => {
-    const guard = new PhysicalWriteGuard({
-      physicalProfile: true,
-      sessionNonce: 12345,
-    });
+  it("rejects a mismatched nonce without consuming the config request", async () => {
+    const fixture = await guardFixture();
+    const guard = fixture.guard();
 
-    await rejects(
-      () => guard.checkConfigRequest(99999),
-      (err: Error) => {
-        ok(err instanceof PhysicalWriteGuardError);
-        strictEqual(err.code, "PHYSICAL_GUARD_NONCE_MISMATCH");
-        return true;
-      },
+    guard.acquireSession(12_345);
+    expectCode(
+      () => guard.authorizeConfigRequest(54_321, wantConfig(54_321)),
+      "PHYSICAL_GUARD_NONCE_MISMATCH",
     );
+    guard.authorizeConfigRequest(12_345, wantConfig(12_345));
+    guard.recordConfigSuccess();
+    guard.releaseSession();
   });
 
-  it("physical mode rejects non-config packet types", () => {
-    const guard = new PhysicalWriteGuard({ physicalProfile: true });
+  it("rejects any non-canonical ToRadio payload before authorization", async () => {
+    const fixture = await guardFixture();
+    const guard = fixture.guard();
 
-    throws(
-      () => guard.rejectWrite("send_text"),
-      (err: Error) => {
-        ok(err instanceof PhysicalWriteGuardError);
-        ok(err.code.includes("PHYSICAL_GUARD_PACKET_TYPE_REJECTED"));
-        return true;
-      },
+    guard.acquireSession(12_345);
+    expectCode(
+      () => guard.authorizeConfigRequest(12_345, new Uint8Array([0x22, 0x00])),
+      "PHYSICAL_GUARD_CONFIG_PAYLOAD_REJECTED",
     );
-
-    throws(
-      () => guard.rejectWrite("admin_message"),
-      (err: Error) => {
-        ok(err instanceof PhysicalWriteGuardError);
-        return true;
-      },
-    );
-
-    // want_config_id is allowed
-    guard.rejectWrite("want_config_id");
+    expect(guard.automaticReconnectAllowed).toBe(false);
+    guard.releaseSession("aborted");
   });
 
-  it("aggregate ledger tracks attempts and opens fuse after threshold", async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), "physical-guard-test-"));
-    const ledgerPath = join(tmpDir, "ledger.json");
+  it("holds one exclusive process lease until clean release", async () => {
+    const fixture = await guardFixture();
+    const first = fixture.guard();
+    const second = fixture.guard();
 
-    try {
-      let clock = new Date("2026-01-01T00:00:00Z");
+    first.acquireSession(1);
+    expectCode(() => second.acquireSession(2), "PHYSICAL_GUARD_LEASE_HELD");
+    first.releaseSession("aborted");
 
-      // Create 4 attempts within 10-minute window
-      for (let i = 0; i < 4; i++) {
-        const guard = new PhysicalWriteGuard({
-          physicalProfile: true,
-          ledgerPath,
-          clock: () => clock,
-        });
-        await guard.checkConnectionAttempt();
-        clock = new Date(clock.getTime() + 60_000); // +1 minute
-      }
+    second.acquireSession(2);
+    second.releaseSession("aborted");
+  });
 
-      // 5th attempt should open fuse
-      const guard5 = new PhysicalWriteGuard({
-        physicalProfile: true,
-        ledgerPath,
-        clock: () => clock,
-      });
-
-      await rejects(
-        () => guard5.checkConnectionAttempt(),
-        (err: Error) => {
-          ok(err instanceof PhysicalWriteGuardError);
-          strictEqual(err.code, "PHYSICAL_GUARD_TOO_MANY_ATTEMPTS_IN_WINDOW");
-          return true;
-        },
-      );
-
-      // Fuse remains open
-      await rejects(
-        () => guard5.checkConnectionAttempt(),
-        (err: Error) => {
-          ok(err instanceof PhysicalWriteGuardError);
-          strictEqual(err.code, "PHYSICAL_GUARD_FUSE_OPEN");
-          return true;
-        },
-      );
-    } finally {
-      rmSync(tmpDir, { recursive: true, force: true });
+  it("opens the fuse before a fifth cycle inside ten minutes", async () => {
+    let now = new Date("2026-07-22T00:00:00.000Z");
+    const fixture = await guardFixture({ clock: () => now });
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const guard = fixture.guard();
+      guard.acquireSession(attempt + 1);
+      guard.releaseSession("connect");
+      now = new Date(now.getTime() + 60_000);
     }
+
+    expectCode(
+      () => fixture.guard().acquireSession(5),
+      "PHYSICAL_GUARD_ATTEMPT_WINDOW_EXCEEDED",
+    );
+    expectCode(
+      () => fixture.guard().acquireSession(6),
+      "PHYSICAL_GUARD_FUSE_OPEN",
+    );
   });
 
-  it("consecutive config failures open fuse", async () => {
-    const tmpDir = mkdtempSync(join(tmpdir(), "physical-guard-test-"));
-    const ledgerPath = join(tmpDir, "ledger.json");
+  it("treats the ten-minute window as half-open at the exact boundary", async () => {
+    let now = new Date("2026-07-22T00:00:00.000Z");
+    const fixture = await guardFixture({ clock: () => now });
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const guard = fixture.guard();
+      guard.acquireSession(attempt + 1);
+      guard.releaseSession("connect");
+      now = new Date(now.getTime() + 60_000);
+    }
+    now = new Date("2026-07-22T00:10:00.000Z");
 
-    try {
-      const clock = new Date("2026-01-01T00:00:00Z");
+    const guard = fixture.guard();
+    guard.acquireSession(5);
+    guard.releaseSession("connect");
+  });
 
-      // Simulate 3 consecutive config failures by manually creating ledger
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(
-        ledgerPath,
-        JSON.stringify({
-          schemaVersion: 1,
-          attempts: [
-            {
-              timestamp: new Date(clock.getTime() - 180_000).toISOString(),
-              sessionId: "test1",
-              kind: "config_request",
-              result: "rejected",
-            },
-            {
-              timestamp: new Date(clock.getTime() - 120_000).toISOString(),
-              sessionId: "test2",
-              kind: "config_request",
-              result: "rejected",
-            },
-            {
-              timestamp: new Date(clock.getTime() - 60_000).toISOString(),
-              sessionId: "test3",
-              kind: "config_request",
-              result: "rejected",
-            },
-          ],
-          fuseState: "closed",
+  it("opens the fuse on the third consecutive config failure", async () => {
+    let now = new Date("2026-07-22T00:00:00.000Z");
+    const fixture = await guardFixture({ clock: () => now });
+    let lastGuard: PhysicalWriteGuard | undefined;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const guard = fixture.guard();
+      lastGuard = guard;
+      guard.acquireSession(attempt + 1);
+      guard.authorizeConfigRequest(attempt + 1, wantConfig(attempt + 1));
+      guard.recordConfigFailure("timeout");
+      guard.releaseSession();
+      now = new Date(now.getTime() + 60_000);
+    }
+    expect(lastGuard?.automaticReconnectAllowed).toBe(false);
+
+    expectCode(
+      () => fixture.guard().acquireSession(4),
+      "PHYSICAL_GUARD_FUSE_OPEN",
+    );
+  });
+
+  it("opens a stage fuse before its fifth config request", async () => {
+    let now = new Date("2026-07-22T00:00:00.000Z");
+    const fixture = await guardFixture({ clock: () => now });
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      completeSession(fixture.guard(), attempt + 1);
+      now = new Date(now.getTime() + 11 * 60_000);
+    }
+    const fifth = fixture.guard();
+    fifth.acquireSession(5);
+    expectCode(
+      () => fifth.authorizeConfigRequest(5, wantConfig(5)),
+      "PHYSICAL_GUARD_STAGE_REQUEST_LIMIT_EXCEEDED",
+    );
+    fifth.releaseSession();
+  });
+
+  it("opens a candidate fuse before its seventeenth config request", async () => {
+    let now = new Date("2026-07-22T00:00:00.000Z");
+    const fixture = await guardFixture({ clock: () => now });
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      completeSession(
+        fixture.guard({
+          qualificationStage: `stage-${Math.floor(attempt / 4)}`,
         }),
+        attempt + 1,
       );
-
-      const guard = new PhysicalWriteGuard({
-        physicalProfile: true,
-        ledgerPath,
-        clock: () => clock,
-      });
-
-      await rejects(
-        () => guard.checkConnectionAttempt(),
-        (err: Error) => {
-          ok(err instanceof PhysicalWriteGuardError);
-          strictEqual(err.code, "PHYSICAL_GUARD_CONSECUTIVE_CONFIG_FAILURES");
-          return true;
-        },
-      );
-    } finally {
-      rmSync(tmpDir, { recursive: true, force: true });
+      now = new Date(now.getTime() + 11 * 60_000);
     }
+    const seventeenth = fixture.guard({ qualificationStage: "stage-4" });
+    seventeenth.acquireSession(17);
+    expectCode(
+      () => seventeenth.authorizeConfigRequest(17, wantConfig(17)),
+      "PHYSICAL_GUARD_CANDIDATE_REQUEST_LIMIT_EXCEEDED",
+    );
+    seventeenth.releaseSession();
+  }, 30_000);
+
+  it("fails closed on a corrupt existing ledger", async () => {
+    const fixture = await guardFixture();
+    writeFileSync(fixture.ledgerPath, "not-a-sqlite-ledger", { mode: 0o600 });
+
+    expectCode(
+      () => fixture.guard().acquireSession(1),
+      "PHYSICAL_GUARD_LEDGER_UNAVAILABLE",
+    );
+    expect(readFileSync(fixture.ledgerPath, "utf8")).toBe(
+      "not-a-sqlite-ledger",
+    );
+  });
+
+  it("bounds physical session bytes, frames, and duration", async () => {
+    let now = new Date("2026-07-22T00:00:00.000Z");
+    const fixture = await guardFixture({
+      clock: () => now,
+      maximumSessionBytes: 4,
+      maximumSessionFrames: 2,
+      maximumSessionDurationMs: 1_000,
+    });
+    const guard = fixture.guard();
+    guard.acquireSession(1);
+    guard.accountIncomingBytes(4);
+    guard.accountIncomingFrames(2);
+    expectCode(
+      () => guard.accountIncomingBytes(1),
+      "PHYSICAL_GUARD_BYTE_BUDGET_EXCEEDED",
+    );
+    expectCode(
+      () => guard.accountIncomingFrames(1),
+      "PHYSICAL_GUARD_FRAME_BUDGET_EXCEEDED",
+    );
+    now = new Date(now.getTime() + 1_001);
+    expectCode(
+      () => guard.accountIncomingBytes(0),
+      "PHYSICAL_GUARD_DURATION_BUDGET_EXCEEDED",
+    );
+    guard.releaseSession("budget");
+  });
+
+  it("fails closed when the wall clock moves behind the persisted fence", async () => {
+    let now = new Date("2026-07-22T00:10:00.000Z");
+    const fixture = await guardFixture({ clock: () => now });
+    const first = fixture.guard();
+    first.acquireSession(1);
+    first.releaseSession("connect");
+
+    now = new Date("2026-07-22T00:09:59.999Z");
+    const second = fixture.guard();
+    expectCode(() => second.acquireSession(2), "PHYSICAL_GUARD_CLOCK_ROLLBACK");
+  });
+
+  it("stores no candidate text and closes Windows file handles on release", async () => {
+    const fixture = await guardFixture({
+      candidateId: "private-callsign-location-message-api-key",
+    });
+    completeSession(fixture.guard(), 1);
+    const rawLedger = readFileSync(fixture.ledgerPath);
+    expect(rawLedger.includes(Buffer.from("private-callsign"))).toBe(false);
+
+    const renamed = `${fixture.ledgerPath}.closed`;
+    renameSync(fixture.ledgerPath, renamed);
+    renameSync(renamed, fixture.ledgerPath);
   });
 });
+
+interface GuardFixture {
+  ledgerPath: string;
+  guard(overrides?: Partial<PhysicalWriteGuardOptions>): PhysicalWriteGuard;
+}
+
+async function guardFixture(
+  overrides: Partial<PhysicalWriteGuardOptions> = {},
+): Promise<GuardFixture> {
+  const directory = await mkdtemp(join(tmpdir(), "cmclient-physical-guard-"));
+  temporaryDirectories.push(directory);
+  const ledgerPath = join(directory, "physical-write-ledger.sqlite");
+  let sequence = 0;
+  return {
+    ledgerPath,
+    guard(extra = {}) {
+      sequence += 1;
+      const tokenSequence = sequence;
+      return new PhysicalWriteGuard({
+        physicalProfile: true,
+        allowedRoot: directory,
+        ledgerPath,
+        candidateId: "fixture-candidate",
+        qualificationStage: "fixture-stage",
+        sessionTokenFactory: () =>
+          `fixture-session-${String(tokenSequence).padStart(8, "0")}`,
+        ...overrides,
+        ...extra,
+      });
+    },
+  };
+}
+
+function completeSession(guard: PhysicalWriteGuard, nonce: number): void {
+  guard.acquireSession(nonce);
+  guard.authorizeConfigRequest(nonce, wantConfig(nonce));
+  guard.recordConfigSuccess();
+  guard.releaseSession();
+}
+
+function expectCode(operation: () => void, code: string): void {
+  try {
+    operation();
+  } catch (error) {
+    expect(error).toBeInstanceOf(PhysicalWriteGuardError);
+    expect((error as PhysicalWriteGuardError).code).toBe(code);
+    return;
+  }
+  throw new Error(`Expected ${code}`);
+}
+
+function wantConfig(nonce: number): Uint8Array {
+  const bytes = [0x18];
+  let remaining = nonce;
+  while (remaining >= 0x80) {
+    bytes.push((remaining % 0x80) | 0x80);
+    remaining = Math.floor(remaining / 0x80);
+  }
+  bytes.push(remaining);
+  return Uint8Array.from(bytes);
+}

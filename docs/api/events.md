@@ -63,6 +63,14 @@ The payload is event-specific and remains bounded. Consumers should treat
 unknown future types as ignorable and refresh the relevant REST projection.
 Current publishers use these types:
 
+The campaign-only physical qualification profile may emit
+`mesh.capture.sealed` after confirmed transport shutdown. Its payload contains
+only the SHA-256 digest of canonical synthetic fixtures, the fixture count, and
+`sanitized: true`. `mesh.capture.error` contains only the stable
+`PACKET_FIXTURE_SANITIZATION_INVALID` code. Neither event may contain raw frame
+bytes, decoded source values, identity, message, position, network metadata,
+endpoint, credential, or original time anchors.
+
 ```text
 gateway.heartbeat
 mesh.transport.state
@@ -70,6 +78,8 @@ mesh.transport.error
 mesh.observation.persisted
 mesh.ingest.error
 mesh.application.ignored
+mesh.capture.sealed
+mesh.capture.error
 node.updated
 message.received
 telemetry.received

@@ -8,12 +8,18 @@ import type {
 import { ReconnectBackoff, type ReconnectBackoffOptions } from "./backoff.js";
 import { ConfigSession, type ConfigSessionCodec } from "./config-session.js";
 import { MeshtasticFrameDecoder, encodeMeshtasticFrame } from "./framing.js";
+import {
+  PhysicalWriteGuard,
+  PhysicalWriteGuardError,
+} from "./physical-guard.js";
 import { TransportConnectionStateMachine } from "./state.js";
 import type {
   MeshtasticTransport,
   TransportEvent,
   TransportEventListener,
 } from "./types.js";
+
+const PHYSICAL_RECONNECT_DELAYS_MS = [5_000, 30_000, 120_000] as const;
 
 const DEFAULT_TCP_CONNECT_TIMEOUT_MS = 10_000;
 const MAX_TCP_TIMEOUT_MS = 120_000;
@@ -30,6 +36,7 @@ export interface TcpMeshtasticTransportOptions {
   reconnect?: ReconnectBackoffOptions;
   random?: () => number;
   clock?: () => Date;
+  physicalGuard?: PhysicalWriteGuard;
 }
 
 export class TcpMeshtasticTransport implements MeshtasticTransport {
@@ -51,6 +58,7 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
   private reconnectTimer: NodeJS.Timeout | undefined;
   private configTimer: NodeJS.Timeout | undefined;
   private connectTimer: NodeJS.Timeout | undefined;
+  private physicalSessionTimer: NodeJS.Timeout | undefined;
   private manualDisconnect = false;
   private attempts = 0;
   private connectPromise: Promise<void> | undefined;
@@ -97,7 +105,11 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
       }
       return Math.floor(sample * 0xffff_ffff) + 1;
     });
-    this.reconnect = new ReconnectBackoff(options.reconnect);
+    this.reconnect = new ReconnectBackoff(
+      options.physicalGuard?.physicalProfile
+        ? { fixedDelaysMs: PHYSICAL_RECONNECT_DELAYS_MS }
+        : options.reconnect,
+    );
   }
 
   get state(): TransportConnectionState {
@@ -119,12 +131,13 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     if (this.connectPromise) {
       return this.connectPromise;
     }
-    this.connectPromise = new Promise<void>((resolve, reject) => {
+    const connectPromise = new Promise<void>((resolve, reject) => {
       this.resolveConnected = resolve;
       this.rejectConnected = reject;
     });
+    this.connectPromise = connectPromise;
     this.openSocket();
-    return this.connectPromise;
+    return connectPromise;
   }
 
   async disconnect(): Promise<void> {
@@ -135,11 +148,21 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     }
     this.clearConnectTimeout();
     this.clearConfigTimeout();
+    this.clearPhysicalSessionTimeout();
     this.configSession.reset();
+    this.decoder.resetBufferedState();
     this.sessionConnectedAt = undefined;
     const socket = this.socket;
     this.socket = undefined;
     socket?.destroy();
+    try {
+      this.options.physicalGuard?.releaseSession("aborted");
+    } catch (error) {
+      this.emit({
+        kind: "error",
+        code: stableGuardCode(error, "PHYSICAL_GUARD_RELEASE_FAILED"),
+      });
+    }
     if (this.state.status !== "disconnected") {
       this.emitState(this.stateMachine.transition("disconnected"));
     }
@@ -147,6 +170,15 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
   }
 
   writeFrame(payload: Uint8Array): Promise<void> {
+    try {
+      this.options.physicalGuard?.rejectApplicationWrite();
+    } catch (error) {
+      return Promise.reject(
+        new TcpTransportError(
+          stableGuardCode(error, "PHYSICAL_GUARD_WRITER_DISABLED"),
+        ),
+      );
+    }
     if (this.state.status !== "ready" || !this.socket) {
       return Promise.reject(new TcpTransportError("TRANSPORT_NOT_READY"));
     }
@@ -176,7 +208,20 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     if (this.manualDisconnect || this.socket) {
       return;
     }
+    this.decoder.resetBufferedState();
     this.emitState(this.stateMachine.transition("connecting"));
+    this.configSession.reset();
+    let configRequest: ReturnType<ConfigSession["beginRequest"]>;
+    try {
+      configRequest = this.configSession.beginRequest();
+      this.options.physicalGuard?.acquireSession(configRequest.nonce);
+    } catch (error) {
+      this.failureCode = stableGuardCode(error, "TCP_CONFIG_SESSION_FAILED");
+      this.emit({ kind: "error", code: this.failureCode });
+      this.emitState(this.stateMachine.transition("disconnected"));
+      this.rejectPending(new TcpTransportError(this.failureCode));
+      return;
+    }
     let socket: Socket;
     try {
       socket = this.socketFactory({
@@ -186,10 +231,22 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     } catch {
       this.failureCode = "TCP_CONNECT_FAILED";
       this.emit({ kind: "error", code: this.failureCode });
+      this.options.physicalGuard?.releaseSession("connect");
       this.scheduleReconnect();
       return;
     }
     this.socket = socket;
+    if (this.options.physicalGuard?.physicalProfile) {
+      this.physicalSessionTimer = setTimeout(() => {
+        if (this.socket !== socket) {
+          return;
+        }
+        this.failureCode = "PHYSICAL_GUARD_DURATION_BUDGET_EXCEEDED";
+        this.emit({ kind: "error", code: this.failureCode });
+        socket.destroy();
+      }, this.options.physicalGuard.sessionDurationLimitMs);
+      this.physicalSessionTimer.unref();
+    }
     this.connectTimer = setTimeout(() => {
       if (this.socket !== socket || this.state.status !== "connecting") {
         return;
@@ -206,15 +263,15 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
       }
       this.clearConnectTimeout();
       this.failureCode = "TCP_CONNECTION_CLOSED";
-      this.configSession.reset();
       this.sessionConnectedAt = undefined;
       this.emitState(this.stateMachine.transition("configuring"));
       try {
+        this.options.physicalGuard?.authorizeConfigRequest(
+          configRequest.nonce,
+          configRequest.payload,
+        );
         this.writeEncoded(
-          encodeMeshtasticFrame(
-            this.configSession.begin(),
-            this.maxPayloadBytes,
-          ),
+          encodeMeshtasticFrame(configRequest.payload, this.maxPayloadBytes),
         ).catch((error: unknown) => {
           const code =
             error instanceof TcpTransportError
@@ -232,8 +289,9 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
           socket.destroy();
         }, this.configTimeoutMs);
         this.configTimer.unref();
-      } catch {
-        this.failureCode = "TCP_CONFIG_SESSION_FAILED";
+      } catch (error) {
+        this.failureCode = stableGuardCode(error, "TCP_CONFIG_SESSION_FAILED");
+        this.emit({ kind: "error", code: this.failureCode });
         socket.destroy();
       }
     });
@@ -253,13 +311,36 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
   }
 
   private onData(chunk: Uint8Array): void {
+    try {
+      this.options.physicalGuard?.accountIncomingBytes(chunk.length);
+    } catch (error) {
+      this.failureCode = stableGuardCode(
+        error,
+        "PHYSICAL_GUARD_BYTE_BUDGET_EXCEEDED",
+      );
+      this.emit({ kind: "error", code: this.failureCode });
+      this.socket?.destroy();
+      return;
+    }
     this.counters.bytesReceived += chunk.length;
     const frames = this.decoder.push(chunk);
+    try {
+      this.options.physicalGuard?.accountIncomingFrames(frames.length);
+    } catch (error) {
+      this.failureCode = stableGuardCode(
+        error,
+        "PHYSICAL_GUARD_FRAME_BUDGET_EXCEEDED",
+      );
+      this.emit({ kind: "error", code: this.failureCode });
+      this.socket?.destroy();
+      return;
+    }
     for (const frame of frames) {
       this.counters.framesReceived += 1;
       if (this.state.status === "configuring") {
         try {
           if (this.configSession.observe(frame)) {
+            this.options.physicalGuard?.recordConfigSuccess();
             this.clearConfigTimeout();
             this.attempts = 0;
             const readyState = this.stateMachine.transition("ready");
@@ -267,8 +348,8 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
             this.emitState(readyState);
             this.resolvePending();
           }
-        } catch {
-          this.failureCode = "TCP_CONFIG_DECODE_FAILED";
+        } catch (error) {
+          this.failureCode = stableGuardCode(error, "TCP_CONFIG_DECODE_FAILED");
           this.emit({ kind: "error", code: this.failureCode });
           this.socket?.destroy();
         }
@@ -290,9 +371,36 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
     }
     this.socket = undefined;
     this.configSession.reset();
+    this.decoder.resetBufferedState();
     this.sessionConnectedAt = undefined;
     this.clearConnectTimeout();
     this.clearConfigTimeout();
+    this.clearPhysicalSessionTimeout();
+    try {
+      this.options.physicalGuard?.releaseSession(
+        physicalFailureReason(this.failureCode),
+      );
+    } catch (error) {
+      this.failureCode = stableGuardCode(
+        error,
+        "PHYSICAL_GUARD_RELEASE_FAILED",
+      );
+      this.emit({ kind: "error", code: this.failureCode });
+      this.emitState(this.stateMachine.transition("disconnected"));
+      this.rejectPending(new TcpTransportError(this.failureCode));
+      return;
+    }
+    if (
+      this.options.physicalGuard?.physicalProfile &&
+      !this.options.physicalGuard.automaticReconnectAllowed
+    ) {
+      if (!this.failureCode.startsWith("PHYSICAL_GUARD_")) {
+        this.failureCode = "PHYSICAL_GUARD_FUSE_OPEN";
+      }
+      this.emitState(this.stateMachine.transition("disconnected"));
+      this.rejectPending(new TcpTransportError(this.failureCode));
+      return;
+    }
     if (this.manualDisconnect) {
       return;
     }
@@ -378,6 +486,13 @@ export class TcpMeshtasticTransport implements MeshtasticTransport {
       this.connectTimer = undefined;
     }
   }
+
+  private clearPhysicalSessionTimeout(): void {
+    if (this.physicalSessionTimer) {
+      clearTimeout(this.physicalSessionTimer);
+      this.physicalSessionTimer = undefined;
+    }
+  }
 }
 
 export class TcpTransportError extends Error {
@@ -387,4 +502,27 @@ export class TcpTransportError extends Error {
     super(code);
     this.code = code;
   }
+}
+
+function stableGuardCode(error: unknown, fallback: string): string {
+  return error instanceof PhysicalWriteGuardError ? error.code : fallback;
+}
+
+function physicalFailureReason(code: string): string {
+  if (code.includes("TIMEOUT")) {
+    return "timeout";
+  }
+  if (code.includes("DECODE")) {
+    return "decode";
+  }
+  if (code.includes("WRITE")) {
+    return "write";
+  }
+  if (code.includes("BUDGET")) {
+    return "budget";
+  }
+  if (code.includes("CONNECT") || code.includes("SOCKET")) {
+    return "connect";
+  }
+  return "closed";
 }

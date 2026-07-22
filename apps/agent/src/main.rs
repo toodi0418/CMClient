@@ -734,6 +734,48 @@ fn apply_aprs_environment(environment: &mut BTreeMap<String, String>, aprs: Opti
     }
 }
 
+fn apply_physical_qualification_environment(
+    environment: &mut BTreeMap<String, String>,
+    configured: Option<&str>,
+    stage: Option<&str>,
+) -> Result<(), ControlError> {
+    let Some(configured) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if ["0", "false", "no", "off"]
+        .iter()
+        .any(|value| configured.eq_ignore_ascii_case(value))
+    {
+        return Ok(());
+    }
+    if !["1", "true", "yes", "on"]
+        .iter()
+        .any(|value| configured.eq_ignore_ascii_case(value))
+    {
+        return Err(ControlError::CommandFailed);
+    }
+    let stage = stage
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("windows-source-smoke");
+    if stage.len() > 128
+        || !stage
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(ControlError::CommandFailed);
+    }
+    environment.insert(
+        String::from("CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE"),
+        String::from("true"),
+    );
+    environment.insert(
+        String::from("CMCLIENT_QUALIFICATION_STAGE"),
+        stage.to_owned(),
+    );
+    Ok(())
+}
+
 impl AgentController {
     fn from_config(config: &AgentConfig) -> Result<Self, ControlError> {
         let secrets =
@@ -825,6 +867,13 @@ impl AgentController {
                         config.paths.data_dir.to_string_lossy().into_owned(),
                     ),
                 ]);
+                let physical_profile = std::env::var("CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE").ok();
+                let qualification_stage = std::env::var("CMCLIENT_QUALIFICATION_STAGE").ok();
+                apply_physical_qualification_environment(
+                    &mut environment,
+                    physical_profile.as_deref(),
+                    qualification_stage.as_deref(),
+                )?;
                 if let Some(callmesh) = &config.callmesh {
                     environment.insert(String::from("CMCLIENT_CALLMESH_URL"), callmesh.url.clone());
                     if let Some(api_key) = secrets
@@ -2111,7 +2160,8 @@ fn bundled_root() -> Option<PathBuf> {
 mod tests {
     use super::{
         AgentConfig, AgentController, AgentSecretStore, ControlHandler, InternalComponent,
-        ManagementWebRequest, SecretKind, apply_aprs_environment, compiled_component_identity,
+        ManagementWebRequest, SecretKind, apply_aprs_environment,
+        apply_physical_qualification_environment, compiled_component_identity,
         dispatch_remote_control,
     };
     #[cfg(not(target_os = "windows"))]
@@ -2230,6 +2280,42 @@ mod tests {
                 "Agent must not inject {forbidden}",
             );
         }
+    }
+
+    #[test]
+    fn physical_qualification_environment_is_explicit_and_bounded() {
+        let mut environment = BTreeMap::new();
+        apply_physical_qualification_environment(
+            &mut environment,
+            Some("true"),
+            Some("windows-source-smoke"),
+        )
+        .expect("physical qualification environment should validate");
+        assert_eq!(
+            environment
+                .get("CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            environment
+                .get("CMCLIENT_QUALIFICATION_STAGE")
+                .map(String::as_str),
+            Some("windows-source-smoke")
+        );
+
+        assert!(
+            apply_physical_qualification_environment(
+                &mut BTreeMap::new(),
+                Some("true"),
+                Some("unsafe stage"),
+            )
+            .is_err()
+        );
+        let mut disabled = BTreeMap::new();
+        apply_physical_qualification_environment(&mut disabled, Some("false"), None)
+            .expect("disabled physical qualification should be accepted");
+        assert!(disabled.is_empty());
     }
 
     #[test]

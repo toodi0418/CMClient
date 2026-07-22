@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { DomainEventBus } from "./events";
 import { GatewayDatabase } from "./persistence/database";
@@ -134,6 +137,43 @@ describe("Gateway production runtime configuration", () => {
       code: "MESHTASTIC_SERIAL_CONFIGURATION_INVALID",
     });
     database.close();
+  });
+
+  it("requires the physical profile to be supervised and campaign-scoped", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const directory = await mkdtemp(
+      join(tmpdir(), "cmclient-runtime-physical-"),
+    );
+    const base = {
+      CMCLIENT_MESHTASTIC_TRANSPORT: "tcp",
+      CMCLIENT_MESHTASTIC_TCP_HOST: "127.0.0.1",
+      CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE: "true",
+      CMCLIENT_BUILD_COMMIT: "a".repeat(40),
+      CMCLIENT_BUILD_TREE: "b".repeat(40),
+      CMCLIENT_QUALIFICATION_STAGE: "windows-source-smoke",
+      CMCLIENT_DATA_DIR: directory,
+    };
+    try {
+      await expect(
+        createConfiguredMeshGatewayRuntime(
+          base,
+          database,
+          new DomainEventBus(),
+        ),
+      ).rejects.toMatchObject({
+        code: "PHYSICAL_PROFILE_CONFIGURATION_INVALID",
+      });
+      await expect(
+        createConfiguredMeshGatewayRuntime(
+          { ...base, CMCLIENT_SUPERVISED: "1" },
+          database,
+          new DomainEventBus(),
+        ),
+      ).resolves.toBeDefined();
+    } finally {
+      database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("requires CallMesh APRS state and rejects static identity settings", () => {

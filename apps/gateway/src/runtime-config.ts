@@ -1,4 +1,5 @@
 import { hostname } from "node:os";
+import { isAbsolute, join } from "node:path";
 
 import { AprsIsRxClient, type AprsIsRxSession } from "./aprs-monitor.js";
 import { AprsIsTcpClient, AprsOutboxWorker } from "./aprs-outbox.js";
@@ -20,11 +21,14 @@ import { GatewayDatabase } from "./persistence/database.js";
 import { MeshtasticApplicationDecoder } from "./protobuf/application.js";
 import { MeshtasticProtobufCodec } from "./protobuf/protobuf.js";
 import { loadMeshtasticSchema } from "./protobuf/schema.js";
+import { projectSyntheticCapture } from "./protobuf/synthetic-capture.js";
+import { PacketRecorder } from "./recorder.js";
 import {
   NativeSerialPortAdapter,
   SerialMeshtasticTransport,
 } from "./transport/serial.js";
 import { TcpMeshtasticTransport } from "./transport/tcp.js";
+import { PhysicalWriteGuard } from "./transport/physical-guard.js";
 
 export class GatewayRuntimeConfigurationError extends Error {
   constructor(readonly code: string) {
@@ -152,6 +156,7 @@ export async function createConfiguredMeshGatewayRuntime(
   );
   const schema = await loadMeshtasticSchema();
   const codec = new MeshtasticProtobufCodec(schema);
+  const physicalGuard = createPhysicalWriteGuard(environment, kind);
   const transport =
     kind === "tcp"
       ? new TcpMeshtasticTransport({
@@ -166,6 +171,7 @@ export async function createConfiguredMeshGatewayRuntime(
             4403,
             "MESHTASTIC_TCP_CONFIGURATION_INVALID",
           ),
+          ...(physicalGuard ? { physicalGuard } : {}),
         })
       : new SerialMeshtasticTransport({
           adapter: new NativeSerialPortAdapter(),
@@ -189,12 +195,76 @@ export async function createConfiguredMeshGatewayRuntime(
     gatewayId,
     meshNetworkId,
     transport,
+    ...(physicalGuard
+      ? {
+          packetRecorder: new PacketRecorder({
+            maximumAgeMs: 5 * 60 * 1_000,
+            maximumBytes: 1024 * 1024,
+            maximumEntries: 2_048,
+            maximumFrameBytes: 512,
+            maximumSanitizedBytes: 4 * 1024 * 1024,
+            syntheticProjector: (source, sequence) =>
+              projectSyntheticCapture(schema, source, sequence),
+          }),
+        }
+      : {}),
     aprs: {
       ...parseAprsEncodingOptions(environment),
       ...(aprsStateProvider
         ? { stateProvider: createAprsRuntimeStateProvider(aprsStateProvider) }
         : {}),
     },
+  });
+}
+
+function createPhysicalWriteGuard(
+  environment: Record<string, string | undefined>,
+  transport: "tcp" | "serial",
+): PhysicalWriteGuard | undefined {
+  const configured = environment.CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE;
+  if (configured === undefined || configured.trim() === "") {
+    return undefined;
+  }
+  const normalized = configured.trim().toLowerCase();
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return undefined;
+  }
+  if (!["1", "true", "yes", "on"].includes(normalized)) {
+    throw new GatewayRuntimeConfigurationError(
+      "PHYSICAL_PROFILE_CONFIGURATION_INVALID",
+    );
+  }
+  const dataDirectory = environment.CMCLIENT_DATA_DIR?.trim();
+  const sourceCommit = environment.CMCLIENT_BUILD_COMMIT?.trim();
+  const sourceTree = environment.CMCLIENT_BUILD_TREE?.trim();
+  const stage = environment.CMCLIENT_QUALIFICATION_STAGE?.trim();
+  if (
+    transport !== "tcp" ||
+    environment.CMCLIENT_SUPERVISED !== "1" ||
+    !dataDirectory ||
+    !isAbsolute(dataDirectory) ||
+    !sourceCommit ||
+    !sourceTree ||
+    !stage
+  ) {
+    throw new GatewayRuntimeConfigurationError(
+      "PHYSICAL_PROFILE_CONFIGURATION_INVALID",
+    );
+  }
+  return new PhysicalWriteGuard({
+    physicalProfile: true,
+    allowedRoot: dataDirectory,
+    ledgerPath: join(
+      dataDirectory,
+      "qualification",
+      "physical-write-ledger.sqlite",
+    ),
+    candidateId: `${sourceCommit}:${sourceTree}`,
+    qualificationStage: boundedText(
+      stage,
+      128,
+      "PHYSICAL_PROFILE_CONFIGURATION_INVALID",
+    ),
   });
 }
 

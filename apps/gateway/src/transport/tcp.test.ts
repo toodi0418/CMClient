@@ -1,16 +1,31 @@
 import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
 import net, { type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { MeshtasticProtobufCodec } from "../protobuf/protobuf";
+import { loadMeshtasticSchema } from "../protobuf/schema";
 import { ReconnectBackoff } from "./backoff";
 import { ConfigSession } from "./config-session";
 import { MeshtasticFrameDecoder, encodeMeshtasticFrame } from "./framing";
+import { PhysicalWriteGuard } from "./physical-guard";
 import { TcpMeshtasticTransport } from "./tcp";
 
 const codec = {
   encodeWantConfig(nonce: number): Uint8Array {
     return new Uint8Array([1, ...uint32(nonce)]);
+  },
+  isConfigComplete(payload: Uint8Array, nonce: number): boolean {
+    return payload[0] === 2 && equals(payload.slice(1), uint32(nonce));
+  },
+};
+
+const physicalCodec = {
+  encodeWantConfig(nonce: number): Uint8Array {
+    return wantConfig(nonce);
   },
   isConfigComplete(payload: Uint8Array, nonce: number): boolean {
     return payload[0] === 2 && equals(payload.slice(1), uint32(nonce));
@@ -78,6 +93,15 @@ describe("ConfigSession and ReconnectBackoff", () => {
     expect(backoff.delayForAttempt(1, () => 0)).toBe(80);
     expect(backoff.delayForAttempt(1, () => 1)).toBe(120);
     expect(backoff.delayForAttempt(10, () => 1)).toBe(800);
+  });
+
+  it("locks the physical reconnect schedule to 5, 30, then 120 seconds", () => {
+    const backoff = new ReconnectBackoff({
+      fixedDelaysMs: [5_000, 30_000, 120_000],
+    });
+    expect(
+      [1, 2, 3, 4].map((attempt) => backoff.delayForAttempt(attempt)),
+    ).toEqual([5_000, 30_000, 120_000, 120_000]);
   });
 });
 
@@ -153,6 +177,45 @@ describe("TcpMeshtasticTransport", () => {
     await connecting;
     expect(transport.state.status).toBe("ready");
     expect(transport.metrics.reconnects).toBe(1);
+
+    await transport.disconnect();
+    await close(server);
+  });
+
+  it("does not carry a truncated decoder tail into the next TCP session", async () => {
+    let connections = 0;
+    const server = net.createServer((socket) => {
+      connections += 1;
+      const generation = connections;
+      const decoder = new MeshtasticFrameDecoder();
+      socket.on("data", (chunk: Buffer) => {
+        for (const payload of decoder.push(chunk)) {
+          if (payload[0] !== 1) {
+            continue;
+          }
+          const completion = encodeMeshtasticFrame(
+            new Uint8Array([2, ...payload.slice(1)]),
+          );
+          if (generation === 1) {
+            socket.end(completion.slice(0, 3));
+          } else {
+            socket.write(completion);
+          }
+        }
+      });
+    });
+    const port = await listen(server);
+    const transport = new TcpMeshtasticTransport({
+      host: "127.0.0.1",
+      port,
+      configSession: codec,
+      reconnect: { initialDelayMs: 1, maximumDelayMs: 1, jitterRatio: 0 },
+      random: () => 0,
+    });
+
+    await transport.connect();
+    expect(connections).toBe(2);
+    expect(transport.state.status).toBe("ready");
 
     await transport.disconnect();
     await close(server);
@@ -301,6 +364,193 @@ describe("TcpMeshtasticTransport", () => {
         }),
     ).toThrowError(/TCP_CONFIGURATION_INVALID/);
   });
+
+  it("uses the product TCP path for one physical config write and fences every later ToRadio frame", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmclient-physical-tcp-"));
+    const schema = await loadMeshtasticSchema();
+    const observed: Uint8Array[] = [];
+    const server = net.createServer((socket) => {
+      const decoder = new MeshtasticFrameDecoder();
+      socket.on("data", (chunk: Buffer) => {
+        for (const payload of decoder.push(chunk)) {
+          observed.push(payload);
+          const request = schema.toRadio.toObject(
+            schema.toRadio.decode(payload),
+            { oneofs: true },
+          ) as { wantConfigId?: number };
+          if (request.wantConfigId !== undefined) {
+            socket.write(
+              encodeMeshtasticFrame(
+                schema.fromRadio
+                  .encode({ configCompleteId: request.wantConfigId })
+                  .finish(),
+              ),
+            );
+          }
+        }
+      });
+    });
+    try {
+      const port = await listen(server);
+      const transport = new TcpMeshtasticTransport({
+        host: "127.0.0.1",
+        port,
+        configSession: new MeshtasticProtobufCodec(schema),
+        random: () => 0,
+        physicalGuard: physicalGuard(directory, "tcp-session"),
+      });
+
+      await transport.connect();
+      expect(transport.state.status).toBe("ready");
+      expect(observed).toEqual([wantConfig(1)]);
+      await expect(
+        transport.writeFrame(new Uint8Array([99])),
+      ).rejects.toMatchObject({ code: "PHYSICAL_GUARD_WRITER_DISABLED" });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(observed).toHaveLength(1);
+      expect(transport.metrics.framesSent).toBe(1);
+
+      await transport.disconnect();
+    } finally {
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("writes zero bytes when a physical codec returns a non-allowlisted ToRadio variant", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmclient-physical-tcp-"));
+    let receivedBytes = 0;
+    let connections = 0;
+    const server = net.createServer((socket) => {
+      connections += 1;
+      socket.on("data", (chunk: Buffer) => {
+        receivedBytes += chunk.length;
+      });
+    });
+    try {
+      const port = await listen(server);
+      const transport = new TcpMeshtasticTransport({
+        host: "127.0.0.1",
+        port,
+        configSession: {
+          encodeWantConfig: () => new Uint8Array([0x22, 0x00]),
+          isConfigComplete: () => false,
+        },
+        random: () => 0,
+        physicalGuard: physicalGuard(directory, "malicious-codec"),
+      });
+
+      await expect(transport.connect()).rejects.toMatchObject({
+        code: "PHYSICAL_GUARD_CONFIG_PAYLOAD_REJECTED",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(connections).toBe(1);
+      expect(receivedBytes).toBe(0);
+      expect(transport.metrics.framesSent).toBe(0);
+      expect(transport.state.status).toBe("disconnected");
+      await transport.disconnect();
+    } finally {
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not schedule another physical socket after the third config failure opens the fuse", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmclient-physical-tcp-"));
+    let connections = 0;
+    const sockets = new Set<Socket>();
+    const server = net.createServer((socket) => {
+      connections += 1;
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
+    try {
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const guard = physicalGuard(directory, `failed-${attempt}`);
+        guard.acquireSession(attempt);
+        guard.authorizeConfigRequest(attempt, wantConfig(attempt));
+        guard.recordConfigFailure("timeout");
+        guard.releaseSession();
+      }
+      const port = await listen(server);
+      const transport = new TcpMeshtasticTransport({
+        host: "127.0.0.1",
+        port,
+        configSession: physicalCodec,
+        configTimeoutMs: 5,
+        random: () => 0,
+        physicalGuard: physicalGuard(directory, "third-failure"),
+      });
+      const trace: string[] = [];
+      transport.subscribe((event) => {
+        trace.push(
+          event.kind === "state"
+            ? `state:${event.state.status}`
+            : `${event.kind}:${"code" in event ? event.code : "frame"}`,
+        );
+      });
+      const outcome = await Promise.race([
+        transport.connect().catch((error: unknown) => error),
+        new Promise((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                code: "FIXTURE_CONNECT_DID_NOT_SETTLE",
+                state: transport.state.status,
+                trace,
+              }),
+            1_000,
+          ),
+        ),
+      ]);
+      await transport.disconnect();
+      expect(outcome).toMatchObject({
+        code: "PHYSICAL_GUARD_FUSE_OPEN",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(connections).toBe(1);
+      expect(transport.state.status).toBe("disconnected");
+    } finally {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("opens no socket when the aggregate physical attempt fuse rejects a fifth cycle", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cmclient-physical-tcp-"));
+    let socketFactoryCalls = 0;
+    try {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const guard = physicalGuard(directory, `reserve-${attempt}`);
+        guard.acquireSession(attempt + 1);
+        guard.releaseSession("connect");
+      }
+      const transport = new TcpMeshtasticTransport(
+        {
+          host: "127.0.0.1",
+          port: 4403,
+          configSession: codec,
+          random: () => 0,
+          physicalGuard: physicalGuard(directory, "blocked-fifth"),
+        },
+        () => {
+          socketFactoryCalls += 1;
+          return new net.Socket();
+        },
+      );
+
+      await expect(transport.connect()).rejects.toMatchObject({
+        code: "PHYSICAL_GUARD_ATTEMPT_WINDOW_EXCEEDED",
+      });
+      expect(socketFactoryCalls).toBe(0);
+      await transport.disconnect();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 function wireConfigServer(
@@ -370,4 +620,26 @@ function equals(left: Uint8Array, right: Uint8Array): boolean {
     left.length === right.length &&
     left.every((value, index) => value === right[index])
   );
+}
+
+function wantConfig(nonce: number): Uint8Array {
+  const bytes = [0x18];
+  let remaining = nonce;
+  while (remaining >= 0x80) {
+    bytes.push((remaining % 0x80) | 0x80);
+    remaining = Math.floor(remaining / 0x80);
+  }
+  bytes.push(remaining);
+  return Uint8Array.from(bytes);
+}
+
+function physicalGuard(directory: string, token: string): PhysicalWriteGuard {
+  return new PhysicalWriteGuard({
+    physicalProfile: true,
+    allowedRoot: directory,
+    ledgerPath: join(directory, "physical-write-ledger.sqlite"),
+    candidateId: "fixture-candidate",
+    qualificationStage: "fixture-stage",
+    sessionTokenFactory: () => `fixture-${token}-00000000`,
+  });
 }

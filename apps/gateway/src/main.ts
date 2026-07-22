@@ -326,6 +326,14 @@ async function createConfiguredProxyRuntime(
   if (!parseOptionalBoolean(environment.CMCLIENT_PROXY_ENABLED, false)) {
     return undefined;
   }
+  if (
+    parseOptionalBoolean(
+      environment.CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE,
+      false,
+    )
+  ) {
+    throw new ProxyRuntimeError("PHYSICAL_PROFILE_SECOND_UPSTREAM_FORBIDDEN");
+  }
   const upstreamHost = environment.CMCLIENT_PROXY_UPSTREAM_HOST?.trim();
   const upstreamPort = parseRequiredPort(
     environment.CMCLIENT_PROXY_UPSTREAM_PORT,

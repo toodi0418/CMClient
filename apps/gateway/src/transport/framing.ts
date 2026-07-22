@@ -83,6 +83,10 @@ export class MeshtasticFrameDecoder {
       scanSteps: this.scanSteps,
     };
   }
+
+  resetBufferedState(): void {
+    this.buffer = new Uint8Array();
+  }
 }
 
 export function encodeMeshtasticFrame(

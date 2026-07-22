@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { Value } from "@sinclair/typebox/value";
 
 import type {
   MeshObservation,
@@ -9,6 +10,7 @@ import type {
   SanitizedPacketFixtureSet,
   TransportKind,
 } from "@cmclient/contracts";
+import { SanitizedPacketFixtureSetSchema } from "@cmclient/contracts";
 
 const FIXTURE_EPOCH_MS = Date.parse("2030-01-02T00:00:00.000Z");
 const UTC_ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
@@ -29,6 +31,27 @@ export interface RecordedPacket extends PacketRecordInput {
 
 export interface PacketRecorderOptions {
   maximumEntries?: number;
+  maximumBytes?: number;
+  maximumAgeMs?: number;
+  maximumFrameBytes?: number;
+  maximumSanitizedBytes?: number;
+  clock?: () => Date;
+  syntheticProjector?: SyntheticCaptureProjector;
+}
+
+export interface SyntheticCaptureProjection {
+  frame: Uint8Array;
+  normalizedFromRadio: NormalizedFromRadio;
+}
+
+export type SyntheticCaptureProjector = (
+  source: NormalizedFromRadio,
+  sequence: number,
+) => SyntheticCaptureProjection;
+
+export interface SanitizedPacketExport {
+  fixtureSet: SanitizedPacketFixtureSet;
+  digest: string;
 }
 
 export class PacketRecorderError extends Error {
@@ -61,35 +84,116 @@ export class PacketReplayError extends Error {
  */
 export class PacketRecorder {
   private readonly maximumEntries: number;
+  private readonly maximumBytes: number;
+  private readonly maximumAgeMs: number;
+  private readonly maximumFrameBytes: number;
+  private readonly maximumSanitizedBytes: number;
+  private readonly clock: () => Date;
+  private readonly syntheticProjector: SyntheticCaptureProjector | undefined;
   private nextSequence = 1;
-  private readonly records: RecordedPacket[] = [];
+  private retainedBytes = 0;
+  private readonly records: Array<{
+    capturedAtMs: number;
+    retainedBytes: number;
+    record: RecordedPacket;
+  }> = [];
 
   constructor(options: PacketRecorderOptions = {}) {
     this.maximumEntries = options.maximumEntries ?? 1_000;
-    if (!Number.isInteger(this.maximumEntries) || this.maximumEntries < 1) {
+    this.maximumBytes = options.maximumBytes ?? 4 * 1024 * 1024;
+    this.maximumAgeMs = options.maximumAgeMs ?? 5 * 60 * 1_000;
+    this.maximumFrameBytes = options.maximumFrameBytes ?? 65_535;
+    this.maximumSanitizedBytes =
+      options.maximumSanitizedBytes ?? 4 * 1024 * 1024;
+    this.clock = options.clock ?? (() => new Date());
+    this.syntheticProjector = options.syntheticProjector;
+    if (
+      !boundedPositiveInteger(this.maximumEntries, 100_000) ||
+      !boundedPositiveInteger(this.maximumBytes, 64 * 1024 * 1024) ||
+      !boundedPositiveInteger(this.maximumAgeMs, 24 * 60 * 60 * 1_000) ||
+      !boundedPositiveInteger(this.maximumFrameBytes, 65_535) ||
+      !boundedPositiveInteger(this.maximumSanitizedBytes, 64 * 1024 * 1024)
+    ) {
       throw new PacketRecorderError();
     }
   }
 
   record(input: PacketRecordInput): RecordedPacket {
     validateRecordInput(input);
+    if (input.rawFrame.length > this.maximumFrameBytes) {
+      throw new PacketRecorderError();
+    }
+    const capturedAtMs = this.clock().getTime();
+    if (!Number.isSafeInteger(capturedAtMs) || capturedAtMs < 0) {
+      throw new PacketRecorderError();
+    }
+    this.evictExpired(capturedAtMs);
     const record: RecordedPacket = {
       sequence: this.nextSequence++,
       ...cloneRecordInput(input),
     };
-    this.records.push(record);
-    if (this.records.length > this.maximumEntries) {
-      this.records.shift();
+    const retainedBytes = estimateRetainedBytes(record);
+    if (retainedBytes > this.maximumBytes) {
+      throw new PacketRecorderError();
     }
+    while (
+      this.records.length >= this.maximumEntries ||
+      this.retainedBytes + retainedBytes > this.maximumBytes
+    ) {
+      this.evictOldest();
+    }
+    this.records.push({ capturedAtMs, retainedBytes, record });
+    this.retainedBytes += retainedBytes;
     return cloneRecordedPacket(record);
   }
 
   snapshot(): RecordedPacket[] {
-    return this.records.map(cloneRecordedPacket);
+    return this.records.map(({ record }) => cloneRecordedPacket(record));
+  }
+
+  sealAndSanitize(): SanitizedPacketExport {
+    const fixtureSet = new PacketFixtureSanitizer(
+      this.syntheticProjector,
+    ).sanitize(this.snapshot());
+    const serialized = JSON.stringify(fixtureSet);
+    if (
+      Buffer.byteLength(serialized, "utf8") > this.maximumSanitizedBytes ||
+      !Value.Check(SanitizedPacketFixtureSetSchema, fixtureSet)
+    ) {
+      throw new PacketFixtureSanitizerError();
+    }
+    const digest = createHash("sha256")
+      .update(serialized, "utf8")
+      .digest("hex");
+    this.clear();
+    return { fixtureSet, digest };
+  }
+
+  clear(): void {
+    this.records.splice(0);
+    this.retainedBytes = 0;
+  }
+
+  private evictExpired(nowMs: number): void {
+    const oldestAllowed = nowMs - this.maximumAgeMs;
+    while (this.records[0] && this.records[0].capturedAtMs < oldestAllowed) {
+      this.evictOldest();
+    }
+  }
+
+  private evictOldest(): void {
+    const removed = this.records.shift();
+    if (removed) {
+      this.retainedBytes -= removed.retainedBytes;
+    }
   }
 }
 
 export class PacketFixtureSanitizer {
+  constructor(
+    private readonly syntheticProjector?: SyntheticCaptureProjector,
+  ) {}
+
   sanitize(records: readonly RecordedPacket[]): SanitizedPacketFixtureSet {
     const ordered = [...records].sort(
       (left, right) => left.sequence - right.sequence,
@@ -118,7 +222,12 @@ export class PacketFixtureSanitizer {
       dataset: "cmclient-sanitized-packet-recordings",
       sanitized: true,
       fixtures: ordered.map((record) =>
-        sanitizeRecord(record, timestampShiftMs, aliases),
+        sanitizeRecord(
+          record,
+          timestampShiftMs,
+          aliases,
+          this.syntheticProjector,
+        ),
       ),
     };
   }
@@ -155,17 +264,43 @@ function sanitizeRecord(
   record: RecordedPacket,
   timestampShiftMs: number,
   aliases: SanitizationAliases,
+  syntheticProjector?: SyntheticCaptureProjector,
 ): SanitizedPacketFixtureEntry {
+  const sanitizedFromRadio = sanitizeNormalizedFromRadio(
+    record.observation.normalizedFromRadio,
+    timestampShiftMs,
+    aliases,
+    record.sequence,
+  );
+  const projection = syntheticProjector?.(
+    structuredClone(sanitizedFromRadio),
+    record.sequence,
+  );
+  if (
+    projection &&
+    (projection.frame.length === 0 ||
+      projection.frame.length > 65_535 ||
+      projection.normalizedFromRadio.kind !== sanitizedFromRadio.kind)
+  ) {
+    throw new PacketFixtureSanitizerError();
+  }
   return {
     id: `fixture-record-${String(record.sequence).padStart(6, "0")}`,
     sanitized: true,
     recording: {
       rawFrameEncoding: "synthetic-hex",
-      rawFrameHex: syntheticFrameHex(record.sequence),
+      rawFrameHex: projection
+        ? Buffer.from(projection.frame).toString("hex")
+        : syntheticFrameHex(record.sequence),
       gatewayId: aliases.gateway(record.gatewayId),
       meshNetworkId: aliases.network(record.meshNetworkId),
       transport: record.transport,
-      transportMetadata: { ...record.transportMetadata },
+      transportMetadata: {
+        connectionStatus: record.transportMetadata.connectionStatus,
+        ...(record.transportMetadata.reconnectAttempt === undefined
+          ? {}
+          : { reconnectAttempt: 0 }),
+      },
       sessionConnectedAt: shiftTimestamp(
         record.observation.sessionConnectedAt,
         timestampShiftMs,
@@ -180,12 +315,7 @@ function sanitizeRecord(
         timestampShiftMs,
       ),
     },
-    normalizedFromRadio: sanitizeNormalizedFromRadio(
-      record.observation.normalizedFromRadio,
-      timestampShiftMs,
-      aliases,
-      record.sequence,
-    ),
+    normalizedFromRadio: projection?.normalizedFromRadio ?? sanitizedFromRadio,
   };
 }
 
@@ -234,7 +364,7 @@ function sanitizeMeshPacket(
     ...(packet.packetId === undefined
       ? {}
       : { packetId: aliases.packet(packet.packetId) }),
-    ...(packet.channel === undefined ? {} : { channel: packet.channel }),
+    ...(packet.channel === undefined ? {} : { channel: 0 }),
     ...(packet.portNum === undefined ? {} : { portNum: packet.portNum }),
     ...(packet.payloadBase64 === undefined
       ? {}
@@ -255,14 +385,14 @@ function sanitizeMeshPacket(
             timestampShiftMs,
           ),
         }),
-    ...(packet.rxSnr === undefined ? {} : { rxSnr: packet.rxSnr }),
-    ...(packet.rxRssi === undefined ? {} : { rxRssi: packet.rxRssi }),
-    ...(packet.hopLimit === undefined ? {} : { hopLimit: packet.hopLimit }),
-    ...(packet.hopStart === undefined ? {} : { hopStart: packet.hopStart }),
-    ...(packet.viaMqtt === undefined ? {} : { viaMqtt: packet.viaMqtt }),
+    ...(packet.rxSnr === undefined ? {} : { rxSnr: 0 }),
+    ...(packet.rxRssi === undefined ? {} : { rxRssi: -100 }),
+    ...(packet.hopLimit === undefined ? {} : { hopLimit: 0 }),
+    ...(packet.hopStart === undefined ? {} : { hopStart: 0 }),
+    ...(packet.viaMqtt === undefined ? {} : { viaMqtt: false }),
     ...(packet.transportMechanism === undefined
       ? {}
-      : { transportMechanism: packet.transportMechanism }),
+      : { transportMechanism: "synthetic" }),
   };
 }
 
@@ -310,6 +440,20 @@ function validateRecordInput(input: PacketRecordInput): void {
   ) {
     throw new PacketRecorderError();
   }
+}
+
+function boundedPositiveInteger(value: number, maximum: number): boolean {
+  return Number.isSafeInteger(value) && value >= 1 && value <= maximum;
+}
+
+function estimateRetainedBytes(record: RecordedPacket): number {
+  return (
+    record.rawFrame.length +
+    Buffer.byteLength(record.gatewayId, "utf8") +
+    Buffer.byteLength(record.meshNetworkId, "utf8") +
+    Buffer.byteLength(JSON.stringify(record.observation), "utf8") +
+    256
+  );
 }
 
 function cloneRecordInput(input: PacketRecordInput): PacketRecordInput {

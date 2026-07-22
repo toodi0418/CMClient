@@ -5,6 +5,11 @@ export interface ConfigSessionCodec {
 
 export type NonceFactory = () => number;
 
+export interface ConfigSessionRequest {
+  nonce: number;
+  payload: Uint8Array;
+}
+
 export class ConfigSessionError extends Error {
   readonly code = "MESHTASTIC_CONFIG_SESSION_INVALID";
 }
@@ -18,6 +23,10 @@ export class ConfigSession {
   ) {}
 
   begin(): Uint8Array {
+    return this.beginRequest().payload;
+  }
+
+  beginRequest(): ConfigSessionRequest {
     const nonce = this.nonceFactory();
     if (!Number.isInteger(nonce) || nonce < 1 || nonce > 0xffff_ffff) {
       throw new ConfigSessionError();
@@ -27,7 +36,11 @@ export class ConfigSession {
       throw new ConfigSessionError();
     }
     this.nonce = nonce;
-    return request;
+    return { nonce, payload: request };
+  }
+
+  get activeNonce(): number | undefined {
+    return this.nonce;
   }
 
   observe(payload: Uint8Array): boolean {

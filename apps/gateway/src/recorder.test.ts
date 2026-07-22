@@ -1,6 +1,12 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import { createMeshObservation } from "./observations";
+import { MeshtasticApplicationDecoder } from "./protobuf/application";
+import { MeshtasticProtobufCodec } from "./protobuf/protobuf";
+import { loadMeshtasticSchema } from "./protobuf/schema";
+import { projectSyntheticCapture } from "./protobuf/synthetic-capture";
 import {
   PacketFixtureSanitizer,
   PacketRecorder,
@@ -26,6 +32,68 @@ describe("PacketRecorder", () => {
     expect(recorder.snapshot().map((record) => record.sequence)).toEqual([
       2, 3,
     ]);
+  });
+
+  it("rotates by duration and rejects frames outside the physical byte bound", () => {
+    let clock = new Date("2026-07-22T00:00:00.000Z");
+    const recorder = new PacketRecorder({
+      maximumAgeMs: 1_000,
+      maximumBytes: 16_384,
+      maximumFrameBytes: 64,
+      clock: () => clock,
+    });
+    recorder.record(packetRecord("capture-one", clock.toISOString()));
+    clock = new Date(clock.getTime() + 1_001);
+    recorder.record(packetRecord("capture-two", clock.toISOString()));
+    expect(recorder.snapshot().map((record) => record.sequence)).toEqual([2]);
+
+    expect(() =>
+      recorder.record({
+        ...packetRecord("capture-oversize", clock.toISOString()),
+        rawFrame: new Uint8Array(65),
+      }),
+    ).toThrowError(/PACKET_RECORD_INVALID/);
+  });
+
+  it("seals replayable deterministic synthetic output and clears all retained raw records", async () => {
+    const schema = await loadMeshtasticSchema();
+    const options = {
+      syntheticProjector: (
+        source: PacketRecordInput["observation"]["normalizedFromRadio"],
+        sequence: number,
+      ) => projectSyntheticCapture(schema, source, sequence),
+    };
+    const first = new PacketRecorder(options);
+    const second = new PacketRecorder(options);
+    const input = packetRecord("capture-private", "2026-07-18T00:00:00.000Z");
+    first.record(input);
+    second.record(input);
+
+    const firstExport = first.sealAndSanitize();
+    const secondExport = second.sealAndSanitize();
+    expect(firstExport).toEqual(secondExport);
+    expect(firstExport.digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(first.snapshot()).toEqual([]);
+    expect(second.snapshot()).toEqual([]);
+
+    const codec = new MeshtasticProtobufCodec(schema);
+    const applicationDecoder = new MeshtasticApplicationDecoder(schema);
+    const replayDigest = async (): Promise<string> => {
+      const decisions: unknown[] = [];
+      await replayPacketFixtures(firstExport.fixtureSet, (fixture) => {
+        const normalized = codec.normalizeFromRadio(
+          Buffer.from(fixture.recording.rawFrameHex, "hex"),
+        );
+        decisions.push({
+          normalized,
+          decoded: applicationDecoder.decode(normalized.packet ?? {}),
+        });
+      });
+      return createHash("sha256")
+        .update(JSON.stringify(decisions), "utf8")
+        .digest("hex");
+    };
+    expect(await replayDigest()).toBe(await replayDigest());
   });
 });
 

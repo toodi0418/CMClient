@@ -29,6 +29,7 @@ import {
 import { validatePositionForAprs } from "./position-validation.js";
 import { MeshtasticApplicationDecoder } from "./protobuf/application.js";
 import { MeshtasticProtobufCodec } from "./protobuf/protobuf.js";
+import { PacketRecorder } from "./recorder.js";
 import type {
   MeshtasticTransport,
   TransportEvent,
@@ -50,6 +51,7 @@ export interface MeshGatewayRuntimeOptions {
   clock?: () => Date;
   idFactory?: () => string;
   stopTimeoutMs?: number;
+  packetRecorder?: PacketRecorder;
 }
 
 export interface MeshIngestResult {
@@ -230,6 +232,7 @@ export class MeshGatewayRuntime {
         "MESH_TRANSPORT_DISCONNECT_UNCONFIRMED",
       );
     }
+    this.sealPacketRecorder();
   }
 
   private isActiveGeneration(generation: number): boolean {
@@ -258,6 +261,21 @@ export class MeshGatewayRuntime {
       ingestedAt: frame.receivedAt,
       serverIngestedAt,
       normalizedFromRadio,
+    });
+    const connection = this.options.transport.state;
+    this.options.packetRecorder?.record({
+      gatewayId: this.options.gatewayId,
+      meshNetworkId: this.options.meshNetworkId,
+      observation,
+      rawFrame: frame.frame,
+      receivedAt: frame.receivedAt,
+      transport: this.options.transport.kind,
+      transportMetadata: {
+        connectionStatus: connection.status,
+        ...(connection.status === "backoff"
+          ? { reconnectAttempt: connection.attempt }
+          : {}),
+      },
     });
     this.options.database.meshObservations.insert(observation);
     const payload = this.domainStore.persist(
@@ -300,6 +318,27 @@ export class MeshGatewayRuntime {
         code: stableErrorCode(error, "MESH_INGEST_FAILED"),
         transport: this.options.transport.kind,
       });
+    }
+  }
+
+  private sealPacketRecorder(): void {
+    const recorder = this.options.packetRecorder;
+    if (!recorder) {
+      return;
+    }
+    try {
+      const sealed = recorder.sealAndSanitize();
+      this.publish("mesh.capture.sealed", {
+        digest: sealed.digest,
+        fixtures: sealed.fixtureSet.fixtures.length,
+        sanitized: true,
+      });
+    } catch {
+      this.publish("mesh.capture.error", {
+        code: "PACKET_FIXTURE_SANITIZATION_INVALID",
+      });
+    } finally {
+      recorder.clear();
     }
   }
 

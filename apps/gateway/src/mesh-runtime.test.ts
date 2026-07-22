@@ -15,6 +15,8 @@ import { GatewayDatabase } from "./persistence/database";
 import { MeshtasticApplicationDecoder } from "./protobuf/application";
 import { MeshtasticProtobufCodec } from "./protobuf/protobuf";
 import { loadMeshtasticSchema, type MeshtasticSchema } from "./protobuf/schema";
+import { projectSyntheticCapture } from "./protobuf/synthetic-capture";
+import { PacketRecorder, replayPacketFixtures } from "./recorder";
 import type {
   MeshtasticTransport,
   TransportEvent,
@@ -112,6 +114,156 @@ describe("MeshGatewayRuntime", () => {
 
     await runtime.stop();
     database.close();
+  });
+
+  it("captures and seals the bounded sanitizer from the same product ingest path", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const schema = await loadMeshtasticSchema();
+    const transport = new FixtureTransport();
+    const events = new DomainEventBus({
+      eventIdFactory: sequentialFactory("event"),
+    });
+    const recorder = new PacketRecorder({
+      maximumAgeMs: 5 * 60_000,
+      maximumBytes: 1024 * 1024,
+      maximumEntries: 2_048,
+      maximumFrameBytes: 512,
+      clock: () => new Date("2026-07-18T00:00:10.000Z"),
+      syntheticProjector: (source, sequence) =>
+        projectSyntheticCapture(schema, source, sequence),
+    });
+    const captureEvents: Array<Record<string, unknown>> = [];
+    events.subscribe((event) => {
+      if (event.type === "mesh.capture.sealed") {
+        captureEvents.push(event.payload);
+      }
+    });
+    const runtime = new MeshGatewayRuntime({
+      applicationDecoder: new MeshtasticApplicationDecoder(schema),
+      codec: new MeshtasticProtobufCodec(schema),
+      database,
+      eventBus: events,
+      gatewayId: "fixture-gateway",
+      meshNetworkId: "fixture-network",
+      transport,
+      packetRecorder: recorder,
+      clock: () => new Date("2026-07-18T00:00:10.000Z"),
+      idFactory: sequentialFactory("observation"),
+    });
+
+    runtime.start();
+    transport.emit({
+      kind: "frame",
+      frame: positionFrame(schema, 32),
+      receivedAt: "2026-07-18T00:00:05.000Z",
+      sessionConnectedAt: "2026-07-18T00:00:01.000Z",
+    });
+    expect(recorder.snapshot()).toHaveLength(1);
+
+    await runtime.stop();
+    expect(recorder.snapshot()).toEqual([]);
+    expect(captureEvents).toEqual([
+      expect.objectContaining({
+        digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+        fixtures: 1,
+        sanitized: true,
+      }),
+    ]);
+    database.close();
+  });
+
+  it("replays every sanitized optional domain twice through product persistence and SSE with identical decisions", async () => {
+    const schema = await loadMeshtasticSchema();
+    const captureDatabase = new GatewayDatabase(":memory:");
+    const captureTransport = new FixtureTransport();
+    const captureEvents = new DomainEventBus({
+      eventIdFactory: sequentialFactory("capture-event"),
+    });
+    const recorder = new PacketRecorder({
+      maximumAgeMs: 5 * 60_000,
+      maximumBytes: 1024 * 1024,
+      maximumEntries: 2_048,
+      maximumFrameBytes: 512,
+      syntheticProjector: (source, sequence) =>
+        projectSyntheticCapture(schema, source, sequence),
+    });
+    const captureRuntime = createRuntime(
+      captureDatabase,
+      schema,
+      captureTransport,
+      captureEvents,
+      () => undefined,
+      recorder,
+    );
+    captureRuntime.start();
+    const sourceFrames = optionalDomainFrames(schema);
+    sourceFrames.forEach((frame, index) => {
+      captureTransport.emit({
+        kind: "frame",
+        frame,
+        receivedAt: new Date(
+          Date.parse("2026-07-18T00:00:05.000Z") + index * 1_000,
+        ).toISOString(),
+        sessionConnectedAt: "2026-07-18T00:00:01.000Z",
+      });
+    });
+    const sealed = recorder.sealAndSanitize();
+    expect(sealed.fixtureSet.fixtures).toHaveLength(4);
+    await captureRuntime.stop();
+    captureDatabase.close();
+
+    const replayOnce = async (): Promise<string> => {
+      const database = new GatewayDatabase(":memory:");
+      const transport = new FixtureTransport();
+      const eventBus = new DomainEventBus({
+        eventIdFactory: sequentialFactory("replay-event"),
+      });
+      const eventTypes: string[] = [];
+      eventBus.subscribe((event) => eventTypes.push(event.type));
+      const runtime = createRuntime(
+        database,
+        schema,
+        transport,
+        eventBus,
+        () => undefined,
+      );
+      runtime.start();
+      await replayPacketFixtures(sealed.fixtureSet, (fixture) => {
+        transport.emit({
+          kind: "frame",
+          frame: Buffer.from(fixture.recording.rawFrameHex, "hex"),
+          receivedAt: fixture.recording.receivedAt,
+          sessionConnectedAt: fixture.recording.sessionConnectedAt,
+        });
+      });
+      const snapshot = {
+        eventTypes,
+        observations: tableCount(database, "mesh_observations"),
+        nodes: tableCount(database, "nodes"),
+        messages: tableCount(database, "messages"),
+        telemetry: tableCount(database, "telemetry"),
+        positions: tableCount(database, "position_observations"),
+      };
+      await runtime.stop();
+      database.close();
+      return JSON.stringify(snapshot);
+    };
+
+    const first = await replayOnce();
+    const second = await replayOnce();
+    expect(second).toBe(first);
+    expect(JSON.parse(first)).toMatchObject({
+      observations: 4,
+      messages: 1,
+      telemetry: 1,
+      positions: 1,
+      eventTypes: expect.arrayContaining([
+        "node.updated",
+        "message.received",
+        "telemetry.received",
+        "position.observed",
+      ]),
+    });
   });
 
   it("retains an insufficient-precision position without advancing or enqueueing", async () => {
@@ -568,6 +720,7 @@ function createRuntime(
     }),
     provisionFingerprint: PROVISION_FINGERPRINT,
   }),
+  packetRecorder?: PacketRecorder,
 ): MeshGatewayRuntime {
   return new MeshGatewayRuntime({
     applicationDecoder: new MeshtasticApplicationDecoder(schema),
@@ -580,7 +733,85 @@ function createRuntime(
     aprs: { stateProvider },
     clock: () => new Date("2026-07-18T00:00:10.000Z"),
     idFactory: sequentialFactory("observation"),
+    ...(packetRecorder ? { packetRecorder } : {}),
   });
+}
+
+function optionalDomainFrames(schema: MeshtasticSchema): Uint8Array[] {
+  return [
+    applicationFrame(
+      schema,
+      "NODEINFO_APP",
+      schema.user
+        .encode({
+          id: "!private-node",
+          longName: "Private Node",
+          shortName: "PRV",
+        })
+        .finish(),
+      41,
+      101,
+    ),
+    applicationFrame(
+      schema,
+      "TEXT_MESSAGE_APP",
+      Buffer.from("private replay message", "utf8"),
+      42,
+      102,
+    ),
+    applicationFrame(
+      schema,
+      "TELEMETRY_APP",
+      schema.telemetry
+        .encode({
+          time: 1_784_332_804,
+          deviceMetrics: { batteryLevel: 73, voltage: 3.9 },
+        })
+        .finish(),
+      43,
+      103,
+    ),
+    positionFrame(schema, 32, { packetId: 104, sequenceNumber: 8 }),
+  ];
+}
+
+function applicationFrame(
+  schema: MeshtasticSchema,
+  port: "NODEINFO_APP" | "TEXT_MESSAGE_APP" | "TELEMETRY_APP",
+  payload: Uint8Array,
+  sender: number,
+  packetId: number,
+): Uint8Array {
+  return schema.fromRadio
+    .encode({
+      packet: {
+        from: sender,
+        id: packetId,
+        rxTime: Math.floor(Date.parse("2026-07-18T00:00:05.000Z") / 1_000),
+        decoded: { portnum: schema.portNum.values[port], payload },
+      },
+    })
+    .finish();
+}
+
+function tableCount(database: GatewayDatabase, table: string): number {
+  const query = (() => {
+    switch (table) {
+      case "mesh_observations":
+        return "SELECT COUNT(*) AS value FROM mesh_observations";
+      case "nodes":
+        return "SELECT COUNT(*) AS value FROM nodes";
+      case "messages":
+        return "SELECT COUNT(*) AS value FROM messages";
+      case "telemetry":
+        return "SELECT COUNT(*) AS value FROM telemetry";
+      case "position_observations":
+        return "SELECT COUNT(*) AS value FROM position_observations";
+      default:
+        throw new Error("fixture table is not allowlisted");
+    }
+  })();
+  return Number(database.connection.prepare(query).get()?.value);
 }
 
 function positionFrame(
