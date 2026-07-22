@@ -902,6 +902,10 @@ impl AgentController {
                     }
                 }
                 supervisor.set_environment(environment);
+                // Enable private bootstrap for supervised Gateway
+                supervisor
+                    .enable_private_bootstrap()
+                    .map_err(|_| ControlError::CommandFailed)?;
                 if let Some(policy) = log_policy {
                     match StructuredLogSink::open(
                         &config.paths.log_dir,
