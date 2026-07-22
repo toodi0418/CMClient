@@ -2201,8 +2201,10 @@ mod tests {
     use std::{
         collections::BTreeMap,
         io::Cursor,
+        path::Path,
         sync::{Arc, Mutex},
         thread,
+        time::{Duration, Instant},
     };
     #[cfg(not(target_os = "windows"))]
     use std::{
@@ -2213,8 +2215,48 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
-        time::{Duration, Instant},
     };
+
+    fn wait_for_fixture_marker(marker: &Path, expected: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match std::fs::read_to_string(marker) {
+                Ok(contents) if contents == expected || contents == "rejected" => {
+                    return contents;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("marker should read: {error}"),
+            }
+            assert!(Instant::now() < deadline, "gateway fixture did not report");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn gateway_fixture_marker_waits_for_committed_content() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-marker-content-{}",
+            std::process::id(),
+        ));
+        let marker = data_dir.join("gateway-environment");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        std::fs::File::create(&marker).expect("empty marker should be observable");
+
+        let writer_marker = marker.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            std::fs::write(writer_marker, "ok").expect("marker content should write");
+        });
+
+        assert_eq!(
+            wait_for_fixture_marker(&marker, "ok", Duration::from_secs(2)),
+            "ok",
+        );
+        writer.join().expect("marker writer should join");
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
 
     #[test]
     fn derives_exact_workspace_identity_for_the_gateway_child() {
@@ -2528,13 +2570,8 @@ mod tests {
             .expect("supervisor should be configured")
             .start()
             .expect("gateway fixture should start");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !marker.exists() {
-            assert!(Instant::now() < deadline, "gateway fixture did not report");
-            thread::sleep(Duration::from_millis(10));
-        }
         assert_eq!(
-            std::fs::read_to_string(&marker).expect("marker should read"),
+            wait_for_fixture_marker(&marker, "ok", Duration::from_secs(2)),
             "ok",
         );
         controller
@@ -2599,13 +2636,8 @@ mod tests {
             .expect("supervisor should be configured")
             .start()
             .expect("gateway fixture should start");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !marker.exists() {
-            assert!(Instant::now() < deadline, "gateway fixture did not report");
-            thread::sleep(Duration::from_millis(10));
-        }
         assert_eq!(
-            std::fs::read_to_string(&marker).expect("marker should read"),
+            wait_for_fixture_marker(&marker, "ok", Duration::from_secs(2)),
             "ok",
         );
         controller

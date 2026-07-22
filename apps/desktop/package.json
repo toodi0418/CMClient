@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vue-tsc --noEmit --project tsconfig.json && vite build",
+    "build": "pnpm --filter @cmclient/contracts run build && vue-tsc --noEmit --project tsconfig.json && vite build",
     "dev": "vite",
     "tauri": "tauri"
   },

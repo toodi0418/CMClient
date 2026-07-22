@@ -84,6 +84,28 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --workspace --locked
 
+  windows-source-build:
+    name: Windows direct source build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0
+      - run: pnpm install --frozen-lockfile
+      - name: Build canonical Windows source targets
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cmclient-source-target
+        run: pnpm build:source:windows
+
   desktop-smoke:
     name: Desktop smoke (${{ matrix.name }})
     runs-on: ${{ matrix.os }}

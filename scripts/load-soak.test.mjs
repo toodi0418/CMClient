@@ -11,6 +11,7 @@ import {
   LOAD_RUST_PACKAGES,
   LOAD_VITEST_FILES,
   RUNTIME_SOAK_SCRIPT,
+  packageManagerInvocation,
   parseCommandTimeout,
   parseSoakIterations,
   runCommand,
@@ -66,6 +67,32 @@ test("load commands have a bounded timeout", () => {
   for (const invalid of ["", "0", "29999", "3600001", "1.5", "timeout"]) {
     assert.throws(() => parseCommandTimeout(invalid));
   }
+});
+
+test("Windows load commands invoke pnpm without a command shell", () => {
+  assert.deepEqual(
+    packageManagerInvocation({
+      nodeExecutable: "node.exe",
+      packageManagerEntrypoint: "C:\\tools\\pnpm.cjs",
+      platform: "win32",
+    }),
+    {
+      command: "node.exe",
+      arguments: ["C:\\tools\\pnpm.cjs"],
+    },
+  );
+  assert.deepEqual(packageManagerInvocation({ platform: "linux" }), {
+    command: "pnpm",
+    arguments: [],
+  });
+  assert.throws(
+    () =>
+      packageManagerInvocation({
+        packageManagerEntrypoint: "",
+        platform: "win32",
+      }),
+    /must be launched through pnpm/,
+  );
 });
 
 test("async command runner preserves success and exit-status semantics", async () => {

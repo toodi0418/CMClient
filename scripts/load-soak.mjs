@@ -66,23 +66,52 @@ export function parseCommandTimeout(value) {
   return timeout;
 }
 
+export function packageManagerInvocation({
+  nodeExecutable = process.execPath,
+  packageManagerEntrypoint = process.env.npm_execpath,
+  platform = process.platform,
+} = {}) {
+  if (platform !== "win32") {
+    return { command: "pnpm", arguments: [] };
+  }
+  if (!packageManagerEntrypoint) {
+    throw new Error("Windows load gate must be launched through pnpm");
+  }
+  return {
+    command: nodeExecutable,
+    arguments: [packageManagerEntrypoint],
+  };
+}
+
 export async function runLoadSoak({
   iterations = parseSoakIterations(process.env.CMCLIENT_SOAK_ITERATIONS),
   root = resolve(dirname(fileURLToPath(import.meta.url)), ".."),
   timeoutMs = parseCommandTimeout(process.env.CMCLIENT_LOAD_COMMAND_TIMEOUT_MS),
 } = {}) {
-  const packageManager = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+  const packageManager = packageManagerInvocation();
   const cargo = process.platform === "win32" ? "cargo.exe" : "cargo";
   const startedAt = Date.now();
 
   await runCommand(
-    packageManager,
-    ["--filter", "@cmclient/contracts", "run", "build"],
+    packageManager.command,
+    [
+      ...packageManager.arguments,
+      "--filter",
+      "@cmclient/contracts",
+      "run",
+      "build",
+    ],
     { cwd: root, timeoutMs },
   );
   await runCommand(
-    packageManager,
-    ["--filter", "@cmclient/gateway", "run", "build"],
+    packageManager.command,
+    [
+      ...packageManager.arguments,
+      "--filter",
+      "@cmclient/gateway",
+      "run",
+      "build",
+    ],
     { cwd: root, timeoutMs },
   );
   process.stdout.write(
@@ -100,8 +129,14 @@ export async function runLoadSoak({
       `[load-soak] iteration ${iteration}/${iterations}: Node load surfaces\n`,
     );
     await runCommand(
-      packageManager,
-      ["exec", "vitest", "run", ...LOAD_VITEST_FILES],
+      packageManager.command,
+      [
+        ...packageManager.arguments,
+        "exec",
+        "vitest",
+        "run",
+        ...LOAD_VITEST_FILES,
+      ],
       { cwd: root, timeoutMs },
     );
 
@@ -148,7 +183,6 @@ export async function runCommand(
     cwd,
     detached: process.platform !== "win32",
     env: { ...process.env, ...environment },
-    shell: process.platform === "win32" && /\.(?:bat|cmd)$/i.test(command),
     stdio: "inherit",
     windowsHide: true,
   });
