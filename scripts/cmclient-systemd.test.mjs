@@ -262,6 +262,10 @@ test("CI exercises systemd 249 credentials and the dedicated Control socket", as
     "scripts/cmclient-systemd-integration.sh",
     "utf8",
   );
+  const plaintextRuntime = await readFile(
+    "apps/agent/tests/plaintext_runtime.rs",
+    "utf8",
+  );
   const workflow = await readFile(".github/workflows/ci.yml", "utf8");
   const { stdout: integrationIndex } = await execute("git", [
     "ls-files",
@@ -279,6 +283,36 @@ test("CI exercises systemd 249 credentials and the dedicated Control socket", as
   assert.match(integration, /unix:\/\/\$CONTROL_SOCKET/);
   assert.match(integration, /"managementWeb":"disabled"/);
   assert.doesNotMatch(integration, /"management_web":"disabled"/);
+  assert.doesNotMatch(integration, /\bgateway_port\b|CMCLIENT_GATEWAY_PORT/);
+  assert.doesNotMatch(integration, /\/usr\/bin\/sleep/);
+  assert.match(integration, /cmclient-systemd-gateway-fixture\.py/);
+  assert.match(integration, /bootstrap\.get\("type"\) != "gateway\.bootstrap"/);
+  assert.match(integration, /"type": "gateway\.ready"/);
+  assert.match(integration, /listener\.bind\(\("127\.0\.0\.1", 0\)\)/);
+  assert.match(integration, /\/_cmclient\/bootstrap\/ownership/);
+  assert.match(integration, /cmclient-bootstrap-ownership-v1/);
+  assert.match(integration, /cmclient\.gateway\.bootstrap-ownership\.v1/);
+  assert.match(integration, /x-cmclient-gateway-ownership-challenge/);
+  assert.match(integration, /x-cmclient-gateway-ownership-proof/);
+  assert.match(integration, /digestmod=hashlib\.sha256/);
+  assert.match(integration, /"x-cmclient-gateway-capability" not in headers/);
+  assert.match(integration, /ownership_proven\.set\(\)/);
+  assert.match(integration, /\/api\/v1\/system\/version/);
+  assert.match(integration, /CMCLIENT_SHUTDOWN\\n/);
+  assert.match(plaintextRuntime, /import \{ createHmac \} from "node:crypto"/);
+  assert.match(plaintextRuntime, /server\.on\("upgrade"/);
+  assert.match(plaintextRuntime, /\/_cmclient\/bootstrap\/ownership/);
+  assert.match(plaintextRuntime, /cmclient-bootstrap-ownership-v1/);
+  assert.match(plaintextRuntime, /cmclient\.gateway\.bootstrap-ownership\.v1/);
+  assert.match(
+    plaintextRuntime,
+    /createHmac\("sha256", bootstrap\.capability\)/,
+  );
+  assert.match(
+    plaintextRuntime,
+    /request\.headers\["x-cmclient-gateway-capability"\] !== undefined/,
+  );
+  assert.match(plaintextRuntime, /ownershipProven = true/);
   assert.match(integration, /systemctl restart "\$SERVICE_NAME"/);
   assert.match(workflow, /linux-systemd-smoke:/);
   assert.match(workflow, /runs-on: ubuntu-22\.04/);

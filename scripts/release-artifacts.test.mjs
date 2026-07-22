@@ -948,6 +948,8 @@ test("release workflow builds each composition and gates the separate Docker sur
   );
   assert.match(smoke, /surface="\$\{5:-headless\}"/);
   assert.match(smoke, /xvfb-run -a "\$desktop"/);
+  assert.doesNotMatch(smoke, /\bgateway_port\b|CMCLIENT_GATEWAY_PORT/);
+  assert.match(smoke, /printf '\[agent\]\\nmanagement_web_enabled = true\\n'/);
   assert.match(
     workflow,
     /cmclient-desktop-linux-x86_64-\$version\.tar\.zst[\s\S]*release-bundle-smoke\.sh[\s\S]*desktop/,

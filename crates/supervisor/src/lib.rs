@@ -1,13 +1,20 @@
 //! Process supervision primitives owned by the Rust Agent.
 
 use cmclient_runtime_logging::{ChildOutputCapture, RuntimeLogError, StructuredLogSink};
+use hmac::{Hmac, Mac};
+#[cfg(unix)]
+use process_wrap::std::ProcessGroup;
+use process_wrap::std::{ChildWrapper, CommandWrap};
+#[cfg(windows)]
+use process_wrap::std::{CommandWrapper, JobObject};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     fmt,
     io::{ErrorKind, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -25,10 +32,70 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_COMMAND: &[u8] = b"CMCLIENT_SHUTDOWN\n";
 pub const GATEWAY_PRIVATE_FRAME_MAX_BYTES: usize = 4096;
 pub const DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(5);
-const GATEWAY_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
-const GATEWAY_CAPABILITY_HEADER: &str = "x-cmclient-gateway-capability";
-const GATEWAY_HEALTH_PATH: &str = "/api/v1/system/health";
+const GATEWAY_OWNERSHIP_RESPONSE_MAX_BYTES: usize = 4096;
+const GATEWAY_OWNERSHIP_PATH: &str = "/_cmclient/bootstrap/ownership";
+const GATEWAY_OWNERSHIP_CHALLENGE_HEADER: &str = "x-cmclient-gateway-ownership-challenge";
+const GATEWAY_OWNERSHIP_PROOF_HEADER: &str = "x-cmclient-gateway-ownership-proof";
+const GATEWAY_OWNERSHIP_PROTOCOL: &str = "cmclient-bootstrap-ownership-v1";
+const GATEWAY_OWNERSHIP_DOMAIN: &str = "cmclient.gateway.bootstrap-ownership.v1";
 const INHERITED_RUNTIME_ENVIRONMENT_NAMES: [&str; 4] = ["PATH", "SystemRoot", "WINDIR", "ComSpec"];
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct SpawnFailureCleanup;
+
+#[cfg(windows)]
+impl CommandWrapper for SpawnFailureCleanup {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn ChildWrapper>,
+        _core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn ChildWrapper>> {
+        Ok(Box::new(SpawnFailureCleanupChild { child: Some(child) }))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct SpawnFailureCleanupChild {
+    child: Option<Box<dyn ChildWrapper>>,
+}
+
+#[cfg(windows)]
+impl ChildWrapper for SpawnFailureCleanupChild {
+    fn inner(&self) -> &dyn ChildWrapper {
+        self.child
+            .as_deref()
+            .expect("spawn cleanup child must remain available")
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("spawn cleanup child must remain available")
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+        self.child
+            .take()
+            .expect("spawn cleanup child must remain available")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SpawnFailureCleanupChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        child.stdin().take();
+        if child.start_kill().is_ok() {
+            let _ = child.wait();
+        } else {
+            let _ = child.try_wait();
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayCommand {
@@ -76,12 +143,6 @@ struct GatewayReadyFrame {
     startup_nonce: String,
     host: String,
     port: u16,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GatewayHealthResponse {
-    status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,10 +228,11 @@ impl SupervisorError {
 pub struct GatewaySupervisor {
     command: GatewayCommand,
     backoff_policy: BackoffPolicy,
-    child: Option<Child>,
+    child: Option<Box<dyn ChildWrapper>>,
     environment: BTreeMap<String, String>,
     log_sink: Option<StructuredLogSink>,
     output_capture: Option<ChildOutputCapture>,
+    bootstrap_reader: Option<thread::JoinHandle<()>>,
     pending_log_error_code: Option<&'static str>,
     failed_attempts: u32,
     restart_not_before: Option<Instant>,
@@ -213,6 +275,7 @@ impl GatewaySupervisor {
             environment: inherited_runtime_environment(),
             log_sink: None,
             output_capture: None,
+            bootstrap_reader: None,
             pending_log_error_code: None,
             failed_attempts: 0,
             restart_not_before: None,
@@ -303,7 +366,8 @@ impl GatewaySupervisor {
     fn spawn_child(&mut self) -> Result<SupervisorEvent, SupervisorError> {
         let capture_output = self.log_sink.is_some();
         let private_bootstrap = self.private_bootstrap;
-        let child = Command::new(&self.command.program)
+        let mut command = Command::new(&self.command.program);
+        command
             .args(&self.command.arguments)
             .env_clear()
             .envs(&self.environment)
@@ -317,8 +381,17 @@ impl GatewaySupervisor {
                 Stdio::piped()
             } else {
                 Stdio::null()
-            })
-            .spawn();
+            });
+        let mut command = CommandWrap::from(command);
+        #[cfg(windows)]
+        {
+            // JobObject spawns suspended; retain a kill-and-reap owner if wrapping fails.
+            command.wrap(SpawnFailureCleanup);
+            command.wrap(JobObject);
+        }
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        let child = command.spawn();
         let mut child = match child {
             Ok(child) => child,
             Err(_) => {
@@ -327,12 +400,19 @@ impl GatewaySupervisor {
             }
         };
         let ready = if private_bootstrap {
-            match perform_private_bootstrap(&mut child, self.bootstrap_deadline) {
-                Ok(ready) => Some(ready),
+            let (result, reader) = perform_private_bootstrap(&mut child, self.bootstrap_deadline);
+            match result {
+                Ok(ready) => {
+                    if join_bootstrap_reader(reader).is_err() {
+                        let observed_at = Instant::now();
+                        self.reject_spawned_child(child, None, observed_at);
+                        return Err(SupervisorError::BootstrapIoFailed);
+                    }
+                    Some(ready)
+                }
                 Err(error) => {
                     let observed_at = Instant::now();
-                    let _ = terminate_child(&mut child);
-                    self.register_failure(observed_at);
+                    self.reject_spawned_child(child, reader, observed_at);
                     return Err(error);
                 }
             }
@@ -379,8 +459,13 @@ impl GatewaySupervisor {
                 Ok(SupervisorEvent::Heartbeat { pid })
             }
             Some(status) => {
-                self.child = None;
                 self.ready = None;
+                let mut child = self.child.take().ok_or(SupervisorError::ProcessIoFailed)?;
+                if terminate_observed_exited_tree(&mut child).is_err() {
+                    self.child = Some(child);
+                    return Err(SupervisorError::ProcessIoFailed);
+                }
+                self.finish_bootstrap_reader();
                 self.finish_output_capture();
                 if survived_stable_window {
                     self.failed_attempts = 0;
@@ -414,6 +499,7 @@ impl GatewaySupervisor {
             return Err(SupervisorError::ProcessIoFailed);
         }
         self.ready = None;
+        self.finish_bootstrap_reader();
         self.finish_output_capture();
         self.reset_tracking();
         Ok(SupervisorEvent::Stopped)
@@ -421,14 +507,14 @@ impl GatewaySupervisor {
 
     fn capture_child_output(
         &mut self,
-        child: &mut Child,
+        child: &mut Box<dyn ChildWrapper>,
         stdout_reserved: bool,
         ready: Option<&GatewayReady>,
     ) -> Result<(), SupervisorError> {
         let Some(sink) = self.log_sink.clone() else {
             return Ok(());
         };
-        let stderr = child.stderr.take().ok_or_else(|| {
+        let stderr = child.stderr().take().ok_or_else(|| {
             let code = RuntimeLogError::CaptureReadFailed.code();
             self.remember_log_error_code(code);
             SupervisorError::LoggingFailed(code)
@@ -441,7 +527,7 @@ impl GatewaySupervisor {
         let capture = if stdout_reserved {
             sink.capture(std::io::empty(), stderr, secrets)
         } else {
-            let stdout = child.stdout.take().ok_or_else(|| {
+            let stdout = child.stdout().take().ok_or_else(|| {
                 let code = RuntimeLogError::CaptureReadFailed.code();
                 self.remember_log_error_code(code);
                 SupervisorError::LoggingFailed(code)
@@ -471,6 +557,27 @@ impl GatewaySupervisor {
         }
     }
 
+    fn finish_bootstrap_reader(&mut self) {
+        let _ = join_bootstrap_reader(self.bootstrap_reader.take());
+    }
+
+    fn reject_spawned_child(
+        &mut self,
+        mut child: Box<dyn ChildWrapper>,
+        reader: Option<thread::JoinHandle<()>>,
+        observed_at: Instant,
+    ) {
+        self.ready = None;
+        if force_terminate_child(&mut child).is_ok() {
+            let _ = join_bootstrap_reader(reader);
+            self.register_failure(observed_at);
+        } else {
+            self.child = Some(child);
+            self.bootstrap_reader = reader;
+            self.started_at = Some(observed_at);
+        }
+    }
+
     fn remember_log_error_code(&mut self, code: &'static str) {
         if self.pending_log_error_code.is_none() {
             self.pending_log_error_code = Some(code);
@@ -486,61 +593,70 @@ impl GatewaySupervisor {
 }
 
 fn perform_private_bootstrap(
-    child: &mut Child,
+    child: &mut Box<dyn ChildWrapper>,
     deadline: Duration,
-) -> Result<GatewayReady, SupervisorError> {
-    if deadline.is_zero() || deadline > Duration::from_secs(30) {
-        return Err(SupervisorError::BootstrapInvalid);
-    }
-    let bootstrap_deadline = Instant::now()
-        .checked_add(deadline)
-        .ok_or(SupervisorError::BootstrapInvalid)?;
-    let startup_nonce = uuid::Uuid::new_v4().simple().to_string();
-    let capability = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    let bootstrap = GatewayBootstrapFrame {
-        schema_version: 1,
-        frame_type: "gateway.bootstrap",
-        startup_nonce: startup_nonce.clone(),
-        capability: capability.clone(),
-    };
-    let encoded = encode_private_frame(&bootstrap)?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or(SupervisorError::BootstrapIoFailed)?
-        .write_all(&encoded)
-        .and_then(|()| {
-            child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("child stdin unavailable"))?
-                .flush()
-        })
-        .map_err(|_| SupervisorError::BootstrapIoFailed)?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or(SupervisorError::BootstrapIoFailed)?;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name(String::from("cmclient-gateway-bootstrap"))
-        .spawn(move || {
-            let _ = sender.send(read_private_frame(&mut stdout));
-        })
-        .map_err(|_| SupervisorError::BootstrapIoFailed)?;
-    let bytes = receiver
-        .recv_timeout(remaining_until(bootstrap_deadline)?)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => SupervisorError::BootstrapTimeout,
-            mpsc::RecvTimeoutError::Disconnected => SupervisorError::BootstrapIoFailed,
-        })??;
-    let ready = validate_gateway_ready(&bytes, child.id(), startup_nonce, capability)?;
-    probe_gateway_health(&ready, remaining_until(bootstrap_deadline)?)?;
-    Ok(ready)
+) -> (
+    Result<GatewayReady, SupervisorError>,
+    Option<thread::JoinHandle<()>>,
+) {
+    let mut reader = None;
+    let result = (|| {
+        if deadline.is_zero() || deadline > Duration::from_secs(30) {
+            return Err(SupervisorError::BootstrapInvalid);
+        }
+        let bootstrap_deadline = Instant::now()
+            .checked_add(deadline)
+            .ok_or(SupervisorError::BootstrapInvalid)?;
+        let startup_nonce = uuid::Uuid::new_v4().simple().to_string();
+        let capability = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let bootstrap = GatewayBootstrapFrame {
+            schema_version: 1,
+            frame_type: "gateway.bootstrap",
+            startup_nonce: startup_nonce.clone(),
+            capability: capability.clone(),
+        };
+        let encoded = encode_private_frame(&bootstrap)?;
+        child
+            .stdin()
+            .as_mut()
+            .ok_or(SupervisorError::BootstrapIoFailed)?
+            .write_all(&encoded)
+            .and_then(|()| {
+                child
+                    .stdin()
+                    .as_mut()
+                    .ok_or_else(|| std::io::Error::other("child stdin unavailable"))?
+                    .flush()
+            })
+            .map_err(|_| SupervisorError::BootstrapIoFailed)?;
+        let mut stdout = child
+            .stdout()
+            .take()
+            .ok_or(SupervisorError::BootstrapIoFailed)?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        reader = Some(
+            thread::Builder::new()
+                .name(String::from("cmclient-gateway-bootstrap"))
+                .spawn(move || {
+                    let _ = sender.send(read_private_frame(&mut stdout));
+                })
+                .map_err(|_| SupervisorError::BootstrapIoFailed)?,
+        );
+        let bytes = receiver
+            .recv_timeout(remaining_until(bootstrap_deadline)?)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => SupervisorError::BootstrapTimeout,
+                mpsc::RecvTimeoutError::Disconnected => SupervisorError::BootstrapIoFailed,
+            })??;
+        let ready = validate_gateway_ready(&bytes, child.id(), startup_nonce, capability)?;
+        probe_gateway_ownership(&ready, remaining_until(bootstrap_deadline)?)?;
+        Ok(ready)
+    })();
+    (result, reader)
 }
 
 fn validate_gateway_ready(
@@ -568,7 +684,7 @@ fn validate_gateway_ready(
     })
 }
 
-fn probe_gateway_health(ready: &GatewayReady, timeout: Duration) -> Result<(), SupervisorError> {
+fn probe_gateway_ownership(ready: &GatewayReady, timeout: Duration) -> Result<(), SupervisorError> {
     if timeout.is_zero()
         || ready.capability.len() != 64
         || !ready
@@ -581,15 +697,19 @@ fn probe_gateway_health(ready: &GatewayReady, timeout: Duration) -> Result<(), S
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(SupervisorError::BootstrapTimeout)?;
+    let challenge = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
     let mut stream = TcpStream::connect_timeout(&ready.address, remaining_until(deadline)?)
         .map_err(map_probe_io_error)?;
     stream
         .set_write_timeout(Some(remaining_until(deadline)?))
         .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
     let request = format!(
-        "GET {GATEWAY_HEALTH_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{GATEWAY_CAPABILITY_HEADER}: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        "GET {GATEWAY_OWNERSHIP_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: Upgrade\r\nUpgrade: {GATEWAY_OWNERSHIP_PROTOCOL}\r\n{GATEWAY_OWNERSHIP_CHALLENGE_HEADER}: {challenge}\r\nContent-Length: 0\r\n\r\n",
         ready.address.port(),
-        ready.capability
     );
     stream
         .write_all(request.as_bytes())
@@ -599,10 +719,15 @@ fn probe_gateway_health(ready: &GatewayReady, timeout: Duration) -> Result<(), S
     let mut response = Vec::with_capacity(512);
     let mut chunk = [0_u8; 512];
     loop {
-        if validate_gateway_health_response(&response)? {
+        if let Some(proof) = parse_gateway_ownership_response(&response)? {
+            let mut mac = Hmac::<Sha256>::new_from_slice(ready.capability.as_bytes())
+                .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
+            mac.update(gateway_ownership_transcript(ready, &challenge).as_bytes());
+            mac.verify_slice(&proof)
+                .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
             return Ok(());
         }
-        if response.len() == GATEWAY_HEALTH_RESPONSE_MAX_BYTES {
+        if response.len() == GATEWAY_OWNERSHIP_RESPONSE_MAX_BYTES {
             return Err(SupervisorError::BootstrapProbeFailed);
         }
         stream
@@ -612,7 +737,7 @@ fn probe_gateway_health(ready: &GatewayReady, timeout: Duration) -> Result<(), S
         if count == 0 {
             return Err(SupervisorError::BootstrapProbeFailed);
         }
-        if response.len().saturating_add(count) > GATEWAY_HEALTH_RESPONSE_MAX_BYTES {
+        if response.len().saturating_add(count) > GATEWAY_OWNERSHIP_RESPONSE_MAX_BYTES {
             return Err(SupervisorError::BootstrapProbeFailed);
         }
         response.extend_from_slice(&chunk[..count]);
@@ -634,61 +759,76 @@ fn map_probe_io_error(error: std::io::Error) -> SupervisorError {
     }
 }
 
-fn validate_gateway_health_response(response: &[u8]) -> Result<bool, SupervisorError> {
+fn gateway_ownership_transcript(ready: &GatewayReady, challenge: &str) -> String {
+    format!(
+        "{GATEWAY_OWNERSHIP_DOMAIN}\n{}\n{}\n{}\n{}\n{challenge}",
+        ready.startup_nonce,
+        ready.pid,
+        ready.address.ip(),
+        ready.address.port()
+    )
+}
+
+fn parse_gateway_ownership_response(response: &[u8]) -> Result<Option<[u8; 32]>, SupervisorError> {
     let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-        return Ok(false);
+        return Ok(None);
     };
+    if response.len() != header_end + 4 {
+        return Err(SupervisorError::BootstrapProbeFailed);
+    }
     let header = std::str::from_utf8(&response[..header_end])
         .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
     let mut lines = header.split("\r\n");
-    let mut status = lines
-        .next()
-        .ok_or(SupervisorError::BootstrapProbeFailed)?
-        .split_ascii_whitespace();
-    let version = status.next().ok_or(SupervisorError::BootstrapProbeFailed)?;
-    let code = status.next().ok_or(SupervisorError::BootstrapProbeFailed)?;
-    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") || code != "200" {
+    if lines.next() != Some("HTTP/1.1 200 OK") {
         return Err(SupervisorError::BootstrapProbeFailed);
     }
 
     let mut content_length = None;
+    let mut connection = None;
+    let mut proof = None;
     for line in lines {
         let (name, value) = line
             .split_once(':')
             .ok_or(SupervisorError::BootstrapProbeFailed)?;
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err(SupervisorError::BootstrapProbeFailed);
-        }
+        let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() {
+            if content_length.replace(value).is_some() {
                 return Err(SupervisorError::BootstrapProbeFailed);
             }
-            content_length = Some(
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| SupervisorError::BootstrapProbeFailed)?,
-            );
+        } else if name.eq_ignore_ascii_case("connection") {
+            if connection.replace(value).is_some() {
+                return Err(SupervisorError::BootstrapProbeFailed);
+            }
+        } else if name.eq_ignore_ascii_case(GATEWAY_OWNERSHIP_PROOF_HEADER) {
+            if proof.replace(decode_ownership_proof(value)?).is_some() {
+                return Err(SupervisorError::BootstrapProbeFailed);
+            }
+        } else {
+            return Err(SupervisorError::BootstrapProbeFailed);
         }
     }
-    let content_length = content_length.ok_or(SupervisorError::BootstrapProbeFailed)?;
-    let body_start = header_end + 4;
-    let response_length = body_start
-        .checked_add(content_length)
-        .filter(|length| *length <= GATEWAY_HEALTH_RESPONSE_MAX_BYTES)
-        .ok_or(SupervisorError::BootstrapProbeFailed)?;
-    if response.len() < response_length {
-        return Ok(false);
-    }
-    if response.len() != response_length {
+    if content_length != Some("0") || connection != Some("close") {
         return Err(SupervisorError::BootstrapProbeFailed);
     }
-    let health: GatewayHealthResponse = serde_json::from_slice(&response[body_start..])
-        .map_err(|_| SupervisorError::BootstrapProbeFailed)?;
-    if health.status != "ok" {
+    proof.map(Some).ok_or(SupervisorError::BootstrapProbeFailed)
+}
+
+fn decode_ownership_proof(value: &str) -> Result<[u8; 32], SupervisorError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(SupervisorError::BootstrapProbeFailed);
     }
-    Ok(true)
+    let mut proof = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let encoded =
+            std::str::from_utf8(pair).map_err(|_| SupervisorError::BootstrapProbeFailed)?;
+        proof[index] =
+            u8::from_str_radix(encoded, 16).map_err(|_| SupervisorError::BootstrapProbeFailed)?;
+    }
+    Ok(proof)
 }
 
 fn encode_private_frame(value: &impl Serialize) -> Result<Vec<u8>, SupervisorError> {
@@ -704,39 +844,72 @@ fn encode_private_frame(value: &impl Serialize) -> Result<Vec<u8>, SupervisorErr
 }
 
 fn read_private_frame(reader: &mut impl Read) -> Result<Vec<u8>, SupervisorError> {
-    let mut prefix = [0_u8; 4];
-    reader
-        .read_exact(&mut prefix)
-        .map_err(|_| SupervisorError::BootstrapIoFailed)?;
-    let length = usize::try_from(u32::from_be_bytes(prefix))
-        .map_err(|_| SupervisorError::BootstrapInvalid)?;
-    if length == 0 || length > GATEWAY_PRIVATE_FRAME_MAX_BYTES {
-        return Err(SupervisorError::BootstrapInvalid);
+    let maximum_frame_bytes = GATEWAY_PRIVATE_FRAME_MAX_BYTES + 4;
+    let mut frame = Vec::with_capacity(maximum_frame_bytes + 1);
+    let mut chunk = [0_u8; GATEWAY_PRIVATE_FRAME_MAX_BYTES + 5];
+    let mut expected_frame_bytes = None;
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|_| SupervisorError::BootstrapIoFailed)?;
+        if count == 0 {
+            return Err(SupervisorError::BootstrapIoFailed);
+        }
+        if frame.len().saturating_add(count) > maximum_frame_bytes + 1 {
+            return Err(SupervisorError::BootstrapInvalid);
+        }
+        frame.extend_from_slice(&chunk[..count]);
+        if expected_frame_bytes.is_none() && frame.len() >= 4 {
+            let length = usize::try_from(u32::from_be_bytes(
+                frame[..4]
+                    .try_into()
+                    .map_err(|_| SupervisorError::BootstrapInvalid)?,
+            ))
+            .map_err(|_| SupervisorError::BootstrapInvalid)?;
+            if length == 0 || length > GATEWAY_PRIVATE_FRAME_MAX_BYTES {
+                return Err(SupervisorError::BootstrapInvalid);
+            }
+            expected_frame_bytes = Some(
+                length
+                    .checked_add(4)
+                    .ok_or(SupervisorError::BootstrapInvalid)?,
+            );
+        }
+        let Some(expected_frame_bytes) = expected_frame_bytes else {
+            continue;
+        };
+        if frame.len() > expected_frame_bytes {
+            return Err(SupervisorError::BootstrapInvalid);
+        }
+        if frame.len() == expected_frame_bytes {
+            return Ok(frame.split_off(4));
+        }
     }
-    let mut body = vec![0_u8; length];
+}
+
+fn join_bootstrap_reader(reader: Option<thread::JoinHandle<()>>) -> Result<(), SupervisorError> {
     reader
-        .read_exact(&mut body)
-        .map_err(|_| SupervisorError::BootstrapIoFailed)?;
-    Ok(body)
+        .map_or(Ok(()), |reader| reader.join())
+        .map_err(|_| SupervisorError::BootstrapIoFailed)
 }
 
 impl Drop for GatewaySupervisor {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             if terminate_child(&mut child).is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = force_terminate_child(&mut child);
             }
         }
+        self.finish_bootstrap_reader();
         self.finish_output_capture();
     }
 }
 
-fn terminate_child(child: &mut Child) -> std::io::Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
+fn terminate_child(child: &mut Box<dyn ChildWrapper>) -> std::io::Result<()> {
+    if child.try_wait().is_ok_and(|status| status.is_some()) {
+        return terminate_observed_exited_tree(child);
     }
-    let graceful_requested = child.stdin.take().is_some_and(|mut input| {
+    let graceful_requested = child.stdin().take().is_some_and(|mut input| {
         input
             .write_all(SHUTDOWN_COMMAND)
             .and_then(|()| input.flush())
@@ -745,8 +918,10 @@ fn terminate_child(child: &mut Child) -> std::io::Result<()> {
     if graceful_requested {
         let deadline = Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT;
         loop {
-            if child.try_wait()?.is_some() {
-                return Ok(());
+            match child.try_wait() {
+                Ok(Some(_)) => return terminate_observed_exited_tree(child),
+                Ok(None) => {}
+                Err(_) => break,
             }
             if Instant::now() >= deadline {
                 break;
@@ -754,9 +929,25 @@ fn terminate_child(child: &mut Child) -> std::io::Result<()> {
             thread::sleep(SHUTDOWN_POLL_INTERVAL);
         }
     }
-    match child.kill() {
+    force_terminate_child(child)
+}
+
+fn terminate_observed_exited_tree(child: &mut Box<dyn ChildWrapper>) -> std::io::Result<()> {
+    child.stdin().take();
+    match child.start_kill() {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(error.kind(), ErrorKind::InvalidInput | ErrorKind::NotFound) => {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn force_terminate_child(child: &mut Box<dyn ChildWrapper>) -> std::io::Result<()> {
+    child.stdin().take();
+    match child.start_kill() {
         Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::InvalidInput => {}
+        Err(error) if matches!(error.kind(), ErrorKind::InvalidInput | ErrorKind::NotFound) => {}
         Err(error) => return Err(error),
     }
     child.wait()?;
@@ -808,12 +999,40 @@ fn is_sensitive_environment_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::SpawnFailureCleanup;
     use super::{
-        BackoffPolicy, GATEWAY_CAPABILITY_HEADER, GATEWAY_PRIVATE_FRAME_MAX_BYTES,
-        GatewayBootstrapFrame, GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor,
-        SupervisorError, SupervisorEvent, encode_private_frame, inherited_runtime_environment_from,
-        probe_gateway_health, read_private_frame, validate_gateway_ready,
+        BackoffPolicy, GATEWAY_OWNERSHIP_CHALLENGE_HEADER, GATEWAY_OWNERSHIP_PATH,
+        GATEWAY_OWNERSHIP_PROOF_HEADER, GATEWAY_PRIVATE_FRAME_MAX_BYTES, GatewayBootstrapFrame,
+        GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor, SupervisorError,
+        SupervisorEvent, encode_private_frame, inherited_runtime_environment_from,
+        probe_gateway_ownership, read_private_frame, validate_gateway_ready,
     };
+    #[cfg(windows)]
+    use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper, JobObject};
+    #[cfg(windows)]
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
+
+    #[cfg(windows)]
+    #[derive(Debug)]
+    struct InjectedWrapFailure {
+        observed_pid: Arc<AtomicU32>,
+    }
+
+    #[cfg(windows)]
+    impl CommandWrapper for InjectedWrapFailure {
+        fn wrap_child(
+            &mut self,
+            child: Box<dyn ChildWrapper>,
+            _core: &CommandWrap,
+        ) -> std::io::Result<Box<dyn ChildWrapper>> {
+            self.observed_pid.store(child.id(), Ordering::Release);
+            Err(std::io::Error::other("injected child wrap failure"))
+        }
+    }
 
     #[test]
     fn private_bootstrap_frames_are_bounded_and_ready_identity_is_exact() {
@@ -832,6 +1051,13 @@ mod tests {
         );
         let body = read_private_frame(&mut encoded.as_slice()).expect("frame should decode");
         assert_eq!(body, encoded[4..]);
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            read_private_frame(&mut trailing.as_slice()),
+            Err(SupervisorError::BootstrapInvalid)
+        );
 
         let ready = serde_json::json!({
             "schemaVersion": 1,
@@ -901,26 +1127,27 @@ mod tests {
     }
 
     #[test]
-    fn capability_health_probe_accepts_the_exact_gateway_contract() {
+    fn ownership_probe_accepts_the_exact_gateway_contract() {
         let capability = "b".repeat(64);
-        let (address, server) = spawn_capability_gate_server(capability.clone());
+        let startup_nonce = "a".repeat(32);
+        let (address, server) =
+            spawn_ownership_proof_server(capability.clone(), 42, startup_nonce.clone());
         let ready = GatewayReady {
             pid: 42,
             address,
-            startup_nonce: "a".repeat(32),
+            startup_nonce,
             capability,
         };
 
-        probe_gateway_health(&ready, Duration::from_secs(2))
-            .expect("capability-gated health should validate");
+        probe_gateway_ownership(&ready, Duration::from_secs(2))
+            .expect("ownership proof should validate");
         server.join().expect("probe server should finish");
     }
 
     #[test]
-    fn capability_health_probe_rejects_an_unrelated_live_loopback_port() {
+    fn ownership_probe_rejects_hostile_takeover_without_disclosing_capability() {
         let capability = "c".repeat(64);
-        let unrelated_capability = "d".repeat(64);
-        let (address, server) = spawn_capability_gate_server(unrelated_capability);
+        let (address, server) = spawn_hostile_takeover_server(capability.clone());
         let ready = GatewayReady {
             pid: 42,
             address,
@@ -929,21 +1156,17 @@ mod tests {
         };
 
         assert_eq!(
-            probe_gateway_health(&ready, Duration::from_secs(2)),
+            probe_gateway_ownership(&ready, Duration::from_secs(2)),
             Err(SupervisorError::BootstrapProbeFailed)
         );
-        server.join().expect("unrelated probe server should finish");
+        server.join().expect("hostile listener should finish");
     }
 
     #[test]
-    fn health_probe_failure_diagnostics_do_not_reflect_capability_or_response() {
+    fn ownership_probe_failure_diagnostics_do_not_reflect_capability_or_response() {
         let capability = "c".repeat(64);
         let reflected = format!(r#"{{"code":"denied","detail":"{capability}"}}"#);
-        let (address, server) = spawn_probe_server(
-            capability.clone(),
-            String::from("403 Forbidden"),
-            reflected.clone(),
-        );
+        let (address, server) = spawn_rejected_probe_server(capability.clone(), reflected.clone());
         let ready = GatewayReady {
             pid: 42,
             address,
@@ -951,7 +1174,7 @@ mod tests {
             capability: capability.clone(),
         };
 
-        let error = probe_gateway_health(&ready, Duration::from_secs(2))
+        let error = probe_gateway_ownership(&ready, Duration::from_secs(2))
             .expect_err("rejected health should fail bootstrap");
         server.join().expect("probe server should finish");
         let diagnostic = format!("{error:?}:{}", error.code());
@@ -960,6 +1183,8 @@ mod tests {
         assert!(!diagnostic.contains(&reflected));
     }
     use cmclient_runtime_logging::{LogPolicy, MIN_LOG_MAX_BYTES, StructuredLogSink};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
     use std::{
         collections::BTreeMap,
         env, fs,
@@ -1293,6 +1518,215 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_parent_exit_terminates_descendant_tree_before_joining_capture() {
+        let log_dir = unique_marker("descendant-stdout-log");
+        let marker = unique_marker("descendant-survived");
+        let mut supervisor =
+            fixture_logging_supervisor(&log_dir, "spawn-descendant-exit", "tree-test-secret");
+        supervisor.set_environment(BTreeMap::from([
+            (String::from(FIXTURE_DELAY_MS), String::from("600")),
+            (
+                String::from(FIXTURE_MARKER),
+                marker.to_string_lossy().into_owned(),
+            ),
+        ]));
+        supervisor.start().expect("parent fixture should start");
+
+        let observed_at = Instant::now();
+        let event = wait_for_event(&mut supervisor, Duration::from_secs(2), |event| {
+            matches!(event, SupervisorEvent::Exited { .. })
+        });
+        assert!(matches!(
+            event,
+            SupervisorEvent::Exited {
+                status: Some(7),
+                ..
+            }
+        ));
+        assert!(
+            observed_at.elapsed() < Duration::from_millis(500),
+            "descendant-held stdout delayed output capture shutdown"
+        );
+        thread::sleep(Duration::from_millis(700));
+        assert!(
+            !marker.exists(),
+            "descendant escaped supervised process tree"
+        );
+        fs::remove_dir_all(log_dir).expect("fixture log directory should remove");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn child_wrap_failure_kills_and_reaps_the_suspended_windows_process() {
+        let powershell = PathBuf::from(
+            env::var("SystemRoot").expect("Windows system root should be configured"),
+        )
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut raw_command = process::Command::new(&powershell);
+        raw_command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdin(process::Stdio::null())
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null());
+
+        let observed_pid = Arc::new(AtomicU32::new(0));
+        let mut command = CommandWrap::from(raw_command);
+        command.wrap(SpawnFailureCleanup);
+        command.wrap(InjectedWrapFailure {
+            observed_pid: Arc::clone(&observed_pid),
+        });
+        command.wrap(JobObject);
+
+        assert!(
+            command.spawn().is_err(),
+            "injected wrap failure must surface"
+        );
+        let pid = observed_pid.load(Ordering::Acquire);
+        assert_ne!(pid, 0, "injected wrapper must observe the spawned child");
+        let leaked = windows_process_exists(&powershell, pid);
+        if leaked {
+            let _ = process::Command::new(&powershell)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"),
+                ])
+                .status();
+        }
+        assert!(!leaked, "child wrap failure left a suspended process alive");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn private_bootstrap_secrets_reach_child_only_through_the_memory_pipe() {
+        let marker = unique_marker("bootstrap-success");
+        let leak_marker = PathBuf::from(format!("{}.secret-leak", marker.to_string_lossy()));
+        let mut supervisor = powershell_bootstrap_supervisor("bootstrap-success", &marker);
+        supervisor
+            .enable_private_bootstrap()
+            .expect("private bootstrap should enable");
+
+        let event = supervisor.start();
+        assert!(
+            !leak_marker.exists(),
+            "child observed a bootstrap secret outside stdin"
+        );
+        assert!(matches!(event, Ok(SupervisorEvent::Started { .. })));
+        let ready = supervisor
+            .gateway_ready()
+            .expect("verified private route should publish");
+        assert_eq!(ready.address.ip(), Ipv4Addr::LOCALHOST);
+        assert_ne!(ready.address.port(), 0);
+        supervisor.stop().expect("verified child should stop");
+        assert!(
+            !leak_marker.exists(),
+            "bootstrap leak marker must remain absent"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn private_bootstrap_faults_terminate_and_reap_real_children() {
+        let cases = [
+            ("bootstrap-wrong-pid", SupervisorError::BootstrapInvalid),
+            ("bootstrap-wrong-nonce", SupervisorError::BootstrapInvalid),
+            (
+                "bootstrap-wrong-capability",
+                SupervisorError::BootstrapProbeFailed,
+            ),
+            ("bootstrap-timeout", SupervisorError::BootstrapTimeout),
+            ("bootstrap-early-exit", SupervisorError::BootstrapIoFailed),
+            ("bootstrap-oversize", SupervisorError::BootstrapInvalid),
+        ];
+        let mut markers = Vec::new();
+
+        for (mode, expected) in cases {
+            let marker = unique_marker(mode);
+            let mut supervisor = powershell_bootstrap_supervisor(mode, &marker);
+            supervisor
+                .enable_private_bootstrap()
+                .expect("private bootstrap should enable");
+            supervisor.bootstrap_deadline = Duration::from_secs(5);
+
+            assert_eq!(
+                supervisor
+                    .start()
+                    .expect_err("bootstrap fault must fail closed"),
+                expected,
+                "unexpected error for {mode}"
+            );
+            assert!(
+                supervisor.child.is_none(),
+                "failed child must be reaped for {mode}"
+            );
+            assert_eq!(supervisor.gateway_ready(), None);
+            assert!(matches!(
+                supervisor.status(),
+                GatewayStatus::Backoff { attempt: 1, .. }
+            ));
+            markers.push((mode, marker));
+        }
+
+        thread::sleep(Duration::from_millis(650));
+        for (mode, marker) in markers {
+            let survived = marker.exists();
+            if survived {
+                fs::remove_file(&marker).expect("orphan marker should remove");
+            }
+            assert!(!survived, "failed bootstrap child survived for {mode}");
+            if mode == "bootstrap-timeout" {
+                let descendant_started =
+                    PathBuf::from(format!("{}.descendant-started", marker.to_string_lossy()));
+                assert!(
+                    descendant_started.exists(),
+                    "stdout-holding descendant must start before bootstrap rejection"
+                );
+                fs::remove_file(descendant_started)
+                    .expect("descendant started marker should remove");
+                let descendant_ready =
+                    PathBuf::from(format!("{}.descendant-ready", marker.to_string_lossy()));
+                if descendant_ready.exists() {
+                    fs::remove_file(descendant_ready)
+                        .expect("descendant ready marker should remove");
+                }
+            }
+            if mode == "bootstrap-wrong-capability" {
+                let server_ready =
+                    PathBuf::from(format!("{}.server-ready", marker.to_string_lossy()));
+                if server_ready.exists() {
+                    fs::remove_file(server_ready).expect("server ready marker should remove");
+                }
+                let server_done =
+                    PathBuf::from(format!("{}.server-done", marker.to_string_lossy()));
+                assert!(
+                    server_done.exists(),
+                    "capability rejection server should finish"
+                );
+                assert_eq!(
+                    fs::read_to_string(&server_done).expect("server summary should read"),
+                    "capability-header-absent"
+                );
+                fs::remove_file(server_done).expect("server done marker should remove");
+                let descendant_marker =
+                    PathBuf::from(format!("{}.descendant-survived", marker.to_string_lossy()));
+                if descendant_marker.exists() {
+                    fs::remove_file(&descendant_marker)
+                        .expect("escaped descendant marker should remove");
+                    panic!("rejected bootstrap descendant escaped the process tree");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn captures_redacts_rotates_and_restarts_real_gateway_output() {
         let log_dir = unique_marker("logging-restart");
         let secret = "exact-gateway-secret-value";
@@ -1453,9 +1887,8 @@ mod tests {
         (files, contents)
     }
 
-    fn spawn_probe_server(
-        expected_capability: String,
-        status: String,
+    fn spawn_rejected_probe_server(
+        capability: String,
         body: String,
     ) -> (SocketAddr, thread::JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1466,37 +1899,75 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("probe request should connect");
             let request = read_probe_request(&mut stream);
-            assert_eq!(
-                capability_headers(&request),
-                vec![expected_capability.as_str()]
-            );
-            assert!(request.starts_with("GET /api/v1/system/health HTTP/1.1\r\n"));
-            write_probe_response(&mut stream, &status, &body);
+            assert!(!request.contains(&capability));
+            assert!(request.starts_with(&format!("GET {GATEWAY_OWNERSHIP_PATH} HTTP/1.1\r\n")));
+            write_probe_response(&mut stream, "403 Forbidden", &body, &[]);
         });
         (address, server)
     }
 
-    fn spawn_capability_gate_server(
-        server_capability: String,
+    fn spawn_ownership_proof_server(
+        capability: String,
+        pid: u32,
+        startup_nonce: String,
     ) -> (SocketAddr, thread::JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("capability gate fixture should bind loopback");
+            .expect("ownership proof fixture should bind loopback");
         let address = listener
             .local_addr()
-            .expect("capability gate fixture address should resolve");
+            .expect("ownership proof fixture address should resolve");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("health probe should connect");
+            let (mut stream, _) = listener.accept().expect("ownership probe should connect");
             let request = read_probe_request(&mut stream);
-            let authorized = capability_headers(&request) == vec![server_capability.as_str()];
-            if authorized {
-                write_probe_response(&mut stream, "200 OK", r#"{"status":"ok"}"#);
-            } else {
-                write_probe_response(
-                    &mut stream,
-                    "403 Forbidden",
-                    r#"{"code":"GATEWAY_CAPABILITY_REJECTED"}"#,
-                );
-            }
+            assert!(!request.contains(&capability));
+            let challenge = exact_probe_header(&request, GATEWAY_OWNERSHIP_CHALLENGE_HEADER)
+                .expect("probe challenge should be singular")
+                .to_owned();
+            let ready = GatewayReady {
+                pid,
+                address,
+                startup_nonce,
+                capability: capability.clone(),
+            };
+            let mut mac = Hmac::<Sha256>::new_from_slice(capability.as_bytes()).unwrap();
+            mac.update(super::gateway_ownership_transcript(&ready, &challenge).as_bytes());
+            let proof = format!("{:x}", mac.finalize().into_bytes());
+            write_probe_response(
+                &mut stream,
+                "200 OK",
+                "",
+                &[(GATEWAY_OWNERSHIP_PROOF_HEADER, &proof)],
+            );
+        });
+        (address, server)
+    }
+
+    fn spawn_hostile_takeover_server(capability: String) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("hostile fixture should bind loopback");
+        let address = listener
+            .local_addr()
+            .expect("hostile fixture address should resolve");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("ownership probe should connect");
+            let request = read_probe_request(&mut stream);
+            assert!(!request.contains(&capability));
+            assert!(exact_probe_header(&request, "x-cmclient-gateway-capability").is_none());
+            let challenge = exact_probe_header(&request, GATEWAY_OWNERSHIP_CHALLENGE_HEADER)
+                .expect("fresh challenge should be present");
+            assert_eq!(challenge.len(), 64);
+            assert!(
+                challenge
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            let forged = "0".repeat(64);
+            write_probe_response(
+                &mut stream,
+                "200 OK",
+                "",
+                &[(GATEWAY_OWNERSHIP_PROOF_HEADER, &forged)],
+            );
         });
         (address, server)
     }
@@ -1516,22 +1987,32 @@ mod tests {
         String::from_utf8(request).expect("probe request should be ASCII")
     }
 
-    fn capability_headers(request: &str) -> Vec<&str> {
-        request
+    fn exact_probe_header<'a>(request: &'a str, expected_name: &str) -> Option<&'a str> {
+        let values = request
             .split("\r\n")
             .filter_map(|line| line.split_once(':'))
-            .filter(|(name, _)| name.eq_ignore_ascii_case(GATEWAY_CAPABILITY_HEADER))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(expected_name))
             .map(|(_, value)| value.trim())
-            .collect()
+            .collect::<Vec<_>>();
+        (values.len() == 1).then(|| values[0])
     }
 
-    fn write_probe_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+    fn write_probe_response(
+        stream: &mut std::net::TcpStream,
+        status: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) {
         write!(
             stream,
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
         )
         .expect("probe response should write");
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").expect("probe header should write");
+        }
+        write!(stream, "\r\n{body}").expect("probe body should write");
         stream.flush().expect("probe response should flush");
     }
 
@@ -1577,6 +2058,338 @@ mod tests {
         ))
     }
 
+    #[cfg(target_os = "windows")]
+    fn powershell_bootstrap_supervisor(mode: &str, marker: &std::path::Path) -> GatewaySupervisor {
+        let powershell = PathBuf::from(
+            env::var("SystemRoot").expect("Windows system root should be configured"),
+        )
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut supervisor = GatewaySupervisor::new_with_stable_window(
+            GatewayCommand {
+                program: powershell.to_string_lossy().into_owned(),
+                arguments: vec![
+                    String::from("-NoLogo"),
+                    String::from("-NoProfile"),
+                    String::from("-NonInteractive"),
+                    String::from("-ExecutionPolicy"),
+                    String::from("Bypass"),
+                    String::from("-Command"),
+                    String::from(POWERSHELL_BOOTSTRAP_FIXTURE),
+                ],
+            },
+            BackoffPolicy::default(),
+            Duration::from_secs(1),
+        )
+        .expect("PowerShell fixture supervisor should initialize");
+        supervisor.set_environment(BTreeMap::from([
+            (String::from(FIXTURE_MODE), String::from(mode)),
+            (String::from(FIXTURE_DELAY_MS), String::from("500")),
+            (
+                String::from(FIXTURE_MARKER),
+                marker.to_string_lossy().into_owned(),
+            ),
+        ]));
+        supervisor
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_process_exists(powershell: &std::path::Path, pid: u32) -> bool {
+        let status = process::Command::new(powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 10 }}; exit 0"
+                ),
+            ])
+            .status()
+            .expect("Windows process query should execute");
+        match status.code() {
+            Some(0) => false,
+            Some(10) => true,
+            code => panic!("Windows process query returned unexpected status {code:?}"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    const POWERSHELL_BOOTSTRAP_FIXTURE: &str = r#"
+$ErrorActionPreference = 'Stop'
+$inputStream = [Console]::OpenStandardInput()
+$outputStream = [Console]::OpenStandardOutput()
+
+$prefix = [byte[]]::new(4)
+$offset = 0
+while ($offset -lt $prefix.Length) {
+    $count = $inputStream.Read($prefix, $offset, $prefix.Length - $offset)
+    if ($count -eq 0) { exit 65 }
+    $offset += $count
+}
+$length = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($prefix, 0))
+if ($length -lt 1 -or $length -gt 4096) { exit 66 }
+$body = [byte[]]::new($length)
+$offset = 0
+while ($offset -lt $body.Length) {
+    $count = $inputStream.Read($body, $offset, $body.Length - $offset)
+    if ($count -eq 0) { exit 67 }
+    $offset += $count
+}
+$bootstrap = [Text.Encoding]::UTF8.GetString($body) | ConvertFrom-Json
+$nonce = [string]$bootstrap.startupNonce
+$capability = [string]$bootstrap.capability
+$mode = [string]$env:CMCLIENT_SUPERVISOR_TEST_MODE
+
+$leaked = [Environment]::GetCommandLineArgs() | Where-Object {
+    ([string]$_).Contains($nonce) -or ([string]$_).Contains($capability)
+}
+if (-not $leaked) {
+    $leaked = [Environment]::GetEnvironmentVariables().Values | Where-Object {
+        ([string]$_).Contains($nonce) -or ([string]$_).Contains($capability)
+    }
+}
+if ($leaked) {
+    [IO.File]::WriteAllText(
+        "$($env:CMCLIENT_SUPERVISOR_TEST_MARKER).secret-leak",
+        'bootstrap secret reached argv or environment'
+    )
+    exit 70
+}
+
+function Write-Ready([uint32]$readyPid, [string]$readyNonce, [uint16]$port) {
+    $ready = [ordered]@{
+        schemaVersion = 1
+        type = 'gateway.ready'
+        pid = $readyPid
+        startupNonce = $readyNonce
+        host = '127.0.0.1'
+        port = $port
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($ready | ConvertTo-Json -Compress))
+    $framePrefix = [BitConverter]::GetBytes(
+        [Net.IPAddress]::HostToNetworkOrder([int]$bytes.Length)
+    )
+    $outputStream.Write($framePrefix, 0, $framePrefix.Length)
+    $outputStream.Write($bytes, 0, $bytes.Length)
+    $outputStream.Flush()
+}
+
+function Wait-And-Mark {
+    Start-Sleep -Milliseconds ([int]$env:CMCLIENT_SUPERVISOR_TEST_DELAY_MS)
+    [IO.File]::WriteAllText(
+        [string]$env:CMCLIENT_SUPERVISOR_TEST_MARKER,
+        'bootstrap child survived'
+    )
+    Start-Sleep -Seconds 30
+}
+
+function Serve-Ownership-Proof(
+    [Net.Sockets.TcpListener]$listener,
+    [uint16]$port
+) {
+    $pending = $listener.BeginAcceptTcpClient($null, $null)
+    if (-not $pending.AsyncWaitHandle.WaitOne(5000)) { exit 71 }
+    $client = $listener.EndAcceptTcpClient($pending)
+    $stream = $client.GetStream()
+    $request = [byte[]]::new(4096)
+    $offset = 0
+    while ($offset -lt $request.Length) {
+        $count = $stream.Read($request, $offset, $request.Length - $offset)
+        if ($count -eq 0) { exit 72 }
+        $offset += $count
+        $text = [Text.Encoding]::ASCII.GetString($request, 0, $offset)
+        if ($text.Contains("`r`n`r`n")) { break }
+    }
+    if (-not $text.Contains("`r`n`r`n")) { exit 73 }
+    if ($text.Contains($capability)) { exit 74 }
+    $match = [Text.RegularExpressions.Regex]::Match(
+        $text,
+        '(?im)^x-cmclient-gateway-ownership-challenge: ([0-9a-f]{64})\r?$'
+    )
+    if (-not $match.Success) { exit 75 }
+    $challenge = $match.Groups[1].Value
+    $transcript =
+        "cmclient.gateway.bootstrap-ownership.v1`n$nonce`n$PID`n127.0.0.1`n$port`n$challenge"
+    $hmac = [Security.Cryptography.HMACSHA256]::new(
+        [Text.Encoding]::UTF8.GetBytes($capability)
+    )
+    $hash = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($transcript))
+    $proof = -join ($hash | ForEach-Object { $_.ToString('x2') })
+    $hmac.Dispose()
+    $response = [Text.Encoding]::ASCII.GetBytes(
+        "HTTP/1.1 200 OK`r`nConnection: close`r`nContent-Length: 0`r`n" +
+        "x-cmclient-gateway-ownership-proof: $proof`r`n`r`n"
+    )
+    $stream.Write($response, 0, $response.Length)
+    $stream.Flush()
+    $client.Dispose()
+    $listener.Stop()
+}
+
+function Start-Rejection-Server {
+    $env:CMCLIENT_SUPERVISOR_TEST_SERVER_READY =
+        "$($env:CMCLIENT_SUPERVISOR_TEST_MARKER).server-ready"
+    $env:CMCLIENT_SUPERVISOR_TEST_SERVER_DONE =
+        "$($env:CMCLIENT_SUPERVISOR_TEST_MARKER).server-done"
+    $env:CMCLIENT_SUPERVISOR_TEST_DESCENDANT_MARKER =
+        "$($env:CMCLIENT_SUPERVISOR_TEST_MARKER).descendant-survived"
+    $serverScript = @'
+$ErrorActionPreference = 'Stop'
+$heldStdout = [Console]::OpenStandardOutput()
+$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+$listener.Start()
+[IO.File]::WriteAllText(
+    [string]$env:CMCLIENT_SUPERVISOR_TEST_SERVER_READY,
+    [string]$listener.LocalEndpoint.Port
+)
+$pending = $listener.BeginAcceptTcpClient($null, $null)
+if (-not $pending.AsyncWaitHandle.WaitOne(5000)) {
+    $listener.Stop()
+    exit 68
+}
+$client = $listener.EndAcceptTcpClient($pending)
+$stream = $client.GetStream()
+$request = [byte[]]::new(4096)
+$count = $stream.Read($request, 0, $request.Length)
+$requestText = [Text.Encoding]::ASCII.GetString($request, 0, $count)
+$summary = if ($requestText -match '(?im)^x-cmclient-gateway-capability:') {
+    'capability-header-present'
+} else {
+    'capability-header-absent'
+}
+[IO.File]::WriteAllText(
+    [string]$env:CMCLIENT_SUPERVISOR_TEST_SERVER_DONE,
+    $summary
+)
+$response = [Text.Encoding]::ASCII.GetBytes(
+    "HTTP/1.1 403 Forbidden`r`nContent-Length: 2`r`nConnection: close`r`n`r`n{}"
+)
+$stream.Write($response, 0, $response.Length)
+$stream.Flush()
+$client.Dispose()
+$listener.Stop()
+[Threading.Thread]::Sleep(600)
+[IO.File]::WriteAllText(
+    [string]$env:CMCLIENT_SUPERVISOR_TEST_DESCENDANT_MARKER,
+    'descendant survived rejection cleanup'
+)
+[Threading.Thread]::Sleep(30000)
+'@
+    $encoded = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($serverScript)
+    )
+    $null = Start-Process `
+        -FilePath (Join-Path $PSHOME 'powershell.exe') `
+        -ArgumentList @(
+            '-NoLogo', '-NoProfile', '-NonInteractive',
+            '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded
+        ) `
+        -WindowStyle Hidden `
+        -PassThru
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not [IO.File]::Exists($env:CMCLIENT_SUPERVISOR_TEST_SERVER_READY)) {
+        if ([DateTime]::UtcNow -ge $deadline) { exit 69 }
+        Start-Sleep -Milliseconds 10
+    }
+    $port = [uint16][IO.File]::ReadAllText(
+        $env:CMCLIENT_SUPERVISOR_TEST_SERVER_READY
+    )
+    [IO.File]::Delete($env:CMCLIENT_SUPERVISOR_TEST_SERVER_READY)
+    return $port
+}
+
+function Start-Stdout-Descendant {
+    $env:CMCLIENT_SUPERVISOR_TEST_DESCENDANT_READY =
+        "$($env:CMCLIENT_SUPERVISOR_TEST_MARKER).descendant-ready"
+    $env:CMCLIENT_SUPERVISOR_TEST_DESCENDANT_MARKER =
+        "$($env:CMCLIENT_SUPERVISOR_TEST_MARKER).stdout-descendant-survived"
+    $descendantScript = @'
+$ErrorActionPreference = 'Stop'
+$heldStdout = [Console]::OpenStandardOutput()
+[IO.File]::WriteAllText(
+    [string]$env:CMCLIENT_SUPERVISOR_TEST_DESCENDANT_READY,
+    'stdout inherited'
+)
+    [Threading.Thread]::Sleep(30000)
+'@
+    $encoded = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($descendantScript)
+    )
+    $null = Start-Process `
+        -FilePath (Join-Path $PSHOME 'powershell.exe') `
+        -ArgumentList @(
+            '-NoLogo', '-NoProfile', '-NonInteractive',
+            '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded
+        ) `
+        -WindowStyle Hidden `
+        -PassThru
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not [IO.File]::Exists($env:CMCLIENT_SUPERVISOR_TEST_DESCENDANT_READY)) {
+        if ([DateTime]::UtcNow -ge $deadline) { exit 76 }
+        Start-Sleep -Milliseconds 10
+    }
+    [IO.File]::WriteAllText(
+        "$($env:CMCLIENT_SUPERVISOR_TEST_MARKER).descendant-started",
+        'stdout-holding descendant started'
+    )
+    [IO.File]::Delete($env:CMCLIENT_SUPERVISOR_TEST_DESCENDANT_READY)
+}
+
+switch ($mode) {
+    'bootstrap-success' {
+        $listener = [Net.Sockets.TcpListener]::new(
+            [Net.IPAddress]::Loopback,
+            0
+        )
+        $listener.Start()
+        $port = [uint16]$listener.LocalEndpoint.Port
+        Write-Ready ([uint32]$PID) $nonce $port
+        Serve-Ownership-Proof $listener $port
+        $shutdown = [byte[]]::new(18)
+        $offset = 0
+        while ($offset -lt $shutdown.Length) {
+            $count = $inputStream.Read(
+                $shutdown,
+                $offset,
+                $shutdown.Length - $offset
+            )
+            if ($count -eq 0) { break }
+            $offset += $count
+        }
+        exit 0
+    }
+    'bootstrap-wrong-pid' {
+        Write-Ready ([uint32]($PID + 1)) $nonce 49152
+        exit 0
+    }
+    'bootstrap-wrong-nonce' {
+        $wrongNonce = 'f' * 32
+        if ($wrongNonce -eq $nonce) { $wrongNonce = 'e' * 32 }
+        Write-Ready ([uint32]$PID) $wrongNonce 49152
+        exit 0
+    }
+    'bootstrap-wrong-capability' {
+        $port = Start-Rejection-Server
+        Write-Ready ([uint32]$PID) $nonce $port
+        exit 0
+    }
+    'bootstrap-timeout' {
+        Start-Stdout-Descendant
+        Start-Sleep -Seconds 30
+    }
+    'bootstrap-early-exit' {
+        exit 23
+    }
+    'bootstrap-oversize' {
+        [byte[]]$oversized = 0, 0, 16, 1
+        $outputStream.Write($oversized, 0, $oversized.Length)
+        $outputStream.Flush()
+        Wait-And-Mark
+    }
+    default { exit 64 }
+}
+"#;
+
     #[test]
     #[ignore = "subprocess fixture"]
     fn supervisor_child_fixture() {
@@ -1613,6 +2426,33 @@ mod tests {
                     .lock()
                     .read_line(&mut command)
                     .expect("shutdown command should read");
+                thread::sleep(Duration::from_secs(30));
+            }
+            "spawn-descendant-exit" => {
+                process::Command::new(
+                    env::current_exe().expect("fixture executable should resolve"),
+                )
+                .args([
+                    "--ignored",
+                    "--nocapture",
+                    "--exact",
+                    "tests::supervisor_child_fixture",
+                ])
+                .env(FIXTURE_MODE, "delayed-descendant-marker")
+                .stdin(process::Stdio::null())
+                .stdout(process::Stdio::inherit())
+                .stderr(process::Stdio::inherit())
+                .spawn()
+                .expect("descendant fixture should spawn");
+                process::exit(7);
+            }
+            "delayed-descendant-marker" => {
+                thread::sleep(Duration::from_millis(delay));
+                fs::write(
+                    env::var(FIXTURE_MARKER).expect("fixture marker should be configured"),
+                    b"descendant escaped",
+                )
+                .expect("descendant marker should be writable");
                 thread::sleep(Duration::from_secs(30));
             }
             "log-exit" => {

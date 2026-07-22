@@ -105,6 +105,10 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cmclient-source-target
         run: pnpm build:source:windows
+      - name: Test the real Agent to Gateway private session
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cmclient-source-target
+        run: cargo test --locked --target x86_64-pc-windows-msvc -p cmclient-agent tests::supervised_real_gateway_uses_private_dynamic_session -- --ignored --exact
 
   desktop-smoke:
     name: Desktop smoke (${{ matrix.name }})
@@ -234,7 +238,7 @@ jobs:
             Copy-Item $hostV1 $hostV2
             Copy-Item (Join-Path $PWD "target\debug\cmclient-agent.exe") $agentV1
             Copy-Item $agentV1 $agentV2
-            [IO.File]::WriteAllText($configFile, "[agent]`ngateway_port = 4811`nmanagement_web_enabled = false`n")
+            [IO.File]::WriteAllText($configFile, "[agent]`nmanagement_web_enabled = false`n")
             [IO.File]::WriteAllText($state, $sentinel)
             & icacls.exe $root /grant '*S-1-5-19:(OI)(CI)RX' /T /C | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "WINDOWS_CI_PACKAGE_ACL_FAILED" }

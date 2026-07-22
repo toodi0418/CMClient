@@ -66,6 +66,7 @@ CACHE_DIR="/var/cache/cmclient-systemd-smoke-$run_label"
 LOG_DIR="/var/log/cmclient-systemd-smoke-$run_label"
 AGENT_BINARY="$INSTALL_ROOT/bin/cmclient-agent"
 CLI_BINARY="$INSTALL_ROOT/bin/cmclient"
+GATEWAY_FIXTURE="$INSTALL_ROOT/bin/cmclient-systemd-gateway-fixture.py"
 CONTROL_SOCKET="$DATA_DIR/control.sock"
 SECRET_STORE_KEY="$CONFIG_DIR/secret-store.key"
 CIPHERTEXT="$DATA_DIR/secrets/callmesh-api-key.secret"
@@ -98,11 +99,247 @@ trap cleanup EXIT
 install -d -m 0755 "$INSTALL_ROOT/bin"
 install -m 0755 "$AGENT_SOURCE" "$AGENT_BINARY"
 install -m 0755 "$CLI_SOURCE" "$CLI_BINARY"
+cat >"$GATEWAY_FIXTURE" <<'PY'
+#!/usr/bin/env python3
+import hashlib
+import hmac
+import json
+import os
+import re
+import socket
+import struct
+import sys
+import threading
+
+MAX_FRAME_BYTES = 4096
+MAX_REQUEST_BYTES = 8192
+OWNERSHIP_PATH = "/_cmclient/bootstrap/ownership"
+OWNERSHIP_PROTOCOL = "cmclient-bootstrap-ownership-v1"
+OWNERSHIP_DOMAIN = "cmclient.gateway.bootstrap-ownership.v1"
+OWNERSHIP_CHALLENGE_HEADER = "x-cmclient-gateway-ownership-challenge"
+OWNERSHIP_PROOF_HEADER = "x-cmclient-gateway-ownership-proof"
+
+
+def read_exact(stream, length):
+    result = bytearray()
+    while len(result) < length:
+        chunk = stream.read(length - len(result))
+        if not chunk:
+            raise RuntimeError("early eof")
+        result.extend(chunk)
+    return bytes(result)
+
+
+def required_environment(name, pattern):
+    value = os.environ.get(name, "")
+    if re.fullmatch(pattern, value) is None:
+        raise RuntimeError("invalid build identity")
+    return value
+
+
+def identity_report():
+    return {
+        "schemaVersion": 1,
+        "component": "gateway",
+        "identity": {
+            "schemaVersion": 1,
+            "product": "CMClient",
+            "version": required_environment(
+                "CMCLIENT_BUILD_VERSION", r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?"
+            ),
+            "sourceCommit": required_environment("CMCLIENT_BUILD_COMMIT", r"[0-9a-f]{40}"),
+            "sourceTree": required_environment(
+                "CMCLIENT_BUILD_TREE", r"(?:[0-9a-f]{40}|sha256:[0-9a-f]{64})"
+            ),
+            "channel": required_environment(
+                "CMCLIENT_BUILD_CHANNEL", r"(?:dev|candidate|stable)"
+            ),
+            "target": {
+                "os": required_environment("CMCLIENT_TARGET_OS", r"(?:windows|macos|linux)"),
+                "architecture": required_environment(
+                    "CMCLIENT_TARGET_ARCHITECTURE", r"(?:x86_64|aarch64|universal)"
+                ),
+                "profile": required_environment(
+                    "CMCLIENT_RUNTIME_PROFILE", r"(?:native|docker)"
+                ),
+                "packageProfile": required_environment(
+                    "CMCLIENT_PACKAGE_PROFILE", r"(?:workspace|setup|dmg|appimage|oci)"
+                ),
+            },
+        },
+    }
+
+
+def send_json(connection, status, value):
+    body = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    reason = {200: "OK", 403: "Forbidden", 404: "Not Found"}[status]
+    header = (
+        f"HTTP/1.1 {status} {reason}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+    connection.sendall(header + body)
+
+
+def send_ownership_response(connection, capability, nonce, pid, port, challenge):
+    transcript = (
+        f"{OWNERSHIP_DOMAIN}\n{nonce}\n{pid}\n127.0.0.1\n{port}\n{challenge}"
+    ).encode("ascii")
+    proof = hmac.new(
+        capability.encode("ascii"), transcript, digestmod=hashlib.sha256
+    ).hexdigest()
+    response = (
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: close\r\n"
+        "Content-Length: 0\r\n"
+        f"{OWNERSHIP_PROOF_HEADER}: {proof}\r\n\r\n"
+    ).encode("ascii")
+    connection.sendall(response)
+
+
+def reject_ownership_request(connection):
+    connection.sendall(
+        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    )
+
+
+def serve_request(listener, capability, nonce, identity, ownership_proven):
+    connection, _ = listener.accept()
+    with connection:
+        connection.settimeout(2)
+        request = bytearray()
+        while b"\r\n\r\n" not in request:
+            chunk = connection.recv(1024)
+            if not chunk or len(request) + len(chunk) > MAX_REQUEST_BYTES:
+                return
+            request.extend(chunk)
+        header, separator, trailing = bytes(request).partition(b"\r\n\r\n")
+        if not separator or trailing:
+            return
+        lines = header.split(b"\r\n")
+        request_line = lines[0].decode("ascii").split()
+        if len(request_line) != 3:
+            send_json(connection, 404, {"code": "NOT_FOUND"})
+            return
+        headers = {}
+        for raw_line in lines[1:]:
+            if not raw_line:
+                break
+            name, separator, value = raw_line.partition(b":")
+            if not separator:
+                return
+            key = name.decode("ascii").strip().lower()
+            if key in headers:
+                return
+            headers[key] = value.decode("ascii").strip()
+
+        if request_line[1] == OWNERSHIP_PATH:
+            challenge = headers.get(OWNERSHIP_CHALLENGE_HEADER, "")
+            port = listener.getsockname()[1]
+            if not (
+                request_line == ["GET", OWNERSHIP_PATH, "HTTP/1.1"]
+                and headers.get("host") == f"127.0.0.1:{port}"
+                and headers.get("connection", "").lower() == "upgrade"
+                and headers.get("upgrade", "").lower() == OWNERSHIP_PROTOCOL
+                and headers.get("content-length") == "0"
+                and "transfer-encoding" not in headers
+                and "x-cmclient-gateway-capability" not in headers
+                and re.fullmatch(r"[0-9a-f]{64}", challenge) is not None
+            ):
+                reject_ownership_request(connection)
+                return
+            send_ownership_response(
+                connection, capability, nonce, os.getpid(), port, challenge
+            )
+            ownership_proven.set()
+            return
+
+        if request_line[0] != "GET" or request_line[2] != "HTTP/1.1":
+            send_json(connection, 404, {"code": "NOT_FOUND"})
+            return
+        if not ownership_proven.is_set():
+            send_json(connection, 403, {"code": "GATEWAY_OWNERSHIP_REQUIRED"})
+            return
+        provided = headers.get("x-cmclient-gateway-capability", "")
+        if not hmac.compare_digest(provided, capability):
+            send_json(connection, 403, {"code": "GATEWAY_CAPABILITY_REQUIRED"})
+        elif request_line[1] == "/api/v1/system/health":
+            send_json(connection, 200, {"status": "ok"})
+        elif request_line[1] == "/api/v1/system/version":
+            send_json(connection, 200, identity)
+        else:
+            send_json(connection, 404, {"code": "NOT_FOUND"})
+
+
+def main():
+    frame_length = struct.unpack(">I", read_exact(sys.stdin.buffer, 4))[0]
+    if frame_length < 1 or frame_length > MAX_FRAME_BYTES:
+        raise RuntimeError("invalid frame length")
+    bootstrap = json.loads(read_exact(sys.stdin.buffer, frame_length))
+    if set(bootstrap) != {"schemaVersion", "type", "startupNonce", "capability"}:
+        raise RuntimeError("invalid bootstrap fields")
+    if bootstrap.get("schemaVersion") != 1 or bootstrap.get("type") != "gateway.bootstrap":
+        raise RuntimeError("invalid bootstrap type")
+    nonce = bootstrap.get("startupNonce")
+    capability = bootstrap.get("capability")
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+        raise RuntimeError("invalid nonce")
+    if not isinstance(capability, str) or re.fullmatch(r"[0-9a-f]{64}", capability) is None:
+        raise RuntimeError("invalid capability")
+
+    identity = identity_report()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        listener.settimeout(0.2)
+        ready = json.dumps(
+            {
+                "schemaVersion": 1,
+                "type": "gateway.ready",
+                "pid": os.getpid(),
+                "startupNonce": nonce,
+                "host": "127.0.0.1",
+                "port": listener.getsockname()[1],
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        sys.stdout.buffer.write(struct.pack(">I", len(ready)) + ready)
+        sys.stdout.buffer.flush()
+
+        stopped = threading.Event()
+        ownership_proven = threading.Event()
+        shutdown_error = []
+
+        def watch_shutdown():
+            command = sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1)
+            if command not in (b"", b"CMCLIENT_SHUTDOWN\n"):
+                shutdown_error.append(True)
+            stopped.set()
+
+        threading.Thread(target=watch_shutdown, daemon=True).start()
+        while not stopped.is_set():
+            try:
+                serve_request(listener, capability, nonce, identity, ownership_proven)
+            except socket.timeout:
+                pass
+        if shutdown_error:
+            raise RuntimeError("invalid shutdown command")
+
+
+try:
+    main()
+except Exception:
+    sys.stderr.write("GATEWAY_FIXTURE_FAILED\n")
+    raise SystemExit(1)
+PY
+chown root:"$SERVICE_GROUP" "$GATEWAY_FIXTURE"
+chmod 0755 "$GATEWAY_FIXTURE"
 install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"
 printf '%s\n' \
   '[agent]' \
-  'gateway_command = ["/usr/bin/sleep", "3600"]' \
-  'gateway_port = 4810' \
+  "gateway_command = [\"/usr/bin/python3\", \"$GATEWAY_FIXTURE\"]" \
   'management_web_enabled = false' \
   '' \
   '[callmesh]' \

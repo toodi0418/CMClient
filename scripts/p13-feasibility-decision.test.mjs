@@ -6,6 +6,7 @@ import {
   DECISION_RELATIVE_PATH,
   checkRepository,
   findLegacyPrebindClaims,
+  findNativeFixedPortClaims,
   validateDecisionDocument,
 } from "./p13-feasibility-decision.mjs";
 
@@ -34,6 +35,26 @@ test("the regression detector identifies inherited listener handoff", () => {
     "P13_T12_LEGACY_PREBIND_CONTRACT:INHERITED_SOCKET_HANDOFF: synthetic-contract.md:1",
     "P13_T12_LEGACY_PREBIND_CONTRACT:RELEASE_REBIND_FALLBACK: synthetic-contract.md:1",
   ]);
+});
+
+test("native fixed-port authority is rejected while Docker standalone ingress remains allowed", () => {
+  assert.deepEqual(
+    findNativeFixedPortClaims(
+      '[agent]\ngateway_port = 4810\nprocess.env.CMCLIENT_GATEWAY_PORT = "4810";',
+      "scripts/native-smoke.sh",
+    ),
+    [
+      "P13_T12_NATIVE_FIXED_PORT_CONTRACT:NATIVE_GATEWAY_PORT_AUTHORITY: scripts/native-smoke.sh:2",
+      "P13_T12_NATIVE_FIXED_PORT_CONTRACT:NATIVE_GATEWAY_PORT_ENV_INJECTION: scripts/native-smoke.sh:3",
+    ],
+  );
+  assert.deepEqual(
+    findNativeFixedPortClaims(
+      'const port = environment.CMCLIENT_GATEWAY_PORT ?? "8081";',
+      "scripts/container-runtime.mjs",
+    ),
+    [],
+  );
 });
 
 test("authoritative implementation documents contain no legacy prebind contract", async () => {

@@ -30,7 +30,8 @@ import { TcpMeshtasticTransport } from "./transport/tcp.js";
 import { compiledGatewayBuildVersion } from "./system.js";
 import {
   readGatewayBootstrap,
-  writeGatewayReady,
+  registerGatewayOwnershipProofEndpoint,
+  startSupervisedGateway,
   type GatewayBootstrapFrame,
 } from "./bootstrap.js";
 import { ConsoleStructuredLogger } from "./observability.js";
@@ -172,22 +173,15 @@ async function runGateway(): Promise<void> {
     const listenOptions = bootstrap
       ? { host: "127.0.0.1", port: 0 }
       : parseGatewayListenOptions(process.env);
-    await callmeshRefresh.run(() =>
-      synchronizeCallMesh(callmesh, activeEvents),
-    );
-    context.throwIfShutdownRequested();
     const verifiedAprsState = () => callmesh.getAprsState();
 
     proxy = await createConfiguredProxyRuntime(process.env, activeEvents);
-    context.throwIfShutdownRequested();
-    await proxy?.start();
     context.throwIfShutdownRequested();
     maintenance = createConfiguredGatewayMaintenanceRuntime(
       process.env,
       activeDatabase,
       activeEvents,
     );
-    maintenance.start();
     context.throwIfShutdownRequested();
     aprs = createConfiguredAprsGatewayRuntime(
       process.env,
@@ -195,7 +189,6 @@ async function runGateway(): Promise<void> {
       activeEvents,
       verifiedAprsState,
     );
-    aprs?.start();
     context.throwIfShutdownRequested();
     mesh = await createConfiguredMeshGatewayRuntime(
       process.env,
@@ -204,10 +197,8 @@ async function runGateway(): Promise<void> {
       verifiedAprsState,
     );
     context.throwIfShutdownRequested();
-    mesh?.start();
-    context.throwIfShutdownRequested();
 
-    runtime = new GatewayRuntime(
+    const activeRuntime = new GatewayRuntime(
       listenOptions,
       bootstrap ? new ConsoleStructuredLogger(process.stderr) : undefined,
       undefined,
@@ -258,12 +249,45 @@ async function runGateway(): Promise<void> {
       },
       bootstrap ? { capability: bootstrap.capability } : undefined,
     );
+    runtime = activeRuntime;
     context.throwIfShutdownRequested();
-    const readyAddress = await runtime.start();
+
+    const startExternalRuntimes = async (): Promise<void> => {
+      await callmeshRefresh.run(() =>
+        synchronizeCallMesh(callmesh, activeEvents),
+      );
+      context.throwIfShutdownRequested();
+      await proxy?.start();
+      context.throwIfShutdownRequested();
+      maintenance?.start();
+      context.throwIfShutdownRequested();
+      aprs?.start();
+      context.throwIfShutdownRequested();
+      mesh?.start();
+      context.throwIfShutdownRequested();
+    };
+
     if (bootstrap) {
-      writeGatewayReady(process.stdout, bootstrap, readyAddress);
+      await startSupervisedGateway(
+        process.stdout,
+        bootstrap,
+        async () => {
+          const address = await activeRuntime.start();
+          context.throwIfShutdownRequested();
+          registerGatewayOwnershipProofEndpoint(
+            activeRuntime.app.server,
+            bootstrap,
+            address,
+          );
+          return address;
+        },
+        startExternalRuntimes,
+      );
+    } else {
+      await startExternalRuntimes();
+      await activeRuntime.start();
+      context.throwIfShutdownRequested();
     }
-    context.throwIfShutdownRequested();
 
     callmeshTimer = setInterval(() => {
       void callmeshRefresh.run(async () => {

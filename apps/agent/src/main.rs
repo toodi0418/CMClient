@@ -2,9 +2,9 @@ use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::access::{ManagementAccessController, ManagementAccessError};
 use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind, SecretStoreError};
 use cmclient_agent_core::web::{
-    ManagementTlsConfig, ManagementWebApiHandler, ManagementWebConfig, ManagementWebError,
-    ManagementWebListener, ManagementWebRequest, ManagementWebService, ManagementWebStream,
-    gateway_health,
+    GATEWAY_CAPABILITY_HEADER, GatewayRoute, GatewaySessionHandle, ManagementTlsConfig,
+    ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
+    ManagementWebRequest, ManagementWebService, ManagementWebStream, gateway_health_with_route,
 };
 use cmclient_agent_core::{
     AgentConfig, AgentLease, AprsConfig, MeshtasticConnectionConfig, ensure_runtime_directories,
@@ -20,7 +20,7 @@ use cmclient_control_api::{
 };
 use cmclient_runtime_logging::{LogLevel, LogPolicy, StructuredLogSink};
 use cmclient_supervisor::{
-    BackoffPolicy, GatewayCommand, GatewayStatus, GatewaySupervisor, SupervisorEvent,
+    BackoffPolicy, GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor, SupervisorEvent,
 };
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
 use std::{
@@ -50,6 +50,7 @@ const GATEWAY_SSE_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const GATEWAY_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const AGENT_LOG_FILE: &str = "agent.jsonl";
 const GATEWAY_LOG_FILE: &str = "gateway.jsonl";
+const MAX_GATEWAY_IDENTITY_BYTES: u64 = 64 * 1024;
 
 struct AgentUpdateService {
     journal: UpdateJournalStore,
@@ -662,8 +663,10 @@ fn is_safe_sse_token(value: &str) -> bool {
 struct AgentController {
     identity: cmclient_control_api::ComponentIdentityReport,
     supervisor: Mutex<Option<GatewaySupervisor>>,
+    gateway_transition: Mutex<()>,
+    private_gateway_bootstrap: bool,
     runtime_log: Option<StructuredLogSink>,
-    gateway: SocketAddr,
+    gateway_session: GatewaySessionHandle,
     management_web: Mutex<Option<ManagementWebService>>,
     management_web_shutdown: Mutex<Option<JoinHandle<Result<(), ManagementWebError>>>>,
     management_web_config: ManagementWebConfig,
@@ -787,6 +790,22 @@ impl AgentController {
         config: &AgentConfig,
         secrets: AgentSecretStore,
     ) -> Result<Self, ControlError> {
+        Self::from_config_with_secrets_internal(config, secrets, true)
+    }
+
+    #[cfg(all(test, not(target_os = "windows")))]
+    fn from_config_with_secrets_without_private_bootstrap(
+        config: &AgentConfig,
+        secrets: AgentSecretStore,
+    ) -> Result<Self, ControlError> {
+        Self::from_config_with_secrets_internal(config, secrets, false)
+    }
+
+    fn from_config_with_secrets_internal(
+        config: &AgentConfig,
+        secrets: AgentSecretStore,
+        private_bootstrap: bool,
+    ) -> Result<Self, ControlError> {
         let identity = compiled_component_identity(InternalComponent::Agent)
             .map_err(|_| ControlError::CommandFailed)?;
         let mut initial_log_error_code = None;
@@ -853,14 +872,6 @@ impl AgentController {
                     (
                         String::from("CMCLIENT_TARGET_ARCHITECTURE"),
                         String::from(identity.identity.target.architecture.as_str()),
-                    ),
-                    (
-                        String::from("CMCLIENT_GATEWAY_HOST"),
-                        String::from("127.0.0.1"),
-                    ),
-                    (
-                        String::from("CMCLIENT_GATEWAY_PORT"),
-                        config.gateway_port.to_string(),
                     ),
                     (
                         String::from("CMCLIENT_DATA_DIR"),
@@ -951,10 +962,11 @@ impl AgentController {
                     }
                 }
                 supervisor.set_environment(environment);
-                // Enable private bootstrap for supervised Gateway
-                supervisor
-                    .enable_private_bootstrap()
-                    .map_err(|_| ControlError::CommandFailed)?;
+                if private_bootstrap {
+                    supervisor
+                        .enable_private_bootstrap()
+                        .map_err(|_| ControlError::CommandFailed)?;
+                }
                 if let Some(policy) = log_policy {
                     match StructuredLogSink::open(
                         &config.paths.log_dir,
@@ -984,7 +996,8 @@ impl AgentController {
             .transpose()?;
         let management_web_config = ManagementWebConfig {
             enabled: true,
-            gateway: gateway_address(config.gateway_port),
+            // Production requests resolve only through gateway_session.
+            gateway: SocketAddr::from(([127, 0, 0, 1], 1)),
             bind: config
                 .management_lan
                 .as_ref()
@@ -1001,11 +1014,12 @@ impl AgentController {
             static_web_root: Some(resolve_static_web_root()),
             gateway_capability: None,
         };
+        let gateway_session = GatewaySessionHandle::new();
         let updates = Arc::new(AgentUpdateService::new(&config.paths.data_dir)?);
         updates.recover()?;
         let management_web = if config.management_web_enabled {
             Some(
-                ManagementWebService::start_with_api_handler(
+                ManagementWebService::start_with_api_handler_and_gateway_session(
                     &management_web_config,
                     Arc::new(AgentManagementWebApi {
                         updates: Arc::clone(&updates),
@@ -1014,6 +1028,7 @@ impl AgentController {
                         secrets: secrets.clone(),
                         remote_replay: Arc::clone(&remote_replay),
                     }),
+                    gateway_session.clone(),
                 )
                 .map_err(|_| ControlError::CommandFailed)?,
             )
@@ -1023,8 +1038,10 @@ impl AgentController {
         let controller = Self {
             identity,
             supervisor: Mutex::new(supervisor),
+            gateway_transition: Mutex::new(()),
+            private_gateway_bootstrap: private_bootstrap,
             runtime_log,
-            gateway: gateway_address(config.gateway_port),
+            gateway_session,
             management_web: Mutex::new(management_web),
             management_web_shutdown: Mutex::new(None),
             management_web_config,
@@ -1056,8 +1073,13 @@ impl AgentController {
             None => GatewayControlStatus::Stopped,
         };
         drop(supervisor);
+        let gateway_route = self.gateway_session.snapshot();
         let gateway = match lifecycle {
-            GatewayControlStatus::Running if gateway_health(self.gateway) => {
+            GatewayControlStatus::Running
+                if gateway_route
+                    .as_ref()
+                    .is_some_and(gateway_health_with_route) =>
+            {
                 GatewayControlStatus::Running
             }
             GatewayControlStatus::Running => GatewayControlStatus::Degraded,
@@ -1123,7 +1145,7 @@ impl AgentController {
         self.ensure_resource_start_allowed()?;
         if management_web.is_none() {
             *management_web = Some(
-                ManagementWebService::start_with_api_handler(
+                ManagementWebService::start_with_api_handler_and_gateway_session(
                     &self.management_web_config,
                     Arc::new(AgentManagementWebApi {
                         updates: Arc::clone(&self.updates),
@@ -1132,6 +1154,7 @@ impl AgentController {
                         secrets: self.secrets.clone(),
                         remote_replay: Arc::clone(&self.remote_replay),
                     }),
+                    self.gateway_session.clone(),
                 )
                 .map_err(|_| ControlError::CommandFailed)?,
             );
@@ -1284,6 +1307,11 @@ impl AgentController {
     }
 
     fn stop_supervisor(&self) -> Result<bool, ControlError> {
+        let _transition = self
+            .gateway_transition
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?;
+        self.gateway_session.clear();
         let (result, log_error_code) = {
             let mut supervisor = self
                 .supervisor
@@ -1308,8 +1336,12 @@ impl AgentController {
     }
 
     fn start_supervisor(&self) -> Result<bool, ControlError> {
+        let _transition = self
+            .gateway_transition
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?;
         self.ensure_resource_start_allowed()?;
-        let (result, log_error_code) = {
+        let (result, ready, log_error_code) = {
             let mut supervisor = self
                 .supervisor
                 .lock()
@@ -1319,16 +1351,25 @@ impl AgentController {
                 return Ok(false);
             };
             let result = supervisor.start();
+            let ready = supervisor.gateway_ready().cloned();
             let log_error_code = supervisor.take_log_error_code();
-            (result, log_error_code)
+            (result, ready, log_error_code)
         };
         if let Some(code) = log_error_code {
             self.remember_error_code(code);
         }
         let event = result.map_err(|error| {
+            self.gateway_session.clear();
             self.remember_error_code(error.code());
             ControlError::CommandFailed
         })?;
+        if self.private_gateway_bootstrap
+            && (matches!(event, SupervisorEvent::Started { .. })
+                || (matches!(event, SupervisorEvent::Heartbeat { .. })
+                    && self.gateway_session.snapshot().is_none()))
+        {
+            self.publish_verified_gateway(ready)?;
+        }
         if matches!(event, SupervisorEvent::Started { .. }) {
             self.log_agent_code(LogLevel::Info, "GATEWAY_SUPERVISOR_STARTED");
         }
@@ -1336,10 +1377,14 @@ impl AgentController {
     }
 
     fn tick_supervisor(&self) -> Result<(), ControlError> {
+        let _transition = self
+            .gateway_transition
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?;
         if self.is_shutdown_requested() {
             return Ok(());
         }
-        let (result, log_error_code) = {
+        let (result, ready, log_error_code) = {
             let mut supervisor = self
                 .supervisor
                 .lock()
@@ -1350,10 +1395,11 @@ impl AgentController {
             match supervisor.as_mut() {
                 Some(supervisor) => {
                     let result = supervisor.tick().map(Some);
+                    let ready = supervisor.gateway_ready().cloned();
                     let log_error_code = supervisor.take_log_error_code();
-                    (result, log_error_code)
+                    (result, ready, log_error_code)
                 }
-                None => (Ok(None), None),
+                None => (Ok(None), None, None),
             }
         };
         if let Some(code) = log_error_code {
@@ -1361,6 +1407,9 @@ impl AgentController {
         }
         match result {
             Ok(Some(SupervisorEvent::Started { .. })) => {
+                if self.private_gateway_bootstrap {
+                    self.publish_verified_gateway(ready)?;
+                }
                 if let Ok(mut latest_error_code) = self.latest_error_code.lock()
                     && latest_error_code
                         .as_deref()
@@ -1372,6 +1421,9 @@ impl AgentController {
                 Ok(())
             }
             Ok(Some(SupervisorEvent::Heartbeat { .. })) => {
+                if self.private_gateway_bootstrap && self.gateway_session.snapshot().is_none() {
+                    self.publish_verified_gateway(ready)?;
+                }
                 if let Ok(mut latest_error_code) = self.latest_error_code.lock()
                     && latest_error_code
                         .as_deref()
@@ -1382,13 +1434,41 @@ impl AgentController {
                 Ok(())
             }
             Ok(Some(SupervisorEvent::Exited { .. })) => {
+                self.gateway_session.clear();
                 self.log_agent_code(LogLevel::Warn, "GATEWAY_SUPERVISOR_EXITED");
                 Ok(())
             }
-            Ok(_) => Ok(()),
+            Ok(Some(SupervisorEvent::Backoff { .. } | SupervisorEvent::Stopped)) | Ok(None) => {
+                self.gateway_session.clear();
+                Ok(())
+            }
             Err(error) => {
+                self.gateway_session.clear();
                 self.remember_error_code(error.code());
                 Err(ControlError::CommandFailed)
+            }
+        }
+    }
+
+    fn publish_verified_gateway(&self, ready: Option<GatewayReady>) -> Result<(), ControlError> {
+        let result = ready
+            .ok_or(ControlError::CommandFailed)
+            .and_then(|ready| verified_gateway_route(&ready, &self.identity))
+            .map_err(|_| ControlError::CommandFailed);
+        match result {
+            Ok(route) => {
+                self.gateway_session.set(route);
+                Ok(())
+            }
+            Err(error) => {
+                self.gateway_session.clear();
+                if let Ok(mut supervisor) = self.supervisor.lock()
+                    && let Some(supervisor) = supervisor.as_mut()
+                {
+                    let _ = supervisor.stop();
+                }
+                self.remember_error_code("GATEWAY_SUPERVISOR_IDENTITY_VERIFICATION_FAILED");
+                Err(error)
             }
         }
     }
@@ -1493,11 +1573,15 @@ impl ControlHandler for AgentController {
         &self,
         projection: GatewayProjection,
     ) -> Result<serde_json::Value, ControlError> {
-        gateway_json_projection(self.gateway, projection)
+        let route = self
+            .gateway_session
+            .snapshot()
+            .ok_or(ControlError::CommandFailed)?;
+        gateway_json_projection(&route, projection)
     }
 
     fn subscribe_gateway_events(&self) -> Result<mpsc::Receiver<ControlUpdateEvent>, ControlError> {
-        Ok(bridge_gateway_events(self.gateway))
+        Ok(bridge_gateway_events(self.gateway_session.clone()))
     }
 
     fn store_secret(&self, kind: ControlSecretKind, value: &str) -> Result<(), ControlError> {
@@ -1516,8 +1600,58 @@ impl ControlHandler for AgentController {
     }
 }
 
+fn verified_gateway_route(
+    ready: &GatewayReady,
+    expected: &cmclient_control_api::ComponentIdentityReport,
+) -> Result<GatewayRoute, ControlError> {
+    let route = GatewayRoute::new(ready.address, ready.capability.clone())
+        .map_err(|_| ControlError::CommandFailed)?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| ControlError::CommandFailed)?;
+    let active_route = route.active().ok_or(ControlError::CommandFailed)?;
+    let response = client
+        .get(format!(
+            "http://{}/api/v1/system/version",
+            active_route.address()
+        ))
+        .header("accept", "application/json")
+        .header(GATEWAY_CAPABILITY_HEADER, active_route.capability())
+        .send()
+        .map_err(map_gateway_request_error)?;
+    drop(active_route);
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_GATEWAY_IDENTITY_BYTES)
+    {
+        return Err(ControlError::CommandFailed);
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_GATEWAY_IDENTITY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(map_gateway_io_error)?;
+    if bytes.len() as u64 > MAX_GATEWAY_IDENTITY_BYTES {
+        return Err(ControlError::ResponseTooLarge);
+    }
+    let actual: cmclient_control_api::ComponentIdentityReport =
+        serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidHttp)?;
+    if actual.validate().is_err()
+        || actual.component != InternalComponent::Gateway
+        || actual.identity != expected.identity
+    {
+        return Err(ControlError::CommandFailed);
+    }
+    Ok(route)
+}
+
 fn gateway_json_projection(
-    gateway: SocketAddr,
+    route: &GatewayRoute,
     projection: GatewayProjection,
 ) -> Result<serde_json::Value, ControlError> {
     const MAX_GATEWAY_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
@@ -1537,14 +1671,18 @@ fn gateway_json_projection(
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()
         .map_err(|_| ControlError::CommandFailed)?;
+    let active_route = route.active().ok_or(ControlError::CommandFailed)?;
     let response = client
-        .request(method, format!("http://{gateway}{path}"))
+        .request(method, format!("http://{}{path}", active_route.address()))
         .header("accept", "application/json")
+        .header(GATEWAY_CAPABILITY_HEADER, active_route.capability())
         .send()
         .map_err(map_gateway_request_error)?;
+    drop(active_route);
     if matches!(response.status().as_u16(), 408 | 504) {
         return Err(ControlError::Timeout);
     }
@@ -1587,12 +1725,14 @@ fn map_gateway_io_error(error: std::io::Error) -> ControlError {
     }
 }
 
-fn bridge_gateway_events(gateway: SocketAddr) -> mpsc::Receiver<ControlUpdateEvent> {
-    bridge_gateway_events_with_read_poll(gateway, GATEWAY_SSE_READ_POLL_INTERVAL)
+fn bridge_gateway_events(
+    gateway_session: GatewaySessionHandle,
+) -> mpsc::Receiver<ControlUpdateEvent> {
+    bridge_gateway_events_with_read_poll(gateway_session, GATEWAY_SSE_READ_POLL_INTERVAL)
 }
 
 fn bridge_gateway_events_with_read_poll(
-    gateway: SocketAddr,
+    gateway_session: GatewaySessionHandle,
     read_poll: Duration,
 ) -> mpsc::Receiver<ControlUpdateEvent> {
     debug_assert!(!read_poll.is_zero());
@@ -1604,9 +1744,16 @@ fn bridge_gateway_events_with_read_poll(
             let _bridge_guard = GatewayEventBridgeTestGuard::new();
             let mut last_event_id = None;
             loop {
-                if !probe_gateway_event_receiver(&sender)
-                    || !bridge_gateway_event_stream(gateway, &sender, read_poll, &mut last_event_id)
-                {
+                if !probe_gateway_event_receiver(&sender) {
+                    break;
+                }
+                let Some(route) = gateway_session.snapshot() else {
+                    if !wait_for_gateway_event_retry(&sender, GATEWAY_SSE_RECONNECT_DELAY) {
+                        break;
+                    }
+                    continue;
+                };
+                if !bridge_gateway_event_stream(&route, &sender, read_poll, &mut last_event_id) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(250));
@@ -1616,12 +1763,12 @@ fn bridge_gateway_events_with_read_poll(
 }
 
 fn bridge_gateway_event_stream(
-    gateway: SocketAddr,
+    route: &GatewayRoute,
     sender: &SyncSender<ControlUpdateEvent>,
     read_poll: Duration,
     last_event_id: &mut Option<String>,
 ) -> bool {
-    let mut reader = match open_gateway_event_stream(gateway, read_poll, last_event_id.as_deref()) {
+    let mut reader = match open_gateway_event_stream(route, read_poll, last_event_id.as_deref()) {
         Ok(reader) => reader,
         Err(()) => return wait_for_gateway_event_retry(sender, GATEWAY_SSE_RECONNECT_DELAY),
     };
@@ -1706,13 +1853,14 @@ fn bridge_gateway_event_stream(
 }
 
 fn open_gateway_event_stream(
-    gateway: SocketAddr,
+    route: &GatewayRoute,
     read_poll: Duration,
     last_event_id: Option<&str>,
 ) -> Result<BufReader<TcpStream>, ()> {
     const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
-    let mut stream =
-        TcpStream::connect_timeout(&gateway, Duration::from_secs(3)).map_err(|_| ())?;
+    let active_route = route.active().ok_or(())?;
+    let mut stream = TcpStream::connect_timeout(&active_route.address(), Duration::from_secs(3))
+        .map_err(|_| ())?;
     stream
         .set_read_timeout(Some(read_poll))
         .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(3))))
@@ -1723,11 +1871,15 @@ fn open_gateway_event_stream(
     stream
         .write_all(
             format!(
-                "GET /api/v1/events HTTP/1.0\r\nhost: {gateway}\r\naccept: text/event-stream\r\n{replay_header}connection: close\r\n\r\n"
+                "GET /api/v1/events HTTP/1.0\r\nhost: {}\r\naccept: text/event-stream\r\n{replay_header}{GATEWAY_CAPABILITY_HEADER}: ",
+                active_route.address()
             )
             .as_bytes(),
         )
+        .and_then(|()| stream.write_all(active_route.capability().as_bytes()))
+        .and_then(|()| stream.write_all(b"\r\nconnection: close\r\n\r\n"))
         .map_err(|_| ())?;
+    drop(active_route);
 
     let mut reader = BufReader::new(stream);
     let mut header_bytes = 0_usize;
@@ -1956,7 +2108,7 @@ fn serve_web_once() -> ExitCode {
     };
     let web_config = ManagementWebConfig {
         enabled: config.management_web_enabled,
-        gateway: gateway_address(config.gateway_port),
+        gateway: SocketAddr::from(([127, 0, 0, 1], 1)),
         bind: config
             .management_lan
             .as_ref()
@@ -2001,7 +2153,7 @@ fn serve_web_once() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
-    let listener = match ManagementWebListener::bind_with_api_handler(
+    let listener = match ManagementWebListener::bind_with_api_handler_and_gateway_session(
         &web_config,
         Arc::new(AgentManagementWebApi {
             updates,
@@ -2010,6 +2162,7 @@ fn serve_web_once() -> ExitCode {
             secrets,
             remote_replay: Arc::new(RemoteControlReplayGuard::default()),
         }),
+        GatewaySessionHandle::new(),
     ) {
         Ok(listener) => listener,
         Err(error) => {
@@ -2110,10 +2263,6 @@ fn serve() -> ExitCode {
     }
 }
 
-fn gateway_address(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
-
 fn resolve_static_web_root() -> PathBuf {
     if let Some(path) = std::env::var_os("CMCLIENT_WEB_ROOT") {
         return PathBuf::from(path);
@@ -2162,7 +2311,7 @@ mod tests {
         AgentConfig, AgentController, AgentSecretStore, ControlHandler, InternalComponent,
         ManagementWebRequest, SecretKind, apply_aprs_environment,
         apply_physical_qualification_environment, compiled_component_identity,
-        dispatch_remote_control,
+        dispatch_remote_control, verified_gateway_route,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -2198,6 +2347,8 @@ mod tests {
     use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewaySupervisor};
     #[cfg(not(target_os = "windows"))]
     use cmclient_updater::{PersistentUpdateJob, UpdatePhase};
+    #[cfg(target_os = "windows")]
+    use std::net::{TcpListener, TcpStream};
     use std::{
         collections::BTreeMap,
         io::Cursor,
@@ -2256,6 +2407,229 @@ mod tests {
         );
         writer.join().expect("marker writer should join");
         std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
+    #[test]
+    fn rejects_a_gateway_with_a_different_product_identity() {
+        let capability = "d".repeat(64);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("identity fixture should bind");
+        let address = listener.local_addr().expect("fixture address should load");
+        let expected = compiled_component_identity(InternalComponent::Agent)
+            .expect("compiled Agent identity should load");
+        let mut response_identity = expected.clone();
+        response_identity.component = InternalComponent::Gateway;
+        response_identity.identity.source_commit = "e".repeat(40);
+        if response_identity.identity.source_commit == expected.identity.source_commit {
+            response_identity.identity.source_commit = "f".repeat(40);
+        }
+        let body = serde_json::to_vec(&response_identity).expect("identity should serialize");
+        let expected_capability = capability.clone();
+        let fixture = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("identity request should connect");
+            use std::io::{Read as _, Write as _};
+            let mut request = [0_u8; 4096];
+            let count = stream
+                .read(&mut request)
+                .expect("identity request should read");
+            let request = std::str::from_utf8(&request[..count]).expect("request should be UTF-8");
+            assert!(request.contains(&format!(
+                "{}: {expected_capability}\r\n",
+                super::GATEWAY_CAPABILITY_HEADER,
+            )));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len(),
+            )
+            .and_then(|()| stream.write_all(&body))
+            .expect("identity response should write");
+        });
+        let ready = cmclient_supervisor::GatewayReady {
+            pid: std::process::id(),
+            address,
+            startup_nonce: "c".repeat(32),
+            capability,
+        };
+
+        assert_eq!(
+            verified_gateway_route(&ready, &expected),
+            Err(ControlError::CommandFailed)
+        );
+        fixture.join().expect("identity fixture should join");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires a built production Gateway and Node; run by Windows source qualification"]
+    fn supervised_real_gateway_uses_private_dynamic_session() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-private-gateway-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let gateway_entry = Path::new(env!("CARGO_MANIFEST_DIR")).join("../gateway/dist/main.js");
+        assert!(
+            gateway_entry.is_file(),
+            "Gateway production entrypoint should be built"
+        );
+        let reserved =
+            TcpListener::bind(("127.0.0.1", 0)).expect("fixed-port sentinel should bind");
+        let fixed_port = reserved
+            .local_addr()
+            .expect("fixed-port sentinel address should load")
+            .port();
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.join("config"),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: Some(vec![
+                String::from("node"),
+                gateway_entry.to_string_lossy().into_owned(),
+            ]),
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller =
+            AgentController::from_config_with_secrets(&config, AgentSecretStore::memory())
+                .expect("controller should build");
+
+        let started = controller
+            .handle(super::ControlCommand::Start)
+            .expect("real supervised Gateway should start");
+        let (ready, supervised_pid) = {
+            let supervisor = controller
+                .supervisor
+                .lock()
+                .expect("supervisor lock should open");
+            let supervisor = supervisor.as_ref().expect("supervisor should exist");
+            let ready = supervisor
+                .gateway_ready()
+                .cloned()
+                .expect("private Gateway session should be published");
+            let supervised_pid = match supervisor.status() {
+                cmclient_supervisor::GatewayStatus::Running { pid } => pid,
+                status => panic!("Gateway should be running, got {status:?}"),
+            };
+            (ready, supervised_pid)
+        };
+        let route = controller
+            .gateway_session
+            .snapshot()
+            .expect("Agent route should be available");
+        let (route_address, route_capability) = {
+            let active_route = route.active().expect("Agent route should be active");
+            (active_route.address(), active_route.capability().to_owned())
+        };
+        assert_eq!(route_address, ready.address);
+        assert!(
+            route_capability == ready.capability,
+            "Gateway session capability did not match bootstrap"
+        );
+        assert_eq!(ready.pid, supervised_pid);
+        assert_ne!(route_address.port(), fixed_port);
+        assert_eq!(route_address.ip().to_string(), "127.0.0.1");
+        assert_eq!(ready.startup_nonce.len(), 32);
+        assert!(
+            ready
+                .startup_nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        );
+        assert_eq!(route_capability.len(), 64);
+        assert!(!format!("{route:?}").contains(&route_capability));
+        assert!(!format!("{:?}", controller.gateway_session).contains(&route_capability));
+
+        let direct = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .expect("test client should build");
+        let health_url = format!("http://{route_address}/api/v1/system/health");
+        assert_eq!(
+            direct
+                .get(&health_url)
+                .send()
+                .expect("direct request should complete")
+                .status()
+                .as_u16(),
+            403
+        );
+        let wrong_capability = if route_capability.starts_with('f') {
+            "e".repeat(64)
+        } else {
+            "f".repeat(64)
+        };
+        assert_eq!(
+            direct
+                .get(&health_url)
+                .header(super::GATEWAY_CAPABILITY_HEADER, wrong_capability)
+                .send()
+                .expect("wrong-capability request should complete")
+                .status()
+                .as_u16(),
+            403
+        );
+        assert_eq!(
+            controller
+                .gateway_projection(cmclient_control_api::GatewayProjection::Meshtastic)
+                .expect("Agent should authenticate the Meshtastic projection"),
+            serde_json::json!({ "configured": false })
+        );
+        assert_eq!(
+            TcpListener::bind(route_address)
+                .expect_err("private Gateway address should already be owned")
+                .kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+
+        let stopped = controller
+            .handle(super::ControlCommand::Stop)
+            .expect("real supervised Gateway should stop");
+        assert!(controller.gateway_session.snapshot().is_none());
+        assert!(!route.is_active(), "stale route clone should be revoked");
+        assert!(
+            TcpStream::connect_timeout(&route_address, Duration::from_millis(250)).is_err(),
+            "stopped private Gateway address should close"
+        );
+        drop(reserved);
+        assert_eq!(started.gateway, super::GatewayControlStatus::Running);
+        assert_eq!(stopped.gateway, super::GatewayControlStatus::Stopped);
+
+        let startup_nonce = ready.startup_nonce;
+        let capability = ready.capability;
+        drop(controller);
+        assert!(!directory_contains_bytes(
+            &data_dir,
+            startup_nonce.as_bytes()
+        ));
+        assert!(!directory_contains_bytes(&data_dir, capability.as_bytes()));
+        std::fs::remove_dir_all(&data_dir).expect("test directory should remove");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn directory_contains_bytes(root: &Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(root)
+            .expect("test root should be readable")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    directory_contains_bytes(&path, needle)
+                } else {
+                    std::fs::read(path).is_ok_and(|bytes| {
+                        bytes.windows(needle.len()).any(|window| window == needle)
+                    })
+                }
+            })
     }
 
     #[test]
@@ -2381,7 +2755,6 @@ mod tests {
             },
             config_file: directory.join("agent.toml"),
             gateway_command: None,
-            gateway_port: 48_121,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -2549,7 +2922,6 @@ mod tests {
                     marker.display(),
                 ),
             ]),
-            gateway_port: 48_120,
             callmesh: Some(CallMeshConfig {
                 url: String::from("https://callmesh.example.invalid"),
             }),
@@ -2559,8 +2931,9 @@ mod tests {
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller = AgentController::from_config_with_secrets(&config, secrets)
-            .expect("controller should initialize");
+        let controller =
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize");
 
         controller
             .supervisor
@@ -2613,7 +2986,6 @@ mod tests {
                     marker.display(),
                 ),
             ]),
-            gateway_port: 48_121,
             callmesh: None,
             meshtastic: None,
             aprs: Some(AprsConfig {
@@ -2625,8 +2997,9 @@ mod tests {
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller = AgentController::from_config_with_secrets(&config, secrets)
-            .expect("controller should initialize");
+        let controller =
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize");
 
         controller
             .supervisor
@@ -2683,10 +3056,7 @@ mod tests {
     #[test]
     fn reports_running_only_after_gateway_health_succeeds() {
         let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
-        let port = gateway
-            .local_addr()
-            .expect("gateway address should load")
-            .port();
+        let gateway_address = gateway.local_addr().expect("gateway address should load");
         let gateway_thread = thread::spawn(move || {
             let (mut stream, _) = gateway.accept().expect("gateway should accept");
             let mut request = [0_u8; 4096];
@@ -2712,7 +3082,6 @@ mod tests {
                 String::from("-c"),
                 String::from("read _"),
             ]),
-            gateway_port: port,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -2720,7 +3089,15 @@ mod tests {
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller = AgentController::from_config(&config).expect("controller should build");
+        let controller = AgentController::from_config_with_secrets_without_private_bootstrap(
+            &config,
+            AgentSecretStore::memory(),
+        )
+        .expect("controller should build");
+        controller.gateway_session.set(
+            cmclient_agent_core::web::GatewayRoute::new(gateway_address, "a".repeat(64))
+                .expect("test route should be valid"),
+        );
 
         let diagnostics = controller
             .diagnostics_bundle()
@@ -2761,7 +3138,6 @@ mod tests {
                 String::from("-c"),
                 format!("printf x >> '{}'; exit 7", marker.display()),
             ]),
-            gateway_port: 48_109,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -2769,8 +3145,13 @@ mod tests {
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller =
-            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        let controller = Arc::new(
+            AgentController::from_config_with_secrets_without_private_bootstrap(
+                &config,
+                AgentSecretStore::memory(),
+            )
+            .expect("controller should initialize"),
+        );
         let mut worker =
             SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
 
@@ -2819,7 +3200,6 @@ mod tests {
                 String::from("-c"),
                 String::from("exit 0"),
             ]),
-            gateway_port: 48_113,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -2885,7 +3265,6 @@ mod tests {
                 String::from("-c"),
                 String::from("sleep 5"),
             ]),
-            gateway_port: 48_114,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -2960,7 +3339,6 @@ mod tests {
                 String::from("-c"),
                 format!("read _; printf x > '{}'; exec sleep 5", marker.display()),
             ]),
-            gateway_port: 48_115,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -2968,8 +3346,13 @@ mod tests {
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller =
-            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        let controller = Arc::new(
+            AgentController::from_config_with_secrets_without_private_bootstrap(
+                &config,
+                AgentSecretStore::memory(),
+            )
+            .expect("controller should initialize"),
+        );
         controller
             .supervisor
             .lock()
@@ -3033,7 +3416,6 @@ mod tests {
                 String::from("-c"),
                 String::from("read _"),
             ]),
-            gateway_port: 48_110,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -3041,8 +3423,13 @@ mod tests {
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller =
-            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        let controller = Arc::new(
+            AgentController::from_config_with_secrets_without_private_bootstrap(
+                &config,
+                AgentSecretStore::memory(),
+            )
+            .expect("controller should initialize"),
+        );
         let mut worker =
             SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
         controller
@@ -3100,7 +3487,6 @@ mod tests {
             },
             config_file: data_dir.join("agent.toml"),
             gateway_command: None,
-            gateway_port: 48_112,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -3178,7 +3564,6 @@ mod tests {
             },
             config_file: data_dir.join("agent.toml"),
             gateway_command: Some(vec![missing_program.to_string_lossy().into_owned()]),
-            gateway_port: 48_111,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -3249,7 +3634,6 @@ mod tests {
                 String::from("-c"),
                 String::from("read _"),
             ]),
-            gateway_port: 48_112,
             callmesh: None,
             meshtastic: None,
             aprs: None,
@@ -3257,8 +3641,11 @@ mod tests {
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller =
-            AgentController::from_config(&config).expect("controller should initialize");
+        let controller = AgentController::from_config_with_secrets_without_private_bootstrap(
+            &config,
+            AgentSecretStore::memory(),
+        )
+        .expect("controller should initialize");
 
         let started = controller
             .handle(ControlCommand::Start)
@@ -3546,19 +3933,24 @@ mod tests {
         let gateway_thread = thread::spawn(move || {
             let (mut stream, _) = gateway.accept().expect("gateway should accept");
             let mut request = [0_u8; 4_096];
-            let _ = stream.read(&mut request).expect("request should read");
+            let count = stream.read(&mut request).expect("request should read");
+            let request = std::str::from_utf8(&request[..count]).expect("request should be UTF-8");
+            assert!(request.contains(&format!(
+                "{}: {}\r\n",
+                super::GATEWAY_CAPABILITY_HEADER,
+                "a".repeat(64)
+            )));
             stream
                 .write_all(
                     b"HTTP/1.1 504 Gateway Timeout\r\ncontent-type: application/json\r\ncontent-length: 26\r\nconnection: close\r\n\r\n{\"code\":\"GATEWAY_TIMEOUT\"}",
                 )
                 .expect("timeout response should write");
         });
+        let route = cmclient_agent_core::web::GatewayRoute::new(gateway_address, "a".repeat(64))
+            .expect("Gateway route should be valid");
 
         assert_eq!(
-            gateway_json_projection(
-                gateway_address,
-                cmclient_control_api::GatewayProjection::Nodes
-            ),
+            gateway_json_projection(&route, cmclient_control_api::GatewayProjection::Nodes),
             Err(cmclient_control_api::ControlError::Timeout)
         );
         assert_eq!(
@@ -3623,16 +4015,18 @@ mod tests {
         });
         let (sender, _receiver) = mpsc::sync_channel(8);
         let mut last_event_id = None;
+        let route = cmclient_agent_core::web::GatewayRoute::new(gateway_address, "b".repeat(64))
+            .expect("Gateway route should be valid");
 
         assert!(bridge_gateway_event_stream(
-            gateway_address,
+            &route,
             &sender,
             Duration::from_millis(100),
             &mut last_event_id,
         ));
         assert_eq!(last_event_id.as_deref(), Some("gateway-1"));
         assert!(bridge_gateway_event_stream(
-            gateway_address,
+            &route,
             &sender,
             Duration::from_millis(100),
             &mut last_event_id,
@@ -3640,6 +4034,13 @@ mod tests {
         assert_eq!(last_event_id.as_deref(), Some("gateway-2"));
 
         let requests = gateway_thread.join().expect("gateway should join");
+        for request in &requests {
+            assert!(request.contains(&format!(
+                "{}: {}\r\n",
+                super::GATEWAY_CAPABILITY_HEADER,
+                "b".repeat(64)
+            )));
+        }
         assert!(!requests[0].to_ascii_lowercase().contains("last-event-id:"));
         assert!(
             requests[1]
@@ -3702,7 +4103,16 @@ mod tests {
 
         let receivers = (0..SUBSCRIPTIONS)
             .map(|_| {
-                bridge_gateway_events_with_read_poll(gateway_address, Duration::from_millis(100))
+                bridge_gateway_events_with_read_poll(
+                    cmclient_agent_core::web::GatewaySessionHandle::with_route(
+                        cmclient_agent_core::web::GatewayRoute::new(
+                            gateway_address,
+                            "c".repeat(64),
+                        )
+                        .expect("Gateway route should be valid"),
+                    ),
+                    Duration::from_millis(100),
+                )
             })
             .collect::<Vec<_>>();
         wait_for_resource_count(

@@ -84,6 +84,17 @@ test("CI keeps the Windows source gate separate from package generation", () => 
     build.env.CARGO_TARGET_DIR,
     "${{ runner.temp }}/cmclient-source-target",
   );
+  const privateGateway = job.steps.find((step) =>
+    step.run?.includes(
+      "tests::supervised_real_gateway_uses_private_dynamic_session",
+    ),
+  );
+  assert.ok(privateGateway);
+  assert.match(privateGateway.run, /--ignored --exact$/);
+  assert.equal(
+    privateGateway.env.CARGO_TARGET_DIR,
+    "${{ runner.temp }}/cmclient-source-target",
+  );
   const serialized = JSON.stringify(job).toLowerCase();
   for (const forbidden of ["tauri build", "nsis", "stage", "updater payload"]) {
     assert.equal(serialized.includes(forbidden), false, forbidden);

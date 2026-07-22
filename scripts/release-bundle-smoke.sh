@@ -69,16 +69,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gateway_port="$(node --input-type=module --eval '
-  import net from "node:net";
-  const server = net.createServer();
-  server.listen(0, "127.0.0.1", () => {
-    console.log(server.address().port);
-    server.close();
-  });
-')"
 mkdir -p "$runtime/data" "$runtime/config" "$runtime/cache" "$runtime/logs"
-printf '[agent]\ngateway_port = %s\nmanagement_web_enabled = true\n' "$gateway_port" >"$runtime/agent.toml"
+printf '[agent]\nmanagement_web_enabled = true\n' >"$runtime/agent.toml"
 
 export CMCLIENT_AGENT_CONFIG="$runtime/agent.toml"
 export CMCLIENT_DATA_DIR="$runtime/data"

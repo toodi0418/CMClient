@@ -9,20 +9,248 @@ use std::{
     net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock, RwLockReadGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
+use zeroize::Zeroizing;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_GATEWAY_HEALTH_RESPONSE_BYTES: usize = 4096;
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
 const GATEWAY_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROXY_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECTION_LIMIT_BODY: &str = r#"{"code":"MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED"}"#;
-const GATEWAY_CAPABILITY_HEADER: &str = "x-cmclient-gateway-capability";
+pub const GATEWAY_CAPABILITY_HEADER: &str = "x-cmclient-gateway-capability";
+
+#[derive(Debug)]
+struct GatewayRouteLease {
+    active: RwLock<bool>,
+}
+
+impl GatewayRouteLease {
+    fn new() -> Self {
+        Self {
+            active: RwLock::new(true),
+        }
+    }
+
+    fn acquire(&self) -> Option<RwLockReadGuard<'_, bool>> {
+        let guard = self
+            .active
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (*guard).then_some(guard)
+    }
+
+    fn revoke(&self) {
+        *self
+            .active
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+}
+
+#[derive(Clone)]
+pub struct GatewayRoute {
+    address: SocketAddr,
+    capability: Arc<Zeroizing<String>>,
+    lease: Arc<GatewayRouteLease>,
+}
+
+impl GatewayRoute {
+    pub fn new(
+        address: SocketAddr,
+        capability: impl Into<String>,
+    ) -> Result<Self, ManagementWebError> {
+        let capability = Zeroizing::new(capability.into());
+        if address.ip() != IpAddr::from([127, 0, 0, 1])
+            || address.port() == 0
+            || !valid_gateway_capability(&capability)
+        {
+            return Err(ManagementWebError::InvalidHttp);
+        }
+        Ok(Self {
+            address,
+            capability: Arc::new(capability),
+            lease: Arc::new(GatewayRouteLease::new()),
+        })
+    }
+
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Reports whether this route still belongs to the current Gateway session.
+    ///
+    /// Callers that send the capability should use [`GatewayRoute::active`] so the session
+    /// cannot be revoked between checking this value and writing the secret to the socket.
+    pub fn is_active(&self) -> bool {
+        self.lease.acquire().is_some()
+    }
+
+    pub fn active(&self) -> Option<ActiveGatewayRoute<'_>> {
+        self.lease.acquire().map(|lease| ActiveGatewayRoute {
+            route: self,
+            _lease: lease,
+        })
+    }
+
+    fn revoke(&self) {
+        self.lease.revoke();
+    }
+}
+
+impl PartialEq for GatewayRoute {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.capability == other.capability
+            && Arc::ptr_eq(&self.lease, &other.lease)
+    }
+}
+
+impl Eq for GatewayRoute {}
+
+pub struct ActiveGatewayRoute<'a> {
+    route: &'a GatewayRoute,
+    _lease: RwLockReadGuard<'a, bool>,
+}
+
+impl ActiveGatewayRoute<'_> {
+    pub const fn address(&self) -> SocketAddr {
+        self.route.address
+    }
+
+    pub fn capability(&self) -> &str {
+        self.route.capability.as_str()
+    }
+}
+
+impl fmt::Debug for ActiveGatewayRoute<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveGatewayRoute")
+            .field("address", &self.route.address)
+            .field("capability", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Debug for GatewayRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayRoute")
+            .field("address", &self.address)
+            .field("capability", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct GatewaySessionHandle {
+    route: Arc<RwLock<Option<GatewayRoute>>>,
+}
+
+impl GatewaySessionHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_route(route: GatewayRoute) -> Self {
+        Self {
+            route: Arc::new(RwLock::new(Some(route))),
+        }
+    }
+
+    pub fn set(&self, route: GatewayRoute) {
+        let mut current = self
+            .route
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = current.take() {
+            previous.revoke();
+        }
+        *current = route.is_active().then_some(route);
+    }
+
+    pub fn clear(&self) {
+        let mut current = self
+            .route
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = current.take() {
+            previous.revoke();
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<GatewayRoute> {
+        self.route
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .filter(GatewayRoute::is_active)
+    }
+}
+
+impl fmt::Debug for GatewaySessionHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewaySessionHandle")
+            .field("available", &self.snapshot().is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+enum GatewayRouteSource {
+    Static {
+        address: SocketAddr,
+        capability: Option<Arc<Zeroizing<String>>>,
+    },
+    Dynamic(GatewaySessionHandle),
+}
+
+#[derive(Clone)]
+struct ResolvedGatewayRoute {
+    address: SocketAddr,
+    capability: Option<Arc<Zeroizing<String>>>,
+    lease: Option<Arc<GatewayRouteLease>>,
+}
+
+impl ResolvedGatewayRoute {
+    fn acquire(&self) -> Option<Option<RwLockReadGuard<'_, bool>>> {
+        self.lease
+            .as_ref()
+            .map_or(Some(None), |lease| lease.acquire().map(Some))
+    }
+}
+
+impl GatewayRouteSource {
+    fn dynamic(session: GatewaySessionHandle) -> Self {
+        Self::Dynamic(session)
+    }
+
+    fn snapshot(&self) -> Option<ResolvedGatewayRoute> {
+        match self {
+            Self::Static {
+                address,
+                capability,
+            } => Some(ResolvedGatewayRoute {
+                address: *address,
+                capability: capability.clone(),
+                lease: None,
+            }),
+            Self::Dynamic(session) => session.snapshot().map(|route| ResolvedGatewayRoute {
+                address: route.address,
+                capability: Some(Arc::clone(&route.capability)),
+                lease: Some(Arc::clone(&route.lease)),
+            }),
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ManagementWebConfig {
@@ -135,8 +363,7 @@ impl ManagementWebRequest {
 
 pub struct ManagementWebListener {
     listener: TcpListener,
-    gateway: SocketAddr,
-    gateway_capability: Option<String>,
+    gateway_route: GatewayRouteSource,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     tls: Option<Arc<ServerConfig>>,
     static_web_root: Option<PathBuf>,
@@ -300,11 +527,32 @@ impl ManagementWebService {
         Self::start_listener(listener)
     }
 
+    pub fn start_with_gateway_session(
+        config: &ManagementWebConfig,
+        gateway_session: GatewaySessionHandle,
+    ) -> Result<Self, ManagementWebError> {
+        let listener = ManagementWebListener::bind_with_gateway_session(config, gateway_session)?;
+        Self::start_listener(listener)
+    }
+
     pub fn start_with_api_handler(
         config: &ManagementWebConfig,
         api_handler: Arc<dyn ManagementWebApiHandler>,
     ) -> Result<Self, ManagementWebError> {
         let listener = ManagementWebListener::bind_with_api_handler(config, api_handler)?;
+        Self::start_listener(listener)
+    }
+
+    pub fn start_with_api_handler_and_gateway_session(
+        config: &ManagementWebConfig,
+        api_handler: Arc<dyn ManagementWebApiHandler>,
+        gateway_session: GatewaySessionHandle,
+    ) -> Result<Self, ManagementWebError> {
+        let listener = ManagementWebListener::bind_with_api_handler_and_gateway_session(
+            config,
+            api_handler,
+            gateway_session,
+        )?;
         Self::start_listener(listener)
     }
 
@@ -363,37 +611,78 @@ impl Drop for ManagementWebService {
     }
 }
 
+fn static_gateway_route(
+    config: &ManagementWebConfig,
+) -> Result<GatewayRouteSource, ManagementWebError> {
+    if !config.gateway.ip().is_loopback() {
+        return Err(ManagementWebError::NonLoopbackBind);
+    }
+    if config
+        .gateway_capability
+        .as_deref()
+        .is_some_and(|value| !valid_gateway_capability(value))
+    {
+        return Err(ManagementWebError::InvalidHttp);
+    }
+    Ok(GatewayRouteSource::Static {
+        address: config.gateway,
+        capability: config
+            .gateway_capability
+            .clone()
+            .map(Zeroizing::new)
+            .map(Arc::new),
+    })
+}
+
 impl ManagementWebListener {
     pub fn bind(config: &ManagementWebConfig) -> Result<Self, ManagementWebError> {
-        Self::bind_internal(config, None)
+        if !config.enabled {
+            return Err(ManagementWebError::Disabled);
+        }
+        Self::bind_internal(config, None, static_gateway_route(config)?)
+    }
+
+    pub fn bind_with_gateway_session(
+        config: &ManagementWebConfig,
+        gateway_session: GatewaySessionHandle,
+    ) -> Result<Self, ManagementWebError> {
+        Self::bind_internal(config, None, GatewayRouteSource::dynamic(gateway_session))
     }
 
     pub fn bind_with_api_handler(
         config: &ManagementWebConfig,
         api_handler: Arc<dyn ManagementWebApiHandler>,
     ) -> Result<Self, ManagementWebError> {
-        Self::bind_internal(config, Some(api_handler))
+        if !config.enabled {
+            return Err(ManagementWebError::Disabled);
+        }
+        Self::bind_internal(config, Some(api_handler), static_gateway_route(config)?)
+    }
+
+    pub fn bind_with_api_handler_and_gateway_session(
+        config: &ManagementWebConfig,
+        api_handler: Arc<dyn ManagementWebApiHandler>,
+        gateway_session: GatewaySessionHandle,
+    ) -> Result<Self, ManagementWebError> {
+        Self::bind_internal(
+            config,
+            Some(api_handler),
+            GatewayRouteSource::dynamic(gateway_session),
+        )
     }
 
     fn bind_internal(
         config: &ManagementWebConfig,
         api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
+        gateway_route: GatewayRouteSource,
     ) -> Result<Self, ManagementWebError> {
         if !config.enabled {
             return Err(ManagementWebError::Disabled);
         }
-        if !config.gateway.ip().is_loopback()
-            || (!config.bind.is_loopback()
-                && (!config.allow_lan || api_handler.is_none() || config.tls.is_none()))
+        if !config.bind.is_loopback()
+            && (!config.allow_lan || api_handler.is_none() || config.tls.is_none())
         {
             return Err(ManagementWebError::NonLoopbackBind);
-        }
-        if config
-            .gateway_capability
-            .as_deref()
-            .is_some_and(|value| !valid_gateway_capability(value))
-        {
-            return Err(ManagementWebError::InvalidHttp);
         }
         let listener = TcpListener::bind(SocketAddr::new(config.bind, config.port))
             .map_err(|_| ManagementWebError::Io)?;
@@ -411,8 +700,7 @@ impl ManagementWebListener {
             .transpose()?;
         Ok(Self {
             listener,
-            gateway: config.gateway,
-            gateway_capability: config.gateway_capability.clone(),
+            gateway_route,
             api_handler,
             tls,
             static_web_root,
@@ -453,8 +741,7 @@ impl ManagementWebListener {
         serve_connection(
             stream,
             remote_addr,
-            self.gateway,
-            self.gateway_capability.clone(),
+            self.gateway_route.clone(),
             self.api_handler.clone(),
             self.tls.clone(),
             self.static_web_root.clone(),
@@ -517,8 +804,7 @@ impl ManagementWebListener {
             }
             Err(ConnectionRegistrationError::Io) => return Err(ManagementWebError::Io),
         };
-        let gateway = self.gateway;
-        let gateway_capability = self.gateway_capability.clone();
+        let gateway_route = self.gateway_route.clone();
         let api_handler = self.api_handler.clone();
         let tls = self.tls.clone();
         let static_web_root = self.static_web_root.clone();
@@ -529,8 +815,7 @@ impl ManagementWebListener {
                 let _ = serve_connection(
                     stream,
                     remote_addr,
-                    gateway,
-                    gateway_capability,
+                    gateway_route,
                     api_handler,
                     tls,
                     static_web_root,
@@ -544,32 +829,151 @@ impl ManagementWebListener {
 }
 
 pub fn gateway_health(gateway: SocketAddr) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&gateway, GATEWAY_TIMEOUT) else {
+    gateway_health_request(gateway, None, GATEWAY_TIMEOUT)
+}
+
+pub fn gateway_health_with_route(route: &GatewayRoute) -> bool {
+    let Some(route) = route.active() else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(GATEWAY_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(GATEWAY_TIMEOUT));
-    if stream
-        .write_all(
-            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
+    gateway_health_request(route.address(), Some(route.capability()), GATEWAY_TIMEOUT)
+}
+
+fn gateway_health_request(
+    gateway: SocketAddr,
+    capability: Option<&str>,
+    timeout: Duration,
+) -> bool {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    let Some(connect_timeout) = remaining_until(deadline) else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&gateway, connect_timeout) else {
+        return false;
+    };
+    let request = Zeroizing::new(if let Some(capability) = capability {
+        if !valid_gateway_capability(capability) {
+            return false;
+        }
+        format!(
+            "GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n{GATEWAY_CAPABILITY_HEADER}: {capability}\r\nconnection: close\r\n\r\n"
         )
-        .is_err()
-    {
+        .into_bytes()
+    } else {
+        b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+            .to_vec()
+    });
+    if !write_all_until(&mut stream, request.as_slice(), deadline) {
         return false;
     }
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).is_ok()
-        && response.starts_with(b"HTTP/1.1 200")
-        && response
-            .windows(br#"{"status":"ok"}"#.len())
-            .any(|window| window == br#"{"status":"ok"}"#)
+    let mut response = Vec::with_capacity(512);
+    let mut buffer = [0_u8; 512];
+    loop {
+        match validate_gateway_health_response(&response) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(()) => return false,
+        }
+        let remaining_capacity = MAX_GATEWAY_HEALTH_RESPONSE_BYTES.saturating_sub(response.len());
+        if remaining_capacity == 0 {
+            return false;
+        }
+        let Some(read_timeout) = remaining_until(deadline) else {
+            return false;
+        };
+        if stream.set_read_timeout(Some(read_timeout)).is_err() {
+            return false;
+        }
+        let read_length = remaining_capacity.min(buffer.len());
+        let count = match stream.read(&mut buffer[..read_length]) {
+            Ok(0) | Err(_) => return false,
+            Ok(count) => count,
+        };
+        response.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn remaining_until(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn write_all_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> bool {
+    while !bytes.is_empty() {
+        let Some(write_timeout) = remaining_until(deadline) else {
+            return false;
+        };
+        if stream.set_write_timeout(Some(write_timeout)).is_err() {
+            return false;
+        }
+        match stream.write(bytes) {
+            Ok(0) | Err(_) => return false,
+            Ok(count) => bytes = &bytes[count..],
+        }
+    }
+    true
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayHealthResponse {
+    status: String,
+}
+
+fn validate_gateway_health_response(response: &[u8]) -> Result<bool, ()> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(false);
+    };
+    let header = std::str::from_utf8(&response[..header_end]).map_err(|_| ())?;
+    let mut lines = header.split("\r\n");
+    if lines.next() != Some("HTTP/1.1 200 OK") {
+        return Err(());
+    }
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        let (name, value) = parse_header_field(line).map_err(|_| ())?;
+        if headers.insert(name, value).is_some() {
+            return Err(());
+        }
+    }
+    if headers.contains_key("transfer-encoding") {
+        return Err(());
+    }
+    let content_type = headers.get("content-type").ok_or(())?;
+    if !matches!(
+        content_type.to_ascii_lowercase().as_str(),
+        "application/json" | "application/json; charset=utf-8"
+    ) {
+        return Err(());
+    }
+    let content_length = headers.get("content-length").ok_or(())?;
+    if content_length.is_empty() || !content_length.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(());
+    }
+    let content_length = content_length.parse::<usize>().map_err(|_| ())?;
+    let body_start = header_end.checked_add(4).ok_or(())?;
+    let response_length = body_start
+        .checked_add(content_length)
+        .filter(|length| *length <= MAX_GATEWAY_HEALTH_RESPONSE_BYTES)
+        .ok_or(())?;
+    if response.len() < response_length {
+        return Ok(false);
+    }
+    if response.len() != response_length {
+        return Err(());
+    }
+    let health: GatewayHealthResponse =
+        serde_json::from_slice(&response[body_start..]).map_err(|_| ())?;
+    (health.status == "ok").then_some(true).ok_or(())
 }
 
 fn serve_connection(
     mut client: TcpStream,
     remote_addr: SocketAddr,
-    gateway: SocketAddr,
-    gateway_capability: Option<String>,
+    gateway_route: GatewayRouteSource,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     tls: Option<Arc<ServerConfig>>,
     static_web_root: Option<PathBuf>,
@@ -588,8 +992,7 @@ fn serve_connection(
         return serve_http_connection(
             &mut stream,
             remote_addr,
-            gateway,
-            gateway_capability.as_deref(),
+            &gateway_route,
             api_handler,
             static_web_root.as_deref(),
             &running,
@@ -598,8 +1001,7 @@ fn serve_connection(
     serve_http_connection(
         &mut client,
         remote_addr,
-        gateway,
-        gateway_capability.as_deref(),
+        &gateway_route,
         api_handler,
         static_web_root.as_deref(),
         &running,
@@ -609,8 +1011,7 @@ fn serve_connection(
 fn serve_http_connection(
     client: &mut dyn ManagementWebStream,
     remote_addr: SocketAddr,
-    gateway: SocketAddr,
-    gateway_capability: Option<&str>,
+    gateway_route: &GatewayRouteSource,
     api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
     static_web_root: Option<&Path>,
     running: &AtomicBool,
@@ -654,7 +1055,10 @@ fn serve_http_connection(
     }
     let routed_path = request_path(&request_context.path);
     if routed_path == "/api" || routed_path.starts_with("/api/") {
-        return proxy_api(client, gateway, gateway_capability, &request, running);
+        let Some(gateway_route) = gateway_route.snapshot() else {
+            return write_gateway_unavailable(client);
+        };
+        return proxy_api(client, &gateway_route, &request, running);
     }
     if let Some(static_web_root) = static_web_root {
         return serve_static_web(client, &request_context, static_web_root);
@@ -825,38 +1229,51 @@ fn static_content_type(path: &Path) -> &'static str {
 
 fn proxy_api(
     client: &mut dyn ManagementWebStream,
-    gateway: SocketAddr,
-    gateway_capability: Option<&str>,
+    gateway: &ResolvedGatewayRoute,
     request: &[u8],
     running: &AtomicBool,
 ) -> Result<(), ManagementWebError> {
-    let mut upstream = match TcpStream::connect_timeout(&gateway, GATEWAY_TIMEOUT) {
+    // A dynamic session cannot be revoked while its capability is in flight. `clear` and `set`
+    // take the lease's write lock, so after either returns every stale snapshot fails here.
+    let Some(lease) = gateway.acquire() else {
+        return write_gateway_unavailable(client);
+    };
+    let Some(deadline) = Instant::now().checked_add(GATEWAY_TIMEOUT) else {
+        return write_gateway_unavailable(client);
+    };
+    let Some(connect_timeout) = remaining_until(deadline) else {
+        return write_gateway_unavailable(client);
+    };
+    let mut upstream = match TcpStream::connect_timeout(&gateway.address, connect_timeout) {
         Ok(stream) => stream,
-        Err(_) => {
-            return write_response(
-                client,
-                "503 Service Unavailable",
-                "application/json",
-                r#"{"code":"GATEWAY_PROXY_UNAVAILABLE"}"#,
-            );
-        }
+        Err(_) => return write_gateway_unavailable(client),
     };
     upstream
         .set_read_timeout(Some(PROXY_READ_POLL_INTERVAL))
         .map_err(|_| ManagementWebError::Io)?;
-    upstream
-        .set_write_timeout(Some(GATEWAY_TIMEOUT))
-        .map_err(|_| ManagementWebError::Io)?;
-    let request = with_gateway_headers(request, gateway_capability)?;
-    if upstream.write_all(&request).is_err() {
-        return write_response(
-            client,
-            "503 Service Unavailable",
-            "application/json",
-            r#"{"code":"GATEWAY_PROXY_UNAVAILABLE"}"#,
-        );
+    let request = Zeroizing::new(with_gateway_headers(
+        request,
+        gateway
+            .capability
+            .as_ref()
+            .map(|capability| capability.as_str()),
+    )?);
+    if !write_all_until(&mut upstream, request.as_slice(), deadline) {
+        return write_gateway_unavailable(client);
     }
+    drop(lease);
     copy_proxy_response(&mut upstream, client, running)
+}
+
+fn write_gateway_unavailable(
+    client: &mut dyn ManagementWebStream,
+) -> Result<(), ManagementWebError> {
+    write_response(
+        client,
+        "503 Service Unavailable",
+        "application/json",
+        r#"{"code":"GATEWAY_PROXY_UNAVAILABLE"}"#,
+    )
 }
 
 fn copy_proxy_response(
@@ -922,7 +1339,7 @@ fn parse_request(
         .strip_suffix("\r\n\r\n")
         .ok_or(ManagementWebError::InvalidHttp)?;
     let line = header
-        .lines()
+        .split("\r\n")
         .next()
         .ok_or(ManagementWebError::InvalidHttp)?;
     let mut parts = line.split_whitespace();
@@ -934,20 +1351,9 @@ fn parse_request(
     }
     validate_request_target(path)?;
     let mut headers = BTreeMap::new();
-    for line in header.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(ManagementWebError::InvalidHttp);
-        };
-        let name = name.trim();
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
-            return Err(ManagementWebError::InvalidHttp);
-        }
-        let key = name.to_ascii_lowercase();
-        if headers.insert(key, value.trim().to_owned()).is_some() {
+    for line in header.split("\r\n").skip(1) {
+        let (name, value) = parse_header_field(line)?;
+        if headers.insert(name, value.to_owned()).is_some() {
             return Err(ManagementWebError::InvalidHttp);
         }
     }
@@ -1033,17 +1439,20 @@ const fn hex_value(byte: u8) -> Option<u8> {
 
 fn content_length(header: &[u8]) -> Result<usize, ManagementWebError> {
     let header = std::str::from_utf8(header).map_err(|_| ManagementWebError::InvalidHttp)?;
+    let header = header
+        .strip_suffix("\r\n\r\n")
+        .ok_or(ManagementWebError::InvalidHttp)?;
     let mut length = None;
-    for line in header.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("transfer-encoding") {
+    for line in header.split("\r\n").skip(1) {
+        let (name, value) = parse_header_field(line)?;
+        if name == "transfer-encoding" {
             return Err(ManagementWebError::InvalidHttp);
         }
-        if name.eq_ignore_ascii_case("content-length") {
+        if name == "content-length" {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(ManagementWebError::InvalidHttp);
+            }
             let parsed = value
-                .trim()
                 .parse::<usize>()
                 .map_err(|_| ManagementWebError::InvalidHttp);
             if length.replace(parsed?).is_some() {
@@ -1066,14 +1475,14 @@ fn with_gateway_headers(
         .ok_or(ManagementWebError::InvalidHttp)?;
     let mut rewritten = String::new();
     for (index, line) in header.split("\r\n").enumerate() {
-        if index > 0
-            && line.split_once(':').is_some_and(|(name, _)| {
-                name.eq_ignore_ascii_case("connection")
-                    || name.eq_ignore_ascii_case("proxy-connection")
-                    || name.eq_ignore_ascii_case(GATEWAY_CAPABILITY_HEADER)
-            })
-        {
-            continue;
+        if index > 0 {
+            let (name, _) = parse_header_field(line)?;
+            if matches!(
+                name.as_str(),
+                "connection" | "proxy-connection" | GATEWAY_CAPABILITY_HEADER
+            ) {
+                continue;
+            }
         }
         rewritten.push_str(line);
         rewritten.push_str("\r\n");
@@ -1099,6 +1508,31 @@ fn valid_gateway_capability(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn canonical_header_name(name: &str) -> Result<String, ManagementWebError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(ManagementWebError::InvalidHttp);
+    }
+    Ok(name.to_ascii_lowercase())
+}
+
+fn parse_header_field(line: &str) -> Result<(String, &str), ManagementWebError> {
+    let (name, value) = line
+        .split_once(':')
+        .ok_or(ManagementWebError::InvalidHttp)?;
+    let name = canonical_header_name(name)?;
+    if value
+        .bytes()
+        .any(|byte| byte == b'\r' || byte == b'\n' || (byte.is_ascii_control() && byte != b'\t'))
+    {
+        return Err(ManagementWebError::InvalidHttp);
+    }
+    Ok((name, value.trim()))
 }
 
 fn header_end(request: &[u8]) -> Option<usize> {
@@ -1182,9 +1616,10 @@ fn load_tls_config(config: &ManagementTlsConfig) -> Result<Arc<ServerConfig>, Ma
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveConnectionRegistry, ConnectionRegistrationError, ManagementWebApiHandler,
-        ManagementWebConfig, ManagementWebError, ManagementWebListener, ManagementWebService,
-        ManagementWebStream, gateway_health, with_gateway_headers,
+        ActiveConnectionRegistry, ConnectionRegistrationError, GatewayRoute, GatewaySessionHandle,
+        ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
+        ManagementWebService, ManagementWebStream, gateway_health, gateway_health_with_route,
+        with_gateway_headers,
     };
 
     #[test]
@@ -1205,12 +1640,39 @@ mod tests {
         assert!(rewritten.ends_with("\r\n\r\nbody"));
         assert!(with_gateway_headers(request, Some(&"A".repeat(64))).is_err());
     }
+
+    #[test]
+    fn rejects_whitespace_obfuscated_gateway_capability_headers_consistently() {
+        let remote = "127.0.0.1:12345"
+            .parse()
+            .expect("remote address should parse");
+        for request in [
+            b"GET /api/v1/system/health HTTP/1.1\r\n X-CMClient-Gateway-Capability: spoofed\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"GET /api/v1/system/health HTTP/1.1\r\nX-CMClient-Gateway-Capability : spoofed\r\nhost: localhost\r\n\r\n".as_slice(),
+            b"POST /api/v1/jobs HTTP/1.1\r\nhost: localhost\r\n transfer-encoding: chunked\r\n\r\n".as_slice(),
+            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\nX-CMClient-Gateway-Capability: spoofed\r\n\r\n".as_slice(),
+        ] {
+            assert!(matches!(
+                super::parse_request(request, remote),
+                Err(ManagementWebError::InvalidHttp)
+            ));
+            assert!(matches!(
+                with_gateway_headers(request, Some(&"a".repeat(64))),
+                Err(ManagementWebError::InvalidHttp)
+            ));
+            let header_end = super::header_end(request).expect("request should have a header");
+            assert!(matches!(
+                super::content_length(&request[..header_end]),
+                Err(ManagementWebError::InvalidHttp)
+            ));
+        }
+    }
     use std::{
         fs,
-        io::{Read, Write},
+        io::{Cursor, Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
         path::{Path, PathBuf},
-        sync::{Arc, mpsc},
+        sync::{Arc, atomic::AtomicBool, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -1294,6 +1756,44 @@ mod tests {
         &response[body_start..]
     }
 
+    fn send_request(address: SocketAddr, request: &[u8]) -> String {
+        let mut client = TcpStream::connect(address).expect("client should connect");
+        client.write_all(request).expect("request should write");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("response should read");
+        response
+    }
+
+    fn spawn_gateway(
+        expected_capability: String,
+        response_body: &'static str,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
+        let address = gateway.local_addr().expect("gateway address should load");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = gateway.accept().expect("gateway should accept");
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).expect("request should read");
+            let request = String::from_utf8(request[..count].to_vec())
+                .expect("gateway request should be UTF-8");
+            assert!(!request.contains("spoofed"));
+            assert_eq!(request.matches("x-cmclient-gateway-capability:").count(), 1);
+            assert!(request.contains(&format!(
+                "x-cmclient-gateway-capability: {expected_capability}\r\n"
+            )));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("gateway response should write");
+        });
+        (address, worker)
+    }
+
     fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("pair listener should bind");
         let client = TcpStream::connect(listener.local_addr().expect("pair address should load"))
@@ -1345,6 +1845,298 @@ mod tests {
             )?;
             Ok(true)
         }
+    }
+
+    #[test]
+    fn gateway_routes_are_loopback_capability_bound_and_redacted() {
+        let capability = "a".repeat(64);
+        let route = GatewayRoute::new(
+            "127.0.0.1:4810".parse().expect("address should parse"),
+            capability.clone(),
+        )
+        .expect("valid route should construct");
+        assert_eq!(route.address().to_string(), "127.0.0.1:4810");
+        let active = route.active().expect("route should be active");
+        assert_eq!(active.capability(), capability);
+        drop(active);
+        assert!(!format!("{route:?}").contains(&capability));
+
+        let session = GatewaySessionHandle::with_route(route.clone());
+        assert_eq!(session.snapshot(), Some(route));
+        assert!(!format!("{session:?}").contains(&capability));
+        let stale = session.snapshot().expect("route should snapshot");
+        session.clear();
+        assert!(session.snapshot().is_none());
+        assert!(!stale.is_active());
+        assert!(stale.active().is_none());
+
+        assert!(matches!(
+            GatewayRoute::new(
+                "192.0.2.1:4810".parse().expect("address should parse"),
+                "b".repeat(64),
+            ),
+            Err(ManagementWebError::InvalidHttp)
+        ));
+        assert!(matches!(
+            GatewayRoute::new(
+                "127.0.0.1:4810".parse().expect("address should parse"),
+                "B".repeat(64),
+            ),
+            Err(ManagementWebError::InvalidHttp)
+        ));
+        assert!(matches!(
+            GatewayRoute::new(
+                "127.0.0.1:0".parse().expect("address should parse"),
+                "c".repeat(64),
+            ),
+            Err(ManagementWebError::InvalidHttp)
+        ));
+        assert!(matches!(
+            GatewayRoute::new(
+                "[::1]:4810".parse().expect("address should parse"),
+                "d".repeat(64),
+            ),
+            Err(ManagementWebError::InvalidHttp)
+        ));
+    }
+
+    #[test]
+    fn session_rotation_revokes_old_snapshots_and_waits_for_capability_users() {
+        let first = GatewayRoute::new(
+            "127.0.0.1:4810".parse().expect("address should parse"),
+            "1".repeat(64),
+        )
+        .expect("first route should construct");
+        let session = GatewaySessionHandle::with_route(first);
+        let stale = session.snapshot().expect("first route should snapshot");
+        let active = stale.active().expect("first route should be active");
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (cleared_sender, cleared_receiver) = mpsc::sync_channel(1);
+        let clear_session = session.clone();
+        let clearer = thread::spawn(move || {
+            started_sender.send(()).expect("start signal should send");
+            clear_session.clear();
+            cleared_sender.send(()).expect("clear signal should send");
+        });
+        started_receiver.recv().expect("clear should start");
+        assert!(
+            cleared_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "clear must wait until the capability write lease is released"
+        );
+        drop(active);
+        cleared_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("clear should finish after the lease is released");
+        clearer.join().expect("clear thread should join");
+        assert!(!stale.is_active());
+
+        let second = GatewayRoute::new(
+            "127.0.0.1:4811".parse().expect("address should parse"),
+            "2".repeat(64),
+        )
+        .expect("second route should construct");
+        session.set(second);
+        let rotated = session.snapshot().expect("second route should snapshot");
+        assert_eq!(rotated.address().port(), 4811);
+        assert!(rotated.is_active());
+        session.set(
+            GatewayRoute::new(
+                "127.0.0.1:4812".parse().expect("address should parse"),
+                "4".repeat(64),
+            )
+            .expect("third route should construct"),
+        );
+        assert!(!rotated.is_active());
+        assert!(
+            session
+                .snapshot()
+                .is_some_and(|route| route.address().port() == 4812 && route.is_active())
+        );
+    }
+
+    #[test]
+    fn stale_dynamic_proxy_snapshot_never_sends_capability_to_reused_port() {
+        let original = TcpListener::bind("127.0.0.1:0").expect("original port should bind");
+        let address = original.local_addr().expect("original address should load");
+        let route = GatewayRoute::new(address, "3".repeat(64)).expect("route should construct");
+        let session = GatewaySessionHandle::with_route(route.clone());
+        let stale = super::GatewayRouteSource::dynamic(session.clone())
+            .snapshot()
+            .expect("route should resolve before clear");
+
+        drop(original);
+        session.clear();
+        let reused = TcpListener::bind(address).expect("cleared port should be reusable");
+        reused
+            .set_nonblocking(true)
+            .expect("reused listener should be nonblocking");
+        assert!(!gateway_health_with_route(&route));
+        let mut response = Cursor::new(Vec::new());
+        super::proxy_api(
+            &mut response,
+            &stale,
+            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n\r\n",
+            &AtomicBool::new(true),
+        )
+        .expect("stale proxy should fail closed");
+        assert!(
+            String::from_utf8(response.into_inner())
+                .expect("response should be UTF-8")
+                .starts_with("HTTP/1.1 503 Service Unavailable")
+        );
+        assert!(matches!(
+            reused.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn dynamic_gateway_session_rotates_without_restarting_management_web() {
+        let session = GatewaySessionHandle::new();
+        let service = ManagementWebService::start_with_api_handler_and_gateway_session(
+            &ManagementWebConfig {
+                port: 0,
+                gateway: "192.0.2.1:9".parse().expect("address should parse"),
+                gateway_capability: Some(String::from("ignored-static-value")),
+                ..Default::default()
+            },
+            Arc::new(AgentRoute),
+            session.clone(),
+        )
+        .expect("dynamic management service should start");
+        let management_address = service.local_addr();
+
+        let agent_response = send_request(
+            management_address,
+            b"GET /api/v1/updates HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        assert!(agent_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(agent_response.contains("{\"schemaVersion\":1}"));
+
+        let unavailable = send_request(
+            management_address,
+            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        assert!(unavailable.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert_eq!(
+            response_body(unavailable.as_bytes()),
+            br#"{"code":"GATEWAY_PROXY_UNAVAILABLE"}"#
+        );
+
+        let first_capability = "1".repeat(64);
+        let (first_address, first_gateway) =
+            spawn_gateway(first_capability.clone(), r#"{"generation":1}"#);
+        session.set(
+            GatewayRoute::new(first_address, first_capability)
+                .expect("first route should construct"),
+        );
+        let first = send_request(
+            management_address,
+            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\nX-CMClient-Gateway-Capability: spoofed\r\n\r\n",
+        );
+        assert!(first.starts_with("HTTP/1.1 200 OK"));
+        assert!(first.ends_with(r#"{"generation":1}"#));
+        first_gateway.join().expect("first gateway should join");
+
+        session.clear();
+        let unavailable = send_request(
+            management_address,
+            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n\r\n",
+        );
+        assert!(unavailable.starts_with("HTTP/1.1 503 Service Unavailable"));
+
+        let second_capability = "2".repeat(64);
+        let (second_address, second_gateway) =
+            spawn_gateway(second_capability.clone(), r#"{"generation":2}"#);
+        session.set(
+            GatewayRoute::new(second_address, second_capability)
+                .expect("second route should construct"),
+        );
+        let second = send_request(
+            management_address,
+            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\nX-CMClient-Gateway-Capability: spoofed\r\n\r\n",
+        );
+        assert!(second.starts_with("HTTP/1.1 200 OK"));
+        assert!(second.ends_with(r#"{"generation":2}"#));
+        assert_eq!(service.local_addr(), management_address);
+        second_gateway.join().expect("second gateway should join");
+        service.stop().expect("management service should stop");
+    }
+
+    #[test]
+    fn gateway_health_with_route_authenticates_with_the_exact_capability() {
+        let capability = "3".repeat(64);
+        let (address, gateway) = spawn_gateway(capability.clone(), r#"{"status":"ok"}"#);
+        let route = GatewayRoute::new(address, capability).expect("route should construct");
+
+        assert!(gateway_health_with_route(&route));
+        gateway.join().expect("gateway should join");
+    }
+
+    #[test]
+    fn gateway_health_requires_an_exact_bounded_http_json_response() {
+        let valid = b"HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: 15\r\nconnection: close\r\n\r\n{\"status\":\"ok\"}";
+        assert_eq!(super::validate_gateway_health_response(valid), Ok(true));
+
+        for body in [
+            r#"{"status":"bad","message":"{\"status\":\"ok\"}"}"#,
+            r#"{"status":"ok","extra":true}"#,
+        ] {
+            let invalid = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            assert_eq!(
+                super::validate_gateway_health_response(invalid.as_bytes()),
+                Err(())
+            );
+        }
+        for invalid in [
+            b"HTTP/1.0 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"status\":\"ok\"}".as_slice(),
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\nf\r\n{\"status\":\"ok\"}\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 5000\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"status\":\"ok\"}trailing".as_slice(),
+        ] {
+            assert_eq!(super::validate_gateway_health_response(invalid), Err(()));
+        }
+        assert_eq!(
+            super::validate_gateway_health_response(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"status\":"
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn gateway_health_uses_one_total_deadline_against_drip_responses() {
+        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
+        let address = gateway.local_addr().expect("gateway address should load");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = gateway.accept().expect("gateway should accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream
+                .read(&mut request)
+                .expect("health request should read");
+            for _ in 0..30 {
+                if stream.write_all(b"H").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let started = Instant::now();
+        assert!(!super::gateway_health_request(
+            address,
+            None,
+            Duration::from_millis(80)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "health probe exceeded its single total deadline"
+        );
+        worker.join().expect("gateway should join");
     }
 
     #[test]

@@ -1,9 +1,18 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import type { Server } from "node:http";
+import type { Duplex } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 
 export const GATEWAY_CAPABILITY_HEADER = "x-cmclient-gateway-capability";
 export const GATEWAY_PRIVATE_FRAME_MAX_BYTES = 4096;
 export const GATEWAY_BOOTSTRAP_DEADLINE_MS = 5000;
+export const GATEWAY_OWNERSHIP_PATH = "/_cmclient/bootstrap/ownership";
+export const GATEWAY_OWNERSHIP_CHALLENGE_HEADER =
+  "x-cmclient-gateway-ownership-challenge";
+export const GATEWAY_OWNERSHIP_PROOF_HEADER =
+  "x-cmclient-gateway-ownership-proof";
+const GATEWAY_OWNERSHIP_PROTOCOL = "cmclient-bootstrap-ownership-v1";
+const GATEWAY_OWNERSHIP_DOMAIN = "cmclient.gateway.bootstrap-ownership.v1";
 
 export interface GatewayBootstrapFrame {
   schemaVersion: 1;
@@ -64,12 +73,12 @@ export async function readGatewayBootstrap(
   return value as unknown as GatewayBootstrapFrame;
 }
 
-export function writeGatewayReady(
+export async function writeGatewayReady(
   output: Writable,
   bootstrap: GatewayBootstrapFrame,
   address: { host: string; port: number },
   pid = process.pid,
-): void {
+): Promise<void> {
   if (
     address.host !== "127.0.0.1" ||
     !Number.isInteger(address.port) ||
@@ -88,7 +97,77 @@ export function writeGatewayReady(
     host: "127.0.0.1",
     port: address.port,
   };
-  output.write(encodePrivateFrame(frame));
+  await endPrivateOutput(output, encodePrivateFrame(frame));
+}
+
+export async function startSupervisedGateway(
+  output: Writable,
+  bootstrap: GatewayBootstrapFrame,
+  bindControlPlane: () => Promise<{ host: string; port: number }>,
+  startExternalRuntimes: () => Promise<void>,
+): Promise<void> {
+  const address = await bindControlPlane();
+  await writeGatewayReady(output, bootstrap, address);
+  await startExternalRuntimes();
+}
+
+export function registerGatewayOwnershipProofEndpoint(
+  server: Server,
+  bootstrap: GatewayBootstrapFrame,
+  address: { host: string; port: number },
+  pid = process.pid,
+): void {
+  if (
+    address.host !== "127.0.0.1" ||
+    !Number.isInteger(address.port) ||
+    address.port < 1 ||
+    address.port > 65_535 ||
+    !Number.isInteger(pid) ||
+    pid < 1
+  ) {
+    throw new GatewayBootstrapError("GATEWAY_OWNERSHIP_ENDPOINT_INVALID");
+  }
+  server.on("upgrade", (request, socket, head) => {
+    const challenge = exactRawHeader(
+      request.rawHeaders,
+      GATEWAY_OWNERSHIP_CHALLENGE_HEADER,
+    );
+    if (
+      request.method !== "GET" ||
+      request.httpVersion !== "1.1" ||
+      request.url !== GATEWAY_OWNERSHIP_PATH ||
+      hasRawHeader(request.rawHeaders, GATEWAY_CAPABILITY_HEADER) ||
+      exactRawHeader(request.rawHeaders, "host") !==
+        `127.0.0.1:${address.port}` ||
+      exactRawHeader(request.rawHeaders, "connection")?.toLowerCase() !==
+        "upgrade" ||
+      exactRawHeader(request.rawHeaders, "upgrade")?.toLowerCase() !==
+        GATEWAY_OWNERSHIP_PROTOCOL ||
+      exactRawHeader(request.rawHeaders, "content-length") !== "0" ||
+      request.headers["transfer-encoding"] !== undefined ||
+      !isLowerHex(challenge, 64) ||
+      head.length !== 0
+    ) {
+      rejectOwnershipProbe(socket);
+      return;
+    }
+
+    const proof = createHmac("sha256", bootstrap.capability)
+      .update(
+        gatewayOwnershipTranscript(
+          bootstrap.startupNonce,
+          pid,
+          address.host,
+          address.port,
+          challenge,
+        ),
+      )
+      .digest("hex");
+    socket.end(
+      `HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n${GATEWAY_OWNERSHIP_PROOF_HEADER}: ${proof}\r\n\r\n`,
+      "ascii",
+    );
+  });
 }
 
 export function gatewayCapabilityMatches(
@@ -128,6 +207,13 @@ async function readPrivateFrame(
 
     const onData = (chunk: Buffer | string): void => {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (
+        bytes.length >
+        GATEWAY_PRIVATE_FRAME_MAX_BYTES + 4 - buffered.length
+      ) {
+        finish(new GatewayBootstrapError("GATEWAY_PRIVATE_FRAME_OVERSIZED"));
+        return;
+      }
       buffered = Buffer.concat([buffered, bytes]);
       if (buffered.length >= 4 && expectedLength === undefined) {
         expectedLength = buffered.readUInt32BE(0);
@@ -181,6 +267,78 @@ async function readPrivateFrame(
     input.once("end", onEnd);
     input.once("error", onError);
     input.resume();
+  });
+}
+
+function gatewayOwnershipTranscript(
+  startupNonce: string,
+  pid: number,
+  host: string,
+  port: number,
+  challenge: string,
+): string {
+  return `${GATEWAY_OWNERSHIP_DOMAIN}\n${startupNonce}\n${pid}\n${host}\n${port}\n${challenge}`;
+}
+
+function exactRawHeader(
+  rawHeaders: readonly string[],
+  expectedName: string,
+): string | undefined {
+  const values: string[] = [];
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    if (rawHeaders[index]?.toLowerCase() === expectedName.toLowerCase()) {
+      values.push(rawHeaders[index + 1] ?? "");
+    }
+  }
+  return values.length === 1 ? values[0] : undefined;
+}
+
+function hasRawHeader(
+  rawHeaders: readonly string[],
+  expectedName: string,
+): boolean {
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    if (rawHeaders[index]?.toLowerCase() === expectedName.toLowerCase()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function rejectOwnershipProbe(socket: Duplex): void {
+  socket.end(
+    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+    "ascii",
+  );
+}
+
+async function endPrivateOutput(
+  output: Writable,
+  frame: Buffer,
+): Promise<void> {
+  if (output.destroyed || output.writableEnded) {
+    throw new GatewayBootstrapError("GATEWAY_READY_PIPE_FAILED");
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      output.off("error", onError);
+      output.off("finish", onFinish);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (): void =>
+      finish(new GatewayBootstrapError("GATEWAY_READY_PIPE_FAILED"));
+    const onFinish = (): void => finish();
+    output.once("error", onError);
+    output.once("finish", onFinish);
+    try {
+      output.end(frame);
+    } catch {
+      onError();
+    }
   });
 }
 

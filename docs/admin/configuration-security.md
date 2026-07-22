@@ -12,7 +12,6 @@ data and never put secret values in this file.
 
 ```toml
 [agent]
-gateway_port = 4810
 management_web_enabled = true
 
 [callmesh]
@@ -38,6 +37,36 @@ port = 4404
 mode = "monitor"
 allow_lan = false
 ```
+
+Native Agent configuration has no Gateway host or port authority. Gateway
+binds an OS-assigned loopback port for each supervised generation and returns
+the address over its private bootstrap channel; Agent keeps the address and
+capability only in memory. A legacy `gateway_port` field is rejected as an
+unknown setting. Web, graphical, and command modes use Agent-owned routes and
+must not connect to the raw Gateway listener.
+
+Before sending that capability on any ordinary Gateway request, Agent proves
+that the process which returned the ready frame owns the loopback listener. It
+sends a fresh 64-character lowercase-hex challenge in an exact HTTP/1.1 Upgrade
+request to `/_cmclient/bootstrap/ownership`; the request contains no capability.
+Gateway returns only a lowercase-hex HMAC-SHA256 proof keyed by the memory-only
+capability over this domain-separated transcript:
+
+```text
+cmclient.gateway.bootstrap-ownership.v1
+<startup nonce>
+<child PID>
+127.0.0.1
+<dynamic port>
+<fresh challenge>
+```
+
+The zero-body response is capped at 4 KiB and shares the bounded bootstrap
+deadline. The raw capability is never returned, written to disk, or included in
+logs or evidence. Only after ownership succeeds may Agent capability-authenticate
+the version endpoint and verify the exact product identity. A malformed,
+timed-out, oversized, stale, or forged exchange fails closed: Agent publishes no
+session and terminates and reaps the supervised process tree.
 
 Meshtastic `transport` is either `tcp` or `serial`, never both. Serial requires
 a non-empty, control-character-free platform device identifier of at most 4096
@@ -149,10 +178,12 @@ require the session, matching Origin, and CSRF header. Login attempts and
 sessions are bounded and pruned, and the audit ring stores only stable action
 and result codes.
 
-The Gateway Fastify routes are not an independent LAN security boundary. They
-are intended to be loopback-only behind Agent. Docker exposes only its fixed
-Ingress. Do not publish a raw Gateway port and assume browser session/CSRF
-protection still applies.
+The Gateway Fastify routes are not an independent LAN security boundary. In a
+native deployment they are bound to an OS-assigned loopback port behind Agent,
+authenticated with a per-generation capability, and never configured or
+published directly. Docker's standalone composition retains its fixed internal
+Ingress as a separate deployment boundary. Do not publish a raw Gateway port
+and assume browser session/CSRF protection still applies.
 
 ## Remote CLI HMAC
 
@@ -169,12 +200,13 @@ window and rejects nonce replay. Required headers are documented in
 
 ## Fail-closed rules
 
-Invalid paths, unknown TOML fields, zero Gateway ports, mixed transports,
-missing TLS files, weak Argon2 parameters, invalid origins, expired sessions,
-malformed HMAC headers, replayed nonces, insufficient GPS precision, and
-unprovable position freshness are rejected. Secrets and raw packet payloads are
-redacted from structured logs and diagnostics. Error handling uses stable codes
-and bounded parameters rather than backend prose.
+Invalid paths, unknown TOML fields (including legacy `gateway_port`), mixed
+transports, missing TLS files, weak Argon2 parameters, invalid origins, expired
+sessions, malformed HMAC headers, replayed nonces or stale ownership proofs,
+insufficient GPS precision, and unprovable position freshness are rejected.
+Secrets and raw packet payloads are redacted from structured logs and
+diagnostics. Error handling uses stable codes and bounded parameters rather
+than backend prose.
 
 Update signing keys are release credentials, not runtime configuration. The
 production signing workflow exposes them only after protected human approval;

@@ -13,6 +13,37 @@ const DEFAULT_AUTHORITATIVE_DOCUMENTS = Object.freeze([
 
 const IMMUTABLE_GRAPH_DOCUMENT = "scripts/unified-task-graph-lock.json";
 
+const NATIVE_FIXED_PORT_SOURCES = Object.freeze([
+  ".github/workflows/ci.yml",
+  ".github/workflows/release-build.yml",
+  "apps/agent/src/main.rs",
+  "crates/agent-core/src/lib.rs",
+  "docs/architecture/agent-runtime.md",
+  "docs/architecture/gateway-runtime.md",
+  "docs/admin/configuration-security.md",
+  "scripts/release-bundle-smoke.sh",
+  "scripts/cmclient-systemd-integration.sh",
+]);
+
+const DOCKER_STANDALONE_PORT_SOURCES = new Set([
+  "Dockerfile",
+  "docker-compose.yml",
+  "docs/architecture/docker-deployment.md",
+  "scripts/container-runtime.mjs",
+  "scripts/container-runtime.test.mjs",
+]);
+
+const NATIVE_FIXED_PORT_PATTERNS = Object.freeze([
+  {
+    code: "NATIVE_GATEWAY_PORT_AUTHORITY",
+    pattern: /^\s*gateway_port\s*=/im,
+  },
+  {
+    code: "NATIVE_GATEWAY_PORT_ENV_INJECTION",
+    pattern: /\bCMCLIENT_GATEWAY_PORT\b/i,
+  },
+]);
+
 const LEGACY_PREBIND_PATTERNS = Object.freeze([
   {
     code: "AGENT_PREBINDS_LISTENER",
@@ -360,6 +391,30 @@ export function findLegacyPrebindClaims(text, source = "<text>") {
   return errors;
 }
 
+export function findNativeFixedPortClaims(text, source = "<text>") {
+  const normalizedSource = String(source)
+    .replaceAll("\\", "/")
+    .replace(/^\.\//, "");
+  if (DOCKER_STANDALONE_PORT_SOURCES.has(normalizedSource)) {
+    return [];
+  }
+  const errors = [];
+  const value = String(text);
+  for (const { code, pattern } of NATIVE_FIXED_PORT_PATTERNS) {
+    const match = pattern.exec(value);
+    if (match) {
+      const line = value.slice(0, match.index).split(/\r?\n/).length;
+      errors.push(
+        error(
+          `P13_T12_NATIVE_FIXED_PORT_CONTRACT:${code}`,
+          `${source}:${line}`,
+        ),
+      );
+    }
+  }
+  return errors;
+}
+
 export async function checkRepository(
   repositoryRoot = resolve("."),
   { includeImmutableGraph = true } = {},
@@ -416,6 +471,21 @@ export async function checkRepository(
     }
     authorityText += `\n${activeText}`;
     errors.push(...findLegacyPrebindClaims(activeText, relativePath));
+  }
+  for (const relativePath of NATIVE_FIXED_PORT_SOURCES) {
+    let text;
+    try {
+      text = await readFile(resolve(repositoryRoot, relativePath), "utf8");
+    } catch (cause) {
+      errors.push(
+        error(
+          "P13_T12_NATIVE_PORT_SOURCE_READ_FAILED",
+          `${relativePath}: ${cause.message}`,
+        ),
+      );
+      continue;
+    }
+    errors.push(...findNativeFixedPortClaims(text, relativePath));
   }
   for (const { code, pattern } of REQUIRED_REPAIRED_CONTRACT_PATTERNS) {
     if (!pattern.test(authorityText)) {

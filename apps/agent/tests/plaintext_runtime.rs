@@ -7,7 +7,6 @@ use std::{
     fs,
     fs::OpenOptions,
     io::ErrorKind,
-    net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -49,45 +48,201 @@ impl Fixture {
             set_private_mode(directory);
         }
 
-        let gateway_script = root.join("gateway-fixture.sh");
+        let gateway_script = root.join("gateway-fixture.mjs");
         fs::write(
             &gateway_script,
-            r#"#!/bin/sh
-set -eu
-marker="$1"
-if [ "${CMCLIENT_PLAINTEXT_SECRET_FILE+x}" = x ]; then
-  printf '%s' 'selector-leaked' > "$marker"
-elif [ "${CMCLIENT_APRS_PASSCODE+x}" = x ] || [ "${CMCLIENT_CONTROL_TOKEN+x}" = x ] || [ "${CMCLIENT_SYSTEMD_SECRET_STORE+x}" = x ]; then
-  printf '%s' 'sensitive-env-leaked' > "$marker"
-elif [ "${CMCLIENT_CALLMESH_URL:-}" != 'https://callmesh.example.invalid' ]; then
-  printf '%s' 'url-mismatch' > "$marker"
-elif [ "${CMCLIENT_CALLMESH_API_KEY+x}" = x ]; then
-  if [ "$CMCLIENT_CALLMESH_API_KEY" = 'fixture-callmesh-value' ]; then
-    printf '%s' 'key-present' > "$marker"
-  else
-    printf '%s' 'key-unexpected' > "$marker"
-  fi
-else
-  printf '%s' 'key-absent' > "$marker"
-fi
-IFS= read -r _ || true
+            r#"import { createHmac } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+
+const OWNERSHIP_PATH = "/_cmclient/bootstrap/ownership";
+const OWNERSHIP_PROTOCOL = "cmclient-bootstrap-ownership-v1";
+const OWNERSHIP_DOMAIN = "cmclient.gateway.bootstrap-ownership.v1";
+const OWNERSHIP_CHALLENGE_HEADER =
+  "x-cmclient-gateway-ownership-challenge";
+const OWNERSHIP_PROOF_HEADER = "x-cmclient-gateway-ownership-proof";
+
+const marker = process.argv[2];
+let markerState = "key-absent";
+if (Object.hasOwn(process.env, "CMCLIENT_PLAINTEXT_SECRET_FILE")) {
+  markerState = "selector-leaked";
+} else if (
+  Object.hasOwn(process.env, "CMCLIENT_APRS_PASSCODE") ||
+  Object.hasOwn(process.env, "CMCLIENT_CONTROL_TOKEN") ||
+  Object.hasOwn(process.env, "CMCLIENT_SYSTEMD_SECRET_STORE")
+) {
+  markerState = "sensitive-env-leaked";
+} else if (process.env.CMCLIENT_CALLMESH_URL !== "https://callmesh.example.invalid") {
+  markerState = "url-mismatch";
+} else if (Object.hasOwn(process.env, "CMCLIENT_CALLMESH_API_KEY")) {
+  markerState =
+    process.env["CMCLIENT_CALLMESH_API_KEY"] === "fixture-callmesh-value"
+      ? "key-present"
+      : "key-unexpected";
+}
+writeFileSync(marker, markerState, { mode: 0o600 });
+
+let input = Buffer.alloc(0);
+let bootstrap;
+let server;
+let shuttingDown = false;
+let ownershipProven = false;
+
+process.stdin.on("data", (chunk) => {
+  input = Buffer.concat([input, chunk]);
+  if (!bootstrap) {
+    if (input.length < 4) return;
+    const length = input.readUInt32BE(0);
+    if (length < 1 || length > 4096 || input.length < length + 4) return;
+    bootstrap = JSON.parse(input.subarray(4, length + 4).toString("utf8"));
+    input = input.subarray(length + 4);
+    startGateway();
+  }
+  if (input.includes(Buffer.from("CMCLIENT_SHUTDOWN\n"))) shutdown();
+});
+process.stdin.once("end", shutdown);
+process.stdin.resume();
+
+function startGateway() {
+  server = createServer((request, response) => {
+    if (!ownershipProven) {
+      return sendJson(response, 403, { code: "GATEWAY_OWNERSHIP_REQUIRED" });
+    }
+    if (
+      request.headers["x-cmclient-gateway-capability"] !== bootstrap.capability
+    ) {
+      return sendJson(response, 403, { code: "GATEWAY_CAPABILITY_REQUIRED" });
+    }
+    if (request.url === "/api/v1/system/health") {
+      return sendJson(response, 200, { status: "ok" });
+    }
+    if (request.url === "/api/v1/system/version") {
+      return sendJson(response, 200, {
+        schemaVersion: 1,
+        component: "gateway",
+        identity: {
+          schemaVersion: 1,
+          product: "CMClient",
+          version: process.env.CMCLIENT_BUILD_VERSION,
+          sourceCommit: process.env.CMCLIENT_BUILD_COMMIT,
+          sourceTree: process.env.CMCLIENT_BUILD_TREE,
+          channel: process.env.CMCLIENT_BUILD_CHANNEL,
+          target: {
+            os: process.env.CMCLIENT_TARGET_OS,
+            architecture: process.env.CMCLIENT_TARGET_ARCHITECTURE,
+            profile: process.env.CMCLIENT_RUNTIME_PROFILE,
+            packageProfile: process.env.CMCLIENT_PACKAGE_PROFILE,
+          },
+        },
+      });
+    }
+    return sendJson(response, 404, { code: "NOT_FOUND" });
+  });
+  server.on("upgrade", (request, socket, head) => {
+    const address = server.address();
+    const challenge = exactRawHeader(
+      request.rawHeaders,
+      OWNERSHIP_CHALLENGE_HEADER,
+    );
+    if (
+      address === null ||
+      typeof address === "string" ||
+      request.method !== "GET" ||
+      request.url !== OWNERSHIP_PATH ||
+      exactRawHeader(request.rawHeaders, "host") !==
+        `127.0.0.1:${address.port}` ||
+      exactRawHeader(request.rawHeaders, "connection")?.toLowerCase() !==
+        "upgrade" ||
+      exactRawHeader(request.rawHeaders, "upgrade")?.toLowerCase() !==
+        OWNERSHIP_PROTOCOL ||
+      exactRawHeader(request.rawHeaders, "content-length") !== "0" ||
+      request.headers["transfer-encoding"] !== undefined ||
+      request.headers["x-cmclient-gateway-capability"] !== undefined ||
+      !isLowerHex(challenge, 64) ||
+      head.length !== 0
+    ) {
+      socket.end(
+        "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        "ascii",
+      );
+      return;
+    }
+
+    const transcript = `${OWNERSHIP_DOMAIN}\n${bootstrap.startupNonce}\n${process.pid}\n127.0.0.1\n${address.port}\n${challenge}`;
+    const proof = createHmac("sha256", bootstrap.capability)
+      .update(transcript, "utf8")
+      .digest("hex");
+    socket.end(
+      `HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n${OWNERSHIP_PROOF_HEADER}: ${proof}\r\n\r\n`,
+      "ascii",
+    );
+    ownershipProven = true;
+  });
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    const body = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 1,
+        type: "gateway.ready",
+        pid: process.pid,
+        startupNonce: bootstrap.startupNonce,
+        host: "127.0.0.1",
+        port: address.port,
+      }),
+      "utf8",
+    );
+    const frame = Buffer.allocUnsafe(body.length + 4);
+    frame.writeUInt32BE(body.length, 0);
+    body.copy(frame, 4);
+    process.stdout.end(frame);
+  });
+}
+
+function exactRawHeader(rawHeaders, expectedName) {
+  const values = [];
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    if (rawHeaders[index]?.toLowerCase() === expectedName.toLowerCase()) {
+      values.push(rawHeaders[index + 1] ?? "");
+    }
+  }
+  return values.length === 1 ? values[0] : undefined;
+}
+
+function isLowerHex(value, length) {
+  return (
+    typeof value === "string" &&
+    value.length === length &&
+    /^[0-9a-f]+$/.test(value)
+  );
+}
+
+function sendJson(response, status, value) {
+  const body = JSON.stringify(value);
+  response.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body),
+    connection: "close",
+  });
+  response.end(body);
+}
+
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (!server) return process.exit(0);
+  server.close(() => process.exit(0));
+}
 "#,
         )
         .expect("gateway fixture should write");
         set_private_mode(&gateway_script);
 
         let marker = root.join("gateway-marker");
-        let gateway_port = TcpListener::bind(("127.0.0.1", 0))
-            .expect("fixture port should bind")
-            .local_addr()
-            .expect("fixture address should load")
-            .port();
         let config = config_dir.join("agent.toml");
         let config_text = format!(
-            "[agent]\ngateway_command = [\"/bin/sh\", {}, {}]\ngateway_port = {}\nmanagement_web_enabled = false\n\n[callmesh]\nurl = \"{}\"\n",
+            "[agent]\ngateway_command = [\"node\", {}, {}]\nmanagement_web_enabled = false\n\n[callmesh]\nurl = \"{}\"\n",
             toml_string(&gateway_script),
             toml_string(&marker),
-            gateway_port,
             CALLMESH_URL,
         );
         fs::write(&config, config_text).expect("Agent config should write");
@@ -117,7 +272,10 @@ IFS= read -r _ || true
             .arg("--serve")
             .env_clear()
             .env("HOME", self.root.join("home"))
-            .env("PATH", "/usr/bin:/bin")
+            .env(
+                "PATH",
+                std::env::var("PATH").expect("source test PATH should exist"),
+            )
             .env("CMCLIENT_AGENT_CONFIG", &self.config)
             .env("CMCLIENT_DATA_DIR", &self.data)
             .env(

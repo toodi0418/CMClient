@@ -5,17 +5,36 @@ APRS domain work. Agent passes only a bounded bootstrap frame through a private
 inherited channel, plus the absolute Agent-owned data paths and validated
 operational configuration required by the runtime. Gateway validates bootstrap,
 atomically binds `127.0.0.1:0`, and reports its port, PID, and startup nonce back
-through that channel. It never reads Agent configuration, manages a service, or
-updates itself.
+through that channel. The address and capability are per-generation,
+memory-only native session state; no native configuration owns or publishes a
+Gateway port. It never reads Agent configuration, manages a service, or updates
+itself. The standalone Docker composition retains its fixed internal Ingress,
+which is not a fallback for native Agent supervision.
 
 ## Startup and shutdown
 
 Gateway opens the migrated SQLite database, recovers persistent Jobs, and
-constructs CallMesh, Proxy, maintenance, APRS, and Meshtastic runtimes. Enabled
-runtimes start before the Fastify listener. A startup failure emits a stable
-code, stops already-started runtimes, and closes SQLite. Shutdown requests share
-one terminal promise. Cleanup runs in ordered phases while settling every member
-of a phase: HTTP and maintenance, Mesh/APRS/Proxy producers, Jobs, then SQLite.
+constructs CallMesh, Proxy, maintenance, APRS, and Meshtastic runtimes. Under
+Agent supervision it first binds the capability-protected Fastify control plane
+to `127.0.0.1:0`, writes the ready frame, and then starts external runtimes. This
+keeps the private bootstrap deadline independent of external service latency;
+Agent still withholds the session and the capability from ordinary HTTP until
+listener ownership is proven. Gateway accepts only the exact HTTP/1.1 Upgrade
+request on `/_cmclient/bootstrap/ownership`, with a fresh 64-character
+lowercase-hex challenge, exact loopback host/port, zero body, and no capability
+header. It returns a zero-body response containing only an HMAC-SHA256 proof
+keyed by the memory-only capability over the domain-separated nonce, PID,
+loopback address, port, and challenge transcript. The proof response is bounded
+to 4 KiB and never returns or logs the raw capability. Agent then uses the
+capability on the version endpoint and publishes the session only after exact
+product identity verification succeeds.
+
+A startup or ownership failure emits a stable code, stops already-started
+runtimes, and closes SQLite. Supervisor additionally terminates and reaps the
+whole process tree on a bootstrap timeout, malformed/oversized exchange, forged
+proof, listener takeover, or early exit. Shutdown requests share one terminal
+promise. Cleanup runs in ordered phases while settling every member of a phase:
+HTTP and maintenance, Mesh/APRS/Proxy producers, Jobs, then SQLite.
 A component failure produces `GATEWAY_SHUTDOWN_FAILED` only after all later
 cleanup phases have run, so a failed transport close cannot skip Job drain or
 the final database decision. In an Agent deployment, a private bounded stdin

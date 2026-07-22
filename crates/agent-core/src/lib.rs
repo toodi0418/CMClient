@@ -37,7 +37,6 @@ pub struct AgentConfig {
     pub paths: RuntimePaths,
     pub config_file: PathBuf,
     pub gateway_command: Option<Vec<String>>,
-    pub gateway_port: u16,
     pub callmesh: Option<CallMeshConfig>,
     pub meshtastic: Option<MeshtasticConfig>,
     pub aprs: Option<AprsConfig>,
@@ -143,7 +142,6 @@ pub enum ConfigError {
     ReadConfig { path: PathBuf },
     InvalidConfig,
     EmptyGatewayCommand,
-    InvalidGatewayPort,
     InvalidCallMesh,
     InvalidMeshtastic,
     InvalidAprs,
@@ -182,7 +180,6 @@ impl ConfigError {
             Self::ReadConfig { .. } => "AGENT_CONFIG_READ_FAILED",
             Self::InvalidConfig => "AGENT_CONFIG_INVALID",
             Self::EmptyGatewayCommand => "AGENT_CONFIG_GATEWAY_COMMAND_EMPTY",
-            Self::InvalidGatewayPort => "AGENT_CONFIG_GATEWAY_PORT_INVALID",
             Self::InvalidCallMesh => "AGENT_CONFIG_CALLMESH_INVALID",
             Self::InvalidMeshtastic => "AGENT_CONFIG_MESHTASTIC_INVALID",
             Self::InvalidAprs => "AGENT_CONFIG_APRS_INVALID",
@@ -261,7 +258,6 @@ struct ProxySection {
 #[serde(deny_unknown_fields)]
 struct AgentSection {
     gateway_command: Option<Vec<String>>,
-    gateway_port: Option<u16>,
     management_web_enabled: Option<bool>,
 }
 
@@ -306,10 +302,6 @@ impl AgentConfig {
             command.is_empty() || command.iter().any(|argument| argument.is_empty())
         }) {
             return Err(ConfigError::EmptyGatewayCommand);
-        }
-        let gateway_port = agent.gateway_port.unwrap_or(4810);
-        if gateway_port == 0 {
-            return Err(ConfigError::InvalidGatewayPort);
         }
         let management_lan = file_config
             .management_lan
@@ -361,7 +353,6 @@ impl AgentConfig {
             paths,
             config_file,
             gateway_command: agent.gateway_command,
-            gateway_port,
             callmesh,
             meshtastic,
             aprs,
@@ -729,7 +720,7 @@ mod tests {
         let config_file = directory.join("agent.toml");
         fs::write(
             &config_file,
-            "[agent]\ngateway_command = [\"gateway\", \"serve\"]\ngateway_port = 4811\nmanagement_web_enabled = false\n",
+            "[agent]\ngateway_command = [\"gateway\", \"serve\"]\nmanagement_web_enabled = false\n",
         )
         .expect("configuration should be written");
         let mut environment = environment();
@@ -744,20 +735,22 @@ mod tests {
             config.gateway_command,
             Some(vec![String::from("gateway"), String::from("serve")])
         );
-        assert_eq!(config.gateway_port, 4811);
         assert!(!config.management_web_enabled);
         assert!(is_config_file(&config.config_file));
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 
     #[test]
-    fn rejects_an_ephemeral_gateway_port() {
+    fn rejects_the_removed_gateway_port_setting() {
         let directory =
             std::env::temp_dir().join(format!("cmclient-agent-port-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("temporary directory should exist");
         let config_file = directory.join("agent.toml");
-        fs::write(&config_file, "[agent]\ngateway_port = 0\n")
-            .expect("configuration should be written");
+        fs::write(
+            &config_file,
+            ["[agent]\n", "gateway_", "port = 4810\n"].concat(),
+        )
+        .expect("configuration should be written");
         let mut environment = environment();
         environment.insert(
             String::from("CMCLIENT_AGENT_CONFIG"),
@@ -766,7 +759,7 @@ mod tests {
 
         assert_eq!(
             AgentConfig::from_environment(&environment),
-            Err(ConfigError::InvalidGatewayPort)
+            Err(ConfigError::InvalidConfig)
         );
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }

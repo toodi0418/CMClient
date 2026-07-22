@@ -11,13 +11,19 @@ only with absolute paths. Relative overrides fail with a stable configuration
 error code. The Agent creates its runtime directories after configuration
 validation.
 
-The optional `agent.toml` accepts loopback operational settings by default:
+The optional `agent.toml` accepts Agent-owned operational settings:
 
 ```toml
 [agent]
-gateway_port = 4810
 management_web_enabled = true
 ```
+
+Native deployments do not accept a Gateway host or port setting. For every
+Gateway generation, the child atomically binds an OS-assigned loopback port and
+returns it over the private bootstrap channel. Agent keeps that address and its
+capability only in memory, rotates both on restart, and routes Web, graphical,
+and command-mode requests through the current session. Operators and clients
+must not probe, reserve, publish, or connect to a raw native Gateway port.
 
 In a staged Headless, Desktop, or Service layout, Agent locates the adjacent
 `gateway/dist/main.js` and `web/` production outputs relative to its own
@@ -161,11 +167,28 @@ code, never addresses, credentials, cookies, or tokens.
 The Agent delivers a bounded memory-only bootstrap frame through the supervised
 Gateway's inherited private pipe; the frame carries the startup nonce and
 capability, never a listener address or a secret-bearing environment value.
-Gateway validates that frame before opening its data store, atomically binds
-`127.0.0.1:0`, and returns the OS-assigned port, child PID, and nonce through the
-same private channel. The Agent publishes a session only after validating that
-ready frame, so there is no fixed-port probe or release/rebind window and no
-Gateway listener is exposed to the LAN.
+Gateway validates that frame, atomically binds `127.0.0.1:0`, and returns the
+OS-assigned port, child PID, and nonce through the same private channel.
+
+Agent does not send the capability to that address yet. It creates a fresh
+64-character lowercase-hex challenge and sends an exact HTTP/1.1 Upgrade request
+to `/_cmclient/bootstrap/ownership` with no capability header. Gateway proves
+listener ownership with HMAC-SHA256 keyed by the capability over
+`cmclient.gateway.bootstrap-ownership.v1`, startup nonce, PID, loopback host,
+dynamic port, and challenge, each separated by a newline. The exact zero-body
+response is limited to 4 KiB and must complete within the shared monotonic
+bootstrap deadline. The capability, challenge, and proof remain memory-only;
+the raw capability is never returned by the Gateway or admitted to arguments,
+environment, disk, logs, or evidence.
+
+Only after that proof succeeds does Agent capability-authenticate the version
+endpoint and verify its exact product identity before publishing the session.
+Any timeout, malformed frame or response, wrong PID/nonce/proof, listener
+takeover, early exit, or oversized input fails closed. Supervisor leaves no
+route published and force-terminates and reaps the complete child process tree
+when bounded graceful cleanup cannot finish. There is no native fixed-port
+configuration, probe, or release/rebind window, and no Gateway listener is
+exposed to the LAN.
 
 Agent also marks only its child as `CMCLIENT_SUPERVISED=1` and owns a private
 stdin shutdown pipe. Stop, restart, OS termination, and service teardown send a
