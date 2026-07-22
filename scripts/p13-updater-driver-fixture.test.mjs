@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import test from "node:test";
 
@@ -74,6 +75,44 @@ test("fixture validator rejects visible windows and artifact-mode drift", async 
   });
   expectCode(errors, "P13_UPDATER_FIXTURE_WINDOW_CONFIG_PRESENT");
   expectCode(errors, "P13_UPDATER_FIXTURE_ARTIFACT_MODE_INVALID");
+});
+
+test("fixture validator requires event-loop readiness before updater work", async () => {
+  const documents = await readFixtureDocuments(repositoryRoot);
+  const errors = validateFixtureDocuments({
+    ...documents,
+    main: documents.main.replaceAll("RunEvent::Ready", "RunEvent::Resumed"),
+  });
+  expectCode(errors, "P13_UPDATER_FIXTURE_HELPER_CONTRACT_MISSING");
+});
+
+test("fixture validator rejects release before the event loop is ready", async () => {
+  const documents = await readFixtureDocuments(repositoryRoot);
+  const main = documents.main.replace(
+    "    app.run(move |app_handle, event| {",
+    [
+      "    lifecycle_sender.as_ref().unwrap().send(()).unwrap();",
+      "    app.run(move |app_handle, event| {",
+    ].join("\n"),
+  );
+  assert.notEqual(main, documents.main);
+  const lock = JSON.parse(documents.lock);
+  lock.files.main = createHash("sha256")
+    .update(main.replace(/\r\n?/g, "\n"))
+    .digest("hex");
+
+  const errors = validateFixtureDocuments({
+    ...documents,
+    main,
+    lock: JSON.stringify(lock),
+  });
+  assert.ok(
+    !errors.some((entry) =>
+      entry.startsWith("P13_UPDATER_FIXTURE_FILE_DIGEST_DRIFT"),
+    ),
+    errors.join(", "),
+  );
+  expectCode(errors, "P13_UPDATER_FIXTURE_HELPER_CONTRACT_MISSING");
 });
 
 test("fixture validator rejects elevated NSIS hooks", async () => {

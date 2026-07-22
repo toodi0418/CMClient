@@ -107,6 +107,23 @@ function canonicalText(value) {
   return value.replace(/\r\n?/g, "\n");
 }
 
+function hasClosedReadyGate(source) {
+  const production = canonicalText(source).split("\n#[cfg(test)]", 1)[0];
+  const count = (fragment) => production.split(fragment).length - 1;
+  return (
+    /fn release_worker_on_ready\(\s*event: &RunEvent,\s*sender: &mut Option<SyncSender<\(\)>>,\s*\) -> Result<\(\), \(\)> \{\s*if !matches!\(event, RunEvent::Ready\) \{\s*return Ok\(\(\)\);\s*\}\s*sender\.take\(\)\.ok_or\(\(\)\)\?\.send\(\(\)\)\.map_err\(\|_\| \(\)\)\s*\}/u.test(
+      production,
+    ) &&
+    /app\.run\(move \|app_handle, event\| \{[\s\S]*release_worker_on_ready\(&event, &mut lifecycle_sender\)\.is_err\(\)[\s\S]*\}\);/u.test(
+      production,
+    ) &&
+    count("lifecycle_sender") === 4 &&
+    count("release_worker_on_ready(") === 2 &&
+    count("spawn_worker(") === 2 &&
+    count(".send(())") === 2
+  );
+}
+
 function error(code, detail) {
   return `${code}${detail ? `: ${detail}` : ""}`;
 }
@@ -232,6 +249,14 @@ export function validateFixtureDocuments(documents) {
         error("P13_UPDATER_FIXTURE_HELPER_CONTRACT_MISSING", pattern.source),
       );
     }
+  }
+  if (!hasClosedReadyGate(main)) {
+    errors.push(
+      error(
+        "P13_UPDATER_FIXTURE_HELPER_CONTRACT_MISSING",
+        "event-loop-ready-gate",
+      ),
+    );
   }
   if (
     /cargo_packager|minisign|ZipArchive|tar::Archive|danger_accept_invalid|WebviewWindowBuilder/.test(
@@ -789,7 +814,7 @@ export async function inspectArtifacts(
     bundle = platformBundle(),
     version,
     targetTriple = hostTargetTriple(),
-    targetDirectoryTriple = targetTriple,
+    targetDirectoryTriple,
     buildStartedAtMs,
     publicKeyPath = resolve(paths.signing, "fixture.key.pub"),
   } = {},

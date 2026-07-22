@@ -4,6 +4,8 @@ packages:
 allowBuilds:
   '@serialport/bindings-cpp': true
 overrides:
+  'fast-uri@^3.0.0': 3.1.4
+  'fast-uri@^4.0.0': 4.1.1
   undici-types: 6.23.0
 minimumReleaseAge: 1440
 minimumReleaseAgeIgnoreMissingTime: false

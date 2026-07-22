@@ -4,10 +4,12 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process,
+    sync::mpsc::{self, Receiver, SyncSender},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_updater::UpdaterExt;
 use url::Url;
 
@@ -19,6 +21,7 @@ const CAMPAIGN_ROOT_ENV: &str = "CMCLIENT_CAMPAIGN_ROOT";
 const TIMEOUT_MS_ENV: &str = "CMCLIENT_P13_UPDATER_TIMEOUT_MS";
 const RELAUNCH_MARKER: &str = "updater-relaunch.pending";
 const RELAUNCH_MARKER_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+const WORKER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const EXIT_OK: i32 = 0;
 const EXIT_NO_UPDATE: i32 = 10;
@@ -260,6 +263,50 @@ fn consume_relaunch_marker(
     Ok(valid_shape)
 }
 
+fn validate_headless(no_window_configs: bool, no_webview_windows: bool) -> Result<(), ()> {
+    if no_window_configs && no_webview_windows {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+fn wait_for_worker_signal(receiver: &Receiver<()>, timeout: Duration) -> Result<(), ()> {
+    receiver.recv_timeout(timeout).map_err(|_| ())
+}
+
+fn release_worker_on_ready(
+    event: &RunEvent,
+    sender: &mut Option<SyncSender<()>>,
+) -> Result<(), ()> {
+    if !matches!(event, RunEvent::Ready) {
+        return Ok(());
+    }
+    sender.take().ok_or(())?.send(()).map_err(|_| ())
+}
+
+fn spawn_worker(app: AppHandle, mode: Mode) -> Result<SyncSender<()>, ()> {
+    let (executor_ready_sender, executor_ready_receiver) = mpsc::sync_channel(0);
+    let (lifecycle_sender, lifecycle_receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name(String::from("cmclient-p13-updater"))
+        .spawn(move || {
+            let code = tauri::async_runtime::block_on(async move {
+                if executor_ready_sender.send(()).is_err()
+                    || wait_for_worker_signal(&lifecycle_receiver, WORKER_HANDSHAKE_TIMEOUT)
+                        .is_err()
+                {
+                    return EXIT_CONFIGURATION;
+                }
+                execute(app, mode).await
+            });
+            process::exit(code);
+        })
+        .map_err(|_| ())?;
+    wait_for_worker_signal(&executor_ready_receiver, WORKER_HANDSHAKE_TIMEOUT)?;
+    Ok(lifecycle_sender)
+}
+
 fn main() {
     let mode = match Mode::from_environment() {
         Ok(value) => value,
@@ -273,27 +320,37 @@ fn main() {
         plugin = plugin.pubkey(public_key);
     }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(plugin.build())
-        .setup(move |app| {
-            if !app.config().app.windows.is_empty() || !app.webview_windows().is_empty() {
-                return Err("P13_TAURI_HELPER_CREATED_WINDOW".into());
-            }
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let code = execute(handle, mode).await;
-                std::process::exit(code);
-            });
-            Ok(())
-        })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("P13_TAURI_RUNTIME_FAILED");
+    let mut lifecycle_sender = match spawn_worker(app.handle().clone(), mode) {
+        Ok(sender) => Some(sender),
+        Err(()) => process::exit(EXIT_CONFIGURATION),
+    };
+    app.run(move |app_handle, event| {
+        let ready = matches!(event, RunEvent::Ready);
+        if (ready
+            && validate_headless(
+                app_handle.config().app.windows.is_empty(),
+                app_handle.webview_windows().is_empty(),
+            )
+            .is_err())
+            || release_worker_on_ready(&event, &mut lifecycle_sender).is_err()
+        {
+            process::exit(EXIT_CONFIGURATION);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, consume_relaunch_marker, parse_endpoint, parse_timeout};
-    use std::{fs, path::PathBuf, process};
+    use super::{
+        Mode, consume_relaunch_marker, parse_endpoint, parse_timeout, release_worker_on_ready,
+        validate_headless, wait_for_worker_signal,
+    };
+    use std::{fs, path::PathBuf, process, sync::mpsc, thread, time::Duration};
+    use tauri::RunEvent;
 
     #[test]
     fn mode_values_are_closed() {
@@ -341,6 +398,33 @@ mod tests {
             assert!(!consume_relaunch_marker(&path, "0.2.0", 8, now_ms).unwrap());
             assert!(!path.exists());
         }
+    }
+
+    #[test]
+    fn helper_refuses_any_configured_or_runtime_window() {
+        assert!(validate_headless(true, true).is_ok());
+        assert!(validate_headless(false, true).is_err());
+        assert!(validate_headless(true, false).is_err());
+    }
+
+    #[test]
+    fn worker_stays_blocked_until_the_lifecycle_is_ready() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut sender = Some(sender);
+        assert!(release_worker_on_ready(&RunEvent::Resumed, &mut sender).is_ok());
+        assert!(receiver.try_recv().is_err());
+        assert!(release_worker_on_ready(&RunEvent::Ready, &mut sender).is_ok());
+        assert!(wait_for_worker_signal(&receiver, Duration::from_secs(1)).is_ok());
+        assert!(release_worker_on_ready(&RunEvent::Ready, &mut sender).is_err());
+
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || sender.send(()).unwrap());
+        assert!(wait_for_worker_signal(&receiver, Duration::from_secs(1)).is_ok());
+        worker.join().unwrap();
+
+        let (sender, receiver) = mpsc::sync_channel(0);
+        drop(sender);
+        assert!(wait_for_worker_signal(&receiver, Duration::from_millis(1)).is_err());
     }
 
     fn fixture_marker(name: &str) -> PathBuf {

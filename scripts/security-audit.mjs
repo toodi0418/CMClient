@@ -44,6 +44,7 @@ const RUSTSEC_WAIVER = Object.freeze({
   transitiveRoot: "tauri",
   version: "0.18.5",
 });
+const RUSTSEC_WAIVER_PLATFORM = "x86_64-unknown-linux-gnu";
 
 const SECRET_PATTERNS = [
   [
@@ -64,6 +65,14 @@ const DEPENDENCY_SECTIONS = [
   "optionalDependencies",
   "peerDependencies",
 ];
+
+// Keep each transitive major compatible while forcing the GHSA-v2hh-gcrm-f6hx fixes.
+const REQUIRED_PNPM_OVERRIDES = Object.freeze({
+  "fast-uri@^3.0.0": "3.1.4",
+  "fast-uri@^4.0.0": "4.1.1",
+  "undici-types": "6.23.0",
+});
+const REQUIRED_FAST_URI_VERSIONS = Object.freeze(["3.1.4", "4.1.1"]);
 
 const FORBIDDEN_LIFECYCLE_SCRIPTS = new Set([
   "preinstall",
@@ -907,12 +916,17 @@ export function auditPnpmWorkspace(path, source) {
     ? document.allowBuilds
     : {};
   const overrides = isRecord(document.overrides) ? document.overrides : {};
+  const overridesMatch =
+    Object.keys(overrides).length ===
+      Object.keys(REQUIRED_PNPM_OVERRIDES).length &&
+    Object.entries(REQUIRED_PNPM_OVERRIDES).every(
+      ([name, version]) => overrides[name] === version,
+    );
   if (
     !sameStringSet(document.packages, ["apps/*", "packages/*"]) ||
     Object.keys(allowBuilds).length !== 1 ||
     allowBuilds["@serialport/bindings-cpp"] !== true ||
-    Object.keys(overrides).length !== 1 ||
-    overrides["undici-types"] !== "6.23.0" ||
+    !overridesMatch ||
     document.minimumReleaseAge !== 1_440 ||
     document.minimumReleaseAgeIgnoreMissingTime !== false ||
     document.trustPolicy !== "no-downgrade" ||
@@ -930,6 +944,71 @@ export function auditPnpmWorkspace(path, source) {
         detail: key,
       });
     }
+  }
+  return violations;
+}
+
+export function auditPnpmLock(path, source) {
+  let document;
+  try {
+    document = parseYaml(source);
+  } catch {
+    return [{ code: "NODE_DEPENDENCY_SECURITY_LOCK_INVALID", path }];
+  }
+  if (!isRecord(document)) {
+    return [{ code: "NODE_DEPENDENCY_SECURITY_LOCK_INVALID", path }];
+  }
+
+  const violations = [];
+  const overrides = isRecord(document.overrides) ? document.overrides : {};
+  if (
+    Object.keys(overrides).length !==
+      Object.keys(REQUIRED_PNPM_OVERRIDES).length ||
+    !Object.entries(REQUIRED_PNPM_OVERRIDES).every(
+      ([name, version]) => overrides[name] === version,
+    )
+  ) {
+    violations.push({
+      code: "NODE_DEPENDENCY_SECURITY_LOCK_INVALID",
+      path,
+      detail: "overrides",
+    });
+  }
+
+  for (const sectionName of ["packages", "snapshots"]) {
+    const section = isRecord(document[sectionName])
+      ? document[sectionName]
+      : {};
+    const versions = Object.keys(section)
+      .map((key) => /^fast-uri@([^()]+)$/u.exec(key)?.[1])
+      .filter((version) => version !== undefined);
+    if (!sameStringSet(versions, REQUIRED_FAST_URI_VERSIONS)) {
+      violations.push({
+        code: "NODE_DEPENDENCY_SECURITY_LOCK_INVALID",
+        path,
+        detail: sectionName,
+      });
+    }
+  }
+
+  const dependencyVersions = [];
+  collectPropertyValues(document, "fast-uri", dependencyVersions);
+  if (
+    dependencyVersions.length === 0 ||
+    dependencyVersions.some(
+      (version) =>
+        typeof version !== "string" ||
+        !REQUIRED_FAST_URI_VERSIONS.includes(version),
+    ) ||
+    !REQUIRED_FAST_URI_VERSIONS.every((version) =>
+      dependencyVersions.includes(version),
+    )
+  ) {
+    violations.push({
+      code: "NODE_DEPENDENCY_SECURITY_LOCK_INVALID",
+      path,
+      detail: "dependency-edges",
+    });
   }
   return violations;
 }
@@ -1091,6 +1170,7 @@ export async function auditTrackedRepository() {
       path: "pnpm-lock.yaml",
     });
   }
+  violations.push(...auditPnpmLock("pnpm-lock.yaml", pnpmLock));
   violations.push(...auditPnpmWorkspace("pnpm-workspace.yaml", pnpmWorkspace));
   const cargoMetadata = rustsecDependencyMetadata();
   violations.push(
@@ -1190,7 +1270,14 @@ function cargoLockVersions(lockfile, packageName) {
 function rustsecDependencyMetadata() {
   const result = spawnSync(
     "cargo",
-    ["metadata", "--format-version", "1", "--locked"],
+    [
+      "metadata",
+      "--format-version",
+      "1",
+      "--locked",
+      "--filter-platform",
+      RUSTSEC_WAIVER_PLATFORM,
+    ],
     { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
   );
   if (result.status !== 0) {
@@ -1309,6 +1396,19 @@ function requireSourceDigest(violations, path, value, expected, code) {
 
 function lineNumber(value, index) {
   return value.slice(0, index).split("\n").length;
+}
+
+function collectPropertyValues(value, propertyName, results) {
+  if (Array.isArray(value)) {
+    for (const item of value)
+      collectPropertyValues(item, propertyName, results);
+    return;
+  }
+  if (!isRecord(value)) return;
+  for (const [name, item] of Object.entries(value)) {
+    if (name === propertyName) results.push(item);
+    collectPropertyValues(item, propertyName, results);
+  }
 }
 
 function isRecord(value) {

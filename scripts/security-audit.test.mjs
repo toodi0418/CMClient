@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   auditAppImageValidatorInstaller,
   auditPackageManifest,
+  auditPnpmLock,
   auditPnpmWorkspace,
   auditProductionDeploy,
   auditRustSecWaivers,
@@ -554,6 +555,20 @@ test("pnpm policy audit parses effective values and rejects spoofed settings", a
   const source = await readFile("pnpm-workspace.yaml", "utf8");
   assert.deepEqual(auditPnpmWorkspace("pnpm-workspace.yaml", source), []);
 
+  for (const [safeVersion, vulnerableVersion] of [
+    ["3.1.4", "3.1.3"],
+    ["4.1.1", "4.1.0"],
+  ]) {
+    assert.ok(
+      violationCodes(
+        auditPnpmWorkspace(
+          "pnpm-workspace.yaml",
+          source.replace(safeVersion, vulnerableVersion),
+        ),
+      ).has("NODE_INSTALL_POLICY_INVALID"),
+    );
+  }
+
   const spoofed = `# minimumReleaseAge: 1440\n${source.replace(
     "minimumReleaseAge: 1440",
     "minimumReleaseAge: 0",
@@ -582,6 +597,53 @@ test("pnpm policy audit parses effective values and rejects spoofed settings", a
       ),
     ).has("NODE_INSTALL_POLICY_UNREVIEWED_SETTING"),
   );
+});
+
+test("pnpm lock keeps both fast-uri majors past GHSA-v2hh-gcrm-f6hx", async () => {
+  const source = await readFile("pnpm-lock.yaml", "utf8");
+  assert.deepEqual(auditPnpmLock("pnpm-lock.yaml", source), []);
+
+  for (const [safeVersion, vulnerableVersion] of [
+    ["3.1.4", "3.1.3"],
+    ["4.1.1", "4.1.0"],
+  ]) {
+    const mutations = [
+      {
+        detail: "packages",
+        source: source.replace(
+          `  fast-uri@${safeVersion}:\n    resolution:`,
+          `  fast-uri@${vulnerableVersion}:\n    resolution:`,
+        ),
+      },
+      {
+        detail: "snapshots",
+        source: source.replace(
+          `  fast-uri@${safeVersion}: {}`,
+          `  fast-uri@${vulnerableVersion}: {}`,
+        ),
+      },
+      {
+        detail: "dependency-edges",
+        source: source.replace(
+          `      fast-uri: ${safeVersion}`,
+          `      fast-uri: ${vulnerableVersion}`,
+        ),
+      },
+    ];
+
+    for (const mutation of mutations) {
+      assert.notEqual(mutation.source, source, mutation.detail);
+      const violations = auditPnpmLock("pnpm-lock.yaml", mutation.source);
+      assert.ok(
+        violations.some(
+          (violation) =>
+            violation.code === "NODE_DEPENDENCY_SECURITY_LOCK_INVALID" &&
+            violation.detail === mutation.detail,
+        ),
+        JSON.stringify(violations),
+      );
+    }
+  }
 });
 
 test("production deploy policy rejects legacy and unlocked dependency resolution", async () => {

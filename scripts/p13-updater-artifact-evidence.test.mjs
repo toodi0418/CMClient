@@ -84,9 +84,15 @@ async function createFixture(t) {
 async function writeNsisSet(
   artifactDirectory,
   keyId,
-  { version, architecture = "x64", signedNameOverride, signatureKeyId },
+  {
+    version,
+    architecture = "x64",
+    productName = "CMClient P13 Updater Fixture",
+    signedNameOverride,
+    signatureKeyId,
+  },
 ) {
-  const stem = `CMClient P13 Updater Fixture_${version}_${architecture}-setup`;
+  const stem = `${productName}_${version}_${architecture}-setup`;
   const installerName = `${stem}.exe`;
   const payloadName = `${stem}.nsis.zip`;
   const effectiveKeyId = signatureKeyId ?? keyId;
@@ -158,6 +164,53 @@ test("artifact evidence selects one fresh same-version NSIS set", async (t) => {
     ),
   );
   assert.equal(persisted.version, "0.2.0");
+});
+
+test("host builds inspect target-neutral Tauri output directories", async (t) => {
+  const fixture = await createFixture(t);
+  const buildStartedAtMs = Date.now() - 5_000;
+  const windowsDirectory = resolve(fixture.paths.target, "release/bundle/nsis");
+  await mkdir(windowsDirectory, { recursive: true });
+  await writeNsisSet(windowsDirectory, fixture.keyId, {
+    version: "0.1.0",
+  });
+
+  const windowsEvidence = await inspectArtifacts(fixture.paths, {
+    bundle: "nsis",
+    version: "0.1.0",
+    targetTriple: "x86_64-pc-windows-msvc",
+    buildStartedAtMs,
+  });
+  assert.equal(windowsEvidence.versionBinding, "artifact-filename");
+  assert.equal(windowsEvidence.artifactArchitecture, "x64");
+  assert.match(
+    windowsEvidence.artifacts.installer.relativePath,
+    /^target\/release\/bundle\/nsis\/CMClient P13 Updater Fixture_0\.1\.0_x64-setup\.exe$/,
+  );
+
+  const macosDirectory = resolve(fixture.paths.target, "release/bundle/macos");
+  await mkdir(macosDirectory, { recursive: true });
+  const macosPayloadName = "CMClient P13 Updater Fixture.app.tar.gz";
+  await Promise.all([
+    writeFile(resolve(macosDirectory, macosPayloadName), "macos-payload"),
+    writeFile(
+      resolve(macosDirectory, `${macosPayloadName}.sig`),
+      signature(fixture.keyId, macosPayloadName),
+    ),
+  ]);
+
+  const macosEvidence = await inspectArtifacts(fixture.paths, {
+    bundle: "app",
+    version: "0.1.0",
+    targetTriple: "aarch64-apple-darwin",
+    buildStartedAtMs,
+  });
+  assert.equal(macosEvidence.versionBinding, "fresh-build-context");
+  assert.equal(macosEvidence.artifactArchitecture, "aarch64");
+  assert.match(
+    macosEvidence.artifacts.updaterPayload.relativePath,
+    /^target\/release\/bundle\/macos\/CMClient P13 Updater Fixture\.app\.tar\.gz$/,
+  );
 });
 
 test("artifact evidence binds unversioned official macOS names to the fresh build", async (t) => {
@@ -232,6 +285,28 @@ test("artifact evidence rejects a signature bound to another file", async (t) =>
       buildStartedAtMs: Date.now() - 5_000,
     }),
     /P13_UPDATER_ARTIFACT_SIGNATURE_FILE_MISMATCH/,
+  );
+});
+
+test("artifact evidence rejects ambiguous same-version artifact sets", async (t) => {
+  const fixture = await createFixture(t);
+  await writeNsisSet(fixture.artifactDirectory, fixture.keyId, {
+    version: "0.2.0",
+  });
+  await writeNsisSet(fixture.artifactDirectory, fixture.keyId, {
+    version: "0.2.0",
+    productName: "Unexpected Product",
+  });
+
+  await assert.rejects(
+    inspectArtifacts(fixture.paths, {
+      bundle: "nsis",
+      version: "0.2.0",
+      targetTriple: TARGET,
+      targetDirectoryTriple: TARGET,
+      buildStartedAtMs: Date.now() - 5_000,
+    }),
+    /P13_UPDATER_ARTIFACT_SET_INCOMPLETE_OR_AMBIGUOUS/,
   );
 });
 
