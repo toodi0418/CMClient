@@ -1451,7 +1451,7 @@ def _validate_invalidation_record(
         if (
             not isinstance(source_repair, str)
             or repair.get("supersedesPartOf") != source_repair
-            or repair.get("status") not in {"pending", "blocked", "in_progress"}
+            or repair.get("status") not in {"pending", "blocked", "in_progress", "done"}
         ):
             raise TaskStateError(f"{label}.sourceRepair is invalid for {repair_id}")
         source = by_id.get(source_repair)

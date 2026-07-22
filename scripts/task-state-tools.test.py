@@ -688,6 +688,57 @@ class TaskStateToolTests(unittest.TestCase):
         self.assertEqual(json.loads(retry.stdout)["id"], "P13-T05")
         self.assertEqual(len(self.read()["candidateInvalidations"]), 1)
 
+    def test_split_invalidation_remains_valid_after_repair_completion(self) -> None:
+        invalidation = {
+            "invalidatedAt": "2026-07-22T02:49:47+00:00",
+            "repairOf": "P13-T06",
+            "runtimeCandidate": True,
+            "distributionCandidate": True,
+            "affectedCases": ["FULL_VERIFY"],
+            "resolvedByCandidate": None,
+            "resolvedAt": None,
+            "sourceRepair": "P13-T15",
+            "targetScope": "windows-shared",
+            "blocksScopedCompletion": True,
+        }
+        source = task("P13-T15", "skipped")
+        source["supersededCandidateInvalidation"] = copy.deepcopy(invalidation)
+        repair = task("P13-T17", "done")
+        repair.update(
+            {
+                "repairOf": "P13-T06",
+                "supersedesPartOf": "P13-T15",
+                "candidateReset": True,
+                "affectedCases": ["FULL_VERIFY"],
+            }
+        )
+        by_id = {
+            "P13-T06": task("P13-T06", "pending"),
+            "P13-T15": source,
+            "P13-T17": repair,
+        }
+
+        LIB._validate_invalidation_record(
+            invalidation,
+            repair_id="P13-T17",
+            repair=repair,
+            by_id=by_id,
+            label="candidateInvalidations[0]",
+        )
+
+        repair["status"] = "skipped"
+        with self.assertRaisesRegex(
+            LIB.TaskStateError,
+            "sourceRepair is invalid for P13-T17",
+        ):
+            LIB._validate_invalidation_record(
+                invalidation,
+                repair_id="P13-T17",
+                repair=repair,
+                by_id=by_id,
+                label="candidateInvalidations[0]",
+            )
+
     def test_repair_resume_adds_done_dependency_without_cycle(self) -> None:
         self.write(
             [
