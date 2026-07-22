@@ -114,6 +114,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use the existing remote-tracking ref (primarily for isolated tests)",
     )
+    parser.add_argument(
+        "--defer-scoped-completion-terminal",
+        action="store_true",
+        help=(
+            "Record the pushed completion checkpoint without terminalizing its "
+            "task; scoped-completion.py owns the ledger transition"
+        ),
+    )
     parser.add_argument("--git", default="git", help="Git executable")
     return parser.parse_args()
 
@@ -484,7 +492,13 @@ def commit_log_update(
     return current + row, True
 
 
-def reconciled_state(state: dict, task_id: str, commit: CheckpointCommit) -> tuple[dict, bool]:
+def reconciled_state(
+    state: dict,
+    task_id: str,
+    commit: CheckpointCommit,
+    *,
+    defer_scoped_completion_terminal: bool = False,
+) -> tuple[dict, bool]:
     task = validate_state_graph(state, task_id)
     try:
         checkpoint_base = task_state_library().normalize_git_object(
@@ -515,11 +529,25 @@ def reconciled_state(state: dict, task_id: str, commit: CheckpointCommit) -> tup
 
     result = copy.deepcopy(state)
     updated = find_task(result, task_id)
-    updated["status"] = "done"
     updated["commit"] = commit.sha
-    updated["completedAt"] = commit.committed_at
-    for field in ("blockedAt", "blockedByRepair", "blockReason"):
-        updated.pop(field, None)
+    if defer_scoped_completion_terminal:
+        if task_id != "P18-T10" and task.get("completionProtocol") != (
+            "cmclient-windows-scoped-completion-attempts/v1"
+        ):
+            raise ReconcileError(
+                "deferred terminalization is reserved for scoped Windows completion tasks"
+            )
+        if status != "in_progress":
+            raise ReconcileError(
+                "a scoped completion checkpoint must be the sole in_progress task"
+            )
+        updated["checkpointPushedAt"] = commit.committed_at
+        updated["completionStage"] = "ledger_reconciliation_pending"
+    else:
+        updated["status"] = "done"
+        updated["completedAt"] = commit.committed_at
+        for field in ("blockedAt", "blockedByRepair", "blockReason"):
+            updated.pop(field, None)
     notes = updated.setdefault("notes", [])
     if not isinstance(notes, list):
         raise ReconcileError(f"task {task_id} notes must be an array")
@@ -629,7 +657,12 @@ def reconcile(args: argparse.Namespace) -> dict[str, object]:
             license_path, "license provenance"
         )
         validate_state_graph(state, args.task, graph_lock, license_provenance)
-        new_state, state_changed = reconciled_state(state, args.task, commit)
+        new_state, state_changed = reconciled_state(
+            state,
+            args.task,
+            commit,
+            defer_scoped_completion_terminal=args.defer_scoped_completion_terminal,
+        )
         library.validate_state_against_graph_lock(
             new_state, graph_lock, license_provenance
         )

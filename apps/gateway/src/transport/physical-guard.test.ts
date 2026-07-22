@@ -1,5 +1,5 @@
 import { describe, it } from "node:test";
-import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { ok, rejects, strictEqual, throws } from "node:assert";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,16 +27,13 @@ describe("PhysicalWriteGuard", () => {
 
     await guard.checkConfigRequest(12345);
 
-    await throws(
+    await rejects(
       () => guard.checkConfigRequest(12345),
       (err: Error) => {
         ok(err instanceof PhysicalWriteGuardError);
-        strictEqual(
-          err.code,
-          "PHYSICAL_GUARD_DUPLICATE_CONFIG_REQUEST"
-        );
+        strictEqual(err.code, "PHYSICAL_GUARD_DUPLICATE_CONFIG_REQUEST");
         return true;
-      }
+      },
     );
   });
 
@@ -46,13 +43,13 @@ describe("PhysicalWriteGuard", () => {
       sessionNonce: 12345,
     });
 
-    await throws(
+    await rejects(
       () => guard.checkConfigRequest(99999),
       (err: Error) => {
         ok(err instanceof PhysicalWriteGuardError);
         strictEqual(err.code, "PHYSICAL_GUARD_NONCE_MISMATCH");
         return true;
-      }
+      },
     );
   });
 
@@ -65,7 +62,7 @@ describe("PhysicalWriteGuard", () => {
         ok(err instanceof PhysicalWriteGuardError);
         ok(err.code.includes("PHYSICAL_GUARD_PACKET_TYPE_REJECTED"));
         return true;
-      }
+      },
     );
 
     throws(
@@ -73,7 +70,7 @@ describe("PhysicalWriteGuard", () => {
       (err: Error) => {
         ok(err instanceof PhysicalWriteGuardError);
         return true;
-      }
+      },
     );
 
     // want_config_id is allowed
@@ -105,26 +102,23 @@ describe("PhysicalWriteGuard", () => {
         clock: () => clock,
       });
 
-      await throws(
+      await rejects(
         () => guard5.checkConnectionAttempt(),
         (err: Error) => {
           ok(err instanceof PhysicalWriteGuardError);
-          strictEqual(
-            err.code,
-            "PHYSICAL_GUARD_TOO_MANY_ATTEMPTS_IN_WINDOW"
-          );
+          strictEqual(err.code, "PHYSICAL_GUARD_TOO_MANY_ATTEMPTS_IN_WINDOW");
           return true;
-        }
+        },
       );
 
       // Fuse remains open
-      await throws(
+      await rejects(
         () => guard5.checkConnectionAttempt(),
         (err: Error) => {
           ok(err instanceof PhysicalWriteGuardError);
           strictEqual(err.code, "PHYSICAL_GUARD_FUSE_OPEN");
           return true;
-        }
+        },
       );
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
@@ -146,32 +140,26 @@ describe("PhysicalWriteGuard", () => {
           schemaVersion: 1,
           attempts: [
             {
-              timestamp: new Date(
-                clock.getTime() - 180_000
-              ).toISOString(),
+              timestamp: new Date(clock.getTime() - 180_000).toISOString(),
               sessionId: "test1",
               kind: "config_request",
               result: "rejected",
             },
             {
-              timestamp: new Date(
-                clock.getTime() - 120_000
-              ).toISOString(),
+              timestamp: new Date(clock.getTime() - 120_000).toISOString(),
               sessionId: "test2",
               kind: "config_request",
               result: "rejected",
             },
             {
-              timestamp: new Date(
-                clock.getTime() - 60_000
-              ).toISOString(),
+              timestamp: new Date(clock.getTime() - 60_000).toISOString(),
               sessionId: "test3",
               kind: "config_request",
               result: "rejected",
             },
           ],
           fuseState: "closed",
-        })
+        }),
       );
 
       const guard = new PhysicalWriteGuard({
@@ -180,16 +168,13 @@ describe("PhysicalWriteGuard", () => {
         clock: () => clock,
       });
 
-      await throws(
+      await rejects(
         () => guard.checkConnectionAttempt(),
         (err: Error) => {
           ok(err instanceof PhysicalWriteGuardError);
-          strictEqual(
-            err.code,
-            "PHYSICAL_GUARD_CONSECUTIVE_CONFIG_FAILURES"
-          );
+          strictEqual(err.code, "PHYSICAL_GUARD_CONSECUTIVE_CONFIG_FAILURES");
           return true;
-        }
+        },
       );
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });

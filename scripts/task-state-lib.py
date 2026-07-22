@@ -25,6 +25,8 @@ DEFAULT_STATE_PATH = WORKSPACE_ROOT / "state/TASKS.json"
 DEFAULT_REPO_PATH = REPOSITORY_ROOT
 DEFAULT_GRAPH_LOCK_PATH = Path(__file__).with_name("unified-task-graph-lock.json")
 GRAPH_LOCK_SCHEMA = "cmclient-unified-task-graph-lock/v2"
+GRAPH_LOCK_SCHEMA_V3 = "cmclient-unified-task-graph-lock/v3"
+GRAPH_LOCK_SCHEMAS = {GRAPH_LOCK_SCHEMA, GRAPH_LOCK_SCHEMA_V3}
 LICENSE_PROVENANCE_SCHEMA = "cmclient-license-provenance/v1"
 GRAPH_UPGRADE_JOURNAL_SCHEMA = "cmclient-graph-upgrade-journal/v1"
 DEFINITION_AMENDMENT_SCHEMA = "cmclient-task-definition-amendment/v1"
@@ -62,6 +64,25 @@ LOCKED_TASK_FIELDS = (
     "candidateReset",
     "acceptance",
 )
+V3_LOCKED_TASK_FIELDS = (
+    "phase",
+    "title",
+    "required",
+    "manualGate",
+    "environmental",
+    "lane",
+    "priority",
+    "kind",
+    "scope",
+    "candidateReset",
+    "repairOf",
+    "supersedesPartOf",
+    "acceptance",
+    "caseGroups",
+    "caseAssertions",
+    "evidenceClaim",
+    "observesWithoutFinalizing",
+)
 GRAPH_PAYLOAD_FIELDS = (
     "tasks",
     "historicalSupersessions",
@@ -96,6 +117,32 @@ ACTIVE_GRAPH_FIELDS = (
     "completionChecker",
     "repairProtocol",
     "definitionAmendments",
+)
+V3_GRAPH_PAYLOAD_FIELDS = (
+    *GRAPH_PAYLOAD_FIELDS,
+    "activation",
+    "completionCheckers",
+    "scheduler",
+    "supersessions",
+    "existingTaskAmendments",
+    "repairAllocation",
+    "scopedCompletion",
+    "activationInputs",
+    "completionToolOnlyRepairAllowlist",
+    "promotionBaseCommit",
+)
+V3_ACTIVE_GRAPH_FIELDS = (
+    *ACTIVE_GRAPH_FIELDS,
+    "activation",
+    "completionCheckers",
+    "scheduler",
+    "supersessions",
+    "existingTaskAmendments",
+    "repairAllocation",
+    "scopedCompletion",
+    "activationInputs",
+    "completionToolOnlyRepairAllowlist",
+    "promotionBaseCommit",
 )
 
 DEFINITION_AMENDMENT_FIELDS = (
@@ -181,15 +228,29 @@ def sha256_file(path: Path) -> str:
 def _normalized_task_value(task: dict[str, Any], field: str) -> object:
     if field == "required":
         return task.get(field, True)
-    if field in {"manualGate", "candidateReset"}:
+    if field in {
+        "manualGate",
+        "candidateReset",
+        "environmental",
+    }:
         return task.get(field, False)
+    # v2 definitions intentionally distinguish an omitted acceptance field
+    # from an explicit empty list.  Keep that legacy comparison stable; v3
+    # fixed tasks carry their case/acceptance arrays explicitly in the graph.
+    if field in {"caseGroups", "caseAssertions", "observesWithoutFinalizing"}:
+        return copy.deepcopy(task.get(field, []))
+    if field in {"acceptance", "evidenceClaim"}:
+        return copy.deepcopy(task.get(field))
     return task.get(field)
 
 
-def task_definition(task: dict[str, Any]) -> dict[str, Any]:
+def task_definition(
+    task: dict[str, Any],
+    fields: tuple[str, ...] = LOCKED_TASK_FIELDS,
+) -> dict[str, Any]:
     return {
         "id": task.get("id"),
-        **{field: _normalized_task_value(task, field) for field in LOCKED_TASK_FIELDS},
+        **{field: _normalized_task_value(task, field) for field in fields},
         "dependsOn": copy.deepcopy(task.get("dependsOn", [])),
     }
 
@@ -388,35 +449,43 @@ def _upgrade_journal_path(state_path: Path) -> Path:
     return Path(state_path).with_name("GRAPH_UPGRADE.json")
 
 
+def _upgrade_journal_paths(state_path: Path) -> tuple[Path, ...]:
+    state_path = Path(state_path)
+    return (
+        _upgrade_journal_path(state_path),
+        state_path.with_name("GRAPH_UPGRADE_V3.json"),
+    )
+
+
 def validate_upgrade_journal_guard(
     state_path: Path,
     operation_id: str | None = None,
 ) -> None:
-    journal_path = _upgrade_journal_path(state_path)
-    if not journal_path.exists():
-        return
-    journal = _load_document(journal_path, "graph upgrade journal")
-    if journal.get("schema") != GRAPH_UPGRADE_JOURNAL_SCHEMA:
-        raise TaskStateError("graph upgrade journal schema is invalid")
-    expected = journal.get("operationId")
-    if not isinstance(expected, str) or not expected:
-        raise TaskStateError("graph upgrade journal operationId is invalid")
-    status = journal.get("status")
-    phase = journal.get("phase")
-    if status not in GRAPH_UPGRADE_STATUSES:
-        raise TaskStateError("graph upgrade journal status is invalid")
-    if phase not in GRAPH_UPGRADE_PHASES:
-        raise TaskStateError("graph upgrade journal phase is invalid")
-    status_complete = status == "complete"
-    phase_complete = phase == "complete"
-    if status_complete != phase_complete:
-        raise TaskStateError("graph upgrade journal is only half complete")
-    if status_complete and phase_complete:
-        return
-    if operation_id != expected:
-        raise TaskStateError(
-            "GRAPH_UPGRADE_IN_PROGRESS: normal task workflow is paused until recovery"
-        )
+    for journal_path in _upgrade_journal_paths(state_path):
+        if not journal_path.exists():
+            continue
+        journal = _load_document(journal_path, "graph upgrade journal")
+        if journal.get("schema") != GRAPH_UPGRADE_JOURNAL_SCHEMA:
+            raise TaskStateError("graph upgrade journal schema is invalid")
+        expected = journal.get("operationId")
+        if not isinstance(expected, str) or not expected:
+            raise TaskStateError("graph upgrade journal operationId is invalid")
+        status = journal.get("status")
+        phase = journal.get("phase")
+        if status not in GRAPH_UPGRADE_STATUSES:
+            raise TaskStateError("graph upgrade journal status is invalid")
+        if phase not in GRAPH_UPGRADE_PHASES:
+            raise TaskStateError("graph upgrade journal phase is invalid")
+        status_complete = status == "complete"
+        phase_complete = phase == "complete"
+        if status_complete != phase_complete:
+            raise TaskStateError("graph upgrade journal is only half complete")
+        if status_complete and phase_complete:
+            continue
+        if operation_id != expected:
+            raise TaskStateError(
+                "GRAPH_UPGRADE_IN_PROGRESS: normal task workflow is paused until recovery"
+            )
 
 
 def _require_sha256(value: object, label: str) -> str:
@@ -686,7 +755,7 @@ def _historical_completed_tasks(
     ]
 
 
-def validate_state_against_graph_lock(
+def _validate_state_against_graph_lock_v2(
     state: dict[str, Any],
     graph_lock: dict[str, Any],
     license_provenance: dict[str, Any],
@@ -882,6 +951,385 @@ def validate_state_against_graph_lock(
     return by_id
 
 
+def _validate_v3_optional_task_fields(
+    task: dict[str, Any], *, label: str, fixed: bool = False
+) -> None:
+    """Validate the scheduler/claim fields introduced by graph v3."""
+
+    lane = task.get("lane")
+    priority = task.get("priority")
+    if lane is None and priority is None and task.get("status") in {"done", "skipped"}:
+        # Completed pre-v3 task objects are immutable historical evidence.
+        return
+    if not isinstance(lane, str) or not lane.strip():
+        raise TaskStateError(f"{label}.lane must be a non-empty string")
+    if not isinstance(priority, int) or isinstance(priority, bool) or priority < 0:
+        raise TaskStateError(f"{label}.priority must be a non-negative integer")
+    for field in ("caseGroups", "caseAssertions", "observesWithoutFinalizing"):
+        value = task.get(field, [])
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            raise TaskStateError(f"{label}.{field} must be a string array")
+        if len(value) != len(set(value)):
+            raise TaskStateError(f"{label}.{field} contains duplicates")
+    evidence = task.get("evidenceClaim")
+    if evidence is not None and not isinstance(evidence, dict):
+        raise TaskStateError(f"{label}.evidenceClaim must be an object or null")
+    if evidence is not None:
+        required = {
+            "identityLevel",
+            "observationOnly",
+            "maySatisfyCaseGroups",
+            "forbiddenClaims",
+        }
+        if set(evidence) != required:
+            raise TaskStateError(f"{label}.evidenceClaim fields are invalid")
+        if evidence.get("identityLevel") != "hardware-source":
+            raise TaskStateError(f"{label}.evidenceClaim.identityLevel is invalid")
+        if evidence.get("observationOnly") is not True:
+            raise TaskStateError(f"{label}.evidenceClaim.observationOnly must be true")
+        if evidence.get("maySatisfyCaseGroups") != ["HWS"]:
+            raise TaskStateError(
+                f"{label}.evidenceClaim.maySatisfyCaseGroups must be ['HWS']"
+            )
+        forbidden = evidence.get("forbiddenClaims")
+        if not isinstance(forbidden, list) or not {
+            "V3",
+            "installed candidate",
+            "final live",
+            "recovery",
+            "soak",
+            "production",
+        }.issubset(forbidden):
+            raise TaskStateError(f"{label}.evidenceClaim.forbiddenClaims is incomplete")
+    if fixed and task.get("repairOf") is not None and not isinstance(
+        task.get("repairOf"), str
+    ):
+        raise TaskStateError(f"{label}.repairOf must be a task ID or null")
+    if task.get("supersedesPartOf") is not None and not isinstance(
+        task.get("supersedesPartOf"), str
+    ):
+        raise TaskStateError(f"{label}.supersedesPartOf must be a task ID or null")
+
+
+def _validate_v3_scheduler(
+    graph_lock: dict[str, Any], by_id: dict[str, dict[str, Any]]
+) -> None:
+    scheduler = graph_lock.get("scheduler")
+    if not isinstance(scheduler, dict):
+        raise TaskStateError("graph lock scheduler must be an object")
+    priorities = scheduler.get("priorities")
+    if not isinstance(priorities, dict) or not priorities:
+        raise TaskStateError("graph lock scheduler priorities are invalid")
+    if any(
+        not isinstance(lane, str)
+        or not isinstance(priority, int)
+        or isinstance(priority, bool)
+        or priority < 0
+        for lane, priority in priorities.items()
+    ):
+        raise TaskStateError("graph lock scheduler priorities are invalid")
+    if not isinstance(scheduler.get("selectionRule"), str):
+        raise TaskStateError("graph lock scheduler selectionRule is invalid")
+    for task_id, task in by_id.items():
+        if task_id.startswith("P13-") or task_id.startswith("P14-") or task_id.startswith(
+            ("P15-", "P16-", "P17-", "P18-")
+        ):
+            _validate_v3_optional_task_fields(task, label=f"task {task_id}")
+            lane = task.get("lane")
+            if lane is None and task.get("priority") is None and task.get(
+                "status"
+            ) in {"done", "skipped"}:
+                continue
+            if lane not in priorities:
+                raise TaskStateError(f"task {task_id} uses unknown scheduler lane {lane!r}")
+            if task.get("priority") != priorities[lane]:
+                raise TaskStateError(f"task {task_id} priority disagrees with lane")
+
+
+def _validate_v3_completion_contract(graph_lock: dict[str, Any]) -> None:
+    checkers = graph_lock.get("completionCheckers")
+    if not isinstance(checkers, dict) or not isinstance(checkers.get("global"), dict):
+        raise TaskStateError("graph lock completionCheckers.global is invalid")
+    global_checker = checkers["global"]
+    preserved = global_checker.get("requiredActiveRoot", {}).get(
+        "completionChecker"
+    )
+    if preserved != graph_lock.get("completionChecker"):
+        raise TaskStateError("global completion checker was not preserved byte-for-byte")
+    scoped = checkers.get("windowsLiveFirst")
+    if not isinstance(scoped, dict) or scoped.get("task") != "P18-T10":
+        raise TaskStateError("windowsLiveFirst completion checker is invalid")
+    scoped_rule = graph_lock.get("scopedCompletion")
+    if not isinstance(scoped_rule, dict) or scoped_rule.get("task") != "P18-T10":
+        raise TaskStateError("scopedCompletion contract is invalid")
+    if scoped_rule.get("mandatoryEarlyMilestone") != "P18-T02":
+        raise TaskStateError("windowsLiveFirst mandatory milestone is invalid")
+    if scoped_rule.get("continuousSoakHours") != 24:
+        raise TaskStateError("scopedCompletion must require a 24-hour soak")
+    allowlist = graph_lock.get("completionToolOnlyRepairAllowlist")
+    if not isinstance(allowlist, dict):
+        raise TaskStateError("completion-tool-only allowlist is invalid")
+    paths = allowlist.get("paths")
+    if not isinstance(paths, list) or len(paths) != len(set(paths)):
+        raise TaskStateError("completion-tool-only allowlist paths are invalid")
+    for path in paths:
+        if (
+            not isinstance(path, str)
+            or not path
+            or "*" in path
+            or "?" in path
+            or path.endswith("/")
+            or "\\" in path
+            or path.startswith("/")
+        ):
+            raise TaskStateError("completion-tool-only allowlist contains a glob or directory")
+    expected = canonical_sha256({"paths": paths})
+    if allowlist.get("sha256") != expected:
+        raise TaskStateError("completion-tool-only allowlist digest drift")
+
+
+def _validate_state_against_graph_lock_v3(
+    state: dict[str, Any],
+    graph_lock: dict[str, Any],
+    license_provenance: dict[str, Any],
+) -> dict[str, dict]:
+    by_id = validate_task_graph(state)
+    if graph_lock.get("schema") != GRAPH_LOCK_SCHEMA_V3:
+        raise TaskStateError(f"graph lock schema must be {GRAPH_LOCK_SCHEMA_V3}")
+    active = state.get("activeGraph")
+    if not isinstance(active, dict):
+        raise TaskStateError("state.activeGraph must be an object")
+    if active.get("id") != "unified-product" or active.get("version") != 3:
+        raise TaskStateError("active graph must be unified-product@3")
+    if graph_lock.get("id") != "unified-product" or graph_lock.get("version") != 3:
+        raise TaskStateError("committed graph lock must be unified-product@3")
+    if active.get("branch") != "dev" or graph_lock.get("branch") != "dev":
+        raise TaskStateError("active graph and graph lock branch must be dev")
+
+    # The v2 history and completion contract are immutable roots of v3.
+    historical = graph_lock.get("historicalSupersessions")
+    if not isinstance(historical, list):
+        raise TaskStateError("graph lock historicalSupersessions must be an array")
+    historical_ids: list[str] = []
+    for index, item in enumerate(historical):
+        if not isinstance(item, dict) or item.get("graphVersion") != 1:
+            raise TaskStateError(f"historicalSupersessions[{index}] must retain graphVersion 1")
+        old_id, replacements, reason = item.get("old"), item.get("new"), item.get("reason")
+        if (
+            not isinstance(old_id, str)
+            or old_id in historical_ids
+            or not isinstance(replacements, list)
+            or not replacements
+            or len(replacements) != len(set(replacements))
+            or not all(isinstance(value, str) for value in replacements)
+            or not isinstance(reason, str)
+            or not reason
+        ):
+            raise TaskStateError(f"historicalSupersessions[{index}] is invalid")
+        historical_ids.append(old_id)
+        task = by_id.get(old_id)
+        if not isinstance(task, dict) or task.get("status") != "skipped":
+            raise TaskStateError(f"historical supersession task is not skipped: {old_id}")
+        if task.get("supersededBy") != replacements or task.get("supersession") != {
+            "graphId": graph_lock.get("id"),
+            "graphVersion": 1,
+            "reason": reason,
+        }:
+            raise TaskStateError(f"historical supersession targets drift: {old_id}")
+
+    v3_supersessions = graph_lock.get("supersessions")
+    if not isinstance(v3_supersessions, list):
+        raise TaskStateError("graph lock supersessions must be an array")
+    p13 = next((item for item in v3_supersessions if isinstance(item, dict) and item.get("old") == "P13-T15"), None)
+    if not isinstance(p13, dict) or p13.get("new") != ["P13-T17", "P15-T14"]:
+        raise TaskStateError("P13-T15 v3 supersession is missing")
+    old_repair = by_id.get("P13-T15")
+    if not isinstance(old_repair, dict) or old_repair.get("status") != "skipped":
+        raise TaskStateError("P13-T15 must be skipped after promotion")
+    if old_repair.get("supersededBy") != ["P13-T17", "P15-T14"]:
+        raise TaskStateError("P13-T15 supersededBy is invalid")
+    if old_repair.get("supersession") != {
+        "graphId": "unified-product",
+        "graphVersion": 2,
+        "reason": p13.get("reason"),
+    }:
+        raise TaskStateError("P13-T15 supersession metadata drift")
+    if "P13-T15" not in historical_ids and "P13-T15" not in active.get("supersededTaskIds", []):
+        raise TaskStateError("P13-T15 is not declared superseded")
+
+    expected_active_values = {field: graph_lock.get(field) for field in V3_ACTIVE_GRAPH_FIELDS}
+    expected_active_values["supersededTaskIds"] = historical_ids + ["P13-T15"]
+    for field, expected in expected_active_values.items():
+        if active.get(field) != expected:
+            raise TaskStateError(f"activeGraph.{field} does not match the committed graph lock")
+    _parse_timestamp(active.get("importedAt"), "activeGraph.importedAt")
+    _require_sha256(active.get("sourceSha256"), "activeGraph.sourceSha256")
+    normalize_git_object(active.get("sourceBaseline"), "activeGraph.sourceBaseline")
+    normalize_git_object(active.get("promotionBaseCommit"), "activeGraph.promotionBaseCommit")
+
+    first_active_phase = graph_lock.get("firstActivePhase")
+    if first_active_phase != "P13":
+        raise TaskStateError("graph lock firstActivePhase must be P13")
+    completed_history = _historical_completed_tasks(state, first_active_phase)
+    expected_history = _require_sha256(graph_lock.get("completedHistorySha256"), "graph lock completedHistorySha256")
+    if canonical_sha256(completed_history) != expected_history:
+        raise TaskStateError("completed historical task state differs from graph lock")
+
+    locked_tasks = graph_lock.get("tasks")
+    if not isinstance(locked_tasks, list) or not locked_tasks:
+        raise TaskStateError("graph lock tasks must be a non-empty array")
+    if graph_lock.get("taskDefinitionCount") != len(locked_tasks):
+        raise TaskStateError("graph lock taskDefinitionCount is incorrect")
+    locked_by_id: dict[str, dict[str, Any]] = {}
+    for index, definition in enumerate(locked_tasks):
+        if not isinstance(definition, dict) or not isinstance(definition.get("id"), str):
+            raise TaskStateError(f"graph lock tasks[{index}] is invalid")
+        task_id = definition["id"]
+        if task_id in locked_by_id:
+            raise TaskStateError(f"graph lock contains duplicate task: {task_id}")
+        if set(definition) != {"id", *V3_LOCKED_TASK_FIELDS, "dependsOn"}:
+            raise TaskStateError(f"graph lock v3 task fields are invalid: {task_id}")
+        locked_by_id[task_id] = definition
+
+    _validate_definition_amendments(graph_lock, active, by_id, locked_by_id)
+    for task_id, definition in locked_by_id.items():
+        task = by_id.get(task_id)
+        if task is None:
+            raise TaskStateError(f"locked active task is missing: {task_id}")
+        _validate_v3_optional_task_fields(task, label=f"task {task_id}", fixed=True)
+        for field in V3_LOCKED_TASK_FIELDS:
+            if _normalized_task_value(task, field) != definition.get(field):
+                raise TaskStateError(f"locked task field changed: {task_id}.{field}")
+        if task_id == "P18-T02":
+            if task.get("evidenceClaim") is None or task.get("caseGroups") != [
+                "HWS"
+            ]:
+                raise TaskStateError("P18-T02 hardware-source evidence claim drift")
+        elif task.get("evidenceClaim") is not None or "HWS" in task.get(
+            "caseGroups", []
+        ):
+            raise TaskStateError(
+                f"HWS evidence is reserved for P18-T02: {task_id}"
+            )
+        original_dependencies = definition.get("dependsOn")
+        dependencies = task.get("dependsOn")
+        if not isinstance(original_dependencies, list) or not isinstance(dependencies, list):
+            raise TaskStateError(f"locked task dependencies are invalid: {task_id}")
+        if dependencies[: len(original_dependencies)] != original_dependencies:
+            raise TaskStateError(f"locked task original dependencies changed: {task_id}")
+        for repair_id in dependencies[len(original_dependencies) :]:
+            repair = by_id.get(repair_id)
+            if not isinstance(repair, dict) or repair.get("status") != "done":
+                raise TaskStateError(f"locked task has an unfinished appended dependency: {task_id} -> {repair_id}")
+            if repair.get("repairOf") != task_id and not (
+                task_id == "P18-T10" and repair_id.startswith("P18-T")
+            ):
+                raise TaskStateError(f"locked task has an invalid appended dependency: {task_id} -> {repair_id}")
+
+    # Dynamic repairs/attempts are allowed only under their declared protocol.
+    for task_id, task in by_id.items():
+        if task_id in locked_by_id or not task_id.startswith(("P13-", "P14-", "P15-", "P16-", "P17-", "P18-")):
+            continue
+        if task_id == "P13-T15":
+            continue
+        if task_id.startswith("P18-T"):
+            match = TASK_ID_PATTERN.fullmatch(task_id)
+            assert match is not None
+            number = int(match.group(2))
+            if number < 20:
+                raise TaskStateError(f"unexpected dynamic P18 task: {task_id}")
+            _validate_v3_optional_task_fields(task, label=f"task {task_id}", fixed=False)
+            if number % 2 == 0:
+                parent_id = task.get("repairOf")
+                parent = by_id.get(parent_id) if isinstance(parent_id, str) else None
+                if (
+                    task.get("kind") != "fix"
+                    or not isinstance(task.get("candidateReset"), bool)
+                    or not isinstance(parent, dict)
+                    or not parent_id.startswith("P18-")
+                    or task.get("lane") != parent.get("lane")
+                    or task.get("priority") != parent.get("priority")
+                    or (parent_id != "P18-T10" and task.get("candidateReset") is not True)
+                ):
+                    raise TaskStateError(f"dynamic P18 repair definition is invalid: {task_id}")
+            else:
+                if task.get("kind") != "release" or task.get("candidateReset") is not False or task.get("scope") != "windows-completion-attempt":
+                    raise TaskStateError(f"dynamic P18 attempt definition is invalid: {task_id}")
+            continue
+        if task.get("repairOf") is None or task.get("kind") != "fix" or task.get("required", True) is not True:
+            raise TaskStateError(f"extra active task is not a valid repair: {task_id}")
+        _validate_v3_optional_task_fields(task, label=f"task {task_id}", fixed=False)
+
+    coverage = graph_lock.get("v2CoverageMap")
+    if not isinstance(coverage, list):
+        raise TaskStateError("graph lock v2CoverageMap must be an array")
+    coverage_ids: list[str] = []
+    for index, item in enumerate(coverage):
+        if not isinstance(item, dict):
+            raise TaskStateError(f"v2CoverageMap[{index}] is invalid")
+        legacy_id = item.get("legacyTask")
+        targets = item.get("v2Tasks")
+        if (
+            not isinstance(legacy_id, str)
+            or legacy_id in coverage_ids
+            or not isinstance(targets, list)
+            or not targets
+            or len(targets) != len(set(targets))
+            or not all(target in locked_by_id for target in targets)
+            or not isinstance(item.get("reason"), str)
+            or not item["reason"]
+        ):
+            raise TaskStateError(f"v2CoverageMap[{index}] is invalid")
+        coverage_ids.append(legacy_id)
+    if set(coverage_ids) != set(historical_ids):
+        raise TaskStateError("v2CoverageMap legacy tasks differ from historical supersessions")
+    identity = graph_lock.get("repositoryIdentity")
+    if not isinstance(identity, dict) or identity.get("branch") != "dev" or identity.get("protectedBranch") != "main" or identity.get("sourceBaseline") != graph_lock.get("sourceBaseline"):
+        raise TaskStateError("graph lock repositoryIdentity is invalid")
+    callmesh = graph_lock.get("callMeshServiceModel")
+    if not isinstance(callmesh, dict) or callmesh.get("productionBaseUrl") != "https://callmesh.tmmarc.org" or callmesh.get("productionAuthority") != "official-hosted-only" or callmesh.get("selfHosting") is not False or callmesh.get("productionEndpointOverride") is not False or callmesh.get("localMappingOverride") is not False or callmesh.get("mappingAuthority") != "CallMesh-only":
+        raise TaskStateError("graph lock CallMesh service model is invalid")
+    _validate_v3_scheduler(graph_lock, by_id)
+    _validate_v3_completion_contract(graph_lock)
+    amendments = graph_lock.get("existingTaskAmendments")
+    if not isinstance(amendments, list) or len({item.get("task") for item in amendments if isinstance(item, dict)}) != len(amendments):
+        raise TaskStateError("existingTaskAmendments are invalid")
+    for item in amendments:
+        if not isinstance(item, dict) or item.get("task") not in locked_by_id:
+            raise TaskStateError("existingTaskAmendments names an unknown task")
+    activation = graph_lock.get("activationInputs")
+    if not isinstance(activation, dict):
+        raise TaskStateError("activationInputs must be an object")
+    for key in ("planSha256", "baselineLockSha256", "baselineStateSha256", "baselineHistorySha256"):
+        _require_sha256(activation.get(key), f"activationInputs.{key}")
+    payload = {field: graph_lock.get(field) for field in V3_GRAPH_PAYLOAD_FIELDS}
+    if canonical_sha256(payload) != _require_sha256(graph_lock.get("graphSha256"), "graph lock graphSha256"):
+        raise TaskStateError("graph lock graphSha256 does not match canonical payload")
+    validate_license_provenance(graph_lock, license_provenance)
+    return by_id
+
+
+def validate_state_against_graph_lock(
+    state: dict[str, Any],
+    graph_lock: dict[str, Any],
+    license_provenance: dict[str, Any],
+) -> dict[str, dict]:
+    """Validate either the immutable v2 graph or the promoted v3 graph."""
+
+    schema = graph_lock.get("schema")
+    if schema == GRAPH_LOCK_SCHEMA:
+        return _validate_state_against_graph_lock_v2(
+            state, graph_lock, license_provenance
+        )
+    if schema == GRAPH_LOCK_SCHEMA_V3:
+        return _validate_state_against_graph_lock_v3(
+            state, graph_lock, license_provenance
+        )
+    raise TaskStateError(f"unsupported graph lock schema: {schema!r}")
+
+
 def workflow_snapshot(
     state: dict[str, Any],
     graph_lock_path: Path,
@@ -967,10 +1415,15 @@ def _validate_invalidation_record(
     parent_id = record.get("repairOf")
     if not isinstance(parent_id, str) or parent_id not in by_id:
         raise TaskStateError(f"{label}.repairOf is not an existing task")
-    if record.get("runtimeCandidate") is not True:
-        raise TaskStateError(f"{label}.runtimeCandidate must be true")
-    if record.get("distributionCandidate") is not True:
-        raise TaskStateError(f"{label}.distributionCandidate must be true")
+    expected_candidate_reset = repair.get("candidateReset") is not False
+    if record.get("runtimeCandidate") is not expected_candidate_reset:
+        raise TaskStateError(
+            f"{label}.runtimeCandidate disagrees with candidateReset"
+        )
+    if record.get("distributionCandidate") is not expected_candidate_reset:
+        raise TaskStateError(
+            f"{label}.distributionCandidate disagrees with candidateReset"
+        )
     invalidated_at = _parse_timestamp(
         record.get("invalidatedAt"), f"{label}.invalidatedAt"
     )
@@ -990,8 +1443,29 @@ def _validate_invalidation_record(
         )
     if cases != repair.get("affectedCases"):
         raise TaskStateError(f"{label}.affectedCases disagrees with {repair_id}")
-    if record.get("invalidatedAt") != repair.get("startedAt"):
-        raise TaskStateError(f"{label}.invalidatedAt disagrees with {repair_id}")
+    source_repair = record.get("sourceRepair")
+    if source_repair is None:
+        if record.get("invalidatedAt") != repair.get("startedAt"):
+            raise TaskStateError(f"{label}.invalidatedAt disagrees with {repair_id}")
+    else:
+        if (
+            not isinstance(source_repair, str)
+            or repair.get("supersedesPartOf") != source_repair
+            or repair.get("status") not in {"pending", "blocked", "in_progress"}
+        ):
+            raise TaskStateError(f"{label}.sourceRepair is invalid for {repair_id}")
+        source = by_id.get(source_repair)
+        source_record = source.get("supersededCandidateInvalidation") if isinstance(source, dict) else None
+        if not isinstance(source_record, dict) or source_record.get("invalidatedAt") != record.get("invalidatedAt"):
+            raise TaskStateError(f"{label}.sourceRepair preimage is unavailable")
+        if not isinstance(record.get("targetScope"), str) or not record[
+            "targetScope"
+        ]:
+            raise TaskStateError(f"{label}.targetScope is required for a split invalidation")
+        if not isinstance(record.get("blocksScopedCompletion"), bool):
+            raise TaskStateError(
+                f"{label}.blocksScopedCompletion is required for a split invalidation"
+            )
 
     resolved = record.get("resolvedByCandidate")
     resolved_at = record.get("resolvedAt")
@@ -1056,6 +1530,9 @@ def _validate_candidate_invalidations(
         "affectedCases",
         "resolvedByCandidate",
         "resolvedAt",
+        "sourceRepair",
+        "targetScope",
+        "blocksScopedCompletion",
     )
     for repair_id, repair in by_id.items():
         per_task = repair.get("candidateInvalidation")
@@ -1448,13 +1925,22 @@ def next_ready_task(state: dict) -> dict | None:
     if active:
         return active[0]
 
-    for task in state["tasks"]:
+    candidates: list[tuple[int, int, dict]] = []
+    for index, task in enumerate(state["tasks"]):
         if not task.get("required", True) or task.get("manualGate", False):
             continue
         if task["status"] != "pending":
             continue
         if _dependencies_done(task, by_id):
-            return task
+            # v3 schedules by lane priority and then by immutable graph order.
+            # A v2 state has no priority, so its existing list order is kept.
+            priority = task.get("priority", 1000)
+            if not isinstance(priority, int) or isinstance(priority, bool):
+                priority = 1000
+            candidates.append((priority, index, task))
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][2]
     return None
 
 
@@ -1463,6 +1949,18 @@ def allocate_repair_id(state: dict, parent: dict) -> str:
     match = TASK_ID_PATTERN.fullmatch(parent["id"])
     assert match is not None
     phase = parent.get("phase", match.group(1))
+    if state.get("activeGraph", {}).get("version") == 3 and phase == "P18":
+        reserved = set(by_id)
+        for value in state.get("immutableTaskIds", []):
+            if isinstance(value, str):
+                reserved.add(value)
+        for sequence in range(20, 99, 2):
+            candidate_id = f"P18-T{sequence:02d}"
+            if candidate_id not in reserved:
+                return candidate_id
+        raise TaskStateError(
+            "repair task ID space exhausted for P18; even repair IDs end at T98"
+        )
     sequences = [
         int(candidate.group(2))
         for task_id in by_id
@@ -1605,6 +2103,19 @@ def start_repair(
         "commit": None,
         "notes": [note] if note else [],
     }
+    if state.get("activeGraph", {}).get("version") == 3:
+        repair.update(
+            {
+                "lane": parent.get("lane"),
+                "priority": parent.get("priority"),
+                "environmental": False,
+                "supersedesPartOf": None,
+                "caseGroups": [],
+                "caseAssertions": [],
+                "evidenceClaim": None,
+                "observesWithoutFinalizing": [],
+            }
+        )
     state["tasks"].append(repair)
     ledger = state.setdefault("candidateInvalidations", [])
     if not isinstance(ledger, list):

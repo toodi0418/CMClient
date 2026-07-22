@@ -34,6 +34,7 @@ has_checkpoint_subject() {
 }
 
 reconcile_checkpoint() {
+  local defer_scoped
   local reconcile_args=(
     "$TASK"
     --repo "$REPO_DIR"
@@ -49,6 +50,19 @@ reconcile_checkpoint() {
   fi
   if [[ "$CMCLIENT_AUTO_PUSH" == "1" ]]; then
     reconcile_args+=(--push-local)
+  fi
+  defer_scoped="$("$CMCLIENT_PYTHON3" - "$WORKSPACE_ROOT/state/TASKS.json" "$TASK" <<'PY'
+import json
+import sys
+
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+task = next((item for item in state.get("tasks", []) if item.get("id") == sys.argv[2]), None)
+marker = "cmclient-windows-scoped-completion-attempts/v1"
+print("1" if isinstance(task, dict) and (task.get("id") == "P18-T10" or task.get("completionProtocol") == marker) else "0")
+PY
+)"
+  if [[ "$defer_scoped" == "1" ]]; then
+    reconcile_args+=(--defer-scoped-completion-terminal)
   fi
   "$CMCLIENT_PYTHON3" "$SCRIPT_DIR/reconcile-task-state.py" "${reconcile_args[@]}"
 }

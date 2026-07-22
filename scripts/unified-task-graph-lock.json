@@ -1,9 +1,9 @@
 {
-  "schema": "cmclient-unified-task-graph-lock/v2",
+  "schema": "cmclient-unified-task-graph-lock/v3",
   "id": "unified-product",
-  "version": 2,
-  "source": "plans/unified-product/tasks.proposed.json",
-  "sourceSha256": "c649d16996b6d715ca0b225ae2f29424c181868600d606b6994e9c4227471c6f",
+  "version": 3,
+  "source": "plans/windows-live-first/tasks.proposed.json",
+  "sourceSha256": "0f9412d21244206f77628354c36d08b16caa9282c152583f1ba156654c16f71d",
   "sourceBaseline": "b3fec2b344bda3b11d0a15d2bad381f7d926114e",
   "branch": "dev",
   "completionTask": "P17-T07",
@@ -11,7 +11,7 @@
   "importedAt": "2026-07-20T11:33:12.570577+00:00",
   "completedHistorySha256": "1280bdb322ce7fffefc6eb779661c32c762504b98325884cf8271f54cc25fdfa",
   "firstActivePhase": "P13",
-  "taskDefinitionCount": 57,
+  "taskDefinitionCount": 72,
   "preservedDefinitions": ["P13-T01", "P13-T02", "P13-T03"],
   "canonicalPayloadFields": [
     "tasks",
@@ -24,7 +24,17 @@
     "candidateIdentity",
     "completionChecker",
     "repairProtocol",
-    "definitionAmendments"
+    "definitionAmendments",
+    "activation",
+    "completionCheckers",
+    "scheduler",
+    "supersessions",
+    "existingTaskAmendments",
+    "repairAllocation",
+    "scopedCompletion",
+    "activationInputs",
+    "completionToolOnlyRepairAllowlist",
+    "promotionBaseCommit"
   ],
   "activeGraphFields": [
     "id",
@@ -46,7 +56,17 @@
     "candidateIdentity",
     "completionChecker",
     "repairProtocol",
-    "definitionAmendments"
+    "definitionAmendments",
+    "activation",
+    "completionCheckers",
+    "scheduler",
+    "supersessions",
+    "existingTaskAmendments",
+    "repairAllocation",
+    "scopedCompletion",
+    "activationInputs",
+    "completionToolOnlyRepairAllowlist",
+    "promotionBaseCommit"
   ],
   "historicalRule": "P12 skipped task fields and graphVersion 1 mappings are compared to the immutable v1 snapshot, never to the meaning of reused v2 task IDs.",
   "coverageRule": "Every v2CoverageMap target must exist in the locked v2 definitions and coverage/license/CallMesh-service-model drift fails the completion checker.",
@@ -58,17 +78,26 @@
       "title": "Promote the unified product contract and rebaseline task state",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": null,
+      "priority": null,
       "kind": "docs",
       "scope": "architecture",
       "candidateReset": false,
-      "dependsOn": ["P12-T08"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Workspace and Repository current docs define one product and the new read order.",
         "A resumable owner-only campaign context exists before verification/build and inventories external gates without values.",
         "P12 supersessions are explicit and completed history is unchanged.",
         "next-task selects P13-T01 instead of old P12-T09.",
         "Repository documentation tests and full verify pass."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P12-T08"]
     },
     {
       "id": "P13-T02",
@@ -76,16 +105,25 @@
       "title": "Add task-state reconciliation and machine Goal completion checks",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": null,
+      "priority": null,
       "kind": "build",
       "scope": "workflow",
       "candidateReset": false,
-      "dependsOn": ["P13-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "A pushed task commit can repair an in-progress state without a duplicate commit.",
         "Dynamic repair allocation blocks the parent, depends only on satisfied predecessors, then adds the pushed repair as a parent dependency and resumes it without a cycle.",
         "Blocked, skipped, manual, pending, and NO_READY_TASK states cannot be mistaken for completion.",
         "Completion checker supports the P17-T07 pre-check exclusion and mandatory post-checkpoint run while verifying origin sync, candidate identity, evidence, cleanup, and clean Repository."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T01"]
     },
     {
       "id": "P13-T03",
@@ -93,15 +131,24 @@
       "title": "Define unified product, runtime profile, capability, and release identity contracts",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": null,
+      "priority": null,
       "kind": "refactor",
       "scope": "contracts",
       "candidateReset": true,
-      "dependsOn": ["P13-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Contracts expose one product and native/docker profiles.",
         "Internal components report one version, commit, channel, and target identity.",
         "Old public Desktop/Headless/CLI/Service selectors fail schema tests."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T01"]
     },
     {
       "id": "P13-T04",
@@ -109,10 +156,14 @@
       "title": "Promote the adopt-first v2 architecture and safely restart unfinished work",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": null,
+      "priority": null,
       "kind": "build",
       "scope": "architecture",
       "candidateReset": true,
-      "dependsOn": ["P13-T03"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Before any new Repository checkpoint/package/public claim, state/LICENSE_PROVENANCE.json records the owner-approved GPL-3.0-only CMClient client route, exact sources/digests/licenses/notices, approval reference and publicDevPushPermitted=true; missing, false, incompatible or malformed evidence is a hard gate.",
         "The workspace v1-to-v2 tool canonical-transforms the draft, journals every phase, upgrades unfinished definitions in place while preserving execution metadata and history, locks historicalSupersessions/v2CoverageMap/licenseGate/callMeshServiceModel into activeGraph, and passes kill/rollback/idempotent-rerun tests.",
@@ -120,7 +171,12 @@
         "The frozen P13-T04 diff is archived as a binary patch plus content-addressed bytes and hashes for every untracked file; a restore self-test passes before all known agent-owned product changes are removed path-scoped and later reintroduced by their owning task. No git reset --hard is used.",
         "After the license gate permits the checkpoint, one meaningful Repository diff installs the route-appropriate LICENSE/NOTICE/provenance contract, aligns README/docs READ_ORDER, generates the full 57-task unified-task-graph-lock/v2 with canonical digest, and updates Repository-owned task-state/reconcile/next/checkpoint/repair/completion-check implementations and tests.",
         "The approved bodies replace workspace EXECPLAN and tasks.proposed; workspace README/GOAL/root READ_ORDER plus PRODUCT_CONTRACT/RUNTIME_ONBOARDING/PLATFORM_RELEASES/VERIFICATION are updated in the same manifest so DB paths, IPC capability, Linux update paths and offline attestation have one authority. Full policy/Repository verification passes, the coherent checkpoint pushes to dev, and prior/draft plans remain dated non-normative history."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T03"]
     },
     {
       "id": "P13-T05",
@@ -128,10 +184,14 @@
       "title": "Prove updater-driver and private Gateway bootstrap feasibility before product refactors",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": null,
+      "priority": null,
       "kind": "test",
       "scope": "architecture-spike",
       "candidateReset": true,
-      "dependsOn": ["P13-T04"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Exact Tauri CLI/core/plugin, cargo-packager-updater and fixture dependency versions, lockfile hashes, sources and licenses are frozen before testing.",
         "A minimal independently built Tauri fixture uses createUpdaterArtifacts=v1Compatible so Tauri directly emits test-signed NSIS, app.tar.gz and AppImage-compatible updater payloads without conversion/repacking; a same-runner local HTTPS lab proves exact-format check/download/signature/install behavior.",
@@ -139,7 +199,12 @@
         "A hidden official Tauri helper is the preferred route and is accepted only after proving exact headless AppHandle/check/download/install/relaunch, helper lifetime and replacement behavior. Public-preview cargo-packager-updater can be selected only with an explicit P13 owner risk acceptance and the same complete qualification; the final-product route cannot be deferred to P17-T08.",
         "Gateway proves a fresh memory-only Agent bootstrap capability delivered through an inherited private pipe, never argv/env/disk/log. After validating that bounded bootstrap frame, Gateway atomically binds 127.0.0.1:0 itself and reports the bound port, child PID and instance nonce only through the inherited private channel; fixed-port probing, release/rebind and unsupported Windows descriptor passing are forbidden. Agent strips/overwrites any client capability header, Gateway rejects direct/spoofed requests on every HTTP/SSE/health route, responses never reflect it, and child identity/port-takeover tests pass.",
         "Wrong key, bit flip, wrong target, oversize, timeout, downgrade, helper/installer death, port takeover and direct-Gateway bypass regressions pass before state/setup/backup work continues; state/UPDATER_DRIVER.json binds the final driver/version/maturity/evidence and any preview-risk approval, with no unproven fallback or custom archive/crypto path."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T04"]
     },
     {
       "id": "P13-T06",
@@ -147,16 +212,25 @@
       "title": "Adopt the async runtime, durable-file, lock, and logging primitives",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "runtime-primitives",
       "candidateReset": true,
-      "dependsOn": ["P13-T05"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "MSRV is 1.87 and CI verifies 1.87 plus pinned 1.96; Tokio, atomic-write-file, fs4 and tracing are exact-pinned with compatible licenses.",
         "Missing build/test prerequisites are installed non-interactively into campaign/current-user scope with source/version/digest/license recorded; no task bypasses UAC or installs a privileged service/driver to manufacture evidence.",
         "Typed documents and lock/log wrappers use atomic old-or-new writes, bounded retention and stable errors; fs2/custom file rotation is absent from production paths.",
         "File write, lock contention, malformed document, rotation/redaction and crash-at-replace regressions pass without introducing process supervision, secret backend, mDNS or setup behavior."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T05", "P13-T13", "P13-T14", "P13-T17", "P13-T18"]
     },
     {
       "id": "P13-T07",
@@ -164,16 +238,25 @@
       "title": "Implement the exact home-root layout and the only plaintext secret backend",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "state",
       "candidateReset": true,
-      "dependsOn": ["P13-T06"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "All native mutable paths derive from a validated immutable startup environment snapshot home/.cmclient and Docker from /home/cmclient/.cmclient; test snapshots do not mutate the parent process environment.",
         "config, setup state, secrets.json, root-level cmclient.db, locks, logs, backups, updates and migration paths use one RuntimePaths API and atomic old-or-new writes; legacy nested or foreign data roots are rejected.",
         "Plaintext secrets.json is the sole runtime secret backend; no persisted Control token or secret-bearing argv/environment path exists.",
         "No credential enters argv/env/log/API/browser/evidence/backup/Git; Unix uses 0700/0600 user-private paths and Windows uses normal current-user files without UAC or cross-principal ACL qualification."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T06"]
     },
     {
       "id": "P13-T08",
@@ -181,17 +264,26 @@
       "title": "Rewrite legacy state migration as a small resumable product transaction",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "refactor",
       "scope": "migration",
       "candidateReset": true,
-      "dependsOn": ["P13-T07"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Node 24.18.0 current-host archive/checksum and the target staging manifest are exact-pinned; full per-target Node/native-addon build/load qualification remains P15 work.",
         "Gateway exposes an offline maintenance command for node:sqlite backup, immutable SQL migration, integrity, FK, schema-history and domain-count reports using Agent-supplied absolute paths; Rust does not own Gateway schema/backup.",
         "Only known config, plaintext secret, DB and backup files are inventoried within count/size bounds; links, junctions, caches, temp, services and logs are excluded.",
         "A compact detected/staged/verified/activated/complete journal, fs4 locks, atomic writes and Gateway maintenance command support idempotent resume without modifying/deleting the source or merging a populated target.",
         "Conflict, source mutation, digest mismatch, DB failure, and real kill at each durable boundary resume or fail with stable recovery state; the generic 2,938-line coordinator is gone."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T07"]
     },
     {
       "id": "P13-T09",
@@ -199,15 +291,24 @@
       "title": "Replace HTTP-over-pipe with typed framed local Control IPC",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "refactor",
       "scope": "control",
       "candidateReset": true,
-      "dependsOn": ["P13-T06", "P13-T07"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "interprocess local sockets and length-delimited Serde envelopes serve Unix socket and root-hashed Windows named-pipe endpoints with no TCP fallback.",
         "Control has no bearer token: Unix uses a user-private 0700/0600 endpoint and Windows uses an interprocess local named pipe with remote clients disabled/PIPE_REJECT_REMOTE_CLIENTS, without SID impersonation, custom ACL work, unsafe FFI or PID-as-identity; CLI/Desktop never read secrets.json and the old persisted/CMCLIENT_CONTROL_TOKEN paths are removed.",
         "Version, malformed/oversize/slow/disconnect/local-command/Windows-remote-rejection/root-collision/restart/event tests pass and custom HTTP/HMAC remote-control parsing is removed; the current-user Windows product makes no cross-account isolation or foreign-account V3 claim."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T06", "P13-T07"]
     },
     {
       "id": "P13-T10",
@@ -215,16 +316,25 @@
       "title": "Replace the Agent Web server and access machinery with Axum and Tower",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "refactor",
       "scope": "web-ingress",
       "candidateReset": true,
-      "dependsOn": ["P13-T07", "P13-T08", "P13-T09"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Axum/Tower serves static Web and Agent-owned setup/lifecycle/update SSE; Fastify @fastify/sse serves Gateway domain/job SSE only, and Agent streaming proxy preserves separate event-ID/replay namespaces and authorization.",
         "Agent validates the Gateway bootstrap ready frame (OS-assigned port, child identity, and instance nonce), strips/overwrites every client-supplied capability header, and injects the per-start memory-only capability only after authorization. Gateway atomically binds 127.0.0.1:0 after bootstrap, rejects direct/spoofed HTTP/SSE/health requests, never reflects the capability, and port-takeover/bypass regressions pass; fixed-port probing, release/rebind, and unsupported Windows descriptor passing are forbidden.",
         "IPv4/IPv6 wildcard bind with deterministic bind-conflict policy, Host allowlist, no wildcard CORS, default loopback admission, authenticated LAN optional CIDR, Docker-always-auth, Origin/CSRF, generation/session revocation, rate limit, HTTP-LAN warning and redacted audit tests pass.",
         "The handwritten HTTP parser/static/TLS/session/rate-limit implementation is absent and no second auth authority exists in Gateway."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T07", "P13-T08", "P13-T09"]
     },
     {
       "id": "P13-T11",
@@ -232,15 +342,24 @@
       "title": "Run the adopt-first runtime, migration, access, and license gate",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "test",
       "scope": "runtime-gate",
       "candidateReset": true,
-      "dependsOn": ["P13-T07", "P13-T08", "P13-T09", "P13-T10"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Fresh, migrated, conflict, crash-resume, no-system-Node, local Control, Web admission/auth and real Agent/Gateway process E2E pass on current Windows plus applicable CI targets.",
         "Dependency decision and license inventory records exact version/license/upstream/digest and proves compatibility with the owner-approved GPL-3.0-only CMClient client route; no checkpoint continues without the evidence required by P13-T04.",
         "Full verify, MSRV/current Rust, Node 24 production tests, secret/license scans and clean checkpoint push pass."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T07", "P13-T08", "P13-T09", "P13-T10"]
     },
     {
       "id": "P14-T01",
@@ -248,15 +367,25 @@
       "title": "Implement authoritative setup state and passive Meshtastic discovery/validation",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "setup",
       "candidateReset": true,
-      "dependsOn": ["P13-T11"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
-        "Agent setup state is versioned, generation-fenced and survives restart; missing/invalid/revoked/reset key enters setupRequired before Gateway external work or APRS TX.",
+        "Agent setup state is versioned, generation-fenced and survives restart; missing/invalid/revoked/reset key enters setupRequired before Gateway external CallMesh/APRS/Proxy work.",
         "Discovery checks migrated endpoint, loopback 4403, bounded _meshtastic._tcp.local browse, then manual input; there is no LAN scan.",
-        "Validation requests/observes configuration only and tests prove no MeshPacket, admin/config mutation, RF command or radio change."
-      ]
+        "Every physical validation path uses the P18-T01 Agent-owned exclusive lease, aggregate attempt ledger, one-upstream socket invariant, and ToRadio write allowlist. It permits only one nonce-correlated want_config_id per budgeted session and rejects every MeshPacket, admin/config mutation, reboot, RF command, radio change, or second transport before socket write.",
+        "The source-smoke profile can enable the existing product transport, ingest, persistence, API/SSE, Agent-served Web status/Meshtastic observation routes, and command observation while CallMesh, APRS, Proxy client writes, every non-Meshtastic producer, and every non-allowlisted Meshtastic writer remain mechanically disabled; it is campaign/test-only and is not a public production override. An already-runnable graphical status surface is supplemental only."
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T11", "P18-T01"]
     },
     {
       "id": "P14-T02",
@@ -264,16 +393,25 @@
       "title": "Expose setup-only API, durable Jobs, and adopted SSE contracts",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "setup-api",
       "candidateReset": true,
-      "dependsOn": ["P14-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Agent exposes only the allowed setup/reset/status surface until ready; TypeBox/OpenAPI snapshots bind Web, Agent and Gateway contracts.",
         "Axum owns Agent setup/lifecycle/update SSE; @fastify/sse owns Gateway domain and durable-Job SSE only. The Agent proxy preserves the Gateway stream bytes and keeps separate route namespaces, event IDs, replay stores, authorization, and reconnect contracts.",
         "p-queue schedules SQLite-authoritative Jobs; Last-Event-ID, unknown/expired ID, subscriber cap, slow consumer, restart recovery, idempotency and setup-generation fence tests pass for each event namespace.",
         "Gateway HTTP, SSE, and health routes require the fresh Agent bootstrap capability from P13-T05; a direct loopback request without it is rejected and no capability appears in argv/env/disk/logs."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T01", "P18-T02"]
     },
     {
       "id": "P14-T03",
@@ -281,15 +419,24 @@
       "title": "Build the full Web setup wizard with XState and PrimeVue Forms",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "web-setup",
       "candidateReset": true,
-      "dependsOn": ["P14-T02"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "The wizard covers terms, discovered/manual Meshtastic, CallMesh API key, provision/default review, validation, finish, resume and recovery through Agent state only; the official CallMesh endpoint and mapping authority are fixed and never shown as editable fields.",
         "XState view flow and PrimeVue field errors do not persist credentials or create a second authority; fresh/resume/offline/invalid/revoked/terms-change Playwright and model tests pass.",
         "Completion atomically transitions to ready and opens the full management Web."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T02"]
     },
     {
       "id": "P14-T04",
@@ -297,15 +444,24 @@
       "title": "Implement operational reset and isolated factory reset",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "reset",
       "candidateReset": true,
-      "dependsOn": ["P14-T02", "P14-T03"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Reset rotates the setup generation, revokes sessions, stops external work, clears secrets/config selections, preserves documented user data, and returns to setupRequired.",
         "Factory reset is fixture-safe, explicit, staged and never deletes arbitrary real roots; interrupted phases recover deterministically.",
         "Old jobs/events/connections cannot commit after the generation change and no credential enters evidence."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T02", "P14-T03"]
     },
     {
       "id": "P14-T05",
@@ -313,15 +469,24 @@
       "title": "Adopt process-wrap supervision and unify resident lifecycle",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "refactor",
       "scope": "supervision",
       "candidateReset": true,
-      "dependsOn": ["P13-T11", "P14-T02"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Agent supervises exact private Node/Gateway through process-wrap Job Object/process group/session with bounded restart and graceful shutdown.",
         "Agent hard-kill, Gateway crash loop, blocked stdout/stderr, update maintenance child and repeated start/stop leave no orphan, zombie, duplicate listener or duplicate DB writer.",
         "Windows service-host/SCM and system service assumptions are not normal-product runtime dependencies."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T11", "P14-T02"]
     },
     {
       "id": "P14-T06",
@@ -329,32 +494,50 @@
       "title": "Integrate one installed product launcher, compact Desktop, and command mode",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "launcher",
       "candidateReset": true,
-      "dependsOn": ["P14-T03", "P14-T05"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "One installed product supplies click-to-GUI and terminal cmclient entrypoints; internal binaries are hidden implementation details, not separate products.",
         "Desktop is limited to tray, compact status, open Web, lifecycle/update commands and notifications; close hides by default and quit respects resident settings.",
         "CLI/Desktop operate only through Control, share version/capability/error contracts, and repeated launches keep one Agent/Desktop instance."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T03", "P14-T05"]
     },
     {
       "id": "P14-T07",
       "phase": "P14",
-      "title": "Implement current-user login autostart and Web controls on all native platforms",
+      "title": "Implement common autostart controls and the Windows current-user provider",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "autostart",
       "candidateReset": true,
-      "dependsOn": ["P14-T05", "P14-T06"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
-        "Windows HKCU, macOS SMAppService through objc2 bindings, and Linux XDG autostart start --background by default with no UAC/root; systemd-user is explicit fallback only.",
-        "Web autostart status/toggle reports enabled, approval-required, missing/stale and repair states and repairs moved install paths idempotently.",
+        "The Agent-owned provider contract and Web/CLI status/toggle support enabled, approval-required, missing/stale, repair, moved-path, and OS-denied states without reporting false success.",
+        "Windows HKCU current-user login startup starts --background by default with no UAC/service; enable/disable/reinstall/upgrade/uninstall fixtures are idempotent and keep one resident core.",
         "The management Web listener is enabled by default and independently toggleable; disabling closes IPv4/IPv6 listeners and revokes Web sessions while Agent/Control remain resident, and Desktop/CLI can re-enable it.",
-        "Enable/disable/reinstall/upgrade/uninstall fixture matrices pass per target without duplicate resident cores."
-      ]
+        "macOS SMAppService implementation/evidence belongs to P15-T06, and Linux XDG/systemd-user implementation/evidence belongs to P15-T10; neither blocks the scoped Windows lane."
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T05", "P14-T06"]
     },
     {
       "id": "P14-T08",
@@ -362,15 +545,24 @@
       "title": "Implement backup and staged restore through Gateway SQLite maintenance",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "backup",
       "candidateReset": true,
-      "dependsOn": ["P13-T07", "P14-T02", "P14-T04"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Backup uses node:sqlite backup and a manifest for config/setup/DB while excluding secrets/run/updates/sessions/staging/cache/live logs.",
         "Restore verifies digests, schema/integrity/FK/domain reports in staging, quiesces Gateway, atomically activates, rotates generation and revalidates credentials.",
         "Cancel/retry/retention, corrupt backup, killed restore and exact rollback tests pass without touching a real user root."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T07", "P14-T02", "P14-T04"]
     },
     {
       "id": "P14-T09",
@@ -378,15 +570,24 @@
       "title": "Expose Agent-owned update preference, trigger, Job, and surface controls",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "feat",
       "scope": "update-controls",
       "candidateReset": true,
-      "dependsOn": ["P13-T05", "P14-T02", "P14-T06"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Agent persists update preference and exposes available/check/download/install/rollback status through setup-aware Jobs without packaging or installing itself.",
         "Web, Desktop, and CLI use the same Agent Job/control contract; Docker exposes only the operator-side digest workflow and hides native self-update controls.",
         "The driver selected by the P13-T05 fixture spike is displayed honestly; full product payload, external watchdog, health gate, and exact rollback remain P15-T02."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T05", "P14-T02", "P14-T06"]
     },
     {
       "id": "P14-T10",
@@ -394,33 +595,56 @@
       "title": "Share one Meshtastic upstream across ingest and protocol-aware Proxy clients",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "fix",
       "scope": "proxy-upstream",
       "candidateReset": true,
-      "dependsOn": ["P14-T01", "P14-T05"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Ingest and every Proxy client share one transport/config session; no client receives or controls the raw upstream socket.",
         "Config cache/replay, request and ACK ownership, slow-client bounded queues, reconnect, generation reset and ordering are protocol-aware and deterministic.",
         "Two-plus-client real TCP and property tests cover collisions, disconnects, backpressure and no duplicate domain/APRS event."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T01", "P14-T05"]
     },
     {
       "id": "P14-T11",
       "phase": "P14",
-      "title": "Finish trusted CallMesh mapping and verified APRS-IS transmission gates",
+      "title": "Finish Legacy-compatible CallMesh mapping and verified APRS-IS transmission gates",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "fix",
       "scope": "callmesh-aprs",
       "candidateReset": true,
-      "dependsOn": ["P14-T10"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
-        "The official hosted CallMesh service is the only production provision/mapping authority for every native and Docker client; production config/UI expose no self-host endpoint, alternate server, imported/manual/local mapping, override or merge path, while automated tests use dependency-injected fixtures unavailable in production.",
-        "CallMesh retries use fetch/p-retry, but schema, atomic complete-snapshot commit, canonical response digest, revision/effective-time/lease handling, mapping high-water, provision transaction and trusted source-event-time selection remain CMClient-owned.",
-        "An outage may use only the last committed CallMesh snapshot while freshness and temporal validity prove it applicable; otherwise provision and APRS transmission fail closed.",
-        "APRS deterministic golden vectors remain byte-identical; differential parser tests cannot authorize TX.",
-        "No first packet is sent until canonical callsign matching verified logresp; mismatch, unverified, timeout, rotation and reconnect fail closed."
-      ]
+        "The official hosted CallMesh service remains the only production provision/mapping authority for fields its validated supported schema actually supplies. Schema, atomic persistence, restart, and event-time projection retain field presence separately from value: Tracker enablement, callsign/SSID, composite symbol plus table/code/overlay aliases, comment, altitude, effective time/version; iGate callsign/SSID, position, composite symbol plus component aliases, comment, altitude, PHG, expiry, and any schema-supported APRS endpoint/beacon fields. Legacy v0.2.28 endpoint/UI and interval-setter behavior are not misrepresented as provision schema: use a validated official field when present, otherwise fixed asia.aprs2.net:14580 and ten minutes bounded one minute through 24 hours. Production exposes no local APRS server, destination, mapping, provision, or beacon-policy override; destination is fixed APTMAG and fixtures use dependency injection only.",
+        "Trusted source event time, sequence/epoch, canonical digest, and temporal high-water remain internal. Select the newest authoritative mapping with effective time less than or equal to the source event time, so equality activates the new revision; conflicting same-time content without an authoritative monotonic order fails closed. Complete valid mapping revision history is append-only across refresh/restart and has no age-only pruning; exact duplicate snapshots may coalesce and factory reset may remove it. A missing applicable revision always fails closed. Unknown Legacy APRS input never advances temporal high-water from APRS receive time.",
+        "The sole public-wire golden oracle is v0.2.28 tag 5e6c294c640766711c6251173711e8226bf8268a and its frozen formatter/client blobs. For every eligible Tracker event, output is byte-exact SOURCE>APTMAG,MESHD*,qAO,IGATE:!legacy-data plus CRLF, with fixed APTMAG and no public timestamp or CM2 marker. Golden fixtures cover latitude/longitude ECMAScript Number/toFixed ties/carry; exact composite-symbol/component precedence and absent/null/empty/explicit values; exact course modulo-before-round including 359.5 -> 360 and Legacy speed conversions; mapping-only String/CRLF/whitespace comment sanitation with no inserted separator or normalization; exact 3.28084 altitude conversion and packet/mapping/self-provision precedence; UTF-8 replacement and full-line byte budget; and disabled mapping zero-write behavior. qAO denotes receive-only translation of Meshtastic RF received through TCP or Serial and does not authorize APRS-IS-to-Meshtastic RF transmission.",
+        "iGate-owned beacon, status, telemetry data, and telemetry definitions use IGATE>APTMAG,TCPIP*:...; CMClient never injects qAC, server-observed qAC is accepted, and status is >TMAG Client v<version> without CLI/Desktop. Golden fixtures lock beacon PHG/position/symbol/comment/altitude and PHG-preserving 512-byte truncation; PARM/UNIT/EQNS/T# bytes and order; nine-character message destination padding; every explicit POS/MSG/CTRL type; rolling buckets; first fresh verified order beacon/PARM/UNIT/EQNS/T#/status; same-process reconnect; status interval anchored at verification; fresh-process timestamp/bucket reset; only last successful 001..999 sequence persistence; failed-write in-memory sequence consumption; and every Legacy cadence boundary.",
+        "A bounded provision-scoped persistent APRS session uses incremental banner/logresp parsing and explicit disconnected, connecting, login-sent, verified, and closing states. Every TX/RX session independently exact-verifies its provision-derived canonical callsign; mismatch, unverified, timeout, EOF, invalid/oversized response, error, close, half-open, rotation, expiry, reset, and stale-generation callback fence Data, trigger bounded reconnect/filter restoration, and require fresh verification. Per-outbox transient connect/login/write/close transmission is forbidden.",
+        "APRS-IS has no per-packet delivery acknowledgement: a socket write is only local-kernel submission. Durable state distinguishes queued/sending/submitted/observer_confirmed/observation_expired, never calls a socket write accepted or delivered, and advances delivery high-water only after independent filtered observation of exact source, destination, and Info. An unmatched submitted row remains unconfirmed for the persisted three-hour observer window, then expires unconfirmed without blind retry or high-water advance; disconnect after write reconciles through the exact observer/cache.",
+        "A bounded persisted normalized-source-plus-exact-Info observer cache covers Tracker and iGate-owned families for three hours and a local transmit cache suppresses exact repeats for 30 seconds across restart/crash, provision/source isolation, and expiry boundaries; qAR versus qAO path differences do not defeat the emulated APRS-IS 30-second exact-Data dedup because path is ignored.",
+        "The supported same-identity Legacy-to-2.0 migration proves the old local process/session stopped before new verification and rejects detectable local overlap; update, rollback, reset, and restart cannot interleave status or telemetry sequence ownership. Cross-host overlap remains forbidden but is not claimed as client-detectable.",
+        "Repository APRS implementation/configuration docs and regressions are updated with a negative drift check forbidding APCM20, public CM2 markers, public APRS timestamps, qAR emission, and production APRS endpoint/destination overrides. P14-T11 explicitly owns the encoder, monitor, runtime-config, Agent propagation, docs/architecture/aprs-position-encoding.md, docs/architecture/aprs-remote-monitor.md, docs/admin/configuration-security.md, docs/architecture/agent-runtime.md, and their tests.",
+        "Regression and claim tests preserve the residual mixed-generation limit: packets delayed beyond 30 seconds or with different Data can escape exact dedup and may backtrack, so neither the task nor later qualification claims mixed-generation zero rollback."
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T10"]
     },
     {
       "id": "P14-T12",
@@ -428,9 +652,24 @@
       "title": "Run the complete setup, lifecycle, backup, Proxy, CallMesh, and APRS gate",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
       "kind": "test",
       "scope": "product-gate",
       "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "Fresh/setup/reset/resume, Web/Desktop/CLI, autostart, private Node supervision, backup/restore, shared upstream/Proxy and CallMesh/APRS fixture E2E all pass.",
+        "All retained P12 defects have failing-then-passing regressions and real-process tests where applicable.",
+        "Before packaging work, every fixture-only CALL, POS, and APRS assertion required by the Windows live-first plan passes, including APRS-01 through APRS-04, APRS-07 through APRS-14, and APRS-16 through APRS-19, mapping-history selection, persistent verified session/reconnect, observer-confirmed delivery, exact cache boundaries, same-identity takeover, and the frozen v0.2.28 wire oracle; no V4 observation substitutes for these local regressions.",
+        "Full verify, secret/license scans and clean pushed checkpoint pass before packaging work."
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
       "dependsOn": [
         "P14-T04",
         "P14-T06",
@@ -439,60 +678,82 @@
         "P14-T09",
         "P14-T10",
         "P14-T11"
-      ],
-      "acceptance": [
-        "Fresh/setup/reset/resume, Web/Desktop/CLI, autostart, private Node supervision, backup/restore, shared upstream/Proxy and CallMesh/APRS fixture E2E all pass.",
-        "All retained P12 defects have failing-then-passing regressions and real-process tests where applicable.",
-        "Full verify, secret/license scans and clean pushed checkpoint pass before packaging work."
       ]
     },
     {
       "id": "P15-T00",
       "phase": "P15",
-      "title": "Establish target-native build lanes and candidate signing profiles",
+      "title": "Establish the Windows target-native lane and shared candidate profile",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
       "kind": "ci",
       "scope": "native-build",
       "candidateReset": true,
-      "dependsOn": ["P13-T11"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
-        "Static Windows x64, macOS x64/arm64, Linux x64/arm64 lanes pin Rust/Node/pnpm/system tools and build target-only native dependencies.",
-        "Development unsigned/ad-hoc/test-signed lanes are distinct from optional production signing and never infer real foreign-host evidence.",
-        "Build/runtime/package output is campaign-temp scoped and no lane downloads/reassembles another GitHub artifact."
-      ]
+        "The Windows x86-64 lane pins Rust, Node, pnpm, Tauri/NSIS and system tools and builds target-only native dependencies from the campaign.",
+        "The shared profile schema distinguishes development unsigned/test-signed from optional production signing and never infers foreign-host evidence.",
+        "Build/runtime/package output is campaign-scoped and no lane downloads or reassembles another GitHub artifact; foreign native lanes are established later by P15-T15."
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T11", "P18-T02"]
     },
     {
       "id": "P15-T01",
       "phase": "P15",
-      "title": "Create one canonical profile manifest and target-native Tauri staging trees",
+      "title": "Create the canonical profile manifest and Windows Tauri staging tree",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
       "kind": "build",
       "scope": "native-stage",
       "candidateReset": true,
-      "dependsOn": ["P14-T12", "P15-T00"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
-        "One deterministic product/profile manifest identifies shared Agent/CLI/Gateway/Web/private-Node inputs and exact native-versus-Docker inclusion/exclusion; each native target stage adds GUI/updater helpers, licenses, migrations and terms.",
-        "Tauri platform config overlays are the only consumers of native staging trees. Docker later builds its own GUI-free stage from the shared profile manifest and never copies a Tauri stage, app bundle, sidecar layout or updater helper.",
+        "One deterministic product/profile manifest identifies shared Agent/CLI/Gateway/Web/private-Node inputs and exact native-versus-Docker inclusion/exclusion.",
+        "The Windows Tauri stage adds GUI/updater helpers, licenses, migrations and terms and is the only input to the Windows platform overlay; foreign stages extend the same manifest in P15-T15.",
         "Missing system Node/npm, wrong architecture/native addon, extra public binary and source-identity mismatch smokes fail closed."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T12", "P15-T00"]
     },
     {
       "id": "P15-T02",
       "phase": "P15",
-      "title": "Implement external update coordinator, watchdog, health gate, and exact rollback",
+      "title": "Implement the external update coordinator and exact Windows health rollback",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
       "kind": "feat",
       "scope": "native-update",
       "candidateReset": true,
-      "dependsOn": ["P14-T08", "P14-T09", "P15-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
-        "The selected maintained updater driver owns check/download/signature/install; CMClient owns only durable job, state backup, quiesce, external watchdog, health and rollback.",
-        "The prior exact installer/app/AppImage remains available through health commit and every mutable phase supports kill/resume.",
-        "Good, corrupt, wrong-target, interrupted, unhealthy-new and failed-rollback labs verify either new exact version or restored old exact version/state."
-      ]
+        "The selected maintained updater driver owns check/download/signature/install; CMClient owns durable Job, state backup, quiesce, external watchdog, health and rollback.",
+        "The prior exact Windows Setup/release remains available through health commit and every mutable phase supports kill/resume.",
+        "Good, corrupt, wrong-target, interrupted, unhealthy-new and failed-rollback Windows labs verify either the new exact version or restored old exact version/state; macOS app and Linux AppImage format/lifecycle proof remains with P15-T06/P15-T10."
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T08", "P14-T09", "P15-T01"]
     },
     {
       "id": "P15-T03",
@@ -500,15 +761,24 @@
       "title": "Produce one current-user Windows x64 Setup executable",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
       "kind": "build",
       "scope": "windows",
       "candidateReset": true,
-      "dependsOn": ["P14-T06", "P14-T07", "P15-T01", "P15-T02"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Tauri NSIS currentUser produces exactly CMClient-Setup.exe with offline WebView2, Start menu GUI, terminal command, all internal components and no normal UAC.",
         "Installer hooks create/repair PATH and HKCU autostart; upgrade/uninstall keep ~/.cmclient unless explicit user reset and remove integrations idempotently.",
         "No MSI, portable archive, separate Desktop/CLI installer or system service is public."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T06", "P14-T07", "P15-T01", "P15-T02"]
     },
     {
       "id": "P15-T04",
@@ -516,15 +786,24 @@
       "title": "Qualify the Windows x64 Setup and lifecycle lab",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
       "kind": "test",
       "scope": "windows-qualification",
       "candidateReset": true,
-      "dependsOn": ["P15-T03"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Fresh install, Next-flow, no-UAC, GUI, CLI, Web setup, background login start, upgrade, unhealthy rollback, repair, uninstall/reinstall and state migration pass from the exact Setup.",
         "Agent hard-kill, locked files, stale PATH/autostart and previous-version rollback leave no orphan or duplicate core.",
         "Current Windows Server evidence is labeled as such and is not represented as Windows 11."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T03"]
     },
     {
       "id": "P15-T05",
@@ -532,15 +811,24 @@
       "title": "Build Universal macOS app resources without rebuilding Node binaries",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "build",
       "scope": "macos",
       "candidateReset": true,
-      "dependsOn": ["P15-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "The Universal Tauri app includes native Rust slices and separate verified official Node x64/arm64 production trees selected at runtime, not lipo-rebuilt Node.",
         "Both architecture resource manifests, serial native addons, JIT/signing entitlements and updater helper layout pass structural/native-load CI checks.",
         "Ad-hoc/test signing is explicit and production Developer ID/notarization remains optional manual work."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T01", "P15-T15"]
     },
     {
       "id": "P15-T06",
@@ -548,15 +836,24 @@
       "title": "Produce one Universal DMG with user CLI and SMAppService integration",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "build",
       "scope": "macos",
       "candidateReset": true,
-      "dependsOn": ["P14-T07", "P15-T02", "P15-T05"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Tauri builds one CMClient.dmg with drag-to-Applications layout and one complete app product.",
         "First run installs/repairs a reversible ~/.local/bin/cmclient shim and SMAppService status/toggle without administrator access; a fresh supported login shell resolves cmclient without manual PATH editing or destructive profile replacement.",
         "Update/rollback preserves prior app, repairs integration and verifies the exact restored/new version."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T07", "P15-T02", "P15-T05"]
     },
     {
       "id": "P15-T07",
@@ -564,14 +861,23 @@
       "title": "Qualify Universal DMG structure and native lifecycle evidence",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "macos-qualification",
       "candidateReset": true,
-      "dependsOn": ["P15-T06"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "DMG/app slices, resources, signatures, Node/native addon selection, CLI shim, SMAppService, migration and update/rollback fixtures pass.",
         "Real Intel and Apple Silicon installed V3 rows remain optional/manual unless executed on those named hosts; CI structure/cross-build is not relabeled."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T06"]
     },
     {
       "id": "P15-T08",
@@ -579,15 +885,24 @@
       "title": "Build the complete Linux x86-64 AppImage product",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "build",
       "scope": "linux-x64",
       "candidateReset": true,
-      "dependsOn": ["P15-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Tauri emits one target-native x86-64 AppImage containing the complete product/private Node and no DEB/RPM split.",
         "A host without system Node starts from the packaged runtime, CLI arguments dispatch command mode while no arguments open the compact GUI, and the package contains only x86-64 native dependencies. XDG integration and versioned update/rollback are verified by P15-T10, not this package-composition task.",
         "Clean Ubuntu 22.04 and Debian 12 class lanes install only the documented WebKitGTK/GTK/indicator/OpenSSL/glibc runtime prerequisites, pass GUI/Agent/CLI/native-addon launch, and fail preflight with an actionable dependency report when a prerequisite is missing; AppImage is not mislabeled fully self-contained."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T01", "P15-T14", "P15-T15"]
     },
     {
       "id": "P15-T09",
@@ -595,15 +910,24 @@
       "title": "Build the complete Linux ARM64 AppImage product",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "build",
       "scope": "linux-arm64",
       "candidateReset": true,
-      "dependsOn": ["P15-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Tauri emits one target-native ARM64 AppImage with ARM Node/native dependencies and no foreign addon fallback.",
         "Architecture inspection and native-load or controlled-emulation rows are labeled exactly; real ARM V3 remains optional/manual until executed. XDG integration and versioned update/rollback are verified by P15-T10.",
         "The documented Ubuntu 22.04/Debian 12 runtime prerequisite matrix is architecture-qualified; clean ARM64 native or honestly labeled emulated lanes prove dependency preflight, GUI/Agent/CLI startup and native-addon load without claiming V3 from emulation."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T01", "P15-T14", "P15-T15"]
     },
     {
       "id": "P15-T10",
@@ -611,15 +935,24 @@
       "title": "Implement Linux XDG integration and versioned AppImage rollback",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "feat",
       "scope": "linux-lifecycle",
       "candidateReset": true,
-      "dependsOn": ["P14-T07", "P15-T02", "P15-T08", "P15-T09"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "First run repairs desktop entry, icon, ~/.local/bin/cmclient and XDG autostart; a fresh supported login shell resolves cmclient without destructive profile replacement, and systemd-user is a mutually exclusive explicit headless fallback.",
         "Updates keep versioned AppImages and the current pointer under ~/.cmclient/updates/releases and atomically switch there; unhealthy update switches to the prior exact AppImage and state. Only reversible shell/XDG integration files live outside ~/.cmclient.",
         "Moved file, no-FUSE extraction fallback, disabled autostart, uninstall integration and kill-at-switch fixtures pass for both architectures."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T07", "P15-T02", "P15-T08", "P15-T09"]
     },
     {
       "id": "P15-T11",
@@ -627,14 +960,23 @@
       "title": "Run the complete native install, migration, update, rollback, and retention matrix",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "native-matrix",
       "candidateReset": true,
-      "dependsOn": ["P15-T04", "P15-T07", "P15-T10"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Every required V0-V2 target row and available honest V3 row covers install, setup, GUI/CLI/Web, autostart, state migration, backup, update, rollback and uninstall retention.",
         "No package requires system Node/npm, elevated normal lifecycle, another public component package or downloaded/reassembled GitHub artifact."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T04", "P15-T07", "P15-T10"]
     },
     {
       "id": "P15-T12",
@@ -642,14 +984,23 @@
       "title": "Run the full native distribution verification gate",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "native-release",
       "candidateReset": true,
-      "dependsOn": ["P15-T11"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Native schema, package policies, install smokes, updater labs, source/runtime identity, full verify, secret/license scans and clean push all pass.",
         "Unavailable real foreign targets and production signing remain explicit pending manual rows."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T11"]
     },
     {
       "id": "P15-T13",
@@ -657,14 +1008,23 @@
       "title": "Manually qualify native packages on real foreign targets",
       "required": false,
       "manualGate": true,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "native-v3",
       "candidateReset": false,
-      "dependsOn": ["P15-T12"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Install and run exact packages on named Windows 11, Intel/Apple Silicon macOS and x64/ARM64 Linux hosts when available.",
         "Never infer a real V3 pass from the current Windows Server host, cross-build, structure check, Rosetta, QEMU or another architecture."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T12"]
     },
     {
       "id": "P16-T01",
@@ -672,16 +1032,25 @@
       "title": "Build one non-root unified Docker container under Docker init",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "build",
       "scope": "docker",
       "candidateReset": true,
-      "dependsOn": ["P14-T12", "P15-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "One service/container contains Agent, CLI, Web, Gateway and pinned Node but no Desktop or CallMesh server/self-host component; Rust Agent is exec-form entrypoint and Compose init:true supplies PID1 reaping.",
         "Docker assembles a separate stage from the P15-T01 shared profile manifest; Tauri GUI resources, app bundle metadata, native updater helpers and foreign-target dependencies are absent.",
         "UID 10001, read-only root, cap-drop ALL, no-new-privileges, one state volume/bounded tmpfs and no socket/device/host/privileged mode pass inspection.",
         "Old gateway/web/ingress multi-service and Node entrypoint contracts are removed."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T12", "P15-T01", "P18-T10"]
     },
     {
       "id": "P16-T02",
@@ -689,16 +1058,25 @@
       "title": "Implement Docker state, authenticated setup, and local host publishing",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "feat",
       "scope": "docker-access",
       "candidateReset": true,
-      "dependsOn": ["P16-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "All state is /home/cmclient/.cmclient on the named volume and survives restart, recreate, and docker compose down when --volumes is not supplied; UID 10001 performs atomic writes and down --volumes is documented as destructive.",
         "Compose publishes host_ip 127.0.0.1 by default and every Docker Web session authenticates; LAN requires both widened publish and enabled LAN policy.",
         "One-time setup code is available only through docker compose exec CLI and never environment/log/URL/diagnostics/evidence.",
         "When the management Web listener is disabled, docker compose exec command mode can inspect and re-enable it while local Control remains healthy."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T01"]
     },
     {
       "id": "P16-T03",
@@ -706,14 +1084,23 @@
       "title": "Qualify Docker signals, reaping, health, and restart behavior",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "docker-lifecycle",
       "candidateReset": true,
-      "dependsOn": ["P16-T02"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "SIGTERM reaches Agent, Gateway shuts down within stop grace, repeated crashes leave no zombie/orphan, and fatal Agent exit increments restart count.",
         "Health is read-only through local Control, setupRequired is healthy, and unhealthy status alone is not claimed to trigger Docker restart."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T02"]
     },
     {
       "id": "P16-T04",
@@ -721,15 +1108,24 @@
       "title": "Qualify Docker setup, CLI, Web, backup/restore, and state E2E",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "docker-e2e",
       "candidateReset": true,
-      "dependsOn": ["P16-T02", "P16-T03"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Compose exec command mode uses Control for setup/status/reset/backup/restore and no direct DB/secret access.",
         "Default local publish, authenticated widened publish, setup generation, DB/WAL, backup/restore, restart/recreate and redaction pass.",
         "Docker Engine older than the approved localhost behavior fails qualification instead of being represented as safe."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T02", "P16-T03"]
     },
     {
       "id": "P16-T05",
@@ -737,15 +1133,24 @@
       "title": "Build and inspect one amd64/arm64 OCI index with native child identities",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "build",
       "scope": "docker-multiarch",
       "candidateReset": true,
-      "dependsOn": ["P16-T04"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Native or honestly labeled controlled lanes build immutable linux/amd64 and linux/arm64 child digests and one exact OCI index; any push is limited to a campaign-local ephemeral or CI-controlled registry, never an assumed public registry.",
         "imagetools inspection proves exactly two targets and binds Rust/Node/native addon/runtime identities plus index/child digests.",
         "No index job downloads image payload layers; QEMU/cross-build evidence is labeled V0-V2 and never real native V3."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T04"]
     },
     {
       "id": "P16-T06",
@@ -753,14 +1158,23 @@
       "title": "Implement operator-side Docker digest update and rollback",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "docker-update",
       "candidateReset": true,
-      "dependsOn": ["P16-T05"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Host workflow records old digest, pulls/recreates exact new digest with the same volume, health-checks, and pins/recreates old digest on failure.",
         "Container has no self-update or Docker socket/API; old image remains through commit and state survives good/bad update."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T05"]
     },
     {
       "id": "P16-T07",
@@ -768,14 +1182,23 @@
       "title": "Reduce the release schema to the unified public install objects",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "release",
       "scope": "release-schema",
       "candidateReset": true,
-      "dependsOn": ["P15-T12", "P16-T05"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Public choices are Windows Setup, Universal DMG, two AppImages, one OCI index and Compose; signatures/checksums/SBOM/provenance/update files are support objects.",
         "Old MSI/portable/DEB/component selectors fail policy tests and release-artifacts becomes a small schema/index validator rather than a packager."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T12", "P16-T05"]
     },
     {
       "id": "P16-T08",
@@ -783,15 +1206,24 @@
       "title": "Replace artifact collectors with same-runner build, test, SBOM, attest, and upload jobs",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "ci",
       "scope": "release-workflow",
       "candidateReset": true,
-      "dependsOn": ["P16-T07"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Each static target job builds, test-signs only when needed, packages, installs/tests, hashes, SBOMs, creates a local offline Cosign blob/attestation bundle and optionally retains its exact final object as one workflow artifact on one runner.",
         "No downstream download-artifact, merge-multiple, overlay, repack or byte finalizer exists; index job consumes metadata outputs only.",
         "No autonomous job calls actions/attest, writes a public transparency log, creates/updates a GitHub Release or publishes a package; production attestation/signing/tag/release upload is an explicit protected human workflow and new signed bytes require new qualification."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T07"]
     },
     {
       "id": "P16-T09",
@@ -799,15 +1231,24 @@
       "title": "Bind exact native and OCI subjects to checksums, SBOM, provenance, and signing status",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "release",
       "scope": "supply-chain",
       "candidateReset": true,
-      "dependsOn": ["P16-T06", "P16-T08"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Checksum-pinned Syft scans final native stages; BuildKit emits OCI SBOM/provenance in the controlled registry; pinned Cosign uses a campaign-local test key to bind exact native blobs and the OCI index with transparency/network upload disabled.",
         "Release index records source, size, digest, SBOM digest, attestation identity and signing status without consuming payload bytes.",
         "Post-attestation repack, missing target, identity mismatch, unresolved license evidence, public attestation/release mutation, and substituted subject fail closed; actions/attest and keyless transparency are reserved for P17-T08."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T06", "P16-T08"]
     },
     {
       "id": "P16-T10",
@@ -815,14 +1256,23 @@
       "title": "Run the complete native package and Docker candidate matrix",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "distribution-matrix",
       "candidateReset": true,
-      "dependsOn": ["P16-T09"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Every required target has exact V0-V2 evidence and only actually executed real hosts have V3; package/Docker install, setup, access, autostart, update/rollback, uninstall/state cases pass.",
         "No current-Windows, cross-build, QEMU or manifest evidence is represented as another platform or production release."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T09"]
     },
     {
       "id": "P16-T11",
@@ -830,14 +1280,23 @@
       "title": "Run the full unified distribution and release-policy gate",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "release-gate",
       "candidateReset": true,
-      "dependsOn": ["P16-T10"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Full verify, policy, package, Docker, load, supply-chain, license/provenance, docs and secret scans pass with exact evidence references.",
         "No main change, tag, production sign/notarize, publication or GitHub artifact download occurs."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T10"]
     },
     {
       "id": "P16-T12",
@@ -845,14 +1304,23 @@
       "title": "Manually qualify OCI children on real amd64 and arm64 hosts",
       "required": false,
       "manualGate": true,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
       "kind": "test",
       "scope": "docker-v3",
       "candidateReset": false,
-      "dependsOn": ["P16-T11"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Run each exact child digest on named real amd64 and arm64 hosts and record native runtime/product evidence.",
         "Do not infer real ARM or amd64 evidence from cross-build, QEMU, index inspection or another host."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P16-T11"]
     },
     {
       "id": "P17-T01",
@@ -860,15 +1328,24 @@
       "title": "Revalidate every live testability gate in the isolated Windows campaign",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "global-final",
+      "priority": 50,
       "kind": "test",
       "scope": "qualification",
       "candidateReset": true,
-      "dependsOn": ["P15-T12", "P16-T11"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "All applicable TG gates pass against exact local source/runtime; optional hosts/signing/Docker/hardware are inventoried by boolean/reason only and independent work continues.",
         "Every child HOME/USERPROFILE/TEMP/TMP/TMPDIR and build/runtime/package/DB/capture/update-lab path is inside the owner-user campaign temp root.",
         "Approved credentials/endpoints are checked without values, public exposure, external mutation, RF or radio change."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T12", "P16-T11", "P18-T10"]
     },
     {
       "id": "P17-T02",
@@ -876,15 +1353,25 @@
       "title": "Qualify passive Meshtastic TCP, CallMesh provision, and verified APRS-IS",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "global-final",
+      "priority": 50,
       "kind": "test",
       "scope": "live-data",
       "candidateReset": true,
-      "dependsOn": ["P17-T01"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Passive TCP 4403 config/live/reconnect and sanitized replay pass without RF or radio mutation.",
-        "The exact candidate uses the official CallMesh service for Legacy-compatible heartbeat/mapping/provision, records the authoritative snapshot identity, and passes canonical matching verified APRS login; only authorized provision-derived flow may transmit and no server/mapping override is used.",
+        "The exact final candidate uses the official CallMesh service for Legacy-compatible heartbeat/mapping/provision, records the authoritative snapshot identity, applies the schema-supported provision-or-fixed-default APRS endpoint/beacon policy, and passes canonical matching verified APRS login; only authorized flow may transmit and no local server/mapping/APRS destination override is used.",
+        "Whenever shared source, runtime, contracts, APRS implementation, or package inputs changed after the scoped Windows candidate, rebuild the exact candidate and rerun the affected Windows CALL/POS/APRS/SOAK cases. The rerun proves APTMAG/MESHD*,qAO untimestamped Tracker Data with no CM2 marker, policy-selected iGate packet family and cadence, persistent verified sessions, observer-confirmed delivery, exact caches, same-identity takeover, and the stated mixed-generation residual limit.",
         "Evidence contains no credential, identity, precise private location or raw sensitive packet data."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P17-T01"]
     },
     {
       "id": "P17-T03",
@@ -892,15 +1379,24 @@
       "title": "Qualify multi-client Proxy, full Web, compact Desktop, and command mode",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "global-final",
+      "priority": 50,
       "kind": "test",
       "scope": "clients",
       "candidateReset": true,
-      "dependsOn": ["P17-T02"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "At least two local Proxy clients share one upstream and pass config/ACK/slow/reconnect/order cases.",
         "All full Web workflows, compact Desktop controls and CLI paths use the same resident Agent and installed product.",
         "Repeated lifecycle operations produce no duplicate process, event, DB write or APRS output."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P17-T02"]
     },
     {
       "id": "P17-T04",
@@ -908,15 +1404,24 @@
       "title": "Qualify persistence, reset, backup/restore, update/rollback, and recovery",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "global-final",
+      "priority": 50,
       "kind": "test",
       "scope": "recovery",
       "candidateReset": true,
-      "dependsOn": ["P17-T03"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Restart/WAL/integrity, operational reset/re-setup, backup/restore manifests/exclusions/staging and generation fences pass.",
         "Local test-signed update lab covers every interrupted phase, corrupt/wrong/unhealthy candidate and exact prior-version/state rollback.",
         "No real user state, production release resource or external admin/radio state is mutated."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P17-T03"]
     },
     {
       "id": "P17-T05",
@@ -924,15 +1429,24 @@
       "title": "Complete the continuous 24-hour unified-product live soak",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "global-final",
+      "priority": 50,
       "kind": "test",
       "scope": "soak",
       "candidateReset": true,
-      "dependsOn": ["P17-T04"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "A continuous 24-hour exact-candidate run records bounded health/RSS/handles/threads/DB/WAL/log/upstream/client metrics.",
         "No duplicate domain/APRS event, position rollback, secret leak, unbounded growth, orphan or stale generation commit occurs.",
         "Every product failure enters the repair/regression/full-verify/push/new-candidate/rerun loop."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P17-T04"]
     },
     {
       "id": "P17-T06",
@@ -940,15 +1454,24 @@
       "title": "Freeze the final candidates, rerun final matrix, sanitize evidence, and close out",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "global-final",
+      "priority": 50,
       "kind": "release",
       "scope": "candidate",
       "candidateReset": false,
-      "dependsOn": ["P17-T05"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "runtimeCandidate binds final source/runtime after the last repair and distributionCandidate binds exact package/index/child bytes without CI artifact equivalence assumptions.",
         "All invalidated cases rerun and honest platform/production deferrals remain pending; the P13 LICENSE_PROVENANCE record is still approved, matches the final exact sources, permits public dev distribution and is not a deferrable completion item.",
         "All processes/handles/listeners close, raw campaign root is deleted, sanitized ledger remains, dev equals origin/dev, and Repository is clean."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P17-T05"]
     },
     {
       "id": "P17-T07",
@@ -956,15 +1479,24 @@
       "title": "Pass the Goal completion checker and prepare the human release proposal",
       "required": true,
       "manualGate": false,
+      "environmental": false,
+      "lane": "global-final",
+      "priority": 50,
       "kind": "release",
       "scope": "completion",
       "candidateReset": false,
-      "dependsOn": ["P17-T06"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "Before checkpoint the checker passes excluding P17-T07 with a durable precheck attestation; after push it passes without exclusion.",
         "Checker proves required task state, exact candidates/evidence, full verify, origin sync, cleanup, no secret residue, an approved non-deferred LICENSE_PROVENANCE record, and explicit platform/production deferrals.",
         "Release proposal separates proven claims from pending human actions and Goal completes without main/tag/sign/publish/RF/radio/GitHub-artifact-download actions."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P17-T06"]
     },
     {
       "id": "P17-T08",
@@ -972,14 +1504,493 @@
       "title": "Human-approved production compliance, stable promotion, signing, tag, and publication",
       "required": false,
       "manualGate": true,
+      "environmental": false,
+      "lane": "manual-production",
+      "priority": 90,
       "kind": "release",
       "scope": "production",
       "candidateReset": false,
-      "dependsOn": ["P17-T07", "P15-T13", "P16-T12"],
+      "repairOf": null,
+      "supersedesPartOf": null,
       "acceptance": [
         "The P13 development-distribution license gate must already be approved. This task separately revalidates final production-candidate notices/source obligations and requires explicit human approval of the exact candidate, main modification, production credentials and exact release actions.",
+        "Before a public APRS product claim, confirm or obtain the APTMAG TOCALL allocation and document MESHD* as the retained product-specific provenance token without presenting it as an APRS-defined alias; an unresolved allocation keeps production publication blocked without changing the Legacy-compatible development wire silently.",
         "Production signing/notarization creates new bytes and requires exact-byte final qualification before publication; same-runner actions/attest/keyless transparency/direct release upload occurs only here with no artifact download/reassembly. This task is outside the autonomous Goal."
-      ]
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P17-T07", "P15-T13", "P16-T12"]
+    },
+    {
+      "id": "P13-T16",
+      "phase": "P13",
+      "title": "Promote the Windows-live-first v3 graph without rewriting history",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "hardware-window",
+      "priority": 0,
+      "kind": "chore",
+      "scope": "task-graph",
+      "candidateReset": false,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "The explicit Goal invokes the promoter before start-session/next-task; it verifies P13-T15 is the sole active v2 task, journals its complete preimage, and injects P13-T16 as the sole in-progress promotion task with the exact pre-mutation checkpoint base. No partially imported graph is visible to normal scheduling.",
+        "Validate the v2 plan, Repository graph lock, source digests, task state, license record, campaign state, and completed-history digest before mutation.",
+        "Journal and atomically archive every preimage; preserve all completed task objects and every P13-T15 execution/candidate-invalidation field in immutable graph history before transforming active state. Require P13-T15 in_progress/repairOf P13-T06, then mark its active object skipped with skippedAt and P13-T17/P15-T14 supersession metadata so no scheduler can resume it.",
+        "Install the v3 delta, supersession map, hardware-first dependency fence, scheduler priorities, repair/attempt ID ranges, scoped Windows completion rule, named pre/post completion checker, and graph-lock/tooling tests as one recoverable transaction. Preserve the active P17-T07 global completionTask/checker byte-for-byte; add WindowsLiveFirst as a separate named scope and prove its postcheck does not prevent the later P17-T07 pre/postcheck. The transform must also match P13-T06 status=blocked and blockedByRepair=P13-T15, archive then clear its block/checkpoint-resume fields, set it pending behind P13-T17/P13-T18, and prove next-task reaches it after both replacements complete.",
+        "Split the unresolved P13-T15 candidate invalidation into linked active records: P13-T17 owns shared/Windows FULL_VERIFY, PACKAGE_MATRIX, and TESTABILITY_GATES invalidation and blocks the scoped candidate; P15-T14 owns only Linux-target invalidation and blocks global Linux completion, not P18-T10. The original record remains unchanged in graph history and no invalidation is silently dropped or double-resolved.",
+        "Completion tooling owns a schema and diff allowlist for docs/qualification/windows-server-2025-x86_64-development-candidate.json plus a hash-linked append-only state/SCOPED_WINDOWS_COMPLETION_ATTEMPTS.json event ledger. P13-T16 also creates and hashes an exact-file completion-tool-only repair allowlist in the graph lock. Its default is empty; any listed path forbids globs/directories and requires proof that it is absent from product/build/package/lockfile/case/oracle/evidence-generation/runtime/Setup inputs. One exclusive task-state/graph lock covers repair/attempt ID allocation, dynamic task creation, dependency reconciliation, and ledger-head transition. The task schema locks P18-T02 evidenceClaim.identityLevel=hardware-source/observationOnly=true and rejects HWS evidence in V3, installed-candidate, final-live, recovery, or soak rows. Tests reject an empty attempt checkpoint, any second Repository path, sensitive/raw fields, a candidate identity equal to a manifest-only tree, a stale/non-pushed head, or a postcheck that does not verify the pre-completion source/tree/runtime/Setup binding.",
+        "P18-T10 is attempt 1. Precheck appends attempt_prepared without a commit; only post-push reconciliation appends attempt_pushed with exact commit/origin and makes it headAttempt. Attempt 1 remains in_progress/postcheck_pending after push. A deterministic failure appends attempt_failed, blocks the coordinator, runs one even repair as the sole in-progress task, then one odd attempt as the sole in-progress task; after its push the attempt is done, repair/attempt dependencies are appended, attempt_pushed becomes head, and only the coordinator resumes in_progress/postcheck_pending. Reconciliation blockers reuse the same attempt/commit without allocation. Tests cover two deterministic failures followed by success, all three failure classes, concurrent allocation, recovery after every allocation/commit/reconcile/terminalization boundary, one-active-task enforcement, checkpoint/task-ID uniqueness, ancestry, stale manifest rejection, retry-range exhaustion, and preservation of P17-T07.",
+        "Hash and journal the APRS compatibility contract, specs/05-position-aprs.md, specs/17-callmesh.md, RUNTIME_ONBOARDING.md, task amendments, cases, and their amendment provenance as one activation input; drift or a missing path fails before graph mutation. Repository APRS implementation/docs remain P14-T11 work, not an untracked promotion side effect.",
+        "Scheduler trace tests select P18-T01 and the required Windows core prerequisites, then reach P14-T01 and mandatory P18-T02 before P14-T02 or P15-T00. A hardware-blocked P18-T02 blocks broad P14 and packaging rather than silently routing around the user's physical-first milestone. Tests also preserve parent lane/priority for dynamic repairs and prove no foreign/Docker/global task can run before P18-T10.",
+        "A failed transaction restores exact v2 bytes; a successful transaction passes full verify and scans, checkpoints, pushes dev, and proves origin equality before another task starts."
+      ],
+      "caseGroups": ["PRE", "COMP"],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T14"]
+    },
+    {
+      "id": "P13-T17",
+      "phase": "P13",
+      "title": "Repair shared load and direct Windows source-build qualification",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
+      "kind": "fix",
+      "scope": "windows-build",
+      "candidateReset": true,
+      "repairOf": "P13-T06",
+      "supersedesPartOf": "P13-T15",
+      "acceptance": [
+        "Reproduce the shared load failure and direct Desktop contracts-build failure with exact sanitized logs; prove failing regressions before repair.",
+        "Make dependency/build ordering explicit so contracts, Gateway, Web, the existing Desktop frontend/source target, and Windows Rust targets build from a clean campaign mirror without Tauri bundling, NSIS, staging, or updater-payload generation.",
+        "Do not absorb the Linux hidden-updater lifecycle into this task; route it to P15-T14.",
+        "Focused, adjacent, full verification and secret/license scans pass; checkpoint and push dev before P13-T06 resumes."
+      ],
+      "caseGroups": ["PRE", "SRC"],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T16"]
+    },
+    {
+      "id": "P13-T18",
+      "phase": "P13",
+      "title": "Repair the real Agent to Gateway private bootstrap on Windows",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
+      "kind": "fix",
+      "scope": "gateway-bootstrap",
+      "candidateReset": true,
+      "repairOf": "P13-T05",
+      "supersedesPartOf": null,
+      "acceptance": [
+        "A real Windows child-process regression proves the current supervised Gateway waits because Agent does not enable/send the private bootstrap.",
+        "Agent enables the bounded memory-only bootstrap, validates exact child PID/nonce/capability and OS-selected loopback ready endpoint, and never passes the capability in argv, environment, disk, logs, or evidence.",
+        "Wrong nonce/PID/capability, timeout, early exit, oversized frame, spoofed header, and port-takeover cases fail closed without orphan processes.",
+        "Complete Agent/Gateway source smoke, full verify, secret scan, checkpoint, and dev push pass."
+      ],
+      "caseGroups": ["SRC", "SEC"],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T16", "P13-T17"]
+    },
+    {
+      "id": "P15-T14",
+      "phase": "P15",
+      "title": "Repair the Linux hidden updater lifecycle before AppImage qualification",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
+      "kind": "fix",
+      "scope": "linux-updater",
+      "candidateReset": true,
+      "repairOf": "P13-T06",
+      "supersedesPartOf": "P13-T15",
+      "acceptance": [
+        "Reproduce and repair only the Linux hidden updater lifecycle with target-native regressions and exact evidence.",
+        "This task remains required for Linux/global release work but never blocks the P18 Windows physical source smoke, implementation, package, or live qualification.",
+        "Focused, adjacent, full verification and scans pass before checkpoint and dev push."
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T15"]
+    },
+    {
+      "id": "P15-T15",
+      "phase": "P15",
+      "title": "Establish foreign native build lanes and staging after Windows qualification",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "foreign-platform",
+      "priority": 40,
+      "kind": "ci",
+      "scope": "foreign-native-build",
+      "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "Establish exact target-native macOS x86-64/arm64 and Linux x86-64/arm64 tool/dependency lanes with honest host/emulation claim boundaries.",
+        "Extend the canonical profile manifest into Universal macOS and Linux AppImage staging trees without changing the completed Windows evidence in place.",
+        "Any shared-source change invalidates the scoped Windows candidate for later global release and is recorded for P17 exact-candidate rerun; target-only failures remain in their native tasks.",
+        "Full verification, scans, checkpoint, and dev push pass before macOS/Linux package tasks continue."
+      ],
+      "caseGroups": [],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P18-T10"]
+    },
+    {
+      "id": "P18-T01",
+      "phase": "P18",
+      "title": "Build and prove the product-integrated physical Meshtastic safety guard",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "hardware-window",
+      "priority": 0,
+      "kind": "test",
+      "scope": "physical-safety-guard",
+      "candidateReset": false,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "Implement the guard in the transport/lease path used by the Agent-owned product, not in a standalone capture substitute. A physical profile permits one nonce-correlated want_config_id per session and rejects every other ToRadio variant before socket write.",
+        "Maintain one aggregate physical-write ledger across every owning process: one request per session, no more than four connection/config attempts in ten minutes, no more than three consecutive configuration failures, no more than four requests in one qualification stage or soak, and no more than sixteen requests per exact candidate before the external-flow fuse opens.",
+        "Bound duration, bytes, frames, memory, and quarantine rotation; raw content never reaches stdout, logs, screenshots, diagnostics, evidence, workspace state, Git, or Tavily.",
+        "The same guarded product path can emit a bounded private quarantine for regression work; its sanitizer replaces raw/decoded/encrypted bytes, identities, messages, positions, network data, and time anchors with synthetic values and produces deterministic replay digests. Building a parallel capture application is forbidden.",
+        "Fixture/property tests, containment/secret scans, and clean shutdown pass without needing the physical endpoint."
+      ],
+      "caseGroups": ["PRE"],
+      "caseAssertions": [
+        "MESH-01",
+        "MESH-07",
+        "MESH-10",
+        "MESH-12",
+        "SEC-02",
+        "SEC-03",
+        "SEC-06"
+      ],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T16"]
+    },
+    {
+      "id": "P18-T02",
+      "phase": "P18",
+      "title": "Boot the real CMClient Agent/Gateway/Web/CLI source path and pass physical TCP smoke",
+      "required": true,
+      "manualGate": false,
+      "environmental": true,
+      "lane": "hardware-window",
+      "priority": 0,
+      "kind": "test",
+      "scope": "early-product-live-smoke",
+      "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "Build and launch the real source component path through Agent supervision: pinned campaign/private Node, Gateway child, the existing Agent-served Web runtime with status/Meshtastic observation routes, and CLI over named-pipe Control. This early gate proves process ownership and physical data projection only; setup-only API/Jobs/SSE, guided wizard, complete management workflows, compact graphical integration, launcher behavior, and their P14-T02/P14-T03/P14-T06 acceptance remain later work. An already-runnable graphical status surface may be checked as supplemental evidence but cannot block HWS completion. Manual Gateway launch, a capture helper, system Node, intercepted Web APIs, direct DB access, or direct device access cannot satisfy the task.",
+        "With CallMesh, APRS, Proxy client writes, and every non-Meshtastic external producer mechanically disabled, reserve/count any optional boolean connectivity probe, close it, acquire the exclusive product lease, and establish exactly one Agent-owned TCP 4403 session.",
+        "Reserve the aggregate ledger before sending exactly one nonce-correlated want_config_id, then permanently disable the session writer. Matching configuration completion and at least one actually observed passive non-configuration FromRadio event must traverse the production decoder, ingest/persistence/domain event path and become consistently visible through real Web/API/SSE and CLI; if the existing graphical status surface is launched, it must agree with Agent Control.",
+        "Continuously prove one owning PID/socket, one source/tree/runtime identity, one campaign root, no RF/radio/config/admin/message/position write, no second transport, no outside-root write, and no credential or raw-data exposure.",
+        "Close through the product shutdown path and prove no process, socket, listener, lock, or handle remains. Sanitize any retained fixture immediately and delete raw quarantine on schedule.",
+        "Any launch, transport, decode, projection, surface, or shutdown defect enters the regression/repair/full-verify/checkpoint/push loop and this smoke reruns before P14-T02 or P15-T00 becomes selectable.",
+        "Evidence is explicitly source-only current-host observation. It cannot pass Setup, exact-candidate final live, Serial, another platform, production, or 24-hour qualification. Missing hardware or a missing passive non-configuration event blocks this physical-first milestone; the scheduler may continue only its unmet core prerequisites and may not bypass into broad P14 or packaging."
+      ],
+      "caseGroups": ["HWS"],
+      "caseAssertions": [],
+      "evidenceClaim": {
+        "identityLevel": "hardware-source",
+        "observationOnly": true,
+        "maySatisfyCaseGroups": ["HWS"],
+        "forbiddenClaims": [
+          "V3",
+          "installed candidate",
+          "final live",
+          "recovery",
+          "soak",
+          "production"
+        ]
+      },
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P14-T01"]
+    },
+    {
+      "id": "P18-T03",
+      "phase": "P18",
+      "title": "Rebuild and qualify the completed no-external Windows source topology",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "windows-core",
+      "priority": 10,
+      "kind": "test",
+      "scope": "windows-source-runtime",
+      "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "After the remaining P14 product work is complete, use a fresh campaign generation to rebuild in canonical dependency order and launch Agent, private Node/Gateway, full Web, compact Desktop, and CLI as one exact-identity resident product with external writes disabled.",
+        "Prove one home root and plaintext secrets backend, named-pipe Control, private bootstrap, wildcard Web bind with default non-loopback denial, setup states, Jobs/SSE, DB, single instances, and ordered shutdown.",
+        "Web/GUI/CLI use real product paths; request interception, manual Gateway launch, system Node, default user state, and direct DB/device access cannot satisfy the cases.",
+        "All PRE, SRC, SET-01 through SET-08 fixture-only, and applicable SEC assertions plus full verification and scans pass. P18-T02 proves only the earlier product/live milestone and none of its observation evidence substitutes for this completed-source gate."
+      ],
+      "caseGroups": ["PRE", "SRC", "SEC"],
+      "caseAssertions": [
+        "SET-01",
+        "SET-02",
+        "SET-03",
+        "SET-04",
+        "SET-05",
+        "SET-06",
+        "SET-07",
+        "SET-08"
+      ],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P13-T11", "P13-T18", "P14-T12", "P18-T01", "P18-T02"]
+    },
+    {
+      "id": "P18-T04",
+      "phase": "P18",
+      "title": "Build and qualify one current-host Windows Setup candidate",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
+      "kind": "test",
+      "scope": "windows-setup",
+      "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "Bind one Tauri NSIS current-user Setup executable to exact source, runtime, component, Web, Gateway, and private Node digests; record unsigned development status.",
+        "Install without routine UAC, remove system Node from PATH, and prove no-argument graphical launch, command mode in new PowerShell/cmd sessions, background autostart, setup-safe state, and one resident topology.",
+        "Upgrade, uninstall-retain-state, reinstall, PATH/autostart repair, and exact cleanup pass without service/firewall/per-machine mutation.",
+        "Every PKG assertion passes on the current Windows Server host and remains explicitly non-Windows-11/non-production."
+      ],
+      "caseGroups": ["PKG", "SRC", "GUI", "CLI", "SEC"],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P15-T04", "P18-T03"]
+    },
+    {
+      "id": "P18-T05",
+      "phase": "P18",
+      "title": "Qualify exact-candidate Meshtastic, CallMesh, Position, and APRS",
+      "required": true,
+      "manualGate": false,
+      "environmental": true,
+      "lane": "hardware-window",
+      "priority": 0,
+      "kind": "test",
+      "scope": "windows-live-data",
+      "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "All fixture/static WLG gates pass before importing the Repository-external key or opening external service sessions; live one-upstream and socket-count invariants are then asserted continuously after the hardware lease opens.",
+        "The installed candidate performs a write-fenced TCP 4403 config/read/reconnect flow with one request per budgeted session and persists/projects only actually observed live event types without radio mutation or second upstream.",
+        "Official-hosted Legacy-compatible CallMesh heartbeat, conditional mappings, full wire-relevant provision/mapping fields, monotonic persistence, and trusted source-time selection pass; all fault cases use local injection.",
+        "Before live Data, fixture gates prove byte-exact Tracker SOURCE>APTMAG,MESHD*,qAO,IGATE:!legacy-data with no public timestamp/CM2 marker and iGate-owned IGATE>APTMAG,TCPIP*: beacon/status/telemetry lines with server-only qAC, >TMAG Client v<version>, and Legacy v0.2.28 fields/cadences.",
+        "The live gate is blocked unless the frozen-oracle, coordinate/fallback, UTF-8 line-budget, and iGate counter/clock/sequence fixture matrices APRS-16 through APRS-19 have already passed; socket-write success is not external delivery evidence.",
+        "APRS writes zero Data until exact provision-derived verified logresp, then a bounded normal Legacy-compatible flow externally observes each policy-enabled iGate beacon/status/telemetry class plus one qualifying precision-32 qAO Tracker event by private digest; evidence contains no identity, position, Data, endpoint, or credential.",
+        "Local coexistence fixtures prove qAR/qAO path-insensitive 30-second APRS-IS exact dedup, the persisted three-hour exact-Info cache, the 30-second local transmit cache, receive-time exclusion from temporal high-water, and rejection of concurrent old/new ownership of one provision identity.",
+        "Qualification records the greater-than-30-second or changed-Data mixed-generation residual risk and makes no zero-backtrack claim beyond the exact candidate's own proven decisions."
+      ],
+      "caseGroups": ["CALL", "POS", "APRS", "SEC"],
+      "caseAssertions": [
+        "SET-09",
+        "SET-10",
+        "MESH-01",
+        "MESH-02",
+        "MESH-06",
+        "MESH-07",
+        "MESH-08",
+        "MESH-09",
+        "MESH-10",
+        "MESH-11",
+        "MESH-12"
+      ],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": ["MESH-03", "MESH-04", "MESH-05"],
+      "dependsOn": ["P18-T01", "P18-T04"]
+    },
+    {
+      "id": "P18-T06",
+      "phase": "P18",
+      "title": "Qualify one-upstream Proxy and every client surface",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "hardware-window",
+      "priority": 0,
+      "kind": "test",
+      "scope": "windows-clients",
+      "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "At least two loopback Proxy clients share the product's one physical upstream and pass config replay, live broadcast, slow-client isolation, reconnect, ordering, and local-only policy in monitor mode.",
+        "Write/ACK collision, malformed input, pressure, and message/full behavior pass against a local real-TCP upstream fixture and never write to the radio.",
+        "Every Web route, compact graphical control, and command catalogue assertion uses the same resident installed Agent with real API/SSE/Job paths.",
+        "Repeated lifecycle operations produce no duplicate process, physical connection, event, DB write, Job, or APRS output."
+      ],
+      "caseGroups": ["PX", "WEB", "GUI", "CLI", "SEC"],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P18-T05"]
+    },
+    {
+      "id": "P18-T07",
+      "phase": "P18",
+      "title": "Qualify persistence, reset, backup, restore, update, rollback, and recovery",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
+      "kind": "test",
+      "scope": "windows-recovery",
+      "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "Restart/WAL/migration/integrity/retention and one-root persistence pass against installed product state.",
+        "Product-triggered backup and staged restore verify manifests, domain counts, exclusions, credential revalidation, cancel/retry, generation fences, and rollback without manual file substitution.",
+        "Operational reset preserves required history/backups/update state, removes secrets/config/terms, stops external activity, and completes re-setup; factory reset runs only in an isolated fixture.",
+        "The local signed update lab covers valid install, wrong target/signature/digest/size, interruption at each mutation phase, unhealthy candidate, restart recovery, and exact prior-version/state rollback.",
+        "For update, rollback, operational reset, staged restore, and process restart, the old APRS TX/RX owner is closed and verification revoked before the new generation starts; APRS-13 proves there is never an interleaved status writer or telemetry-sequence owner and every new session must exact-reverify."
+      ],
+      "caseGroups": ["DATA", "UPD", "SEC"],
+      "caseAssertions": ["SET-07", "SET-08", "APRS-13"],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P18-T06"]
+    },
+    {
+      "id": "P18-T08",
+      "phase": "P18",
+      "title": "Run the continuous 24-hour exact-candidate live soak",
+      "required": true,
+      "manualGate": false,
+      "environmental": true,
+      "lane": "hardware-window",
+      "priority": 0,
+      "kind": "test",
+      "scope": "windows-live-soak",
+      "candidateReset": true,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "Freeze exact source/runtime/Setup and forbid Repository commits for 24 continuous hours; a product defect or identity drift ends the run and resets the clock after repair.",
+        "Every 15 minutes record bounded health, RSS, handles/resources, threads, event-loop latency, DB/WAL/log, Jobs/outbox, upstream/client count, duplicate/order metrics, and three-hour exact-Info plus 30-second local-transmit cache state without raw identity/Data.",
+        "Exercise one CMClient Mesh reconnect, Gateway restart, Web/SSE reconnect, Proxy-client reconnect, and APRS session disconnect/reverify within the aggregate physical-write/reconnect budget and without radio reboot/configuration or source change. APRS recovery must restore the observer filter/cache continuity and obtain one exact post-reconnect observer confirmation before passing.",
+        "Throughout restart/reconnect, Tracker output remains Legacy ! data over qAO with no public timestamp/CM2 marker, iGate-owned output remains TCPIP* with no client-injected qAC, policy-enabled iGate packet classes retain their bounded Legacy cadences, and unknown Legacy receive time never advances temporal high-water.",
+        "No Legacy process may concurrently own the candidate's provision/iGate identity; all SOAK thresholds pass with zero candidate-caused crash, orphan, second upstream, stale-generation write, accepted rollback, duplicate domain/APRS decision, unverified Data, leak, or outside-root write.",
+        "The final soak evidence preserves the explicit residual risk for greater-than-30-second or changed-Data packets from separately operated Legacy stations and does not turn the candidate result into a mixed-generation zero-backtrack claim."
+      ],
+      "caseGroups": ["SOAK", "SEC"],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": ["MESH-03", "MESH-04", "MESH-05"],
+      "dependsOn": ["P18-T07"]
+    },
+    {
+      "id": "P18-T09",
+      "phase": "P18",
+      "title": "Freeze the scoped Windows candidate, rerun the matrix, and clean the campaign",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
+      "kind": "release",
+      "scope": "windows-candidate",
+      "candidateReset": false,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "Bind final source/tree, component/runtime/private Node, Setup, schema, and sanitized corpus digests to one Windows qualification candidate.",
+        "Audit the earlier HWS source-smoke identity, hard dependency ordering, physical ledger, and source-only claim boundary. It remains immutable prerequisite evidence and is not relabeled or copied into final-candidate rows; final MESH/live cases carry the installed candidate proof.",
+        "Audit every repair/candidate invalidation and rerun affected plus final PRE/SRC/PKG/live/client/recovery/security assertions against the same candidate, including CALL/POS/APRS/SOAK oracle, persistent-session, observer-delivery, cache, takeover, and cadence cases whenever any shared APRS input changed.",
+        "Close every process, handle, listener, lab, and hardware lease; delete raw quarantine and scoped build/runtime/package/DB/capture/update payloads while retaining Repository-external input.",
+        "Full verification, scans, evidence validator, dev/origin equality, clean Repository, and explicit deferred claim ledger pass."
+      ],
+      "caseGroups": [
+        "PRE",
+        "SRC",
+        "SET",
+        "MESH",
+        "CALL",
+        "POS",
+        "APRS",
+        "PX",
+        "WEB",
+        "GUI",
+        "CLI",
+        "DATA",
+        "UPD",
+        "PKG",
+        "SEC",
+        "SOAK"
+      ],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P18-T08"]
+    },
+    {
+      "id": "P18-T10",
+      "phase": "P18",
+      "title": "Pass the scoped Windows completion checker and stop",
+      "required": true,
+      "manualGate": false,
+      "environmental": false,
+      "lane": "windows-package",
+      "priority": 20,
+      "kind": "release",
+      "scope": "windows-completion",
+      "candidateReset": false,
+      "repairOf": null,
+      "supersedesPartOf": null,
+      "acceptance": [
+        "P18-T10 is the completion coordinator and first unique manifest attempt. Before checkpoint, the named windows-live-first checker excludes coordinator P18-T10, names the current attempt, and writes the durable sanitized precheck. Generate and validate the sole meaningful Repository diff at docs/qualification/windows-server-2025-x86_64-development-candidate.json: a schema-validated, secret/identity/location-free claim manifest binding the exact pre-completion qualified source commit/tree, runtime, Setup digest, case-result digests/counts, precheck digest, explicit Windows-only exclusions, attempt number/task, and prior-attempt ancestry. Then append immutable attempt_prepared with attempt/candidate/precheck/intended-manifest/prior-head data but no commit. It never presents a manifest-only commit/tree as tested candidate bytes.",
+        "After unique push, reconciliation appends a separate immutable attempt_pushed event with exact commit/origin, manifest digest, and prepared-event digest; only attempt_pushed may become completionState.headAttempt. Attempt 1 leaves P18-T10 in_progress/postcheck_pending. Postcheck appends attempt_passed or attempt_failed, verifies exact head commit, manifest/candidate binding, origin equality, and ancestry, and only success atomically appends coordinator_completed and marks P18-T10 done.",
+        "Classify failure before allocating anything. Network/auth/origin divergence, interrupted reconciliation, and transient lock/file failure append reconciliation_blocked/resumed and reconcile the same task/commit with no ID or commit. A deterministic completion-tool defect uses an even candidateReset=false repair only under the graph-locked non-product/non-package/non-case/non-oracle path allowlist. Any product/runtime/package/case/oracle/evidence-generation or uncertain defect uses an even candidateReset=true repair and reruns affected plus final qualification, including a fresh soak whenever identity or soak validity changed.",
+        "For a deterministic repair, append attempt_failed and atomically set P18-T10 blocked/completion_postcheck_failed. The even P18-T20..T98 repair is the sole in_progress task. After its push P18-T10 remains blocked while a fresh odd P18-T21..T99 manifest-attempt task is the sole in_progress task with the declared phase/required/lane/priority/kind/scope/candidateReset/caseGroups fields and dependencies on P18-T09 plus all prior completion repairs/attempts, never P18-T10. After the odd attempt push, mark it done, append repair/attempt dependencies to P18-T10, append attempt_pushed/set head, then return only P18-T10 to in_progress/postcheck_pending. No two tasks are active, no ID/subject/event is reused, and the initial commit remains an ancestor.",
+        "The scoped checker proves every required P18 task/assertion at its exact identity level: HWS against the recorded early source, final package/live/recovery/soak against one exact installed candidate, plus 24-hour continuity, repair reruns, full verification, cleanup, origin sync, and secret/raw-data absence.",
+        "The checker enforces always/when_observed/hard_input terminal rules, rejects pending as pass, and treats a missing precision-32 live position or observer delivery as blocked.",
+        "The handover separates current Windows Server source/package/live proof from pending Windows 11, Serial, macOS, Linux, Docker, signing, production, main, tag, and publication work.",
+        "The scoped Goal completes and stops without executing P17 global completion or any foreign/manual-production task."
+      ],
+      "caseGroups": ["PRE", "SEC", "COMP"],
+      "caseAssertions": [],
+      "evidenceClaim": null,
+      "observesWithoutFinalizing": [],
+      "dependsOn": ["P18-T09"]
     }
   ],
   "historicalSupersessions": [
@@ -1149,7 +2160,8 @@
     "origin": "https://github.com/toodi0418/CMClient.git",
     "branch": "dev",
     "sourceBaseline": "b3fec2b344bda3b11d0a15d2bad381f7d926114e",
-    "protectedBranch": "main"
+    "protectedBranch": "main",
+    "promotionBaseCommit": "bfe4ba83e04e6f8ab1f841c81444f5a824ec5b2a"
   },
   "targetPlatforms": {
     "windows": {
@@ -1199,7 +2211,6 @@
     "resume": "After repair checkpoint and push, add the repair as a parent dependency and resume the parent.",
     "candidateEffect": "Invalidate runtime and distribution candidates and rerun affected plus final cases."
   },
-  "graphSha256": "65232cd3930d32db6653ce03dd824e37e4f36dd2dd884fe7f5a0510f70be01ea",
   "definitionAmendments": [
     {
       "schema": "cmclient-task-definition-amendment/v1",
@@ -1271,5 +2282,407 @@
       ],
       "recordedAt": "2026-07-21T08:00:00Z"
     }
-  ]
+  ],
+  "activation": {
+    "entryTask": "P13-T16",
+    "mode": "explicit-journaled-promoter-before-normal-scheduler",
+    "preconditionActiveTask": "P13-T15",
+    "rule": "The explicit Implementation Goal invokes the v3 promoter directly before start-session or next-task. Under one lock/journal transaction it verifies the v2 preimage, archives P13-T15, injects P13-T16 as the sole in-progress task with the pre-mutation checkpoint base, applies the complete delta, and leaves no other in-progress task. Only P13-T16's successful non-empty checkpoint and dev push may mark it done and hand control to the normal v3 scheduler; failure restores exact v2 bytes and active-task state."
+  },
+  "completionCheckers": {
+    "global": {
+      "mode": "preserve-active-root",
+      "task": "P17-T07",
+      "preCheckpointArgs": ["--exclude-task", "P17-T07"],
+      "postCheckpointRequired": true,
+      "requiredEvidence": ["state/LICENSE_PROVENANCE.json"],
+      "requiredActiveRoot": {
+        "completionTask": "P17-T07",
+        "completionChecker": {
+          "task": "P17-T07",
+          "preCheckpointArgs": ["--exclude-task", "P17-T07"],
+          "postCheckpointRequired": true,
+          "requiredEvidence": ["state/LICENSE_PROVENANCE.json"],
+          "rule": "Run once excluding P17-T07 before its pushed checkpoint, then rerun without exclusion after the checkpoint."
+        }
+      },
+      "rule": "Preserve the active unified-product global completionTask/completionChecker byte-for-byte; the Windows scoped checker must not replace or mutate it."
+    },
+    "windowsLiveFirst": {
+      "mode": "named-scoped",
+      "task": "P18-T10",
+      "coordinatorTask": "P18-T10",
+      "initialAttemptTask": "P18-T10",
+      "retryAttemptAllocation": "next unused odd P18 task ID from P18-T21 through P18-T99",
+      "repairAllocation": "next unused even P18 task ID from P18-T20 through P18-T98",
+      "preCheckpointArgs": [
+        "--scope",
+        "windows-live-first",
+        "--exclude-task",
+        "P18-T10",
+        "--attempt-task",
+        "<CURRENT_ATTEMPT_TASK>"
+      ],
+      "postCheckpointArgs": [
+        "--scope",
+        "windows-live-first",
+        "--post-checkpoint-attempt",
+        "<CURRENT_ATTEMPT_TASK>"
+      ],
+      "attemptLedger": "state/SCOPED_WINDOWS_COMPLETION_ATTEMPTS.json",
+      "allocationLock": "Use the same exclusive task-state/graph lock for repair ID allocation, attempt ID allocation, task creation, dependency reconciliation, and ledger-head transition.",
+      "recoveryRule": "Before any new allocation or checkpoint, reconcile the append-only attempt ledger, task objects, Repository HEAD, origin/dev, manifest digest, and candidate invalidations. Recover idempotently from reservation-before-task-write, commit-before-reconcile, attempt-done-before-parent-resume, and postcheck-pass-before-terminalize states; ambiguity fails closed.",
+      "attemptTaskTemplate": {
+        "phase": "P18",
+        "required": true,
+        "lane": "windows-package",
+        "priority": 20,
+        "kind": "release",
+        "scope": "windows-completion-attempt",
+        "candidateReset": false,
+        "caseGroups": ["COMP"],
+        "ownerRule": "Copy the P18-T10 owner.",
+        "activeRule": "The attempt is the sole in_progress task only while preparing, checkpointing, and pushing its one allowlisted manifest diff."
+      },
+      "ledgerEventModel": {
+        "events": [
+          "attempt_prepared",
+          "attempt_pushed",
+          "reconciliation_blocked",
+          "reconciliation_resumed",
+          "attempt_failed",
+          "repair_allocated",
+          "repair_pushed",
+          "attempt_passed",
+          "coordinator_completed"
+        ],
+        "preparedRule": "Append attempt_prepared before checkpoint with attempt task/number, prior pushed head, candidate identity, precheck digest, and intended manifest digest; it has no commit and cannot be a head.",
+        "pushedRule": "After the unique commit is pushed, append a separate attempt_pushed event with exact commit, origin/dev, manifest digest, and prepared-event digest. Only this event may become headAttempt.",
+        "terminalRule": "A reconciliation-only interruption appends reconciliation_blocked/resumed around the same pushed attempt. A completed postcheck appends attempt_passed or attempt_failed. Existing events are immutable; recovery derives state only from the last valid hash-linked event chain."
+      },
+      "failureClasses": {
+        "reconciliationBlocker": "Network/auth/origin divergence, interrupted reconciliation, or transient lock/file failure appends reconciliation_blocked, blocks P18-T10, then appends reconciliation_resumed and retries reconciliation/postcheck against the same task and commit after the condition clears. It allocates no task ID and creates no commit; unexpected remote history never triggers force push.",
+        "completionToolDefect": "A deterministic checker/manifest/ledger defect allocates an even repair with candidateReset=false only when its diff matches the graph-locked completion-tool-only path allowlist and those paths are proven absent from product build/runtime/package, cases, or qualification oracle inputs. Otherwise classify it as candidate-affecting.",
+        "candidateAffectingDefect": "Any product, runtime, package, case, oracle, evidence-generation, or uncertain defect allocates an even repair with candidateReset=true and invalidates/reruns affected plus final qualification, including a fresh 24-hour soak whenever candidate identity or soak validity changes."
+      },
+      "completionToolOnlyAllowlist": {
+        "owner": "P13-T16",
+        "pathRule": "Create and hash an exact Repository-relative file list in the graph lock; directory entries and globs are forbidden.",
+        "requiredExclusions": [
+          "product source",
+          "build and package configuration",
+          "dependency lockfiles",
+          "cases.json and qualification case definitions",
+          "APRS or other behavior oracles",
+          "evidence generation and sanitization",
+          "runtime and Setup inputs"
+        ],
+        "defaultRule": "The allowlist starts empty. A path absent from the locked list, a changed list after candidate freeze, or incomplete exclusion proof forces candidateAffectingDefect."
+      },
+      "singleActiveTaskRule": "After deterministic postcheck failure, append attempt_failed and atomically set P18-T10 to blocked/completion_postcheck_failed. The even repair becomes the sole in_progress task. After repair push, mark it done and keep P18-T10 blocked while the odd attempt becomes the sole in_progress task, depending on P18-T09, all prior completion repair/attempt tasks, and the latest repair but never on P18-T10. After that attempt push, mark it done, append repair/attempt dependencies to P18-T10, append attempt_pushed and set headAttempt, then return only P18-T10 to in_progress/postcheck_pending. Coordinator, repair, and attempt may never overlap in_progress.",
+      "preCheckpointEvidence": "state/completion/windows-live-first/<CURRENT_ATTEMPT_TASK>-precheck.json",
+      "postCheckpointEvidence": "state/completion/windows-live-first/<CURRENT_ATTEMPT_TASK>-postcheck.json",
+      "completionOnlyRepositoryArtifact": "docs/qualification/windows-server-2025-x86_64-development-candidate.json",
+      "checkpointMode": "unique-attempt-task-push-with-coordinator-terminal-state-deferred-until-postcheck",
+      "postCheckpointRequired": true,
+      "rule": "P18-T10 is the coordinator and attempt 1. Before checkpoint, the named checker excludes P18-T10, validates the exact pre-completion candidate, writes the sanitized precheck, generates and validates only the qualification manifest, then appends attempt_prepared with the intended manifest digest and no commit. After unique push, append attempt_pushed with exact commit/origin and make only that pushed event the ledger head. Postcheck appends attempt_passed or attempt_failed; success atomically completes P18-T10. A reconciliation blocker rechecks the same attempt without an ID or commit. A deterministic defect follows the single-active repair/odd-attempt state machine and the declared candidate-invalidation class. Task IDs, commit subjects, and ledger events are never reused or edited; two consecutive deterministic failures and a third successful attempt are mandatory tooling tests."
+    }
+  },
+  "scheduler": {
+    "priorities": {
+      "hardware-window": 0,
+      "windows-core": 10,
+      "windows-package": 20,
+      "foreign-platform": 40,
+      "global-final": 50,
+      "manual-production": 90
+    },
+    "selectionRule": "Among ready tasks, choose the lowest numeric lane priority, then preserve deterministic graph order.",
+    "retainedTaskClassification": [
+      {
+        "match": "unfinished P13 and P14",
+        "lane": "windows-core",
+        "priority": 10
+      },
+      {
+        "match": "P15-T00 through P15-T04",
+        "lane": "windows-package",
+        "priority": 20
+      },
+      {
+        "match": "P15-T05 through P15-T15 and all P16",
+        "lane": "foreign-platform",
+        "priority": 40
+      },
+      {
+        "match": "all P17 except manual production",
+        "lane": "global-final",
+        "priority": 50
+      },
+      {
+        "match": "P17-T08",
+        "lane": "manual-production",
+        "priority": 90
+      }
+    ],
+    "rules": [
+      "Preemption occurs only after the current edit, verification, checkpoint, push, and task-state transaction is complete.",
+      "Before P18-T02, a blocked physical task may yield only to its P13/P14-T01 prerequisites and safety repairs.",
+      "Exactly one Agent-owned product process owns the physical Meshtastic lease.",
+      "Candidate freeze and continuous soak forbid Repository commits.",
+      "Shared failures block Windows; target-only foreign failures route to the foreign task.",
+      "A dynamically allocated repair inherits its parent lane and numeric priority."
+    ]
+  },
+  "supersessions": [
+    {
+      "old": "P13-T15",
+      "new": ["P13-T17", "P15-T14"],
+      "executionTransition": {
+        "requireBefore": {
+          "status": "in_progress",
+          "repairOf": "P13-T06"
+        },
+        "set": {
+          "status": "skipped",
+          "owner": null,
+          "completedAt": null,
+          "commit": null
+        },
+        "setSkippedAtFromPromotionClock": true,
+        "setSupersededBy": ["P13-T17", "P15-T14"],
+        "archiveCompletePreimage": true,
+        "appendNote": "Superseded atomically by graph v3 after unfinished shared/Windows and Linux work was split into P13-T17 and P15-T14."
+      },
+      "rule": "Preserve the complete P13-T15 object, timestamps, notes, repair linkage, CI references, and candidate invalidations before marking it superseded.",
+      "reason": "Separate shared/Windows direct-build and load defects from the Linux-only hidden updater lifecycle so foreign failures do not consume the hardware window."
+    }
+  ],
+  "existingTaskAmendments": [
+    {
+      "task": "P13-T06",
+      "replaceDependsOn": [
+        "P13-T05",
+        "P13-T13",
+        "P13-T14",
+        "P13-T17",
+        "P13-T18"
+      ],
+      "executionTransition": {
+        "requireBefore": {
+          "status": "blocked",
+          "blockedByRepair": "P13-T15"
+        },
+        "set": {
+          "status": "pending",
+          "owner": null,
+          "completedAt": null,
+          "commit": null
+        },
+        "clear": [
+          "blockedAt",
+          "blockedByRepair",
+          "blockReason",
+          "checkpointBaseCommit",
+          "lastRepairTask",
+          "resumedAt"
+        ],
+        "archiveClearedExecutionFields": true,
+        "appendNote": "Graph v3 replaced unfinished P13-T15 with P13-T17/P15-T14; P13-T06 is pending behind P13-T17 and P13-T18 with a new checkpoint base after both complete."
+      },
+      "reason": "Replace the superseded P13-T15 blocker with its shared Windows repair and the confirmed private-bootstrap repair, and make the parent schedulable after the replacement dependencies finish."
+    },
+    {
+      "task": "P14-T01",
+      "addDependsOn": ["P18-T01"],
+      "replaceAcceptance": [
+        "Agent setup state is versioned, generation-fenced and survives restart; missing/invalid/revoked/reset key enters setupRequired before Gateway external CallMesh/APRS/Proxy work.",
+        "Discovery checks migrated endpoint, loopback 4403, bounded _meshtastic._tcp.local browse, then manual input; there is no LAN scan.",
+        "Every physical validation path uses the P18-T01 Agent-owned exclusive lease, aggregate attempt ledger, one-upstream socket invariant, and ToRadio write allowlist. It permits only one nonce-correlated want_config_id per budgeted session and rejects every MeshPacket, admin/config mutation, reboot, RF command, radio change, or second transport before socket write.",
+        "The source-smoke profile can enable the existing product transport, ingest, persistence, API/SSE, Agent-served Web status/Meshtastic observation routes, and command observation while CallMesh, APRS, Proxy client writes, every non-Meshtastic producer, and every non-allowlisted Meshtastic writer remain mechanically disabled; it is campaign/test-only and is not a public production override. An already-runnable graphical status surface is supplemental only."
+      ],
+      "reason": "Make the product-integrated physical safety boundary part of setup/discovery before the mandatory early source smoke."
+    },
+    {
+      "task": "P14-T02",
+      "addDependsOn": ["P18-T02"],
+      "reason": "Broad setup API, wizard, lifecycle, and all downstream P14 work may start only after the real CMClient source path has consumed physical Meshtastic TCP data."
+    },
+    {
+      "task": "P14-T07",
+      "replaceTitle": "Implement common autostart controls and the Windows current-user provider",
+      "replaceAcceptance": [
+        "The Agent-owned provider contract and Web/CLI status/toggle support enabled, approval-required, missing/stale, repair, moved-path, and OS-denied states without reporting false success.",
+        "Windows HKCU current-user login startup starts --background by default with no UAC/service; enable/disable/reinstall/upgrade/uninstall fixtures are idempotent and keep one resident core.",
+        "The management Web listener is enabled by default and independently toggleable; disabling closes IPv4/IPv6 listeners and revokes Web sessions while Agent/Control remain resident, and Desktop/CLI can re-enable it.",
+        "macOS SMAppService implementation/evidence belongs to P15-T06, and Linux XDG/systemd-user implementation/evidence belongs to P15-T10; neither blocks the scoped Windows lane."
+      ],
+      "reason": "Keep the common product contract and Windows provider on the Windows path while assigning foreign OS providers to their native package owners."
+    },
+    {
+      "task": "P14-T11",
+      "replaceTitle": "Finish Legacy-compatible CallMesh mapping and verified APRS-IS transmission gates",
+      "replaceAcceptance": [
+        "The official hosted CallMesh service remains the only production provision/mapping authority for fields its validated supported schema actually supplies. Schema, atomic persistence, restart, and event-time projection retain field presence separately from value: Tracker enablement, callsign/SSID, composite symbol plus table/code/overlay aliases, comment, altitude, effective time/version; iGate callsign/SSID, position, composite symbol plus component aliases, comment, altitude, PHG, expiry, and any schema-supported APRS endpoint/beacon fields. Legacy v0.2.28 endpoint/UI and interval-setter behavior are not misrepresented as provision schema: use a validated official field when present, otherwise fixed asia.aprs2.net:14580 and ten minutes bounded one minute through 24 hours. Production exposes no local APRS server, destination, mapping, provision, or beacon-policy override; destination is fixed APTMAG and fixtures use dependency injection only.",
+        "Trusted source event time, sequence/epoch, canonical digest, and temporal high-water remain internal. Select the newest authoritative mapping with effective time less than or equal to the source event time, so equality activates the new revision; conflicting same-time content without an authoritative monotonic order fails closed. Complete valid mapping revision history is append-only across refresh/restart and has no age-only pruning; exact duplicate snapshots may coalesce and factory reset may remove it. A missing applicable revision always fails closed. Unknown Legacy APRS input never advances temporal high-water from APRS receive time.",
+        "The sole public-wire golden oracle is v0.2.28 tag 5e6c294c640766711c6251173711e8226bf8268a and its frozen formatter/client blobs. For every eligible Tracker event, output is byte-exact SOURCE>APTMAG,MESHD*,qAO,IGATE:!legacy-data plus CRLF, with fixed APTMAG and no public timestamp or CM2 marker. Golden fixtures cover latitude/longitude ECMAScript Number/toFixed ties/carry; exact composite-symbol/component precedence and absent/null/empty/explicit values; exact course modulo-before-round including 359.5 -> 360 and Legacy speed conversions; mapping-only String/CRLF/whitespace comment sanitation with no inserted separator or normalization; exact 3.28084 altitude conversion and packet/mapping/self-provision precedence; UTF-8 replacement and full-line byte budget; and disabled mapping zero-write behavior. qAO denotes receive-only translation of Meshtastic RF received through TCP or Serial and does not authorize APRS-IS-to-Meshtastic RF transmission.",
+        "iGate-owned beacon, status, telemetry data, and telemetry definitions use IGATE>APTMAG,TCPIP*:...; CMClient never injects qAC, server-observed qAC is accepted, and status is >TMAG Client v<version> without CLI/Desktop. Golden fixtures lock beacon PHG/position/symbol/comment/altitude and PHG-preserving 512-byte truncation; PARM/UNIT/EQNS/T# bytes and order; nine-character message destination padding; every explicit POS/MSG/CTRL type; rolling buckets; first fresh verified order beacon/PARM/UNIT/EQNS/T#/status; same-process reconnect; status interval anchored at verification; fresh-process timestamp/bucket reset; only last successful 001..999 sequence persistence; failed-write in-memory sequence consumption; and every Legacy cadence boundary.",
+        "A bounded provision-scoped persistent APRS session uses incremental banner/logresp parsing and explicit disconnected, connecting, login-sent, verified, and closing states. Every TX/RX session independently exact-verifies its provision-derived canonical callsign; mismatch, unverified, timeout, EOF, invalid/oversized response, error, close, half-open, rotation, expiry, reset, and stale-generation callback fence Data, trigger bounded reconnect/filter restoration, and require fresh verification. Per-outbox transient connect/login/write/close transmission is forbidden.",
+        "APRS-IS has no per-packet delivery acknowledgement: a socket write is only local-kernel submission. Durable state distinguishes queued/sending/submitted/observer_confirmed/observation_expired, never calls a socket write accepted or delivered, and advances delivery high-water only after independent filtered observation of exact source, destination, and Info. An unmatched submitted row remains unconfirmed for the persisted three-hour observer window, then expires unconfirmed without blind retry or high-water advance; disconnect after write reconciles through the exact observer/cache.",
+        "A bounded persisted normalized-source-plus-exact-Info observer cache covers Tracker and iGate-owned families for three hours and a local transmit cache suppresses exact repeats for 30 seconds across restart/crash, provision/source isolation, and expiry boundaries; qAR versus qAO path differences do not defeat the emulated APRS-IS 30-second exact-Data dedup because path is ignored.",
+        "The supported same-identity Legacy-to-2.0 migration proves the old local process/session stopped before new verification and rejects detectable local overlap; update, rollback, reset, and restart cannot interleave status or telemetry sequence ownership. Cross-host overlap remains forbidden but is not claimed as client-detectable.",
+        "Repository APRS implementation/configuration docs and regressions are updated with a negative drift check forbidding APCM20, public CM2 markers, public APRS timestamps, qAR emission, and production APRS endpoint/destination overrides. P14-T11 explicitly owns the encoder, monitor, runtime-config, Agent propagation, docs/architecture/aprs-position-encoding.md, docs/architecture/aprs-remote-monitor.md, docs/admin/configuration-security.md, docs/architecture/agent-runtime.md, and their tests.",
+        "Regression and claim tests preserve the residual mixed-generation limit: packets delayed beyond 30 seconds or with different Data can escape exact dedup and may backtrack, so neither the task nor later qualification claims mixed-generation zero rollback."
+      ],
+      "reason": "Bind the owner-confirmed Legacy v0.2.28 public wire profile, receive-only qAO path, internal-only ordering metadata, coexistence safeguards, and irreducible mixed-generation risk to the implementation task."
+    },
+    {
+      "task": "P14-T12",
+      "replaceAcceptance": [
+        "Fresh/setup/reset/resume, Web/Desktop/CLI, autostart, private Node supervision, backup/restore, shared upstream/Proxy and CallMesh/APRS fixture E2E all pass.",
+        "All retained P12 defects have failing-then-passing regressions and real-process tests where applicable.",
+        "Before packaging work, every fixture-only CALL, POS, and APRS assertion required by the Windows live-first plan passes, including APRS-01 through APRS-04, APRS-07 through APRS-14, and APRS-16 through APRS-19, mapping-history selection, persistent verified session/reconnect, observer-confirmed delivery, exact cache boundaries, same-identity takeover, and the frozen v0.2.28 wire oracle; no V4 observation substitutes for these local regressions.",
+        "Full verify, secret/license scans and clean pushed checkpoint pass before packaging work."
+      ],
+      "reason": "Make the complete local APRS compatibility gate an implementation prerequisite rather than deferring it to live qualification."
+    },
+    {
+      "task": "P15-T00",
+      "addDependsOn": ["P18-T02"],
+      "replaceTitle": "Establish the Windows target-native lane and shared candidate profile",
+      "replaceAcceptance": [
+        "The Windows x86-64 lane pins Rust, Node, pnpm, Tauri/NSIS and system tools and builds target-only native dependencies from the campaign.",
+        "The shared profile schema distinguishes development unsigned/test-signed from optional production signing and never infers foreign-host evidence.",
+        "Build/runtime/package output is campaign-scoped and no lane downloads or reassembles another GitHub artifact; foreign native lanes are established later by P15-T15."
+      ],
+      "reason": "Windows packaging begins only after the mandatory physical source smoke, while still not waiting for macOS/Linux target lane bring-up."
+    },
+    {
+      "task": "P15-T01",
+      "replaceTitle": "Create the canonical profile manifest and Windows Tauri staging tree",
+      "replaceAcceptance": [
+        "One deterministic product/profile manifest identifies shared Agent/CLI/Gateway/Web/private-Node inputs and exact native-versus-Docker inclusion/exclusion.",
+        "The Windows Tauri stage adds GUI/updater helpers, licenses, migrations and terms and is the only input to the Windows platform overlay; foreign stages extend the same manifest in P15-T15.",
+        "Missing system Node/npm, wrong architecture/native addon, extra public binary and source-identity mismatch smokes fail closed."
+      ],
+      "reason": "Create the reusable manifest now but defer foreign stage construction to its target lane."
+    },
+    {
+      "task": "P15-T02",
+      "replaceTitle": "Implement the external update coordinator and exact Windows health rollback",
+      "replaceAcceptance": [
+        "The selected maintained updater driver owns check/download/signature/install; CMClient owns durable Job, state backup, quiesce, external watchdog, health and rollback.",
+        "The prior exact Windows Setup/release remains available through health commit and every mutable phase supports kill/resume.",
+        "Good, corrupt, wrong-target, interrupted, unhealthy-new and failed-rollback Windows labs verify either the new exact version or restored old exact version/state; macOS app and Linux AppImage format/lifecycle proof remains with P15-T06/P15-T10."
+      ],
+      "reason": "The shared coordinator is implemented once, but the Windows candidate does not wait for foreign package bytes."
+    },
+    {
+      "task": "P15-T05",
+      "addDependsOn": ["P15-T15"],
+      "reason": "Universal macOS resources begin only after the scoped Windows lane and foreign-native staging task."
+    },
+    {
+      "task": "P15-T08",
+      "addDependsOn": ["P15-T14", "P15-T15"],
+      "reason": "Linux x86-64 packaging owns the Linux hidden updater repair."
+    },
+    {
+      "task": "P15-T09",
+      "addDependsOn": ["P15-T14", "P15-T15"],
+      "reason": "Linux ARM64 packaging owns the Linux hidden updater repair."
+    },
+    {
+      "task": "P17-T01",
+      "addDependsOn": ["P18-T10"],
+      "reason": "The later global-final lane must audit the scoped Windows candidate. If shared source changed, it must rebuild and rerun exact-candidate Windows live cases rather than reuse stale evidence."
+    },
+    {
+      "task": "P17-T02",
+      "replaceAcceptance": [
+        "Passive TCP 4403 config/live/reconnect and sanitized replay pass without RF or radio mutation.",
+        "The exact final candidate uses the official CallMesh service for Legacy-compatible heartbeat/mapping/provision, records the authoritative snapshot identity, applies the schema-supported provision-or-fixed-default APRS endpoint/beacon policy, and passes canonical matching verified APRS login; only authorized flow may transmit and no local server/mapping/APRS destination override is used.",
+        "Whenever shared source, runtime, contracts, APRS implementation, or package inputs changed after the scoped Windows candidate, rebuild the exact candidate and rerun the affected Windows CALL/POS/APRS/SOAK cases. The rerun proves APTMAG/MESHD*,qAO untimestamped Tracker Data with no CM2 marker, policy-selected iGate packet family and cadence, persistent verified sessions, observer-confirmed delivery, exact caches, same-identity takeover, and the stated mixed-generation residual limit.",
+        "Evidence contains no credential, identity, precise private location or raw sensitive packet data."
+      ],
+      "reason": "Prevent later global completion from reusing stale Windows APRS compatibility or soak evidence after a shared change."
+    },
+    {
+      "task": "P17-T08",
+      "replaceAcceptance": [
+        "The P13 development-distribution license gate must already be approved. This task separately revalidates final production-candidate notices/source obligations and requires explicit human approval of the exact candidate, main modification, production credentials and exact release actions.",
+        "Before a public APRS product claim, confirm or obtain the APTMAG TOCALL allocation and document MESHD* as the retained product-specific provenance token without presenting it as an APRS-defined alias; an unresolved allocation keeps production publication blocked without changing the Legacy-compatible development wire silently.",
+        "Production signing/notarization creates new bytes and requires exact-byte final qualification before publication; same-runner actions/attest/keyless transparency/direct release upload occurs only here with no artifact download/reassembly. This task is outside the autonomous Goal."
+      ],
+      "reason": "Carry the APRS identifier/allocation claim boundary into the existing human production gate while leaving the Windows development candidate and main untouched."
+    },
+    {
+      "task": "P16-T01",
+      "addDependsOn": ["P18-T10"],
+      "reason": "Machine-fence Docker implementation behind the explicitly scoped Windows stop; scheduler priority alone is not the only guard."
+    }
+  ],
+  "repairAllocation": {
+    "P13": "next unused P13 repair task after fixed v3 tasks",
+    "P18": {
+      "repairTasks": "next unused even task ID from P18-T20 through P18-T98",
+      "completionAttemptTasks": "next unused odd task ID from P18-T21 through P18-T99; these are manifest-only attempt tasks, never repairs",
+      "completionAttemptTemplate": "completionCheckers.windowsLiveFirst.attemptTaskTemplate",
+      "exhaustion": "Fail closed and require an explicit graph extension; never reuse an ID or cross the reserved parity."
+    },
+    "laneInheritance": "Each repair copies the parent lane unchanged.",
+    "priorityInheritance": "Each repair copies the parent numeric priority unchanged.",
+    "rule": "Under the same exclusive task-state/graph lock, allocation selects the next ID absent from fixed tasks, dynamic tasks, immutable history, and the attempt ledger. A repair depends only on already-satisfied parent predecessors, starts with a failing regression, checkpoints/pushes before parent resume, and applies the declared completion failure class; graph tooling rejects a repair without inherited lane/priority, the required candidateReset classification, or with an odd P18 ID. A completion-attempt task uses the fixed template, depends on P18-T09 plus every prior completion repair/attempt and the latest pushed repair, never on blocked P18-T10, changes only the allowlisted manifest, and is the sole in_progress task until terminal-on-push. It is then appended to P18-T10 before only the coordinator resumes for postcheck. Recovery reconciles task, ledger event chain, Git, origin, manifest, and invalidation state before another allocation; ambiguity fails closed."
+  },
+  "scopedCompletion": {
+    "task": "P18-T10",
+    "completionChecker": "windowsLiveFirst",
+    "mandatoryEarlyMilestone": "P18-T02",
+    "earlyMilestoneRule": "P18-T02 must pass through the real Agent-owned source topology and a physical non-configuration FromRadio event before P14-T02, P15-T00, or any broad product/package task becomes ready.",
+    "completionAttemptRule": "P18-T10 may terminalize only after an immutable attempt_pushed ledger head passes postcheck. Reconciliation blockers reuse the same pushed attempt without a new ID; every deterministic repaired attempt uses a distinct task ID and remains in ancestry under the one-active-task state machine.",
+    "allRequiredTasksInScopedClosureTerminal": true,
+    "outOfClosureRequiredTasksMayRemainPending": true,
+    "assertionApplicabilityPolicy": {
+      "always": "must pass",
+      "when_observed": "must pass when the trigger is observed; otherwise requires a terminal not_observed record proving the bounded observation window plus the paired V1 assertion pass",
+      "hard_input": "must pass; absent required real input is blocked and cannot complete the scoped Goal"
+    },
+    "continuousSoakHours": 24,
+    "repositoryClean": true,
+    "devEqualsOriginDev": true,
+    "campaignCleanup": true,
+    "foreignAndProductionRowsMustRemainExplicit": true,
+    "globalGraphMayRemainIncomplete": true,
+    "stopAfterCompletion": true
+  },
+  "activationInputs": {
+    "schema": "cmclient-windows-live-first-activation-inputs/v1",
+    "planPath": "plans/windows-live-first/tasks.proposed.json",
+    "planSha256": "67780d9ef578786016797e21aa785ee7feab6f59006268f77dda974f2e7f37ea",
+    "contractDigests": {
+      "plans/windows-live-first/APRS_WIRE_CONTRACT.md": "7269fd03d11c828409b559836062cb5f9b26c9a4f744b9682c72502eeccc35c4",
+      "specs/05-position-aprs.md": "a3a8ffc89afc0fd7fb615baaa66168f5c3f585ba66c4c3720d71e871be8b57f5",
+      "specs/17-callmesh.md": "07e7da0e8d57ca5957ce1b24109d842b35e1bee11c370793d01230c450c51514",
+      "plans/unified-product/RUNTIME_ONBOARDING.md": "9840c6fee4affb50beffb8c644b5eb9051a60fed8ff7f9fcc62997af53802c89",
+      "plans/windows-live-first/tasks.proposed.json": "67780d9ef578786016797e21aa785ee7feab6f59006268f77dda974f2e7f37ea",
+      "plans/windows-live-first/cases.json": "9502d3fb07bf20cd9bb9f54fd628507cebdb0df9497aa62a20fbf378c05c98a1"
+    },
+    "baselineLockSha256": "225011362367d17e405adb999cef6a7ccd2ebb24bacb650825f233ffa77d71dd",
+    "baselineStateSha256": "96a2f003bae209ce4578926cacf068c0162135af63f999f2ffbd1e7edd1a898e",
+    "baselineHistorySha256": "97a9a102d196e3711cefb0ac34beac2e5d6a5964765cc21e6d1c5a4e179eee6b",
+    "requiredPaths": [
+      "plans/windows-live-first/APRS_WIRE_CONTRACT.md",
+      "specs/05-position-aprs.md",
+      "specs/17-callmesh.md",
+      "plans/unified-product/RUNTIME_ONBOARDING.md",
+      "plans/windows-live-first/tasks.proposed.json",
+      "plans/windows-live-first/cases.json"
+    ]
+  },
+  "completionToolOnlyRepairAllowlist": {
+    "paths": [],
+    "sha256": "4ce95370e221ea0a3ef42ee0992d28ac44cbae9b311b7e310061d35b819bb093"
+  },
+  "promotionBaseCommit": "bfe4ba83e04e6f8ab1f841c81444f5a824ec5b2a",
+  "graphSha256": "4571add63e61998d655261e44d24a2e54480d6dd2584692686df899898cd506c"
 }

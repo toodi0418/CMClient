@@ -95,7 +95,7 @@ export class PhysicalWriteGuard {
     const now = this.clock();
     const windowStart = new Date(now.getTime() - SLIDING_WINDOW_MS);
     const recentAttempts = ledger.attempts.filter(
-      (a) => new Date(a.timestamp) >= windowStart
+      (a) => new Date(a.timestamp) >= windowStart,
     );
 
     if (recentAttempts.length >= MAX_ATTEMPTS_PER_10MIN) {
@@ -103,7 +103,7 @@ export class PhysicalWriteGuard {
       ledger.fuseOpenedAt = now.toISOString();
       this.saveLedger(ledger);
       throw new PhysicalWriteGuardError(
-        "PHYSICAL_GUARD_TOO_MANY_ATTEMPTS_IN_WINDOW"
+        "PHYSICAL_GUARD_TOO_MANY_ATTEMPTS_IN_WINDOW",
       );
     }
 
@@ -120,7 +120,7 @@ export class PhysicalWriteGuard {
       ledger.fuseOpenedAt = now.toISOString();
       this.saveLedger(ledger);
       throw new PhysicalWriteGuardError(
-        "PHYSICAL_GUARD_CONSECUTIVE_CONFIG_FAILURES"
+        "PHYSICAL_GUARD_CONSECUTIVE_CONFIG_FAILURES",
       );
     }
 
@@ -147,7 +147,7 @@ export class PhysicalWriteGuard {
     // Only one config request per session
     if (this.configRequestSent) {
       throw new PhysicalWriteGuardError(
-        "PHYSICAL_GUARD_DUPLICATE_CONFIG_REQUEST"
+        "PHYSICAL_GUARD_DUPLICATE_CONFIG_REQUEST",
       );
     }
 
@@ -185,7 +185,7 @@ export class PhysicalWriteGuard {
 
     if (packetType !== "want_config_id") {
       throw new PhysicalWriteGuardError(
-        `PHYSICAL_GUARD_PACKET_TYPE_REJECTED: ${packetType}`
+        `PHYSICAL_GUARD_PACKET_TYPE_REJECTED: ${packetType}`,
       );
     }
   }
