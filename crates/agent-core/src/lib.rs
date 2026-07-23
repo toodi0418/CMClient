@@ -22,14 +22,98 @@ use std::{
 /// Stable workspace identity for the Agent core boundary.
 pub const COMPONENT: &str = "agent-core";
 
-const APP_NAME: &str = "CMClient";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
     pub data_dir: PathBuf,
     pub config_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub log_dir: PathBuf,
+}
+
+impl RuntimePaths {
+    /// The single mutable root used by every native runtime.
+    pub fn root_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn config_file(&self) -> PathBuf {
+        self.data_dir.join("config.toml")
+    }
+
+    pub fn state_dir(&self) -> PathBuf {
+        self.data_dir.join("state")
+    }
+
+    pub fn setup_state_file(&self) -> PathBuf {
+        self.state_dir().join("setup.json")
+    }
+
+    pub fn database_file(&self) -> PathBuf {
+        self.data_dir.join("cmclient.db")
+    }
+
+    pub fn run_dir(&self) -> PathBuf {
+        self.data_dir.join("run")
+    }
+
+    pub fn lock_dir(&self) -> PathBuf {
+        self.run_dir()
+    }
+
+    pub fn agent_lock_file(&self) -> PathBuf {
+        self.run_dir().join("agent.lock")
+    }
+
+    pub fn secrets_file(&self) -> PathBuf {
+        self.data_dir.join("secrets.json")
+    }
+
+    pub fn backups_dir(&self) -> PathBuf {
+        self.data_dir.join("backups")
+    }
+
+    pub fn updates_dir(&self) -> PathBuf {
+        self.data_dir.join("updates")
+    }
+
+    pub fn migration_state_file(&self) -> PathBuf {
+        self.state_dir().join("migration.json")
+    }
+
+    pub fn managed_directories(&self) -> [PathBuf; 7] {
+        [
+            self.data_dir.clone(),
+            self.state_dir(),
+            self.run_dir(),
+            self.cache_dir.clone(),
+            self.log_dir.clone(),
+            self.backups_dir(),
+            self.updates_dir(),
+        ]
+    }
+
+    pub fn from_environment(environment: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        for name in [
+            "CMCLIENT_DATA_DIR",
+            "CMCLIENT_CONFIG_DIR",
+            "CMCLIENT_CACHE_DIR",
+            "CMCLIENT_LOG_DIR",
+        ] {
+            reject_path_override(environment, name)?;
+        }
+
+        let root = if is_docker_profile(environment) {
+            PathBuf::from("/home/cmclient/.cmclient")
+        } else {
+            home_directory(environment)?.join(".cmclient")
+        };
+        Ok(Self {
+            data_dir: root.clone(),
+            config_dir: root.clone(),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +203,7 @@ pub struct AgentLease {
 pub enum ConfigError {
     HomeDirectoryUnavailable,
     RelativePathOverride { name: &'static str },
+    ForeignPathOverride { name: &'static str },
     ReadConfig { path: PathBuf },
     InvalidConfig,
     EmptyGatewayCommand,
@@ -159,6 +244,7 @@ impl ConfigError {
         match self {
             Self::HomeDirectoryUnavailable => "AGENT_CONFIG_HOME_UNAVAILABLE",
             Self::RelativePathOverride { .. } => "AGENT_CONFIG_PATH_NOT_ABSOLUTE",
+            Self::ForeignPathOverride { .. } => "AGENT_CONFIG_FOREIGN_PATH_FORBIDDEN",
             Self::ReadConfig { .. } => "AGENT_CONFIG_READ_FAILED",
             Self::InvalidConfig => "AGENT_CONFIG_INVALID",
             Self::EmptyGatewayCommand => "AGENT_CONFIG_GATEWAY_COMMAND_EMPTY",
@@ -264,11 +350,7 @@ impl AgentConfig {
 
     pub fn from_environment(environment: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
         let paths = RuntimePaths::from_environment(environment)?;
-        let config_file = path_override(
-            environment,
-            "CMCLIENT_AGENT_CONFIG",
-            paths.config_dir.join("agent.toml"),
-        )?;
+        let config_file = config_file_override(environment, &paths)?;
 
         let file_config = if config_file.exists() {
             let contents =
@@ -469,105 +551,110 @@ fn is_https_origin(value: &str) -> bool {
         && (suffix.is_empty() || suffix == "/")
 }
 
-impl RuntimePaths {
-    pub fn from_environment(environment: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
-        let home = home_directory(environment)?;
-        let (data_dir, config_dir, cache_dir) = if cfg!(target_os = "macos") {
-            let library = home.join("Library");
-            (
-                library.join("Application Support").join(APP_NAME),
-                library.join("Application Support").join(APP_NAME),
-                library.join("Caches").join(APP_NAME),
-            )
-        } else if cfg!(target_os = "windows") {
-            let app_data = environment
-                .get("APPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("AppData").join("Roaming"));
-            let local_app_data = environment
-                .get("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("AppData").join("Local"));
-            (
-                app_data.join(APP_NAME),
-                app_data.join(APP_NAME),
-                local_app_data.join(APP_NAME).join("cache"),
-            )
-        } else {
-            (
-                xdg_path(environment, "XDG_DATA_HOME", home.join(".local/share")).join("cmclient"),
-                xdg_path(environment, "XDG_CONFIG_HOME", home.join(".config")).join("cmclient"),
-                xdg_path(environment, "XDG_CACHE_HOME", home.join(".cache")).join("cmclient"),
-            )
-        };
-
-        let data_dir = path_override(environment, "CMCLIENT_DATA_DIR", data_dir)?;
-        let config_dir = path_override(environment, "CMCLIENT_CONFIG_DIR", config_dir)?;
-        let cache_dir = path_override(environment, "CMCLIENT_CACHE_DIR", cache_dir)?;
-        let log_dir = path_override(environment, "CMCLIENT_LOG_DIR", data_dir.join("logs"))?;
-
-        Ok(Self {
-            data_dir,
-            config_dir,
-            cache_dir,
-            log_dir,
-        })
-    }
-}
-
 fn home_directory(environment: &BTreeMap<String, String>) -> Result<PathBuf, ConfigError> {
+    let name = if cfg!(target_os = "windows") {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    };
     environment
-        .get("HOME")
-        .or_else(|| environment.get("USERPROFILE"))
+        .get(name)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or(ConfigError::HomeDirectoryUnavailable)
 }
 
-fn xdg_path(environment: &BTreeMap<String, String>, name: &str, fallback: PathBuf) -> PathBuf {
+fn is_docker_profile(environment: &BTreeMap<String, String>) -> bool {
     environment
-        .get(name)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or(fallback)
+        .get("CMCLIENT_RUNTIME_PROFILE")
+        .is_some_and(|profile| profile.trim().eq_ignore_ascii_case("docker"))
+        || environment
+            .get("CMCLIENT_PACKAGE_PROFILE")
+            .is_some_and(|profile| profile.trim().eq_ignore_ascii_case("oci"))
 }
 
-fn path_override(
+fn reject_path_override(
     environment: &BTreeMap<String, String>,
     name: &'static str,
-    fallback: PathBuf,
-) -> Result<PathBuf, ConfigError> {
+) -> Result<(), ConfigError> {
     match environment.get(name) {
         Some(value) if !value.trim().is_empty() => {
             let path = PathBuf::from(value);
             if path.is_absolute() {
-                Ok(path)
+                Err(ConfigError::ForeignPathOverride { name })
             } else {
                 Err(ConfigError::RelativePathOverride { name })
             }
         }
-        _ => Ok(fallback),
+        _ => Ok(()),
     }
 }
 
+fn config_file_override(
+    environment: &BTreeMap<String, String>,
+    paths: &RuntimePaths,
+) -> Result<PathBuf, ConfigError> {
+    reject_path_override(environment, "CMCLIENT_AGENT_CONFIG")?;
+    Ok(paths.config_file())
+}
+
 pub fn ensure_runtime_directories(paths: &RuntimePaths) -> Result<(), ConfigError> {
-    for path in [
-        &paths.data_dir,
-        &paths.config_dir,
-        &paths.cache_dir,
-        &paths.log_dir,
-    ] {
-        fs::create_dir_all(path).map_err(|_| ConfigError::ReadConfig { path: path.clone() })?;
+    for path in paths.managed_directories() {
+        ensure_runtime_directory(&path)?;
+    }
+    Ok(())
+}
+
+fn ensure_runtime_directory(path: &Path) -> Result<(), ConfigError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(ConfigError::ReadConfig {
+                path: path.to_owned(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|_| ConfigError::ReadConfig {
+                path: path.to_owned(),
+            })?;
+        }
+        Err(_) => {
+            return Err(ConfigError::ReadConfig {
+                path: path.to_owned(),
+            });
+        }
+    }
+    if !fs::symlink_metadata(path)
+        .map_err(|_| ConfigError::ReadConfig {
+            path: path.to_owned(),
+        })?
+        .file_type()
+        .is_dir()
+    {
+        return Err(ConfigError::ReadConfig {
+            path: path.to_owned(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
+            ConfigError::ReadConfig {
+                path: path.to_owned(),
+            }
+        })?;
     }
     Ok(())
 }
 
 impl AgentLease {
     pub fn acquire(paths: &RuntimePaths) -> Result<(Self, AgentState), InstanceError> {
-        fs::create_dir_all(&paths.data_dir).map_err(|_| InstanceError::Io)?;
+        ensure_runtime_directory(&paths.data_dir).map_err(|_| InstanceError::Io)?;
         let canonical_data_dir =
             fs::canonicalize(&paths.data_dir).map_err(|_| InstanceError::Io)?;
-        let lock_path = canonical_data_dir.join("agent.lock");
+        let lock_dir = canonical_data_dir.join("run");
+        ensure_runtime_directory(&lock_dir).map_err(|_| InstanceError::Io)?;
+        let lock_path = lock_dir.join("agent.lock");
         let lock = ExclusiveFileLock::try_acquire(&lock_path).map_err(map_lock_error)?;
 
         let state = AgentState {
@@ -578,7 +665,9 @@ impl AgentLease {
                 .map_err(|_| InstanceError::Io)?
                 .as_secs(),
         };
-        let state_file = canonical_data_dir.join("agent-state.json");
+        let state_dir = canonical_data_dir.join("state");
+        ensure_runtime_directory(&state_dir).map_err(|_| InstanceError::Io)?;
+        let state_file = state_dir.join("agent.json");
         TypedDocument::<AgentState>::new(&state_file)
             .and_then(|document| document.store(&state))
             .map_err(map_document_write_error)?;
@@ -592,7 +681,7 @@ impl AgentLease {
     }
 
     pub fn read_state(paths: &RuntimePaths) -> Result<Option<AgentState>, InstanceError> {
-        let state_file = paths.data_dir.join("agent-state.json");
+        let state_file = paths.state_dir().join("agent.json");
         TypedDocument::<AgentState>::new(state_file)
             .and_then(|document| document.load_optional())
             .map_err(map_document_read_error)
@@ -626,16 +715,22 @@ fn map_document_write_error(_error: DocumentError) -> InstanceError {
 }
 
 pub fn is_config_file(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "agent.toml")
+    path.file_name().is_some_and(|name| name == "config.toml")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AgentConfig, AgentLease, AprsConfig, ConfigError, InstanceError, MeshtasticConfig,
-        MeshtasticConnectionConfig, ProxyConfig, RuntimePaths, is_config_file,
+        MeshtasticConnectionConfig, ProxyConfig, RuntimePaths, ensure_runtime_directories,
+        is_config_file,
     };
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+    };
+    use uuid::Uuid;
 
     fn fixture_home() -> PathBuf {
         #[cfg(windows)]
@@ -648,63 +743,167 @@ mod tests {
         }
     }
 
+    fn environment_for_home(home: &Path) -> BTreeMap<String, String> {
+        let mut environment =
+            BTreeMap::from([(String::from("HOME"), home.to_string_lossy().into_owned())]);
+        #[cfg(windows)]
+        environment.insert(
+            String::from("USERPROFILE"),
+            home.to_string_lossy().into_owned(),
+        );
+        environment
+    }
+
     fn environment() -> BTreeMap<String, String> {
-        BTreeMap::from([(
-            String::from("HOME"),
-            fixture_home().to_string_lossy().into_owned(),
-        )])
+        environment_for_home(&fixture_home())
+    }
+
+    fn config_fixture(label: &str) -> (PathBuf, BTreeMap<String, String>, PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("cmclient-agent-config-{label}-{}", Uuid::new_v4()));
+        let home = directory.join("home");
+        let config_file = home.join(".cmclient/config.toml");
+        fs::create_dir_all(config_file.parent().expect("config parent should exist"))
+            .expect("configuration root should exist");
+        (directory, environment_for_home(&home), config_file)
     }
 
     #[test]
     fn uses_standard_platform_paths() {
         let paths = RuntimePaths::from_environment(&environment()).expect("paths should load");
         let home = fixture_home();
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                paths.data_dir,
-                home.join("Library/Application Support/CMClient")
-            );
-            assert_eq!(
-                paths.config_dir,
-                home.join("Library/Application Support/CMClient")
-            );
-        } else if cfg!(target_os = "windows") {
-            assert_eq!(paths.data_dir, home.join("AppData/Roaming/CMClient"));
-        } else {
-            assert_eq!(paths.data_dir, home.join(".local/share/cmclient"));
-            assert_eq!(paths.config_dir, home.join(".config/cmclient"));
-        }
+        assert_eq!(paths.data_dir, home.join(".cmclient"));
+        assert_eq!(paths.config_dir, home.join(".cmclient"));
+        assert_eq!(paths.cache_dir, home.join(".cmclient/cache"));
         assert_eq!(paths.log_dir, paths.data_dir.join("logs"));
+        assert_eq!(paths.database_file(), home.join(".cmclient/cmclient.db"));
+        assert_eq!(paths.secrets_file(), home.join(".cmclient/secrets.json"));
+        assert_eq!(paths.config_file(), home.join(".cmclient/config.toml"));
+        assert_eq!(
+            paths.setup_state_file(),
+            home.join(".cmclient/state/setup.json")
+        );
+        assert_eq!(
+            paths.migration_state_file(),
+            home.join(".cmclient/state/migration.json")
+        );
+        assert_eq!(
+            paths.agent_lock_file(),
+            home.join(".cmclient/run/agent.lock")
+        );
     }
 
     #[test]
-    fn rejects_relative_runtime_path_overrides() {
+    fn docker_paths_are_fixed_and_ignore_host_home() {
         let mut environment = environment();
-        environment.insert(String::from("CMCLIENT_DATA_DIR"), String::from("relative"));
+        environment.insert(
+            String::from("CMCLIENT_RUNTIME_PROFILE"),
+            String::from("docker"),
+        );
+        environment.insert(String::from("HOME"), String::from("C:\\foreign"));
+        let paths = RuntimePaths::from_environment(&environment).expect("docker paths should load");
+        assert_eq!(paths.data_dir, PathBuf::from("/home/cmclient/.cmclient"));
         assert_eq!(
-            RuntimePaths::from_environment(&environment),
+            paths.config_file(),
+            PathBuf::from("/home/cmclient/.cmclient/config.toml")
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_and_foreign_runtime_path_overrides() {
+        let mut legacy_environment = environment();
+        legacy_environment.insert(String::from("CMCLIENT_DATA_DIR"), String::from("relative"));
+        assert_eq!(
+            RuntimePaths::from_environment(&legacy_environment),
             Err(ConfigError::RelativePathOverride {
                 name: "CMCLIENT_DATA_DIR"
+            })
+        );
+
+        let mut foreign_environment = environment();
+        foreign_environment.insert(
+            String::from("CMCLIENT_CONFIG_DIR"),
+            fixture_home()
+                .join("foreign-config")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert_eq!(
+            RuntimePaths::from_environment(&foreign_environment),
+            Err(ConfigError::ForeignPathOverride {
+                name: "CMCLIENT_CONFIG_DIR"
+            })
+        );
+
+        let mut config_environment = environment();
+        config_environment.insert(
+            String::from("CMCLIENT_AGENT_CONFIG"),
+            fixture_home()
+                .join("foreign-config.toml")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert_eq!(
+            AgentConfig::from_environment(&config_environment),
+            Err(ConfigError::ForeignPathOverride {
+                name: "CMCLIENT_AGENT_CONFIG"
             })
         );
     }
 
     #[test]
-    fn loads_a_strict_agent_file() {
+    fn environment_snapshot_is_immutable() {
+        let environment = environment();
+        let snapshot = environment.clone();
+        RuntimePaths::from_environment(&environment).expect("paths should load");
+        assert_eq!(environment, snapshot);
+    }
+
+    #[test]
+    fn creates_only_canonical_runtime_directories_and_rejects_foreign_entries() {
         let directory =
-            std::env::temp_dir().join(format!("cmclient-agent-core-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let config_file = directory.join("agent.toml");
+            std::env::temp_dir().join(format!("cmclient-runtime-paths-{}", Uuid::new_v4()));
+        let home = directory.join("home");
+        fs::create_dir_all(&home).expect("fixture home should exist");
+        let paths = RuntimePaths::from_environment(&environment_for_home(&home))
+            .expect("runtime paths should resolve");
+
+        ensure_runtime_directories(&paths).expect("runtime directories should be created");
+        for path in paths.managed_directories() {
+            assert!(path.is_dir(), "{} should be a directory", path.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&path)
+                        .expect("runtime directory should have metadata")
+                        .permissions()
+                        .mode()
+                        & 0o7777,
+                    0o700,
+                    "{} should be user-private",
+                    path.display()
+                );
+            }
+        }
+
+        fs::remove_dir_all(paths.run_dir()).expect("run directory should be removable");
+        fs::write(paths.run_dir(), b"not-a-directory").expect("blocking file should be written");
+        assert!(matches!(
+            ensure_runtime_directories(&paths),
+            Err(ConfigError::ReadConfig { path }) if path == paths.run_dir()
+        ));
+        fs::remove_dir_all(directory).expect("runtime fixture should be removed");
+    }
+
+    #[test]
+    fn loads_a_strict_agent_file() {
+        let (directory, environment, config_file) = config_fixture("strict");
         fs::write(
             &config_file,
             "[agent]\ngateway_command = [\"gateway\", \"serve\"]\nmanagement_web_enabled = false\n",
         )
         .expect("configuration should be written");
-        let mut environment = environment();
-        environment.insert(
-            String::from("CMCLIENT_AGENT_CONFIG"),
-            config_file.display().to_string(),
-        );
 
         let config =
             AgentConfig::from_environment(&environment).expect("configuration should load");
@@ -719,20 +918,12 @@ mod tests {
 
     #[test]
     fn rejects_the_removed_gateway_port_setting() {
-        let directory =
-            std::env::temp_dir().join(format!("cmclient-agent-port-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let config_file = directory.join("agent.toml");
+        let (directory, environment, config_file) = config_fixture("removed-port");
         fs::write(
             &config_file,
             ["[agent]\n", "gateway_", "port = 4810\n"].concat(),
         )
         .expect("configuration should be written");
-        let mut environment = environment();
-        environment.insert(
-            String::from("CMCLIENT_AGENT_CONFIG"),
-            config_file.display().to_string(),
-        );
 
         assert_eq!(
             AgentConfig::from_environment(&environment),
@@ -743,15 +934,7 @@ mod tests {
 
     #[test]
     fn accepts_only_an_https_callmesh_url_without_a_secret_in_configuration() {
-        let directory =
-            std::env::temp_dir().join(format!("cmclient-agent-callmesh-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let config_file = directory.join("agent.toml");
-        let mut environment = environment();
-        environment.insert(
-            String::from("CMCLIENT_AGENT_CONFIG"),
-            config_file.display().to_string(),
-        );
+        let (directory, environment, config_file) = config_fixture("callmesh");
         fs::write(
             &config_file,
             "[callmesh]\nurl = \"https://callmesh.example.invalid/\"\n",
@@ -790,12 +973,7 @@ mod tests {
 
     #[test]
     fn loads_gateway_transport_aprs_and_proxy_without_inline_secrets() {
-        let directory = std::env::temp_dir().join(format!(
-            "cmclient-agent-gateway-runtime-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let config_file = directory.join("agent.toml");
+        let (directory, environment, config_file) = config_fixture("gateway-runtime");
         fs::write(
             &config_file,
             r#"[meshtastic]
@@ -821,12 +999,6 @@ allowlist = ["192.0.2.20"]
 "#,
         )
         .expect("configuration should be written");
-        let mut environment = environment();
-        environment.insert(
-            String::from("CMCLIENT_AGENT_CONFIG"),
-            config_file.display().to_string(),
-        );
-
         let config = AgentConfig::from_environment(&environment)
             .expect("gateway runtime configuration should load");
         assert_eq!(
@@ -909,17 +1081,7 @@ comment = "legacy comment"
 
     #[test]
     fn rejects_ambiguous_meshtastic_and_unsafe_proxy_configuration() {
-        let directory = std::env::temp_dir().join(format!(
-            "cmclient-agent-runtime-invalid-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let config_file = directory.join("agent.toml");
-        let mut environment = environment();
-        environment.insert(
-            String::from("CMCLIENT_AGENT_CONFIG"),
-            config_file.display().to_string(),
-        );
+        let (directory, environment, config_file) = config_fixture("runtime-invalid");
         fs::write(
             &config_file,
             "[meshtastic]\ntransport = \"tcp\"\nmesh_network_id = \"mesh\"\ngateway_id = \"gateway\"\nserial_path = \"/dev/ttyUSB0\"\n",
@@ -943,11 +1105,7 @@ comment = "legacy comment"
 
     #[test]
     fn accepts_only_a_complete_non_loopback_management_lan_configuration() {
-        let directory =
-            std::env::temp_dir().join(format!("cmclient-agent-lan-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let config_file = directory.join("agent.toml");
+        let (directory, environment, config_file) = config_fixture("management-lan");
         let certificate_path = directory.join("certificate.pem");
         let private_key_path = directory.join("private-key.pem");
         fs::write(
@@ -968,12 +1126,6 @@ private_key_path = '{}'
             ),
         )
         .expect("configuration should be written");
-        let mut environment = environment();
-        environment.insert(
-            String::from("CMCLIENT_AGENT_CONFIG"),
-            config_file.display().to_string(),
-        );
-
         assert!(AgentConfig::from_environment(&environment).is_err());
         fs::write(
             &config_file,
@@ -1050,7 +1202,8 @@ private_key_path = '{}'
             cache_dir: directory.join("cache"),
             log_dir: directory.join("logs"),
         };
-        let blocked_state = directory.join("agent-state.json");
+        let blocked_state = directory.join("state").join("agent.json");
+        fs::create_dir_all(directory.join("state")).expect("state directory should exist");
         fs::create_dir(&blocked_state).expect("blocked state fixture should exist");
 
         assert!(matches!(
@@ -1080,13 +1233,14 @@ private_key_path = '{}'
             log_dir: directory.join("logs"),
         };
 
-        fs::write(directory.join("agent-state.json"), b"{").expect("malformed state should write");
+        fs::create_dir_all(directory.join("state")).expect("state directory should exist");
+        fs::write(directory.join("state/agent.json"), b"{").expect("malformed state should write");
         let error = AgentLease::read_state(&paths).expect_err("malformed state must fail closed");
         assert!(matches!(error, InstanceError::StateInvalid));
         assert_eq!(error.code(), "AGENT_INSTANCE_STATE_INVALID");
 
         fs::write(
-            directory.join("agent-state.json"),
+            directory.join("state/agent.json"),
             br#"{"schemaVersion":2,"pid":1,"startedAtUnixSeconds":1}"#,
         )
         .expect("invalid schema state should write");

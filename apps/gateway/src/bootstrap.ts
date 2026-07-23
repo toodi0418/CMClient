@@ -4,7 +4,8 @@ import type { Duplex } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 
 export const GATEWAY_CAPABILITY_HEADER = "x-cmclient-gateway-capability";
-export const GATEWAY_PRIVATE_FRAME_MAX_BYTES = 4096;
+export const GATEWAY_PRIVATE_FRAME_MAX_BYTES = 16 * 1024;
+export const GATEWAY_CALLMESH_API_KEY_MAX_BYTES = 4096;
 export const GATEWAY_BOOTSTRAP_DEADLINE_MS = 5000;
 export const GATEWAY_OWNERSHIP_PATH = "/_cmclient/bootstrap/ownership";
 export const GATEWAY_OWNERSHIP_CHALLENGE_HEADER =
@@ -15,10 +16,11 @@ const GATEWAY_OWNERSHIP_PROTOCOL = "cmclient-bootstrap-ownership-v1";
 const GATEWAY_OWNERSHIP_DOMAIN = "cmclient.gateway.bootstrap-ownership.v1";
 
 export interface GatewayBootstrapFrame {
-  schemaVersion: 1;
-  type: "gateway.bootstrap";
-  startupNonce: string;
-  capability: string;
+  readonly schemaVersion: 1;
+  readonly type: "gateway.bootstrap";
+  readonly startupNonce: string;
+  readonly capability: string;
+  readonly callMeshApiKey?: string;
 }
 
 export interface GatewayReadyFrame {
@@ -52,21 +54,25 @@ export async function readGatewayBootstrap(
   deadlineMs = GATEWAY_BOOTSTRAP_DEADLINE_MS,
 ): Promise<GatewayBootstrapFrame> {
   const value = await readPrivateFrame(input, deadlineMs);
+  const exactKeys = ["capability", "schemaVersion", "startupNonce", "type"];
   if (
-    !isExactObject(value, [
-      "capability",
-      "schemaVersion",
-      "startupNonce",
-      "type",
-    ])
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.hasOwn(value, "callMeshApiKey")
   ) {
+    exactKeys.push("callMeshApiKey");
+  }
+  if (!isExactObject(value, exactKeys)) {
     throw new GatewayBootstrapError("GATEWAY_BOOTSTRAP_FRAME_INVALID");
   }
   if (
     value.schemaVersion !== 1 ||
     value.type !== "gateway.bootstrap" ||
     !isLowerHex(value.startupNonce, 32) ||
-    !isLowerHex(value.capability, 64)
+    !isLowerHex(value.capability, 64) ||
+    (value.callMeshApiKey !== undefined &&
+      !isCallMeshApiKey(value.callMeshApiKey))
   ) {
     throw new GatewayBootstrapError("GATEWAY_BOOTSTRAP_FRAME_INVALID");
   }
@@ -361,4 +367,21 @@ function isLowerHex(value: unknown, length: number): value is string {
     value.length === length &&
     /^[0-9a-f]+$/.test(value)
   );
+}
+
+function isCallMeshApiKey(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    Buffer.byteLength(value, "utf8") > GATEWAY_CALLMESH_API_KEY_MAX_BYTES
+  ) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x1f || codeUnit === 0x7f) {
+      return false;
+    }
+  }
+  return true;
 }

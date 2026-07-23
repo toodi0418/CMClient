@@ -122,7 +122,7 @@ assert_ingress_gateway_isolation
 '
 "${compose[@]}" exec --no-TTY gateway node --input-type=module --eval '
   import { writeFileSync } from "node:fs";
-  writeFileSync("/var/lib/cmclient/packaging-lifecycle-sentinel", "must survive recreate");
+  writeFileSync("/home/cmclient/.cmclient/packaging-lifecycle-sentinel", "must survive recreate");
 '
 recreate=(up --detach --force-recreate)
 if [[ "${CMCLIENT_SMOKE_PREBUILT:-0}" == "1" ]]; then
@@ -134,7 +134,7 @@ assert_network_topology web 2 2
 assert_ingress_gateway_isolation
 "${compose[@]}" exec --no-TTY gateway node --input-type=module --eval '
   import { readFileSync } from "node:fs";
-  if (readFileSync("/var/lib/cmclient/packaging-lifecycle-sentinel", "utf8") !== "must survive recreate") {
+  if (readFileSync("/home/cmclient/.cmclient/packaging-lifecycle-sentinel", "utf8") !== "must survive recreate") {
     process.exit(1);
   }
 '

@@ -9,13 +9,11 @@ DEFAULT_UNIT_DIR="/etc/systemd/system"
 UNIT_DIR="${CMCLIENT_SYSTEMD_UNIT_DIR:-$DEFAULT_UNIT_DIR}"
 INSTALL_ROOT="${CMCLIENT_INSTALL_ROOT:-/opt/cmclient/current}"
 AGENT_BINARY="${CMCLIENT_AGENT_BINARY:-$INSTALL_ROOT/bin/cmclient-agent}"
-CONFIG_DIR="${CMCLIENT_CONFIG_DIR:-/etc/cmclient}"
-DATA_DIR="${CMCLIENT_DATA_DIR:-/var/lib/cmclient}"
-CACHE_DIR="${CMCLIENT_CACHE_DIR:-/var/cache/cmclient}"
-LOG_DIR="${CMCLIENT_LOG_DIR:-/var/log/cmclient}"
-SECRET_STORE_KEY=""
 SERVICE_USER="${CMCLIENT_SERVICE_USER:-cmclient}"
 SERVICE_GROUP="${CMCLIENT_SERVICE_GROUP:-cmclient}"
+HOME_DIRECTORY="${CMCLIENT_SERVICE_HOME:-}"
+RUNTIME_ROOT=""
+LOG_DIR=""
 SERIAL_GROUP="${CMCLIENT_SERIAL_GROUP:-}"
 SYSTEMCTL="${CMCLIENT_SYSTEMCTL:-systemctl}"
 JOURNALCTL="${CMCLIENT_JOURNALCTL:-journalctl}"
@@ -60,10 +58,7 @@ Usage: scripts/cmclient-systemd.sh <install|uninstall|start|stop|restart|status|
 Install options:
   --agent <absolute path>        Agent executable (default: /opt/cmclient/current/bin/cmclient-agent)
   --unit-dir <absolute path>     Unit directory (default: /etc/systemd/system)
-  --config-dir <absolute path>   Agent configuration directory (default: /etc/cmclient)
-  --data-dir <absolute path>     Persistent Agent data directory (default: /var/lib/cmclient)
-  --cache-dir <absolute path>    Agent cache directory (default: /var/cache/cmclient)
-  --log-dir <absolute path>      Agent log directory (default: /var/log/cmclient)
+  --home <absolute path>         Effective service HOME (default: /home/<service-user>)
   --service-user <name>          Non-login account (default: cmclient)
   --service-group <name>         Service group (default: cmclient)
   --serial-group <name>          Existing group allowed to access serial devices
@@ -72,9 +67,10 @@ Install options:
   --lines <1..10000>             Lines for logs (default: 200)
   --skip-user-setup              Packaging-test only: do not create or modify accounts
 
-The manager never accepts credentials or writes secret values. `uninstall`
-removes the unit only; Agent configuration, the service wrapping key, data,
-cache, and logs are retained.
+The manager never accepts credentials or writes secret values. Agent owns all
+mutable state below HOME/.cmclient, including config.toml, cmclient.db,
+secrets.json, run, logs, backups, and updates. `uninstall` removes the unit
+only and retains that runtime root.
 EOF
 }
 
@@ -132,7 +128,7 @@ ensure_service_account() {
     run_privileged useradd \
       --system \
       --gid "$SERVICE_GROUP" \
-      --home-dir "$DATA_DIR" \
+      --home-dir "$HOME_DIRECTORY" \
       --create-home \
       --shell /usr/sbin/nologin \
       "$SERVICE_USER"
@@ -152,61 +148,30 @@ install_directory() {
   fi
 }
 
-prepare_directories() {
-  if [[ "$SKIP_USER_SETUP" == "1" ]]; then
-    install -d -m 0750 "$CONFIG_DIR"
-  else
-    run_privileged install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"
+validate_managed_directory() {
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -d "$path" && ! -L "$path" ]] || fail "SYSTEMD_RUNTIME_DIRECTORY_INVALID"
   fi
-  install_directory "$DATA_DIR" 0750
-  install_directory "$CACHE_DIR" 0750
-  install_directory "$LOG_DIR" 0750
 }
 
-ensure_secret_store_key() {
-  local key_size
-  if run_privileged test -e "$SECRET_STORE_KEY" || run_privileged test -L "$SECRET_STORE_KEY"; then
-    if ! run_privileged test -f "$SECRET_STORE_KEY" || run_privileged test -L "$SECRET_STORE_KEY"; then
-      fail "SYSTEMD_SECRET_STORE_KEY_INVALID"
-    fi
-    key_size="$(run_privileged wc -c "$SECRET_STORE_KEY" | awk '{print $1}')"
-    if [[ "$key_size" != "32" ]]; then
-      fail "SYSTEMD_SECRET_STORE_KEY_INVALID"
-    fi
-    if [[ "$SKIP_USER_SETUP" == "1" ]]; then
-      chmod 0600 "$SECRET_STORE_KEY"
-    else
-      run_privileged chown root:root "$SECRET_STORE_KEY"
-      run_privileged chmod 0600 "$SECRET_STORE_KEY"
-    fi
-    return
-  fi
-
-  if run_privileged test -e "$DATA_DIR/secrets" || run_privileged test -L "$DATA_DIR/secrets"; then
-    if ! run_privileged test -d "$DATA_DIR/secrets" || run_privileged test -L "$DATA_DIR/secrets"; then
-      fail "SYSTEMD_SECRET_STORE_DIRECTORY_INVALID"
-    fi
-    local existing_secret_entry
-    if ! existing_secret_entry="$(run_privileged find "$DATA_DIR/secrets" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
-      fail "SYSTEMD_SECRET_STORE_SCAN_FAILED"
-    fi
-    if [[ -n "$existing_secret_entry" ]]; then
-      fail "SYSTEMD_SECRET_STORE_KEY_MISSING"
-    fi
-  fi
-
-  (
-    local temporary_key
-    temporary_key="$(mktemp)"
-    trap 'rm -f "$temporary_key"' EXIT
-    chmod 0600 "$temporary_key"
-    dd if=/dev/urandom of="$temporary_key" bs=32 count=1 status=none
-    if [[ "$SKIP_USER_SETUP" == "1" ]]; then
-      install -m 0600 "$temporary_key" "$SECRET_STORE_KEY"
-    else
-      run_privileged install -o root -g root -m 0600 "$temporary_key" "$SECRET_STORE_KEY"
-    fi
+prepare_directories() {
+  local paths=(
+    "$RUNTIME_ROOT"
+    "$RUNTIME_ROOT/state"
+    "$RUNTIME_ROOT/run"
+    "$RUNTIME_ROOT/cache"
+    "$RUNTIME_ROOT/logs"
+    "$RUNTIME_ROOT/backups"
+    "$RUNTIME_ROOT/updates"
   )
+  local path
+  for path in "${paths[@]}"; do
+    validate_managed_directory "$path"
+  done
+  for path in "${paths[@]}"; do
+    install_directory "$path" 0700
+  done
 }
 
 render_unit() {
@@ -223,22 +188,19 @@ render_unit() {
     -e "s|@SUPPLEMENTARY_GROUP_LINE@|$supplementary_group_line|g" \
     -e "s|@WORKING_DIRECTORY@|$working_directory|g" \
     -e "s|@AGENT_BINARY@|$AGENT_BINARY|g" \
-    -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
-    -e "s|@DATA_DIR@|$DATA_DIR|g" \
-    -e "s|@CACHE_DIR@|$CACHE_DIR|g" \
-    -e "s|@LOG_DIR@|$LOG_DIR|g" \
-    -e "s|@SECRET_STORE_KEY@|$SECRET_STORE_KEY|g" \
+    -e "s|@HOME_DIRECTORY@|$HOME_DIRECTORY|g" \
+    -e "s|@RUNTIME_ROOT@|$RUNTIME_ROOT|g" \
     "$TEMPLATE_PATH"
 }
 
 validate_configuration() {
   validate_path "$UNIT_DIR"
   validate_path "$AGENT_BINARY"
-  validate_path "$CONFIG_DIR"
-  validate_path "$DATA_DIR"
-  validate_path "$CACHE_DIR"
+  validate_path "$HOME_DIRECTORY"
+  validate_path "$RUNTIME_ROOT"
   validate_path "$LOG_DIR"
-  validate_path "$SECRET_STORE_KEY"
+  validate_managed_directory "$RUNTIME_ROOT"
+  validate_managed_directory "$LOG_DIR"
   validate_account_name "$SERVICE_USER"
   validate_account_name "$SERVICE_GROUP"
   if [[ -n "$SERIAL_GROUP" ]]; then
@@ -262,7 +224,6 @@ install_service() {
   fi
   ensure_service_account
   prepare_directories
-  ensure_secret_store_key
   local temporary_unit
   temporary_unit="$(mktemp)"
   trap 'rm -f "$temporary_unit"' RETURN
@@ -361,10 +322,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --agent) AGENT_BINARY="${2:-}"; shift 2 ;;
     --unit-dir) UNIT_DIR="${2:-}"; shift 2 ;;
-    --config-dir) CONFIG_DIR="${2:-}"; shift 2 ;;
-    --data-dir) DATA_DIR="${2:-}"; shift 2 ;;
-    --cache-dir) CACHE_DIR="${2:-}"; shift 2 ;;
-    --log-dir) LOG_DIR="${2:-}"; shift 2 ;;
+    --home) HOME_DIRECTORY="${2:-}"; shift 2 ;;
     --service-user) SERVICE_USER="${2:-}"; shift 2 ;;
     --service-group) SERVICE_GROUP="${2:-}"; shift 2 ;;
     --serial-group) SERIAL_GROUP="${2:-}"; shift 2 ;;
@@ -376,7 +334,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-SECRET_STORE_KEY="$CONFIG_DIR/secret-store.key"
+if [[ -z "$HOME_DIRECTORY" ]]; then
+  HOME_DIRECTORY="/home/$SERVICE_USER"
+fi
+RUNTIME_ROOT="$HOME_DIRECTORY/.cmclient"
+LOG_DIR="$RUNTIME_ROOT/logs"
 
 require_linux
 validate_configuration

@@ -1,33 +1,31 @@
 # Getting Started
 
-> Historical P12 snapshot. Where this file conflicts with
-> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
-> history rather than the current install or release contract.
+CMClient is one product with several launch modes. Every native package contains
+graphical mode, command mode, full Web, Agent, Gateway, and a pinned private
+Node runtime. Docker contains the same resident core, command mode, and Web but
+omits graphical mode and native host integration. Users do not install Node,
+npm, pnpm, a separate CLI, or a separate service package.
 
-CMClient 2.0 RC.1 is a local Agent, not a cloud account. Choose the product
-surface that matches the host:
-
-| Surface | Use it when | Host prerequisites |
+| Host | Public install object | Prerequisite |
 | --- | --- | --- |
-| Portable Desktop | You want the Tauri supervisor and the complete local runtime | Node.js `^22.18.0` or `>=24.11.0`; an Agent service must be started separately |
-| Native Desktop package | You want a DMG, DEB, AppImage, MSI, or NSIS installer | Same runtime requirement; native package does not register a privileged Agent |
-| Headless | A server or Raspberry Pi should run Agent, Gateway, Web, and CLI | Node.js `^22.18.0` or `>=24.11.0` |
-| CLI | A shell or automation host only needs Agent control | No Node.js requirement for the standalone CLI |
-| Docker OCI | Gateway, Web, and fixed Ingress should run without host control | Docker Compose; no Agent, serial, service, or updater capability |
+| Windows x86-64 | `CMClient-Setup.exe` | A supported Windows host; Setup carries offline WebView2 |
+| macOS Intel / Apple Silicon | Universal `CMClient.dmg` | macOS 13.5 or newer |
+| Linux x86-64 / ARM64 | One AppImage per CPU | Supported glibc/WebKitGTK host; FUSE or the documented extraction fallback |
+| Docker amd64 / arm64 | One OCI image index plus Compose | Docker Engine 28+ and Compose |
 
 The RC is not production-signed. Do not use it as evidence that a production
 tag, notarization, or platform signing key has been approved.
 
 ## Verify an artifact
 
-Download the archive, `SHA256SUMS`, and the matching release metadata from the
-same workflow artifact. Select exactly one checksum row and require exactly one
-match before extracting; do not use `--ignore-missing`, which can succeed
+Download the install object, `SHA256SUMS`, and matching release metadata from
+the same release set. Select exactly one checksum row and require exactly one
+match before running it; do not use `--ignore-missing`, which can succeed
 without checking the requested file:
 
 ```bash
 set -eu
-artifact='cmclient-headless-linux-x86_64-2.0.0-rc.1.tar.zst'
+artifact='CMClient-x86_64.AppImage'
 awk -v name="*$artifact" '$2 == name { print }' SHA256SUMS > "$artifact.sha256"
 test "$(wc -l < "$artifact.sha256")" -eq 1
 sha256sum -c "$artifact.sha256"
@@ -37,30 +35,20 @@ sha256sum -c "$artifact.sha256"
 When the complete release directory is present, `sha256sum -c SHA256SUMS`
 verifies the whole set and fails for every missing or changed subject.
 
-The portable names are fixed:
-
-```text
-cmclient-<component>-<target>-2.0.0-rc.1.tar.zst
-cmclient-<component>-windows-x86_64-2.0.0-rc.1.zip
-```
-
-Native Desktop files keep the same stem and use `.dmg`, `.deb`, `.AppImage`,
-`.msi`, or `.setup.exe`. Docker is delivered as
-`cmclient-docker-linux-x86_64-2.0.0-rc.1.oci.tar` and
-`cmclient-docker-linux-aarch64-2.0.0-rc.1.oci.tar`. Native installers and OCI
-archives are not Agent updater bundles.
+Checksums, release metadata, SBOMs, provenance, and update payloads are support
+files, not extra product choices. Candidate artifacts are not production signed
+unless the release metadata explicitly records completion of that human gate.
 
 ## First local run
 
-1. Extract a verified `headless` or `desktop` archive outside the data and
-   configuration directories.
-2. Put the required `agent.toml` in the platform configuration directory. The
-   strict examples and path rules are in [configuration and security](../admin/configuration-security.md).
-3. Ensure `node` resolves to the supported Node.js version for the service
-   account. The Agent starts the adjacent production Gateway and Web bundle.
-4. Start the Agent with `cmclient-agent --serve` (or use the documented service
-   manager). `cmclient-agent --check-config` validates without starting a child.
-5. Run the local checks:
+1. Install or launch the verified native object. It starts the resident core in
+   the current-user context; no routine UAC or administrator service is needed.
+2. Open graphical mode or run `cmclient web`. A missing key or reset redirects
+   to the Web setup wizard.
+3. Accept the terms, confirm the detected Meshtastic endpoint, and enter the
+   CallMesh key. Agent stores it in `~/.cmclient/secrets.json` and never passes
+   it through argv or environment.
+4. Finish setup, then run the local checks:
 
 ```bash
 cmclient status
@@ -70,47 +58,56 @@ cmclient --json version
 ```
 
 `cmclient web` returns the Agent-owned Management Web URL. The default local
-listener is `http://127.0.0.1:7080` when enabled. The private Control socket is
-always available even when the Web listener is disabled. A live Gateway that
-fails its health probe is reported as `degraded`, not `running`.
+URL is `http://127.0.0.1:7080`; the listener binds wildcard addresses but rejects
+non-loopback peers by default. The private Control endpoint remains available
+when Web is disabled. A live Gateway that fails its health probe is `degraded`,
+not `running`. Source-tree operators may use `cmclient-agent --serve` for a
+bounded development run, but packaged users launch the unified product.
 
 ## Docker first run
 
-Import the verified OCI archive without rebuilding it, then use the release
-descriptor `cmclient-docker-compose-2.0.0-rc.1.yml` and the fixed Ingress port.
-An OCI layout archive is not a Docker archive, so convert it with `skopeo`
-before `docker load`. The compose topology exposes only Ingress to the host;
-Gateway and Web stay on internal networks. The image reports its version,
-source commit, and channel at `/api/v1/system/version`.
+Use the release Compose descriptor with the immutable image/index digest. One
+service named `cmclient` runs Agent and its supervised Gateway; `init: true`
+provides signal forwarding and orphan reaping. Compose publishes Web to host
+loopback by default, and every Docker browser session still authenticates.
 
 ```bash
-skopeo copy --format v2s2 \
-  "oci-archive:cmclient-docker-linux-x86_64-2.0.0-rc.1.oci.tar" \
-  "docker-archive:cmclient.docker.tar:cmclient:2.0.0-rc.1"
-docker load --input cmclient.docker.tar
-CMCLIENT_IMAGE=cmclient:2.0.0-rc.1 \
+CMCLIENT_IMAGE=registry.example/cmclient@sha256:<verified-digest> \
   docker compose --file cmclient-docker-compose-2.0.0-rc.1.yml \
-  up --detach --no-build --force-recreate
+  up --detach --no-build --force-recreate --wait
+docker compose exec -T cmclient cmclient setup-code
 ```
 
-Docker is an operator-managed deployment. It cannot start the host Agent,
-access serial devices, install a system service, or perform an in-place Agent
-update.
+Docker is operator-managed. It does not include graphical mode, install a host
+service, control the Docker socket, or perform an in-place image update.
 
 ## Where state lives
 
-CMClient keeps binaries separate from user data. macOS uses
-`~/Library/Application Support/CMClient` and `~/Library/Caches/CMClient`;
-Windows uses `%APPDATA%\CMClient` and `%LOCALAPPDATA%\CMClient\cache`;
-Linux follows XDG data/config/cache directories under `~/.local/share`,
-`~/.config`, and `~/.cache`. Logs default below the data directory. Absolute
-`CMCLIENT_*_DIR` overrides are allowed; relative overrides fail closed.
+Every native platform uses the effective startup user's `~/.cmclient`; on
+Windows this is `%USERPROFILE%\.cmclient`. Docker uses the fixed
+`/home/cmclient/.cmclient`. Agent takes one immutable home snapshot at startup,
+and split data/config/cache/log overrides or foreign roots fail closed.
 
-Never put API keys, APRS credentials, browser passwords, or update signing keys
-in `agent.toml`, a command argument, or a diagnostic bundle. Use standard input
-to set only the CallMesh API key or Management admin token. APRS identity comes
-from a valid CallMesh provision, and Gateway derives its runtime passcode
-locally; neither is a static user-set secret.
+```text
+~/.cmclient/
+  config.toml
+  secrets.json
+  cmclient.db
+  state/
+  run/
+  cache/
+  logs/
+  backups/
+  updates/
+```
+
+`secrets.json` is the sole plaintext runtime backend. It is atomically replaced;
+POSIX uses private `0700`/`0600` paths and Windows uses a normal current-user
+file without UAC. CMClient does not use Keychain, Credential Manager/DPAPI,
+Secret Service, a systemd vault, or a persisted Control token. Never put keys,
+browser passwords, APRS credentials, or signing keys in `config.toml`, command
+arguments, environment variables, diagnostics, backups, or Git. APRS identity
+comes from a valid CallMesh provision and Gateway derives its runtime passcode.
 
 For installation, upgrade, uninstall retention, and service registration see
 [Deployment](../admin/deployment.md). For the day-to-day Web and CLI workflow

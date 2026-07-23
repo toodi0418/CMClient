@@ -69,14 +69,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$runtime/data" "$runtime/config" "$runtime/cache" "$runtime/logs"
-printf '[agent]\nmanagement_web_enabled = true\n' >"$runtime/agent.toml"
-
-export CMCLIENT_AGENT_CONFIG="$runtime/agent.toml"
-export CMCLIENT_DATA_DIR="$runtime/data"
-export CMCLIENT_CONFIG_DIR="$runtime/config"
-export CMCLIENT_CACHE_DIR="$runtime/cache"
-export CMCLIENT_LOG_DIR="$runtime/logs"
+export HOME="$runtime/home"
+mkdir -p "$HOME/.cmclient"
+printf '[agent]\nmanagement_web_enabled = true\n' >"$HOME/.cmclient/config.toml"
 
 "$agent" --serve >"$runtime/agent.log" 2>&1 &
 agent_pid="$!"

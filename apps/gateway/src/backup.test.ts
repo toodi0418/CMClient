@@ -11,7 +11,7 @@ import { GatewayDatabase } from "./persistence/database";
 describe("verified Gateway backup", () => {
   it("creates a standalone integrity-checked SQLite snapshot", async () => {
     const directory = await mkdtemp(join(tmpdir(), "cmclient-backup-"));
-    const source = new GatewayDatabase(join(directory, "gateway.sqlite"));
+    const source = new GatewayDatabase(join(directory, "cmclient.db"));
     source.settings.set("fixture", { value: 42 });
 
     const result = await createVerifiedGatewayBackup(
@@ -49,7 +49,7 @@ describe("verified Gateway backup", () => {
 
   it("fails before creating an artifact when shutdown already cancelled work", async () => {
     const directory = await mkdtemp(join(tmpdir(), "cmclient-backup-abort-"));
-    const source = new GatewayDatabase(join(directory, "gateway.sqlite"));
+    const source = new GatewayDatabase(join(directory, "cmclient.db"));
     const controller = new AbortController();
     controller.abort();
 

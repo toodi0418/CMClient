@@ -60,23 +60,17 @@ if [[ ! "$run_id" =~ ^(local|[1-9][0-9]*)$ || ! "$run_attempt" =~ ^[1-9][0-9]*$ 
 fi
 run_label="$run_id-$run_attempt-$$"
 INSTALL_ROOT="/opt/cmclient-systemd-smoke-$run_label"
-CONFIG_DIR="/etc/cmclient-systemd-smoke-$run_label"
-DATA_DIR="/var/lib/cmclient-systemd-smoke-$run_label"
-CACHE_DIR="/var/cache/cmclient-systemd-smoke-$run_label"
-LOG_DIR="/var/log/cmclient-systemd-smoke-$run_label"
+SERVICE_HOME="/home/cmclient-systemd-smoke-$run_label"
+RUNTIME_ROOT="$SERVICE_HOME/.cmclient"
 AGENT_BINARY="$INSTALL_ROOT/bin/cmclient-agent"
 CLI_BINARY="$INSTALL_ROOT/bin/cmclient"
 GATEWAY_FIXTURE="$INSTALL_ROOT/bin/cmclient-systemd-gateway-fixture.py"
-CONTROL_SOCKET="$DATA_DIR/control.sock"
-SECRET_STORE_KEY="$CONFIG_DIR/secret-store.key"
-CIPHERTEXT="$DATA_DIR/secrets/callmesh-api-key.secret"
+CONTROL_SOCKET="$RUNTIME_ROOT/run/control.sock"
+SECRETS_FILE="$RUNTIME_ROOT/secrets.json"
 
 manager_arguments=(
   --agent "$AGENT_BINARY"
-  --config-dir "$CONFIG_DIR"
-  --data-dir "$DATA_DIR"
-  --cache-dir "$CACHE_DIR"
-  --log-dir "$LOG_DIR"
+  --home "$SERVICE_HOME"
   --service-user "$SERVICE_USER"
   --service-group "$SERVICE_GROUP"
 )
@@ -91,7 +85,7 @@ cleanup() {
   fi
   bash "$MANAGER" uninstall "${manager_arguments[@]}" >/dev/null 2>&1
   systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1
-  rm -rf "$INSTALL_ROOT" "$CONFIG_DIR" "$DATA_DIR" "$CACHE_DIR" "$LOG_DIR"
+  rm -rf "$INSTALL_ROOT" "$SERVICE_HOME"
   exit "$status"
 }
 trap cleanup EXIT
@@ -111,7 +105,8 @@ import struct
 import sys
 import threading
 
-MAX_FRAME_BYTES = 4096
+MAX_FRAME_BYTES = 16 * 1024
+MAX_CALLMESH_API_KEY_BYTES = 4096
 MAX_REQUEST_BYTES = 8192
 OWNERSHIP_PATH = "/_cmclient/bootstrap/ownership"
 OWNERSHIP_PROTOCOL = "cmclient-bootstrap-ownership-v1"
@@ -277,16 +272,31 @@ def main():
     if frame_length < 1 or frame_length > MAX_FRAME_BYTES:
         raise RuntimeError("invalid frame length")
     bootstrap = json.loads(read_exact(sys.stdin.buffer, frame_length))
-    if set(bootstrap) != {"schemaVersion", "type", "startupNonce", "capability"}:
+    fields = {"schemaVersion", "type", "startupNonce", "capability"}
+    if set(bootstrap) not in (fields, fields | {"callMeshApiKey"}):
         raise RuntimeError("invalid bootstrap fields")
     if bootstrap.get("schemaVersion") != 1 or bootstrap.get("type") != "gateway.bootstrap":
         raise RuntimeError("invalid bootstrap type")
     nonce = bootstrap.get("startupNonce")
     capability = bootstrap.get("capability")
+    callmesh_api_key = bootstrap.get("callMeshApiKey")
     if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
         raise RuntimeError("invalid nonce")
     if not isinstance(capability, str) or re.fullmatch(r"[0-9a-f]{64}", capability) is None:
         raise RuntimeError("invalid capability")
+    if callmesh_api_key is not None:
+        if (
+            not isinstance(callmesh_api_key, str)
+            or not callmesh_api_key
+            or len(callmesh_api_key.encode("utf-8")) > MAX_CALLMESH_API_KEY_BYTES
+            or any(
+                ord(character) <= 0x1F or ord(character) == 0x7F
+                for character in callmesh_api_key
+            )
+        ):
+            raise RuntimeError("invalid callmesh api key")
+        if any(callmesh_api_key in value for value in [*sys.argv, *os.environ.values()]):
+            raise RuntimeError("callmesh api key escaped private bootstrap")
 
     identity = identity_report()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -336,7 +346,7 @@ except Exception:
 PY
 chown root:"$SERVICE_GROUP" "$GATEWAY_FIXTURE"
 chmod 0755 "$GATEWAY_FIXTURE"
-install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"
+install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$RUNTIME_ROOT"
 printf '%s\n' \
   '[agent]' \
   "gateway_command = [\"/usr/bin/python3\", \"$GATEWAY_FIXTURE\"]" \
@@ -344,9 +354,9 @@ printf '%s\n' \
   '' \
   '[callmesh]' \
   'url = "https://callmesh.invalid"' \
-  >"$CONFIG_DIR/agent.toml"
-chown root:"$SERVICE_GROUP" "$CONFIG_DIR/agent.toml"
-chmod 0640 "$CONFIG_DIR/agent.toml"
+  >"$RUNTIME_ROOT/config.toml"
+chown "$SERVICE_USER:$SERVICE_GROUP" "$RUNTIME_ROOT/config.toml"
+chmod 0600 "$RUNTIME_ROOT/config.toml"
 
 bash "$MANAGER" install "${manager_arguments[@]}"
 systemd-analyze verify "/etc/systemd/system/$SERVICE_NAME"
@@ -379,44 +389,46 @@ wait_for_control_socket
 if [[ "$(stat -c '%a' "$CONTROL_SOCKET")" != "600" ]]; then
   fail "SYSTEMD_SMOKE_CONTROL_SOCKET_MODE_INVALID"
 fi
-if [[ "$(stat -c '%U:%G' "$SECRET_STORE_KEY")" != "root:root" \
-  || "$(stat -c '%a' "$SECRET_STORE_KEY")" != "600" \
-  || "$(wc -c <"$SECRET_STORE_KEY")" != "32" ]]; then
-  fail "SYSTEMD_SMOKE_WRAPPING_KEY_INVALID"
+if [[ "$(stat -c '%U:%G' "$RUNTIME_ROOT")" != "$SERVICE_USER:$SERVICE_GROUP" \
+  || "$(stat -c '%a' "$RUNTIME_ROOT")" != "700" ]]; then
+  fail "SYSTEMD_SMOKE_RUNTIME_ROOT_INVALID"
 fi
 
 main_pid="$(systemctl show "$SERVICE_NAME" --property=MainPID --value)"
 if [[ ! "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
   fail "SYSTEMD_SMOKE_MAIN_PID_INVALID"
 fi
-credentials_directory="$(tr '\0' '\n' <"/proc/$main_pid/environ" | sed -n 's/^CREDENTIALS_DIRECTORY=//p')"
-if [[ ! "$credentials_directory" =~ ^/run/credentials/ \
-  || ! -f "$credentials_directory/cmclient-secret-store-key" \
-  || "$(wc -c <"$credentials_directory/cmclient-secret-store-key")" != "32" ]]; then
-  fail "SYSTEMD_SMOKE_CREDENTIAL_NOT_LOADED"
+if [[ "$(tr '\0' '\n' <"/proc/$main_pid/environ" | sed -n 's/^HOME=//p')" != "$SERVICE_HOME" ]]; then
+  fail "SYSTEMD_SMOKE_HOME_INVALID"
+fi
+if tr '\0' '\n' <"/proc/$main_pid/environ" | grep -Eq '^CMCLIENT_'; then
+  fail "SYSTEMD_SMOKE_APPLICATION_ENVIRONMENT_PRESENT"
 fi
 assert_control_status
 
 secret_value="cmclient-systemd-smoke-$run_label"
 printf '%s\n' "$secret_value" \
   | "$CLI_BINARY" --quiet --endpoint "unix://$CONTROL_SOCKET" secret set callmesh-api-key
-if [[ ! -f "$CIPHERTEXT" || "$(stat -c '%a' "$CIPHERTEXT")" != "600" ]]; then
-  fail "SYSTEMD_SMOKE_CIPHERTEXT_INVALID"
+if [[ ! -f "$SECRETS_FILE" \
+  || "$(stat -c '%U:%G' "$SECRETS_FILE")" != "$SERVICE_USER:$SERVICE_GROUP" \
+  || "$(stat -c '%a' "$SECRETS_FILE")" != "600" ]]; then
+  fail "SYSTEMD_SMOKE_SECRETS_DOCUMENT_INVALID"
 fi
-if LC_ALL=C grep -aFq "$secret_value" "$CIPHERTEXT"; then
-  fail "SYSTEMD_SMOKE_PLAINTEXT_PERSISTED"
+stored_secret="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["callmesh-api-key"])' "$SECRETS_FILE")"
+if [[ "$stored_secret" != "$secret_value" ]]; then
+  fail "SYSTEMD_SMOKE_PLAINTEXT_SECRET_VALUE_INVALID"
 fi
-unset secret_value
+unset stored_secret secret_value
 
-wrapping_key_digest="$(sha256sum "$SECRET_STORE_KEY" | awk '{ print $1 }')"
+secrets_digest="$(sha256sum "$SECRETS_FILE" | awk '{ print $1 }')"
 bash "$MANAGER" install "${manager_arguments[@]}"
-if [[ "$(sha256sum "$SECRET_STORE_KEY" | awk '{ print $1 }')" != "$wrapping_key_digest" ]]; then
-  fail "SYSTEMD_SMOKE_WRAPPING_KEY_REPLACED"
+if [[ "$(sha256sum "$SECRETS_FILE" | awk '{ print $1 }')" != "$secrets_digest" ]]; then
+  fail "SYSTEMD_SMOKE_SECRETS_REPLACED"
 fi
 
 systemctl restart "$SERVICE_NAME"
 wait_for_control_socket
 assert_control_status
 
-printf '[cmclient-systemd-smoke] systemd %s LoadCredential and Unix control socket verified\n' \
+printf '[cmclient-systemd-smoke] systemd %s canonical plaintext runtime and Unix control socket verified\n' \
   "$systemd_version"

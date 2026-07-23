@@ -12,9 +12,11 @@ services:
       CMCLIENT_PACKAGE_PROFILE: oci
       CMCLIENT_GATEWAY_HOST: 0.0.0.0
       CMCLIENT_GATEWAY_PORT: "8081"
-      CMCLIENT_DATA_DIR: /var/lib/cmclient
+      CMCLIENT_RUNTIME_ROOT: /home/cmclient/.cmclient
+      CMCLIENT_DB_PATH: /home/cmclient/.cmclient/cmclient.db
+      CMCLIENT_BACKUP_DIR: /home/cmclient/.cmclient/backups
     volumes:
-      - cmclient-data:/var/lib/cmclient
+      - cmclient-data:/home/cmclient/.cmclient
     expose:
       - "8081"
     networks:

@@ -4,9 +4,9 @@
 > [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
 > history rather than the current install or release contract.
 
-The Agent accepts a strict, `deny_unknown_fields` `agent.toml`. Runtime paths
-must be absolute. Keep executable/configuration paths separate from persistent
-data and never put secret values in this file.
+The Agent accepts a strict, `deny_unknown_fields` `~/.cmclient/config.toml`.
+Every mutable path is derived from that one home root; arbitrary path overrides
+are rejected. Never put secret values in this file.
 
 ## Minimal configuration
 
@@ -78,53 +78,28 @@ endpoint/destination overrides. Existing
 `login_callsign`, `symbol_table`, `symbol_code`, and `comment` fields from rc.1
 are accepted only so an upgrade can start; Agent ignores them, never injects
 them, and administrators must remove them. Other unknown fields, including an
-inline passcode, are rejected. CallMesh key and the Management admin token remain
-separate Agent-selected backend entries. The
+inline passcode, are rejected. The CallMesh key lives only in root-level
+`~/.cmclient/secrets.json`. The
 control/API `aprs-passcode` name is retained only to remove values left by an
 older installation. Setting it returns `CONTROL_SECRET_KIND_DEPRECATED`; Agent
 does not read or inject an old stored value when launching APRS.
 
 ```bash
 cmclient secret set callmesh-api-key
-cmclient secret set management-admin-token
 cmclient secret remove aprs-passcode # upgraded installations only
 ```
 
-Those commands use the interactive user's default Control socket. For the
-packaged systemd service, address its data-directory socket explicitly and run
-the client with sufficient permission, for example:
-
-```bash
-sudo cmclient --endpoint unix:///var/lib/cmclient/control.sock \
-  secret set callmesh-api-key
-```
-
 The command reads one bounded, non-control-character UTF-8 value from stdin.
-The Agent returns only whether a value was stored. Interactive macOS, Windows,
-and Linux sessions use Keychain, Credential Manager, or Secret Service. The
-packaged systemd service instead receives a root-owned wrapping key through
-`LoadCredential` and keeps XChaCha20-Poly1305 ciphertext under its private data
-directory; neither half is placed in the unit environment. A missing,
-malformed, or tampered service vault fails with
-`AGENT_SECRET_STORE_UNAVAILABLE`. Secret values are never echoed, logged,
-serialized into diagnostics, or passed as a CLI argument.
-
-For the controlled Unix/macOS no-Keychain field mode, set
-`CMCLIENT_PLAINTEXT_SECRET_FILE` to an absolute file path outside the Repository
-before starting Agent. The direct parent must already be an owner-only,
-non-symlink `0700` directory. Agent accepts only an owner regular file with one
-link and exact mode `0600`, writes it atomically as `0600`, and rejects unsafe
-permissions, links, unknown fields, invalid values, and an attempt to combine
-this mode with the Linux systemd vault. The environment contains only the path;
-put values into the selected backend with the same stdin-based `cmclient secret
-set` commands. A macOS LaunchAgent persists this path only when installed with
-`--plaintext-secret-file` or when the same selector is explicitly present in
-the manager environment; if neither source is present, field mode stays off.
+The Agent returns only whether a value was stored. `secrets.json` is the sole
+runtime backend on macOS, Windows, Linux, and Docker. Writes are atomic; POSIX
+uses `0700` for the root and `0600` for the file, while Windows uses an ordinary
+current-user file without UAC or cross-principal ACL qualification. Secret
+values are never echoed, logged, serialized into diagnostics, copied to
+backups, or passed through argv or environment.
 
 Storage and removal complete immediately, but runtime consumers have different
-refresh boundaries. Agent reads `management-admin-token` for every remote
-Control request, so that value changes immediately. At Gateway launch Agent
-copies only the CallMesh key and the validated transport/endpoint overrides;
+refresh boundaries. At Gateway launch Agent sends only the CallMesh key through
+the private bootstrap pipe and passes validated non-secret transport/endpoint overrides;
 CallMesh-provisioned APRS identity and credential handling stay inside the
 Gateway contract. `cmclient restart` restarts only that Gateway and reuses the
 snapshot. After changing the CallMesh key, restart the entire Agent or its
@@ -185,18 +160,12 @@ published directly. Docker's standalone composition retains its fixed internal
 Ingress as a separate deployment boundary. Do not publish a raw Gateway port
 and assume browser session/CSRF protection still applies.
 
-## Remote CLI HMAC
+## Remote command access
 
-The remote CLI uses the opt-in Agent HTTPS Control bridge, not the browser
-cookie. Agent verifies requests against its selected `management-admin-token`;
-the remote CLI cannot read that backend and must receive the same
-value in its own process's `CMCLIENT_CONTROL_TOKEN` environment variable. It
-signs method, path, body digest, timestamp, nonce, and `control:admin` scope.
-The value must be 32 through 4096 UTF-8 bytes without ASCII control characters.
-The endpoint must be an HTTPS origin root: credentials, a non-root path, query,
-fragment, and redirects are rejected. The Agent accepts a 30-second clock
-window and rejects nonce replay. Required headers are documented in
-[Local Agent Control API](../api/local-control.md).
+The former persisted HMAC Control token and `CMCLIENT_CONTROL_TOKEN`
+environment path are deprecated and unavailable. Command mode is local through
+the framed Control IPC. Remote management uses the authenticated Web session
+boundary owned by Agent; no Control credential is persisted separately.
 
 ## Fail-closed rules
 

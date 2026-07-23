@@ -21,6 +21,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use zeroize::Zeroizing;
 
 /// Stable workspace identity for the supervisor boundary.
 pub const COMPONENT: &str = "supervisor";
@@ -32,7 +33,8 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(40);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_COMMAND: &[u8] = b"CMCLIENT_SHUTDOWN\n";
-pub const GATEWAY_PRIVATE_FRAME_MAX_BYTES: usize = 4096;
+pub const GATEWAY_PRIVATE_FRAME_MAX_BYTES: usize = 16 * 1024;
+pub const GATEWAY_CALLMESH_API_KEY_MAX_BYTES: usize = 4096;
 pub const DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(5);
 const GATEWAY_OWNERSHIP_RESPONSE_MAX_BYTES: usize = 4096;
 const GATEWAY_OWNERSHIP_PATH: &str = "/_cmclient/bootstrap/ownership";
@@ -40,6 +42,7 @@ const GATEWAY_OWNERSHIP_CHALLENGE_HEADER: &str = "x-cmclient-gateway-ownership-c
 const GATEWAY_OWNERSHIP_PROOF_HEADER: &str = "x-cmclient-gateway-ownership-proof";
 const GATEWAY_OWNERSHIP_PROTOCOL: &str = "cmclient-bootstrap-ownership-v1";
 const GATEWAY_OWNERSHIP_DOMAIN: &str = "cmclient.gateway.bootstrap-ownership.v1";
+const CALLMESH_API_KEY_ENVIRONMENT_NAME: &str = "CMCLIENT_CALLMESH_API_KEY";
 const INHERITED_RUNTIME_ENVIRONMENT_NAMES: [&str; 4] = ["PATH", "SystemRoot", "WINDIR", "ComSpec"];
 
 #[cfg(windows)]
@@ -125,14 +128,16 @@ impl fmt::Debug for GatewayReady {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GatewayBootstrapFrame {
+struct GatewayBootstrapFrame<'a> {
     schema_version: u8,
     #[serde(rename = "type")]
     frame_type: &'static str,
     startup_nonce: String,
     capability: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    callmesh_api_key: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +255,7 @@ pub struct GatewaySupervisor {
     stable_window: Duration,
     started_at: Option<Instant>,
     private_bootstrap: bool,
+    callmesh_api_key: Option<Zeroizing<String>>,
     bootstrap_deadline: Duration,
     ready: Option<GatewayReady>,
 }
@@ -295,6 +301,7 @@ impl GatewaySupervisor {
             stable_window,
             started_at: None,
             private_bootstrap: false,
+            callmesh_api_key: None,
             bootstrap_deadline: DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE,
             ready: None,
         })
@@ -311,7 +318,9 @@ impl GatewaySupervisor {
         }
     }
 
-    pub fn set_environment(&mut self, environment: BTreeMap<String, String>) {
+    pub fn set_environment(&mut self, mut environment: BTreeMap<String, String>) {
+        environment.remove(CALLMESH_API_KEY_ENVIRONMENT_NAME);
+        self.environment.remove(CALLMESH_API_KEY_ENVIRONMENT_NAME);
         self.environment.extend(environment);
     }
 
@@ -320,6 +329,19 @@ impl GatewaySupervisor {
             return Err(SupervisorError::ProcessIoFailed);
         }
         self.private_bootstrap = true;
+        Ok(())
+    }
+
+    pub fn set_callmesh_api_key(&mut self, api_key: &str) -> Result<(), SupervisorError> {
+        if !self.private_bootstrap
+            || self.child.is_some()
+            || api_key.is_empty()
+            || api_key.len() > GATEWAY_CALLMESH_API_KEY_MAX_BYTES
+            || api_key.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(SupervisorError::BootstrapInvalid);
+        }
+        self.callmesh_api_key = Some(Zeroizing::new(api_key.to_owned()));
         Ok(())
     }
 
@@ -414,7 +436,11 @@ impl GatewaySupervisor {
             }
         };
         let ready = if private_bootstrap {
-            let (result, reader) = perform_private_bootstrap(&mut child, self.bootstrap_deadline);
+            let (result, reader) = perform_private_bootstrap(
+                &mut child,
+                self.bootstrap_deadline,
+                self.callmesh_api_key.as_deref().map(String::as_str),
+            );
             match result {
                 Ok(ready) => {
                     if join_bootstrap_reader(reader).is_err() {
@@ -533,11 +559,7 @@ impl GatewaySupervisor {
             self.remember_capture_log_error_code(code);
             SupervisorError::LoggingFailed(code)
         })?;
-        let mut secrets = sensitive_environment_values(&self.environment);
-        if let Some(ready) = ready {
-            secrets.push(ready.capability.clone());
-            secrets.push(ready.startup_nonce.clone());
-        }
+        let secrets = self.child_output_redaction_secrets(ready);
         let capture = if stdout_reserved {
             sink.capture(std::io::empty(), stderr, secrets)
         } else {
@@ -554,6 +576,18 @@ impl GatewaySupervisor {
             SupervisorError::LoggingFailed(code)
         })?);
         Ok(())
+    }
+
+    fn child_output_redaction_secrets(&self, ready: Option<&GatewayReady>) -> Vec<String> {
+        let mut secrets = sensitive_environment_values(&self.environment);
+        if let Some(ready) = ready {
+            secrets.push(ready.capability.clone());
+            secrets.push(ready.startup_nonce.clone());
+        }
+        if let Some(api_key) = self.callmesh_api_key.as_deref() {
+            secrets.push(api_key.to_owned());
+        }
+        secrets
     }
 
     fn finish_output_capture(&mut self) {
@@ -654,6 +688,7 @@ fn is_capture_log_error_code(code: &str) -> bool {
 fn perform_private_bootstrap(
     child: &mut Box<dyn ChildWrapper>,
     deadline: Duration,
+    callmesh_api_key: Option<&str>,
 ) -> (
     Result<GatewayReady, SupervisorError>,
     Option<thread::JoinHandle<()>>,
@@ -677,13 +712,14 @@ fn perform_private_bootstrap(
             frame_type: "gateway.bootstrap",
             startup_nonce: startup_nonce.clone(),
             capability: capability.clone(),
+            callmesh_api_key,
         };
-        let encoded = encode_private_frame(&bootstrap)?;
+        let encoded = Zeroizing::new(encode_private_frame(&bootstrap)?);
         child
             .stdin()
             .as_mut()
             .ok_or(SupervisorError::BootstrapIoFailed)?
-            .write_all(&encoded)
+            .write_all(encoded.as_slice())
             .and_then(|()| {
                 child
                     .stdin()
@@ -1061,10 +1097,10 @@ mod tests {
     #[cfg(windows)]
     use super::SpawnFailureCleanup;
     use super::{
-        BackoffPolicy, GATEWAY_OWNERSHIP_CHALLENGE_HEADER, GATEWAY_OWNERSHIP_PATH,
-        GATEWAY_OWNERSHIP_PROOF_HEADER, GATEWAY_PRIVATE_FRAME_MAX_BYTES, GatewayBootstrapFrame,
-        GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor, SupervisorError,
-        SupervisorEvent, encode_private_frame, inherited_runtime_environment_from,
+        BackoffPolicy, GATEWAY_CALLMESH_API_KEY_MAX_BYTES, GATEWAY_OWNERSHIP_CHALLENGE_HEADER,
+        GATEWAY_OWNERSHIP_PATH, GATEWAY_OWNERSHIP_PROOF_HEADER, GATEWAY_PRIVATE_FRAME_MAX_BYTES,
+        GatewayBootstrapFrame, GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor,
+        SupervisorError, SupervisorEvent, encode_private_frame, inherited_runtime_environment_from,
         probe_gateway_ownership, read_private_frame, validate_gateway_ready,
     };
     #[cfg(windows)]
@@ -1097,11 +1133,13 @@ mod tests {
     fn private_bootstrap_frames_are_bounded_and_ready_identity_is_exact() {
         let nonce = "a".repeat(32);
         let capability = "b".repeat(64);
+        let api_key = "fixture-private-callmesh-key";
         let encoded = encode_private_frame(&GatewayBootstrapFrame {
             schema_version: 1,
             frame_type: "gateway.bootstrap",
             startup_nonce: nonce.clone(),
             capability: capability.clone(),
+            callmesh_api_key: Some(api_key),
         })
         .expect("bootstrap should encode");
         assert_eq!(
@@ -1110,6 +1148,18 @@ mod tests {
         );
         let body = read_private_frame(&mut encoded.as_slice()).expect("frame should decode");
         assert_eq!(body, encoded[4..]);
+        let decoded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded["callmeshApiKey"], api_key);
+        let maximum_escaped_key = "\\".repeat(GATEWAY_CALLMESH_API_KEY_MAX_BYTES);
+        let maximum_frame = encode_private_frame(&GatewayBootstrapFrame {
+            schema_version: 1,
+            frame_type: "gateway.bootstrap",
+            startup_nonce: nonce.clone(),
+            capability: capability.clone(),
+            callmesh_api_key: Some(&maximum_escaped_key),
+        })
+        .expect("maximum escaped API key should fit the bounded frame");
+        assert!(maximum_frame.len() <= GATEWAY_PRIVATE_FRAME_MAX_BYTES + 4);
 
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -1151,6 +1201,45 @@ mod tests {
             read_private_frame(&mut oversized.as_slice()),
             Err(SupervisorError::BootstrapInvalid)
         ));
+    }
+
+    #[test]
+    fn callmesh_key_requires_private_bootstrap_and_never_enters_child_environment() {
+        let mut supervisor = GatewaySupervisor::new(fixture_command(), BackoffPolicy::default())
+            .expect("supervisor should initialize");
+        assert_eq!(
+            supervisor.set_callmesh_api_key("fixture-private-callmesh-key"),
+            Err(SupervisorError::BootstrapInvalid)
+        );
+        supervisor
+            .enable_private_bootstrap()
+            .expect("private bootstrap should enable");
+        for invalid in [
+            String::new(),
+            String::from("control\ncharacter"),
+            "x".repeat(GATEWAY_CALLMESH_API_KEY_MAX_BYTES + 1),
+        ] {
+            assert_eq!(
+                supervisor.set_callmesh_api_key(&invalid),
+                Err(SupervisorError::BootstrapInvalid)
+            );
+        }
+        supervisor.set_environment(BTreeMap::from([(
+            String::from("CMCLIENT_CALLMESH_API_KEY"),
+            String::from("environment-secret"),
+        )]));
+        supervisor
+            .set_callmesh_api_key("fixture-private-callmesh-key")
+            .expect("bounded key should be accepted");
+        assert!(
+            !supervisor
+                .environment
+                .contains_key("CMCLIENT_CALLMESH_API_KEY")
+        );
+        assert_eq!(
+            supervisor.child_output_redaction_secrets(None),
+            vec![String::from("fixture-private-callmesh-key")]
+        );
     }
 
     #[test]
@@ -1257,6 +1346,8 @@ mod tests {
     const FIXTURE_MODE: &str = "CMCLIENT_SUPERVISOR_TEST_MODE";
     const FIXTURE_DELAY_MS: &str = "CMCLIENT_SUPERVISOR_TEST_DELAY_MS";
     const FIXTURE_MARKER: &str = "CMCLIENT_SUPERVISOR_TEST_MARKER";
+    #[cfg(target_os = "windows")]
+    const FIXTURE_CALLMESH_API_KEY: &str = "fixture-private-callmesh-key";
 
     #[test]
     fn bounds_exponential_restart_delays() {
@@ -1672,6 +1763,9 @@ mod tests {
         supervisor
             .enable_private_bootstrap()
             .expect("private bootstrap should enable");
+        supervisor
+            .set_callmesh_api_key(FIXTURE_CALLMESH_API_KEY)
+            .expect("CallMesh key should use private bootstrap");
 
         let event = supervisor.start();
         assert!(
@@ -1976,7 +2070,7 @@ mod tests {
             None,
         );
         supervisor.set_environment(BTreeMap::from([(
-            String::from("CMCLIENT_CALLMESH_API_KEY"),
+            String::from("CMCLIENT_FIXTURE_SECRET"),
             String::from(secret),
         )]));
         fs::create_dir_all(log_dir).expect("fixture log directory should create");
@@ -2263,7 +2357,7 @@ while ($offset -lt $prefix.Length) {
     $offset += $count
 }
 $length = [Net.IPAddress]::NetworkToHostOrder([BitConverter]::ToInt32($prefix, 0))
-if ($length -lt 1 -or $length -gt 4096) { exit 66 }
+if ($length -lt 1 -or $length -gt 16384) { exit 66 }
 $body = [byte[]]::new($length)
 $offset = 0
 while ($offset -lt $body.Length) {
@@ -2274,14 +2368,19 @@ while ($offset -lt $body.Length) {
 $bootstrap = [Text.Encoding]::UTF8.GetString($body) | ConvertFrom-Json
 $nonce = [string]$bootstrap.startupNonce
 $capability = [string]$bootstrap.capability
+$callMeshApiKey = [string]$bootstrap.callMeshApiKey
 $mode = [string]$env:CMCLIENT_SUPERVISOR_TEST_MODE
 
 $leaked = [Environment]::GetCommandLineArgs() | Where-Object {
-    ([string]$_).Contains($nonce) -or ([string]$_).Contains($capability)
+    ([string]$_).Contains($nonce) -or
+    ([string]$_).Contains($capability) -or
+    ($callMeshApiKey.Length -gt 0 -and ([string]$_).Contains($callMeshApiKey))
 }
 if (-not $leaked) {
     $leaked = [Environment]::GetEnvironmentVariables().Values | Where-Object {
-        ([string]$_).Contains($nonce) -or ([string]$_).Contains($capability)
+        ([string]$_).Contains($nonce) -or
+        ([string]$_).Contains($capability) -or
+        ($callMeshApiKey.Length -gt 0 -and ([string]$_).Contains($callMeshApiKey))
     }
 }
 if ($leaked) {
@@ -2290,6 +2389,17 @@ if ($leaked) {
         'bootstrap secret reached argv or environment'
     )
     exit 70
+}
+if ($mode -eq 'bootstrap-success') {
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $callMeshApiKeyHash = -join (
+        $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($callMeshApiKey)) |
+            ForEach-Object { $_.ToString('x2') }
+    )
+    $sha256.Dispose()
+    if ($callMeshApiKeyHash -ne 'dbc01b6ad52367ef996a43d8a223a0854f9dcac3a34cdc46039452189bebee15') {
+        exit 78
+    }
 }
 
 function Write-Ready([uint32]$readyPid, [string]$readyNonce, [uint16]$port) {
@@ -2517,7 +2627,7 @@ switch ($mode) {
         exit 23
     }
     'bootstrap-oversize' {
-        [byte[]]$oversized = 0, 0, 16, 1
+        [byte[]]$oversized = 0, 0, 64, 1
         $outputStream.Write($oversized, 0, $oversized.Length)
         $outputStream.Flush()
         Wait-And-Mark
@@ -2617,7 +2727,7 @@ switch ($mode) {
 
     fn write_log_fixture_output() {
         let secret =
-            env::var("CMCLIENT_CALLMESH_API_KEY").expect("fixture secret should be configured");
+            env::var("CMCLIENT_FIXTURE_SECRET").expect("fixture secret should be configured");
         for index in 0..8 {
             println!(
                 "{{\"level\":\"info\",\"message\":\"GATEWAY_FIXTURE_RECORD\",\"traceId\":\"fixture-{index}\",\"fields\":{{\"apiKey\":\"{secret}\",\"detail\":\"prefix-{secret}-suffix\"}}}}"

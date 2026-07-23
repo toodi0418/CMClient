@@ -1,12 +1,9 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
-
 import { GatewayRuntime, parseGatewayListenOptions } from "./app.js";
 import { createVerifiedGatewayBackup } from "./backup.js";
 import { DomainEventBus } from "./events.js";
 import { JobEngine } from "./jobs.js";
 import { GatewayDatabase } from "./persistence/database.js";
-import { callMeshOptionsFromEnvironment, CallMeshClient } from "./callmesh.js";
+import { callMeshOptionsFromRuntime, CallMeshClient } from "./callmesh.js";
 import type { AprsGatewayRuntime } from "./aprs-runtime.js";
 import type { MeshGatewayRuntime } from "./mesh-runtime.js";
 import type { GatewayMaintenanceRuntime } from "./maintenance.js";
@@ -35,6 +32,7 @@ import {
   type GatewayBootstrapFrame,
 } from "./bootstrap.js";
 import { ConsoleStructuredLogger } from "./observability.js";
+import { gatewayRuntimePaths } from "./runtime-paths.js";
 
 void runGateway().catch((error: unknown) => {
   process.stderr.write(`${runtimeErrorCode(error, "GATEWAY_MAIN_FAILED")}\n`);
@@ -125,10 +123,8 @@ async function runGateway(): Promise<void> {
   }
 
   const startup = await lifecycle.start(async (context) => {
-    const dataDirectory = gatewayDataDirectory(process.env);
-    const activeDatabase = new GatewayDatabase(
-      join(dataDirectory, "gateway.sqlite"),
-    );
+    const paths = gatewayRuntimePaths(process.env);
+    const activeDatabase = new GatewayDatabase(paths.database);
     database = activeDatabase;
     context.throwIfShutdownRequested();
     const activeEvents = new DomainEventBus();
@@ -148,7 +144,7 @@ async function runGateway(): Promise<void> {
             context.throwIfCancellationRequested();
             const result = await createVerifiedGatewayBackup(
               activeDatabase.connection,
-              join(dataDirectory, "backups"),
+              paths.backups,
               context.job.id,
               context.signal,
             );
@@ -163,9 +159,10 @@ async function runGateway(): Promise<void> {
     context.throwIfShutdownRequested();
 
     const callmesh = new CallMeshClient(
-      callMeshOptionsFromEnvironment(
+      callMeshOptionsFromRuntime(
         process.env,
         compiledGatewayBuildVersion(),
+        bootstrap?.callMeshApiKey,
       ),
       activeDatabase.callmeshMappings,
     );
@@ -335,12 +332,6 @@ async function synchronizeCallMesh(
       payload: { code: runtimeErrorCode(error, "CALLMESH_SYNC_FAILED") },
     });
   }
-}
-
-function gatewayDataDirectory(
-  environment: Record<string, string | undefined>,
-): string {
-  return environment.CMCLIENT_DATA_DIR?.trim() || join(homedir(), ".cmclient");
 }
 
 async function createConfiguredProxyRuntime(

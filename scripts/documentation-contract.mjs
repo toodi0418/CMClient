@@ -99,7 +99,7 @@ const REQUIRED_DOCUMENT_SECTIONS = new Map([
       "Minimal configuration",
       "Generate the Management password hash",
       "Management LAN boundary",
-      "Remote CLI HMAC",
+      "Remote command access",
       "Fail-closed rules",
     ],
   ],
@@ -219,9 +219,9 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
       "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
       "762fc01e0e6520b03487c6cc7b4afbafeadc39f10a66fa17def966e9ea428602",
       "ce3d3f9376b9a2552fc22c7d962ee9b25ebeda9e748301284be730fbff21b8f1",
-      "c60abf3e8f42f5ba73e5155c528629dc5a7161c96b8805af3c3f14807a3aca55",
+      "4313a3ae2a59e7d84786797ed82ff2465b762dd9a582d6f4848e068bb01502e8",
       "99207257e14da5b216e65b9863c11dfcde7fdb58403be094cd93a9ec66fdbca3",
-      "276124d4ec635012d9657bb0d111684cfee2f4c4b7a7dfbac142ee1104045674",
+      "b9334626dfa4319244fc28ac141aa73c00a49477f0e2449daf5eb0e48817b028",
       "1a46ec827117d651b449faf536c353763f642de4550537361358a93b5a22b281",
       "d491d358344f842685c1b1585970999db65fe30ecf7ef3867af8814f4016c016",
       "https://callmesh.tmmarc.org",
@@ -239,7 +239,7 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
     "docs/admin/deployment.md",
     [
       "cmclient-systemd.sh",
-      "unix:///var/lib/cmclient/control.sock",
+      "unix:///home/cmclient/.cmclient/run/control.sock",
       "cmclient-windows-service.ps1",
       "fixed singleton",
       "SCM stop/shutdown",
@@ -252,10 +252,10 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
     [
       "[callmesh]",
       "[management_lan]",
-      "AGENT_SECRET_STORE_UNAVAILABLE",
-      "unix:///var/lib/cmclient/control.sock",
+      "~/.cmclient/config.toml",
+      "~/.cmclient/secrets.json",
       "restarts only that Gateway",
-      "32 through 4096 UTF-8 bytes",
+      "deprecated and unavailable",
     ],
   ],
   [
@@ -265,7 +265,7 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
       "cmclient-migrate",
       "CMCLIENT_LOG_MAX_BYTES",
       "RUNTIME_LOG_POLICY_INVALID",
-      "unix:///var/lib/cmclient/control.sock",
+      "~/.cmclient/run/control.sock",
       "does not carry the previous ID",
       "bounded journal tail",
       "latestErrorCode",
@@ -330,6 +330,93 @@ const OBSOLETE_UNIFIED_CLAIMS = [
   "Agent is PID 1 and directly supervises",
   "Do not set Compose `init: true`",
   "unix:///var/lib/cmclient/control.sock",
+];
+
+const CURRENT_RUNTIME_DOCUMENT_TOKENS = new Map([
+  [
+    "docs/api/local-control.md",
+    [
+      "~/.cmclient/run",
+      "~/.cmclient/secrets.json",
+      "bootstrap channel",
+      "never falls back to TCP",
+    ],
+  ],
+  [
+    "docs/api/cli.md",
+    [
+      "local IPC",
+      "~/.cmclient/run",
+      "never opens `~/.cmclient/secrets.json`",
+      "does not expose a remote CLI Control",
+    ],
+  ],
+  [
+    "docs/user/using-cmclient.md",
+    [
+      "~/.cmclient/secrets.json",
+      "same user's local Agent endpoint",
+      "private pinned Node runtime",
+    ],
+  ],
+  [
+    "docs/user/getting-started.md",
+    [
+      "%USERPROFILE%\\.cmclient",
+      "/home/cmclient/.cmclient",
+      "config.toml",
+      "cmclient.db",
+      "secrets.json",
+    ],
+  ],
+  [
+    "docs/admin/operations.md",
+    ["~/.cmclient/run/control.sock", "$HOME/.cmclient/cmclient.db"],
+  ],
+  [
+    "docs/admin/configuration-security.md",
+    [
+      "~/.cmclient/config.toml",
+      "~/.cmclient/secrets.json",
+      "deprecated and unavailable",
+    ],
+  ],
+  [
+    "docs/admin/deployment.md",
+    [
+      "%USERPROFILE%\\.cmclient",
+      "/home/cmclient/.cmclient",
+      "root-level `cmclient.db`",
+      "`secrets.json`",
+    ],
+  ],
+  [
+    "docs/architecture/systemd-service.md",
+    [
+      "/home/cmclient/.cmclient/config.toml",
+      "/home/cmclient/.cmclient/cmclient.db",
+      "/home/cmclient/.cmclient/secrets.json",
+      "/home/cmclient/.cmclient/run/control.sock",
+    ],
+  ],
+  [
+    "docs/architecture/packaging-lifecycle.md",
+    ["~/.cmclient", "/home/cmclient/.cmclient", "secrets.json"],
+  ],
+]);
+
+const OBSOLETE_CURRENT_RUNTIME_CLAIMS = [
+  "unix:///var/lib/cmclient/control.sock",
+  "/etc/cmclient",
+  "%PROGRAMDATA%\\CMClient",
+  "%APPDATA%\\CMClient",
+  "~/Library/Application Support/CMClient",
+  "CMCLIENT_PLAINTEXT_SECRET_FILE",
+  "LoadCredential",
+  "XChaCha20-Poly1305",
+  "agent.toml",
+  "cmclient.sqlite",
+  "gateway.sqlite",
 ];
 
 const MARKDOWN_SCAN_EXCLUDED_DIRECTORIES = new Set([
@@ -398,6 +485,7 @@ export async function checkDocumentation(repositoryRoot = resolve(".")) {
 
   checkReadmeIndex(contents.get("README.md") ?? "", errors);
   checkUnifiedProductContract(contents, errors);
+  checkCurrentRuntimeDocumentation(contents, errors);
   await checkLicenseAndProvenanceContract(
     repositoryRoot,
     contents.get("README.md") ?? "",
@@ -502,6 +590,35 @@ function checkUnifiedProductContract(contents, errors) {
           `authoritative unified contract contains obsolete claim: ${relativePath} -> ${claim}`,
         );
       }
+    }
+  }
+}
+
+function checkCurrentRuntimeDocumentation(contents, errors) {
+  for (const [relativePath, tokens] of CURRENT_RUNTIME_DOCUMENT_TOKENS) {
+    const documentation = contents.get(relativePath) ?? "";
+    for (const token of tokens) {
+      if (!documentation.includes(token)) {
+        errors.push(
+          `current runtime documentation is missing: ${relativePath} -> ${token}`,
+        );
+      }
+    }
+    for (const claim of OBSOLETE_CURRENT_RUNTIME_CLAIMS) {
+      if (documentation.includes(claim)) {
+        errors.push(
+          `current runtime documentation contains obsolete claim: ${relativePath} -> ${claim}`,
+        );
+      }
+    }
+    if (
+      /remote CLI[\s\S]{0,240}`CMCLIENT_CONTROL_TOKEN` environment variable/i.test(
+        documentation,
+      )
+    ) {
+      errors.push(
+        `current runtime documentation contains obsolete remote token flow: ${relativePath}`,
+      );
     }
   }
 }

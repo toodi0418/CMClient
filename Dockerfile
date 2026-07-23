@@ -28,10 +28,10 @@ ARG CMCLIENT_BUILD_CHANNEL=""
 ARG CMCLIENT_TARGET_ARCHITECTURE=""
 
 RUN groupadd --gid 10001 cmclient \
-    && useradd --uid 10001 --gid cmclient --home-dir /nonexistent \
+    && useradd --uid 10001 --gid cmclient --home-dir /home/cmclient \
       --no-create-home --shell /usr/sbin/nologin cmclient \
-    && mkdir --parents /var/lib/cmclient \
-    && touch /var/lib/cmclient/.volume-initialized
+    && mkdir --parents /home/cmclient/.cmclient \
+    && touch /home/cmclient/.cmclient/.volume-initialized
 
 WORKDIR /app
 COPY --from=build --chown=cmclient:cmclient /opt/cmclient/gateway /app/gateway
@@ -39,10 +39,13 @@ COPY --from=build --chown=cmclient:cmclient /workspace/apps/web/dist /app/web
 COPY --from=build --chown=cmclient:cmclient /workspace/proto /app/proto
 COPY --from=build --chown=cmclient:cmclient /workspace/scripts/container-entrypoint.mjs /app/container-entrypoint.mjs
 COPY --from=build --chown=cmclient:cmclient /workspace/scripts/container-runtime.mjs /app/container-runtime.mjs
-RUN chown --recursive cmclient:cmclient /var/lib/cmclient
+RUN chown --recursive cmclient:cmclient /home/cmclient
 
 ENV NODE_ENV=production \
-    CMCLIENT_DATA_DIR=/var/lib/cmclient \
+    HOME=/home/cmclient \
+    CMCLIENT_RUNTIME_ROOT=/home/cmclient/.cmclient \
+    CMCLIENT_DB_PATH=/home/cmclient/.cmclient/cmclient.db \
+    CMCLIENT_BACKUP_DIR=/home/cmclient/.cmclient/backups \
     CMCLIENT_BUILD_VERSION=${CMCLIENT_BUILD_VERSION} \
     CMCLIENT_BUILD_COMMIT=${CMCLIENT_BUILD_COMMIT} \
     CMCLIENT_BUILD_TREE=${CMCLIENT_BUILD_TREE} \

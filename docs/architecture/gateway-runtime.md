@@ -1,9 +1,11 @@
 # Gateway Production Runtime
 
 The supervised TypeScript Gateway is the production owner of Meshtastic and
-APRS domain work. Agent passes only a bounded bootstrap frame through a private
-inherited channel, plus the absolute Agent-owned data paths and validated
-operational configuration required by the runtime. Gateway validates bootstrap,
+APRS domain work. Agent passes a bounded bootstrap frame through a private
+inherited channel, plus exact absolute paths derived from the one Agent-owned
+runtime root and validated non-secret operational configuration. The frame may
+contain the CallMesh key; that value is never placed in argv or environment.
+Gateway validates bootstrap,
 atomically binds `127.0.0.1:0`, and reports its port, PID, and startup nonce back
 through that channel. The address and capability are per-generation,
 memory-only native session state; no native configuration owns or publishes a
@@ -13,7 +15,7 @@ which is not a fallback for native Agent supervision.
 
 ## Startup and shutdown
 
-Gateway opens the migrated SQLite database, recovers persistent Jobs, and
+Gateway opens root-level `~/.cmclient/cmclient.db`, recovers persistent Jobs, and
 constructs CallMesh, Proxy, maintenance, APRS, and Meshtastic runtimes. Under
 Agent supervision it first binds the capability-protected Fastify control plane
 to `127.0.0.1:0`, writes the ready frame, and then starts external runtimes. This

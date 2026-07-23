@@ -1,17 +1,14 @@
 # Agent Runtime Configuration
 
-The Rust Agent owns process lifecycle and uses OS-standard directories. On
-macOS its data and configuration location is
-`~/Library/Application Support/CMClient`; Linux uses XDG data/config/cache
-locations; Windows uses roaming/local application-data locations.
+The Rust Agent owns process lifecycle and derives every mutable path from one
+immutable startup-environment snapshot. Windows uses
+`%USERPROFILE%\.cmclient`; macOS and Linux use `$HOME/.cmclient`; Docker uses
+`/home/cmclient/.cmclient`. Split AppData, Application Support, XDG,
+`/var/lib`, `/etc`, installation-directory, and arbitrary path overrides are
+rejected. Tests isolate state by supplying a synthetic home snapshot without
+mutating the parent process environment.
 
-`CMCLIENT_DATA_DIR`, `CMCLIENT_CONFIG_DIR`, `CMCLIENT_CACHE_DIR`,
-`CMCLIENT_LOG_DIR`, and `CMCLIENT_AGENT_CONFIG` may override those locations
-only with absolute paths. Relative overrides fail with a stable configuration
-error code. The Agent creates its runtime directories after configuration
-validation.
-
-The optional `agent.toml` accepts Agent-owned operational settings:
+The optional root-level `config.toml` accepts Agent-owned operational settings:
 
 ```toml
 [agent]
@@ -35,55 +32,32 @@ current packaged Gateway command invokes `node`, so Node.js `^22.18.0` or
 `>=24.11.0` must be present; release portability is verified separately from
 this config contract.
 
-CallMesh keys, CallMesh-derived APRS credentials, and administrative tokens do
-not belong in this file or in Agent command arguments. Interactive Agent sessions use the operating
-system credential store: Keychain on macOS, Credential Manager on Windows, and
-Secret Service on Linux. The packaged Linux systemd service cannot depend on a
-user-session D-Bus service, so it instead receives a root-owned wrapping key
-through systemd `LoadCredential` and keeps authenticated ciphertext under its
-private data directory. The service fails closed when either half is missing or
-invalid; see [systemd Agent Service](./systemd-service.md).
-
-Controlled Unix/macOS field runtimes can explicitly select an external
-plaintext file by setting `CMCLIENT_PLAINTEXT_SECRET_FILE` to an absolute path.
-This selector is a path, never a secret value. Its existing parent must be a
-non-symlink directory owned by the Agent user with exact mode `0700`; an
-existing file must be a single-link regular file owned by that user with exact
-mode `0600`. Agent creates or atomically replaces the file as `0600`, accepts
-only its versioned three-key document, and rejects malformed, oversized,
-unknown-field, symlink, hardlink, owner, or mode violations. When selected, the
-process uses this backend instead of constructing or accessing the platform
-credential backend. Linux systemd credential mode and plaintext mode are
-mutually exclusive and fail closed if both are requested. Files must remain
-outside the Repository and are populated only through the Control API/CLI.
+CallMesh keys and other approved runtime credentials do not belong in this
+file, command arguments, or environment variables. The only runtime backend is
+root-level `secrets.json`. Agent validates its bounded versioned JSON schema and
+atomically replaces the complete document. POSIX creates the root as `0700`
+and the file as `0600`; Windows uses ordinary current-user files without UAC or
+a cross-principal ACL gate. Keychain, Credential Manager, DPAPI, Secret Service,
+the former systemd vault, and persisted Control tokens are not used.
 
 ```bash
-install -d -m 0700 /absolute/path/outside/repository/cmclient-secrets
-export CMCLIENT_PLAINTEXT_SECRET_FILE=/absolute/path/outside/repository/cmclient-secrets/runtime.json
-cmclient-agent --serve
+printf '%s\n' '<CallMesh API key>' | cmclient secret set callmesh-api-key
 ```
 
 `cmclient secret set <kind>` reads a single value from standard input and
 forwards it over the private Control API; its response never contains the value.
-Settable kinds are `callmesh-api-key` and `management-admin-token`. The legacy
-`aprs-passcode` name is removal-only so upgraded installations can run
-`cmclient secret remove aprs-passcode`; attempts to set it fail with
-`CONTROL_SECRET_KIND_DEPRECATED`. Update signing private keys are deliberately
-not a runtime secret kind: release signing remains outside the product runtime.
-
-`management-admin-token` is the shared secret for remote CLI HMAC control, not
-the browser login password or session. Provision at least 32 random printable
-characters through local CLI standard input before using the HTTPS Control
-bridge; the remote CLI reads the same value from `CMCLIENT_CONTROL_TOKEN` in its
-own process environment. Neither side accepts it as a command argument.
+The settable kind is `callmesh-api-key`. Legacy `aprs-passcode` and
+`management-admin-token` names are deprecation-only and cannot create a new
+persisted value. Update signing private keys remain outside the product
+runtime.
 
 CallMesh's non-secret endpoint is optional Agent configuration. Its URL must be
 an exact HTTPS origin with no path, query, fragment, or embedded credential. At
 Gateway launch Agent drops inherited application configuration, retaining only
-launcher variables such as `PATH`/Windows runtime paths, and passes this URL
-plus a CallMesh API key only when that key is present in the Agent-selected
-secret backend. Gateway therefore cannot inherit a legacy API key from the
-parent shell.
+launcher variables such as `PATH` and required Windows runtime paths. It passes
+the non-secret URL in the bounded child environment and sends an optional
+CallMesh API key only inside the private bootstrap frame. Gateway therefore
+cannot inherit a legacy API key from the parent shell.
 
 ```toml
 [callmesh]
@@ -124,10 +98,11 @@ mode = "monitor"
 allow_lan = false
 ```
 
-Agent clears inherited application configuration before it passes this
-validated configuration, the data path, and only the required Agent-owned
-secrets to Gateway. The small launcher allowlist retains `PATH` and required Windows
-runtime paths so the configured process can start. Gateway then owns transport,
+Agent clears inherited application configuration before it passes validated
+non-secret configuration and exact absolute runtime paths to Gateway. The
+small launcher allowlist retains `PATH` and required Windows runtime paths so
+the configured process can start. The required CallMesh key uses the private
+bootstrap pipe, never argv or environment. Gateway then owns transport,
 protobuf/domain persistence, Position and APRS processing, CallMesh, Proxy,
 retention, Jobs, and domain SSE. See
 [Gateway Production Runtime](./gateway-runtime.md).
@@ -165,8 +140,9 @@ bounded audit projection records only timestamp, action, and stable outcome
 code, never addresses, credentials, cookies, or tokens.
 
 The Agent delivers a bounded memory-only bootstrap frame through the supervised
-Gateway's inherited private pipe; the frame carries the startup nonce and
-capability, never a listener address or a secret-bearing environment value.
+Gateway's inherited private pipe; the frame carries the startup nonce,
+capability, and optional CallMesh key. The key is never placed in a
+secret-bearing environment value or returned in the ready frame.
 Gateway validates that frame, atomically binds `127.0.0.1:0`, and returns the
 OS-assigned port, child PID, and nonce through the same private channel.
 
@@ -207,7 +183,7 @@ deadline, stable-reset, stop, and drop behavior.
 
 ## Service Logging
 
-Service deployments use application-owned JSONL under `CMCLIENT_LOG_DIR`:
+Runtime deployments use application-owned JSONL under `~/.cmclient/logs`:
 `agent.jsonl.YYYY-MM-DD` for Agent output and
 `gateway.jsonl.YYYY-MM-DD` for the supervised Gateway. The Windows SCM wrapper
 additionally uses `service-host.jsonl.YYYY-MM-DD` for failures that occur
@@ -232,7 +208,7 @@ before the files exist, but its manager exposes only stable codes; launchd
 routes unmanaged fallback stdout and stderr to `/dev/null`.
 
 Verified update archives are transient Agent cache data under
-`<cache_dir>/updates/staging`. They are selected from a signed manifest, streamed
+`~/.cmclient/cache/updates/staging`. They are selected from a signed manifest, streamed
 with an exact byte limit, SHA-256 verified, and atomically published by digest.
 This cache must not be treated as user data and updates must not overwrite the
 Agent data or configuration directories.

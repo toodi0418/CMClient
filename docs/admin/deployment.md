@@ -1,76 +1,63 @@
 # Deployment
 
-> Historical P12 snapshot. Where this file conflicts with
-> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
-> history rather than the current install or release contract.
-
-CMClient has one runtime composition and several launch surfaces. A native
-Desktop installer is a packaging format, not a second Agent implementation.
-All complete Desktop, Headless, and Service bundles contain Agent, CLI,
-migration tooling, production Gateway/Web output, the locked protobuf corpus,
-and the platform service support files.
+CMClient has one runtime composition and several launch modes. Each native
+package contains graphical mode, command mode, Agent, Gateway, full Web,
+migration/update helpers, the locked protobuf corpus, and a pinned private Node
+runtime. Docker omits graphical mode only. System Node, npm, and pnpm are not
+runtime prerequisites.
 
 ## Portable archives
 
-Use a verified `headless` archive for a server and a `desktop` archive for a
-supervisor host. Extract to an immutable versioned directory such as
-`/opt/cmclient/releases/2.0.0-rc.1` or a per-user application directory, then
-point the service manager at that release. Keep data, config, cache, and logs
-outside the release directory. The Agent updater owns this layout for future
-signed manifests; do not replace `active-release` or its journal manually.
-
-The standalone `cli` archive contains only `bin/cmclient` and does not start a
-Gateway. The Windows `service` archive adds the Service Host and SCM manager.
+Portable component archives are internal build and qualification inputs, not
+public install choices. When used by a developer, extract one immutable runtime
+outside `~/.cmclient`; do not move binaries, caches, or generated build output
+into the state root. There is no standalone Desktop, Headless, CLI, or Service
+download.
 
 ## Native Desktop packages
 
 | Target | Packages |
 | --- | --- |
-| macOS Apple Silicon / Intel | DMG |
-| Linux ARM64 / x64 | DEB and AppImage |
-| Windows x64 | MSI and NSIS (`setup.exe`) |
+| macOS Apple Silicon / Intel | One Universal `CMClient.dmg` |
+| Linux ARM64 / x64 | One AppImage per CPU |
+| Windows x64 | One current-user `CMClient-Setup.exe` |
 
-Each package embeds the portable composition at `cmclient-runtime/`. The
-collector and native smoke gate verify that tree and bounded-launch the Tauri
-executable. Windows MSI uses a numeric-only internal prerelease (`2.0.0-1` for
-this RC) because WiX cannot encode `rc.1`; the external filename, manifest,
-checksum, and release identity remain `2.0.0-rc.1`.
-
-An AppImage is not a stable system-service installation path. A native package
-does not create a privileged service or silently claim ownership of the Agent.
-Register the embedded Agent explicitly with the platform manager below.
+The package owns only installed program files and reversible user integration.
+Mutable state remains in the effective user's `~/.cmclient`; Windows resolves
+that to `%USERPROFILE%\.cmclient`. Native install registers current-user login
+startup by default, and the Web setting can disable it. Windows uses no routine
+UAC or SCM service, macOS uses `SMAppService`, and Linux graphical sessions use
+one XDG autostart entry. Uninstall retains the entire state root.
 
 ## Linux systemd
 
-The package includes `scripts/cmclient-systemd.sh` and a unit template. Run it
-as an administrator with an absolute Agent path:
+Linux headless installations may use the system-level systemd fallback instead
+of XDG autostart. It runs as the dedicated `cmclient` account, whose effective
+HOME defaults to `/home/cmclient`; `--home` is a packaging-only override. The
+unit injects only HOME before Agent takes its immutable startup snapshot:
 
 ```bash
 sudo scripts/cmclient-systemd.sh install \
   --agent /opt/cmclient/current/bin/cmclient-agent \
-  --config-dir /etc/cmclient \
-  --data-dir /var/lib/cmclient \
-  --cache-dir /var/cache/cmclient \
-  --log-dir /var/log/cmclient
+  --home /home/cmclient
 sudo scripts/cmclient-systemd.sh status
 sudo scripts/cmclient-systemd.sh logs --lines 200
 ```
 
-The manager's `status` command reports systemd unit state, not the Agent health
-contract. Query the running service through its explicit private socket:
+The manager's `status` command reports unit state, not Agent health. Root may
+query the service account's private socket explicitly:
 
 ```bash
-sudo cmclient --endpoint unix:///var/lib/cmclient/control.sock status --json
+sudo cmclient \
+  --endpoint unix:///home/cmclient/.cmclient/run/control.sock status --json
 ```
 
-Replace `/var/lib/cmclient` when installing with a different `--data-dir`.
-
-The unit uses a non-login `cmclient` account, `UMask=0077`, no new privileges,
-restricted filesystem access, and a bounded restart policy. The installer
-creates a root-only wrapping key, supplies it with systemd `LoadCredential`,
-and keeps only authenticated ciphertext under the service data directory.
-`uninstall` removes the unit and stops it but retains configuration, the
-wrapping key, data, cache, and logs.
+The unit uses `UMask=0077`, no new privileges, restricted filesystem access,
+and bounded restart. It does not accept split directory overrides or create a
+second service state root. Agent atomically stores runtime secrets only in
+`/home/cmclient/.cmclient/secrets.json`; the unit has no credential mount,
+wrapping key, secret environment file, or encrypted vault. `uninstall` removes
+registration and retains the configured service HOME's `.cmclient` directory.
 
 ## macOS launchd
 
@@ -84,33 +71,21 @@ scripts/cmclient-launchd.sh status
 scripts/cmclient-launchd.sh logs --lines 200
 ```
 
-`uninstall` removes only the plist and retains the user data and logs. launchd
+`uninstall` removes only the plist and retains `~/.cmclient`. launchd
 routes unmanaged stdout/stderr to `/dev/null`; Agent and Supervisor own the
 bounded `agent.jsonl.YYYY-MM-DD` and `gateway.jsonl.YYYY-MM-DD` families. A launchd process is not a
 system daemon and must not be described as one.
 
 ## Windows Service
 
-The Windows service archive contains `cmclient-service-host.exe`, the adjacent
-Agent, and `scripts/cmclient-windows-service.ps1`. Register from an elevated
-PowerShell session using an absolute bundle path; the Service Host locates the
-adjacent Agent. It bridges only SCM stop/shutdown into one bounded Agent
-shutdown request over the private pipe; CLI and Desktop connect directly to
-Agent rather than proxying through Service Host. The service account must see
-the documented external Node.js installation on `PATH`; `node.exe` is not
-copied into the bundle.
-
-The install/upgrade/uninstall operation retains the configured data directory.
-The final release gate starts the SCM service, checks Agent/CLI/Gateway health
-and exact version/commit/channel, then removes the registration without
-deleting retained state. Run the PowerShell 5.1-compatible manager from an
-elevated session with explicit parameters:
-
-The Service Host deliberately overrides interactive-user paths. It runs Agent
-with `config`, `data`, `cache`, and `logs` below
-`%PROGRAMDATA%\CMClient`; place the service's `agent.toml` at
-`%PROGRAMDATA%\CMClient\config\agent.toml`. `%APPDATA%\CMClient` is for an
-interactive per-user Agent and is not read by the Windows Service.
+The public Windows Setup uses current-user login startup, not SCM. The retained
+`cmclient-service-host.exe` and `scripts/cmclient-windows-service.ps1` are a
+transitional qualification surface only. They bridge SCM stop/shutdown into a
+bounded Agent shutdown request; CLI and Desktop still connect directly to
+Agent. They are not a second product, do not supply an external Node runtime,
+and cannot create a ProgramData data root. If exercised in a controlled test,
+the service identity must have a valid effective home and all mutable paths
+derive from that identity's `.cmclient` directory.
 
 ```powershell
 $manager = 'C:\Program Files\CMClient\scripts\cmclient-windows-service.ps1'
@@ -124,35 +99,32 @@ $hostPath = 'C:\Program Files\CMClient\bin\cmclient-service-host.exe'
 `-Command` also accepts `start`, `stop`, `restart`, `logs`, and `render`;
 installation accepts `-NoStart`. The SCM identity is the fixed singleton
 `CMClientAgent`; custom service names and a `-ServiceName` parameter are not
-supported. Windows operations retain bounded `service-host.jsonl.YYYY-MM-DD`,
-`agent.jsonl.YYYY-MM-DD`, and `gateway.jsonl.YYYY-MM-DD` families below
-`%PROGRAMDATA%\CMClient\logs`.
+supported. Qualification retains bounded `service-host.jsonl.YYYY-MM-DD`,
+`agent.jsonl.YYYY-MM-DD`, and `gateway.jsonl.YYYY-MM-DD` families below the
+effective home's `.cmclient\logs`. This does not qualify SCM as a public install
+path.
 
 ## Docker OCI
 
-Import the exact platform archive and run the checksum-covered, versioned
-`cmclient-docker-compose-2.0.0-rc.1.yml` descriptor with `--no-build`. The x64
-and ARM64 images are separate single-platform OCI archives. Convert the OCI
-layout for Docker Engine before loading it:
+Use the exact immutable digest from the release's multi-platform OCI index and
+the checksum-covered `cmclient-docker-compose-2.0.0-rc.1.yml` descriptor. The
+index contains `linux/amd64` and `linux/arm64`; Docker selects the matching child
+manifest. Do not rebuild or combine per-architecture payloads locally:
 
 ```bash
-skopeo copy --format v2s2 \
-  "oci-archive:cmclient-docker-linux-x86_64-2.0.0-rc.1.oci.tar" \
-  "docker-archive:cmclient.docker.tar:cmclient:2.0.0-rc.1"
-docker load --input cmclient.docker.tar
-CMCLIENT_IMAGE=cmclient:2.0.0-rc.1 \
+CMCLIENT_IMAGE=registry.example/cmclient@sha256:<verified-index-digest> \
   docker compose --file cmclient-docker-compose-2.0.0-rc.1.yml \
-  up --detach --no-build --force-recreate
+  up --detach --no-build --force-recreate --wait
 ```
 
-Only the Ingress port is host-facing; Gateway and Web are internal, read-only,
-non-privileged services. Docker reports `docker` capability and fails closed
-for `update`, `serial`, `service`, and `autoStart`.
+The one `cmclient` service runs Agent plus its supervised Gateway with
+`init: true`; only Web is host-facing. The image is non-privileged and uses the
+fixed `/home/cmclient/.cmclient` volume. Docker reports its capability limits
+and fails closed for graphical, serial, host service, and self-update actions.
 
-Docker archives are source-bound and timestamp-normalized, but not byte-for-byte
-reproducible because Debian package indexes are resolved during the build. The
-release metadata, outer SHA-256, OCI descriptor digests, config labels, SBOM,
-and no-rebuild runtime smoke close that integrity boundary.
+Release metadata binds the index digest, child-manifest/config/layer digests,
+source identity, labels, SBOM, and no-rebuild runtime smoke. Current-host
+evidence never substitutes for the other architecture.
 
 ## Upgrade and removal
 
@@ -162,7 +134,8 @@ release tree, migrates, starts the new release, and requires a health gate. A
 failure records a stable code and rolls back the active pointer and backup.
 Never overwrite a live release in place.
 
-Service-manager uninstall removes registration files only. It must retain
-`agent.toml`, the SQLite database, update journal, backups, cache (unless an
-operator explicitly purges it), and logs. Docker `down` removes containers but
-does not imply deletion of an externally mounted data volume.
+Native uninstall removes program files and reversible integration only. It must
+retain `~/.cmclient/config.toml`, root-level `cmclient.db`, `secrets.json`, the
+update journal, backups, cache, and logs. Secrets are excluded from backup and
+rollback media. Docker `down` removes containers but does not imply deletion of
+the `/home/cmclient/.cmclient` volume.

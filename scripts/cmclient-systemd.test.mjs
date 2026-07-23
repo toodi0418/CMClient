@@ -29,171 +29,19 @@ async function runManager(argumentsList, environment = {}) {
   });
 }
 
+function escaped(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 systemdTest(
-  "systemd manager upgrades its unit and retains runtime state on uninstall",
+  "systemd manager uses one service-home root and retains it on uninstall",
   async () => {
     const directory = await mkdtemp(join(tmpdir(), "cmclient-systemd-"));
     const agentV1 = join(directory, "releases/v1/bin/cmclient-agent");
     const agentV2 = join(directory, "releases/v2/bin/cmclient-agent");
     const unitDir = join(directory, "units");
-    const configDir = join(directory, "config");
-    const dataDir = join(directory, "data");
-    const cacheDir = join(directory, "cache");
-    const logDir = join(directory, "logs");
-    const systemctl = join(directory, "systemctl");
-    const calls = join(directory, "systemctl-calls");
-    const { stdout: groupOutput } = await execute("id", ["-gn"]);
-    const user = process.env.USER ?? process.env.LOGNAME ?? "runner";
-    const group = groupOutput.trim();
-
-    await mkdir(join(directory, "releases/v1/bin"), { recursive: true });
-    await mkdir(join(directory, "releases/v2/bin"), { recursive: true });
-    await writeFile(agentV1, "#!/usr/bin/env sh\nexit 0\n");
-    await writeFile(agentV2, "#!/usr/bin/env sh\nexit 0\n");
-    await chmod(agentV1, 0o755);
-    await chmod(agentV2, 0o755);
-    await writeFile(
-      systemctl,
-      `#!/usr/bin/env sh\nprintf '%s\\n' "$*" >> '${calls}'\n`,
-    );
-    await chmod(systemctl, 0o755);
-
-    const shared = [
-      "--agent",
-      agentV1,
-      "--unit-dir",
-      unitDir,
-      "--config-dir",
-      configDir,
-      "--data-dir",
-      dataDir,
-      "--cache-dir",
-      cacheDir,
-      "--log-dir",
-      logDir,
-      "--service-user",
-      user,
-      "--service-group",
-      group,
-      "--systemctl",
-      systemctl,
-      "--skip-user-setup",
-    ];
-
-    await runManager(["install", ...shared]);
-    const unit = await readFile(
-      join(unitDir, "cmclient-agent.service"),
-      "utf8",
-    );
-    assert.match(unit, new RegExp(`ExecStart=${agentV1} --serve`));
-    assert.match(unit, new RegExp(`ExecStartPre=${agentV1} --check-config`));
-    assert.match(unit, new RegExp(`CMCLIENT_DATA_DIR=${dataDir}`));
-    assert.match(unit, /CMCLIENT_SYSTEMD_SECRET_STORE=1/);
-    assert.match(
-      unit,
-      new RegExp(
-        `LoadCredential=cmclient-secret-store-key:${configDir}/secret-store.key`,
-      ),
-    );
-    assert.match(unit, /NoNewPrivileges=true/);
-    assert.match(unit, /CapabilityBoundingSet=\nAmbientCapabilities=/);
-    assert.match(unit, /ProtectSystem=strict/);
-    assert.doesNotMatch(unit, /CALLMESH|API_KEY|PASSCODE|TOKEN/);
-    const wrappingKey = await readFile(join(configDir, "secret-store.key"));
-    assert.equal(wrappingKey.length, 32);
-    assert.equal(
-      (await stat(join(configDir, "secret-store.key"))).mode & 0o777,
-      0o600,
-    );
-    assert.match(
-      await readFile(calls, "utf8"),
-      /daemon-reload\nenable --now cmclient-agent.service\n/,
-    );
-
-    await writeFile(join(dataDir, "retained-state"), "must survive uninstall");
-    const upgraded = shared.map((value) =>
-      value === agentV1 ? agentV2 : value,
-    );
-    await runManager(["install", ...upgraded]);
-    const upgradedUnit = await readFile(
-      join(unitDir, "cmclient-agent.service"),
-      "utf8",
-    );
-    assert.match(upgradedUnit, new RegExp(`ExecStart=${agentV2} --serve`));
-    assert.equal(
-      await readFile(join(dataDir, "retained-state"), "utf8"),
-      "must survive uninstall",
-    );
-    assert.deepEqual(
-      await readFile(join(configDir, "secret-store.key")),
-      wrappingKey,
-    );
-
-    await runManager(["uninstall", ...upgraded]);
-    await assert.rejects(
-      readFile(join(unitDir, "cmclient-agent.service"), "utf8"),
-    );
-    assert.equal(
-      await readFile(join(dataDir, "retained-state"), "utf8"),
-      "must survive uninstall",
-    );
-    assert.deepEqual(
-      await readFile(join(configDir, "secret-store.key")),
-      wrappingKey,
-    );
-    assert.match(
-      await readFile(calls, "utf8"),
-      /disable --now cmclient-agent.service/,
-    );
-
-    await rm(join(configDir, "secret-store.key"));
-    await mkdir(join(dataDir, "secrets"), { recursive: true });
-    await writeFile(
-      join(dataDir, "secrets", "aprs-passcode.secret"),
-      "retained ciphertext",
-    );
-    await assert.rejects(
-      runManager(["install", ...upgraded]),
-      /SYSTEMD_SECRET_STORE_KEY_MISSING/,
-    );
-    await rm(directory, { recursive: true, force: true });
-  },
-);
-
-systemdTest(
-  "systemd manager rejects non-executable or unsafe Agent paths",
-  async () => {
-    const directory = await mkdtemp(
-      join(tmpdir(), "cmclient-systemd-invalid-"),
-    );
-    const unsafeAgent = join(directory, "agent with spaces");
-    await writeFile(unsafeAgent, "fixture");
-
-    await assert.rejects(
-      runManager([
-        "install",
-        "--agent",
-        unsafeAgent,
-        "--unit-dir",
-        join(directory, "units"),
-        "--skip-user-setup",
-      ]),
-      /SYSTEMD_PATH_INVALID/,
-    );
-    await rm(directory, { recursive: true, force: true });
-  },
-);
-
-systemdTest(
-  "systemd manager fails closed when the secret store cannot be scanned",
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), "cmclient-systemd-scan-"));
-    const agent = join(directory, "bin/cmclient-agent");
-    const unitDir = join(directory, "units");
-    const configDir = join(directory, "config");
-    const dataDir = join(directory, "data");
-    const cacheDir = join(directory, "cache");
-    const logDir = join(directory, "logs");
+    const serviceHome = join(directory, "home");
+    const runtimeRoot = join(serviceHome, ".cmclient");
     const systemctl = join(directory, "systemctl");
     const calls = join(directory, "systemctl-calls");
     const { stdout: groupOutput } = await execute("id", ["-gn"]);
@@ -201,9 +49,12 @@ systemdTest(
     const group = groupOutput.trim();
 
     try {
-      await mkdir(join(directory, "bin"), { recursive: true });
-      await writeFile(agent, "#!/usr/bin/env sh\nexit 0\n");
-      await chmod(agent, 0o755);
+      await mkdir(join(directory, "releases/v1/bin"), { recursive: true });
+      await mkdir(join(directory, "releases/v2/bin"), { recursive: true });
+      await writeFile(agentV1, "#!/usr/bin/env sh\nexit 0\n");
+      await writeFile(agentV2, "#!/usr/bin/env sh\nexit 0\n");
+      await chmod(agentV1, 0o755);
+      await chmod(agentV2, 0o755);
       await writeFile(
         systemctl,
         `#!/usr/bin/env sh\nprintf '%s\\n' "$*" >> '${calls}'\n`,
@@ -212,17 +63,11 @@ systemdTest(
 
       const shared = [
         "--agent",
-        agent,
+        agentV1,
         "--unit-dir",
         unitDir,
-        "--config-dir",
-        configDir,
-        "--data-dir",
-        dataDir,
-        "--cache-dir",
-        cacheDir,
-        "--log-dir",
-        logDir,
+        "--home",
+        serviceHome,
         "--service-user",
         user,
         "--service-group",
@@ -233,23 +78,81 @@ systemdTest(
       ];
 
       await runManager(["install", ...shared]);
-      await rm(join(configDir, "secret-store.key"));
-      const secretsDir = join(dataDir, "secrets");
-      await mkdir(secretsDir, { recursive: true });
-      await chmod(secretsDir, 0o000);
-      await assert.rejects(
-        runManager(["install", ...shared]),
-        /SYSTEMD_SECRET_STORE_SCAN_FAILED/,
+      const unit = await readFile(
+        join(unitDir, "cmclient-agent.service"),
+        "utf8",
       );
-      await chmod(secretsDir, 0o750);
+      assert.match(unit, new RegExp(`ExecStart=${escaped(agentV1)} --serve`));
+      assert.match(
+        unit,
+        new RegExp(`ExecStartPre=${escaped(agentV1)} --check-config`),
+      );
+      assert.match(
+        unit,
+        new RegExp(`Environment="HOME=${escaped(serviceHome)}"`),
+      );
+      assert.match(unit, new RegExp(`ReadWritePaths=${escaped(runtimeRoot)}`));
+      assert.match(unit, /ProtectHome=read-only/);
+      assert.match(unit, /NoNewPrivileges=true/);
+      assert.match(unit, /CapabilityBoundingSet=\nAmbientCapabilities=/);
+      assert.match(unit, /ProtectSystem=strict/);
+      assert.doesNotMatch(
+        unit,
+        /CMCLIENT_(?:AGENT_CONFIG|DATA_DIR|CONFIG_DIR|CACHE_DIR|LOG_DIR|SYSTEMD_SECRET_STORE)/,
+      );
+      assert.doesNotMatch(unit, /LoadCredential|secret-store|vault/i);
+      assert.doesNotMatch(unit, /CALLMESH|API_KEY|PASSCODE|TOKEN/);
 
-      await rm(secretsDir, { recursive: true, force: true });
-      const externalSecretsDir = join(directory, "external-secrets");
-      await mkdir(externalSecretsDir);
-      await symlink(externalSecretsDir, secretsDir);
+      for (const relative of [
+        "",
+        "state",
+        "run",
+        "cache",
+        "logs",
+        "backups",
+        "updates",
+      ]) {
+        const path = relative ? join(runtimeRoot, relative) : runtimeRoot;
+        assert.equal((await stat(path)).mode & 0o777, 0o700);
+      }
+      await assert.rejects(stat(join(runtimeRoot, "secrets.json")));
+      assert.match(
+        await readFile(calls, "utf8"),
+        /daemon-reload\nenable --now cmclient-agent.service\n/,
+      );
+
+      await writeFile(
+        join(runtimeRoot, "retained-state"),
+        "must survive uninstall",
+      );
+      const upgraded = shared.map((value) =>
+        value === agentV1 ? agentV2 : value,
+      );
+      await runManager(["install", ...upgraded]);
+      const upgradedUnit = await readFile(
+        join(unitDir, "cmclient-agent.service"),
+        "utf8",
+      );
+      assert.match(
+        upgradedUnit,
+        new RegExp(`ExecStart=${escaped(agentV2)} --serve`),
+      );
+      assert.equal(
+        await readFile(join(runtimeRoot, "retained-state"), "utf8"),
+        "must survive uninstall",
+      );
+
+      await runManager(["uninstall", ...upgraded]);
       await assert.rejects(
-        runManager(["install", ...shared]),
-        /SYSTEMD_SECRET_STORE_DIRECTORY_INVALID/,
+        readFile(join(unitDir, "cmclient-agent.service"), "utf8"),
+      );
+      assert.equal(
+        await readFile(join(runtimeRoot, "retained-state"), "utf8"),
+        "must survive uninstall",
+      );
+      assert.match(
+        await readFile(calls, "utf8"),
+        /disable --now cmclient-agent.service/,
       );
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -257,7 +160,63 @@ systemdTest(
   },
 );
 
-test("CI exercises systemd 249 credentials and the dedicated Control socket", async () => {
+systemdTest(
+  "systemd manager rejects unsafe paths and legacy split-root options",
+  async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "cmclient-systemd-invalid-"),
+    );
+    try {
+      const unsafeAgent = join(directory, "agent with spaces");
+      await writeFile(unsafeAgent, "fixture");
+      await assert.rejects(
+        runManager([
+          "install",
+          "--agent",
+          unsafeAgent,
+          "--unit-dir",
+          join(directory, "units"),
+          "--skip-user-setup",
+        ]),
+        /SYSTEMD_PATH_INVALID/,
+      );
+      await assert.rejects(
+        runManager(["render", "--data-dir", join(directory, "data")]),
+        /SYSTEMD_USAGE_INVALID_ARGUMENT/,
+      );
+
+      const safeAgent = join(directory, "agent");
+      const serviceHome = join(directory, "home");
+      const externalRoot = join(directory, "external-root");
+      await writeFile(safeAgent, "#!/usr/bin/env sh\nexit 0\n");
+      await chmod(safeAgent, 0o755);
+      await mkdir(serviceHome);
+      await mkdir(externalRoot);
+      await symlink(externalRoot, join(serviceHome, ".cmclient"));
+      await assert.rejects(
+        runManager([
+          "install",
+          "--agent",
+          safeAgent,
+          "--unit-dir",
+          join(directory, "units"),
+          "--home",
+          serviceHome,
+          "--service-user",
+          "runner",
+          "--service-group",
+          "runner",
+          "--skip-user-setup",
+        ]),
+        /SYSTEMD_RUNTIME_DIRECTORY_INVALID/,
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test("CI exercises systemd 249 with canonical plaintext runtime state", async () => {
   const integration = await readFile(
     "scripts/cmclient-systemd-integration.sh",
     "utf8",
@@ -279,7 +238,15 @@ test("CI exercises systemd 249 credentials and the dedicated Control socket", as
     /^100755 [a-f0-9]{40,64} 0\tscripts\/cmclient-systemd-integration\.sh\s*$/,
   );
   assert.match(integration, /EXPECTED_SYSTEMD_VERSION="249"/);
-  assert.match(integration, /CREDENTIALS_DIRECTORY=/);
+  assert.match(integration, /RUNTIME_ROOT="\$SERVICE_HOME\/\.cmclient"/);
+  assert.match(
+    integration,
+    /CONTROL_SOCKET="\$RUNTIME_ROOT\/run\/control\.sock"/,
+  );
+  assert.match(integration, /SECRETS_FILE="\$RUNTIME_ROOT\/secrets\.json"/);
+  assert.match(integration, /config\.toml/);
+  assert.doesNotMatch(integration, /CREDENTIALS_DIRECTORY=|LoadCredential/);
+  assert.doesNotMatch(integration, /secret-store\.key|\.secret"/);
   assert.match(integration, /unix:\/\/\$CONTROL_SOCKET/);
   assert.match(integration, /"managementWeb":"disabled"/);
   assert.doesNotMatch(integration, /"management_web":"disabled"/);
@@ -320,10 +287,11 @@ test("CI exercises systemd 249 credentials and the dedicated Control socket", as
 });
 
 systemdTest(
-  "systemd logs prefer bounded application JSONL and sanitize journal fallback",
+  "systemd logs prefer bounded canonical JSONL and sanitize journal fallback",
   async () => {
     const directory = await mkdtemp(join(tmpdir(), "cmclient-systemd-logs-"));
-    const logDir = join(directory, "logs");
+    const serviceHome = join(directory, "home");
+    const logDir = join(serviceHome, ".cmclient/logs");
     const journalctl = join(directory, "journalctl");
     const journalCalls = join(directory, "journalctl-calls");
 
@@ -354,8 +322,8 @@ systemdTest(
 
       const { stdout: applicationOutput } = await runManager([
         "logs",
-        "--log-dir",
-        logDir,
+        "--home",
+        serviceHome,
         "--journalctl",
         journalctl,
         "--lines",
@@ -371,8 +339,8 @@ systemdTest(
       await rm(join(logDir, "gateway.jsonl.2026-07-22"));
       const { stdout: legacyOutput } = await runManager([
         "logs",
-        "--log-dir",
-        logDir,
+        "--home",
+        serviceHome,
         "--journalctl",
         journalctl,
         "--lines",
@@ -381,18 +349,19 @@ systemdTest(
       assert.match(legacyOutput, /AGENT_LEGACY/);
       assert.match(legacyOutput, /GATEWAY_LEGACY/);
       await assert.rejects(readFile(journalCalls, "utf8"));
+
       await rm(join(logDir, "agent.jsonl"));
       await rm(join(logDir, "gateway.jsonl"));
       await writeFile(join(logDir, "agent.jsonl.2026-99-99"), "invalid\n");
       await assert.rejects(
-        runManager(["logs", "--log-dir", logDir]),
+        runManager(["logs", "--home", serviceHome]),
         /SYSTEMD_LOG_FILE_INVALID/,
       );
       await rm(join(logDir, "agent.jsonl.2026-99-99"));
       const { stdout: fallbackOutput } = await runManager([
         "logs",
-        "--log-dir",
-        logDir,
+        "--home",
+        serviceHome,
         "--unit-dir",
         join(directory, "units"),
         "--journalctl",
@@ -407,7 +376,7 @@ systemdTest(
         /--unit cmclient-agent\.service --no-pager --lines 17 --output cat/,
       );
       await assert.rejects(
-        runManager(["logs", "--log-dir", logDir, "--lines", "10001"]),
+        runManager(["logs", "--home", serviceHome, "--lines", "10001"]),
         /SYSTEMD_LOG_LINES_INVALID/,
       );
 
@@ -415,7 +384,7 @@ systemdTest(
       await writeFile(externalLog, '{"code":"MUST_NOT_BE_READ"}\n');
       await symlink(externalLog, join(logDir, "agent.jsonl.2026-07-22"));
       await assert.rejects(
-        runManager(["logs", "--log-dir", logDir]),
+        runManager(["logs", "--home", serviceHome]),
         /SYSTEMD_LOG_FILE_INVALID/,
       );
     } finally {

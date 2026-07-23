@@ -45,12 +45,14 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `c60abf3e8f42f5ba73e5155c528629dc5a7161c96b8805af3c3f14807a3aca55`.
-- Cargo license inventory: 603 registry packages, 13 workspace packages, zero
+  `4313a3ae2a59e7d84786797ed82ff2465b762dd9a582d6f4848e068bb01502e8`.
+- Cargo license inventory: 584 registry packages, 13 workspace packages, zero
   Git sources and zero unknown licenses; inventory SHA-256
-  `276124d4ec635012d9657bb0d111684cfee2f4c4b7a7dfbac142ee1104045674`.
+  `b9334626dfa4319244fc28ac141aa73c00a49477f0e2449daf5eb0e48817b028`.
   The digest is canonical JSON sorted by package name, version, source,
   checksum, and declared license.
+  P13-T07 removed the obsolete platform keyring and encrypted-vault dependency
+  chain; it introduced no new registry package or license expression.
 - `pnpm-lock.yaml` SHA-256:
   `99207257e14da5b216e65b9863c11dfcde7fdb58403be094cd93a9ec66fdbca3`.
 - The current Windows production install contains 183 package versions;

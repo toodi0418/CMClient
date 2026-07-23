@@ -16,16 +16,13 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 const FIXTURE_SECRET: &str = "fixture-callmesh-value";
-const CALLMESH_URL: &str = "https://callmesh.example.invalid";
 const INHERITED_CALLMESH_SECRET: &str = "fixture-parent-callmesh-ignored";
 const INHERITED_APRS_SECRET: &str = "fixture-parent-aprs-ignored";
 const INHERITED_CONTROL_TOKEN: &str = "fixture-parent-control-token-ignored";
 
 struct Fixture {
     root: PathBuf,
-    config: PathBuf,
     data: PathBuf,
-    cache: PathBuf,
     logs: PathBuf,
     secret_parent: PathBuf,
     secret_file: PathBuf,
@@ -37,16 +34,15 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = unique_private_directory("cmclient-agent-plaintext-e2e");
-        let config_dir = root.join("config");
-        let data = root.join("data");
-        let cache = root.join("cache");
-        let logs = root.join("logs");
-        let secret_parent = root.join("credentials");
         let home = root.join("home");
-        for directory in [&config_dir, &data, &cache, &logs, &secret_parent, &home] {
+        let data = home.join(".cmclient");
+        let cache = data.join("cache");
+        let logs = data.join("logs");
+        for directory in [&home, &data, &cache, &logs] {
             fs::create_dir(directory).expect("fixture directory should exist");
             set_private_mode(directory);
         }
+        let secret_parent = data.clone();
 
         let gateway_script = root.join("gateway-fixture.mjs");
         fs::write(
@@ -63,24 +59,27 @@ const OWNERSHIP_CHALLENGE_HEADER =
 const OWNERSHIP_PROOF_HEADER = "x-cmclient-gateway-ownership-proof";
 
 const marker = process.argv[2];
-let markerState = "key-absent";
+let boundaryError;
 if (Object.hasOwn(process.env, "CMCLIENT_PLAINTEXT_SECRET_FILE")) {
-  markerState = "selector-leaked";
+  boundaryError = "selector-leaked";
 } else if (
   Object.hasOwn(process.env, "CMCLIENT_APRS_PASSCODE") ||
   Object.hasOwn(process.env, "CMCLIENT_CONTROL_TOKEN") ||
   Object.hasOwn(process.env, "CMCLIENT_SYSTEMD_SECRET_STORE")
 ) {
-  markerState = "sensitive-env-leaked";
-} else if (process.env.CMCLIENT_CALLMESH_URL !== "https://callmesh.example.invalid") {
-  markerState = "url-mismatch";
+  boundaryError = "sensitive-env-leaked";
+} else if (Object.hasOwn(process.env, "CMCLIENT_CALLMESH_URL")) {
+  boundaryError = "url-override-leaked";
 } else if (Object.hasOwn(process.env, "CMCLIENT_CALLMESH_API_KEY")) {
-  markerState =
-    process.env["CMCLIENT_CALLMESH_API_KEY"] === "fixture-callmesh-value"
-      ? "key-present"
-      : "key-unexpected";
+  boundaryError = "sensitive-env-leaked";
+} else if (
+  process.argv.some((argument) =>
+    argument.includes("fixture-callmesh-value") ||
+    argument.includes("fixture-parent-callmesh-ignored")
+  )
+) {
+  boundaryError = "sensitive-argv-leaked";
 }
-writeFileSync(marker, markerState, { mode: 0o600 });
 
 let input = Buffer.alloc(0);
 let bootstrap;
@@ -93,9 +92,17 @@ process.stdin.on("data", (chunk) => {
   if (!bootstrap) {
     if (input.length < 4) return;
     const length = input.readUInt32BE(0);
-    if (length < 1 || length > 4096 || input.length < length + 4) return;
+    if (length < 1 || length > 16384 || input.length < length + 4) return;
     bootstrap = JSON.parse(input.subarray(4, length + 4).toString("utf8"));
     input = input.subarray(length + 4);
+    const markerState = boundaryError ?? (
+      Object.hasOwn(bootstrap, "callMeshApiKey")
+        ? bootstrap.callMeshApiKey === "fixture-callmesh-value"
+          ? "key-present"
+          : "key-unexpected"
+        : "key-absent"
+    );
+    writeFileSync(marker, markerState, { mode: 0o600 });
     startGateway();
   }
   if (input.includes(Buffer.from("CMCLIENT_SHUTDOWN\n"))) shutdown();
@@ -238,12 +245,11 @@ function shutdown() {
         set_private_mode(&gateway_script);
 
         let marker = root.join("gateway-marker");
-        let config = config_dir.join("agent.toml");
+        let config = data.join("config.toml");
         let config_text = format!(
-            "[agent]\ngateway_command = [\"node\", {}, {}]\nmanagement_web_enabled = false\n\n[callmesh]\nurl = \"{}\"\n",
+            "[agent]\ngateway_command = [\"node\", {}, {}]\nmanagement_web_enabled = false\n",
             toml_string(&gateway_script),
             toml_string(&marker),
-            CALLMESH_URL,
         );
         fs::write(&config, config_text).expect("Agent config should write");
         set_private_mode(&config);
@@ -251,11 +257,9 @@ function shutdown() {
         let agent_stderr = root.join("agent-stderr.log");
 
         Self {
-            secret_file: secret_parent.join("runtime.json"),
+            secret_file: secret_parent.join("secrets.json"),
             root,
-            config,
             data,
-            cache,
             logs,
             secret_parent,
             marker,
@@ -276,14 +280,6 @@ function shutdown() {
                 "PATH",
                 std::env::var("PATH").expect("source test PATH should exist"),
             )
-            .env("CMCLIENT_AGENT_CONFIG", &self.config)
-            .env("CMCLIENT_DATA_DIR", &self.data)
-            .env(
-                "CMCLIENT_CONFIG_DIR",
-                self.config.parent().expect("config parent"),
-            )
-            .env("CMCLIENT_CACHE_DIR", &self.cache)
-            .env("CMCLIENT_LOG_DIR", &self.logs)
             .env("CMCLIENT_PLAINTEXT_SECRET_FILE", &self.secret_file)
             .env("CMCLIENT_CALLMESH_API_KEY", INHERITED_CALLMESH_SECRET)
             .env("CMCLIENT_APRS_PASSCODE", INHERITED_APRS_SECRET)
@@ -297,7 +293,7 @@ function shutdown() {
     }
 
     fn endpoint(&self) -> ControlEndpoint {
-        default_local_endpoint(&self.data)
+        default_local_endpoint(&self.data.join("run"))
     }
 
     fn wait_for_client(&self, agent: &mut RunningAgent) -> ControlClient {

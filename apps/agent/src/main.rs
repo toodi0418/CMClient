@@ -799,7 +799,7 @@ fn apply_physical_qualification_environment(
 impl AgentController {
     fn from_config(config: &AgentConfig) -> Result<Self, ControlError> {
         let secrets =
-            AgentSecretStore::runtime(&config.paths.data_dir).map_err(control_secret_error)?;
+            AgentSecretStore::runtime(config.paths.root_dir()).map_err(control_secret_error)?;
         Self::from_config_with_secrets(config, secrets)
     }
 
@@ -846,7 +846,7 @@ impl AgentController {
                 }
             }
         });
-        let control_endpoint = default_local_endpoint(&config.paths.data_dir);
+        let control_endpoint = default_local_endpoint(&config.paths.run_dir());
         let remote_replay = Arc::new(RemoteControlReplayGuard::default());
         let gateway_command = resolve_gateway_command(config);
         let supervisor = gateway_command
@@ -895,8 +895,16 @@ impl AgentController {
                         String::from(identity.identity.target.architecture.as_str()),
                     ),
                     (
-                        String::from("CMCLIENT_DATA_DIR"),
-                        config.paths.data_dir.to_string_lossy().into_owned(),
+                        String::from("CMCLIENT_RUNTIME_ROOT"),
+                        config.paths.root_dir().to_string_lossy().into_owned(),
+                    ),
+                    (
+                        String::from("CMCLIENT_DB_PATH"),
+                        config.paths.database_file().to_string_lossy().into_owned(),
+                    ),
+                    (
+                        String::from("CMCLIENT_BACKUP_DIR"),
+                        config.paths.backups_dir().to_string_lossy().into_owned(),
                     ),
                 ]);
                 let physical_profile = std::env::var("CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE").ok();
@@ -908,15 +916,6 @@ impl AgentController {
                 )?;
                 if let Some(callmesh) = &config.callmesh {
                     environment.insert(String::from("CMCLIENT_CALLMESH_URL"), callmesh.url.clone());
-                    if let Some(api_key) = secrets
-                        .read(SecretKind::CallMeshApiKey)
-                        .map_err(control_secret_error)?
-                    {
-                        environment.insert(
-                            String::from("CMCLIENT_CALLMESH_API_KEY"),
-                            api_key.expose_secret().to_owned(),
-                        );
-                    }
                 }
                 if let Some(meshtastic) = &config.meshtastic {
                     environment.insert(
@@ -987,6 +986,14 @@ impl AgentController {
                     supervisor
                         .enable_private_bootstrap()
                         .map_err(|_| ControlError::CommandFailed)?;
+                    if let Some(api_key) = secrets
+                        .read(SecretKind::CallMeshApiKey)
+                        .map_err(control_secret_error)?
+                    {
+                        supervisor
+                            .set_callmesh_api_key(api_key.expose_secret())
+                            .map_err(|_| ControlError::CommandFailed)?;
+                    }
                 }
                 if let Some(policy) = log_policy {
                     match StructuredLogSink::open(
@@ -1037,7 +1044,7 @@ impl AgentController {
             gateway_capability: None,
         };
         let gateway_session = GatewaySessionHandle::new();
-        let updates = Arc::new(AgentUpdateService::new(&config.paths.data_dir)?);
+        let updates = Arc::new(AgentUpdateService::new(config.paths.root_dir())?);
         updates.recover()?;
         let management_web = if config.management_web_enabled {
             Some(
@@ -1702,7 +1709,10 @@ impl ControlHandler for AgentController {
     }
 
     fn store_secret(&self, kind: ControlSecretKind, value: &str) -> Result<(), ControlError> {
-        if kind == ControlSecretKind::AprsPasscode {
+        if matches!(
+            kind,
+            ControlSecretKind::AprsPasscode | ControlSecretKind::ManagementAdminToken
+        ) {
             return Err(ControlError::SecretKindDeprecated);
         }
         self.secrets
@@ -2223,6 +2233,10 @@ fn serve_web_once() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
+    if let Err(error) = ensure_runtime_directories(&config.paths) {
+        eprintln!("{}", error.code());
+        return ExitCode::from(EX_CONFIG);
+    }
     let web_config = ManagementWebConfig {
         enabled: config.management_web_enabled,
         gateway: SocketAddr::from(([127, 0, 0, 1], 1)),
@@ -2252,7 +2266,7 @@ fn serve_web_once() -> ExitCode {
         },
         None => None,
     };
-    let updates = match AgentUpdateService::new(&config.paths.data_dir) {
+    let updates = match AgentUpdateService::new(config.paths.root_dir()) {
         Ok(updates) => Arc::new(updates),
         Err(error) => {
             eprintln!("{}", error.code());
@@ -2263,7 +2277,7 @@ fn serve_web_once() -> ExitCode {
         eprintln!("{}", error.code());
         return ExitCode::from(EX_CONFIG);
     }
-    let secrets = match AgentSecretStore::runtime(&config.paths.data_dir) {
+    let secrets = match AgentSecretStore::runtime(config.paths.root_dir()) {
         Ok(secrets) => secrets,
         Err(error) => {
             eprintln!("{}", error.code());
@@ -2275,7 +2289,7 @@ fn serve_web_once() -> ExitCode {
         Arc::new(AgentManagementWebApi {
             updates,
             access: management_access,
-            control_endpoint: default_local_endpoint(&config.paths.data_dir),
+            control_endpoint: default_local_endpoint(&config.paths.run_dir()),
             secrets,
             remote_replay: Arc::new(RemoteControlReplayGuard::default()),
         }),
@@ -2327,7 +2341,7 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
-    let endpoint = match default_local_endpoint(&config.paths.data_dir) {
+    let endpoint = match default_local_endpoint(&config.paths.run_dir()) {
         ControlEndpoint::UnixSocket(path) => ControlEndpoint::unix(path),
         endpoint => endpoint,
     };
@@ -3246,7 +3260,7 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn configured_callmesh_secret_reaches_only_the_gateway_contract() {
+    fn configured_callmesh_secret_is_never_added_to_the_gateway_environment() {
         let data_dir = std::env::temp_dir().join(format!(
             "cmclient-agent-plaintext-boundary-{}",
             std::process::id(),
@@ -3270,7 +3284,7 @@ mod tests {
                 String::from("sh"),
                 String::from("-c"),
                 format!(
-                    "if [ \"$CMCLIENT_CALLMESH_URL\" = \"https://callmesh.example.invalid\" ] && [ \"$CMCLIENT_CALLMESH_API_KEY\" = \"fixture-callmesh-value\" ] && [ -z \"${{CMCLIENT_PLAINTEXT_SECRET_FILE+x}}\" ]; then printf ok > '{}'; else printf rejected > '{}'; fi; read _",
+                    "if [ \"$CMCLIENT_CALLMESH_URL\" = \"https://callmesh.example.invalid\" ] && [ -z \"${{CMCLIENT_CALLMESH_API_KEY+x}}\" ] && [ -z \"${{CMCLIENT_PLAINTEXT_SECRET_FILE+x}}\" ]; then printf ok > '{}'; else printf rejected > '{}'; fi; read _",
                     marker.display(),
                     marker.display(),
                 ),

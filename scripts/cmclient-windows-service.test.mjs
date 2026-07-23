@@ -97,70 +97,41 @@ test("Windows service path validation remains compatible with Windows PowerShell
   }
 });
 
-test("Windows lifecycle smoke creates and rechecks its retained-state sentinel", async () => {
+test("Windows CI keeps the transitional service host contract non-elevated", async () => {
   const workflow = await readFile(".github/workflows/ci.yml", "utf8");
-  const lifecycleStart = workflow.indexOf(
-    "Exercise canonical Windows Service install, upgrade, start, and uninstall",
-  );
-  const lifecycleEnd = workflow.indexOf(
-    "\n  linux-systemd-smoke:",
-    lifecycleStart,
-  );
-  const lifecycle = workflow.slice(lifecycleStart, lifecycleEnd);
+  const jobStart = workflow.indexOf("\n  windows-service-smoke:");
+  const jobEnd = workflow.indexOf("\n  linux-systemd-smoke:", jobStart);
+  const job = workflow.slice(jobStart, jobEnd);
 
-  assert.ok(lifecycleStart >= 0);
-  assert.ok(lifecycleEnd > lifecycleStart);
-  assert.match(lifecycle, /\[IO\.File\]::WriteAllText\(\$state, \$sentinel\)/);
-  assert.equal(
-    (
-      lifecycle.match(
-        /Test-Path -LiteralPath \$state -PathType Leaf\) -or \[IO\.File\]::ReadAllText\(\$state\) -ne \$sentinel/g,
-      ) ?? []
-    ).length,
-    2,
-  );
-  const writeIndex = lifecycle.indexOf(
-    "[IO.File]::WriteAllText($state, $sentinel)",
-  );
-  const initialCheckIndex = lifecycle.indexOf(
-    "Windows lifecycle retained-state fixture was not created",
-  );
-  const installIndex = lifecycle.indexOf(
-    "powershell -NoProfile -ExecutionPolicy Bypass -File $manager install -HostPath $hostV1",
-  );
-  const uninstallIndex = lifecycle.indexOf(
-    "powershell -NoProfile -ExecutionPolicy Bypass -File $manager uninstall -HostPath $hostV2",
-  );
-  const finalCheckIndex = lifecycle.indexOf(
-    "Windows service uninstall removed retained state",
-  );
-  assert.ok(writeIndex >= 0);
-  assert.ok(writeIndex < initialCheckIndex);
-  assert.ok(initialCheckIndex < installIndex);
-  assert.ok(installIndex < uninstallIndex);
-  assert.ok(uninstallIndex < finalCheckIndex);
-  assert.doesNotMatch(lifecycle, /Set-Content\s+-NoNewline\s+\$state/);
-  assert.match(lifecycle, /\$serviceName = "CMClientAgent"/);
-  assert.match(lifecycle, /WINDOWS_CANONICAL_SERVICE_NAME_IN_USE/);
-  assert.doesNotMatch(lifecycle, /CMClientAgentPackage/);
-  assert.doesNotMatch(lifecycle, /-ServiceName/);
-  assert.match(lifecycle, /\$programDataIsolated = \$false/);
-  const isolateIndex = lifecycle.indexOf("$programDataIsolated = $true");
-  const cleanupIndex = lifecycle.indexOf("if ($programDataIsolated) {");
-  assert.ok(isolateIndex >= 0);
-  assert.ok(cleanupIndex > isolateIndex);
+  assert.ok(jobStart >= 0);
+  assert.ok(jobEnd > jobStart);
+  assert.match(job, /name: Windows transitional service-host contract/);
+  assert.match(job, /cargo test -p cmclient-service-host --locked/);
   assert.match(
-    lifecycle.slice(cleanupIndex),
-    /if \(\$programDataIsolated\) \{[\s\S]*Remove-Item -Recurse -Force \$programDataRoot[\s\S]*if \(\$programDataMoved\) \{ Move-Item/,
-  );
-  assert.match(lifecycle, /Start-Service -Name \$serviceName/);
-  assert.match(lifecycle, /\\\\\.\\pipe\\cmclient-control/);
-  assert.match(lifecycle, /\$candidate\.managementWeb -eq "disabled"/);
-  assert.doesNotMatch(lifecycle, /\$candidate\.management_web/);
-  assert.match(
-    workflow,
+    job,
     /cargo build -p cmclient-agent -p cmclient-cli -p cmclient-service-host --locked/,
   );
-  assert.match(lifecycle, /\$controlStatus\.agent -ne "running"/);
-  assert.match(lifecycle, /\$agent\.ExecutablePath -ne \$agentV2/);
+  assert.match(job, /cmclient-windows-service\.ps1 render/);
+  const managerCommands = [
+    ...job.matchAll(/cmclient-windows-service\.ps1\s+([a-z]+)/gi),
+  ].map(([, command]) => command.toLowerCase());
+  assert.deepEqual(managerCommands, ["render"]);
+  assert.doesNotMatch(
+    job,
+    /\b(?:sc(?:\.exe)?|Get-Service|New-Service|Set-Service|Start-Service|Stop-Service|Restart-Service|Remove-Service)\b/i,
+  );
+  assert.doesNotMatch(
+    job,
+    /\b(?:icacls(?:\.exe)?|takeown(?:\.exe)?|Set-Acl|Get-Acl)\b|S-1-5-|LocalService|NetworkService/i,
+  );
+  assert.doesNotMatch(
+    job,
+    /#requires\s+-RunAsAdministrator|-Verb\s+RunAs|\brunas(?:\.exe)?\b|\bgsudo\b/i,
+  );
+  assert.doesNotMatch(job, /\bProgramData\b/i);
+  assert.doesNotMatch(
+    job,
+    /cmclient-windows-service\.ps1 (?:install|uninstall)/,
+  );
+  assert.doesNotMatch(job, /Exercise canonical Windows Service/);
 });

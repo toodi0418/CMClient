@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   GATEWAY_CAPABILITY_HEADER,
+  GATEWAY_CALLMESH_API_KEY_MAX_BYTES,
   GatewayBootstrapError,
   encodePrivateFrame,
   gatewayCapabilityMatches,
@@ -25,6 +26,7 @@ const bootstrap = {
   type: "gateway.bootstrap" as const,
   startupNonce: "a".repeat(32),
   capability: "b".repeat(64),
+  callMeshApiKey: " fixture-private-callmesh-key ",
 };
 
 describe("private Gateway bootstrap", () => {
@@ -36,6 +38,17 @@ describe("private Gateway bootstrap", () => {
     input.write(encoded.subarray(3, 11));
     input.write(encoded.subarray(11));
     await expect(pending).resolves.toEqual(bootstrap);
+
+    const withoutCallMeshKey = {
+      schemaVersion: bootstrap.schemaVersion,
+      type: bootstrap.type,
+      startupNonce: bootstrap.startupNonce,
+      capability: bootstrap.capability,
+    };
+    const inputWithoutKey = new PassThrough();
+    const pendingWithoutKey = readGatewayBootstrap(inputWithoutKey);
+    inputWithoutKey.end(encodePrivateFrame(withoutCallMeshKey));
+    await expect(pendingWithoutKey).resolves.toEqual(withoutCallMeshKey);
 
     const output = new PassThrough();
     const chunks: Buffer[] = [];
@@ -57,6 +70,7 @@ describe("private Gateway bootstrap", () => {
       host: "127.0.0.1",
       port: 49152,
     });
+    expect(ready.includes(Buffer.from(bootstrap.callMeshApiKey))).toBe(false);
   });
 
   it("finishes the private ready channel before slow external startup", async () => {
@@ -142,6 +156,8 @@ describe("private Gateway bootstrap", () => {
     );
     expect(request).not.toContain(bootstrap.capability);
     expect(response).not.toContain(bootstrap.capability);
+    expect(request).not.toContain(bootstrap.callMeshApiKey);
+    expect(response).not.toContain(bootstrap.callMeshApiKey);
 
     for (const invalidRequest of [
       request.replace("HTTP/1.1", "HTTP/1.0"),
@@ -169,11 +185,26 @@ describe("private Gateway bootstrap", () => {
       Buffer.from([0, 0, 0, 1, 0xff]),
       Buffer.concat([encodePrivateFrame(bootstrap), Buffer.from([0])]),
       encodePrivateFrame({ ...bootstrap, capability: "not-a-capability" }),
+      encodePrivateFrame({ ...bootstrap, unknown: true }),
     ]) {
       const input = new PassThrough();
       const pending = readGatewayBootstrap(input, 100);
       input.write(frame);
       await expect(pending).rejects.toBeInstanceOf(GatewayBootstrapError);
+    }
+
+    for (const callMeshApiKey of [
+      null,
+      42,
+      "",
+      "control\ncharacter",
+      "x".repeat(GATEWAY_CALLMESH_API_KEY_MAX_BYTES + 1),
+      "\u00e9".repeat(GATEWAY_CALLMESH_API_KEY_MAX_BYTES / 2 + 1),
+    ]) {
+      const input = new PassThrough();
+      const pending = readGatewayBootstrap(input, 100);
+      input.end(encodePrivateFrame({ ...bootstrap, callMeshApiKey }));
+      await expect(pending).rejects.toThrow("GATEWAY_BOOTSTRAP_FRAME_INVALID");
     }
 
     const stalled = new PassThrough();

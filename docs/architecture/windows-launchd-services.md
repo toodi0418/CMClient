@@ -17,22 +17,21 @@ and the following poll sleep are capped by the remaining 50-second budget. A
 stalled named-pipe request therefore cannot delay the process fallback beyond
 the service deadline.
 
-`scripts/cmclient-windows-service.ps1` registers `CMClientAgent` with the
-`LocalService` account and automatic start. The host gives the child explicit,
-absolute paths under `%ProgramData%\CMClient` for data, configuration, cache,
-and logs. The manager accepts only the service-host path and operational
-actions; it never accepts or writes a CallMesh key, APRS passcode, token, or
-signing key. `CMClientAgent` is the fixed singleton SCM identity shared by the
-manager and the compiled service host; there is no service-name override.
-Re-running install updates that registration's executable target. Uninstall
-removes the SCM registration only and retains `%ProgramData%\CMClient`.
+`scripts/cmclient-windows-service.ps1` and `cmclient-service-host.exe` are
+retained transition and qualification surfaces, not the public Windows install
+model. Public Setup uses current-user login startup without routine UAC. When
+the SCM fixture is exercised, Agent derives every mutable path from the service
+identity's effective `%USERPROFILE%\.cmclient`; the host does not inject split
+data, configuration, cache, or log roots. The manager accepts only the
+service-host path and operational actions; it never accepts or writes a
+CallMesh key, APRS credential, Control token, or signing key. `CMClientAgent`
+remains the fixed singleton fixture identity. Uninstall removes that test
+registration and retains the effective home's `.cmclient` directory.
 
-The private Agent Control API is the local named pipe
-`\\.\pipe\cmclient-control`. It uses the default LocalService security
-descriptor, so control clients require an OS principal allowed by that local
-pipe, typically an elevated administrator. It never falls back to a TCP
-listener. This restrictive default is intentional until a user-scoped pipe ACL
-is configured as part of a future authenticated installer flow.
+The private Agent Control API is a root-derived local named pipe. It never
+falls back to TCP and carries no bearer token. The public current-user product
+uses the same user's pipe with remote clients rejected; it makes no
+cross-account access claim and requires no custom ACL or UAC flow.
 
 Windows byte-mode `PIPE_NOWAIT` reports both a temporarily empty pipe and a
 closed peer as the same zero-byte read through the synchronous transport. The
@@ -51,7 +50,8 @@ powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 un
 ```
 
 The `logs` action accepts between 1 and 10,000 lines and reads only regular,
-non-reparse-point application logs under `%ProgramData%\CMClient\logs`:
+non-reparse-point application logs under the effective user's
+`.cmclient\logs`:
 the newest `service-host.jsonl.YYYY-MM-DD`, `agent.jsonl.YYYY-MM-DD`, and
 `gateway.jsonl.YYYY-MM-DD` file in each family, with fixed-name legacy
 fallback. These are sanitized, size-bounded, retained JSONL files; the service
@@ -61,22 +61,16 @@ unsafe path fails with a stable manager error code.
 ## macOS
 
 `scripts/cmclient-launchd.sh` installs `io.cmclient.agent` as a per-user
-LaunchAgent at `~/Library/LaunchAgents`. It launches the Agent with the owning
-user's standard CMClient Application Support and Caches paths. The controlled
-no-Keychain field mode adds `--plaintext-secret-file` with an absolute external
-path, or explicitly exports the same selector while installing; the generated
-plist contains only that path, never a secret value. The
-manager requires its direct parent to be an owner-matched, non-symlink `0700`
-directory and an existing file to be an owner-matched, single-link,
-non-symlink regular `0600` file, while Agent repeats the
-owner/link/mode validation before use. When neither the option nor selector is
-provided, the ordinary platform-backend behavior remains. It is intentionally
-not a root LaunchDaemon.
+LaunchAgent at `~/Library/LaunchAgents`. The generated plist injects only the
+owning user's `HOME`; Agent derives its sole mutable root as `~/.cmclient`.
+Runtime credentials exist only in `~/.cmclient/secrets.json`, with the root at
+mode `0700` and the atomically replaced file at mode `0600`. There is no
+Keychain mode, external secret selector, or secret-bearing launchd environment.
+It is intentionally not a root LaunchDaemon.
 
 ```bash
 bash scripts/cmclient-launchd.sh install \
-  --agent /Applications/CMClient/current/bin/cmclient-agent \
-  --plaintext-secret-file /absolute/path/outside/repository/agent-secrets.json
+  --agent /Applications/CMClient/current/bin/cmclient-agent
 bash scripts/cmclient-launchd.sh status
 bash scripts/cmclient-launchd.sh logs --lines 200
 bash scripts/cmclient-launchd.sh uninstall
@@ -87,7 +81,7 @@ and uses a five-second throttle. launchd sends fallback stdout and stderr to
 `/dev/null`, preventing its own unbounded `agent.stdout.log` and
 `agent.stderr.log` files. Agent and Supervisor instead own sanitized,
 size-bounded `agent.jsonl.YYYY-MM-DD` and `gateway.jsonl.YYYY-MM-DD` families
-under the user's Agent log directory; `logs --lines N` accepts `1..10000` and
+under `~/.cmclient/logs`; `logs --lines N` accepts `1..10000` and
 tails only each family's newest regular file, with fixed-name legacy fallback. Its
-uninstall operation removes only the plist; configuration, data, cache, and
-logs remain available for reinstall and rollback.
+uninstall operation removes only the plist; `~/.cmclient` remains available for
+reinstall and rollback.

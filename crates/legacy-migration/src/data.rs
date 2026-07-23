@@ -2407,7 +2407,7 @@ mod tests {
     fn request(directory: &Path) -> LegacyDataImportRequest {
         LegacyDataImportRequest {
             source_dir: directory.join("legacy"),
-            target_database: directory.join("gateway.sqlite"),
+            target_database: directory.join("cmclient.db"),
             mesh_network_id: String::from("fixture-network"),
             backup_dir: directory.join("backups"),
         }
@@ -2419,7 +2419,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
 
         let report = inspect_legacy_data(&request(&directory)).expect("dry run should succeed");
         assert!(report.dry_run);
@@ -2428,8 +2428,7 @@ mod tests {
         assert_eq!(report.records.telemetry, 1);
         let serialized = serde_json::to_string(&report).expect("report should serialize");
         assert!(!serialized.contains("history-value-not-in-report"));
-        let target =
-            Connection::open(directory.join("gateway.sqlite")).expect("target should open");
+        let target = Connection::open(directory.join("cmclient.db")).expect("target should open");
         let message_count: i64 = target
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .expect("count should succeed");
@@ -2453,7 +2452,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
 
         let report = apply_legacy_data(&request).expect("apply should succeed");
@@ -2519,7 +2518,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_inline_telemetry_source(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
 
         let report = inspect_legacy_data(&request(&directory)).expect("dry run should succeed");
         assert_eq!(report.records.nodes, 0);
@@ -2540,7 +2539,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_inline_message_source(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
 
         let report = apply_legacy_data(&request).expect("import should succeed");
@@ -2571,7 +2570,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_normalized_message_source(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
 
         apply_legacy_data(&request).expect("normalized sender should import");
@@ -2591,7 +2590,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_jsonl_fallback_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
 
         let report = apply_legacy_data(&request).expect("migrated fallback should import");
@@ -2628,7 +2627,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         initialize_target(&directory.join("other.sqlite"));
         let request = request(&directory);
         let report = apply_legacy_data(&request).expect("import should succeed");
@@ -2675,7 +2674,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
         let target = Connection::open(&request.target_database).expect("target should open");
         target
@@ -2718,7 +2717,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
 
         let mut overlap = request.clone();
@@ -2750,7 +2749,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
 
         let target = Connection::open(&request.target_database).expect("target should open");
@@ -2816,7 +2815,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
         let report = apply_legacy_data(&request).expect("import should succeed");
         let backup = request
@@ -2858,7 +2857,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
         let report = apply_legacy_data(&request).expect("import should succeed");
         let backup = request
@@ -2890,7 +2889,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("legacy")).expect("source directory should exist");
         initialize_sources(&directory.join("legacy"));
-        initialize_target(&directory.join("gateway.sqlite"));
+        initialize_target(&directory.join("cmclient.db"));
         let request = request(&directory);
 
         let report = apply_legacy_data(&request).expect("private backup should succeed");

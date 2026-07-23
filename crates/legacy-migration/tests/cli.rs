@@ -144,7 +144,7 @@ fn data_import_requires_explicit_gateway_stop_confirmation_and_rolls_back_from_r
     let source_dir = directory.join("legacy");
     fs::create_dir_all(&source_dir).expect("source directory should exist");
     initialize_legacy_sources(&source_dir);
-    let target = directory.join("gateway.sqlite");
+    let target = directory.join("cmclient.db");
     initialize_gateway_target(&target);
     let backup_dir = directory.join("backups");
     let binary = env!("CARGO_BIN_EXE_cmclient-migrate");

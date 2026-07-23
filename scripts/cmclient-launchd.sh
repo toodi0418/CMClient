@@ -7,11 +7,8 @@ TEMPLATE_PATH="${SCRIPT_DIR}/../packaging/launchd/${LABEL}.plist.in"
 INSTALL_ROOT="${CMCLIENT_INSTALL_ROOT:-/Applications/CMClient/current}"
 AGENT_BINARY="${CMCLIENT_AGENT_BINARY:-$INSTALL_ROOT/bin/cmclient-agent}"
 HOME_DIRECTORY="${HOME:?HOME is required}"
-DATA_DIR="${CMCLIENT_DATA_DIR:-$HOME_DIRECTORY/Library/Application Support/CMClient}"
-CONFIG_DIR="${CMCLIENT_CONFIG_DIR:-$HOME_DIRECTORY/Library/Application Support/CMClient}"
-CACHE_DIR="${CMCLIENT_CACHE_DIR:-$HOME_DIRECTORY/Library/Caches/CMClient}"
-LOG_DIR="${CMCLIENT_LOG_DIR:-$DATA_DIR/Logs}"
-PLAINTEXT_SECRET_FILE="${CMCLIENT_PLAINTEXT_SECRET_FILE:-}"
+RUNTIME_ROOT="$HOME_DIRECTORY/.cmclient"
+LOG_DIR="$RUNTIME_ROOT/logs"
 PLIST_PATH="${CMCLIENT_LAUNCHD_PLIST:-$HOME_DIRECTORY/Library/LaunchAgents/${LABEL}.plist}"
 LAUNCHCTL="${CMCLIENT_LAUNCHCTL:-launchctl}"
 PLUTIL="${CMCLIENT_PLUTIL:-plutil}"
@@ -55,17 +52,12 @@ Usage: scripts/cmclient-launchd.sh <install|uninstall|start|stop|restart|status|
 Options:
   --agent <absolute path>       Agent executable
   --plist <absolute path>       LaunchAgent plist path
-  --data-dir <absolute path>    Persistent Agent data directory
-  --config-dir <absolute path>  Agent configuration directory
-  --cache-dir <absolute path>   Agent cache directory
-  --log-dir <absolute path>     Agent log directory
-  --plaintext-secret-file <absolute path>
-                                External owner-only plaintext secret file
   --lines <1..10000>            Lines for logs (default: 200)
 
-This is a per-user LaunchAgent. It accepts only an optional secret file path;
-it never accepts, exports, or writes credential values.
-`uninstall` removes only the plist and retains Agent configuration, data, cache, and logs.
+This is a per-user LaunchAgent. Agent owns all mutable state below
+HOME/.cmclient, including config.toml, cmclient.db, secrets.json, run, logs,
+backups, and updates. The manager never accepts, exports, or writes credential
+values. `uninstall` removes only the plist and retains that runtime root.
 EOF
 }
 
@@ -89,60 +81,14 @@ validate_positive_integer() {
   fi
 }
 
-file_mode() {
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    stat -f '%Lp' "$1"
-  else
-    stat -c '%a' "$1"
-  fi
-}
-
-file_owner() {
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    stat -f '%u' "$1"
-  else
-    stat -c '%u' "$1"
-  fi
-}
-
-file_link_count() {
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    stat -f '%l' "$1"
-  else
-    stat -c '%h' "$1"
-  fi
-}
-
-validate_plaintext_secret_file() {
-  [[ -n "$PLAINTEXT_SECRET_FILE" ]] || return 0
-  validate_path "$PLAINTEXT_SECRET_FILE"
-  local parent
-  parent="$(dirname "$PLAINTEXT_SECRET_FILE")"
-  if [[ ! -d "$parent" || -L "$parent" ]]; then
-    fail "LAUNCHD_SECRET_FILE_PARENT_INVALID"
-  fi
-  if [[ "$(file_mode "$parent")" != "700" || "$(file_owner "$parent")" != "$(id -u)" ]]; then
-    fail "LAUNCHD_SECRET_FILE_PARENT_INVALID"
-  fi
-  if [[ -e "$PLAINTEXT_SECRET_FILE" || -L "$PLAINTEXT_SECRET_FILE" ]]; then
-    if [[ ! -f "$PLAINTEXT_SECRET_FILE" || -L "$PLAINTEXT_SECRET_FILE" ]]; then
-      fail "LAUNCHD_SECRET_FILE_INVALID"
-    fi
-    if [[ "$(file_mode "$PLAINTEXT_SECRET_FILE")" != "600" || "$(file_owner "$PLAINTEXT_SECRET_FILE")" != "$(id -u)" || "$(file_link_count "$PLAINTEXT_SECRET_FILE")" != "1" ]]; then
-      fail "LAUNCHD_SECRET_FILE_INVALID"
-    fi
-  fi
-}
-
 validate_configuration() {
   validate_path "$AGENT_BINARY"
   validate_path "$HOME_DIRECTORY"
-  validate_path "$DATA_DIR"
-  validate_path "$CONFIG_DIR"
-  validate_path "$CACHE_DIR"
+  validate_path "$RUNTIME_ROOT"
   validate_path "$LOG_DIR"
   validate_path "$PLIST_PATH"
-  validate_plaintext_secret_file
+  validate_managed_directory "$RUNTIME_ROOT"
+  validate_managed_directory "$LOG_DIR"
   validate_positive_integer "$LOG_LINES"
   if [[ ! -f "$TEMPLATE_PATH" ]]; then
     fail "LAUNCHD_TEMPLATE_MISSING"
@@ -166,30 +112,40 @@ working_directory() {
 
 render_plist() {
   local workdir
-  local plaintext_key=""
-  local plaintext_value=""
   workdir="$(working_directory)"
   validate_path "$workdir"
-  if [[ -n "$PLAINTEXT_SECRET_FILE" ]]; then
-    plaintext_key="    <key>CMCLIENT_PLAINTEXT_SECRET_FILE</key>"
-    plaintext_value="    <string>$PLAINTEXT_SECRET_FILE</string>"
-  fi
   sed \
     -e "s|@AGENT_BINARY@|$AGENT_BINARY|g" \
     -e "s|@WORKING_DIRECTORY@|$workdir|g" \
     -e "s|@HOME_DIRECTORY@|$HOME_DIRECTORY|g" \
-    -e "s|@DATA_DIR@|$DATA_DIR|g" \
-    -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
-    -e "s|@CACHE_DIR@|$CACHE_DIR|g" \
-    -e "s|@LOG_DIR@|$LOG_DIR|g" \
-    -e "s|@PLAINTEXT_SECRET_FILE_KEY@|$plaintext_key|g" \
-    -e "s|@PLAINTEXT_SECRET_FILE_VALUE@|$plaintext_value|g" \
     "$TEMPLATE_PATH"
 }
 
+validate_managed_directory() {
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -d "$path" && ! -L "$path" ]] || fail "LAUNCHD_RUNTIME_DIRECTORY_INVALID"
+  fi
+}
+
 prepare_directories() {
+  local paths=(
+    "$RUNTIME_ROOT"
+    "$RUNTIME_ROOT/state"
+    "$RUNTIME_ROOT/run"
+    "$RUNTIME_ROOT/cache"
+    "$RUNTIME_ROOT/logs"
+    "$RUNTIME_ROOT/backups"
+    "$RUNTIME_ROOT/updates"
+  )
+  local path
+  for path in "${paths[@]}"; do
+    validate_managed_directory "$path"
+  done
   install -d -m 0700 "$(dirname "$PLIST_PATH")"
-  install -d -m 0700 "$DATA_DIR" "$CONFIG_DIR" "$CACHE_DIR" "$LOG_DIR"
+  for path in "${paths[@]}"; do
+    install -d -m 0700 "$path"
+  done
 }
 
 bootout() {
@@ -278,15 +234,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --agent) AGENT_BINARY="${2:-}"; shift 2 ;;
     --plist) PLIST_PATH="${2:-}"; shift 2 ;;
-    --data-dir) DATA_DIR="${2:-}"; shift 2 ;;
-    --config-dir) CONFIG_DIR="${2:-}"; shift 2 ;;
-    --cache-dir) CACHE_DIR="${2:-}"; shift 2 ;;
-    --log-dir) LOG_DIR="${2:-}"; shift 2 ;;
-    --plaintext-secret-file)
-      [[ $# -ge 2 && -n "${2:-}" ]] || fail "LAUNCHD_USAGE_INVALID_ARGUMENT"
-      PLAINTEXT_SECRET_FILE="$2"
-      shift 2
-      ;;
     --lines) LOG_LINES="${2:-}"; shift 2 ;;
     *) fail "LAUNCHD_USAGE_INVALID_ARGUMENT" ;;
   esac

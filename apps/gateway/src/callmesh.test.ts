@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildCallMeshAgent,
-  callMeshOptionsFromEnvironment,
+  callMeshOptionsFromRuntime,
   CallMeshClient,
 } from "./callmesh";
 import { GatewayDatabase } from "./persistence/database";
@@ -36,18 +36,25 @@ describe("CallMesh client", () => {
       "callmesh-client/2.0.0 (Windows NT; x64)",
     );
     expect(
-      callMeshOptionsFromEnvironment(
+      callMeshOptionsFromRuntime(
         {
-          CMCLIENT_CALLMESH_API_KEY: "fixture-api-key",
+          CMCLIENT_CALLMESH_API_KEY: "ignored-environment-api-key",
           CMCLIENT_MESH_NETWORK_ID: "fixture-network",
         },
         "2.0.0-rc.1",
+        " fixture-api-key ",
       ),
     ).toEqual({
-      apiKey: "fixture-api-key",
+      apiKey: " fixture-api-key ",
       agent: expect.stringMatching(/^callmesh-client\/2\.0\.0-rc\.1 \(/),
       meshNetworkId: "fixture-network",
     });
+    expect(
+      callMeshOptionsFromRuntime(
+        { CMCLIENT_CALLMESH_API_KEY: "ignored-environment-api-key" },
+        "2.0.0-rc.1",
+      ),
+    ).not.toHaveProperty("apiKey");
   });
 
   it("uses the Legacy heartbeat/mappings contract and conditionally reuses the durable snapshot", async () => {
@@ -273,6 +280,28 @@ describe("CallMesh client", () => {
           agent: "callmesh-client/2.0.0 (fixture; arm64)",
         }),
     ).toThrow("CALLMESH_CONFIGURATION_INVALID");
+    expect(
+      () =>
+        new CallMeshClient({
+          apiKey: "\u00e9".repeat(2_049),
+          agent: "callmesh-client/2.0.0 (fixture; arm64)",
+        }),
+    ).toThrow("CALLMESH_CONFIGURATION_INVALID");
+
+    const exactApiKey = " fixture key with spaces ";
+    let transmittedApiKey: string | undefined;
+    const exactKeyClient = new CallMeshClient({
+      ...clientOptions(async (_input, init) => {
+        transmittedApiKey = (init?.headers as Record<string, string>)[
+          "x-api-key"
+        ];
+        return jsonResponse(heartbeat({ needs_update: false }));
+      }),
+      apiKey: exactApiKey,
+      maximumRetries: 0,
+    });
+    await exactKeyClient.synchronize();
+    expect(transmittedApiKey).toBe(exactApiKey);
 
     const oversized = clientWithFetch(
       async () => new Response("x".repeat(512 * 1024 + 1), { status: 200 }),

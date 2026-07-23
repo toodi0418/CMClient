@@ -813,11 +813,12 @@ fn parse_secret_kind(value: &str) -> Option<ControlSecretKind> {
 }
 
 fn parse_secret_kind_for_set(value: &str) -> Option<ControlSecretKind> {
-    (value != "aprs-passcode").then(|| parse_secret_kind(value))?
+    (!matches!(value, "aprs-passcode" | "management-admin-token"))
+        .then(|| parse_secret_kind(value))?
 }
 
 fn secret_kind_error(value: &str) -> &'static str {
-    if value == "aprs-passcode" {
+    if matches!(value, "aprs-passcode" | "management-admin-token") {
         "CLI_SECRET_KIND_DEPRECATED"
     } else {
         "CLI_SECRET_KIND_INVALID"
@@ -864,9 +865,12 @@ fn control_client(value: &str, timeout: Duration) -> Result<CliControlClient, Cl
         cmclient_cli_client::ControlEndpointSpec::Local => {
             let config =
                 AgentConfig::load().map_err(|_| ClientSetupError::Exit(ExitCode::Validation))?;
-            ControlClient::new_with_timeout(default_local_endpoint(&config.paths.data_dir), timeout)
-                .map(CliControlClient::Local)
-                .map_err(ClientSetupError::Control)
+            ControlClient::new_with_timeout(
+                default_local_endpoint(&config.paths.run_dir()),
+                timeout,
+            )
+            .map(CliControlClient::Local)
+            .map_err(ClientSetupError::Control)
         }
         cmclient_cli_client::ControlEndpointSpec::UnixSocket(path) => {
             ControlClient::new_with_timeout(ControlEndpoint::unix(path), timeout)
@@ -879,8 +883,8 @@ fn control_client(value: &str, timeout: Duration) -> Result<CliControlClient, Cl
                 .map_err(ClientSetupError::Control)
         }
         cmclient_cli_client::ControlEndpointSpec::Https(url) => {
-            let token = std::env::var("CMCLIENT_CONTROL_TOKEN")
-                .map_err(|_| ClientSetupError::Control(ControlError::Authentication))?;
+            let token = read_secret_from_standard_input()
+                .ok_or(ClientSetupError::Control(ControlError::Authentication))?;
             RemoteControlClient::new(url, token, timeout)
                 .map(CliControlClient::Remote)
                 .map_err(ClientSetupError::Control)

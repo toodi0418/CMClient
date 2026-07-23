@@ -12,15 +12,14 @@ curl --fail http://127.0.0.1:7080/api/v1/system/health
 curl --fail http://127.0.0.1:7080/api/v1/system/version
 ```
 
-The `cmclient` and `curl` examples above assume an interactive Agent with its
-default per-user paths and enabled loopback Web listener. For a packaged
-systemd service, replace every Agent Control command beginning with `cmclient`
-in this guide with
-`sudo cmclient --endpoint unix:///var/lib/cmclient/control.sock` (adjusting the
-installed data directory). `cmclient-systemd.sh status` reports only unit
-state. If Management Web is disabled, use Control CLI only; a configured LAN
-listener uses its HTTPS bind/port and authentication instead of the loopback
-`curl` URLs.
+The `cmclient` commands use the current user's private Control endpoint:
+`~/.cmclient/run/control.sock` on macOS/Linux or the local named pipe on
+Windows. The Linux headless system unit uses the dedicated account's
+`/home/cmclient/.cmclient/run/control.sock`; root may select it explicitly.
+`cmclient-systemd.sh status` reports only unit state. There is no separate
+system-service data root or Control token. If Management Web is disabled, use
+local command mode only; a configured LAN listener uses Web authentication
+instead of exposing Control routes.
 
 `running` means Agent's child passed the Gateway health probe. A live process
 that fails the probe is `degraded`. Always record `version`, source `commit`,
@@ -95,8 +94,8 @@ retention task eventually removes terminal Jobs after the configured window.
 `cmclient update` reports Agent journal state; `cmclient update --follow` reads
 the private update SSE. The public Gateway has no update trigger. Agent alone
 verifies the signed manifest before network staging, checks exact bytes and
-SHA-256, snapshots data/config, installs a digest-named release, migrates, and
-health-checks it. An interruption in a mutation phase first records durable
+SHA-256, snapshots non-secret state below `~/.cmclient`, installs a digest-named
+release, migrates, and health-checks it. An interruption in a mutation phase first records durable
 `rolling_back`, restores the backup and active pointer, and exposes a stable
 failure code. Do not delete the journal or staging directory while recovering.
 
@@ -114,12 +113,12 @@ cmclient-migrate settings \
   --dry-run
 cmclient-migrate settings \
   --source /absolute/legacy/client-preferences.json \
-  --write-agent-config /absolute/new-config/agent.toml
+  --write-agent-config "$HOME/.cmclient/config.toml"
 cmclient-migrate data import \
   --source-dir /absolute/legacy \
-  --target-database /absolute/data/cmclient.sqlite \
+  --target-database "$HOME/.cmclient/cmclient.db" \
   --mesh-network-id local-mesh \
-  --backup-dir /absolute/backups
+  --backup-dir "$HOME/.cmclient/backups"
 ```
 
 Stop Gateway, then repeat the data import with `--apply` and the explicit stop
@@ -128,24 +127,25 @@ confirmation. The JSON report names the backup required for rollback:
 ```bash
 cmclient-migrate data import \
   --source-dir /absolute/legacy \
-  --target-database /absolute/data/cmclient.sqlite \
+  --target-database "$HOME/.cmclient/cmclient.db" \
   --mesh-network-id local-mesh \
-  --backup-dir /absolute/backups \
+  --backup-dir "$HOME/.cmclient/backups" \
   --apply --confirm-gateway-stopped
 cmclient-migrate data rollback \
-  --target-database /absolute/data/cmclient.sqlite \
-  --backup-database /absolute/backups/filename-from-backupFile-field.sqlite \
+  --target-database "$HOME/.cmclient/cmclient.db" \
+  --backup-database "$HOME/.cmclient/backups/filename-from-backupFile-field.sqlite" \
   --confirm-gateway-stopped
 ```
 
-The settings writer is create-only. Keep backups outside the target tree and
+The settings writer is create-only. Keep migration backups in the canonical
+`~/.cmclient/backups` directory, never beside or over the live database, and
 verify each JSON report before starting Agent.
 
 ## Common stable codes
 
 | Code | Meaning | First action |
 | --- | --- | --- |
-| `AGENT_INSTANCE_ALREADY_RUNNING` | Another Agent owns the data-dir lock | Inspect the existing service; do not delete the lock while it runs |
+| `AGENT_INSTANCE_ALREADY_RUNNING` | Another Agent owns `~/.cmclient/run/agent.lock` | Inspect the existing process; do not delete the lock while it runs |
 | `AGENT_CONFIG_INVALID` | Strict TOML or path validation failed | Run `cmclient-agent --check-config` and fix the named section |
 | `AGENT_INSTANCE_STATE_INVALID` | The bounded Agent instance-state document is malformed or has an unsupported schema | Stop the Agent, preserve the file for diagnosis, and remove it only after confirming no Agent instance is running |
 | `GATEWAY_PROXY_UNAVAILABLE` | Agent cannot reach its supervised Gateway | Check Agent status, child logs, and Gateway health |
@@ -154,7 +154,6 @@ verify each JSON report before starting Agent.
 | `JOB_QUEUE_FULL` | Bounded Job queue is full | Wait for existing Jobs; do not submit an unbounded retry loop |
 | `JOB_INTERRUPTED_BY_RESTART` | A non-terminal Job was interrupted | Inspect the persisted Job; resubmit only if its operation is safe |
 | `UPDATE_ROLLBACK_FAILED` | Update recovery did not complete | Preserve the journal/backups and stop automatic retries |
-| `REMOTE_CONTROL_NONCE_REPLAY` | HMAC nonce was already used | Generate a fresh nonce and check clock synchronization |
 | `unavailable_in_docker` | Native-only capability is unavailable in Docker | Use the applicable native mode or the Docker operator workflow |
 
 Never “fix” a stable error by weakening validation, exposing a raw Gateway

@@ -151,7 +151,8 @@ describe("Gateway production runtime configuration", () => {
       CMCLIENT_BUILD_COMMIT: "a".repeat(40),
       CMCLIENT_BUILD_TREE: "b".repeat(40),
       CMCLIENT_QUALIFICATION_STAGE: "windows-source-smoke",
-      CMCLIENT_DATA_DIR: directory,
+      CMCLIENT_TEST_MODE: "1",
+      CMCLIENT_RUNTIME_ROOT: directory,
     };
     try {
       await expect(

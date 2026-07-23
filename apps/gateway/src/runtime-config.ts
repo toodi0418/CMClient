@@ -234,7 +234,7 @@ function createPhysicalWriteGuard(
       "PHYSICAL_PROFILE_CONFIGURATION_INVALID",
     );
   }
-  const dataDirectory = environment.CMCLIENT_DATA_DIR?.trim();
+  const dataDirectory = environment.CMCLIENT_RUNTIME_ROOT?.trim();
   const sourceCommit = environment.CMCLIENT_BUILD_COMMIT?.trim();
   const sourceTree = environment.CMCLIENT_BUILD_TREE?.trim();
   const stage = environment.CMCLIENT_QUALIFICATION_STAGE?.trim();

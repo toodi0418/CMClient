@@ -204,8 +204,8 @@ mod service {
             1,
         )?;
 
-        let runtime_root = program_data_directory();
-        let mut agent = match start_agent(&runtime_root) {
+        let runtime_home = effective_home_directory()?;
+        let mut agent = match start_agent(&runtime_home) {
             Ok(agent) => agent,
             Err(error) => {
                 report_stopped(&status_handle, ServiceExitCode::Win32(1))?;
@@ -238,7 +238,7 @@ mod service {
                         ServiceControlAccept::empty(),
                         1,
                     )?;
-                    stop_agent(&mut agent, &runtime_root)?;
+                    stop_agent(&mut agent, &runtime_home)?;
                     agent.write_code("WINDOWS_SERVICE_AGENT_STOPPED");
                     break;
                 }
@@ -329,12 +329,12 @@ mod service {
     }
 
     fn initialize_service_log(
-        root: &Path,
+        home: &Path,
         policy: Result<LogPolicy, RuntimeLogError>,
     ) -> io::Result<StructuredLogSink> {
         let policy = policy.map_err(runtime_log_io_error)?;
         let log = StructuredLogSink::open(
-            root.join("logs"),
+            home.join(".cmclient").join("logs"),
             "service-host.jsonl",
             "service-host",
             policy,
@@ -349,23 +349,19 @@ mod service {
         Ok(log)
     }
 
-    fn spawn_agent_process(root: &Path, agent: &Path) -> io::Result<Child> {
+    fn spawn_agent_process(home: &Path, agent: &Path) -> io::Result<Child> {
         let mut command = Command::new(agent);
         command
             .arg("--serve")
-            .env("HOME", root.join("home"))
-            .env("USERPROFILE", root.join("home"))
-            .env("CMCLIENT_DATA_DIR", root.join("data"))
-            .env("CMCLIENT_CONFIG_DIR", root.join("config"))
-            .env("CMCLIENT_CACHE_DIR", root.join("cache"))
-            .env("CMCLIENT_LOG_DIR", root.join("logs"))
+            .env("HOME", home)
+            .env("USERPROFILE", home)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.spawn()
     }
 
-    fn stop_agent(agent: &mut ManagedAgent, runtime_root: &std::path::Path) -> io::Result<()> {
+    fn stop_agent(agent: &mut ManagedAgent, home: &std::path::Path) -> io::Result<()> {
         let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
         let mut graceful_requested = false;
         while Instant::now() < deadline {
@@ -374,7 +370,7 @@ mod service {
                 return Ok(());
             }
             if !graceful_requested {
-                let endpoint = default_local_endpoint(&runtime_root.join("data"));
+                let endpoint = default_local_endpoint(&home.join(".cmclient").join("run"));
                 graceful_requested =
                     run_before_deadline(deadline, CONTROL_REQUEST_TIMEOUT, move |timeout| {
                         ControlClient::new_with_timeout(endpoint, timeout)
@@ -409,12 +405,11 @@ mod service {
         io::Error::other(error.code())
     }
 
-    fn program_data_directory() -> PathBuf {
-        std::env::var_os("PROGRAMDATA")
+    fn effective_home_directory() -> io::Result<PathBuf> {
+        std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join("CMClient")
+            .ok_or_else(|| io::Error::other("WINDOWS_SERVICE_HOME_UNAVAILABLE"))
     }
 
     #[cfg(test)]
@@ -433,7 +428,7 @@ mod service {
                 "cmclient-service-host-quota-{}-{sequence}",
                 std::process::id()
             ));
-            let log_dir = root.join("logs");
+            let log_dir = root.join(".cmclient").join("logs");
             let policy = LogPolicy {
                 max_bytes: MIN_LOG_MAX_BYTES,
                 retained_files: 1,
@@ -483,8 +478,12 @@ mod service {
                 .expect("invalid policy should fail");
             assert_eq!(policy_error.to_string(), "RUNTIME_LOG_POLICY_INVALID");
 
-            std::fs::create_dir_all(root.join("logs").join("service-host.jsonl"))
-                .expect("unsafe log fixture should create");
+            std::fs::create_dir_all(
+                root.join(".cmclient")
+                    .join("logs")
+                    .join("service-host.jsonl"),
+            )
+            .expect("unsafe log fixture should create");
             let open_error = initialize_service_log(&root, Ok(LogPolicy::default()))
                 .err()
                 .expect("unsafe log path should fail");

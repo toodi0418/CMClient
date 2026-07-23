@@ -1,9 +1,5 @@
 # Using CMClient
 
-> Historical P12 snapshot. Where this file conflicts with
-> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
-> history rather than the current install or release contract.
-
 The Management Web shell is a projection client. It does not open SQLite,
 operate a Meshtastic transport, or perform privileged lifecycle work directly.
 
@@ -32,10 +28,10 @@ disabled (`not_enabled`) and has no send action in this RC.
 
 Desktop is a small Tauri client of the local Control API. Its red, yellow, and
 green window controls exit, minimize, and hide the Desktop application; they do
-not stop the Agent service or duplicate the Web application. A tray entry can
-reopen the Management Web URL returned by Agent. Native packages embed the
-complete portable runtime under `cmclient-runtime/`, but installation does not
-silently register or start a privileged Agent service.
+not stop the resident Agent or duplicate the Web application. A tray entry can
+reopen the Management Web URL returned by Agent. Each native package embeds the
+same Agent, Gateway, Web, CLI, and private pinned Node runtime. Login startup is
+a current-user setting and does not require a privileged Agent service.
 
 ## CLI essentials
 
@@ -63,25 +59,25 @@ Exit codes are documented in the [CLI contract](../api/cli.md).
 `events` and the host service manager's logs for operational output. The Web
 Logs area instead keeps at most 50 events from the current browser SSE session.
 
-Secrets are read from standard input and never appear in shell history:
+The CallMesh key is read from standard input and sent over local Control IPC;
+it never appears in the command line or shell history:
 
 ```bash
-printf '%s\n' "$CALLMESH_KEY" | cmclient secret set callmesh-api-key
+cmclient secret set callmesh-api-key
 cmclient secret remove aprs-passcode # cleanup for upgraded installations only
 cmclient secret remove management-admin-token
 ```
 
-CallMesh provisions the APRS callsign, symbol, and comment; Gateway derives the
-runtime passcode locally. CMClient does not accept a static APRS passcode; a
-`secret set` attempt for the legacy name fails with
-`CLI_SECRET_KIND_DEPRECATED`. The removal command above
-remains so an upgrade can delete a value stored by an older release.
+Agent atomically stores the value only in `~/.cmclient/secrets.json`; CLI and
+Desktop never open that file. CallMesh provisions the APRS callsign, symbol,
+and comment, and Gateway derives the runtime passcode locally. CMClient does
+not accept a static APRS passcode or a persisted Control token. A `secret set`
+attempt for either legacy name fails with `CLI_SECRET_KIND_DEPRECATED`; removal
+remains only so an upgraded installation can delete obsolete data.
 
-For remote control, provision `management-admin-token` in the Agent's secret
-store, then provide the same value to the remote CLI only through that calling
-process's `CMCLIENT_CONTROL_TOKEN` environment variable. The CLI signs each
-request with the nonce/timestamp HMAC contract; it does not accept a token
-option or follow redirects.
+CLI and Desktop control only the same user's local Agent endpoint. Remote
+administration uses the authenticated Management Web session and never shares
+a Control credential with command mode.
 
 ## Theme, language, and limits
 

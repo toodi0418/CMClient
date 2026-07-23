@@ -73,15 +73,15 @@ export interface CallMeshClientOptions {
   sleep?: (delayMs: number) => Promise<void>;
 }
 
-export function callMeshOptionsFromEnvironment(
+export function callMeshOptionsFromRuntime(
   environment: NodeJS.ProcessEnv,
   version: string,
+  callMeshApiKey?: string,
 ): CallMeshClientOptions {
   const baseUrl = environment.CMCLIENT_CALLMESH_URL?.trim();
-  const apiKey = environment.CMCLIENT_CALLMESH_API_KEY;
   return {
     ...(baseUrl ? { baseUrl } : {}),
-    ...(apiKey ? { apiKey } : {}),
+    ...(callMeshApiKey !== undefined ? { apiKey: callMeshApiKey } : {}),
     agent: buildCallMeshAgent(version),
     meshNetworkId: environment.CMCLIENT_MESH_NETWORK_ID?.trim() || "default",
   };
@@ -1318,10 +1318,17 @@ function hasControlCharacter(value: string): boolean {
 }
 
 function validateApiKey(value: string | undefined): string | undefined {
-  if (value === undefined || !value.trim()) {
+  if (value === undefined) {
     return undefined;
   }
-  return boundedText(value, 4_096, "CALLMESH_CONFIGURATION_INVALID");
+  if (
+    value.length === 0 ||
+    Buffer.byteLength(value, "utf8") > 4_096 ||
+    hasControlCharacter(value)
+  ) {
+    throw new CallMeshClientError("CALLMESH_CONFIGURATION_INVALID");
+  }
+  return value;
 }
 
 async function readBoundedResponse(response: Response): Promise<string> {

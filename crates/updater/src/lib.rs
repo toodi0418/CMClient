@@ -824,14 +824,17 @@ pub fn read_active_release(
 }
 
 fn validate_install_request(request: &UpdateInstallRequest<'_>) -> Result<(), UpdateInstallError> {
+    let canonical_runtime_layout = request.data_dir == request.config_dir
+        && request.backup_root == request.data_dir.join("backups");
+    let backup_overlaps_runtime = request.backup_root.starts_with(request.data_dir)
+        || request.backup_root.starts_with(request.config_dir);
     if request.maximum_unpacked_bytes == 0
         || !request.installation_root.is_absolute()
         || !request.data_dir.is_absolute()
         || !request.config_dir.is_absolute()
         || !request.backup_root.is_absolute()
         || !is_safe_backup_id(request.backup_id)
-        || request.backup_root.starts_with(request.data_dir)
-        || request.backup_root.starts_with(request.config_dir)
+        || (backup_overlaps_runtime && !canonical_runtime_layout)
     {
         return Err(UpdateInstallError::InvalidInstallLayout);
     }
@@ -1027,8 +1030,10 @@ fn create_backup(request: &UpdateInstallRequest<'_>) -> Result<PathBuf, UpdateIn
     }
     fs::create_dir(&temporary).map_err(|_| UpdateInstallError::BackupFailed)?;
     let copy_result = (|| {
-        copy_directory(request.data_dir, &temporary.join("data"))?;
-        copy_directory(request.config_dir, &temporary.join("config"))?;
+        copy_runtime_backup_directory(request.data_dir, &temporary.join("data"))?;
+        if request.config_dir != request.data_dir {
+            copy_runtime_backup_directory(request.config_dir, &temporary.join("config"))?;
+        }
         Ok(())
     })();
     if let Err(error) = copy_result {
@@ -1042,6 +1047,46 @@ fn create_backup(request: &UpdateInstallRequest<'_>) -> Result<PathBuf, UpdateIn
         return Err(UpdateInstallError::BackupFailed);
     }
     Ok(backup_path)
+}
+
+fn copy_runtime_backup_directory(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), UpdateInstallError> {
+    let metadata = fs::symlink_metadata(source).map_err(|_| UpdateInstallError::BackupFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    fs::create_dir(destination).map_err(|_| UpdateInstallError::BackupFailed)?;
+    for entry in fs::read_dir(source).map_err(|_| UpdateInstallError::BackupFailed)? {
+        let entry = entry.map_err(|_| UpdateInstallError::BackupFailed)?;
+        let name = entry.file_name();
+        if is_protected_runtime_leaf(&name) {
+            continue;
+        }
+        let source_path = entry.path();
+        let destination_path = destination.join(&name);
+        let metadata =
+            fs::symlink_metadata(&source_path).map_err(|_| UpdateInstallError::BackupFailed)?;
+        if metadata.file_type().is_symlink() {
+            return Err(UpdateInstallError::BackupFailed);
+        }
+        if metadata.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            copy_backup_file(&source_path, &destination_path)?;
+        } else {
+            return Err(UpdateInstallError::BackupFailed);
+        }
+    }
+    Ok(())
+}
+
+fn is_protected_runtime_leaf(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some("secrets.json" | "run" | "updates" | "cache" | "logs" | "backups")
+    )
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<(), UpdateInstallError> {
@@ -1136,13 +1181,92 @@ pub fn rollback_update(plan: &UpdateRollbackPlan) -> Result<(), UpdateInstallErr
     {
         return Err(UpdateInstallError::InvalidInstallLayout);
     }
-    restore_backup_directory(&plan.backup_path.join("data"), &plan.data_dir)?;
-    if plan.config_dir != plan.data_dir {
+    if plan.config_dir == plan.data_dir {
+        restore_canonical_runtime_backup(&plan.backup_path.join("data"), &plan.data_dir)?;
+    } else {
+        restore_backup_directory(&plan.backup_path.join("data"), &plan.data_dir)?;
         restore_backup_directory(&plan.backup_path.join("config"), &plan.config_dir)?;
     }
     match &plan.previous_active_release {
         Some(active_release) => set_active_release(&plan.installation_root, active_release),
         None => clear_active_release(&plan.installation_root),
+    }
+}
+
+fn restore_canonical_runtime_backup(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), UpdateInstallError> {
+    let destination_metadata =
+        fs::symlink_metadata(destination).map_err(|_| UpdateInstallError::BackupFailed)?;
+    if destination_metadata.file_type().is_symlink() || !destination_metadata.is_dir() {
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    let parent = destination
+        .parent()
+        .ok_or(UpdateInstallError::BackupFailed)?;
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or(UpdateInstallError::BackupFailed)?;
+    let staging = parent.join(format!(".{name}.restore-items-{}", std::process::id()));
+    if staging.exists() {
+        return Err(UpdateInstallError::BackupFailed);
+    }
+    copy_runtime_backup_directory(source, &staging)?;
+
+    let restore_result = (|| {
+        let entries = fs::read_dir(&staging)
+            .map_err(|_| UpdateInstallError::BackupFailed)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| UpdateInstallError::BackupFailed)?;
+        for (index, entry) in entries.into_iter().enumerate() {
+            let leaf_name = entry.file_name();
+            if is_protected_runtime_leaf(&leaf_name) {
+                continue;
+            }
+            let staged_path = entry.path();
+            let destination_path = destination.join(&leaf_name);
+            let previous = parent.join(format!(
+                ".{name}.previous-item-{}-{index}",
+                std::process::id()
+            ));
+            if previous.exists() {
+                return Err(UpdateInstallError::BackupFailed);
+            }
+
+            let had_previous = destination_path.exists();
+            if had_previous && fs::rename(&destination_path, &previous).is_err() {
+                return Err(UpdateInstallError::BackupFailed);
+            }
+            if fs::rename(&staged_path, &destination_path).is_err() {
+                if had_previous {
+                    let _ = fs::rename(&previous, &destination_path);
+                }
+                return Err(UpdateInstallError::BackupFailed);
+            }
+            if had_previous {
+                remove_backup_entry(&previous)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = restore_result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    fs::remove_dir(&staging).map_err(|_| UpdateInstallError::BackupFailed)
+}
+
+fn remove_backup_entry(path: &Path) -> Result<(), UpdateInstallError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| UpdateInstallError::BackupFailed)?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path).map_err(|_| UpdateInstallError::BackupFailed)
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path).map_err(|_| UpdateInstallError::BackupFailed)
+    } else {
+        Err(UpdateInstallError::BackupFailed)
     }
 }
 
@@ -1870,10 +1994,10 @@ mod tests {
         fs::create_dir_all(&config_dir).unwrap();
         fs::create_dir_all(backup_path.join("data")).unwrap();
         fs::create_dir_all(backup_path.join("config")).unwrap();
-        fs::write(data_dir.join("gateway.sqlite"), b"new database").unwrap();
-        fs::write(config_dir.join("agent.toml"), b"new config").unwrap();
-        fs::write(backup_path.join("data/gateway.sqlite"), b"old database").unwrap();
-        fs::write(backup_path.join("config/agent.toml"), b"old config").unwrap();
+        fs::write(data_dir.join("cmclient.db"), b"new database").unwrap();
+        fs::write(config_dir.join("config.toml"), b"new config").unwrap();
+        fs::write(backup_path.join("data/cmclient.db"), b"old database").unwrap();
+        fs::write(backup_path.join("config/config.toml"), b"old config").unwrap();
         set_active_release(
             &installation_root,
             &ActiveRelease {
@@ -2191,10 +2315,13 @@ mod tests {
         let data_dir = root.join("data");
         let config_dir = root.join("config");
         let backup_root = root.join("backups");
-        fs::create_dir_all(data_dir.join("sqlite")).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
         fs::create_dir_all(&config_dir).unwrap();
-        fs::write(data_dir.join("sqlite/gateway.sqlite"), b"database").unwrap();
-        fs::write(config_dir.join("agent.toml"), b"[agent]\n").unwrap();
+        fs::write(data_dir.join("cmclient.db"), b"database").unwrap();
+        fs::write(data_dir.join("secrets.json"), b"must-not-enter-backup").unwrap();
+        fs::create_dir_all(data_dir.join("run")).unwrap();
+        fs::write(data_dir.join("run/agent.lock"), b"").unwrap();
+        fs::write(config_dir.join("config.toml"), b"[agent]\n").unwrap();
         let mut lifecycle = RecordingLifecycle::healthy();
 
         let installed = install_verified_release(
@@ -2215,13 +2342,15 @@ mod tests {
             b"new agent"
         );
         assert_eq!(
-            fs::read(installed.backup_path.join("data/sqlite/gateway.sqlite")).unwrap(),
+            fs::read(installed.backup_path.join("data/cmclient.db")).unwrap(),
             b"database"
         );
         assert_eq!(
-            fs::read(installed.backup_path.join("config/agent.toml")).unwrap(),
+            fs::read(installed.backup_path.join("config/config.toml")).unwrap(),
             b"[agent]\n"
         );
+        assert!(!installed.backup_path.join("data/secrets.json").exists());
+        assert!(!installed.backup_path.join("data/run").exists());
         assert_eq!(
             read_active_release(&installation_root).unwrap(),
             Some(ActiveRelease {
@@ -2230,6 +2359,58 @@ mod tests {
                 bundle_sha256: staged.sha256.clone(),
             })
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installs_with_one_canonical_runtime_snapshot_and_excludes_protected_leaves() {
+        let root = stage_directory("canonical-install-transaction");
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("release.tar.zst");
+        write_tar_zst(&archive_path, &[("bin/cmclient-agent", b"new agent")]);
+        let staged = staged_archive(&archive_path, UpdateArchive::TarZst);
+        let installation_root = root.join("install");
+        let runtime_root = root.join(".cmclient");
+        let backup_root = runtime_root.join("backups");
+        fs::create_dir_all(runtime_root.join("run")).unwrap();
+        fs::create_dir_all(runtime_root.join("updates")).unwrap();
+        fs::create_dir_all(runtime_root.join("cache")).unwrap();
+        fs::create_dir_all(runtime_root.join("logs")).unwrap();
+        fs::create_dir_all(backup_root.join("existing")).unwrap();
+        fs::write(runtime_root.join("cmclient.db"), b"database").unwrap();
+        fs::write(runtime_root.join("config.toml"), b"[agent]\n").unwrap();
+        fs::write(runtime_root.join("secrets.json"), b"secret").unwrap();
+        fs::write(runtime_root.join("run/agent.lock"), b"lock").unwrap();
+        fs::write(runtime_root.join("updates/staged"), b"update").unwrap();
+        fs::write(runtime_root.join("cache/download"), b"cache").unwrap();
+        fs::write(runtime_root.join("logs/agent.log"), b"log").unwrap();
+        fs::write(backup_root.join("existing/snapshot"), b"backup").unwrap();
+        let mut lifecycle = RecordingLifecycle::healthy();
+
+        let installed = install_verified_release(
+            &install_request(
+                &staged,
+                &installation_root,
+                &runtime_root,
+                &runtime_root,
+                &backup_root,
+            ),
+            &mut lifecycle,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(installed.backup_path.join("data/cmclient.db")).unwrap(),
+            b"database"
+        );
+        assert_eq!(
+            fs::read(installed.backup_path.join("data/config.toml")).unwrap(),
+            b"[agent]\n"
+        );
+        assert!(!installed.backup_path.join("config").exists());
+        for protected in ["secrets.json", "run", "updates", "cache", "logs", "backups"] {
+            assert!(!installed.backup_path.join("data").join(protected).exists());
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2375,16 +2556,93 @@ mod tests {
         rollback_update(&plan).unwrap();
 
         assert_eq!(
-            fs::read(plan.data_dir.join("gateway.sqlite")).unwrap(),
+            fs::read(plan.data_dir.join("cmclient.db")).unwrap(),
             b"old database"
         );
         assert_eq!(
-            fs::read(plan.config_dir.join("agent.toml")).unwrap(),
+            fs::read(plan.config_dir.join("config.toml")).unwrap(),
             b"old config"
         );
         assert_eq!(
             read_active_release(&plan.installation_root).unwrap(),
             plan.previous_active_release
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_rollback_restores_state_without_replacing_protected_leaves() {
+        let root = stage_directory("canonical-rollback");
+        let installation_root = root.join("install");
+        let runtime_root = root.join(".cmclient");
+        let backup_path = runtime_root.join("backups/backup-1");
+        let backup_data = backup_path.join("data");
+        fs::create_dir_all(backup_data.join("run")).unwrap();
+        fs::create_dir_all(backup_data.join("updates")).unwrap();
+        fs::create_dir_all(backup_data.join("cache")).unwrap();
+        fs::create_dir_all(backup_data.join("logs")).unwrap();
+        fs::create_dir_all(backup_data.join("backups")).unwrap();
+        fs::write(backup_data.join("cmclient.db"), b"old database").unwrap();
+        fs::write(backup_data.join("config.toml"), b"old config").unwrap();
+        fs::write(backup_data.join("secrets.json"), b"old secret").unwrap();
+        fs::write(backup_data.join("run/agent.lock"), b"old lock").unwrap();
+        fs::write(backup_data.join("updates/staged"), b"old update").unwrap();
+        fs::write(backup_data.join("cache/download"), b"old cache").unwrap();
+        fs::write(backup_data.join("logs/agent.log"), b"old log").unwrap();
+        fs::write(backup_data.join("backups/snapshot"), b"old backup").unwrap();
+
+        fs::create_dir_all(runtime_root.join("run")).unwrap();
+        fs::create_dir_all(runtime_root.join("updates")).unwrap();
+        fs::create_dir_all(runtime_root.join("cache")).unwrap();
+        fs::create_dir_all(runtime_root.join("logs")).unwrap();
+        fs::write(runtime_root.join("cmclient.db"), b"new database").unwrap();
+        fs::write(runtime_root.join("config.toml"), b"new config").unwrap();
+        fs::write(runtime_root.join("secrets.json"), b"current secret").unwrap();
+        fs::write(runtime_root.join("run/agent.lock"), b"current lock").unwrap();
+        fs::write(runtime_root.join("updates/staged"), b"current update").unwrap();
+        fs::write(runtime_root.join("cache/download"), b"current cache").unwrap();
+        fs::write(runtime_root.join("logs/agent.log"), b"current log").unwrap();
+        let plan = UpdateRollbackPlan {
+            installation_root,
+            data_dir: runtime_root.clone(),
+            config_dir: runtime_root.clone(),
+            backup_path: backup_path.clone(),
+            previous_active_release: None,
+        };
+
+        rollback_update(&plan).unwrap();
+
+        assert_eq!(
+            fs::read(runtime_root.join("cmclient.db")).unwrap(),
+            b"old database"
+        );
+        assert_eq!(
+            fs::read(runtime_root.join("config.toml")).unwrap(),
+            b"old config"
+        );
+        assert_eq!(
+            fs::read(runtime_root.join("secrets.json")).unwrap(),
+            b"current secret"
+        );
+        assert_eq!(
+            fs::read(runtime_root.join("run/agent.lock")).unwrap(),
+            b"current lock"
+        );
+        assert_eq!(
+            fs::read(runtime_root.join("updates/staged")).unwrap(),
+            b"current update"
+        );
+        assert_eq!(
+            fs::read(runtime_root.join("cache/download")).unwrap(),
+            b"current cache"
+        );
+        assert_eq!(
+            fs::read(runtime_root.join("logs/agent.log")).unwrap(),
+            b"current log"
+        );
+        assert_eq!(
+            fs::read(backup_path.join("data/cmclient.db")).unwrap(),
+            b"old database"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -2419,7 +2677,7 @@ mod tests {
         );
         assert_eq!(store.load().unwrap(), Some(recovered));
         assert_eq!(
-            fs::read(plan.data_dir.join("gateway.sqlite")).unwrap(),
+            fs::read(plan.data_dir.join("cmclient.db")).unwrap(),
             b"old database"
         );
         let _ = fs::remove_dir_all(root);

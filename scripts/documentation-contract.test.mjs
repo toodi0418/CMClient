@@ -277,31 +277,68 @@ test("rejects a Windows service name override that production does not support",
   });
 });
 
-test("rejects service endpoint and remote token boundary documentation drift", async () => {
+test("rejects unified home and removed remote token boundary drift", async () => {
   await withFixture(async (root) => {
     await replaceInFile(
       root,
       "docs/admin/configuration-security.md",
-      "unix:///var/lib/cmclient/control.sock",
-      "unix:///tmp/cmclient.sock",
+      "~/.cmclient/secrets.json",
+      "~/.cmclient/other-secrets.json",
     );
     await replaceInFile(
       root,
       "docs/admin/configuration-security.md",
-      "32 through 4096 UTF-8 bytes",
-      "an unspecified number of bytes",
+      "deprecated and unavailable",
+      "supported for remote CLI use",
     );
 
     const errors = await checkDocumentation(root);
     assert.ok(
       errors.includes(
-        "required documentation content is missing: docs/admin/configuration-security.md -> unix:///var/lib/cmclient/control.sock",
+        "required documentation content is missing: docs/admin/configuration-security.md -> ~/.cmclient/secrets.json",
       ),
       errors.join("\n"),
     );
     assert.ok(
       errors.includes(
-        "required documentation content is missing: docs/admin/configuration-security.md -> 32 through 4096 UTF-8 bytes",
+        "required documentation content is missing: docs/admin/configuration-security.md -> deprecated and unavailable",
+      ),
+      errors.join("\n"),
+    );
+  });
+});
+
+test("rejects obsolete split roots in current runtime documentation", async () => {
+  await withFixture(async (root) => {
+    const relativePath = "docs/user/using-cmclient.md";
+    const path = join(root, relativePath);
+    const source = await readFile(path, "utf8");
+    await writeFile(path, `${source}\nLegacy runtime root: /etc/cmclient.\n`);
+
+    const errors = await checkDocumentation(root);
+    assert.ok(
+      errors.includes(
+        `current runtime documentation contains obsolete claim: ${relativePath} -> /etc/cmclient`,
+      ),
+      errors.join("\n"),
+    );
+  });
+});
+
+test("rejects the removed remote Control token flow", async () => {
+  await withFixture(async (root) => {
+    const relativePath = "docs/api/cli.md";
+    const path = join(root, relativePath);
+    const source = await readFile(path, "utf8");
+    await writeFile(
+      path,
+      `${source}\nFor remote CLI access, use the same value through the \`CMCLIENT_CONTROL_TOKEN\` environment variable.\n`,
+    );
+
+    const errors = await checkDocumentation(root);
+    assert.ok(
+      errors.includes(
+        `current runtime documentation contains obsolete remote token flow: ${relativePath}`,
       ),
       errors.join("\n"),
     );

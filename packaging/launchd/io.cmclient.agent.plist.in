@@ -15,18 +15,6 @@
   <dict>
     <key>HOME</key>
     <string>@HOME_DIRECTORY@</string>
-    <key>CMCLIENT_AGENT_CONFIG</key>
-    <string>@CONFIG_DIR@/agent.toml</string>
-    <key>CMCLIENT_DATA_DIR</key>
-    <string>@DATA_DIR@</string>
-    <key>CMCLIENT_CONFIG_DIR</key>
-    <string>@CONFIG_DIR@</string>
-    <key>CMCLIENT_CACHE_DIR</key>
-    <string>@CACHE_DIR@</string>
-    <key>CMCLIENT_LOG_DIR</key>
-    <string>@LOG_DIR@</string>
-@PLAINTEXT_SECRET_FILE_KEY@
-@PLAINTEXT_SECRET_FILE_VALUE@
   </dict>
   <key>RunAtLoad</key>
   <true/>

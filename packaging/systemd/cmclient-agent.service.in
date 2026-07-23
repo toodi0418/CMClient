@@ -12,14 +12,7 @@ User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 @SUPPLEMENTARY_GROUP_LINE@
 WorkingDirectory=@WORKING_DIRECTORY@
-Environment="HOME=@DATA_DIR@"
-Environment="CMCLIENT_AGENT_CONFIG=@CONFIG_DIR@/agent.toml"
-Environment="CMCLIENT_DATA_DIR=@DATA_DIR@"
-Environment="CMCLIENT_CONFIG_DIR=@CONFIG_DIR@"
-Environment="CMCLIENT_CACHE_DIR=@CACHE_DIR@"
-Environment="CMCLIENT_LOG_DIR=@LOG_DIR@"
-Environment="CMCLIENT_SYSTEMD_SECRET_STORE=1"
-LoadCredential=cmclient-secret-store-key:@SECRET_STORE_KEY@
+Environment="HOME=@HOME_DIRECTORY@"
 ExecStartPre=@AGENT_BINARY@ --check-config
 ExecStart=@AGENT_BINARY@ --serve
 Restart=on-failure
@@ -30,7 +23,7 @@ UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -41,7 +34,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadWritePaths=@DATA_DIR@ @CACHE_DIR@ @LOG_DIR@
+ReadWritePaths=@RUNTIME_ROOT@
 
 [Install]
 WantedBy=multi-user.target

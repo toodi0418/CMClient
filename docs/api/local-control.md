@@ -1,11 +1,11 @@
 # Local Agent Control API
 
 The authoritative Agent Control endpoint is always local IPC, not the public
-Gateway Business API: a mode-`0600` socket at `<data-dir>/control.sock` on Unix
-or `\\.\pipe\cmclient-control` on Windows. Windows uses the service account's
-named-pipe security descriptor and never falls back to TCP. This layer does not
-bind a LAN address; the optional HTTPS bridge below authenticates requests and
-forwards them to this local endpoint.
+Gateway Business API: a mode-`0600` socket below `~/.cmclient/run` on macOS and
+Linux, `/home/cmclient/.cmclient/run` in Docker, or
+`\\.\pipe\cmclient-control` on Windows. Windows disables remote named-pipe
+clients. Control never falls back to TCP or an HTTPS bridge, and CLI and
+Desktop use only the current user's private endpoint.
 
 The Control routes are:
 
@@ -30,16 +30,15 @@ GET /api/v1/control/events/recent
 GET /api/v1/control/events
 POST /api/v1/control/database/integrity-check
 POST /api/v1/control/backups
-PUT /api/v1/control/secrets/{callmesh-api-key|management-admin-token}
-PUT /api/v1/control/secrets/aprs-passcode (deprecated; always 410)
+PUT /api/v1/control/secrets/callmesh-api-key
+PUT /api/v1/control/secrets/{aprs-passcode|management-admin-token} (deprecated; always 410)
 DELETE /api/v1/control/secrets/{callmesh-api-key|aprs-passcode|management-admin-token}
 ```
 
 Local IPC exposes every route above, including `agent/shutdown` and secret
-storage. The authenticated HTTPS bridge exposes status, lifecycle, Web,
-updates, diagnostics, Gateway projections, events, Jobs, and secret routes but
-deliberately does not forward `POST /api/v1/control/agent/shutdown`. Shutdown
-is local-only so a remote browser or CLI cannot terminate the host Agent.
+storage. No browser or network listener exposes these routes. Management Web
+uses its session, Origin, and CSRF boundary instead of forwarding raw Control
+requests, and no remote browser or CLI can terminate the host Agent.
 
 Control routes use exact method/path matching. Query strings are not accepted;
 an unmatched method or path returns the code-only
@@ -70,8 +69,8 @@ bounded server-side read/write deadlines. Excess clients receive the stable
 its slot.
 
 `POST /api/v1/control/agent/shutdown` is reserved for local IPC and the Windows
-Service Host. It requests one terminal Agent teardown and is not forwarded by
-the authenticated HTTPS bridge. Agent stops the supervisor worker,
+Service Host. It requests one terminal Agent teardown and is not exposed by
+Management Web or any network listener. Agent stops the supervisor worker,
 cooperatively drains Gateway, and closes Management Web before exiting.
 Once terminal teardown is requested, resource-starting commands (`start`,
 `restart`, and `web/enable`) fail with `CONTROL_COMMAND_FAILED`; status and
@@ -117,47 +116,26 @@ reading `/updates` before subscribing again.
 runtime state. It contains stable error/log codes but never paths, config,
 environment, database content, packet data, credentials, or log payloads.
 
-The secret routes never pass through Gateway. `PUT` accepts a single UTF-8 value
-in its request body (maximum 4096 bytes, no control characters) and stores it in
-the Agent-selected secret backend. `aprs-passcode` is the one removal-only
-legacy name: local and remote `PUT` return HTTP 410 with
-`CONTROL_SECRET_KIND_DEPRECATED` without dispatching the value, while `DELETE`
-removes any value left by an older installation. Interactive sessions normally use the
-platform credential store; controlled Unix/macOS field runtimes can instead
-select a strict external `0600` plaintext file with
-`CMCLIENT_PLAINTEXT_SECRET_FILE`. The packaged systemd service uses its
-`LoadCredential` wrapping key and authenticated private ciphertext vault. The response is only
-`{ "stored": true }`; secret values are never returned. `DELETE` removes a
-named value and returns whether a value existed. CLI users should use
-`cmclient secret set <kind>` with standard input rather than constructing these
-requests by hand. Local IPC protects the body with OS permissions; the optional
-remote bridge additionally requires TLS and the HMAC control authorization
-described below.
+## Secret boundary
 
-## Authenticated HTTPS bridge
+Secret routes never pass through Gateway. `PUT` accepts one bounded UTF-8 value
+without control characters. `callmesh-api-key` is the only settable runtime
+kind. `aprs-passcode` and `management-admin-token` are removal-only compatibility
+names: `PUT` returns HTTP 410 with `CONTROL_SECRET_KIND_DEPRECATED` without
+dispatching the value, while `DELETE` removes any value left by an older
+installation.
 
-When the opt-in Management LAN HTTPS listener is configured, the same
-`/api/v1/control/*` contract is available to the remote CLI. It is not
-authorized by the browser session cookie. Agent verifies every request with
-its Agent-selected `management-admin-token`; the remote CLI receives the same value
-through its own `CMCLIENT_CONTROL_TOKEN` process environment. The resulting
-HMAC-SHA-256 signature is bound to schema version, `control:admin` scope, Unix
-timestamp, random nonce, HTTP method, path, and SHA-256 body digest. Agent
-requires the four authentication headers, compares signatures in constant
-time, accepts only a 30-second clock window, and rejects nonce replay with a
-stable `REMOTE_CONTROL_*` code before forwarding to local IPC.
+Agent is the only owner of secret persistence. It atomically writes the sole
+backend, root-level `~/.cmclient/secrets.json` (or
+`/home/cmclient/.cmclient/secrets.json` in Docker). POSIX uses `0700` for the
+root and `0600` for the file; Windows uses an ordinary current-user file without
+UAC or a cross-principal ACL claim. There is no Keychain, Credential
+Manager/DPAPI, Secret Service, systemd vault, persisted Control token, or
+secret-bearing argv/environment path.
 
-```text
-Authorization: CMClient-HMAC <lowercase HMAC-SHA-256 hex>
-x-cmclient-timestamp: <Unix seconds>
-x-cmclient-nonce: <32 hexadecimal characters>
-x-cmclient-scope: control:admin
-```
-
-The signed bytes are the newline-delimited values `v1`, scope, timestamp,
-nonce, uppercase method, path, and lowercase SHA-256 body digest. Query strings
-and fragments are not accepted in a signed Control path.
-
-The remote listener exposes no plaintext variant. Browser static files remain
-public on the configured HTTPS origin, browser APIs retain session/CSRF/origin
-authorization, and remote Control routes retain their independent HMAC gate.
+The response is only `{ "stored": true }`; values are never returned. CLI
+users send a new CallMesh key over standard input with
+`cmclient secret set callmesh-api-key`, and the CLI never reads `secrets.json`.
+Agent transfers the key to a supervised Gateway only through its private
+inherited bootstrap channel. Local IPC permissions and bounded typed messages
+are the complete command-mode authorization boundary.

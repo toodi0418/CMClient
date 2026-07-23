@@ -29,10 +29,30 @@ const RESPONSE_HEADER_NAMES = [
 ];
 
 export function gatewayEnvironment(environment = process.env) {
+  const safeEnvironment = { ...environment };
+  for (const name of [
+    "CMCLIENT_DATA_DIR",
+    "CMCLIENT_CONFIG_DIR",
+    "CMCLIENT_CACHE_DIR",
+    "CMCLIENT_LOG_DIR",
+    "CMCLIENT_CALLMESH_API_KEY",
+    "CMCLIENT_APRS_PASSCODE",
+    "CMCLIENT_MANAGEMENT_ADMIN_TOKEN",
+    "CMCLIENT_CONTROL_TOKEN",
+    "CMCLIENT_PLAINTEXT_SECRET_FILE",
+    "CMCLIENT_SYSTEMD_SECRET_STORE",
+    "CREDENTIALS_DIRECTORY",
+  ]) {
+    delete safeEnvironment[name];
+  }
   return {
-    ...environment,
+    ...safeEnvironment,
     CMCLIENT_RUNTIME_PROFILE: "docker",
     CMCLIENT_PACKAGE_PROFILE: "oci",
+    HOME: "/home/cmclient",
+    CMCLIENT_RUNTIME_ROOT: "/home/cmclient/.cmclient",
+    CMCLIENT_DB_PATH: "/home/cmclient/.cmclient/cmclient.db",
+    CMCLIENT_BACKUP_DIR: "/home/cmclient/.cmclient/backups",
     CMCLIENT_GATEWAY_HOST: "0.0.0.0",
     CMCLIENT_GATEWAY_PORT: environment.CMCLIENT_GATEWAY_PORT?.trim() || "8081",
   };

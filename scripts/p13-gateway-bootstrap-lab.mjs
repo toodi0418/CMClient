@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 const CAPABILITY_HEADER = "x-cmclient-gateway-capability";
-const MAX_FRAME_BYTES = 4096;
+const MAX_FRAME_BYTES = 16 * 1024;
 const READY_TIMEOUT_MS = 15_000;
 
 export async function runGatewayBootstrapLab({ entrypoint, dataRoot }) {
@@ -208,7 +208,10 @@ function childEnvironment(dataRoot) {
   return {
     ...inherited,
     CMCLIENT_SUPERVISED: "1",
-    CMCLIENT_DATA_DIR: dataRoot,
+    CMCLIENT_QUALIFICATION_MODE: "1",
+    CMCLIENT_RUNTIME_ROOT: dataRoot,
+    CMCLIENT_DB_PATH: resolve(dataRoot, "cmclient.db"),
+    CMCLIENT_BACKUP_DIR: resolve(dataRoot, "backups"),
     CMCLIENT_BUILD_VERSION: "2.0.0-rc.1",
     CMCLIENT_BUILD_COMMIT: "a".repeat(40),
     CMCLIENT_BUILD_TREE: "b".repeat(40),

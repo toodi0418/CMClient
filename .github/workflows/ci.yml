@@ -208,7 +208,7 @@ jobs:
       - run: cargo build -p cmclient-desktop --locked
 
   windows-service-smoke:
-    name: Windows service and control-pipe smoke
+    name: Windows transitional service-host contract
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -226,89 +226,6 @@ jobs:
         run: |
           $rendered = powershell -NoProfile -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 render -HostPath 'C:\Program Files\CMClient\current\bin\cmclient-service-host.exe' | ConvertFrom-Json
           if ($rendered.serviceName -ne 'CMClientAgent' -or $rendered.storesCredentials) { throw 'Windows service render failed' }
-      - name: Exercise canonical Windows Service install, upgrade, start, and uninstall
-        shell: powershell
-        run: |
-          $serviceName = "CMClientAgent"
-          if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) { throw "WINDOWS_CANONICAL_SERVICE_NAME_IN_USE" }
-          $runIdentity = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $root = Join-Path $env:ProgramData "CMClientPackageSmoke-$runIdentity"
-          if (Test-Path -LiteralPath $root) { throw "WINDOWS_CI_PACKAGE_ROOT_EXISTS" }
-          $hostV1 = Join-Path $root "v1\cmclient-service-host.exe"
-          $hostV2 = Join-Path $root "v2\cmclient-service-host.exe"
-          $agentV1 = Join-Path $root "v1\cmclient-agent.exe"
-          $agentV2 = Join-Path $root "v2\cmclient-agent.exe"
-          $cliPath = Join-Path $PWD "target\debug\cmclient.exe"
-          $controlEndpoint = '\\.\pipe\cmclient-control'
-          $programDataRoot = Join-Path $env:ProgramData "CMClient"
-          $programDataBackup = "$programDataRoot.ci-backup-$runIdentity"
-          $programDataMoved = $false
-          $programDataIsolated = $false
-          $configFile = Join-Path $programDataRoot "config\agent.toml"
-          $state = Join-Path $programDataRoot "data\retained-state"
-          $sentinel = "must survive service lifecycle"
-          $manager = Join-Path $PWD "scripts\cmclient-windows-service.ps1"
-          if (Test-Path -LiteralPath $programDataBackup) { throw "WINDOWS_CI_STATE_BACKUP_EXISTS" }
-          try {
-            if (Test-Path -LiteralPath $programDataRoot) {
-              Move-Item -LiteralPath $programDataRoot -Destination $programDataBackup
-              $programDataMoved = $true
-            }
-            $programDataIsolated = $true
-            New-Item -ItemType Directory -Force (Split-Path $hostV1), (Split-Path $hostV2), (Split-Path $configFile), (Split-Path $state) | Out-Null
-            Copy-Item (Join-Path $PWD "target\debug\cmclient-service-host.exe") $hostV1
-            Copy-Item $hostV1 $hostV2
-            Copy-Item (Join-Path $PWD "target\debug\cmclient-agent.exe") $agentV1
-            Copy-Item $agentV1 $agentV2
-            [IO.File]::WriteAllText($configFile, "[agent]`nmanagement_web_enabled = false`n")
-            [IO.File]::WriteAllText($state, $sentinel)
-            & icacls.exe $root /grant '*S-1-5-19:(OI)(CI)RX' /T /C | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "WINDOWS_CI_PACKAGE_ACL_FAILED" }
-            & icacls.exe $programDataRoot /grant '*S-1-5-19:(OI)(CI)F' /T /C | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "WINDOWS_CI_STATE_ACL_FAILED" }
-            if (-not (Test-Path -LiteralPath $state -PathType Leaf) -or [IO.File]::ReadAllText($state) -ne $sentinel) { throw "Windows lifecycle retained-state fixture was not created" }
-
-            powershell -NoProfile -ExecutionPolicy Bypass -File $manager install -HostPath $hostV1 -NoStart
-            if ((Get-Service -Name $serviceName).Status -ne "Stopped") { throw "Windows service should not start in lifecycle smoke" }
-            powershell -NoProfile -ExecutionPolicy Bypass -File $manager install -HostPath $hostV2 -NoStart
-            $configuration = sc.exe qc $serviceName | Out-String
-            if ($configuration -notmatch [regex]::Escape($hostV2)) { throw "Windows service upgrade path was not applied" }
-
-            Start-Service -Name $serviceName
-            $controlStatus = $null
-            for ($attempt = 0; $attempt -lt 60 -and $null -eq $controlStatus; $attempt++) {
-              $statusJson = & $cliPath --json --endpoint $controlEndpoint status 2>$null
-              if ($LASTEXITCODE -eq 0) {
-                try {
-                  $candidate = $statusJson | ConvertFrom-Json
-                  if ($candidate.agent -eq "running" -and $candidate.managementWeb -eq "disabled") { $controlStatus = $candidate }
-                }
-                catch {}
-              }
-              if ($null -eq $controlStatus) { Start-Sleep -Milliseconds 500 }
-            }
-            if ($null -eq $controlStatus -or $controlStatus.agent -ne "running") { throw "WINDOWS_CANONICAL_SERVICE_CONTROL_PIPE_FAILED" }
-            if ((Get-Service -Name $serviceName).Status -ne "Running") { throw "WINDOWS_CANONICAL_SERVICE_NOT_RUNNING" }
-            $agent = Get-CimInstance Win32_Process -Filter "Name = 'cmclient-agent.exe'" |
-              Where-Object { $_.ExecutablePath -eq $agentV2 } |
-              Select-Object -First 1
-            if ($null -eq $agent -or $agent.ExecutablePath -ne $agentV2) { throw "WINDOWS_CANONICAL_SERVICE_ADJACENT_AGENT_INVALID" }
-
-            powershell -NoProfile -ExecutionPolicy Bypass -File $manager uninstall -HostPath $hostV2
-            for ($attempt = 0; $attempt -lt 10 -and (Get-Service -Name $serviceName -ErrorAction SilentlyContinue); $attempt++) { Start-Sleep -Milliseconds 250 }
-            if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) { throw "Windows service was not removed" }
-            if (-not (Test-Path -LiteralPath $state -PathType Leaf) -or [IO.File]::ReadAllText($state) -ne $sentinel) { throw "Windows service uninstall removed retained state" }
-          }
-          finally {
-            if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-              powershell -NoProfile -ExecutionPolicy Bypass -File $manager uninstall -HostPath $hostV2
-            }
-            Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
-            if ($programDataIsolated) {
-              Remove-Item -Recurse -Force $programDataRoot -ErrorAction SilentlyContinue
-              if ($programDataMoved) { Move-Item -LiteralPath $programDataBackup -Destination $programDataRoot }
-            }
-          }
 
   linux-systemd-smoke:
     name: Linux systemd 249 service and control-socket smoke
@@ -325,7 +242,7 @@ jobs:
           sudo apt-get install --yes libdbus-1-dev
       - name: Build the service Agent and control CLI
         run: cargo build -p cmclient-agent -p cmclient-cli --locked
-      - name: Exercise systemd LoadCredential and the dedicated Control socket
+      - name: Exercise canonical plaintext runtime and the dedicated Control socket
         run: |
           sudo env \
             CI=true \
