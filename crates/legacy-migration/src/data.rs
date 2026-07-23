@@ -1,7 +1,7 @@
 //! Explicit, offline migration of safe Legacy history into a prepared Gateway database.
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use fs2::FileExt;
+use cmclient_runtime_primitives::{ExclusiveFileLock, LockError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,7 +22,7 @@ const MAX_BACKUP_MANIFEST_BYTES: u64 = 64 * 1024;
 const LEGACY_OBSERVATION_JSON: &str = r#"{"schemaVersion":1,"kind":"other"}"#;
 
 struct MigrationLock {
-    _file: File,
+    _lock: ExclusiveFileLock,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +105,7 @@ pub enum LegacyDataError {
     TargetIntegrityFailed,
     GatewayStopConfirmationRequired,
     ImportInProgress,
+    LockUnavailable,
     TargetAlreadyImported,
     BackupAlreadyExists,
     BackupFailed,
@@ -138,6 +139,7 @@ impl LegacyDataError {
                 "LEGACY_DATA_GATEWAY_STOP_CONFIRMATION_REQUIRED"
             }
             Self::ImportInProgress => "LEGACY_DATA_IMPORT_IN_PROGRESS",
+            Self::LockUnavailable => "LEGACY_DATA_LOCK_UNAVAILABLE",
             Self::TargetAlreadyImported => "LEGACY_DATA_TARGET_ALREADY_IMPORTED",
             Self::BackupAlreadyExists => "LEGACY_DATA_BACKUP_ALREADY_EXISTS",
             Self::BackupFailed => "LEGACY_DATA_BACKUP_FAILED",
@@ -293,12 +295,19 @@ fn acquire_migration_lock(target: &Path) -> Result<MigrationLock, LegacyDataErro
         .read(true)
         .write(true)
         .truncate(false)
-        .open(path)
-        .map_err(|_| LegacyDataError::TargetMissing)?;
+        .open(&path)
+        .map_err(|_| LegacyDataError::LockUnavailable)?;
     verify_migration_lock(&file)?;
-    file.try_lock_exclusive()
-        .map_err(|_| LegacyDataError::ImportInProgress)?;
-    Ok(MigrationLock { _file: file })
+    let lock =
+        ExclusiveFileLock::try_acquire_opened(&path, file).map_err(map_migration_lock_error)?;
+    Ok(MigrationLock { _lock: lock })
+}
+
+fn map_migration_lock_error(error: LockError) -> LegacyDataError {
+    match error {
+        LockError::Contended => LegacyDataError::ImportInProgress,
+        _ => LegacyDataError::LockUnavailable,
+    }
 }
 
 fn reconcile_existing_journal(
@@ -636,7 +645,7 @@ fn private_open_options() -> OpenOptions {
 
 #[cfg(unix)]
 fn verify_migration_lock(file: &File) -> Result<(), LegacyDataError> {
-    verify_private_file(file, LegacyDataError::TargetMissing)
+    verify_private_file(file, LegacyDataError::LockUnavailable)
 }
 
 #[cfg(windows)]
@@ -2263,8 +2272,9 @@ fn open_restore_target(target: &Path) -> Result<Connection, LegacyDataError> {
 mod tests {
     use super::{
         LegacyDataError, LegacyDataImportRequest, LegacyDataRollbackRequest, apply_legacy_data,
-        inspect_legacy_data, rollback_legacy_data,
+        inspect_legacy_data, map_migration_lock_error, rollback_legacy_data,
     };
+    use cmclient_runtime_primitives::LockError;
     use rusqlite::Connection;
     use std::{
         fs,
@@ -2279,6 +2289,26 @@ mod tests {
             "cmclient-legacy-data-{name}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn migration_lock_errors_distinguish_contention_from_unavailability() {
+        assert_eq!(
+            map_migration_lock_error(LockError::Contended),
+            LegacyDataError::ImportInProgress
+        );
+        for error in [
+            LockError::PathInvalid,
+            LockError::DirectoryUnavailable,
+            LockError::OpenFailed,
+            LockError::LockFailed,
+            LockError::IdentityMismatch,
+            LockError::UnlockFailed,
+        ] {
+            let mapped = map_migration_lock_error(error);
+            assert_eq!(mapped, LegacyDataError::LockUnavailable);
+            assert_eq!(mapped.code(), "LEGACY_DATA_LOCK_UNAVAILABLE");
+        }
     }
 
     fn initialize_target(path: &Path) {

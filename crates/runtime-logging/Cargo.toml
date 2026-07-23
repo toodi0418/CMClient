@@ -11,4 +11,7 @@ workspace = true
 [dependencies]
 libc = "0.2"
 serde_json = "1.0"
+time = { workspace = true, features = ["std"] }
+tracing.workspace = true
+tracing-appender.workspace = true
 zeroize = "1.8"

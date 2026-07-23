@@ -1,0 +1,19 @@
+[package]
+name = "cmclient-runtime-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+atomic-write-file.workspace = true
+fs4.workspace = true
+same-file.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio.workspace = true
+tokio-util.workspace = true
+toml = "0.9"
+
+[lints]
+workspace = true

@@ -347,14 +347,22 @@ function shutdown() {
     }
 
     fn assert_secret_absent_from_outputs(&self) {
-        let agent_log = self.logs.join("agent.jsonl");
-        let gateway_log = self.logs.join("gateway.jsonl");
-        for path in [
-            &self.agent_stdout,
-            &self.agent_stderr,
-            &agent_log,
-            &gateway_log,
-        ] {
+        let mut paths = vec![self.agent_stdout.clone(), self.agent_stderr.clone()];
+        paths.extend(
+            fs::read_dir(&self.logs)
+                .expect("runtime log directory should read")
+                .map(|entry| entry.expect("runtime log entry should read").path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            ["agent.jsonl", "gateway.jsonl"].iter().any(|prefix| {
+                                name == *prefix || name.starts_with(&format!("{prefix}."))
+                            })
+                        })
+                }),
+        );
+        for path in &paths {
             if let Ok(contents) = fs::read_to_string(path) {
                 for sensitive in [
                     FIXTURE_SECRET,

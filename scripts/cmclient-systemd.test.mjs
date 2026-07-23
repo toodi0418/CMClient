@@ -329,13 +329,22 @@ systemdTest(
 
     try {
       await mkdir(logDir, { recursive: true });
-      await writeFile(
-        join(logDir, "agent.jsonl"),
-        '{"code":"AGENT_OLD"}\n{"code":"AGENT_CURRENT"}\n',
-      );
+      await writeFile(join(logDir, "agent.jsonl"), '{"code":"AGENT_LEGACY"}\n');
       await writeFile(
         join(logDir, "gateway.jsonl"),
-        '{"code":"GATEWAY_OLD"}\n{"code":"GATEWAY_CURRENT"}\n',
+        '{"code":"GATEWAY_LEGACY"}\n',
+      );
+      await writeFile(
+        join(logDir, "agent.jsonl.2026-07-21"),
+        '{"code":"AGENT_DAILY_OLD"}\n',
+      );
+      await writeFile(
+        join(logDir, "agent.jsonl.2026-07-22"),
+        '{"code":"AGENT_CURRENT"}\n',
+      );
+      await writeFile(
+        join(logDir, "gateway.jsonl.2026-07-22"),
+        '{"code":"GATEWAY_CURRENT"}\n',
       );
       await writeFile(
         journalctl,
@@ -354,11 +363,32 @@ systemdTest(
       ]);
       assert.match(applicationOutput, /AGENT_CURRENT/);
       assert.match(applicationOutput, /GATEWAY_CURRENT/);
-      assert.doesNotMatch(applicationOutput, /AGENT_OLD|GATEWAY_OLD/);
+      assert.doesNotMatch(applicationOutput, /DAILY_OLD|LEGACY/);
       await assert.rejects(readFile(journalCalls, "utf8"));
 
+      await rm(join(logDir, "agent.jsonl.2026-07-21"));
+      await rm(join(logDir, "agent.jsonl.2026-07-22"));
+      await rm(join(logDir, "gateway.jsonl.2026-07-22"));
+      const { stdout: legacyOutput } = await runManager([
+        "logs",
+        "--log-dir",
+        logDir,
+        "--journalctl",
+        journalctl,
+        "--lines",
+        "1",
+      ]);
+      assert.match(legacyOutput, /AGENT_LEGACY/);
+      assert.match(legacyOutput, /GATEWAY_LEGACY/);
+      await assert.rejects(readFile(journalCalls, "utf8"));
       await rm(join(logDir, "agent.jsonl"));
       await rm(join(logDir, "gateway.jsonl"));
+      await writeFile(join(logDir, "agent.jsonl.2026-99-99"), "invalid\n");
+      await assert.rejects(
+        runManager(["logs", "--log-dir", logDir]),
+        /SYSTEMD_LOG_FILE_INVALID/,
+      );
+      await rm(join(logDir, "agent.jsonl.2026-99-99"));
       const { stdout: fallbackOutput } = await runManager([
         "logs",
         "--log-dir",
@@ -383,7 +413,7 @@ systemdTest(
 
       const externalLog = join(directory, "external.jsonl");
       await writeFile(externalLog, '{"code":"MUST_NOT_BE_READ"}\n');
-      await symlink(externalLog, join(logDir, "agent.jsonl"));
+      await symlink(externalLog, join(logDir, "agent.jsonl.2026-07-22"));
       await assert.rejects(
         runManager(["logs", "--log-dir", logDir]),
         /SYSTEMD_LOG_FILE_INVALID/,

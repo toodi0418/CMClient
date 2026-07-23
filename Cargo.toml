@@ -9,6 +9,7 @@ members = [
   "crates/control-api",
   "crates/legacy-migration",
   "crates/product-identity",
+  "crates/runtime-primitives",
   "crates/runtime-logging",
   "crates/supervisor",
   "crates/updater"
@@ -20,6 +21,16 @@ version = "2.0.0-rc.1"
 edition = "2024"
 license = "GPL-3.0-only"
 rust-version = "1.87"
+
+[workspace.dependencies]
+atomic-write-file = "=0.3.0"
+fs4 = { version = "=1.1.0", features = ["sync"] }
+same-file = "=1.0.6"
+time = { version = "=0.3.45", default-features = false, features = ["formatting"] }
+tokio = { version = "=1.53.1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+tracing = "=0.1.44"
+tracing-appender = "=0.2.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

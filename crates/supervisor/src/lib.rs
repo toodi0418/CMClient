@@ -1,6 +1,8 @@
 //! Process supervision primitives owned by the Rust Agent.
 
-use cmclient_runtime_logging::{ChildOutputCapture, RuntimeLogError, StructuredLogSink};
+use cmclient_runtime_logging::{
+    ChildOutputCapture, RuntimeLogError, StructuredLogSink, WriteHealthSnapshot,
+};
 use hmac::{Hmac, Mac};
 #[cfg(unix)]
 use process_wrap::std::ProcessGroup;
@@ -225,6 +227,13 @@ impl SupervisorError {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatewayLogHealthUpdate {
+    pub capture_error_code: Option<&'static str>,
+    pub write_error_code: Option<&'static str>,
+    pub write_recovered_code: Option<&'static str>,
+}
+
 pub struct GatewaySupervisor {
     command: GatewayCommand,
     backoff_policy: BackoffPolicy,
@@ -233,7 +242,9 @@ pub struct GatewaySupervisor {
     log_sink: Option<StructuredLogSink>,
     output_capture: Option<ChildOutputCapture>,
     bootstrap_reader: Option<thread::JoinHandle<()>>,
-    pending_log_error_code: Option<&'static str>,
+    pending_capture_log_error_code: Option<&'static str>,
+    pending_write_log_error_code: Option<&'static str>,
+    pending_write_recovered_code: Option<&'static str>,
     failed_attempts: u32,
     restart_not_before: Option<Instant>,
     stable_window: Duration,
@@ -276,7 +287,9 @@ impl GatewaySupervisor {
             log_sink: None,
             output_capture: None,
             bootstrap_reader: None,
-            pending_log_error_code: None,
+            pending_capture_log_error_code: None,
+            pending_write_log_error_code: None,
+            pending_write_recovered_code: None,
             failed_attempts: 0,
             restart_not_before: None,
             stable_window,
@@ -322,12 +335,13 @@ impl GatewaySupervisor {
         Ok(())
     }
 
-    pub fn take_log_error_code(&mut self) -> Option<&'static str> {
-        let sink_error = self
-            .log_sink
-            .as_ref()
-            .and_then(StructuredLogSink::take_error_code);
-        self.pending_log_error_code.take().or(sink_error)
+    pub fn take_log_health_update(&mut self) -> GatewayLogHealthUpdate {
+        self.collect_sink_log_health();
+        GatewayLogHealthUpdate {
+            capture_error_code: self.pending_capture_log_error_code.take(),
+            write_error_code: self.pending_write_log_error_code.take(),
+            write_recovered_code: self.pending_write_recovered_code.take(),
+        }
     }
 
     pub fn start(&mut self) -> Result<SupervisorEvent, SupervisorError> {
@@ -516,7 +530,7 @@ impl GatewaySupervisor {
         };
         let stderr = child.stderr().take().ok_or_else(|| {
             let code = RuntimeLogError::CaptureReadFailed.code();
-            self.remember_log_error_code(code);
+            self.remember_capture_log_error_code(code);
             SupervisorError::LoggingFailed(code)
         })?;
         let mut secrets = sensitive_environment_values(&self.environment);
@@ -529,32 +543,26 @@ impl GatewaySupervisor {
         } else {
             let stdout = child.stdout().take().ok_or_else(|| {
                 let code = RuntimeLogError::CaptureReadFailed.code();
-                self.remember_log_error_code(code);
+                self.remember_capture_log_error_code(code);
                 SupervisorError::LoggingFailed(code)
             })?;
             sink.capture(stdout, stderr, secrets)
         };
         self.output_capture = Some(capture.map_err(|error| {
             let code = error.code();
-            self.remember_log_error_code(code);
+            self.remember_capture_log_error_code(code);
             SupervisorError::LoggingFailed(code)
         })?);
         Ok(())
     }
 
     fn finish_output_capture(&mut self) {
-        if let Some(capture) = self.output_capture.take()
-            && let Err(error) = capture.finish()
-        {
-            self.remember_log_error_code(error.code());
+        if let Some(capture) = self.output_capture.take() {
+            if let Err(error) = capture.finish() {
+                self.remember_classified_log_error_code(error.code());
+            }
         }
-        if let Some(code) = self
-            .log_sink
-            .as_ref()
-            .and_then(StructuredLogSink::take_error_code)
-        {
-            self.remember_log_error_code(code);
-        }
+        self.collect_sink_log_health();
     }
 
     fn finish_bootstrap_reader(&mut self) {
@@ -578,9 +586,51 @@ impl GatewaySupervisor {
         }
     }
 
-    fn remember_log_error_code(&mut self, code: &'static str) {
-        if self.pending_log_error_code.is_none() {
-            self.pending_log_error_code = Some(code);
+    fn collect_sink_log_health(&mut self) {
+        let (capture_error_code, write_health) =
+            self.log_sink
+                .as_ref()
+                .map_or((None, WriteHealthSnapshot::default()), |sink| {
+                    (
+                        sink.take_capture_error_code(),
+                        sink.take_write_health_snapshot(),
+                    )
+                });
+        if let Some(code) = capture_error_code {
+            self.remember_capture_log_error_code(code);
+        }
+        if let Some(code) = write_health.write_error_code {
+            self.pending_write_recovered_code = None;
+            self.pending_write_log_error_code = Some(code);
+        }
+        if let Some(code) = write_health.write_recovered_code {
+            if self
+                .pending_write_log_error_code
+                .is_some_and(|pending| pending != code)
+            {
+                self.pending_write_log_error_code = None;
+            }
+            self.pending_write_recovered_code = Some(code);
+        }
+    }
+
+    fn remember_classified_log_error_code(&mut self, code: &'static str) {
+        if is_capture_log_error_code(code) {
+            self.remember_capture_log_error_code(code);
+        } else {
+            self.remember_write_log_error_code(code);
+        }
+    }
+
+    fn remember_capture_log_error_code(&mut self, code: &'static str) {
+        if self.pending_capture_log_error_code.is_none() {
+            self.pending_capture_log_error_code = Some(code);
+        }
+    }
+
+    fn remember_write_log_error_code(&mut self, code: &'static str) {
+        if self.pending_write_log_error_code.is_none() {
+            self.pending_write_log_error_code = Some(code);
         }
     }
 
@@ -590,6 +640,15 @@ impl GatewaySupervisor {
         self.started_at = None;
         self.ready = None;
     }
+}
+
+fn is_capture_log_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "RUNTIME_LOG_CAPTURE_READ_FAILED"
+            | "RUNTIME_LOG_CAPTURE_THREAD_FAILED"
+            | "RUNTIME_LOG_QUEUE_FULL"
+    )
 }
 
 fn perform_private_bootstrap(
@@ -1727,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn captures_redacts_rotates_and_restarts_real_gateway_output() {
+    fn captures_redacts_retains_and_restarts_real_gateway_output() {
         let log_dir = unique_marker("logging-restart");
         let secret = "exact-gateway-secret-value";
         let mut supervisor = fixture_logging_supervisor(&log_dir, "log-exit", secret);
@@ -1744,14 +1803,20 @@ mod tests {
         supervisor.stop().expect("supervisor should reset");
 
         let (files, contents) = read_gateway_logs(&log_dir);
-        assert!(files.len() > 1, "fixture should exercise rotation");
+        assert!(
+            files.len() > 1,
+            "fixture should include a retained generation"
+        );
         assert!(files.len() <= 5, "retention should remain bounded");
         assert!(!contents.contains(secret));
         assert!(contents.contains("[REDACTED]"));
         assert!(contents.contains("GATEWAY_FIXTURE_STDERR"));
         assert!(contents.contains("RUNTIME_LOG_STDERR_INVALID"));
         assert!(contents.contains("RUNTIME_LOG_STDOUT_OVERSIZED"));
-        assert!(supervisor.take_log_error_code().is_none());
+        assert_eq!(
+            supervisor.take_log_health_update(),
+            super::GatewayLogHealthUpdate::default()
+        );
         fs::remove_dir_all(log_dir).expect("log directory should remove");
     }
 
@@ -1790,10 +1855,81 @@ mod tests {
             .expect("logging failure must not block child shutdown");
         assert!(started_at.elapsed() < Duration::from_secs(2));
         assert_eq!(
-            supervisor.take_log_error_code(),
+            supervisor.take_log_health_update().write_error_code,
             Some("RUNTIME_LOG_FILE_UNAVAILABLE")
         );
-        assert_eq!(supervisor.take_log_error_code(), None);
+        assert_eq!(
+            supervisor.take_log_health_update(),
+            super::GatewayLogHealthUpdate::default()
+        );
+        fs::remove_dir_all(log_dir).expect("log directory should remove");
+    }
+
+    #[test]
+    fn capture_error_and_matching_write_recovery_are_reported_independently() {
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected capture read failure"))
+            }
+        }
+
+        let log_dir = unique_marker("overlapping-log-health");
+        fs::create_dir_all(&log_dir).expect("log directory should create");
+        let sink = StructuredLogSink::open(
+            &log_dir,
+            "gateway.jsonl",
+            "gateway",
+            LogPolicy {
+                max_bytes: MIN_LOG_MAX_BYTES,
+                retained_files: 2,
+                max_line_bytes: 256,
+            },
+        )
+        .expect("sink should open");
+        let capture = sink
+            .capture(FailingReader, std::io::empty(), Vec::new())
+            .expect("capture threads should start");
+        assert_eq!(
+            capture.finish(),
+            Err(cmclient_runtime_logging::RuntimeLogError::CaptureReadFailed)
+        );
+
+        let failure_path = log_dir.join("gateway.jsonl.1");
+        fs::create_dir(&failure_path).expect("write failure fixture should create");
+        assert!(
+            sink.write_code(
+                cmclient_runtime_logging::LogLevel::Info,
+                "GATEWAY_HEARTBEAT"
+            )
+            .is_err()
+        );
+        fs::remove_dir(&failure_path).expect("write failure fixture should remove");
+        sink.write_code(
+            cmclient_runtime_logging::LogLevel::Info,
+            "GATEWAY_HEARTBEAT",
+        )
+        .expect("repaired write should succeed");
+
+        let mut supervisor = fixture_supervisor(
+            "log-wait",
+            Duration::ZERO,
+            BackoffPolicy::default(),
+            Duration::from_secs(1),
+            None,
+        );
+        supervisor
+            .set_log_sink(sink)
+            .expect("sink should attach before spawn");
+        assert_eq!(
+            supervisor.take_log_health_update(),
+            super::GatewayLogHealthUpdate {
+                capture_error_code: Some("RUNTIME_LOG_CAPTURE_READ_FAILED"),
+                write_error_code: None,
+                write_recovered_code: Some("RUNTIME_LOG_FILE_UNAVAILABLE"),
+            }
+        );
         fs::remove_dir_all(log_dir).expect("log directory should remove");
     }
 
@@ -1845,10 +1981,10 @@ mod tests {
         )]));
         fs::create_dir_all(log_dir).expect("fixture log directory should create");
         fs::write(
-            log_dir.join("gateway.jsonl"),
+            log_dir.join("gateway.jsonl.2000-01-01"),
             vec![b'x'; usize::try_from(MIN_LOG_MAX_BYTES - 128).expect("size should fit")],
         )
-        .expect("fixture active log should prefill");
+        .expect("fixture retained dated log should prefill");
         let sink = StructuredLogSink::open(
             log_dir,
             "gateway.jsonl",

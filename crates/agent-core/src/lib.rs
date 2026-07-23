@@ -5,17 +5,17 @@ pub mod secrets;
 pub mod web;
 
 use crate::access::{LanAccessConfig, ManagementAccessController};
-use fs2::FileExt;
+use cmclient_runtime_primitives::{
+    DocumentError, DocumentFormat, DurableDocument, ExclusiveFileLock, LockError, TypedDocument,
+};
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     env,
     fmt::{Display, Formatter},
     fs,
-    fs::OpenOptions,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -94,45 +94,25 @@ pub struct ManagementLanConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentState {
     pub schema_version: u8,
     pub pid: u32,
     pub started_at_unix_seconds: u64,
 }
 
+impl DurableDocument for AgentState {
+    const FORMAT: DocumentFormat = DocumentFormat::Json;
+    const MAX_BYTES: usize = 4 * 1024;
+
+    fn validate(&self) -> bool {
+        self.schema_version == 1 && self.pid != 0 && self.started_at_unix_seconds != 0
+    }
+}
+
 pub struct AgentLease {
-    lock_file: fs::File,
+    _lock: ExclusiveFileLock,
     state_file: PathBuf,
-    _process_guard: ProcessLocalLease,
-}
-
-struct ProcessLocalLease {
-    lock_path: PathBuf,
-}
-
-static PROCESS_LOCAL_LEASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-
-impl ProcessLocalLease {
-    fn acquire(lock_path: PathBuf) -> Result<Self, InstanceError> {
-        let active = PROCESS_LOCAL_LEASES.get_or_init(|| Mutex::new(HashSet::new()));
-        let mut active = active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !active.insert(lock_path.clone()) {
-            return Err(InstanceError::AlreadyRunning);
-        }
-        Ok(Self { lock_path })
-    }
-}
-
-impl Drop for ProcessLocalLease {
-    fn drop(&mut self) {
-        let active = PROCESS_LOCAL_LEASES.get_or_init(|| Mutex::new(HashSet::new()));
-        active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.lock_path);
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +132,7 @@ pub enum ConfigError {
 #[derive(Debug)]
 pub enum InstanceError {
     AlreadyRunning,
+    StateInvalid,
     Io,
 }
 
@@ -159,6 +140,7 @@ impl InstanceError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::AlreadyRunning => "AGENT_INSTANCE_ALREADY_RUNNING",
+            Self::StateInvalid => "AGENT_INSTANCE_STATE_INVALID",
             Self::Io => "AGENT_INSTANCE_IO_FAILED",
         }
     }
@@ -586,21 +568,7 @@ impl AgentLease {
         let canonical_data_dir =
             fs::canonicalize(&paths.data_dir).map_err(|_| InstanceError::Io)?;
         let lock_path = canonical_data_dir.join("agent.lock");
-        let process_guard = ProcessLocalLease::acquire(lock_path.clone())?;
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path)
-            .map_err(|_| InstanceError::Io)?;
-        match lock_file.try_lock_exclusive() {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                return Err(InstanceError::AlreadyRunning);
-            }
-            Err(_) => return Err(InstanceError::Io),
-        }
+        let lock = ExclusiveFileLock::try_acquire(&lock_path).map_err(map_lock_error)?;
 
         let state = AgentState {
             schema_version: 1,
@@ -611,12 +579,13 @@ impl AgentLease {
                 .as_secs(),
         };
         let state_file = canonical_data_dir.join("agent-state.json");
-        write_state(&state_file, &state)?;
+        TypedDocument::<AgentState>::new(&state_file)
+            .and_then(|document| document.store(&state))
+            .map_err(map_document_write_error)?;
         Ok((
             Self {
-                lock_file,
+                _lock: lock,
                 state_file,
-                _process_guard: process_guard,
             },
             state,
         ))
@@ -624,28 +593,36 @@ impl AgentLease {
 
     pub fn read_state(paths: &RuntimePaths) -> Result<Option<AgentState>, InstanceError> {
         let state_file = paths.data_dir.join("agent-state.json");
-        if !state_file.exists() {
-            return Ok(None);
-        }
-        let contents = fs::read_to_string(state_file).map_err(|_| InstanceError::Io)?;
-        serde_json::from_str(&contents)
-            .map(Some)
-            .map_err(|_| InstanceError::Io)
+        TypedDocument::<AgentState>::new(state_file)
+            .and_then(|document| document.load_optional())
+            .map_err(map_document_read_error)
     }
 }
 
 impl Drop for AgentLease {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.state_file);
-        let _ = FileExt::unlock(&self.lock_file);
     }
 }
 
-fn write_state(path: &Path, state: &AgentState) -> Result<(), InstanceError> {
-    let temporary_path = path.with_extension(format!("{}.tmp", std::process::id()));
-    let serialized = serde_json::to_vec(state).map_err(|_| InstanceError::Io)?;
-    fs::write(&temporary_path, serialized).map_err(|_| InstanceError::Io)?;
-    fs::rename(temporary_path, path).map_err(|_| InstanceError::Io)
+fn map_lock_error(error: LockError) -> InstanceError {
+    match error {
+        LockError::Contended => InstanceError::AlreadyRunning,
+        _ => InstanceError::Io,
+    }
+}
+
+fn map_document_read_error(error: DocumentError) -> InstanceError {
+    match error {
+        DocumentError::Malformed | DocumentError::SchemaInvalid | DocumentError::TooLarge => {
+            InstanceError::StateInvalid
+        }
+        _ => InstanceError::Io,
+    }
+}
+
+fn map_document_write_error(_error: DocumentError) -> InstanceError {
+    InstanceError::Io
 }
 
 pub fn is_config_file(path: &Path) -> bool {
@@ -1073,19 +1050,50 @@ private_key_path = '{}'
             cache_dir: directory.join("cache"),
             log_dir: directory.join("logs"),
         };
-        let blocked_temporary_state =
-            directory.join(format!("agent-state.{}.tmp", std::process::id()));
-        fs::create_dir(&blocked_temporary_state).expect("blocked state fixture should exist");
+        let blocked_state = directory.join("agent-state.json");
+        fs::create_dir(&blocked_state).expect("blocked state fixture should exist");
 
         assert!(matches!(
             AgentLease::acquire(&paths),
             Err(InstanceError::Io)
         ));
 
-        fs::remove_dir(&blocked_temporary_state).expect("blocked state fixture should remove");
+        fs::remove_dir(&blocked_state).expect("blocked state fixture should remove");
         let (lease, _) = AgentLease::acquire(&paths)
             .expect("failed initialization must release process and file locks");
         drop(lease);
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn malformed_or_invalid_diagnostic_state_fails_with_a_stable_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-state-invalid-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("state fixture should exist");
+        let paths = RuntimePaths {
+            data_dir: directory.clone(),
+            config_dir: directory.join("config"),
+            cache_dir: directory.join("cache"),
+            log_dir: directory.join("logs"),
+        };
+
+        fs::write(directory.join("agent-state.json"), b"{").expect("malformed state should write");
+        let error = AgentLease::read_state(&paths).expect_err("malformed state must fail closed");
+        assert!(matches!(error, InstanceError::StateInvalid));
+        assert_eq!(error.code(), "AGENT_INSTANCE_STATE_INVALID");
+
+        fs::write(
+            directory.join("agent-state.json"),
+            br#"{"schemaVersion":2,"pid":1,"startedAtUnixSeconds":1}"#,
+        )
+        .expect("invalid schema state should write");
+        assert!(matches!(
+            AgentLease::read_state(&paths),
+            Err(InstanceError::StateInvalid)
+        ));
+        fs::remove_dir_all(directory).expect("state fixture should remove");
     }
 }

@@ -111,11 +111,13 @@ mod service {
         sensitive_process_environment_values,
     };
     use cmclient_control_api::{ControlClient, default_local_endpoint};
-    use cmclient_runtime_logging::{ChildOutputCapture, LogLevel, LogPolicy, StructuredLogSink};
+    use cmclient_runtime_logging::{
+        ChildOutputCapture, LogLevel, LogPolicy, RuntimeLogError, StructuredLogSink,
+    };
     use std::{
         ffi::OsString,
         io,
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{Child, Command, ExitStatus, Stdio},
         sync::mpsc,
         thread,
@@ -149,11 +151,11 @@ mod service {
         }
 
         fn finish_capture(&mut self) {
-            if let Some(capture) = self.capture.take()
-                && let Err(error) = capture.finish()
-            {
-                eprintln!("{}", error.code());
-                let _ = self.log.write_code(LogLevel::Error, error.code());
+            if let Some(capture) = self.capture.take() {
+                if let Err(error) = capture.finish() {
+                    eprintln!("{}", error.code());
+                    let _ = self.log.write_code(LogLevel::Error, error.code());
+                }
             }
         }
 
@@ -282,29 +284,16 @@ mod service {
     fn start_agent(root: &std::path::Path) -> io::Result<ManagedAgent> {
         let host = std::env::current_exe()?;
         let agent = agent_path_from_host(&host);
-        let policy = LogPolicy::from_environment().map_err(runtime_log_io_error)?;
-        let log = StructuredLogSink::open(
-            root.join("logs"),
-            "service-host.jsonl",
-            "service-host",
-            policy,
-        )
-        .map_err(runtime_log_io_error)?;
-        log.write_code(LogLevel::Info, "WINDOWS_SERVICE_AGENT_STARTING")
-            .map_err(runtime_log_io_error)?;
-        let mut command = Command::new(agent);
-        command
-            .arg("--serve")
-            .env("HOME", root.join("home"))
-            .env("USERPROFILE", root.join("home"))
-            .env("CMCLIENT_DATA_DIR", root.join("data"))
-            .env("CMCLIENT_CONFIG_DIR", root.join("config"))
-            .env("CMCLIENT_CACHE_DIR", root.join("cache"))
-            .env("CMCLIENT_LOG_DIR", root.join("logs"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match command.spawn() {
+        start_agent_with_program(root, &agent, LogPolicy::from_environment())
+    }
+
+    fn start_agent_with_program(
+        root: &Path,
+        agent: &Path,
+        policy: Result<LogPolicy, RuntimeLogError>,
+    ) -> io::Result<ManagedAgent> {
+        let log = initialize_service_log(root, policy)?;
+        let mut child = match spawn_agent_process(root, agent) {
             Ok(child) => child,
             Err(error) => {
                 let _ = log.write_code(LogLevel::Error, "WINDOWS_SERVICE_AGENT_START_FAILED");
@@ -325,8 +314,9 @@ mod service {
             Ok(capture) => capture,
             Err(error) => {
                 terminate_failed_capture_start(&mut child);
+                eprintln!("{}", error.code());
                 let _ = log.write_code(LogLevel::Error, error.code());
-                return Err(runtime_log_io_error(error));
+                return Err(io::Error::other(error.code()));
             }
         };
         let managed = ManagedAgent {
@@ -336,6 +326,43 @@ mod service {
         };
         managed.write_code("WINDOWS_SERVICE_AGENT_STARTED");
         Ok(managed)
+    }
+
+    fn initialize_service_log(
+        root: &Path,
+        policy: Result<LogPolicy, RuntimeLogError>,
+    ) -> io::Result<StructuredLogSink> {
+        let policy = policy.map_err(runtime_log_io_error)?;
+        let log = StructuredLogSink::open(
+            root.join("logs"),
+            "service-host.jsonl",
+            "service-host",
+            policy,
+        )
+        .map_err(runtime_log_io_error)?;
+        if let Err(error) = log.write_code(LogLevel::Info, "WINDOWS_SERVICE_AGENT_STARTING") {
+            eprintln!("{}", error.code());
+            if error != RuntimeLogError::RetentionLimit {
+                return Err(runtime_log_io_error(error));
+            }
+        }
+        Ok(log)
+    }
+
+    fn spawn_agent_process(root: &Path, agent: &Path) -> io::Result<Child> {
+        let mut command = Command::new(agent);
+        command
+            .arg("--serve")
+            .env("HOME", root.join("home"))
+            .env("USERPROFILE", root.join("home"))
+            .env("CMCLIENT_DATA_DIR", root.join("data"))
+            .env("CMCLIENT_CONFIG_DIR", root.join("config"))
+            .env("CMCLIENT_CACHE_DIR", root.join("cache"))
+            .env("CMCLIENT_LOG_DIR", root.join("logs"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn()
     }
 
     fn stop_agent(agent: &mut ManagedAgent, runtime_root: &std::path::Path) -> io::Result<()> {
@@ -378,7 +405,7 @@ mod service {
         let _ = child.wait();
     }
 
-    fn runtime_log_io_error(error: cmclient_runtime_logging::RuntimeLogError) -> io::Error {
+    fn runtime_log_io_error(error: RuntimeLogError) -> io::Error {
         io::Error::other(error.code())
     }
 
@@ -388,6 +415,82 @@ mod service {
             .filter(|path| path.is_absolute())
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
             .join("CMClient")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use cmclient_runtime_logging::MIN_LOG_MAX_BYTES;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn full_service_log_quota_does_not_gate_agent_spawn() {
+            let sequence = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should follow epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "cmclient-service-host-quota-{}-{sequence}",
+                std::process::id()
+            ));
+            let log_dir = root.join("logs");
+            let policy = LogPolicy {
+                max_bytes: MIN_LOG_MAX_BYTES,
+                retained_files: 1,
+                max_line_bytes: 256,
+            };
+            let seed =
+                StructuredLogSink::open(&log_dir, "service-host.jsonl", "service-host", policy)
+                    .expect("seed log should open");
+            drop(seed);
+            let active_path = std::fs::read_dir(&log_dir)
+                .expect("log directory should read")
+                .map(|entry| entry.expect("log entry should read").path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("service-host.jsonl."))
+                })
+                .expect("dated active log should exist");
+            std::fs::write(
+                active_path,
+                vec![b'x'; usize::try_from(MIN_LOG_MAX_BYTES).expect("quota should fit")],
+            )
+            .expect("quota fixture should write");
+
+            let executable = std::env::current_exe().expect("test executable should resolve");
+            let mut managed = start_agent_with_program(&root, &executable, Ok(policy))
+                .expect("logging quota must not prevent process spawn");
+            assert!(managed.capture.is_some());
+            assert!(managed.child.stdout.is_none());
+            assert!(managed.child.stderr.is_none());
+            let _ = managed.child.wait();
+            managed.finish_capture();
+            assert!(managed.capture.is_none());
+            drop(managed);
+            std::fs::remove_dir_all(root).expect("test root should remove");
+        }
+
+        #[test]
+        fn policy_and_open_failures_remain_stable_startup_errors() {
+            let root = std::env::temp_dir().join(format!(
+                "cmclient-service-host-structural-log-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let policy_error = initialize_service_log(&root, Err(RuntimeLogError::PolicyInvalid))
+                .err()
+                .expect("invalid policy should fail");
+            assert_eq!(policy_error.to_string(), "RUNTIME_LOG_POLICY_INVALID");
+
+            std::fs::create_dir_all(root.join("logs").join("service-host.jsonl"))
+                .expect("unsafe log fixture should create");
+            let open_error = initialize_service_log(&root, Ok(LogPolicy::default()))
+                .err()
+                .expect("unsafe log path should fail");
+            assert_eq!(open_error.to_string(), "RUNTIME_LOG_FILE_UNAVAILABLE");
+            std::fs::remove_dir_all(root).expect("test root should remove");
+        }
     }
 }
 

@@ -15,6 +15,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use cmclient_product_identity::{ProductTarget, ReleaseIdentity};
+use cmclient_runtime_primitives::{DocumentError, DocumentFormat, DurableDocument, TypedDocument};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
@@ -643,6 +644,17 @@ pub struct ActiveRelease {
     pub bundle_sha256: String,
 }
 
+impl DurableDocument for ActiveRelease {
+    const FORMAT: DocumentFormat = DocumentFormat::Json;
+    const MAX_BYTES: usize = 4 * 1024;
+
+    fn validate(&self) -> bool {
+        self.schema_version == 1
+            && is_sha256_hex(&self.release_id)
+            && self.release_id == self.bundle_sha256
+    }
+}
+
 /// Result of a successful update install transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledRelease {
@@ -806,19 +818,9 @@ pub fn read_active_release(
     installation_root: &Path,
 ) -> Result<Option<ActiveRelease>, UpdateInstallError> {
     let pointer_path = installation_root.join("active-release.json");
-    if !pointer_path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(pointer_path).map_err(|_| UpdateInstallError::ActiveReleaseInvalid)?;
-    let release = serde_json::from_slice::<ActiveRelease>(&bytes)
-        .map_err(|_| UpdateInstallError::ActiveReleaseInvalid)?;
-    if release.schema_version != 1
-        || !is_sha256_hex(&release.release_id)
-        || release.release_id != release.bundle_sha256
-    {
-        return Err(UpdateInstallError::ActiveReleaseInvalid);
-    }
-    Ok(Some(release))
+    TypedDocument::<ActiveRelease>::new(pointer_path)
+        .and_then(|document| document.load_optional())
+        .map_err(|_| UpdateInstallError::ActiveReleaseInvalid)
 }
 
 fn validate_install_request(request: &UpdateInstallRequest<'_>) -> Result<(), UpdateInstallError> {
@@ -1094,25 +1096,9 @@ pub fn set_active_release(
     }
     fs::create_dir_all(installation_root).map_err(|_| UpdateInstallError::ActivationFailed)?;
     let pointer_path = installation_root.join("active-release.json");
-    let temporary = installation_root.join(format!(".active-release.part-{}", std::process::id()));
-    let bytes =
-        serde_json::to_vec(active_release).map_err(|_| UpdateInstallError::ActivationFailed)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|_| UpdateInstallError::ActivationFailed)?;
-    if output.write_all(&bytes).is_err() || output.sync_all().is_err() {
-        drop(output);
-        let _ = fs::remove_file(&temporary);
-        return Err(UpdateInstallError::ActivationFailed);
-    }
-    drop(output);
-    if fs::rename(&temporary, &pointer_path).is_err() {
-        let _ = fs::remove_file(&temporary);
-        return Err(UpdateInstallError::ActivationFailed);
-    }
-    Ok(())
+    TypedDocument::<ActiveRelease>::new(pointer_path)
+        .and_then(|document| document.store(active_release))
+        .map_err(|_| UpdateInstallError::ActivationFailed)
 }
 
 /// Removes the active release pointer for an interrupted first installation.
@@ -1300,6 +1286,15 @@ pub struct PersistentUpdateJob {
     pub rollback_plan: Option<UpdateRollbackPlan>,
 }
 
+impl DurableDocument for PersistentUpdateJob {
+    const FORMAT: DocumentFormat = DocumentFormat::Json;
+    const MAX_BYTES: usize = 1024 * 1024;
+
+    fn validate(&self) -> bool {
+        validate_persistent_job(self).is_ok()
+    }
+}
+
 /// Byte progress for a long-running Agent update phase.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1375,14 +1370,9 @@ impl UpdateJournalStore {
 
     /// Returns the current durable job, if the Agent has created one.
     pub fn load(&self) -> Result<Option<PersistentUpdateJob>, UpdateJournalError> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let bytes = fs::read(&self.path).map_err(|_| UpdateJournalError::Io)?;
-        let job = serde_json::from_slice::<PersistentUpdateJob>(&bytes)
-            .map_err(|_| UpdateJournalError::InvalidRecord)?;
-        validate_persistent_job(&job)?;
-        Ok(Some(job))
+        TypedDocument::<PersistentUpdateJob>::new(&self.path)
+            .and_then(|document| document.load_optional())
+            .map_err(map_journal_document_read_error)
     }
 
     /// Atomically persists the current job state before a side effect begins.
@@ -1390,24 +1380,9 @@ impl UpdateJournalStore {
         validate_persistent_job(job)?;
         let parent = self.path.parent().ok_or(UpdateJournalError::Io)?;
         fs::create_dir_all(parent).map_err(|_| UpdateJournalError::Io)?;
-        let temporary = parent.join(format!(".update-job.part-{}", std::process::id()));
-        let bytes = serde_json::to_vec(job).map_err(|_| UpdateJournalError::Io)?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|_| UpdateJournalError::Io)?;
-        if output.write_all(&bytes).is_err() || output.sync_all().is_err() {
-            drop(output);
-            let _ = fs::remove_file(&temporary);
-            return Err(UpdateJournalError::Io);
-        }
-        drop(output);
-        if fs::rename(&temporary, &self.path).is_err() {
-            let _ = fs::remove_file(&temporary);
-            return Err(UpdateJournalError::Io);
-        }
-        Ok(())
+        TypedDocument::<PersistentUpdateJob>::new(&self.path)
+            .and_then(|document| document.store(job))
+            .map_err(|_| UpdateJournalError::Io)
     }
 
     /// Transitions and persists one job phase before the corresponding effect.
@@ -1456,6 +1431,15 @@ impl UpdateJournalStore {
             job.recent_logs.drain(..job.recent_logs.len() - 64);
         }
         self.persist(job)
+    }
+}
+
+fn map_journal_document_read_error(error: DocumentError) -> UpdateJournalError {
+    match error {
+        DocumentError::Malformed | DocumentError::SchemaInvalid | DocumentError::TooLarge => {
+            UpdateJournalError::InvalidRecord
+        }
+        _ => UpdateJournalError::Io,
     }
 }
 
@@ -1652,9 +1636,9 @@ mod tests {
     use super::{
         ActiveRelease, BundleResponse, BundleTransport, DEFAULT_MAX_UNPACKED_BYTES,
         MANIFEST_SCHEMA_VERSION, SignatureAlgorithm, SignedUpdateManifest, StagedBundle,
-        UpdateArchive, UpdateBundle, UpdateInstallError, UpdateInstallRequest, UpdateJournalStore,
-        UpdateLifecycle, UpdateLogEntry, UpdateManifest, UpdateManifestError, UpdatePhase,
-        UpdateProgress, UpdateRollbackPlan, UpdateStageError, UpdateStageRequest,
+        UpdateArchive, UpdateBundle, UpdateInstallError, UpdateInstallRequest, UpdateJournalError,
+        UpdateJournalStore, UpdateLifecycle, UpdateLogEntry, UpdateManifest, UpdateManifestError,
+        UpdatePhase, UpdateProgress, UpdateRollbackPlan, UpdateStageError, UpdateStageRequest,
         install_verified_release, read_active_release, recover_interrupted_update, rollback_update,
         set_active_release, sha256_hex, stage_verified_bundle,
     };
@@ -2353,6 +2337,36 @@ mod tests {
     }
 
     #[test]
+    fn active_release_rejects_malformed_unknown_and_oversized_documents() {
+        let release = ActiveRelease {
+            schema_version: 1,
+            release_id: "a".repeat(64),
+            bundle_sha256: "a".repeat(64),
+        };
+        let mut unknown = serde_json::to_value(&release).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        let cases = [
+            b"{".to_vec(),
+            serde_json::to_vec(&unknown).unwrap(),
+            vec![b' '; 4 * 1024 + 1],
+        ];
+
+        for (index, bytes) in cases.into_iter().enumerate() {
+            let root = stage_directory(&format!("active-release-invalid-{index}"));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("active-release.json"), bytes).unwrap();
+            assert_eq!(
+                read_active_release(&root),
+                Err(UpdateInstallError::ActiveReleaseInvalid)
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn rollback_restores_data_config_and_the_previous_active_release() {
         let root = stage_directory("rollback");
         fs::create_dir_all(&root).unwrap();
@@ -2408,6 +2422,40 @@ mod tests {
             fs::read(plan.data_dir.join("gateway.sqlite")).unwrap(),
             b"old database"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn journal_rejects_malformed_unknown_and_oversized_documents() {
+        let root = stage_directory("journal-invalid-documents");
+        fs::create_dir_all(&root).unwrap();
+        let store = UpdateJournalStore::new(&root).unwrap();
+        let job = super::PersistentUpdateJob {
+            schema_version: 1,
+            id: "update-1".to_owned(),
+            phase: UpdatePhase::Downloading,
+            created_at: "2026-07-18T03:00:00.000Z".to_owned(),
+            updated_at: "2026-07-18T03:01:00.000Z".to_owned(),
+            error_code: None,
+            progress: None,
+            recent_logs: Vec::new(),
+            rollback_plan: None,
+        };
+        let mut unknown = serde_json::to_value(&job).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        let cases = [
+            b"{".to_vec(),
+            serde_json::to_vec(&unknown).unwrap(),
+            vec![b' '; 1024 * 1024 + 1],
+        ];
+
+        for bytes in cases {
+            fs::write(&store.path, bytes).unwrap();
+            assert_eq!(store.load(), Err(UpdateJournalError::InvalidRecord));
+        }
         let _ = fs::remove_dir_all(root);
     }
 

@@ -44,11 +44,13 @@ The promotion baseline is CMClient commit
 `b3fec2b344bda3b11d0a15d2bad381f7d926114e`, tree
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
-- Baseline `Cargo.lock` SHA-256:
-  `91d9a6b87f834b20edde0341f97c20eac8deab044ed4fdd82b81fe402d1d73e1`.
-- Cargo license inventory: 586 registry packages, 12 workspace packages, zero
-  Git sources; inventory SHA-256
-  `b62d86a78088d0ec37f0a409ca2435e7d26ba4833fdd030ee89db39cbb09cc7a`.
+- Current `Cargo.lock` SHA-256:
+  `c60abf3e8f42f5ba73e5155c528629dc5a7161c96b8805af3c3f14807a3aca55`.
+- Cargo license inventory: 603 registry packages, 13 workspace packages, zero
+  Git sources and zero unknown licenses; inventory SHA-256
+  `276124d4ec635012d9657bb0d111684cfee2f4c4b7a7dfbac142ee1104045674`.
+  The digest is canonical JSON sorted by package name, version, source,
+  checksum, and declared license.
 - `pnpm-lock.yaml` SHA-256:
   `99207257e14da5b216e65b9863c11dfcde7fdb58403be094cd93a9ec66fdbca3`.
 - The current Windows production install contains 183 package versions;
@@ -60,6 +62,45 @@ The promotion baseline is CMClient commit
 - The Apache ECharts 6.1.0 notice SHA-256 is
   `d491d358344f842685c1b1585970999db65fe30ecf7ef3867af8814f4016c016`
   and its text is retained in the root `NOTICE`.
+
+### Adopted Runtime Primitives
+
+P13 adopts the following exact crates from the crates.io registry. The digest
+is the SHA-256 checksum of the published `.crate` archive recorded by crates.io
+and Cargo. Each declared license is compatible with CMClient's
+`GPL-3.0-only` distribution route; the dependency's own license text and
+notices remain part of the target-specific packaging inventory.
+
+| Crate | Exact version | Upstream | License | Crate SHA-256 | Declared Rust floor |
+| --- | --- | --- | --- | --- | --- |
+| `tokio` | `1.53.1` | `https://github.com/tokio-rs/tokio` | MIT | `202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed` | 1.71 |
+| `tokio-util` | `0.7.18` | `https://github.com/tokio-rs/tokio` | MIT | `9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098` | 1.71 |
+| `atomic-write-file` | `0.3.0` | `https://github.com/andreacorbellini/rust-atomic-write-file` | BSD-3-Clause | `84790c55b5704b0d35130bf16a4ce22a8e70eb0ea773522557524d9a4852663d` | 1.85 |
+| `fs4` | `1.1.0` | `https://github.com/al8n/fs4` | MIT OR Apache-2.0 | `7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5` | 1.75.0 |
+| `same-file` | `1.0.6` | `https://github.com/BurntSushi/same-file` | Unlicense/MIT | `93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502` | Not declared |
+| `time` | `0.3.45` | `https://github.com/time-rs/time` | MIT OR Apache-2.0 | `f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd` | 1.83.0 |
+| `tracing` | `0.1.44` | `https://github.com/tokio-rs/tracing` | MIT | `63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100` | 1.65.0 |
+| `tracing-appender` | `0.2.5` | `https://github.com/tokio-rs/tracing` | MIT | `050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c` | 1.63.0 |
+
+The workspace MSRV is Rust 1.87.0 and the pinned current toolchain is Rust
+1.96.0. CI checks every workspace target at 1.87 and runs the full workspace
+test and build at 1.96. The official Rust 1.87.0 channel manifest is
+`https://static.rust-lang.org/dist/channel-rust-1.87.0.toml`, with SHA-256
+`2949b5ea91e3f9c45e75ff2fc6cfc7776616c693ab599ed43abc2120b7522415`.
+The MSRV workflow pins the `dtolnay/rust-toolchain` 1.87.0 action commit
+`c4743642b206695ff6aa863032b1037759ee95ea`. Rust is distributed under MIT or
+Apache-2.0 terms with its bundled third-party notices.
+
+The current Windows qualification installed the official minimal
+`1.87.0-x86_64-pc-windows-msvc` toolchain in current-user campaign tooling and
+ran `cargo check --workspace --all-targets --locked` successfully. The exact
+`rustc` commit is `17067e9ac6d7ecb70e50f92c1944e545188d2359`; the installed
+`rustc.exe` SHA-256 is
+`31219ec9fefef647623ca50fb119c36ecc737f80f06863b550a88bfaac85c193` and
+`cargo.exe` SHA-256 is
+`4ec4e44523bc28667db1e1a3febfa450938d8f6f50667b06218849f0a9d6dd4e`.
+This is current-host Windows x86-64 evidence only; CI remains responsible for
+the independently pinned Linux MSRV job.
 
 ## Invalidation And Release Gate
 

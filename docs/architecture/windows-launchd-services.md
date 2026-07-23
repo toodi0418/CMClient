@@ -52,10 +52,11 @@ powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 un
 
 The `logs` action accepts between 1 and 10,000 lines and reads only regular,
 non-reparse-point application logs under `%ProgramData%\CMClient\logs`:
-`service-host.jsonl`, `agent.jsonl`, and `gateway.jsonl`. These are sanitized,
-size-bounded, retained JSONL files; the service manager never returns raw child
-stdout or stderr. A missing log set or an unsafe path fails with a stable
-manager error code.
+the newest `service-host.jsonl.YYYY-MM-DD`, `agent.jsonl.YYYY-MM-DD`, and
+`gateway.jsonl.YYYY-MM-DD` file in each family, with fixed-name legacy
+fallback. These are sanitized, size-bounded, retained JSONL files; the service
+manager never returns raw child stdout or stderr. A missing log set or an
+unsafe path fails with a stable manager error code.
 
 ## macOS
 
@@ -85,7 +86,8 @@ The generated plist has `RunAtLoad`, restarts only an unsuccessful Agent exit,
 and uses a five-second throttle. launchd sends fallback stdout and stderr to
 `/dev/null`, preventing its own unbounded `agent.stdout.log` and
 `agent.stderr.log` files. Agent and Supervisor instead own sanitized,
-size-bounded `agent.jsonl` and `gateway.jsonl` files under the user's Agent log
-directory; `logs --lines N` accepts `1..10000` and tails only their active regular files. Its
+size-bounded `agent.jsonl.YYYY-MM-DD` and `gateway.jsonl.YYYY-MM-DD` families
+under the user's Agent log directory; `logs --lines N` accepts `1..10000` and
+tails only each family's newest regular file, with fixed-name legacy fallback. Its
 uninstall operation removes only the plist; configuration, data, cache, and
 logs remain available for reinstall and rollback.

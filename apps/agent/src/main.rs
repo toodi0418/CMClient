@@ -20,7 +20,8 @@ use cmclient_control_api::{
 };
 use cmclient_runtime_logging::{LogLevel, LogPolicy, StructuredLogSink};
 use cmclient_supervisor::{
-    BackoffPolicy, GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor, SupervisorEvent,
+    BackoffPolicy, GatewayCommand, GatewayLogHealthUpdate, GatewayReady, GatewayStatus,
+    GatewaySupervisor, SupervisorEvent,
 };
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
 use std::{
@@ -666,6 +667,8 @@ struct AgentController {
     gateway_transition: Mutex<()>,
     private_gateway_bootstrap: bool,
     runtime_log: Option<StructuredLogSink>,
+    agent_log_error_code: Mutex<Option<String>>,
+    gateway_log_health: Mutex<GatewayRuntimeLogHealth>,
     gateway_session: GatewaySessionHandle,
     management_web: Mutex<Option<ManagementWebService>>,
     management_web_shutdown: Mutex<Option<JoinHandle<Result<(), ManagementWebError>>>>,
@@ -678,6 +681,20 @@ struct AgentController {
     shutdown_requested: AtomicBool,
     started_at: Instant,
     latest_error_code: Mutex<Option<String>>,
+}
+
+#[derive(Default)]
+struct GatewayRuntimeLogHealth {
+    capture_error_code: Option<String>,
+    write_error_code: Option<String>,
+}
+
+impl GatewayRuntimeLogHealth {
+    fn current_error_code(&self) -> Option<String> {
+        self.capture_error_code
+            .clone()
+            .or_else(|| self.write_error_code.clone())
+    }
 }
 
 struct SupervisorWorker {
@@ -809,10 +826,13 @@ impl AgentController {
         let identity = compiled_component_identity(InternalComponent::Agent)
             .map_err(|_| ControlError::CommandFailed)?;
         let mut initial_log_error_code = None;
+        let mut initial_agent_log_error_code = None;
+        let mut initial_gateway_log_error_code = None;
         let log_policy = match LogPolicy::from_environment() {
             Ok(policy) => Some(policy),
             Err(error) => {
                 initial_log_error_code = Some(String::from(error.code()));
+                initial_agent_log_error_code = Some(String::from(error.code()));
                 None
             }
         };
@@ -821,6 +841,7 @@ impl AgentController {
                 Ok(sink) => Some(sink),
                 Err(error) => {
                     remember_initial_log_error(&mut initial_log_error_code, error.code());
+                    initial_agent_log_error_code = Some(String::from(error.code()));
                     None
                 }
             }
@@ -978,7 +999,8 @@ impl AgentController {
                             .set_log_sink(sink)
                             .map_err(|_| ControlError::CommandFailed)?,
                         Err(error) => {
-                            remember_initial_log_error(&mut initial_log_error_code, error.code())
+                            remember_initial_log_error(&mut initial_log_error_code, error.code());
+                            initial_gateway_log_error_code = Some(String::from(error.code()));
                         }
                     }
                 }
@@ -1041,6 +1063,11 @@ impl AgentController {
             gateway_transition: Mutex::new(()),
             private_gateway_bootstrap: private_bootstrap,
             runtime_log,
+            agent_log_error_code: Mutex::new(initial_agent_log_error_code),
+            gateway_log_health: Mutex::new(GatewayRuntimeLogHealth {
+                capture_error_code: None,
+                write_error_code: initial_gateway_log_error_code,
+            }),
             gateway_session,
             management_web: Mutex::new(management_web),
             management_web_shutdown: Mutex::new(None),
@@ -1109,11 +1136,14 @@ impl AgentController {
             .lock()
             .map_err(|_| ControlError::CommandFailed)?
             .clone();
-        let latest_error_code = if remembered_error_code
-            .as_deref()
-            .is_some_and(is_runtime_log_error)
-        {
-            remembered_error_code
+        let persistent_log_error_code = self
+            .agent_log_error_code
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .clone()
+            .or(self.current_gateway_log_error_code()?);
+        let latest_error_code = if persistent_log_error_code.is_some() {
+            persistent_log_error_code
         } else {
             match gateway {
                 GatewayControlStatus::Backoff => Some(String::from("GATEWAY_RESTART_BACKOFF")),
@@ -1264,10 +1294,80 @@ impl AgentController {
     }
 
     fn remember_error_code(&self, code: &str) {
+        let sink_available = self.runtime_log.is_some();
         let log_error_code = self.write_agent_code(LogLevel::Error, code);
         if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
-            *latest_error_code = Some(String::from(log_error_code.unwrap_or(code)));
+            if let Ok(mut agent_log_error_code) = self.agent_log_error_code.lock() {
+                if let Some(log_error_code) = log_error_code {
+                    let log_error_code = String::from(log_error_code);
+                    *latest_error_code = Some(log_error_code.clone());
+                    *agent_log_error_code = Some(log_error_code);
+                } else {
+                    if sink_available {
+                        *agent_log_error_code = None;
+                    }
+                    *latest_error_code = Some(String::from(code));
+                }
+            } else {
+                *latest_error_code = Some(String::from(log_error_code.unwrap_or(code)));
+            }
         }
+    }
+
+    fn apply_gateway_log_health(&self, update: GatewayLogHealthUpdate) {
+        let (reported_error_code, recovered_error_code, current_gateway_error_code) = {
+            let Ok(mut health) = self.gateway_log_health.lock() else {
+                return;
+            };
+            if let Some(code) = update.capture_error_code {
+                health.capture_error_code = Some(String::from(code));
+            }
+            if let Some(code) = update.write_error_code {
+                health.write_error_code = Some(String::from(code));
+            }
+            let recovered_error_code = update.write_recovered_code.and_then(|recovered| {
+                if health.write_error_code.as_deref() == Some(recovered) {
+                    health.write_error_code.take()
+                } else {
+                    None
+                }
+            });
+            let reported_error_code = update.capture_error_code.map(String::from).or_else(|| {
+                update.write_error_code.and_then(|code| {
+                    (health.write_error_code.as_deref() == Some(code)).then(|| String::from(code))
+                })
+            });
+            (
+                reported_error_code,
+                recovered_error_code,
+                health.current_error_code(),
+            )
+        };
+
+        if let Some(code) = reported_error_code {
+            self.remember_error_code(&code);
+            return;
+        }
+        let Some(recovered_error_code) = recovered_error_code else {
+            return;
+        };
+        let agent_log_error_code = self
+            .agent_log_error_code
+            .lock()
+            .ok()
+            .and_then(|code| code.clone());
+        if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
+            if latest_error_code.as_deref() == Some(recovered_error_code.as_str()) {
+                *latest_error_code = agent_log_error_code.or(current_gateway_error_code);
+            }
+        }
+    }
+
+    fn current_gateway_log_error_code(&self) -> Result<Option<String>, ControlError> {
+        self.gateway_log_health
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)
+            .map(|health| health.current_error_code())
     }
 
     fn clear_error(&self) {
@@ -1282,10 +1382,31 @@ impl AgentController {
     }
 
     fn log_agent_code(&self, level: LogLevel, code: &str) {
-        if let Some(error_code) = self.write_agent_code(level, code)
-            && let Ok(mut latest_error_code) = self.latest_error_code.lock()
-        {
-            *latest_error_code = Some(String::from(error_code));
+        let sink_available = self.runtime_log.is_some();
+        let log_error_code = self.write_agent_code(level, code);
+        let gateway_log_error_code = self.current_gateway_log_error_code().ok().flatten();
+        if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
+            if let Ok(mut agent_log_error_code) = self.agent_log_error_code.lock() {
+                if let Some(error_code) = log_error_code {
+                    let error_code = String::from(error_code);
+                    *latest_error_code = Some(error_code.clone());
+                    *agent_log_error_code = Some(error_code);
+                } else if sink_available {
+                    let owns_latest =
+                        latest_error_code.as_deref() == agent_log_error_code.as_deref();
+                    let recovered = if owns_latest {
+                        *latest_error_code = gateway_log_error_code;
+                        true
+                    } else {
+                        true
+                    };
+                    if recovered {
+                        *agent_log_error_code = None;
+                    }
+                }
+            } else if let Some(error_code) = log_error_code {
+                *latest_error_code = Some(String::from(error_code));
+            }
         }
     }
 
@@ -1312,7 +1433,7 @@ impl AgentController {
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
         self.gateway_session.clear();
-        let (result, log_error_code) = {
+        let (result, log_health) = {
             let mut supervisor = self
                 .supervisor
                 .lock()
@@ -1321,12 +1442,10 @@ impl AgentController {
                 return Ok(false);
             };
             let result = supervisor.stop();
-            let log_error_code = supervisor.take_log_error_code();
-            (result, log_error_code)
+            let log_health = supervisor.take_log_health_update();
+            (result, log_health)
         };
-        if let Some(code) = log_error_code {
-            self.remember_error_code(code);
-        }
+        self.apply_gateway_log_health(log_health);
         result.map_err(|error| {
             self.remember_error_code(error.code());
             ControlError::CommandFailed
@@ -1341,7 +1460,7 @@ impl AgentController {
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
         self.ensure_resource_start_allowed()?;
-        let (result, ready, log_error_code) = {
+        let (result, ready, log_health) = {
             let mut supervisor = self
                 .supervisor
                 .lock()
@@ -1352,12 +1471,10 @@ impl AgentController {
             };
             let result = supervisor.start();
             let ready = supervisor.gateway_ready().cloned();
-            let log_error_code = supervisor.take_log_error_code();
-            (result, ready, log_error_code)
+            let log_health = supervisor.take_log_health_update();
+            (result, ready, log_health)
         };
-        if let Some(code) = log_error_code {
-            self.remember_error_code(code);
-        }
+        self.apply_gateway_log_health(log_health);
         let event = result.map_err(|error| {
             self.gateway_session.clear();
             self.remember_error_code(error.code());
@@ -1384,7 +1501,7 @@ impl AgentController {
         if self.is_shutdown_requested() {
             return Ok(());
         }
-        let (result, ready, log_error_code) = {
+        let (result, ready, log_health) = {
             let mut supervisor = self
                 .supervisor
                 .lock()
@@ -1396,26 +1513,25 @@ impl AgentController {
                 Some(supervisor) => {
                     let result = supervisor.tick().map(Some);
                     let ready = supervisor.gateway_ready().cloned();
-                    let log_error_code = supervisor.take_log_error_code();
-                    (result, ready, log_error_code)
+                    let log_health = supervisor.take_log_health_update();
+                    (result, ready, log_health)
                 }
-                None => (Ok(None), None, None),
+                None => (Ok(None), None, GatewayLogHealthUpdate::default()),
             }
         };
-        if let Some(code) = log_error_code {
-            self.remember_error_code(code);
-        }
+        self.apply_gateway_log_health(log_health);
         match result {
             Ok(Some(SupervisorEvent::Started { .. })) => {
                 if self.private_gateway_bootstrap {
                     self.publish_verified_gateway(ready)?;
                 }
-                if let Ok(mut latest_error_code) = self.latest_error_code.lock()
-                    && latest_error_code
+                if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
+                    if latest_error_code
                         .as_deref()
                         .is_some_and(is_transient_supervisor_error)
-                {
-                    *latest_error_code = None;
+                    {
+                        *latest_error_code = None;
+                    }
                 }
                 self.log_agent_code(LogLevel::Info, "GATEWAY_SUPERVISOR_STARTED");
                 Ok(())
@@ -1424,12 +1540,13 @@ impl AgentController {
                 if self.private_gateway_bootstrap && self.gateway_session.snapshot().is_none() {
                     self.publish_verified_gateway(ready)?;
                 }
-                if let Ok(mut latest_error_code) = self.latest_error_code.lock()
-                    && latest_error_code
+                if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
+                    if latest_error_code
                         .as_deref()
                         .is_some_and(is_transient_supervisor_error)
-                {
-                    *latest_error_code = None;
+                    {
+                        *latest_error_code = None;
+                    }
                 }
                 Ok(())
             }
@@ -1462,10 +1579,10 @@ impl AgentController {
             }
             Err(error) => {
                 self.gateway_session.clear();
-                if let Ok(mut supervisor) = self.supervisor.lock()
-                    && let Some(supervisor) = supervisor.as_mut()
-                {
-                    let _ = supervisor.stop();
+                if let Ok(mut supervisor) = self.supervisor.lock() {
+                    if let Some(supervisor) = supervisor.as_mut() {
+                        let _ = supervisor.stop();
+                    }
                 }
                 self.remember_error_code("GATEWAY_SUPERVISOR_IDENTITY_VERIFICATION_FAILED");
                 Err(error)
@@ -2308,8 +2425,8 @@ fn bundled_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, AgentController, AgentSecretStore, ControlHandler, InternalComponent,
-        ManagementWebRequest, SecretKind, apply_aprs_environment,
+        AgentConfig, AgentController, AgentSecretStore, ControlHandler, GatewayLogHealthUpdate,
+        InternalComponent, LogLevel, ManagementWebRequest, SecretKind, apply_aprs_environment,
         apply_physical_qualification_environment, compiled_component_identity,
         dispatch_remote_control, verified_gateway_route,
     };
@@ -2382,6 +2499,242 @@ mod tests {
             assert!(Instant::now() < deadline, "gateway fixture did not report");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn agent_log_recovery_restores_a_persistent_gateway_log_error() {
+        let sequence = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should follow epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cmclient-agent-log-recovery-{}-{sequence}",
+            std::process::id()
+        ));
+        let make_config = |data_dir: &Path, log_dir: &Path| AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.to_path_buf(),
+                config_dir: data_dir.join("config"),
+                cache_dir: data_dir.join("cache"),
+                log_dir: log_dir.to_path_buf(),
+            },
+            config_file: data_dir.join("config").join("agent.toml"),
+            gateway_command: None,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+
+        let healthy_root = root.join("healthy");
+        let healthy_log_dir = healthy_root.join("logs");
+        std::fs::create_dir_all(&healthy_root).expect("healthy root should create");
+        let healthy = AgentController::from_config_with_secrets(
+            &make_config(&healthy_root, &healthy_log_dir),
+            AgentSecretStore::memory(),
+        )
+        .expect("healthy controller should initialize");
+        healthy.apply_gateway_log_health(GatewayLogHealthUpdate {
+            capture_error_code: Some("RUNTIME_LOG_CAPTURE_READ_FAILED"),
+            write_error_code: None,
+            write_recovered_code: None,
+        });
+        assert_eq!(
+            healthy
+                .latest_error_code
+                .lock()
+                .expect("latest error should lock")
+                .as_deref(),
+            Some("RUNTIME_LOG_CAPTURE_READ_FAILED")
+        );
+        assert_eq!(
+            healthy
+                .gateway_log_health
+                .lock()
+                .expect("Gateway log error should lock")
+                .capture_error_code
+                .as_deref(),
+            Some("RUNTIME_LOG_CAPTURE_READ_FAILED")
+        );
+
+        let agent_failure = healthy_log_dir.join("agent.jsonl.1");
+        std::fs::create_dir(&agent_failure).expect("Agent log failure fixture should create");
+        healthy.log_agent_code(LogLevel::Info, "AGENT_HEARTBEAT");
+        assert_eq!(
+            healthy
+                .latest_error_code
+                .lock()
+                .expect("latest error should lock")
+                .as_deref(),
+            Some("RUNTIME_LOG_FILE_UNAVAILABLE")
+        );
+        assert_eq!(
+            healthy
+                .agent_log_error_code
+                .lock()
+                .expect("Agent log error should lock")
+                .as_deref(),
+            Some("RUNTIME_LOG_FILE_UNAVAILABLE")
+        );
+
+        std::fs::remove_dir(agent_failure).expect("Agent log failure fixture should remove");
+        healthy.log_agent_code(LogLevel::Info, "AGENT_HEARTBEAT");
+        assert_eq!(
+            healthy
+                .agent_log_error_code
+                .lock()
+                .expect("Agent log error should lock")
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            healthy
+                .latest_error_code
+                .lock()
+                .expect("latest error should lock")
+                .as_deref(),
+            Some("RUNTIME_LOG_CAPTURE_READ_FAILED"),
+            "Agent recovery must restore the independent Gateway log failure"
+        );
+        assert_eq!(
+            healthy
+                .gateway_log_health
+                .lock()
+                .expect("Gateway log error should lock")
+                .capture_error_code
+                .as_deref(),
+            Some("RUNTIME_LOG_CAPTURE_READ_FAILED")
+        );
+        assert_eq!(
+            healthy
+                .latest_error_code
+                .lock()
+                .expect("latest error should lock")
+                .as_deref(),
+            Some("RUNTIME_LOG_CAPTURE_READ_FAILED"),
+            "Agent writes must not clear an independent Gateway capture failure"
+        );
+        drop(healthy);
+
+        let missing_root = root.join("missing");
+        let missing_log_dir = missing_root.join("logs");
+        std::fs::create_dir_all(missing_log_dir.join("agent.jsonl"))
+            .expect("unsafe active log fixture should create");
+        let missing = AgentController::from_config_with_secrets(
+            &make_config(&missing_root, &missing_log_dir),
+            AgentSecretStore::memory(),
+        )
+        .expect("controller should tolerate an unavailable runtime log");
+        assert_eq!(
+            missing
+                .latest_error_code
+                .lock()
+                .expect("latest error should lock")
+                .as_deref(),
+            Some("RUNTIME_LOG_FILE_UNAVAILABLE")
+        );
+        assert_eq!(
+            missing
+                .agent_log_error_code
+                .lock()
+                .expect("Agent log error should lock")
+                .as_deref(),
+            Some("RUNTIME_LOG_FILE_UNAVAILABLE")
+        );
+        missing.log_agent_code(LogLevel::Info, "AGENT_HEARTBEAT");
+        assert_eq!(
+            missing
+                .latest_error_code
+                .lock()
+                .expect("latest error should lock")
+                .as_deref(),
+            Some("RUNTIME_LOG_FILE_UNAVAILABLE")
+        );
+        drop(missing);
+        std::fs::remove_dir_all(root).expect("test root should remove");
+    }
+
+    #[test]
+    fn overlapping_gateway_capture_error_and_write_recovery_preserves_capture_health() {
+        let sequence = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should follow epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cmclient-agent-overlapping-log-health-{}-{sequence}",
+            std::process::id()
+        ));
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: root.clone(),
+                config_dir: root.join("config"),
+                cache_dir: root.join("cache"),
+                log_dir: root.join("logs"),
+            },
+            config_file: root.join("config").join("agent.toml"),
+            gateway_command: None,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        std::fs::create_dir_all(&root).expect("test root should create");
+        let controller =
+            AgentController::from_config_with_secrets(&config, AgentSecretStore::memory())
+                .expect("controller should initialize");
+        controller.apply_gateway_log_health(GatewayLogHealthUpdate {
+            capture_error_code: Some("RUNTIME_LOG_CAPTURE_READ_FAILED"),
+            write_error_code: Some("RUNTIME_LOG_FILE_UNAVAILABLE"),
+            write_recovered_code: Some("RUNTIME_LOG_FILE_UNAVAILABLE"),
+        });
+
+        let health = controller
+            .gateway_log_health
+            .lock()
+            .expect("Gateway log health should lock");
+        assert_eq!(
+            health.capture_error_code.as_deref(),
+            Some("RUNTIME_LOG_CAPTURE_READ_FAILED")
+        );
+        assert_eq!(health.write_error_code, None);
+        drop(health);
+        assert_eq!(
+            controller
+                .status()
+                .expect("status should derive persistent log health")
+                .latest_error_code
+                .as_deref(),
+            Some("RUNTIME_LOG_CAPTURE_READ_FAILED"),
+            "matching write recovery must not clear the overlapping capture failure"
+        );
+
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("test root should remove");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn read_runtime_log_family(directory: &Path, file_name: &str) -> String {
+        let mut paths = std::fs::read_dir(directory)
+            .expect("runtime log directory should read")
+            .map(|entry| entry.expect("runtime log entry should read").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name == file_name || name.starts_with(&format!("{file_name}."))
+                    })
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+            .iter()
+            .map(|path| std::fs::read_to_string(path).expect("runtime log should read"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -3669,8 +4022,7 @@ mod tests {
             Some("RUNTIME_LOG_FILE_UNAVAILABLE")
         );
 
-        let agent_log =
-            std::fs::read_to_string(log_dir.join("agent.jsonl")).expect("agent log should read");
+        let agent_log = read_runtime_log_family(&log_dir, "agent.jsonl");
         assert!(agent_log.contains("AGENT_RUNTIME_READY"));
         assert!(agent_log.contains("GATEWAY_SUPERVISOR_STARTED"));
         assert!(agent_log.contains("GATEWAY_SUPERVISOR_STOPPED"));

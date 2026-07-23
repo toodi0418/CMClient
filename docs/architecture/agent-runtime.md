@@ -208,11 +208,13 @@ deadline, stable-reset, stop, and drop behavior.
 ## Service Logging
 
 Service deployments use application-owned JSONL under `CMCLIENT_LOG_DIR`:
-`agent.jsonl` for Agent output and `gateway.jsonl` for the supervised Gateway.
-The Windows SCM wrapper additionally uses `service-host.jsonl` for failures
-that occur before Agent can start. Every active file has a fixed byte ceiling,
-bounded retained-file rotation, restrictive permissions, and symlink/non-file
-rejection.
+`agent.jsonl.YYYY-MM-DD` for Agent output and
+`gateway.jsonl.YYYY-MM-DD` for the supervised Gateway. The Windows SCM wrapper
+additionally uses `service-host.jsonl.YYYY-MM-DD` for failures that occur
+before Agent can start. Every UTC daily file has a fixed byte ceiling, bounded
+daily retention, restrictive permissions, and symlink/non-file rejection.
+Reaching the daily ceiling fails with `RUNTIME_LOG_RETENTION_LIMIT` without a
+custom rename rotation; a new file is selected on the next UTC date.
 
 The logging drain accepts a stdout record only when it is a bounded JSON object,
 recursively redacts sensitive field names, and writes the sanitized object.
@@ -223,8 +225,9 @@ error codes while both pipes continue to drain, so a broken log destination
 cannot deadlock process shutdown. Stop, restart, and drop join the drain workers
 and flush accepted records before returning.
 
-Platform service managers tail only these active application logs with a
-bounded line count. systemd may fall back to similarly bounded journal records
+Platform service managers tail only the newest dated file in each application
+log family with a bounded line count and retain a fixed-name legacy fallback.
+systemd may fall back to similarly bounded journal records
 before the files exist, but its manager exposes only stable codes; launchd
 routes unmanaged fallback stdout and stderr to `/dev/null`.
 

@@ -86,7 +86,7 @@ scripts/cmclient-launchd.sh logs --lines 200
 
 `uninstall` removes only the plist and retains the user data and logs. launchd
 routes unmanaged stdout/stderr to `/dev/null`; Agent and Supervisor own the
-bounded `agent.jsonl` and `gateway.jsonl` files. A launchd process is not a
+bounded `agent.jsonl.YYYY-MM-DD` and `gateway.jsonl.YYYY-MM-DD` families. A launchd process is not a
 system daemon and must not be described as one.
 
 ## Windows Service
@@ -124,8 +124,9 @@ $hostPath = 'C:\Program Files\CMClient\bin\cmclient-service-host.exe'
 `-Command` also accepts `start`, `stop`, `restart`, `logs`, and `render`;
 installation accepts `-NoStart`. The SCM identity is the fixed singleton
 `CMClientAgent`; custom service names and a `-ServiceName` parameter are not
-supported. Windows operations retain bounded `service-host.jsonl`,
-`agent.jsonl`, and `gateway.jsonl` files below `%PROGRAMDATA%\CMClient\logs`.
+supported. Windows operations retain bounded `service-host.jsonl.YYYY-MM-DD`,
+`agent.jsonl.YYYY-MM-DD`, and `gateway.jsonl.YYYY-MM-DD` families below
+`%PROGRAMDATA%\CMClient\logs`.
 
 ## Docker OCI
 

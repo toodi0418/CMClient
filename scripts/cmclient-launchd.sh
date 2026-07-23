@@ -26,6 +26,28 @@ fail() {
   exit 1
 }
 
+valid_daily_stamp() {
+  local stamp="$1"
+  local year month day max_day
+
+  [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  year=$((10#${stamp:0:4}))
+  month=$((10#${stamp:5:2}))
+  day=$((10#${stamp:8:2}))
+  (( year >= 1970 && month >= 1 && month <= 12 && day >= 1 )) || return 1
+  case "$month" in
+    2)
+      max_day=28
+      if (( year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) )); then
+        max_day=29
+      fi
+      ;;
+    4|6|9|11) max_day=30 ;;
+    *) max_day=31 ;;
+  esac
+  (( day <= max_day ))
+}
+
 usage() {
   cat <<'EOF'
 Usage: scripts/cmclient-launchd.sh <install|uninstall|start|stop|restart|status|logs|render> [options]
@@ -206,8 +228,11 @@ start_service() {
 
 tail_application_logs() {
   local log_files=()
+  local candidate
+  local latest_daily
   local log_path
   local log_name
+  local selected_log
 
   for log_name in agent.jsonl gateway.jsonl; do
     log_path="$LOG_DIR/$log_name"
@@ -216,7 +241,25 @@ tail_application_logs() {
     fi
     if [[ -e "$log_path" ]]; then
       [[ -f "$log_path" ]] || fail "LAUNCHD_LOG_FILE_INVALID"
-      log_files+=("$log_path")
+      selected_log="$log_path"
+    else
+      selected_log=""
+    fi
+
+    latest_daily=""
+    for candidate in "$LOG_DIR/$log_name".[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+      [[ -e "$candidate" || -L "$candidate" ]] || continue
+      [[ ! -L "$candidate" && -f "$candidate" ]] || fail "LAUNCHD_LOG_FILE_INVALID"
+      valid_daily_stamp "${candidate##*.}" || fail "LAUNCHD_LOG_FILE_INVALID"
+      if [[ -z "$latest_daily" || "$candidate" > "$latest_daily" ]]; then
+        latest_daily="$candidate"
+      fi
+    done
+    if [[ -n "$latest_daily" ]]; then
+      selected_log="$latest_daily"
+    fi
+    if [[ -n "$selected_log" ]]; then
+      log_files+=("$selected_log")
     fi
   done
 

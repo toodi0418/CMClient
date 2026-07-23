@@ -33,6 +33,10 @@ test("Windows service manager registers the service host without credential argu
   assert.match(script, /service-host\.jsonl/);
   assert.match(script, /agent\.jsonl/);
   assert.match(script, /gateway\.jsonl/);
+  assert.match(script, /\\d\{\{4\}\}-\\d\{\{2\}\}-\\d\{\{2\}\}/);
+  assert.match(script, /Sort-Object Name -Descending/);
+  assert.match(script, /\$datedLogs\[0\]\.FullName/);
+  assert.match(script, /\[DateTime\]::TryParseExact/);
   assert.match(script, /Get-Content -LiteralPath \$logFile -Tail \$LineCount/);
   assert.match(script, /WINDOWS_SERVICE_LOG_FILE_INVALID/);
   assert.match(script, /WINDOWS_SERVICE_LOGS_UNAVAILABLE/);
@@ -40,13 +44,14 @@ test("Windows service manager registers the service host without credential argu
   assert.match(serviceHost, /service-host\.jsonl/);
   assert.match(serviceHost, /\.stdout\(Stdio::piped\(\)\)/);
   assert.match(serviceHost, /\.stderr\(Stdio::piped\(\)\)/);
-  assert.match(serviceHost, /log\.capture\(\s*stdout,\s*stderr,/);
+  assert.match(serviceHost, /\.capture\(\s*stdout,\s*stderr,/);
   assert.match(serviceHost, /sensitive_process_environment_values\(\)/);
   assert.match(serviceHost, /WINDOWS_SERVICE_AGENT_START_FAILED/);
   assert.match(
     serviceHost,
     /agent\.child\.wait\(\)\?;[\s\S]*agent\.finish_capture\(\);/,
   );
+  assert.doesNotMatch(serviceHost, /capture_output/);
   assert.doesNotMatch(serviceHost, /\.stdout\(Stdio::null\(\)\)/);
   assert.doesNotMatch(serviceHost, /\.stderr\(Stdio::null\(\)\)/);
 });

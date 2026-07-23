@@ -42,6 +42,28 @@ jobs:
         run: |
           "$RUNNER_TEMP/cmclient-security-tools/cargo-audit" audit --deny unsound --ignore RUSTSEC-2024-0429
 
+  rust-msrv:
+    name: Rust MSRV 1.87
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@c4743642b206695ff6aa863032b1037759ee95ea # 1.87.0
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            libdbus-1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+      - run: cargo check --workspace --all-targets --locked
+
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -81,7 +103,7 @@ jobs:
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:e2e:web
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
       - run: cargo build --workspace --locked
 
   windows-source-build:

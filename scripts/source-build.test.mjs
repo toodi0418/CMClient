@@ -100,3 +100,90 @@ test("CI keeps the Windows source gate separate from package generation", () => 
     assert.equal(serialized.includes(forbidden), false, forbidden);
   }
 });
+
+test("workspace exact-pins the adopted runtime primitives", () => {
+  const manifest = readFileSync(join(root, "Cargo.toml"), "utf8");
+  const exactPins = new Map([
+    ["atomic-write-file", "0.3.0"],
+    ["fs4", "1.1.0"],
+    ["same-file", "1.0.6"],
+    ["time", "0.3.45"],
+    ["tokio", "1.53.1"],
+    ["tokio-util", "0.7.18"],
+    ["tracing", "0.1.44"],
+    ["tracing-appender", "0.2.5"],
+  ]);
+
+  for (const [dependency, version] of exactPins) {
+    const escapedDependency = dependency.replaceAll("-", "\\-");
+    const escapedVersion = version.replaceAll(".", "\\.");
+    assert.match(
+      manifest,
+      new RegExp(
+        `^${escapedDependency}\\s*=\\s*(?:"=${escapedVersion}"|\\{[^\\n}]*version\\s*=\\s*"=${escapedVersion}"[^\\n}]*\\})\\s*$`,
+        "m",
+      ),
+      `${dependency} must use an exact workspace version`,
+    );
+  }
+});
+
+test("CI compiles all Rust targets at the MSRV and tests the pinned toolchain", () => {
+  const workflow = parse(
+    readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8"),
+  );
+  const msrv = workflow.jobs["rust-msrv"];
+  assert.equal(msrv.name, "Rust MSRV 1.87");
+  assert.equal(msrv["runs-on"], "ubuntu-22.04");
+  assert.ok(
+    msrv.steps.some(
+      (step) =>
+        step.uses ===
+        "dtolnay/rust-toolchain@c4743642b206695ff6aa863032b1037759ee95ea",
+    ),
+  );
+  assert.ok(
+    msrv.steps.some(
+      (step) => step.run === "cargo check --workspace --all-targets --locked",
+    ),
+  );
+
+  const verify = workflow.jobs.verify;
+  assert.ok(
+    verify.steps.some(
+      (step) =>
+        step.uses ===
+        "dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4",
+    ),
+  );
+  assert.ok(
+    verify.steps.some((step) => step.run === "cargo test --workspace --locked"),
+  );
+});
+
+test("production consumers use the shared lock and logging primitives", () => {
+  const manifests = [
+    "crates/agent-core/Cargo.toml",
+    "crates/legacy-migration/Cargo.toml",
+    "crates/runtime-primitives/Cargo.toml",
+    "crates/updater/Cargo.toml",
+  ].map((path) => readFileSync(join(root, path), "utf8"));
+  const runtimeLogging = readFileSync(
+    join(root, "crates/runtime-logging/src/lib.rs"),
+    "utf8",
+  );
+
+  assert.equal(
+    manifests.some((manifest) => /\bfs2\b/.test(manifest)),
+    false,
+  );
+  assert.match(manifests[0], /cmclient-runtime-primitives/);
+  assert.match(manifests[1], /cmclient-runtime-primitives/);
+  assert.match(manifests[1], /same-file\.workspace = true/);
+  assert.match(manifests[2], /atomic-write-file\.workspace = true/);
+  assert.match(manifests[2], /fs4\.workspace = true/);
+  assert.match(manifests[2], /same-file\.workspace = true/);
+  assert.match(manifests[3], /cmclient-runtime-primitives/);
+  assert.doesNotMatch(runtimeLogging, /fn rotate\s*\(/);
+  assert.doesNotMatch(runtimeLogging, /fs::rename\s*\(/);
+});

@@ -3,7 +3,7 @@
 use serde_json::{Map, Value};
 use std::{
     ffi::{OsStr, OsString},
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -13,6 +13,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
+use time::OffsetDateTime;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(unix)]
@@ -41,6 +43,7 @@ const MAX_EVENT_CODE_BYTES: usize = 128;
 const MAX_IDENTIFIER_BYTES: usize = 128;
 const MAX_REDACTION_DEPTH: usize = 32;
 const REDACTED: &str = "[REDACTED]";
+const DAILY_STAMP_BYTES: usize = 10;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 #[cfg(windows)]
@@ -126,6 +129,7 @@ pub enum RuntimeLogError {
     DirectoryUnavailable,
     FileUnavailable,
     WriteFailed,
+    RetentionLimit,
     StateUnavailable,
     CaptureReadFailed,
     CaptureThreadFailed,
@@ -141,6 +145,7 @@ impl RuntimeLogError {
             Self::DirectoryUnavailable => "RUNTIME_LOG_DIRECTORY_UNAVAILABLE",
             Self::FileUnavailable => "RUNTIME_LOG_FILE_UNAVAILABLE",
             Self::WriteFailed => "RUNTIME_LOG_WRITE_FAILED",
+            Self::RetentionLimit => "RUNTIME_LOG_RETENTION_LIMIT",
             Self::StateUnavailable => "RUNTIME_LOG_STATE_UNAVAILABLE",
             Self::CaptureReadFailed => "RUNTIME_LOG_CAPTURE_READ_FAILED",
             Self::CaptureThreadFailed => "RUNTIME_LOG_CAPTURE_THREAD_FAILED",
@@ -158,6 +163,12 @@ pub enum LogLevel {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteHealthSnapshot {
+    pub write_error_code: Option<&'static str>,
+    pub write_recovered_code: Option<&'static str>,
+}
+
 impl LogLevel {
     const fn as_str(self) -> &'static str {
         match self {
@@ -169,6 +180,35 @@ impl LogLevel {
     }
 }
 
+fn trace_safe_event(level: LogLevel, component: &str, event_code: &str) {
+    match level {
+        LogLevel::Debug => tracing::debug!(
+            target: "cmclient.runtime_logging",
+            component = %component,
+            event_code = %event_code,
+            "runtime log event persisted"
+        ),
+        LogLevel::Info => tracing::info!(
+            target: "cmclient.runtime_logging",
+            component = %component,
+            event_code = %event_code,
+            "runtime log event persisted"
+        ),
+        LogLevel::Warn => tracing::warn!(
+            target: "cmclient.runtime_logging",
+            component = %component,
+            event_code = %event_code,
+            "runtime log event persisted"
+        ),
+        LogLevel::Error => tracing::error!(
+            target: "cmclient.runtime_logging",
+            component = %component,
+            event_code = %event_code,
+            "runtime log event persisted"
+        ),
+    }
+}
+
 #[derive(Clone)]
 pub struct StructuredLogSink {
     shared: Arc<SharedSink>,
@@ -176,18 +216,28 @@ pub struct StructuredLogSink {
 
 struct SharedSink {
     state: Mutex<SinkState>,
-    error: Mutex<Option<RuntimeLogError>>,
+    capture_error: Mutex<Option<RuntimeLogError>>,
+    write_health: Mutex<WriteHealth>,
     component: String,
     policy: LogPolicy,
+}
+
+#[derive(Default)]
+struct WriteHealth {
+    unhealthy: Option<RuntimeLogError>,
+    latched_error: Option<RuntimeLogError>,
+    recovered: Option<RuntimeLogError>,
 }
 
 struct SinkState {
     directory: PathBuf,
     active_path: PathBuf,
     file_name: String,
-    file: Option<File>,
+    appender: RollingFileAppender,
+    active_date: String,
     current_bytes: u64,
     policy: LogPolicy,
+    rollover_blocked: bool,
 }
 
 impl StructuredLogSink {
@@ -203,20 +253,36 @@ impl StructuredLogSink {
 
         let directory = log_dir.as_ref().to_path_buf();
         prepare_directory(&directory)?;
-        prune_rotated_files(&directory, file_name, policy.retained_files)?;
-        let active_path = directory.join(file_name);
-        let (file, current_bytes) = open_active_file(&active_path)?;
+        validate_log_family(&directory, file_name, None)?;
+        let active_date = utc_date_stamp();
+        let active_path = dated_log_path(&directory, file_name, &active_date);
+        let max_log_files = policy
+            .retained_files
+            .checked_add(1)
+            .ok_or(RuntimeLogError::PolicyInvalid)?;
+        let appender = RollingFileAppender::builder()
+            .rotation(Rotation::DAILY)
+            .filename_prefix(file_name)
+            .max_log_files(max_log_files)
+            .build(&directory)
+            .map_err(|_| RuntimeLogError::FileUnavailable)?;
+        secure_regular_file(&active_path)?;
+        validate_log_family(&directory, file_name, Some(max_log_files))?;
+        let current_bytes = regular_file_len(&active_path)?;
         Ok(Self {
             shared: Arc::new(SharedSink {
                 state: Mutex::new(SinkState {
                     directory,
                     active_path,
                     file_name: String::from(file_name),
-                    file: Some(file),
+                    appender,
+                    active_date,
                     current_bytes,
                     policy,
+                    rollover_blocked: false,
                 }),
-                error: Mutex::new(None),
+                capture_error: Mutex::new(None),
+                write_health: Mutex::new(WriteHealth::default()),
                 component: String::from(component),
                 policy,
             }),
@@ -245,7 +311,12 @@ impl StructuredLogSink {
                 sanitize_value(Value::Object(fields), &secrets, 0),
             );
         }
-        self.write_value_or_generic(Value::Object(record), "RUNTIME_LOG_EVENT_OVERSIZED")
+        let result =
+            self.write_value_or_generic(Value::Object(record), "RUNTIME_LOG_EVENT_OVERSIZED");
+        if result.is_ok() {
+            trace_safe_event(level, &self.shared.component, event_code);
+        }
+        result
     }
 
     pub fn capture<Stdout, Stderr, Secrets>(
@@ -343,9 +414,31 @@ impl StructuredLogSink {
     }
 
     pub fn take_error_code(&self) -> Option<&'static str> {
-        match self.shared.error.lock() {
-            Ok(mut error) => error.take().map(RuntimeLogError::code),
+        self.take_capture_error_code()
+            .or_else(|| self.take_write_error_code())
+    }
+
+    pub fn take_capture_error_code(&self) -> Option<&'static str> {
+        take_error_code(&self.shared.capture_error)
+    }
+
+    fn take_write_error_code(&self) -> Option<&'static str> {
+        match self.shared.write_health.lock() {
+            Ok(mut health) => health.latched_error.take().map(RuntimeLogError::code),
             Err(_) => Some(RuntimeLogError::StateUnavailable.code()),
+        }
+    }
+
+    pub fn take_write_health_snapshot(&self) -> WriteHealthSnapshot {
+        match self.shared.write_health.lock() {
+            Ok(mut health) => WriteHealthSnapshot {
+                write_error_code: health.latched_error.take().map(RuntimeLogError::code),
+                write_recovered_code: health.recovered.take().map(RuntimeLogError::code),
+            },
+            Err(_) => WriteHealthSnapshot {
+                write_error_code: Some(RuntimeLogError::StateUnavailable.code()),
+                write_recovered_code: None,
+            },
         }
     }
 
@@ -385,8 +478,13 @@ impl StructuredLogSink {
             .lock()
             .map_err(|_| RuntimeLogError::StateUnavailable)
             .and_then(|mut state| state.write_line(serialized));
-        if let Err(error) = result {
-            self.latch_error(error);
+        match result {
+            Ok(()) => {
+                self.mark_write_healthy();
+            }
+            Err(error) => {
+                self.latch_error(error);
+            }
         }
         result
     }
@@ -405,15 +503,65 @@ impl StructuredLogSink {
     }
 
     fn latch_error(&self, error: RuntimeLogError) {
-        if let Ok(mut current) = self.shared.error.lock()
-            && current.is_none()
-        {
-            *current = Some(error);
+        if error.is_capture_error() {
+            latch_first_error(&self.shared.capture_error, error);
+        } else {
+            if let Ok(mut health) = self.shared.write_health.lock() {
+                if health.unhealthy.is_none() {
+                    health.unhealthy = Some(error);
+                    health.latched_error = Some(error);
+                    health.recovered = None;
+                }
+            }
+        }
+    }
+
+    fn mark_write_healthy(&self) {
+        if let Ok(mut health) = self.shared.write_health.lock() {
+            if let Some(recovered) = health.unhealthy.take() {
+                health.latched_error = None;
+                health.recovered = Some(recovered);
+            }
         }
     }
 
     fn latched_error(&self) -> Option<RuntimeLogError> {
-        self.shared.error.lock().ok().and_then(|error| *error)
+        self.shared
+            .capture_error
+            .lock()
+            .ok()
+            .and_then(|error| *error)
+            .or_else(|| {
+                self.shared
+                    .write_health
+                    .lock()
+                    .ok()
+                    .and_then(|health| health.latched_error)
+            })
+    }
+}
+
+impl RuntimeLogError {
+    const fn is_capture_error(self) -> bool {
+        matches!(
+            self,
+            Self::CaptureReadFailed | Self::CaptureThreadFailed | Self::QueueFull
+        )
+    }
+}
+
+fn latch_first_error(target: &Mutex<Option<RuntimeLogError>>, error: RuntimeLogError) {
+    if let Ok(mut current) = target.lock() {
+        if current.is_none() {
+            *current = Some(error);
+        }
+    }
+}
+
+fn take_error_code(target: &Mutex<Option<RuntimeLogError>>) -> Option<&'static str> {
+    match target.lock() {
+        Ok(mut error) => error.take().map(RuntimeLogError::code),
+        Err(_) => Some(RuntimeLogError::StateUnavailable.code()),
     }
 }
 
@@ -462,6 +610,9 @@ impl Drop for ChildOutputCapture {
 
 impl SinkState {
     fn write_line(&mut self, serialized: &[u8]) -> Result<(), RuntimeLogError> {
+        if self.rollover_blocked {
+            return Err(RuntimeLogError::FileUnavailable);
+        }
         if serialized.len() > self.policy.max_line_bytes {
             return Err(RuntimeLogError::WriteFailed);
         }
@@ -470,53 +621,118 @@ impl SinkState {
             .and_then(|bytes| bytes.checked_add(1))
             .ok_or(RuntimeLogError::WriteFailed)?;
         if record_bytes > self.policy.max_bytes {
-            return Err(RuntimeLogError::WriteFailed);
+            return Err(RuntimeLogError::RetentionLimit);
         }
-        if self.current_bytes.saturating_add(record_bytes) > self.policy.max_bytes {
-            self.rotate()?;
+        let active_date = utc_date_stamp();
+        if active_date != self.active_date {
+            self.refresh_quota_date(active_date)?;
         }
-        let file = self.file.as_mut().ok_or(RuntimeLogError::FileUnavailable)?;
-        file.write_all(serialized)
-            .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.flush())
+        validate_log_family(&self.directory, &self.file_name, None)?;
+        let expected_bytes = self
+            .current_bytes
+            .checked_add(record_bytes)
+            .ok_or(RuntimeLogError::RetentionLimit)?;
+        if expected_bytes > self.policy.max_bytes {
+            return Err(RuntimeLogError::RetentionLimit);
+        }
+        let pre_write_date = self.active_date.clone();
+        let pre_write_path = self.active_path.clone();
+        let pre_write_bytes = self.current_bytes;
+        let mut record = Vec::with_capacity(serialized.len() + 1);
+        record.extend_from_slice(serialized);
+        record.push(b'\n');
+        self.appender
+            .write_all(&record)
+            .and_then(|()| self.appender.flush())
             .map_err(|_| RuntimeLogError::WriteFailed)?;
-        self.current_bytes = self.current_bytes.saturating_add(record_bytes);
+        self.reconcile_post_write(
+            &pre_write_date,
+            &pre_write_path,
+            pre_write_bytes,
+            expected_bytes,
+            record_bytes,
+            utc_date_stamp(),
+        )?;
+        let max_log_files = self
+            .policy
+            .retained_files
+            .checked_add(1)
+            .ok_or(RuntimeLogError::PolicyInvalid)?;
+        if let Err(error) =
+            validate_log_family(&self.directory, &self.file_name, Some(max_log_files))
+        {
+            self.rollover_blocked = true;
+            return Err(error);
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), RuntimeLogError> {
-        self.file
-            .as_mut()
-            .ok_or(RuntimeLogError::FileUnavailable)?
+        self.appender
             .flush()
             .map_err(|_| RuntimeLogError::WriteFailed)
     }
 
-    fn rotate(&mut self) -> Result<(), RuntimeLogError> {
-        if let Some(mut file) = self.file.take() {
-            file.flush().map_err(|_| RuntimeLogError::WriteFailed)?;
-        }
-        prune_rotated_files(&self.directory, &self.file_name, self.policy.retained_files)?;
-        for index in (1..=self.policy.retained_files).rev() {
-            let source = if index == 1 {
-                self.active_path.clone()
-            } else {
-                rotated_path(&self.directory, &self.file_name, index - 1)
-            };
-            let destination = rotated_path(&self.directory, &self.file_name, index);
-            if path_exists(&destination)? {
-                validate_regular_file(&destination)?;
-                fs::remove_file(&destination).map_err(|_| RuntimeLogError::FileUnavailable)?;
-            }
-            if path_exists(&source)? {
-                validate_regular_file(&source)?;
-                fs::rename(&source, &destination).map_err(|_| RuntimeLogError::FileUnavailable)?;
-            }
-        }
-        let (file, current_bytes) = open_active_file(&self.active_path)?;
-        self.file = Some(file);
+    fn refresh_quota_date(&mut self, active_date: String) -> Result<(), RuntimeLogError> {
+        let active_path = dated_log_path(&self.directory, &self.file_name, &active_date);
+        validate_log_family(&self.directory, &self.file_name, None)?;
+        let current_bytes = if path_exists(&active_path)? {
+            regular_file_len(&active_path)?
+        } else {
+            0
+        };
+        self.active_date = active_date;
+        self.active_path = active_path;
         self.current_bytes = current_bytes;
         Ok(())
+    }
+
+    fn reconcile_post_write(
+        &mut self,
+        pre_write_date: &str,
+        pre_write_path: &Path,
+        pre_write_bytes: u64,
+        expected_bytes: u64,
+        record_bytes: u64,
+        post_write_date: String,
+    ) -> Result<(), RuntimeLogError> {
+        let result = (|| {
+            let pre_write_observed = if path_exists(pre_write_path)? {
+                secure_regular_file(pre_write_path)?;
+                Some(regular_file_len(pre_write_path)?)
+            } else {
+                None
+            };
+            if pre_write_observed == Some(expected_bytes) && post_write_date == pre_write_date {
+                self.active_date = String::from(pre_write_date);
+                self.active_path = pre_write_path.to_path_buf();
+                self.current_bytes = expected_bytes;
+                return Ok(());
+            }
+            if post_write_date == pre_write_date
+                || pre_write_observed.is_some_and(|observed| observed != pre_write_bytes)
+            {
+                return Err(RuntimeLogError::FileUnavailable);
+            }
+            let post_write_path =
+                dated_log_path(&self.directory, &self.file_name, &post_write_date);
+            if !path_exists(&post_write_path)? {
+                return Err(RuntimeLogError::FileUnavailable);
+            }
+            secure_regular_file(&post_write_path)?;
+            let post_write_bytes = regular_file_len(&post_write_path)?;
+            if post_write_bytes != record_bytes {
+                return Err(RuntimeLogError::FileUnavailable);
+            }
+            self.active_date = post_write_date;
+            self.active_path = post_write_path;
+            self.current_bytes = post_write_bytes;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.rollover_blocked = true;
+        }
+        result
     }
 }
 
@@ -976,74 +1192,77 @@ fn prepare_directory(directory: &Path) -> Result<(), RuntimeLogError> {
     Ok(())
 }
 
-fn open_active_file(path: &Path) -> Result<(File, u64), RuntimeLogError> {
-    if path_exists(path)? {
-        validate_regular_file(path)?;
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).append(true).read(true);
-    #[cfg(unix)]
-    {
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options
-        .open(path)
-        .map_err(|_| RuntimeLogError::FileUnavailable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| RuntimeLogError::FileUnavailable)?;
-    if metadata_is_link_like(&metadata) || !metadata.is_file() {
-        return Err(RuntimeLogError::FileUnavailable);
-    }
-    #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|_| RuntimeLogError::FileUnavailable)?;
-    Ok((file, metadata.len()))
+fn utc_date_stamp() -> String {
+    let date = OffsetDateTime::now_utc().date();
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month() as u8,
+        date.day()
+    )
 }
 
-fn prune_rotated_files(
+fn dated_log_path(directory: &Path, file_name: &str, date_stamp: &str) -> PathBuf {
+    directory.join(format!("{file_name}.{date_stamp}"))
+}
+
+fn validate_log_family(
     directory: &Path,
     file_name: &str,
-    retained_files: usize,
-) -> Result<(), RuntimeLogError> {
-    let prefix = format!("{file_name}.");
+    maximum_files: Option<usize>,
+) -> Result<usize, RuntimeLogError> {
     let entries = fs::read_dir(directory).map_err(|_| RuntimeLogError::DirectoryUnavailable)?;
-    let mut stale = Vec::new();
+    let mut count = 0usize;
     for entry in entries {
         let entry = entry.map_err(|_| RuntimeLogError::DirectoryUnavailable)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(suffix) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        if !name.starts_with(file_name) {
             continue;
         }
-        let Ok(index) = suffix.parse::<usize>() else {
-            continue;
-        };
-        if index == 0 {
-            continue;
+        if !is_owned_log_file_name(name, file_name) {
+            return Err(RuntimeLogError::PathInvalid);
         }
         secure_regular_file(&entry.path())?;
-        if index > retained_files {
-            stale.push((index, entry.path()));
-        }
+        count = count
+            .checked_add(1)
+            .ok_or(RuntimeLogError::FileUnavailable)?;
     }
-    stale.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    for (_, path) in stale {
-        validate_regular_file(&path)?;
-        fs::remove_file(path).map_err(|_| RuntimeLogError::FileUnavailable)?;
+    if maximum_files.is_some_and(|maximum| count > maximum) {
+        return Err(RuntimeLogError::FileUnavailable);
     }
-    Ok(())
+    Ok(count)
 }
 
-fn rotated_path(directory: &Path, file_name: &str, index: usize) -> PathBuf {
-    directory.join(format!("{file_name}.{index}"))
+fn is_owned_log_file_name(name: &str, file_name: &str) -> bool {
+    if name == file_name {
+        return true;
+    }
+    let Some(suffix) = name
+        .strip_prefix(file_name)
+        .and_then(|name| name.strip_prefix('.'))
+    else {
+        return false;
+    };
+    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        || is_daily_stamp(suffix)
+}
+
+fn is_daily_stamp(value: &str) -> bool {
+    value.len() == DAILY_STAMP_BYTES
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+fn regular_file_len(path: &Path) -> Result<u64, RuntimeLogError> {
+    validate_regular_file(path)?;
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|_| RuntimeLogError::FileUnavailable)
 }
 
 fn validate_regular_file(path: &Path) -> Result<(), RuntimeLogError> {
@@ -1118,6 +1337,24 @@ mod tests {
         process, thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn production_source_uses_only_native_daily_rotation() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains(".rotation(Rotation::DAILY)"));
+        assert!(source.contains(".max_log_files("));
+        for prohibited in [
+            concat!("Rotation::", "NEVER"),
+            concat!("fs::", "remove_file"),
+            concat!("fn build_", "appender"),
+            concat!("self.appender", " ="),
+        ] {
+            assert!(
+                !source.contains(prohibited),
+                "prohibited source: {prohibited}"
+            );
+        }
+    }
 
     #[test]
     fn policy_defaults_and_environment_bounds_are_strict() {
@@ -1213,8 +1450,7 @@ mod tests {
             Err(RuntimeLogError::EventInvalid)
         );
 
-        let contents =
-            fs::read_to_string(directory.join("agent.jsonl")).expect("runtime log should read");
+        let contents = read_log_family(&directory, "agent.jsonl");
         assert!(contents.contains("AGENT_STARTED"));
         assert!(contents.contains("[REDACTED]"));
         assert!(!contents.contains("must-not-appear"));
@@ -1245,8 +1481,7 @@ mod tests {
             .expect("capture should start");
         capture.finish().expect("capture should finish");
 
-        let contents =
-            fs::read_to_string(directory.join("gateway.jsonl")).expect("gateway log should read");
+        let contents = read_log_family(&directory, "gateway.jsonl");
         assert!(contents.contains("ready [REDACTED]"));
         assert!(contents.contains("GATEWAY_START_FAILED"));
         assert!(contents.contains("RUNTIME_LOG_STDOUT_INVALID"));
@@ -1279,8 +1514,7 @@ mod tests {
             )
             .expect("capture should start");
         capture.finish().expect("capture should drain to EOF");
-        let contents =
-            fs::read_to_string(directory.join("gateway.jsonl")).expect("gateway log should read");
+        let contents = read_log_family(&directory, "gateway.jsonl");
         assert!(contents.contains("RUNTIME_LOG_STDOUT_OVERSIZED"));
         assert!(contents.contains("after"));
         assert!(!contents.contains(secret));
@@ -1339,8 +1573,7 @@ mod tests {
         let started = Instant::now();
         capture.finish().expect("all capture threads should join");
         assert!(started.elapsed() < Duration::from_secs(5));
-        let contents =
-            fs::read_to_string(directory.join("gateway.jsonl")).expect("gateway log should read");
+        let contents = read_log_family(&directory, "gateway.jsonl");
         assert_eq!(contents.matches("\"message\":\"slow\"").count(), 20);
         assert_eq!(contents.matches("GATEWAY_SLOW_WARNING").count(), 20);
         remove_directory(directory);
@@ -1360,16 +1593,22 @@ mod tests {
             .capture(stdout, Cursor::new(Vec::<u8>::new()), Vec::new())
             .expect("capture should start");
         drop(capture);
-        let contents =
-            fs::read_to_string(directory.join("gateway.jsonl")).expect("gateway log should read");
+        let contents = read_log_family(&directory, "gateway.jsonl");
         assert!(contents.contains("drop-finished"));
         remove_directory(directory);
     }
 
     #[test]
-    fn rotation_is_bounded_deterministic_and_prunes_old_generations() {
+    fn native_daily_rotation_keeps_the_log_family_bounded() {
         let directory = temporary_directory("rotation");
-        fs::write(directory.join("agent.jsonl.7"), b"stale").expect("stale rotation should write");
+        for generation in ["2026-07-18", "2026-07-19", "2026-07-20", "2026-07-22"] {
+            fs::write(
+                directory.join(format!("agent.jsonl.{generation}")),
+                format!("generation-{generation}\n"),
+            )
+            .expect("retained generation should write");
+            thread::sleep(Duration::from_millis(2));
+        }
         let sink = StructuredLogSink::open(
             &directory,
             "agent.jsonl",
@@ -1381,18 +1620,358 @@ mod tests {
             },
         )
         .expect("sink should open");
-        assert!(!directory.join("agent.jsonl.7").exists());
-        for _ in 0..3_000 {
-            sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT")
-                .expect("event should rotate");
+        sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT")
+            .expect("event should write through the native daily appender");
+        let files = log_family_paths(&directory, "agent.jsonl");
+        let active_name = format!("agent.jsonl.{}", utc_date_stamp());
+        assert!(!files.is_empty());
+        assert!(files.len() <= 3, "native max_log_files should be honored");
+        assert!(
+            files.iter().any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == active_name)
+            }),
+            "the active file should use tracing-appender's daily name"
+        );
+        for path in &files {
+            assert!(fs::metadata(path).unwrap().len() <= MIN_LOG_MAX_BYTES);
         }
-        assert!(directory.join("agent.jsonl").is_file());
-        assert!(directory.join("agent.jsonl.1").is_file());
-        assert!(directory.join("agent.jsonl.2").is_file());
-        assert!(!directory.join("agent.jsonl.3").exists());
-        for name in ["agent.jsonl", "agent.jsonl.1", "agent.jsonl.2"] {
-            assert!(fs::metadata(directory.join(name)).unwrap().len() <= MIN_LOG_MAX_BYTES);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn full_daily_quota_keeps_the_sink_for_native_daily_recovery() {
+        let directory = temporary_directory("quota");
+        let active_path = dated_log_path(&directory, "agent.jsonl", &utc_date_stamp());
+        fs::write(
+            &active_path,
+            vec![b'x'; usize::try_from(MIN_LOG_MAX_BYTES).expect("quota should fit")],
+        )
+        .expect("active quota fixture should write");
+        let sink = StructuredLogSink::open(
+            &directory,
+            "agent.jsonl",
+            "agent",
+            LogPolicy {
+                max_bytes: MIN_LOG_MAX_BYTES,
+                retained_files: 1,
+                max_line_bytes: 256,
+            },
+        )
+        .expect("a full current-day file must not prevent the sink from opening");
+        assert_eq!(
+            sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT"),
+            Err(RuntimeLogError::RetentionLimit)
+        );
+        assert_eq!(sink.latched_error(), Some(RuntimeLogError::RetentionLimit));
+        assert_eq!(
+            fs::metadata(active_path)
+                .expect("active log should remain")
+                .len(),
+            MIN_LOG_MAX_BYTES
+        );
+        drop(sink);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn write_recovery_signal_requires_a_success_after_failure() {
+        let directory = temporary_directory("write-recovery");
+        let sink = test_sink(&directory, "gateway.jsonl", MIN_LOG_MAX_BYTES, 256);
+        let failure_path = directory.join("gateway.jsonl.1");
+        fs::create_dir(&failure_path).expect("write failure fixture should create");
+        assert_eq!(
+            sink.write_code(LogLevel::Info, "GATEWAY_HEARTBEAT"),
+            Err(RuntimeLogError::FileUnavailable)
+        );
+        assert_eq!(
+            sink.take_write_health_snapshot(),
+            WriteHealthSnapshot {
+                write_error_code: Some("RUNTIME_LOG_FILE_UNAVAILABLE"),
+                write_recovered_code: None,
+            }
+        );
+        fs::remove_dir(failure_path).expect("write failure fixture should remove");
+        sink.write_code(LogLevel::Info, "GATEWAY_HEARTBEAT")
+            .expect("repaired sink should write");
+        assert_eq!(
+            sink.take_write_health_snapshot(),
+            WriteHealthSnapshot {
+                write_error_code: None,
+                write_recovered_code: Some("RUNTIME_LOG_FILE_UNAVAILABLE"),
+            }
+        );
+        assert_eq!(
+            sink.take_write_health_snapshot(),
+            WriteHealthSnapshot::default()
+        );
+        drop(sink);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn write_recovery_stays_correlated_with_the_first_unrecovered_error() {
+        let directory = temporary_directory("write-recovery-correlation");
+        let sink = test_sink(&directory, "gateway.jsonl", MIN_LOG_MAX_BYTES, 256);
+        sink.latch_error(RuntimeLogError::FileUnavailable);
+        sink.latch_error(RuntimeLogError::RetentionLimit);
+        assert_eq!(
+            sink.take_write_health_snapshot(),
+            WriteHealthSnapshot {
+                write_error_code: Some("RUNTIME_LOG_FILE_UNAVAILABLE"),
+                write_recovered_code: None,
+            },
+            "the first unresolved write error owns the health transition"
+        );
+
+        sink.write_code(LogLevel::Info, "GATEWAY_HEARTBEAT")
+            .expect("a successful write should recover the sink");
+        assert_eq!(
+            sink.take_write_health_snapshot(),
+            WriteHealthSnapshot {
+                write_error_code: None,
+                write_recovered_code: Some("RUNTIME_LOG_FILE_UNAVAILABLE"),
+            },
+            "recovery must identify the same error that made the sink unhealthy"
+        );
+        drop(sink);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn write_health_snapshot_never_combines_different_episodes() {
+        let directory = temporary_directory("write-health-epoch");
+        let sink = test_sink(&directory, "gateway.jsonl", MIN_LOG_MAX_BYTES, 256);
+        sink.latch_error(RuntimeLogError::FileUnavailable);
+        sink.mark_write_healthy();
+        sink.latch_error(RuntimeLogError::RetentionLimit);
+        sink.mark_write_healthy();
+
+        assert_eq!(
+            sink.take_write_health_snapshot(),
+            WriteHealthSnapshot {
+                write_error_code: None,
+                write_recovered_code: Some("RUNTIME_LOG_RETENTION_LIMIT"),
+            },
+            "one atomic snapshot must expose only the latest completed episode"
+        );
+        drop(sink);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn post_write_retention_validation_failure_poisoned_sink_cannot_grow_again() {
+        let directory = temporary_directory("post-write-retention-poison");
+        let sink = test_sink(&directory, "agent.jsonl", MIN_LOG_MAX_BYTES, 256);
+        for generation in ["1", "2", "3"] {
+            fs::write(
+                directory.join(format!("agent.jsonl.{generation}")),
+                b"retained",
+            )
+            .expect("retained fixture should write");
         }
+        let active_path = sink
+            .shared
+            .state
+            .lock()
+            .expect("sink state should lock")
+            .active_path
+            .clone();
+        assert_eq!(
+            sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT"),
+            Err(RuntimeLogError::FileUnavailable),
+            "post-write retention validation should report the family overflow"
+        );
+        let poisoned_length = fs::metadata(&active_path)
+            .expect("active log should remain")
+            .len();
+        assert_eq!(
+            sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT"),
+            Err(RuntimeLogError::FileUnavailable)
+        );
+        assert_eq!(
+            fs::metadata(&active_path)
+                .expect("active log should remain")
+                .len(),
+            poisoned_length,
+            "a post-write retention failure must poison before the next appender call"
+        );
+        drop(sink);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn quota_date_bookkeeping_does_not_create_or_rotate_files() {
+        let directory = temporary_directory("quota-date-state");
+        let sink = test_sink(&directory, "agent.jsonl", MIN_LOG_MAX_BYTES, 256);
+        let next_date = String::from("2099-12-31");
+        let next_path = dated_log_path(&directory, "agent.jsonl", &next_date);
+        {
+            let mut state = sink.shared.state.lock().expect("sink state should lock");
+            state
+                .refresh_quota_date(next_date.clone())
+                .expect("quota date should refresh");
+            assert_eq!(state.active_date, next_date);
+            assert_eq!(state.current_bytes, 0);
+        }
+        assert!(
+            !next_path.exists(),
+            "only tracing-appender may create a daily generation"
+        );
+        drop(sink);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn midnight_reconcile_selects_the_single_native_new_day_record() {
+        let directory = temporary_directory("midnight-reconcile");
+        let sink = test_sink(&directory, "agent.jsonl", MIN_LOG_MAX_BYTES, 256);
+        let pre_write_date = "2099-12-30";
+        let post_write_date = "2099-12-31";
+        let pre_write_path = dated_log_path(&directory, "agent.jsonl", pre_write_date);
+        let post_write_path = dated_log_path(&directory, "agent.jsonl", post_write_date);
+        let old_contents = b"older";
+        let one_record = b"record\n";
+        fs::write(&pre_write_path, old_contents).expect("old daily fixture should write");
+        fs::write(&post_write_path, one_record).expect("new daily fixture should write");
+        {
+            let mut state = sink.shared.state.lock().expect("sink state should lock");
+            state
+                .reconcile_post_write(
+                    pre_write_date,
+                    &pre_write_path,
+                    u64::try_from(old_contents.len()).expect("old length should fit"),
+                    u64::try_from(old_contents.len() + one_record.len())
+                        .expect("expected length should fit"),
+                    u64::try_from(one_record.len()).expect("record length should fit"),
+                    String::from(post_write_date),
+                )
+                .expect("post-write midnight state should reconcile");
+            assert_eq!(state.active_date, post_write_date);
+            assert_eq!(state.active_path, post_write_path);
+            assert_eq!(
+                state.current_bytes,
+                u64::try_from(one_record.len()).expect("record length should fit")
+            );
+        }
+        assert_eq!(
+            fs::read(&pre_write_path).expect("old daily fixture should read"),
+            old_contents
+        );
+        assert_eq!(
+            fs::read(&post_write_path).expect("new daily fixture should read"),
+            one_record,
+            "reconciliation must never write the record a second time"
+        );
+        drop(sink);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn midnight_old_file_growth_blocks_all_follow_up_writes() {
+        let directory = temporary_directory("midnight-old-growth");
+        let sink = test_sink(&directory, "agent.jsonl", MIN_LOG_MAX_BYTES, 256);
+        let pre_write_date = "2099-12-30";
+        let post_write_date = "2099-12-31";
+        let pre_write_path = dated_log_path(&directory, "agent.jsonl", pre_write_date);
+        let old_contents = b"older";
+        let one_record = b"record\n";
+        let mut grown_contents = old_contents.to_vec();
+        grown_contents.extend_from_slice(one_record);
+        fs::write(&pre_write_path, &grown_contents)
+            .expect("simulated native old-file write should succeed");
+
+        {
+            let mut state = sink.shared.state.lock().expect("sink state should lock");
+            assert_eq!(
+                state.reconcile_post_write(
+                    pre_write_date,
+                    &pre_write_path,
+                    u64::try_from(old_contents.len()).expect("old length should fit"),
+                    u64::try_from(grown_contents.len()).expect("grown length should fit"),
+                    u64::try_from(one_record.len()).expect("record length should fit"),
+                    String::from(post_write_date),
+                ),
+                Err(RuntimeLogError::FileUnavailable),
+                "a crossed-date write to the prior-day file must fail closed"
+            );
+            assert!(state.rollover_blocked);
+        }
+
+        let blocked_length = fs::metadata(&pre_write_path)
+            .expect("prior-day file should remain")
+            .len();
+        assert_eq!(
+            sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT"),
+            Err(RuntimeLogError::FileUnavailable)
+        );
+        assert_eq!(
+            fs::metadata(&pre_write_path)
+                .expect("prior-day file should remain")
+                .len(),
+            blocked_length,
+            "a poisoned sink must fail before the native appender can grow the prior-day file"
+        );
+        drop(sink);
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn already_crossed_midnight_missing_new_file_blocks_follow_up_writes() {
+        let directory = temporary_directory("midnight-already-crossed");
+        let sink = test_sink(&directory, "agent.jsonl", MIN_LOG_MAX_BYTES, 256);
+        let active_date = String::from("2099-12-31");
+        let active_path = dated_log_path(&directory, "agent.jsonl", &active_date);
+        let one_record = b"record\n";
+        let old_path = sink
+            .shared
+            .state
+            .lock()
+            .expect("sink state should lock")
+            .active_path
+            .clone();
+        OpenOptions::new()
+            .append(true)
+            .open(&old_path)
+            .and_then(|mut file| file.write_all(one_record))
+            .expect("the appender's actual prior-day file should grow");
+
+        {
+            let mut state = sink.shared.state.lock().expect("sink state should lock");
+            state
+                .refresh_quota_date(active_date.clone())
+                .expect("quota bookkeeping should cross midnight before the write");
+            assert!(!active_path.exists(), "the native rollover file is missing");
+            assert_eq!(
+                state.reconcile_post_write(
+                    &active_date,
+                    &active_path,
+                    0,
+                    u64::try_from(one_record.len()).expect("record length should fit"),
+                    u64::try_from(one_record.len()).expect("record length should fit"),
+                    active_date.clone(),
+                ),
+                Err(RuntimeLogError::FileUnavailable)
+            );
+            assert!(state.rollover_blocked);
+        }
+
+        let blocked_length = fs::metadata(&old_path)
+            .expect("prior-day file should remain")
+            .len();
+        assert_eq!(
+            sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT"),
+            Err(RuntimeLogError::FileUnavailable)
+        );
+        assert_eq!(
+            fs::metadata(&old_path)
+                .expect("prior-day file should remain")
+                .len(),
+            blocked_length,
+            "a poisoned sink must fail before the old native appender can write again"
+        );
+        drop(sink);
         remove_directory(directory);
     }
 
@@ -1403,7 +1982,7 @@ mod tests {
 
         let directory = temporary_directory("paths");
         let sink = test_sink(&directory, "agent.jsonl", MIN_LOG_MAX_BYTES, 256);
-        let mode = fs::metadata(directory.join("agent.jsonl"))
+        let mode = fs::metadata(dated_log_path(&directory, "agent.jsonl", &utc_date_stamp()))
             .expect("active log should exist")
             .permissions()
             .mode()
@@ -1476,14 +2055,10 @@ mod tests {
         let target = directory.join("target");
         fs::write(&target, b"target").expect("target should write");
         symlink(&target, directory.join("agent.jsonl.1")).expect("symlink should create");
-        let mut observed = None;
-        for _ in 0..2_000 {
-            if let Err(error) = sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT") {
-                observed = Some(error);
-                break;
-            }
-        }
-        assert_eq!(observed, Some(RuntimeLogError::FileUnavailable));
+        assert_eq!(
+            sink.write_code(LogLevel::Info, "AGENT_HEARTBEAT"),
+            Err(RuntimeLogError::FileUnavailable)
+        );
         assert_eq!(sink.take_error_code(), Some("RUNTIME_LOG_FILE_UNAVAILABLE"));
         remove_directory(directory);
     }
@@ -1552,6 +2127,28 @@ mod tests {
             },
         )
         .expect("test sink should open")
+    }
+
+    fn log_family_paths(directory: &Path, file_name: &str) -> Vec<PathBuf> {
+        let mut paths = fs::read_dir(directory)
+            .expect("log directory should read")
+            .map(|entry| entry.expect("log entry should read").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| is_owned_log_file_name(name, file_name))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn read_log_family(directory: &Path, file_name: &str) -> String {
+        log_family_paths(directory, file_name)
+            .iter()
+            .map(|path| fs::read_to_string(path).expect("runtime log should read"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn temporary_directory(label: &str) -> PathBuf {

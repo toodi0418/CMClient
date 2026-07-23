@@ -59,20 +59,41 @@ if (-not [int]::TryParse($Lines, [ref]$LineCount) -or $LineCount -lt 1 -or $Line
 function Show-ServiceLogs {
     $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
     $logDirectory = Join-Path $programData "CMClient\logs"
-    $logFiles = @(
-        (Join-Path $logDirectory "service-host.jsonl"),
-        (Join-Path $logDirectory "agent.jsonl"),
-        (Join-Path $logDirectory "gateway.jsonl")
-    )
+    $logNames = @("service-host.jsonl", "agent.jsonl", "gateway.jsonl")
     $availableLogs = @()
 
-    foreach ($logFile in $logFiles) {
-        if (Test-Path -LiteralPath $logFile) {
-            $item = Get-Item -LiteralPath $logFile -Force
+    foreach ($logName in $logNames) {
+        $legacyLog = Join-Path $logDirectory $logName
+        $selectedLog = $null
+        if (Test-Path -LiteralPath $legacyLog) {
+            $item = Get-Item -LiteralPath $legacyLog -Force
             if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
                 throw "WINDOWS_SERVICE_LOG_FILE_INVALID"
             }
-            $availableLogs += $logFile
+            $selectedLog = $item.FullName
+        }
+
+        $datedPattern = ('^{0}\.\d{{4}}-\d{{2}}-\d{{2}}$' -f [regex]::Escape($logName))
+        $datedLogs = @(
+            Get-ChildItem -LiteralPath $logDirectory -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match $datedPattern } |
+                Sort-Object Name -Descending
+        )
+        foreach ($item in $datedLogs) {
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "WINDOWS_SERVICE_LOG_FILE_INVALID"
+            }
+            $stamp = $item.Name.Substring($logName.Length + 1)
+            $parsedDate = [DateTime]::MinValue
+            if (-not [DateTime]::TryParseExact($stamp, "yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsedDate)) {
+                throw "WINDOWS_SERVICE_LOG_FILE_INVALID"
+            }
+        }
+        if ($datedLogs.Count -gt 0) {
+            $selectedLog = $datedLogs[0].FullName
+        }
+        if ($null -ne $selectedLog) {
+            $availableLogs += $selectedLog
         }
     }
 

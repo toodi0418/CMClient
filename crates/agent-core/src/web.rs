@@ -1048,10 +1048,10 @@ fn serve_http_connection(
         }
         Err(error) => return Err(error),
     };
-    if let Some(api_handler) = api_handler
-        && api_handler.handle(client, &request_context)?
-    {
-        return Ok(());
+    if let Some(api_handler) = api_handler {
+        if api_handler.handle(client, &request_context)? {
+            return Ok(());
+        }
     }
     let routed_path = request_path(&request_context.path);
     if routed_path == "/api" || routed_path.starts_with("/api/") {

@@ -40,19 +40,21 @@ a gap; update subscriptions instead receive an immediate durable snapshot. The
 Web Logs page is an in-memory current-session event buffer, not a durable audit
 record.
 
-Agent writes `agent.jsonl`; Supervisor drains Gateway stdout/stderr into
-`gateway.jsonl`; the Windows SCM wrapper additionally writes
-`service-host.jsonl`. Each JSONL record has `schemaVersion: 1`. Structured
+Agent writes the `agent.jsonl.YYYY-MM-DD` daily family; Supervisor drains
+Gateway stdout/stderr into `gateway.jsonl.YYYY-MM-DD`; the Windows SCM wrapper
+additionally writes `service-host.jsonl.YYYY-MM-DD`. Each JSONL record has
+`schemaVersion: 1`. Structured
 stdout is allowlisted and recursively redacted, while child stderr accepts only
 a stable uppercase code; malformed, raw, or oversized output becomes a generic
 `RUNTIME_LOG_*` record. Unix log files are mode `0600`, and symlink, reparse
 point, or non-file destinations fail closed. Platform manager `logs` commands
-accept only `1..10000` lines. launchd and Windows read active application
-files; systemd prefers those files but falls back, only when both are absent,
+accept only `1..10000` lines. launchd, systemd, and Windows select the newest
+UTC-dated file in each family and retain fixed-name legacy fallback. systemd
+falls back, only when both application families are absent,
 to the bounded journal tail filtered to stable uppercase codes. No manager
 exposes unbounded raw child output.
 
-The active file and its numbered retained generations are bounded by strict
+The active daily file and its retained daily generations are bounded by strict
 decimal environment settings supplied to Agent or Service Host:
 
 | Setting | Default | Accepted range |
@@ -61,8 +63,10 @@ decimal environment settings supplied to Agent or Service Host:
 | `CMCLIENT_LOG_RETAINED_FILES` | 5 | 1 through 16 |
 | `CMCLIENT_LOG_MAX_LINE_BYTES` | 64 KiB | 256 bytes through 1 MiB, and no more than half the file limit |
 
-Invalid or out-of-range values report `RUNTIME_LOG_POLICY_INVALID`. Within
-Agent and Supervisor, rotation, write, and bounded-queue failures remain stable
+Invalid or out-of-range values report `RUNTIME_LOG_POLICY_INVALID`. A daily
+file stops accepting records at its byte quota with
+`RUNTIME_LOG_RETENTION_LIMIT`; the next UTC day starts a new file. Within Agent
+and Supervisor, rollover, write, and bounded-queue failures remain stable
 runtime codes in Agent `latestErrorCode` and never cause a shutdown
 reader/writer deadlock. If Windows Service Host rejects policy before it can
 open its sink or start Agent, SCM reports a service-start failure; no JSONL or
@@ -143,6 +147,7 @@ verify each JSON report before starting Agent.
 | --- | --- | --- |
 | `AGENT_INSTANCE_ALREADY_RUNNING` | Another Agent owns the data-dir lock | Inspect the existing service; do not delete the lock while it runs |
 | `AGENT_CONFIG_INVALID` | Strict TOML or path validation failed | Run `cmclient-agent --check-config` and fix the named section |
+| `AGENT_INSTANCE_STATE_INVALID` | The bounded Agent instance-state document is malformed or has an unsupported schema | Stop the Agent, preserve the file for diagnosis, and remove it only after confirming no Agent instance is running |
 | `GATEWAY_PROXY_UNAVAILABLE` | Agent cannot reach its supervised Gateway | Check Agent status, child logs, and Gateway health |
 | `CONTROL_RESOURCE_EXHAUSTED` | Local IPC connection limit reached | Close stale clients; retry with bounded backoff |
 | `SSE_SUBSCRIBER_LIMIT_REACHED` | Gateway event subscriber cap reached | Disconnect unused streams and reconnect |
