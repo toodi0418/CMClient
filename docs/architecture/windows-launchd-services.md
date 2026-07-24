@@ -6,7 +6,7 @@
 wrapper around a console binary. It receives SCM start/stop/shutdown controls,
 starts the adjacent `cmclient-agent.exe`, and reports the Agent child exit as a
 service failure. On stop it repeatedly requests the local-only Agent shutdown
-route, waits up to 50 seconds for Agent and Gateway cooperative teardown, then
+operation, waits up to 50 seconds for Agent and Gateway cooperative teardown, then
 uses process termination only as a bounded fallback. The supervised Gateway
 also treats its Agent stdin pipe closing as parent death, so fallback cannot
 leave an orphan Gateway holding the loopback port. The Agent's durable update
@@ -28,18 +28,17 @@ CallMesh key, APRS credential, Control token, or signing key. `CMClientAgent`
 remains the fixed singleton fixture identity. Uninstall removes that test
 registration and retains the effective home's `.cmclient` directory.
 
-The private Agent Control API is a root-derived local named pipe. It never
-falls back to TCP and carries no bearer token. The public current-user product
-uses the same user's pipe with remote clients rejected; it makes no
-cross-account access claim and requires no custom ACL or UAC flow.
+The private Agent Control API is an `interprocess` local named pipe derived from
+a SHA-256 digest of the canonical state root. It never falls back to TCP and
+carries no bearer token. The public current-user product uses the same user's
+pipe with remote clients rejected by the named-pipe transport; it makes no
+cross-account access claim and requires no SID impersonation, custom ACL,
+unsafe FFI, PID identity, or UAC flow.
 
-Windows byte-mode `PIPE_NOWAIT` reports both a temporarily empty pipe and a
-closed peer as the same zero-byte read through the synchronous transport. The
-client therefore waits for its bounded deadline instead of treating zero bytes
-as EOF: no complete response, including a peer that closes silently, maps to
-`CONTROL_TIMEOUT`. Complete malformed HTTP still maps to
-`CONTROL_HTTP_INVALID`. A future overlapped transport may distinguish EOF
-without changing the deadline guarantee.
+Control carries bounded length-delimited typed envelopes rather than HTTP.
+Malformed or oversized frames fail with stable Control codes, a peer that does
+not complete a frame reaches the bounded deadline, and disconnects release the
+request slot. The Service Host uses the same typed client as command mode.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/cmclient-windows-service.ps1 install `

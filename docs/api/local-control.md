@@ -1,141 +1,147 @@
-# Local Agent Control API
+# Local Agent Control IPC
 
-The authoritative Agent Control endpoint is always local IPC, not the public
-Gateway Business API: a mode-`0600` socket below `~/.cmclient/run` on macOS and
-Linux, `/home/cmclient/.cmclient/run` in Docker, or
-`\\.\pipe\cmclient-control` on Windows. Windows disables remote named-pipe
-clients. Control never falls back to TCP or an HTTPS bridge, and CLI and
-Desktop use only the current user's private endpoint.
+The authoritative Agent Control endpoint is private local IPC, not an HTTP API
+and not the public Gateway Business API. On macOS, Linux, and Docker it is the
+mode-`0600` socket `~/.cmclient/run/control.sock` (under
+`/home/cmclient/.cmclient/run` in Docker). The owning root and run directory are
+mode `0700`. On Windows it is an `interprocess` local named pipe whose name
+contains a SHA-256 digest of the canonical `~/.cmclient` state root, so two
+different roots cannot collide. Windows rejects remote named-pipe clients. The
+`interprocess` listener keeps `accept_remote` disabled, which maps to
+`PIPE_REJECT_REMOTE_CLIENTS`.
 
-The Control routes are:
+Control never falls back to TCP, HTTP, HTTPS, or a Management Web bridge. It
+has no bearer token, HMAC credential, persisted Control credential, or
+`CMCLIENT_CONTROL_TOKEN` environment path. CLI and Desktop connect only to the
+current user's endpoint and never open `~/.cmclient/secrets.json`. The Windows
+current-user product claims remote-client rejection, not isolation between two
+accounts on the same host; it does not use SID impersonation, a custom ACL,
+unsafe FFI, PID identity, or UAC. After an ambiguous nonblocking zero-byte read,
+Windows handles this with a zero-length write on the underlying local named
+pipe. The write is solely a liveness probe and emits no protocol bytes.
+Peer PID is not consulted for liveness, authentication, identity, or
+authorization, and neither probe result changes command behavior.
 
-```text
-GET /api/v1/control/status
-POST /api/v1/control/start
-POST /api/v1/control/stop
-POST /api/v1/control/restart
-POST /api/v1/control/agent/shutdown
-POST /api/v1/control/web/enable
-POST /api/v1/control/web/disable
-GET /api/v1/control/updates
-GET /api/v1/control/updates/events
-GET /api/v1/control/diagnostics/bundle
-GET /api/v1/control/gateway/meshtastic
-GET /api/v1/control/gateway/nodes
-GET /api/v1/control/gateway/positions
-GET /api/v1/control/gateway/aprs
-GET /api/v1/control/gateway/callmesh
-GET /api/v1/control/gateway/proxy
-GET /api/v1/control/events/recent
-GET /api/v1/control/events
-POST /api/v1/control/database/integrity-check
-POST /api/v1/control/backups
-PUT /api/v1/control/secrets/callmesh-api-key
-PUT /api/v1/control/secrets/{aprs-passcode|management-admin-token} (deprecated; always 410)
-DELETE /api/v1/control/secrets/{callmesh-api-key|aprs-passcode|management-admin-token}
-```
+## Wire contract
 
-Local IPC exposes every route above, including `agent/shutdown` and secret
-storage. No browser or network listener exposes these routes. Management Web
-uses its session, Origin, and CSRF boundary instead of forwarding raw Control
-requests, and no remote browser or CLI can terminate the host Agent.
+`interprocess::local_socket` carries byte streams. CMClient frames those bytes
+with `tokio_util::codec::LengthDelimitedCodec`: a four-byte big-endian length
+prefix followed by one bounded Serde JSON envelope. `CONTROL_PROTOCOL_VERSION`
+identifies the envelope contract and `MAX_CONTROL_FRAME_BYTES` fixes its maximum
+size. A peer must send exactly one complete request envelope before it receives
+a response or subscription event. There is no HTTP request line, header block,
+query string, status code, chunking, or SSE text in this protocol.
 
-Control routes use exact method/path matching. Query strings are not accepted;
-an unmatched method or path returns the code-only
-`{"code":"CONTROL_ROUTE_NOT_FOUND"}` envelope. Lifecycle, backup, diagnostics,
-and projection commands currently ignore a request body after the HTTP request
-has been parsed, so clients must send an empty body. Secret `PUT` is the only
-value-bearing route, and secret `DELETE` requires an empty body.
+Every request contains the protocol version, a fresh request ID, and one typed
+operation. Every response repeats the version and request ID and contains
+either the operation's typed result or one stable `CONTROL_*` error code.
+Subscription events carry their own typed envelope and retain the subscribing
+request ID. Unknown versions, unknown operations, mismatched request IDs,
+malformed JSON, trailing data, oversized frames, and oversized serialized
+results fail closed without reflecting parser text or payload data.
 
-Requests are capped at 8 KiB and JSON responses at 2 MiB. Control SSE events
-are capped at 60 KiB, the connection pool is capped at 64 concurrent requests
-or streams, and every operation keeps a bounded deadline. Control payloads use
-camelCase Rust serde contracts; the nested update projection follows the shared
-`UpdateControlStatus` field names. A
-transport or size violation maps to a stable `CONTROL_*` error rather than a
-raw parser message.
+The server checks for trailing available bytes before dispatch. Any already
+available byte after the first complete request, including an incomplete second
+frame, rejects the entire request; the first operation is not executed. This is
+a fail-closed framing check, not permission for a second request on the same
+stream.
 
-Lifecycle status schema v3 returns the Agent component identity/state, Gateway
-lifecycle, Management Web listener state and its URL (only when running),
-uptime, and the latest stable error code. The identity contains the exact shared
-CMClient version, commit, tree/content digest, channel, and target. The
-`agentVersion`-only schema v2 shape is rejected. The enable/disable commands
-control only the optional loopback Management Web listener; the private Control
-API remains available in both states. This bounded endpoint exists to support
-local Agent control, CLI, and Desktop operations while Gateway is unavailable.
-The IPC server admits at most 64 concurrent requests/SSE streams and applies
-bounded server-side read/write deadlines. Excess clients receive the stable
-`CONTROL_RESOURCE_EXHAUSTED` error; releasing a connection immediately returns
-its slot.
+The frame limit, connection limit, and read/write deadlines are fixed by the
+Control contract. A length prefix over the limit is rejected before allocation.
+A slow partial frame, silent peer, or incomplete response reaches the bounded
+deadline; disconnects release their server slot and terminate any associated
+Gateway bridge. The configured client timeout starts before local connect and
+bounds connect and request setup, including the request write and initial
+response or subscription acceptance.
 
-`POST /api/v1/control/agent/shutdown` is reserved for local IPC and the Windows
-Service Host. It requests one terminal Agent teardown and is not exposed by
-Management Web or any network listener. Agent stops the supervisor worker,
-cooperatively drains Gateway, and closes Management Web before exiting.
-Once terminal teardown is requested, resource-starting commands (`start`,
-`restart`, and `web/enable`) fail with `CONTROL_COMMAND_FAILED`; status and
-resource-draining commands remain safe while teardown completes.
+ControlServer shutdown cancels and joins every active request or subscription
+stream before the endpoint can be reused. No detached stream survives the
+server, so a restart invalidates existing streams before the same root resolves
+to and rebinds the same deterministic endpoint.
 
-Gateway projection routes are an Agent-owned bridge. The local client asks
-Agent, Agent calls the loopback Gateway with a bounded timeout, and Agent
-returns the schema-backed JSON or stable Control error. `events` streams the
-bounded Gateway SSE feed; `events/recent` forwards Gateway's default 100-item,
-newest-first process-local snapshot and exposes no `limit` query. The bridge
-applies a one-second upstream read poll even after HTTP connection setup. A
-timed-out read checks the bounded downstream channel and continues the same
-healthy stream, so
-dropping a Control SSE client terminates its bridge thread and loopback socket
-even when Gateway is half-open and sends no heartbeat. Backup and database
-integrity routes return accepted persistent Jobs rather than performing work in
-the CLI or Desktop process. Gateway events use non-blocking offers to the fixed
-64-entry downstream queue; a full or disconnected queue closes that one bridge
-instead of blocking its upstream reader. The bridge retains the last event ID
-it successfully forwarded and sends it as `Last-Event-ID` after an upstream
-reconnect, allowing Gateway's bounded replay window to fill short disconnects.
-The snapshot and reconnect replay do not survive a Gateway restart and cannot
-recover events that have already left the bounded Gateway buffer.
+On Unix, an existing socket path is probed before binding. A successful probe
+means the endpoint is in use; only a probe that fails with `ConnectionRefused`
+allows removal as a stale socket. All other probe failures fail closed and
+leave the path intact.
 
-When the supervisor has a live child process, Agent additionally probes the
-Gateway loopback health endpoint. The control status is `running` only after a
-successful probe; otherwise it reports `degraded`.
+## Operations
 
-`GET /api/v1/control/updates` returns the Agent-owned persistent update job,
-or `job: null` when there is no job. Its safe projection includes phase, update
-time, optional bytes downloaded/total/speed, error code, and at most 64 stable
-log codes. It never returns manifest URLs, signing material, archive paths,
-server response text, or user configuration.
+The request operation, rather than an HTTP method/path pair, selects behavior:
 
-`GET /api/v1/control/updates/events` is a local `text/event-stream` feed.
-Every connection receives an immediate `update.status_changed` snapshot, then
-future state transitions and a 15-second heartbeat. The Agent retains no
-unbounded per-client backlog: slow or disconnected subscribers are removed.
-The durable source of truth is the update journal, so clients reconnect by
-reading `/updates` before subscribing again.
+| Operation | Result |
+| --- | --- |
+| `Status` | Agent, Gateway, Management Web, identity, uptime, and stable error status |
+| `Start` | Start Gateway and return updated lifecycle status |
+| `Stop` | Stop Gateway and return updated lifecycle status |
+| `Restart` | Restart Gateway and return updated lifecycle status |
+| `ShutdownAgent` | Terminal local Agent teardown status |
+| `EnableManagementWeb` | Enable the optional Web listener and return updated lifecycle status |
+| `DisableManagementWeb` | Disable the optional Web listener and return updated lifecycle status |
+| `UpdateStatus` | Safe persistent update-job projection |
+| `SubscribeUpdateEvents` | Initial update snapshot followed by typed update events |
+| `DiagnosticsBundle` | Sanitized Agent/runtime allowlist |
+| `GatewayProjection` | Meshtastic, nodes, positions, APRS, CallMesh, Proxy, recent events, integrity Job, or backup Job projection |
+| `SubscribeGatewayEvents` | Typed events bridged from the bounded Gateway stream |
+| `StoreSecret` | Store the bounded CallMesh API key and return only `stored: true` |
+| `RemoveSecret` | Remove a supported or legacy-removal secret kind |
 
-`GET /api/v1/control/diagnostics/bundle` returns a JSON allowlist of Agent and
-runtime state. It contains stable error/log codes but never paths, config,
-environment, database content, packet data, credentials, or log payloads.
+Lifecycle status schema v3 returns component identity/state, Gateway lifecycle,
+Management Web listener state and its URL only when running, uptime, and the
+latest stable error code. The identity contains the exact shared CMClient
+version, commit, tree/content digest, channel, and target. The obsolete
+`agentVersion`-only schema v2 shape is rejected. Management Web enable/disable
+controls only the optional Web listener; local Control remains available.
+
+`ShutdownAgent` is reserved for local IPC and the Windows Service Host. It
+requests one terminal teardown and is never available from Management Web or a
+network listener. Agent commits the shutdown request only after the typed
+success response has been written, so Service Host can observe the graceful
+acknowledgement before Control teardown. Agent stops the supervisor worker, cooperatively drains
+Gateway, and closes Management Web before exiting. Once teardown begins,
+resource-starting operations fail with `CONTROL_COMMAND_FAILED`; status and
+resource-draining operations remain safe while teardown completes.
+
+Gateway projections are Agent-owned bridges. Agent calls its private loopback
+Gateway with bounded timeouts and returns schema-backed JSON or a stable Control
+error. Recent events use Gateway's bounded default snapshot. Integrity and
+backup return accepted persistent Jobs rather than doing database work in CLI
+or Desktop. A Gateway event subscription uses a fixed downstream queue, closes
+one slow subscriber without blocking Gateway, remembers the last successfully
+forwarded event ID for bounded Gateway replay, and adds Agent heartbeat events.
+Replay remains process-local and cannot recover events older than Gateway's
+bounded buffer or survive a Gateway restart.
+
+`UpdateStatus` returns the Agent-owned persistent update job or `job: null`.
+Its safe projection includes phase, update time, optional transfer progress,
+error code, and bounded stable log codes. It never returns manifest URLs,
+signing material, archive paths, server text, or user configuration.
+`SubscribeUpdateEvents` sends an immediate typed status snapshot and future
+state transitions. The durable journal remains authoritative, so a reconnecting
+client first reads `UpdateStatus` and then opens a new subscription.
+
+`DiagnosticsBundle` returns a JSON allowlist of Agent and runtime state. It may
+contain stable error/log codes but never paths, configuration, environment,
+database content, packet data, credentials, or log payloads.
 
 ## Secret boundary
 
-Secret routes never pass through Gateway. `PUT` accepts one bounded UTF-8 value
-without control characters. `callmesh-api-key` is the only settable runtime
-kind. `aprs-passcode` and `management-admin-token` are removal-only compatibility
-names: `PUT` returns HTTP 410 with `CONTROL_SECRET_KIND_DEPRECATED` without
-dispatching the value, while `DELETE` removes any value left by an older
-installation.
+Secret operations never pass through Gateway. `StoreSecret` accepts one
+bounded UTF-8 value without control characters. `callmesh-api-key` is the only
+settable runtime kind. `aprs-passcode` and `management-admin-token` are
+removal-only compatibility names: attempts to store them return
+`CONTROL_SECRET_KIND_DEPRECATED` without dispatching the value, while removal
+deletes any value left by an older installation.
 
 Agent is the only owner of secret persistence. It atomically writes the sole
 backend, root-level `~/.cmclient/secrets.json` (or
 `/home/cmclient/.cmclient/secrets.json` in Docker). POSIX uses `0700` for the
 root and `0600` for the file; Windows uses an ordinary current-user file without
-UAC or a cross-principal ACL claim. There is no Keychain, Credential
-Manager/DPAPI, Secret Service, systemd vault, persisted Control token, or
-secret-bearing argv/environment path.
+a cross-principal security claim. There is no Keychain, Credential
+Manager/DPAPI, Secret Service, systemd vault, or secret-bearing argv/environment
+path.
 
-The response is only `{ "stored": true }`; values are never returned. CLI
-users send a new CallMesh key over standard input with
-`cmclient secret set callmesh-api-key`, and the CLI never reads `secrets.json`.
-Agent transfers the key to a supervised Gateway only through its private
-inherited bootstrap channel. Local IPC permissions and bounded typed messages
-are the complete command-mode authorization boundary.
+CLI reads a new CallMesh key from standard input and sends it in one bounded
+local request. The value is never returned. Agent transfers the key to a
+supervised Gateway only through its private inherited bootstrap channel. Local
+endpoint access and bounded typed frames are the complete command-mode
+authorization boundary.

@@ -5,8 +5,9 @@ Meshtastic device directly. Global options are `--json`, `--quiet`,
 `--no-color`, `--timeout`, and `--endpoint`.
 
 Endpoints are local IPC (`local`, a Unix socket below `~/.cmclient/run`, or the
-Windows named pipe). The unified product does not expose a remote CLI Control
-endpoint and never accepts a Control token through arguments, environment, or
+root-hashed Windows named pipe). The typed client uses bounded length-delimited
+request, response, and event envelopes. CMClient does not expose a remote CLI Control
+endpoint. It never accepts a Control token through arguments, environment, or
 persistent storage.
 
 Exit codes are stable: 0 success, 2 usage, 3 connection, 4 authentication, 5
@@ -22,9 +23,9 @@ commands return persistent Job acceptance rather than touching SQLite.
 
 `update` reads the Agent-owned persistent update projection and reports the
 current phase, transfer, speed, and stable failure code without contacting
-Gateway. `update --follow` reconnects to the private
-`/api/v1/control/updates/events` SSE feed and prints each complete status
-projection. With `--json`, each line is one stable
+Gateway. `update --follow` reconnects to the private typed update-event
+subscription and prints each complete status projection. With `--json`, each
+line is one stable
 `UpdateControlStatus` JSON document; `--quiet` suppresses normal output.
 
 `diagnostics` reads the Agent's sanitized diagnostic bundle through the private
@@ -36,11 +37,15 @@ The legacy `aprs-passcode` and `management-admin-token` kinds are accepted only
 by `secret remove` so upgrades can delete obsolete entries; trying to set either
 returns `CLI_SECRET_KIND_DEPRECATED` with validation exit code 5.
 
-`logs --follow`, `events --follow`, and `update --follow` use bounded SSE
-parsing, reconnect after transient disconnects, and exit cleanly on Ctrl+C.
-`--timeout` applies to setup and bounded requests; timeout maps to exit 8 rather
-than an ordinary connection failure. Human output, JSON, quiet mode, and colour
-suppression are handled by the CLI after a shared projection is returned.
+`logs --follow`, `events --follow`, and `update --follow` consume bounded typed
+Control event frames, reconnect after transient disconnects, and exit cleanly
+on Ctrl+C. The Agent's internal Gateway bridge still consumes Gateway SSE, but
+SSE text never crosses the local Control endpoint. `--timeout` starts before
+local endpoint connection and bounds connect and request setup, including the
+request write and initial response or subscription acceptance. A timeout maps
+to exit 8 rather than an ordinary connection failure. Human output, JSON, quiet
+mode, and colour suppression are handled by the CLI after a shared projection
+is returned.
 
 `events` displays every validated domain event. `logs` is currently a reserved
 projection that filters for `log.entry`; no production Gateway publisher emits

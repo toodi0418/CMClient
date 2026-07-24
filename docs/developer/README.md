@@ -4,7 +4,7 @@ CMClient 2.0 is a boundary-driven workspace:
 
 | Owner | Responsibility |
 | --- | --- |
-| Rust Agent | Process supervision, single-instance lock, local/remote Control, Web listener, updates, backup/recovery |
+| Rust Agent | Process supervision, single-instance lock, private local Control IPC, Web listener, updates, backup/recovery |
 | TypeScript Gateway | Meshtastic transports, protobuf/domain normalization, SQLite, Position/APRS, CallMesh, Proxy, Jobs, SSE |
 | Vue Web | Presentation and validated API/SSE clients; no privileged I/O |
 | Tauri Desktop | Small Agent Control client and supervisor UI; no duplicate Gateway |
@@ -71,6 +71,8 @@ environment and an exact version tag; ordinary `dev` runs never sign.
 - Do not let Web, Desktop, or CLI touch files, processes, SQLite, or
   Meshtastic directly.
 - Do not add a LAN Gateway listener outside Agent's authenticated boundary.
+- Do not add a remote Control transport; CLI and Desktop use private local IPC,
+  while remote management stays behind the Management Web session boundary.
 - Do not put secrets in Git, command arguments, logs, fixtures, API responses,
   or diagnostic bundles.
 - Do not reintroduce any removed Legacy runtime or compatibility path. Remote

@@ -9,6 +9,7 @@ import { checkDocumentation } from "./documentation-contract.mjs";
 const REPOSITORY_ROOT = resolve(".");
 const FIXTURE_PATHS = [
   "AGENTS.md",
+  "Cargo.lock",
   "Cargo.toml",
   "CHANGELOG.md",
   "LICENSE",
@@ -69,6 +70,22 @@ test("rejects altered GPL license bytes and manifest license drift", async () =>
     assert.ok(
       errors.includes(
         "package.json license must be GPL-3.0-only: received MIT",
+      ),
+      errors.join("\n"),
+    );
+  });
+});
+
+test("rejects stale Cargo.lock provenance", async () => {
+  await withFixture(async (root) => {
+    const path = join(root, "Cargo.lock");
+    const source = await readFile(path, "utf8");
+    await writeFile(path, `${source}\n`);
+
+    const errors = await checkDocumentation(root);
+    assert.ok(
+      errors.some((error) =>
+        error.startsWith("license provenance Cargo.lock SHA-256 is stale:"),
       ),
       errors.join("\n"),
     );
@@ -211,6 +228,94 @@ test("rejects a documented route that has no production owner", async () => {
       ),
       errors.join("\n"),
     );
+  });
+});
+
+test("checks the typed Control operation catalog exactly", async () => {
+  await withFixture(async (root) => {
+    await replaceInFile(
+      root,
+      "docs/api/local-control.md",
+      "| `Status` | Agent, Gateway, Management Web, identity, uptime, and stable error status |",
+      "| `Phantom` | Agent, Gateway, Management Web, identity, uptime, and stable error status |",
+    );
+
+    const errors = await checkDocumentation(root);
+    assert.ok(
+      errors.includes("Control IPC documentation is missing operation: Status"),
+      errors.join("\n"),
+    );
+    assert.ok(
+      errors.includes(
+        "Control IPC documentation contains unknown operation: Phantom",
+      ),
+      errors.join("\n"),
+    );
+  });
+});
+
+test("rejects an HTTP or remote-token Control transport regression", async () => {
+  await withFixture(async (root) => {
+    const documentationPath = join(root, "docs/api/local-control.md");
+    const documentation = await readFile(documentationPath, "utf8");
+    await writeFile(
+      documentationPath,
+      `${documentation}\nRetired route: GET /api/v1/control/status.\n`,
+    );
+    const sourcePath = join(root, "crates/control-api/src/lib.rs");
+    const source = await readFile(sourcePath, "utf8");
+    await writeFile(
+      sourcePath,
+      `${source}\n// HTTP/1.1 CMCLIENT_CONTROL_TOKEN\n`,
+    );
+
+    const errors = await checkDocumentation(root);
+    assert.ok(
+      errors.includes(
+        "Control IPC documentation contains an obsolete HTTP route",
+      ),
+      errors.join("\n"),
+    );
+    assert.ok(
+      errors.includes(
+        "Control IPC source contains removed transport: HTTP/1.1",
+      ),
+      errors.join("\n"),
+    );
+    assert.ok(
+      errors.includes(
+        "Control IPC source contains removed transport: CMCLIENT_CONTROL_TOKEN",
+      ),
+      errors.join("\n"),
+    );
+  });
+});
+
+test("rejects missing local Control hardening guarantees", async () => {
+  await withFixture(async (root) => {
+    const removals = [
+      "ambiguous nonblocking zero-byte read",
+      "zero-length write",
+      "solely a liveness probe",
+      "emits no protocol bytes",
+      "Peer PID is not consulted",
+      "trailing available bytes",
+      "connect and request setup",
+      "cancels and joins every active request or subscription",
+      "`ConnectionRefused`",
+      "All other probe failures fail closed",
+    ];
+    for (const token of removals) {
+      await replaceInFile(root, "docs/api/local-control.md", token, "removed");
+    }
+
+    const errors = await checkDocumentation(root);
+    for (const token of removals) {
+      assert.ok(
+        errors.includes(`Control IPC documentation is missing: ${token}`),
+        errors.join("\n"),
+      );
+    }
   });
 });
 

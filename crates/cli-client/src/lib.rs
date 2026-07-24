@@ -29,7 +29,6 @@ pub enum ControlEndpointSpec {
     Local,
     UnixSocket(PathBuf),
     NamedPipe(String),
-    Https(String),
 }
 
 pub fn parse_endpoint(value: &str) -> Result<ControlEndpointSpec, ExitCode> {
@@ -45,9 +44,6 @@ pub fn parse_endpoint(value: &str) -> Result<ControlEndpointSpec, ExitCode> {
     }
     if value.starts_with(r"\\.\pipe\") {
         return Ok(ControlEndpointSpec::NamedPipe(value.to_owned()));
-    }
-    if value.starts_with("https://") {
-        return Ok(ControlEndpointSpec::Https(value.to_owned()));
     }
     Err(ExitCode::Validation)
 }
@@ -79,6 +75,10 @@ mod tests {
         }
         assert_eq!(
             parse_endpoint("http://127.0.0.1"),
+            Err(ExitCode::Validation)
+        );
+        assert_eq!(
+            parse_endpoint("https://cmclient.example"),
             Err(ExitCode::Validation)
         );
     }

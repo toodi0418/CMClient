@@ -12,12 +12,9 @@ use cmclient_agent_core::{
 };
 use cmclient_control_api::{
     ControlClient, ControlCommand, ControlEndpoint, ControlError, ControlHandler,
-    ControlSecretKind, ControlServer, ControlStatus, ControlUpdateEvent, ControlUpdateEventStream,
-    DiagnosticsControlBundle, GatewayControlStatus, GatewayProjection, InternalComponent,
-    ManagementWebControlStatus, REMOTE_CONTROL_NONCE_HEADER, REMOTE_CONTROL_SCOPE_HEADER,
-    REMOTE_CONTROL_TIMESTAMP_HEADER, RemoteControlAuth, RemoteControlAuthError,
-    RemoteControlReplayGuard, UpdateControlJob, UpdateControlStatus, compiled_component_identity,
-    default_local_endpoint,
+    ControlSecretKind, ControlServer, ControlStatus, ControlUpdateEvent, DiagnosticsControlBundle,
+    GatewayControlStatus, GatewayProjection, InternalComponent, ManagementWebControlStatus,
+    UpdateControlJob, UpdateControlStatus, compiled_component_identity, default_local_endpoint,
 };
 use cmclient_legacy_migration::{
     ChildGatewayMaintenanceRunner, GatewayMaintenanceRunner, ProductMigrationSourceSet,
@@ -171,9 +168,6 @@ fn utc_now() -> String {
 struct AgentManagementWebApi {
     updates: Arc<AgentUpdateService>,
     access: Option<Arc<ManagementAccessController>>,
-    control_endpoint: ControlEndpoint,
-    secrets: AgentSecretStore,
-    remote_replay: Arc<RemoteControlReplayGuard>,
 }
 
 impl ManagementWebApiHandler for AgentManagementWebApi {
@@ -183,7 +177,12 @@ impl ManagementWebApiHandler for AgentManagementWebApi {
         request: &ManagementWebRequest,
     ) -> Result<bool, ManagementWebError> {
         if request.path.starts_with("/api/v1/control/") {
-            return self.handle_remote_control(client, request);
+            write_management_json(
+                client,
+                "404 Not Found",
+                br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#,
+            )?;
+            return Ok(true);
         }
         if let Some(access) = &self.access {
             if request.method == "POST" && request.path == "/api/v1/auth/login" {
@@ -237,272 +236,6 @@ impl ManagementWebApiHandler for AgentManagementWebApi {
             }
             _ => Ok(false),
         }
-    }
-}
-
-impl AgentManagementWebApi {
-    fn handle_remote_control(
-        &self,
-        client: &mut dyn ManagementWebStream,
-        request: &ManagementWebRequest,
-    ) -> Result<bool, ManagementWebError> {
-        let token = match self.secrets.read(SecretKind::ManagementAdminToken) {
-            Ok(Some(token)) => token,
-            _ => {
-                write_remote_control_auth_error(client, RemoteControlAuthError::Missing)?;
-                return Ok(true);
-            }
-        };
-        let auth = match remote_control_auth(request) {
-            Ok(auth) => auth,
-            Err(error) => {
-                write_remote_control_auth_error(client, error)?;
-                return Ok(true);
-            }
-        };
-        if let Err(error) = self.remote_replay.verify_and_record(
-            token.expose_secret(),
-            &request.method,
-            &request.path,
-            &request.body,
-            &auth,
-            unix_now_seconds(),
-        ) {
-            write_remote_control_auth_error(client, error)?;
-            return Ok(true);
-        }
-        if request.method == "PUT" && is_legacy_aprs_passcode_path(&request.path) {
-            write_remote_control_error(client, &ControlError::SecretKindDeprecated)?;
-            return Ok(true);
-        }
-        let control = match ControlClient::new_with_timeout(
-            self.control_endpoint.clone(),
-            Duration::from_secs(30),
-        ) {
-            Ok(control) => control,
-            Err(error) => {
-                write_remote_control_error(client, &error)?;
-                return Ok(true);
-            }
-        };
-        dispatch_remote_control(client, request, &control)?;
-        Ok(true)
-    }
-}
-
-fn remote_control_auth(
-    request: &ManagementWebRequest,
-) -> Result<RemoteControlAuth, RemoteControlAuthError> {
-    Ok(RemoteControlAuth {
-        timestamp: request
-            .header(REMOTE_CONTROL_TIMESTAMP_HEADER)
-            .ok_or(RemoteControlAuthError::Missing)?
-            .to_owned(),
-        nonce: request
-            .header(REMOTE_CONTROL_NONCE_HEADER)
-            .ok_or(RemoteControlAuthError::Missing)?
-            .to_owned(),
-        scope: request
-            .header(REMOTE_CONTROL_SCOPE_HEADER)
-            .ok_or(RemoteControlAuthError::Missing)?
-            .to_owned(),
-        authorization: request
-            .header("authorization")
-            .ok_or(RemoteControlAuthError::Missing)?
-            .to_owned(),
-    })
-}
-
-fn dispatch_remote_control(
-    client: &mut dyn ManagementWebStream,
-    request: &ManagementWebRequest,
-    control: &ControlClient,
-) -> Result<(), ManagementWebError> {
-    if request.method == "GET" && request.path == "/api/v1/control/updates/events" {
-        return match control.subscribe_update_events() {
-            Ok(events) => write_remote_control_event_stream(client, events),
-            Err(error) => write_remote_control_error(client, &error),
-        };
-    }
-    if request.method == "GET" && request.path == "/api/v1/control/events" {
-        return match control.subscribe_gateway_events() {
-            Ok(events) => write_remote_control_event_stream(client, events),
-            Err(error) => write_remote_control_error(client, &error),
-        };
-    }
-    let result = match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/api/v1/control/status") => control.status().and_then(to_json_value),
-        ("POST", "/api/v1/control/start") => control.start().and_then(to_json_value),
-        ("POST", "/api/v1/control/stop") => control.stop().and_then(to_json_value),
-        ("POST", "/api/v1/control/restart") => control.restart().and_then(to_json_value),
-        ("POST", "/api/v1/control/web/enable") => {
-            control.enable_management_web().and_then(to_json_value)
-        }
-        ("POST", "/api/v1/control/web/disable") => {
-            control.disable_management_web().and_then(to_json_value)
-        }
-        ("GET", "/api/v1/control/updates") => control.update_status().and_then(to_json_value),
-        ("GET", "/api/v1/control/diagnostics/bundle") => {
-            control.diagnostics_bundle().and_then(to_json_value)
-        }
-        ("GET", "/api/v1/control/gateway/meshtastic") => {
-            control.gateway_projection(GatewayProjection::Meshtastic)
-        }
-        ("GET", "/api/v1/control/gateway/nodes") => {
-            control.gateway_projection(GatewayProjection::Nodes)
-        }
-        ("GET", "/api/v1/control/gateway/positions") => {
-            control.gateway_projection(GatewayProjection::Positions)
-        }
-        ("GET", "/api/v1/control/gateway/aprs") => {
-            control.gateway_projection(GatewayProjection::Aprs)
-        }
-        ("GET", "/api/v1/control/gateway/callmesh") => {
-            control.gateway_projection(GatewayProjection::CallMesh)
-        }
-        ("GET", "/api/v1/control/gateway/proxy") => {
-            control.gateway_projection(GatewayProjection::Proxy)
-        }
-        ("GET", "/api/v1/control/events/recent") => {
-            control.gateway_projection(GatewayProjection::RecentEvents)
-        }
-        ("POST", "/api/v1/control/database/integrity-check") => {
-            control.gateway_projection(GatewayProjection::DatabaseIntegrity)
-        }
-        ("POST", "/api/v1/control/backups") => {
-            control.gateway_projection(GatewayProjection::Backup)
-        }
-        ("PUT", path) if path.starts_with("/api/v1/control/secrets/") => {
-            if is_legacy_aprs_passcode_path(path) {
-                return write_remote_control_error(client, &ControlError::SecretKindDeprecated);
-            }
-            let Some(kind) = remote_secret_kind(path) else {
-                write_management_json(
-                    client,
-                    "404 Not Found",
-                    br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#,
-                )?;
-                return Ok(());
-            };
-            let value =
-                std::str::from_utf8(&request.body).map_err(|_| ManagementWebError::InvalidHttp)?;
-            control.store_secret(kind, value).and_then(to_json_value)
-        }
-        ("DELETE", path) if path.starts_with("/api/v1/control/secrets/") => {
-            let Some(kind) = remote_secret_kind(path) else {
-                write_management_json(
-                    client,
-                    "404 Not Found",
-                    br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#,
-                )?;
-                return Ok(());
-            };
-            if !request.body.is_empty() {
-                Err(ControlError::InvalidHttp)
-            } else {
-                control.remove_secret(kind).and_then(to_json_value)
-            }
-        }
-        _ => {
-            write_management_json(
-                client,
-                "404 Not Found",
-                br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#,
-            )?;
-            return Ok(());
-        }
-    };
-    match result {
-        Ok(value) => {
-            let body = serde_json::to_vec(&value).map_err(|_| ManagementWebError::Io)?;
-            write_management_json(client, "200 OK", &body)
-        }
-        Err(error) => write_remote_control_error(client, &error),
-    }
-}
-
-fn to_json_value(value: impl serde::Serialize) -> Result<serde_json::Value, ControlError> {
-    serde_json::to_value(value).map_err(|_| ControlError::InvalidHttp)
-}
-
-fn remote_secret_kind(path: &str) -> Option<ControlSecretKind> {
-    match path.strip_prefix("/api/v1/control/secrets/")? {
-        "callmesh-api-key" => Some(ControlSecretKind::CallMeshApiKey),
-        "aprs-passcode" => Some(ControlSecretKind::AprsPasscode),
-        "management-admin-token" => Some(ControlSecretKind::ManagementAdminToken),
-        _ => None,
-    }
-}
-
-fn is_legacy_aprs_passcode_path(path: &str) -> bool {
-    path.strip_prefix("/api/v1/control/secrets/")
-        .is_some_and(|kind| kind == "aprs-passcode")
-}
-
-fn write_remote_control_event_stream(
-    client: &mut dyn ManagementWebStream,
-    mut events: ControlUpdateEventStream,
-) -> Result<(), ManagementWebError> {
-    client
-        .write_all(
-            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
-        )
-        .map_err(|_| ManagementWebError::Io)?;
-    loop {
-        match events.next_event() {
-            Ok(Some(event)) => {
-                if !is_safe_sse_token(&event.id)
-                    || !is_safe_sse_token(&event.event)
-                    || event.data.len() > MAX_SSE_EVENT_BYTES
-                    || event.data.iter().any(|byte| matches!(*byte, b'\r' | b'\n'))
-                {
-                    return Err(ManagementWebError::InvalidHttp);
-                }
-                client
-                    .write_all(
-                        format!("id: {}\nevent: {}\ndata: ", event.id, event.event).as_bytes(),
-                    )
-                    .and_then(|_| client.write_all(&event.data))
-                    .and_then(|_| client.write_all(b"\n\n"))
-                    .map_err(|_| ManagementWebError::Io)?;
-            }
-            Ok(None) => return Ok(()),
-            Err(ControlError::Timeout) => client
-                .write_all(b": heartbeat\n\n")
-                .map_err(|_| ManagementWebError::Io)?,
-            Err(_) => return Err(ManagementWebError::Io),
-        }
-    }
-}
-
-fn write_remote_control_auth_error(
-    client: &mut dyn ManagementWebStream,
-    error: RemoteControlAuthError,
-) -> Result<(), ManagementWebError> {
-    let status = match error {
-        RemoteControlAuthError::Missing | RemoteControlAuthError::Invalid => "401 Unauthorized",
-        RemoteControlAuthError::Expired | RemoteControlAuthError::Replay => "403 Forbidden",
-    };
-    let body = format!(r#"{{"code":"{}"}}"#, error.code());
-    write_management_json(client, status, body.as_bytes())
-}
-
-fn write_remote_control_error(
-    client: &mut dyn ManagementWebStream,
-    error: &ControlError,
-) -> Result<(), ManagementWebError> {
-    let body = format!(r#"{{"code":"{}"}}"#, error.code());
-    write_management_json(client, remote_control_error_status(error), body.as_bytes())
-}
-
-const fn remote_control_error_status(error: &ControlError) -> &'static str {
-    match error {
-        ControlError::SecretValueInvalid => "400 Bad Request",
-        ControlError::Authentication => "401 Unauthorized",
-        ControlError::SecretKindDeprecated => "410 Gone",
-        ControlError::Timeout => "504 Gateway Timeout",
-        ControlError::InvalidHttp | ControlError::ResponseTooLarge => "502 Bad Gateway",
-        _ => "503 Service Unavailable",
     }
 }
 
@@ -683,7 +416,6 @@ struct AgentController {
     management_web_config: ManagementWebConfig,
     management_access: Option<Arc<ManagementAccessController>>,
     control_endpoint: ControlEndpoint,
-    remote_replay: Arc<RemoteControlReplayGuard>,
     secrets: AgentSecretStore,
     updates: Arc<AgentUpdateService>,
     shutdown_requested: AtomicBool,
@@ -818,7 +550,7 @@ impl AgentController {
         Self::from_config_with_secrets_internal(config, secrets, true)
     }
 
-    #[cfg(all(test, not(target_os = "windows")))]
+    #[cfg(test)]
     fn from_config_with_secrets_without_private_bootstrap(
         config: &AgentConfig,
         secrets: AgentSecretStore,
@@ -854,8 +586,7 @@ impl AgentController {
                 }
             }
         });
-        let control_endpoint = default_local_endpoint(&config.paths.run_dir());
-        let remote_replay = Arc::new(RemoteControlReplayGuard::default());
+        let control_endpoint = default_local_endpoint(config.paths.root_dir())?;
         let gateway_command = resolve_gateway_command(config);
         let supervisor = gateway_command
             .as_ref()
@@ -1061,9 +792,6 @@ impl AgentController {
                     Arc::new(AgentManagementWebApi {
                         updates: Arc::clone(&updates),
                         access: management_access.clone(),
-                        control_endpoint: control_endpoint.clone(),
-                        secrets: secrets.clone(),
-                        remote_replay: Arc::clone(&remote_replay),
                     }),
                     gateway_session.clone(),
                 )
@@ -1089,7 +817,6 @@ impl AgentController {
             management_web_config,
             management_access,
             control_endpoint,
-            remote_replay,
             secrets,
             updates,
             shutdown_requested: AtomicBool::new(false),
@@ -1195,9 +922,6 @@ impl AgentController {
                     Arc::new(AgentManagementWebApi {
                         updates: Arc::clone(&self.updates),
                         access: self.management_access.clone(),
-                        control_endpoint: self.control_endpoint.clone(),
-                        secrets: self.secrets.clone(),
-                        remote_replay: Arc::clone(&self.remote_replay),
                     }),
                     self.gateway_session.clone(),
                 )
@@ -1679,6 +1403,25 @@ impl ControlHandler for AgentController {
         result
     }
 
+    fn prepare_command(&self, command: ControlCommand) -> Result<ControlStatus, ControlError> {
+        if command != ControlCommand::ShutdownAgent {
+            return self.handle(command);
+        }
+        let result = self.status();
+        match &result {
+            Ok(_) => self.clear_error(),
+            Err(ControlError::CommandFailed) if self.has_precise_supervisor_error() => {}
+            Err(error) => self.remember_error(error),
+        }
+        result
+    }
+
+    fn command_response_sent(&self, command: ControlCommand) {
+        if command == ControlCommand::ShutdownAgent {
+            self.request_shutdown();
+        }
+    }
+
     fn update_status(&self) -> Result<UpdateControlStatus, ControlError> {
         self.updates.status()
     }
@@ -1775,7 +1518,7 @@ fn verified_gateway_route(
         return Err(ControlError::ResponseTooLarge);
     }
     let actual: cmclient_control_api::ComponentIdentityReport =
-        serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidHttp)?;
+        serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidEnvelope)?;
     if actual.validate().is_err()
         || actual.component != InternalComponent::Gateway
         || actual.identity != expected.identity
@@ -1838,7 +1581,7 @@ fn gateway_json_projection(
     if bytes.len() as u64 > MAX_GATEWAY_PROJECTION_BYTES {
         return Err(ControlError::ResponseTooLarge);
     }
-    serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidHttp)
+    serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidEnvelope)
 }
 
 fn map_gateway_request_error(error: reqwest::Error) -> ControlError {
@@ -2499,21 +2242,11 @@ fn serve_web_once() -> ExitCode {
         eprintln!("{}", error.code());
         return ExitCode::from(EX_CONFIG);
     }
-    let secrets = match AgentSecretStore::runtime(config.paths.root_dir()) {
-        Ok(secrets) => secrets,
-        Err(error) => {
-            eprintln!("{}", error.code());
-            return ExitCode::from(EX_CONFIG);
-        }
-    };
     let listener = match ManagementWebListener::bind_with_api_handler_and_gateway_session(
         &web_config,
         Arc::new(AgentManagementWebApi {
             updates,
             access: management_access,
-            control_endpoint: default_local_endpoint(&config.paths.run_dir()),
-            secrets,
-            remote_replay: Arc::new(RemoteControlReplayGuard::default()),
         }),
         GatewaySessionHandle::new(),
     ) {
@@ -2563,9 +2296,13 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
-    let endpoint = match default_local_endpoint(&config.paths.run_dir()) {
-        ControlEndpoint::UnixSocket(path) => ControlEndpoint::unix(path),
-        endpoint => endpoint,
+    let endpoint = match default_local_endpoint(config.paths.root_dir()) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            controller.remember_error(&error);
+            eprintln!("{}", error.code());
+            return ExitCode::from(EX_CONFIG);
+        }
     };
     let control_handler: Arc<dyn ControlHandler> = controller.clone();
     let server = match ControlServer::bind(endpoint, control_handler) {
@@ -2593,12 +2330,13 @@ fn serve() -> ExitCode {
         if controller.is_shutdown_requested() {
             break None;
         }
-        match server.serve_once() {
-            Ok(()) if controller.is_shutdown_requested() => break None,
-            Ok(()) => {}
+        match server.poll_once() {
+            Ok(_) if controller.is_shutdown_requested() => break None,
+            Ok(_) => {}
             Err(error) => break Some(error),
         }
     };
+    drop(server);
     let shutdown_error = shutdown_agent_runtime(&controller, &mut supervisor_worker).err();
     if let Some(error) = &serve_error {
         controller.remember_error(error);
@@ -2654,21 +2392,19 @@ fn bundled_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, AgentController, AgentSecretStore, ControlHandler, GatewayLogHealthUpdate,
-        InternalComponent, LogLevel, ManagementWebRequest, SecretKind, apply_aprs_environment,
+        AgentConfig, AgentController, AgentManagementWebApi, AgentSecretStore, AgentUpdateService,
+        ControlHandler, GatewayLogHealthUpdate, InternalComponent, LogLevel,
+        ManagementWebApiHandler, ManagementWebRequest, SecretKind, apply_aprs_environment,
         apply_physical_qualification_environment, compiled_component_identity,
-        dispatch_remote_control, legacy_state_candidates, load_agent_config_after_migration_with,
+        legacy_state_candidates, load_agent_config_after_migration_with,
         push_legacy_source_candidate, resolve_gateway_maintenance_program, verified_gateway_route,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
-        AgentManagementWebApi, AgentUpdateService, ControlCommand, GatewayControlStatus,
-        ManagementWebApiHandler, ManagementWebControlStatus, ManagementWebService,
-        RemoteControlReplayGuard, SupervisorWorker, active_gateway_event_bridge_count,
-        bridge_gateway_event_stream, bridge_gateway_events_with_read_poll, default_local_endpoint,
-        gateway_heartbeat, gateway_json_projection, read_bounded_gateway_sse_line,
-        remote_control_error_status, shutdown_agent_runtime, try_forward_gateway_event,
-        unix_now_seconds,
+        ControlCommand, GatewayControlStatus, ManagementWebControlStatus, ManagementWebService,
+        SupervisorWorker, active_gateway_event_bridge_count, bridge_gateway_event_stream,
+        bridge_gateway_events_with_read_poll, gateway_heartbeat, gateway_json_projection,
+        read_bounded_gateway_sse_line, shutdown_agent_runtime, try_forward_gateway_event,
     };
     #[cfg(not(target_os = "windows"))]
     use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
@@ -2678,16 +2414,10 @@ mod tests {
         CallMeshConfig,
         access::{LanAccessConfig, ManagementAccessController},
     };
-    use cmclient_control_api::{
-        ControlClient as CrossPlatformControlClient, ControlEndpoint, ControlError,
-        ControlHandler as CrossPlatformControlHandler, ControlSecretKind,
-        ControlServer as CrossPlatformControlServer, ControlStatus as CrossPlatformControlStatus,
-    };
     #[cfg(not(target_os = "windows"))]
+    use cmclient_control_api::UpdateControlStatus;
     use cmclient_control_api::{
-        ControlClient, ControlServer, ControlStatus, REMOTE_CONTROL_NONCE_HEADER,
-        REMOTE_CONTROL_SCOPE_HEADER, REMOTE_CONTROL_TIMESTAMP_HEADER, StaticControlHandler,
-        UpdateControlStatus, sign_remote_control_request,
+        ControlClient, ControlError, ControlSecretKind, ControlServer, default_local_endpoint,
     };
     use cmclient_legacy_migration::ProductMigrationSourceSet;
     use cmclient_legacy_migration::{
@@ -2704,7 +2434,7 @@ mod tests {
         collections::BTreeMap,
         io::Cursor,
         path::Path,
-        sync::{Arc, Mutex},
+        sync::Arc,
         thread,
         time::{Duration, Instant},
     };
@@ -2714,6 +2444,7 @@ mod tests {
         net::{SocketAddr, TcpListener, TcpStream},
         path::PathBuf,
         sync::{
+            Mutex,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
@@ -3554,110 +3285,40 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 
-    struct LegacyRemoteSecretHandler {
-        present: Mutex<bool>,
-    }
-
-    impl CrossPlatformControlHandler for LegacyRemoteSecretHandler {
-        fn handle(
-            &self,
-            _command: super::ControlCommand,
-        ) -> Result<CrossPlatformControlStatus, ControlError> {
-            Err(ControlError::CommandFailed)
-        }
-
-        fn store_secret(&self, _kind: ControlSecretKind, _value: &str) -> Result<(), ControlError> {
-            panic!("deprecated APRS passcode must not reach secret storage")
-        }
-
-        fn remove_secret(&self, kind: ControlSecretKind) -> Result<bool, ControlError> {
-            assert_eq!(kind, ControlSecretKind::AprsPasscode);
-            let mut present = self
-                .present
-                .lock()
-                .map_err(|_| ControlError::CommandFailed)?;
-            let was_present = *present;
-            *present = false;
-            Ok(was_present)
-        }
-    }
-
-    fn cross_platform_control_endpoint() -> ControlEndpoint {
-        let unique = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("test clock should follow epoch")
-                .as_nanos(),
-        );
-        #[cfg(windows)]
-        {
-            ControlEndpoint::named_pipe(format!(r"\\.\pipe\cmclient-aprs-cleanup-{unique}"))
-        }
-        #[cfg(not(windows))]
-        {
-            ControlEndpoint::unix(
-                std::env::temp_dir().join(format!("cmclient-aprs-cleanup-{unique}.sock")),
-            )
-        }
-    }
-
     #[test]
-    fn remote_control_rejects_legacy_aprs_set_but_forwards_cleanup() {
-        let endpoint = cross_platform_control_endpoint();
-        let control = CrossPlatformControlClient::new(endpoint.clone())
-            .expect("control client should initialize");
-        let remote_addr = "127.0.0.1:48100"
-            .parse()
-            .expect("remote fixture address should parse");
+    fn management_web_never_exposes_the_local_control_protocol() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-no-network-control-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let api = AgentManagementWebApi {
+            updates: Arc::new(
+                AgentUpdateService::new(&directory).expect("update service should initialize"),
+            ),
+            access: None,
+        };
+        let request = ManagementWebRequest {
+            method: String::from("GET"),
+            path: String::from("/api/v1/control/status"),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            remote_addr: "127.0.0.1:48100"
+                .parse()
+                .expect("fixture address should parse"),
+        };
+        let mut response = Cursor::new(Vec::new());
 
-        let mut put_response = Cursor::new(Vec::new());
-        dispatch_remote_control(
-            &mut put_response,
-            &ManagementWebRequest {
-                method: String::from("PUT"),
-                path: String::from("/api/v1/control/secrets/aprs-passcode"),
-                headers: BTreeMap::new(),
-                body: b"ignored".to_vec(),
-                remote_addr,
-            },
-            &control,
-        )
-        .expect("deprecated remote set should respond");
-        let put_response = String::from_utf8(put_response.into_inner())
-            .expect("remote set response should be UTF-8");
-        assert!(put_response.starts_with("HTTP/1.1 410 Gone"));
-        assert!(put_response.contains("CONTROL_SECRET_KIND_DEPRECATED"));
+        assert!(
+            api.handle(&mut response, &request)
+                .expect("request should be handled")
+        );
+        let response = String::from_utf8(response.into_inner()).expect("response should be UTF-8");
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(response.contains("CONTROL_ROUTE_NOT_FOUND"));
 
-        let handler = Arc::new(LegacyRemoteSecretHandler {
-            present: Mutex::new(true),
-        });
-        let server = CrossPlatformControlServer::bind(endpoint, handler.clone())
-            .expect("control server should bind");
-        let server_thread = thread::spawn(move || server.serve_once());
-        let mut delete_response = Cursor::new(Vec::new());
-        dispatch_remote_control(
-            &mut delete_response,
-            &ManagementWebRequest {
-                method: String::from("DELETE"),
-                path: String::from("/api/v1/control/secrets/aprs-passcode"),
-                headers: BTreeMap::new(),
-                body: Vec::new(),
-                remote_addr,
-            },
-            &control,
-        )
-        .expect("legacy remote cleanup should respond");
-        server_thread
-            .join()
-            .expect("control server thread should join")
-            .expect("control server should serve cleanup");
-        let delete_response = String::from_utf8(delete_response.into_inner())
-            .expect("remote cleanup response should be UTF-8");
-        assert!(delete_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(delete_response.contains(r#"{"stored":true}"#));
-        assert!(!*handler.present.lock().expect("secret state should lock"));
+        std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -4165,9 +3826,69 @@ mod tests {
         std::fs::remove_dir_all(data_dir).expect("test directory should remove");
     }
 
+    #[test]
+    fn local_shutdown_ack_precedes_agent_control_teardown() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "cmclient-agent-shutdown-ack-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
+                cache_dir: data_dir.join("cache"),
+                log_dir: data_dir.join("logs"),
+            },
+            config_file: data_dir.join("agent.toml"),
+            gateway_command: None,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = Arc::new(
+            AgentController::from_config_with_secrets_without_private_bootstrap(
+                &config,
+                AgentSecretStore::memory(),
+            )
+            .expect("controller should initialize"),
+        );
+        let endpoint = default_local_endpoint(&data_dir).expect("endpoint should derive");
+        let handler: Arc<dyn ControlHandler> = controller.clone();
+        let server = ControlServer::bind(endpoint.clone(), handler).expect("server should bind");
+        let server_controller = Arc::clone(&controller);
+        let server_thread = thread::spawn(move || {
+            while !server.poll_once().expect("server poll should succeed") {}
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !server_controller.is_shutdown_requested() {
+                assert!(
+                    Instant::now() < deadline,
+                    "shutdown should commit after its response is sent"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            drop(server);
+        });
+
+        let shutdown_status = ControlClient::new(endpoint)
+            .expect("client should initialize")
+            .shutdown_agent()
+            .expect("shutdown response should arrive before Agent teardown");
+        assert_eq!(shutdown_status.agent, "running");
+        server_thread.join().expect("server thread should join");
+        assert!(controller.is_shutdown_requested());
+
+        drop(controller);
+        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn teardown_stops_the_gateway_while_a_control_sse_retains_the_controller() {
+    fn teardown_stops_the_gateway_while_a_control_event_stream_retains_the_controller() {
         let data_dir =
             std::env::temp_dir().join(format!("cmclient-agent-teardown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -4205,24 +3926,45 @@ mod tests {
             .handle(ControlCommand::Start)
             .expect("gateway should start");
 
-        let endpoint = default_local_endpoint(&data_dir);
+        let endpoint = default_local_endpoint(&data_dir).expect("endpoint should derive");
         let handler: Arc<dyn ControlHandler> = controller.clone();
-        let server = ControlServer::bind(endpoint.clone(), handler).expect("server should bind");
-        let server_thread = thread::spawn(move || server.serve_once());
-        let events = ControlClient::new(endpoint)
+        let server =
+            Arc::new(ControlServer::bind(endpoint.clone(), handler).expect("server should bind"));
+        let polling_server = Arc::clone(&server);
+        let server_thread = thread::spawn(move || polling_server.serve_once());
+        let mut events = ControlClient::new(endpoint.clone())
             .expect("client should initialize")
             .subscribe_update_events()
-            .expect("control SSE should connect");
+            .expect("control event stream should connect");
         server_thread
             .join()
             .expect("server should join")
-            .expect("server should accept SSE");
+            .expect("server should accept the event subscription");
+        let initial_event = events
+            .next_event()
+            .expect("control event should decode")
+            .expect("initial control event should arrive");
+        assert_eq!(initial_event.event, "update.status_changed");
         assert!(Arc::strong_count(&controller) >= 3);
-        controller
-            .handle(ControlCommand::ShutdownAgent)
-            .expect("local shutdown command should be accepted");
+        let shutdown_server = Arc::clone(&server);
+        let shutdown_thread = thread::spawn(move || shutdown_server.serve_once());
+        ControlClient::new(endpoint)
+            .expect("shutdown client should initialize")
+            .shutdown_agent()
+            .expect("shutdown response should arrive before Agent teardown");
+        shutdown_thread
+            .join()
+            .expect("shutdown server should join")
+            .expect("shutdown server should accept the request");
         assert!(controller.is_shutdown_requested());
 
+        drop(server);
+        assert!(
+            events
+                .next_event()
+                .expect("server shutdown should close the control event stream")
+                .is_none()
+        );
         shutdown_agent_runtime(&controller, &mut worker).expect("Agent should tear down");
         assert!(matches!(
             controller
@@ -4234,8 +3976,6 @@ mod tests {
                 .status(),
             cmclient_supervisor::GatewayStatus::Stopped
         ));
-        assert!(Arc::strong_count(&controller) >= 2);
-
         drop(events);
         std::fs::remove_dir_all(data_dir).expect("test directory should remove");
     }
@@ -4521,13 +4261,23 @@ mod tests {
                 AgentUpdateService::new(&data_dir).expect("update service should initialize"),
             ),
             access: Some(access),
-            control_endpoint: default_local_endpoint(&data_dir),
-            secrets: AgentSecretStore::platform(),
-            remote_replay: Arc::new(RemoteControlReplayGuard::default()),
         });
         let remote_addr: SocketAddr = "192.168.1.20:54000"
             .parse()
             .expect("fixture address should parse");
+
+        let control_blocked = invoke_management_api(
+            Arc::clone(&api),
+            ManagementWebRequest {
+                method: String::from("GET"),
+                path: String::from("/api/v1/control/status"),
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+                remote_addr,
+            },
+        );
+        assert!(control_blocked.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(control_blocked.contains("CONTROL_ROUTE_NOT_FOUND"));
 
         let denied = invoke_management_api(
             Arc::clone(&api),
@@ -4605,97 +4355,7 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn remote_control_requires_a_scoped_signature_and_rejects_replay() {
-        let data_dir =
-            std::env::temp_dir().join(format!("cmc-agent-remote-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&data_dir);
-        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
-        let endpoint = default_local_endpoint(&data_dir);
-        let status = ControlStatus {
-            schema_version: 3,
-            agent: String::from("running"),
-            identity: compiled_component_identity(InternalComponent::Agent).unwrap(),
-            gateway: GatewayControlStatus::Running,
-            management_web: ManagementWebControlStatus::Running,
-            management_web_url: Some(String::from("https://cmclient.example")),
-            uptime_seconds: 10,
-            latest_error_code: None,
-        };
-        let server = ControlServer::bind(
-            endpoint.clone(),
-            Arc::new(StaticControlHandler::new(status)),
-        )
-        .expect("control server should bind");
-        let server_thread = thread::spawn(move || server.serve_once());
-        let token = "test-token-test-token-test-token-0";
-        let secrets = AgentSecretStore::memory();
-        secrets
-            .store(SecretKind::ManagementAdminToken, token)
-            .expect("remote token should store");
-        let api = Arc::new(AgentManagementWebApi {
-            updates: Arc::new(
-                AgentUpdateService::new(&data_dir).expect("update service should initialize"),
-            ),
-            access: None,
-            control_endpoint: endpoint,
-            secrets,
-            remote_replay: Arc::new(RemoteControlReplayGuard::default()),
-        });
-        let path = "/api/v1/control/status";
-        let auth = sign_remote_control_request(token, "GET", path, b"", unix_now_seconds())
-            .expect("remote request should sign");
-        let request = ManagementWebRequest {
-            method: String::from("GET"),
-            path: String::from(path),
-            headers: BTreeMap::from([
-                (String::from("authorization"), auth.authorization),
-                (
-                    String::from(REMOTE_CONTROL_TIMESTAMP_HEADER),
-                    auth.timestamp,
-                ),
-                (String::from(REMOTE_CONTROL_NONCE_HEADER), auth.nonce),
-                (String::from(REMOTE_CONTROL_SCOPE_HEADER), auth.scope),
-            ]),
-            body: Vec::new(),
-            remote_addr: "192.168.1.20:54000"
-                .parse()
-                .expect("fixture address should parse"),
-        };
-
-        let allowed = invoke_management_api(Arc::clone(&api), request.clone());
-        assert!(allowed.starts_with("HTTP/1.1 200 OK"));
-        assert!(allowed.contains(r#""product":"CMClient""#));
-        assert!(allowed.contains(r#""component":"agent""#));
-        assert!(!allowed.contains("agentVersion"));
-        server_thread
-            .join()
-            .expect("control server thread should join")
-            .expect("control server should respond");
-
-        let replayed = invoke_management_api(Arc::clone(&api), request);
-        assert!(replayed.starts_with("HTTP/1.1 403 Forbidden"));
-        assert!(replayed.contains("REMOTE_CONTROL_REPLAY_REJECTED"));
-
-        let missing = invoke_management_api(
-            api,
-            ManagementWebRequest {
-                method: String::from("GET"),
-                path: String::from(path),
-                headers: BTreeMap::new(),
-                body: Vec::new(),
-                remote_addr: "192.168.1.20:54000"
-                    .parse()
-                    .expect("fixture address should parse"),
-            },
-        );
-        assert!(missing.starts_with("HTTP/1.1 401 Unauthorized"));
-        assert!(missing.contains("REMOTE_CONTROL_AUTH_MISSING"));
-        let _ = std::fs::remove_dir_all(data_dir);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn preserves_gateway_timeout_for_local_and_remote_control_clients() {
+    fn preserves_gateway_timeout_for_local_control_clients() {
         let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
         let gateway_address = gateway.local_addr().expect("gateway address should load");
         let gateway_thread = thread::spawn(move || {
@@ -4720,20 +4380,6 @@ mod tests {
         assert_eq!(
             gateway_json_projection(&route, cmclient_control_api::GatewayProjection::Nodes),
             Err(cmclient_control_api::ControlError::Timeout)
-        );
-        assert_eq!(
-            remote_control_error_status(&cmclient_control_api::ControlError::Timeout),
-            "504 Gateway Timeout"
-        );
-        assert_eq!(
-            remote_control_error_status(&cmclient_control_api::ControlError::SecretValueInvalid),
-            "400 Bad Request"
-        );
-        assert_eq!(
-            remote_control_error_status(
-                &cmclient_control_api::ControlError::SecretStoreUnavailable
-            ),
-            "503 Service Unavailable"
         );
         gateway_thread.join().expect("gateway should join");
     }

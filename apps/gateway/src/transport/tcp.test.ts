@@ -11,7 +11,7 @@ import { loadMeshtasticSchema } from "../protobuf/schema";
 import { ReconnectBackoff } from "./backoff";
 import { ConfigSession } from "./config-session";
 import { MeshtasticFrameDecoder, encodeMeshtasticFrame } from "./framing";
-import { PhysicalWriteGuard } from "./physical-guard";
+import { PhysicalWriteGuard, PhysicalWriteGuardError } from "./physical-guard";
 import { TcpMeshtasticTransport } from "./tcp";
 
 const codec = {
@@ -519,22 +519,23 @@ describe("TcpMeshtasticTransport", () => {
     }
   }, 30_000);
 
-  it("opens no socket when the aggregate physical attempt fuse rejects a fifth cycle", async () => {
+  it("opens no socket when the physical attempt fuse rejects before connect", async () => {
     const directory = await mkdtemp(join(tmpdir(), "cmclient-physical-tcp-"));
     let socketFactoryCalls = 0;
     try {
-      for (let attempt = 0; attempt < 4; attempt += 1) {
-        const guard = physicalGuard(directory, `reserve-${attempt}`);
-        guard.acquireSession(attempt + 1);
-        guard.releaseSession("connect");
-      }
+      const guard = physicalGuard(directory, "blocked-attempt");
+      guard.acquireSession = () => {
+        throw new PhysicalWriteGuardError(
+          "PHYSICAL_GUARD_ATTEMPT_WINDOW_EXCEEDED",
+        );
+      };
       const transport = new TcpMeshtasticTransport(
         {
           host: "127.0.0.1",
           port: 4403,
           configSession: codec,
           random: () => 0,
-          physicalGuard: physicalGuard(directory, "blocked-fifth"),
+          physicalGuard: guard,
         },
         () => {
           socketFactoryCalls += 1;

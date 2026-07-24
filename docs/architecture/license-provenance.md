@@ -45,7 +45,7 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `5afcf2d027cc345772f20c72d6acac29a4e9da489820f7d28b7fad03d31764b4`.
+  `4534621e40451977c6c364ffd26f65ea4aaa921a7798469d151d5fa6e078e54a`.
 - Cargo license inventory: 574 registry packages, 13 workspace packages, zero
   Git sources and zero unknown licenses; inventory SHA-256
   `0da4c2e9cc7770b7cccc23e7ce60799d4f43d21998676db9efebcc67f279f5a3`.
@@ -56,6 +56,12 @@ The promotion baseline is CMClient commit
   platform dependencies. They provide no-follow existing-file opens on Unix
   and read-only hard-link count inspection on Windows for migration and staged
   Agent configuration validation.
+  P13-T09 made the already-inventoried `bytes`, `interprocess`, and `tokio-util`
+  packages direct Control IPC dependencies. `interprocess` owns the Unix local
+  socket and remote-rejected Windows named-pipe transport; `tokio-util` and
+  `bytes` own bounded length-delimited framing. No registry package, version,
+  checksum, or license row was added to the 574-package inventory, so its
+  canonical inventory digest is unchanged.
 - `pnpm-lock.yaml` SHA-256:
   `9b234eb100e287daaf76e9cb13cd07a47205e50ea08adadcfe0e97b933fdc5ab`.
 - The current Windows production install contains 183 package versions;
@@ -85,7 +91,9 @@ notices remain part of the target-specific packaging inventory.
 | `tokio` | `1.53.1` | `https://github.com/tokio-rs/tokio` | MIT | `202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed` | 1.71 |
 | `tokio-util` | `0.7.18` | `https://github.com/tokio-rs/tokio` | MIT | `9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098` | 1.71 |
 | `atomic-write-file` | `0.3.0` | `https://github.com/andreacorbellini/rust-atomic-write-file` | BSD-3-Clause | `84790c55b5704b0d35130bf16a4ce22a8e70eb0ea773522557524d9a4852663d` | 1.85 |
+| `bytes` | `1.12.1` | `https://github.com/tokio-rs/bytes` | MIT | `fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04` | 1.57 |
 | `fs4` | `1.1.0` | `https://github.com/al8n/fs4` | MIT OR Apache-2.0 | `7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5` | 1.75.0 |
+| `interprocess` | `2.4.2` | `https://github.com/kotauskas/interprocess` | 0BSD OR Apache-2.0 | `069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b` | 1.75 |
 | `libc` | `0.2.186` | `https://github.com/rust-lang/libc` | MIT OR Apache-2.0 | `68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66` | 1.65 |
 | `same-file` | `1.0.6` | `https://github.com/BurntSushi/same-file` | Unlicense/MIT | `93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502` | Not declared |
 | `time` | `0.3.45` | `https://github.com/time-rs/time` | MIT OR Apache-2.0 | `f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd` | 1.83.0 |

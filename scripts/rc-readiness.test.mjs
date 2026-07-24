@@ -164,6 +164,10 @@ test("field plan is pinned to the canonical target, mode, case, and execution ma
   assert.equal(result.executionCount, 129);
   assert.deepEqual(new Set(plan.requiredTargets), new Set(REQUIRED_TARGETS));
   assert.deepEqual(new Set(plan.requiredModes), new Set(REQUIRED_MODES));
+  assert.ok(REQUIRED_MODES.includes("local-control"));
+  assert.ok(!REQUIRED_MODES.includes("remote-control"));
+  assert.ok(REQUIRED_CASE_IDS.includes("RC-LOCAL-CONTROL"));
+  assert.ok(!REQUIRED_CASE_IDS.includes("RC-REMOTE-CONTROL"));
 
   const missingTarget = clone(plan);
   missingTarget.requiredTargets = missingTarget.requiredTargets.filter(

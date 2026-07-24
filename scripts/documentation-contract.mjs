@@ -219,7 +219,6 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
       "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
       "762fc01e0e6520b03487c6cc7b4afbafeadc39f10a66fa17def966e9ea428602",
       "ce3d3f9376b9a2552fc22c7d962ee9b25ebeda9e748301284be730fbff21b8f1",
-      "5afcf2d027cc345772f20c72d6acac29a4e9da489820f7d28b7fad03d31764b4",
       "9b234eb100e287daaf76e9cb13cd07a47205e50ea08adadcfe0e97b933fdc5ab",
       "0da4c2e9cc7770b7cccc23e7ce60799d4f43d21998676db9efebcc67f279f5a3",
       "632b3ae7d319aede117c8113b1961e23a331d66972f6b59ff2b548b5fc10ca5f",
@@ -351,7 +350,13 @@ const CURRENT_RUNTIME_DOCUMENT_TOKENS = new Map([
       "~/.cmclient/run",
       "never opens `~/.cmclient/secrets.json`",
       "does not expose a remote CLI Control",
+      "local endpoint connection",
+      "connect and request setup",
     ],
+  ],
+  [
+    "docs/developer/README.md",
+    ["private local Control IPC", "Do not add a remote Control transport"],
   ],
   [
     "docs/user/using-cmclient.md",
@@ -491,6 +496,7 @@ export async function checkDocumentation(repositoryRoot = resolve(".")) {
   await checkLicenseAndProvenanceContract(
     repositoryRoot,
     contents.get("README.md") ?? "",
+    contents.get("docs/architecture/license-provenance.md") ?? "",
     errors,
   );
 
@@ -514,7 +520,7 @@ export async function checkDocumentation(repositoryRoot = resolve(".")) {
     join(repositoryRoot, "crates/control-api/src/lib.rs"),
     "utf8",
   );
-  const agentRoutes = extractAgentRoutes(agentSource, controlSource);
+  const agentRoutes = extractAgentRoutes(agentSource);
   checkRouteCoverage(agentRoutes, documentedRoutes, "Agent", errors);
   checkUnexpectedDocumentedRoutes(
     [...gatewayRoutes, ...agentRoutes],
@@ -523,17 +529,13 @@ export async function checkDocumentation(repositoryRoot = resolve(".")) {
   );
   checkCanonicalRouteCatalog(
     contents.get("docs/api/README.md") ?? "",
-    [
-      ...gatewayRoutes,
-      ...agentRoutes.filter(({ path }) => !path.startsWith("/api/v1/control/")),
-    ],
+    [...gatewayRoutes, ...agentRoutes],
     "API index",
     errors,
   );
-  checkCanonicalRouteCatalog(
+  checkControlIpcContract(
+    controlSource,
     contents.get("docs/api/local-control.md") ?? "",
-    agentRoutes.filter(({ path }) => path.startsWith("/api/v1/control/")),
-    "Control API reference",
     errors,
   );
 
@@ -628,6 +630,7 @@ function checkCurrentRuntimeDocumentation(contents, errors) {
 async function checkLicenseAndProvenanceContract(
   repositoryRoot,
   readme,
+  provenance,
   errors,
 ) {
   let license;
@@ -661,6 +664,18 @@ async function checkLicenseAndProvenanceContract(
         `Cargo workspace license must be ${PROJECT_LICENSE}: received ${declaredLicense ?? "missing"}`,
       );
     }
+  }
+
+  try {
+    const cargoLock = await readFile(join(repositoryRoot, "Cargo.lock"));
+    const digest = createHash("sha256").update(cargoLock).digest("hex");
+    if (!provenance.includes(digest)) {
+      errors.push(
+        `license provenance Cargo.lock SHA-256 is stale: expected ${digest}`,
+      );
+    }
+  } catch {
+    errors.push("missing license contract: Cargo.lock");
   }
 
   let packageManifest;
@@ -879,7 +894,7 @@ function analyzeGatewayRoutes(source) {
   return { routes: [...routes.values()], errors };
 }
 
-export function extractAgentRoutes(agentSource, controlSource) {
+export function extractAgentRoutes(agentSource) {
   const routes = new Map();
   const addRoute = (method, path) => {
     if (HTTP_METHODS.has(method) && path.startsWith("/api/v1/")) {
@@ -897,28 +912,114 @@ export function extractAgentRoutes(agentSource, controlSource) {
   )) {
     addRoute(match[1], match[2]);
   }
-  for (const match of controlSource.matchAll(
-    /\[\s*"([A-Z]+)"\s*,\s*"(\/api\/v1\/[^"\s]+)"\s*,\s*"HTTP\/1\.[01]"\s*\]/g,
-  )) {
-    addRoute(match[1], match[2]);
-  }
-
-  const secretSegments = extractControlSecretSegments(controlSource);
-  for (const method of ["PUT", "DELETE"]) {
-    for (const segment of secretSegments) {
-      addRoute(method, `/api/v1/control/secrets/${segment}`);
-    }
-  }
   return [...routes.values()];
 }
 
-function extractControlSecretSegments(source) {
-  const block = source.match(
-    /pub const fn path_segment\([^)]*\)[^{]*\{\s*match self \{([\s\S]*?)\n\s*\}\n\s*\}/,
+export function extractControlOperations(source) {
+  const commands = extractRustEnumVariants(source, "ControlCommand");
+  const requests = extractRustEnumVariants(source, "WireRequest").filter(
+    (operation) => operation !== "Command",
+  );
+  return new Set([...commands, ...requests]);
+}
+
+function extractRustEnumVariants(source, name) {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const body = source.match(
+    new RegExp(`(?:pub\\s+)?enum\\s+${escapedName}\\s*\\{([\\s\\S]*?)\\n\\}`),
   )?.[1];
-  if (!block) return [];
-  return [...block.matchAll(/Self::[A-Za-z]+\s*=>\s*"([a-z0-9-]+)"/g)].map(
+  if (!body) return [];
+  return [...body.matchAll(/^\s{4}([A-Z][A-Za-z0-9_]*)\b/gm)].map(
     (match) => match[1],
+  );
+}
+
+function extractDocumentedControlOperations(documentation) {
+  const operations = new Set();
+  for (const match of documentation.matchAll(
+    /^\|\s*`([A-Z][A-Za-z0-9_]*)`\s*\|/gm,
+  )) {
+    operations.add(match[1]);
+  }
+  return operations;
+}
+
+function checkControlIpcContract(source, documentation, errors) {
+  const requiredSourceTokens = [
+    "interprocess::local_socket",
+    "LengthDelimitedCodec",
+    "CONTROL_PROTOCOL_VERSION",
+    "MAX_CONTROL_FRAME_BYTES",
+    "RequestEnvelope",
+    "ServerEnvelope",
+    "fs::canonicalize",
+    "Sha256",
+    "accept_remote=false",
+    "PIPE_REJECT_REMOTE_CLIENTS",
+  ];
+  for (const token of requiredSourceTokens) {
+    if (!source.includes(token)) {
+      errors.push(`Control IPC source contract is missing: ${token}`);
+    }
+  }
+
+  for (const token of [
+    "HTTP/1.1",
+    "REMOTE_CONTROL_",
+    "sign_remote_control_request",
+    "CMCLIENT_CONTROL_TOKEN",
+  ]) {
+    if (source.includes(token)) {
+      errors.push(`Control IPC source contains removed transport: ${token}`);
+    }
+  }
+
+  const requiredDocumentationTokens = [
+    "interprocess::local_socket",
+    "LengthDelimitedCodec",
+    "CONTROL_PROTOCOL_VERSION",
+    "MAX_CONTROL_FRAME_BYTES",
+    "PIPE_REJECT_REMOTE_CLIENTS",
+    "~/.cmclient/run/control.sock",
+    "never falls back to TCP",
+    "has no bearer token",
+    "ambiguous nonblocking zero-byte read",
+    "zero-length write",
+    "solely a liveness probe",
+    "emits no protocol bytes",
+    "Peer PID is not consulted",
+    "trailing available bytes",
+    "connect and request setup",
+    "cancels and joins every active request or subscription",
+    "`ConnectionRefused`",
+    "All other probe failures fail closed",
+  ];
+  for (const token of requiredDocumentationTokens) {
+    if (!documentation.includes(token)) {
+      errors.push(`Control IPC documentation is missing: ${token}`);
+    }
+  }
+  if (
+    /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\/api\/v1\/control(?:\/|\b)/.test(
+      documentation,
+    )
+  ) {
+    errors.push("Control IPC documentation contains an obsolete HTTP route");
+  }
+
+  const expected = extractControlOperations(source);
+  if (expected.size === 0) {
+    errors.push("Control IPC source operation catalog is missing");
+    return;
+  }
+  compareExactSets(
+    expected,
+    extractDocumentedControlOperations(documentation),
+    (operation) =>
+      `Control IPC documentation is missing operation: ${operation}`,
+    (operation) =>
+      `Control IPC documentation contains unknown operation: ${operation}`,
+    errors,
   );
 }
 

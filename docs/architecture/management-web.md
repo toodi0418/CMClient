@@ -8,8 +8,9 @@ By default it binds `127.0.0.1:7080`, serves the static shell, and
 reverse-proxies `/api/*` to the Agent-supervised loopback Gateway. Agent-owned
 routes are handled before that proxy: `GET /api/v1/updates` and
 `GET /api/v1/updates/events` expose the durable update-journal projection/SSE
-even while Gateway is stopped, while `/api/v1/control/*` uses the independent
-remote CLI HMAC gate documented in [Local Agent Control API](../api/local-control.md).
+even while Gateway is stopped. `/api/v1/control/*` is deliberately absent and
+returns `CONTROL_ROUTE_NOT_FOUND`; CLI and Desktop use the independent local
+framed IPC documented in [Local Agent Control IPC](../api/local-control.md).
 The proxy streams every other upstream response, including Gateway SSE, and
 forces the upstream connection to close after ordinary responses. If the
 Gateway cannot be reached it returns the stable
@@ -36,9 +37,10 @@ session, an allowed Origin, and the CSRF header. Repeated failed logins are
 rate-limited without emitting password or token material. The audit ring is
 bounded and code-only, so it records allow/deny/rate-limit decisions without
 storing source addresses, request payloads, cookies, or credentials.
-Remote `/api/v1/control/*` requests do not reuse this browser cookie or CSRF
-token; they are independently authenticated with the Agent-selected admin token,
-request signature, timestamp, and nonce replay guard.
+The browser cookie and CSRF token never authorize local Control. There is no
+remote Control token, request-signing scheme, HTTPS Control bridge, or raw
+Control protocol forwarding through this listener. Agent-owned Web actions call
+the same application services in-process after their own Web authorization.
 
 `apps/web` is the Vue 3/Vite management shell. It owns presentation-only
 navigation, responsive rail/drawer state, and route composition; it does not

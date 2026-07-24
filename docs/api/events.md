@@ -22,9 +22,9 @@ out, the complete retained buffer is sent so clients can deduplicate by
 The replay buffer holds at most 1,000 events with the production default and
 is cleared on Gateway restart. `GET /api/v1/events/recent` accepts `limit` from
 1 through 200 (default 100) and returns newest first; SSE replay is oldest
-first. The Agent Control bridge's `/api/v1/control/events/recent` route forwards
-the default snapshot only and does not accept a query string. Neither snapshot
-can reconstruct events older than the current process buffer.
+first. The local Agent Control `RecentEvents` projection forwards the default
+snapshot only and has no query input. Neither snapshot can reconstruct events
+older than the current process buffer.
 
 The stream sends `: heartbeat` comments every 15 seconds, including once when
 the connection opens. A socket that applies backpressure is closed immediately;
@@ -112,8 +112,8 @@ job.status_changed
 `GET /api/v1/jobs/:jobId/events` filters the same stream to that Job's
 `job.created` and `job.status_changed` events. It does not send an initial Job
 snapshot; fetch `GET /api/v1/jobs/:jobId` before subscribing and after any
-reconnect. The Agent `/api/v1/control/events` stream adds
-`gateway.heartbeat` and is not byte-identical to the direct Gateway stream.
+reconnect. The Agent's typed local Gateway-event subscription adds
+`gateway.heartbeat` and is not byte-identical to the direct Gateway SSE stream.
 
 `log.entry` remains a reserved CLI filter, but no production Gateway publisher
 emits that type in this RC. Use the domain events above and the host service

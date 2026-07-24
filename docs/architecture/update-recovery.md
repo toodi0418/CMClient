@@ -19,16 +19,16 @@ same-parent replacement, restores the previous active release pointer, then
 persists `rollback_completed`. If filesystem rollback cannot finish, the
 journal remains `failed` with `UPDATE_ROLLBACK_FAILED` for operator attention.
 
-Agent Control exposes this state while Gateway is stopped at
-`GET /api/v1/control/updates` and
-`GET /api/v1/control/updates/events`. The SSE feed sends an initial snapshot,
-subsequent `update.status_changed` projections, and heartbeat comments. It is
-an observation channel only; release signing, download, installation, backup,
-and rollback remain Agent-owned operations.
+Agent Control exposes this state while Gateway is stopped through the typed
+`UpdateStatus` operation and update-event subscription. The subscription sends
+an initial snapshot followed by typed `update.status_changed` projections. It
+is an observation channel only; release signing, download, installation,
+backup, and rollback remain Agent-owned operations.
 
 Desktop and CLI consume that private endpoint directly. The loopback
 Management Web listener relays the same safe projection at
 `GET /api/v1/updates` and `GET /api/v1/updates/events` so the browser has no
 access to the private socket. Each client reads the durable snapshot when it
-opens or reconnects, then follows Agent SSE; a transient stream loss never
-changes the journal state.
+opens or reconnects, then follows its surface-specific event stream; a
+transient stream loss never changes the journal state. Browser transport remains
+HTTP/SSE, while Desktop and CLI use length-delimited local IPC frames.

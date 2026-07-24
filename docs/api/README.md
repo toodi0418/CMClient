@@ -1,18 +1,18 @@
 # API Reference
 
-CMClient has three deliberately separate control surfaces. Do not infer the
+CMClient has two deliberately separate control surfaces. Do not infer the
 security of one surface from another.
 
 | Surface | Base | Authentication | Owner |
 | --- | --- | --- | --- |
 | Gateway public projection | Agent loopback `/api/v1/*` or Docker Ingress | Agent browser session/CSRF when reached through LAN Management Web; Docker Ingress topology; no raw LAN Gateway | Gateway, behind Agent |
-| Local Agent Control | Unix socket `<data-dir>/control.sock` or Windows `\\.\\pipe\\cmclient-control` | OS permissions and named-pipe ACL | Agent |
-| Remote Agent Control | Agent HTTPS Management LAN listener `/api/v1/control/*` | TLS plus nonce/timestamp HMAC `control:admin` | Agent |
+| Local Agent Control | Unix socket `<root>/run/control.sock` or a root-hashed Windows local named pipe | Private POSIX endpoint or remote-rejected current-user Windows pipe; no token | Agent |
 
 The local socket is always available while Agent is running. The optional Web
-listener can be disabled without disabling local Control. Browser cookies and
-CSRF tokens never authorize remote CLI Control; remote CLI uses the HMAC
-contract in [local-control.md](./local-control.md).
+listener can be disabled without disabling local Control. Control uses bounded
+length-delimited typed envelopes, not HTTP routes. Browser cookies and CSRF
+tokens never authorize it, and CMClient exposes no remote CLI Control surface.
+See [local-control.md](./local-control.md).
 
 ## Error envelopes
 
@@ -31,12 +31,13 @@ secret. Gateway responses include `x-trace-id`; callers may send bounded
 `x-trace-id` and `x-correlation-id` request headers. A correlation ID is copied
 into Job and event envelopes when the operation is asynchronous.
 
-Agent-owned Management Web, browser-auth, and Control errors deliberately use
-the smaller envelope `{"code":"CONTROL_COMMAND_FAILED"}`. They do not add
-Gateway `params` or `traceId` fields. A Gateway response proxied successfully
-through Agent keeps its Gateway envelope; failure to reach Gateway returns the
-Agent-owned code-only `GATEWAY_PROXY_UNAVAILABLE` response. Clients accept both
-documented shapes but must not invent a trace ID for an Agent response.
+Agent-owned Management Web and browser-auth errors deliberately use the smaller
+HTTP envelope `{"code":"CONTROL_COMMAND_FAILED"}`. Typed local Control error
+responses likewise contain a stable code but are framed IPC, not HTTP. Neither
+adds Gateway `params` or `traceId` fields. A Gateway response proxied
+successfully through Agent keeps its Gateway envelope; failure to reach Gateway
+returns the Agent-owned code-only `GATEWAY_PROXY_UNAVAILABLE` response. Clients
+accept the documented shape for their surface but must not invent a trace ID.
 
 ## Query and body validation
 
@@ -65,8 +66,9 @@ proxies the remaining `/api/*` requests to loopback Gateway:
 
 On a configured LAN listener, login is Origin-bound, subsequent browser API
 reads require the session cookie, and writes additionally require the matching
-Origin and CSRF token. `/api/v1/control/*` is a separate HMAC-authenticated CLI
-surface and is evaluated before browser-session authorization.
+Origin and CSRF token. `/api/v1/control/*` is not a browser or CLI surface and
+returns the stable Agent-owned `CONTROL_ROUTE_NOT_FOUND` response. CLI and
+Desktop use only the separate local framed IPC endpoint.
 
 ## Gateway route index
 

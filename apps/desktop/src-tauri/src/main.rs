@@ -40,9 +40,9 @@ fn agent_update_status() -> Result<UpdateControlStatus, String> {
 fn agent_service_status() -> Result<DesktopServiceStatus, String> {
     let config =
         AgentConfig::load().map_err(|_| String::from("DESKTOP_AGENT_CONFIG_UNAVAILABLE"))?;
-    Ok(service_status::load(default_local_endpoint(
-        &config.paths.run_dir(),
-    )))
+    let endpoint =
+        default_local_endpoint(config.paths.root_dir()).map_err(|error| error.code().to_owned())?;
+    Ok(service_status::load(endpoint))
 }
 
 #[tauri::command]
@@ -91,8 +91,9 @@ fn control(command: ControlCommand) -> Result<ControlStatus, String> {
 fn control_client() -> Result<ControlClient, String> {
     let config =
         AgentConfig::load().map_err(|_| String::from("DESKTOP_AGENT_CONFIG_UNAVAILABLE"))?;
-    ControlClient::new(default_local_endpoint(&config.paths.run_dir()))
-        .map_err(|error| error.code().to_owned())
+    let endpoint =
+        default_local_endpoint(config.paths.root_dir()).map_err(|error| error.code().to_owned())?;
+    ControlClient::new(endpoint).map_err(|error| error.code().to_owned())
 }
 
 fn start_update_event_forwarder(app: AppHandle) {

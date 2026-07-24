@@ -24,7 +24,7 @@
     "callmesh",
     "proxy",
     "management-web",
-    "remote-control",
+    "local-control",
     "backup",
     "migration",
     "update-rollback",
@@ -208,15 +208,15 @@
       "evidence": ["sanitized browser record", "stable HTTP/error codes", "Control status after Web disable"]
     },
     {
-      "id": "RC-REMOTE-CONTROL",
+      "id": "RC-LOCAL-CONTROL",
       "gate": "rc",
       "required": true,
       "validator": "human",
       "targets": ["all"],
-      "modes": ["remote-control"],
-      "procedure": "Use a scoped HTTPS token to run a permitted CLI command, then replay and alter signed requests.",
-      "expected": "Valid scope succeeds; replay, expiry, method/path/body changes, and oversized SSE lines fail with stable codes.",
-      "evidence": ["token alias only", "stable exit/error codes", "sanitized replay transcript"]
+      "modes": ["local-control"],
+      "procedure": "From the installed package, exercise command and graphical modes over the per-user local IPC endpoint, keep an event subscription active across Agent shutdown, and attempt malformed, oversized, slow, trailing, second-root, and remote Windows named-pipe connections where applicable.",
+      "expected": "Typed local commands and events succeed without HTTP, TCP, or a Control token; invalid peers fail with stable codes, active streams close on shutdown, and the deterministic endpoint can be rebound after restart.",
+      "evidence": ["sanitized command results", "stable exit/error codes", "endpoint and restart test summary"]
     },
     {
       "id": "RC-BACKUP-RESTORE",

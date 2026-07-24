@@ -370,12 +370,13 @@ mod service {
                 return Ok(());
             }
             if !graceful_requested {
-                let endpoint = default_local_endpoint(&home.join(".cmclient").join("run"));
                 graceful_requested =
-                    run_before_deadline(deadline, CONTROL_REQUEST_TIMEOUT, move |timeout| {
-                        ControlClient::new_with_timeout(endpoint, timeout)
-                            .and_then(|client| client.shutdown_agent())
-                            .is_ok()
+                    default_local_endpoint(&home.join(".cmclient")).is_ok_and(|endpoint| {
+                        run_before_deadline(deadline, CONTROL_REQUEST_TIMEOUT, move |timeout| {
+                            ControlClient::new_with_timeout(endpoint, timeout)
+                                .and_then(|client| client.shutdown_agent())
+                                .is_ok()
+                        })
                     });
             }
             let Some(remaining) = deadline

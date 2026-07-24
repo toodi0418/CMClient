@@ -2,25 +2,22 @@ use clap::{Parser, Subcommand};
 use cmclient_agent_core::AgentConfig;
 use cmclient_cli_client::{ExitCode, parse_endpoint};
 use cmclient_control_api::{
-    ControlClient, ControlEndpoint, ControlError, ControlSecretKind, ControlSecretReceipt,
-    ControlStatus, ControlUpdateEvent, ControlUpdateEventStream, DiagnosticsControlBundle,
-    GatewayControlStatus, GatewayProjection, InternalComponent, REMOTE_CONTROL_NONCE_HEADER,
-    REMOTE_CONTROL_SCOPE_HEADER, REMOTE_CONTROL_TIMESTAMP_HEADER, UpdateControlStatus,
-    compiled_component_identity, default_local_endpoint, sign_remote_control_request,
+    ControlClient, ControlEndpoint, ControlError, ControlSecretKind, ControlStatus,
+    DiagnosticsControlBundle, GatewayControlStatus, GatewayProjection, InternalComponent,
+    UpdateControlStatus, compiled_component_identity, default_local_endpoint,
 };
 use serde_json::{Value, json};
 use std::{
-    io::{BufRead, BufReader, IsTerminal, Read},
+    io::{IsTerminal, Read},
     process::ExitCode as ProcessExitCode,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, RecvTimeoutError},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 #[derive(Debug, Parser)]
 #[command(name = "cmclient", version, about = "CMClient Agent control client")]
@@ -85,480 +82,9 @@ enum SecretCommand {
     },
 }
 
-enum CliControlClient {
-    Local(ControlClient),
-    Remote(RemoteControlClient),
-}
-
-enum CliEventStream {
-    Local(ControlUpdateEventStream),
-    Remote(mpsc::Receiver<Result<ControlUpdateEvent, ControlError>>),
-}
-
-struct RemoteControlClient {
-    base_url: String,
-    token: Zeroizing<String>,
-    timeout: Duration,
-    client: reqwest::blocking::Client,
-}
-
 enum ClientSetupError {
     Exit(ExitCode),
     Control(ControlError),
-}
-
-impl CliControlClient {
-    fn status(&self) -> Result<ControlStatus, ControlError> {
-        match self {
-            Self::Local(client) => client.status(),
-            Self::Remote(client) => client.request_json("GET", "/api/v1/control/status", ""),
-        }
-    }
-
-    fn start(&self) -> Result<ControlStatus, ControlError> {
-        self.control_command("POST", "/api/v1/control/start")
-    }
-
-    fn stop(&self) -> Result<ControlStatus, ControlError> {
-        self.control_command("POST", "/api/v1/control/stop")
-    }
-
-    fn restart(&self) -> Result<ControlStatus, ControlError> {
-        self.control_command("POST", "/api/v1/control/restart")
-    }
-
-    fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
-        match self {
-            Self::Local(client) => client.enable_management_web(),
-            Self::Remote(client) => client.request_json("POST", "/api/v1/control/web/enable", ""),
-        }
-    }
-
-    fn update_status(&self) -> Result<UpdateControlStatus, ControlError> {
-        match self {
-            Self::Local(client) => client.update_status(),
-            Self::Remote(client) => client.request_json("GET", "/api/v1/control/updates", ""),
-        }
-    }
-
-    fn diagnostics_bundle(&self) -> Result<DiagnosticsControlBundle, ControlError> {
-        match self {
-            Self::Local(client) => client.diagnostics_bundle(),
-            Self::Remote(client) => {
-                client.request_json("GET", "/api/v1/control/diagnostics/bundle", "")
-            }
-        }
-    }
-
-    fn gateway_projection(&self, projection: GatewayProjection) -> Result<Value, ControlError> {
-        match self {
-            Self::Local(client) => client.gateway_projection(projection),
-            Self::Remote(client) => client.request_json(
-                projection_method(projection),
-                projection_control_path(projection),
-                "",
-            ),
-        }
-    }
-
-    fn store_secret(
-        &self,
-        kind: ControlSecretKind,
-        value: &str,
-    ) -> Result<ControlSecretReceipt, ControlError> {
-        match self {
-            Self::Local(client) => client.store_secret(kind, value),
-            Self::Remote(client) => client.request_json(
-                "PUT",
-                &format!("/api/v1/control/secrets/{}", kind.path_segment()),
-                value,
-            ),
-        }
-    }
-
-    fn remove_secret(&self, kind: ControlSecretKind) -> Result<ControlSecretReceipt, ControlError> {
-        match self {
-            Self::Local(client) => client.remove_secret(kind),
-            Self::Remote(client) => client.request_json(
-                "DELETE",
-                &format!("/api/v1/control/secrets/{}", kind.path_segment()),
-                "",
-            ),
-        }
-    }
-
-    fn subscribe_update_events(&self) -> Result<CliEventStream, ControlError> {
-        match self {
-            Self::Local(client) => client.subscribe_update_events().map(CliEventStream::Local),
-            Self::Remote(client) => client
-                .subscribe("/api/v1/control/updates/events")
-                .map(CliEventStream::Remote),
-        }
-    }
-
-    fn subscribe_gateway_events(&self) -> Result<CliEventStream, ControlError> {
-        match self {
-            Self::Local(client) => client.subscribe_gateway_events().map(CliEventStream::Local),
-            Self::Remote(client) => client
-                .subscribe("/api/v1/control/events")
-                .map(CliEventStream::Remote),
-        }
-    }
-
-    fn control_command(&self, method: &str, path: &str) -> Result<ControlStatus, ControlError> {
-        match (self, path) {
-            (Self::Local(client), "/api/v1/control/start") => client.start(),
-            (Self::Local(client), "/api/v1/control/stop") => client.stop(),
-            (Self::Local(client), "/api/v1/control/restart") => client.restart(),
-            (Self::Local(_), _) => Err(ControlError::CommandFailed),
-            (Self::Remote(client), _) => client.request_json(method, path, ""),
-        }
-    }
-}
-
-impl CliEventStream {
-    fn next_event(&mut self) -> Result<Option<ControlUpdateEvent>, ControlError> {
-        match self {
-            Self::Local(events) => events.next_event(),
-            Self::Remote(events) => match events.recv_timeout(Duration::from_millis(250)) {
-                Ok(event) => event.map(Some),
-                Err(RecvTimeoutError::Timeout) => Err(ControlError::Timeout),
-                Err(RecvTimeoutError::Disconnected) => Ok(None),
-            },
-        }
-    }
-}
-
-impl RemoteControlClient {
-    fn new(base_url: String, token: String, timeout: Duration) -> Result<Self, ControlError> {
-        if timeout.is_zero() {
-            return Err(ControlError::Timeout);
-        }
-        let token = Zeroizing::new(token);
-        let parsed =
-            reqwest::Url::parse(&base_url).map_err(|_| ControlError::UnsupportedEndpoint)?;
-        if parsed.scheme() != "https"
-            || parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-            || !matches!(parsed.path(), "" | "/")
-        {
-            return Err(ControlError::UnsupportedEndpoint);
-        }
-        if token.len() < 32
-            || token.len() > 4_096
-            || token.bytes().any(|byte| byte.is_ascii_control())
-        {
-            return Err(ControlError::Authentication);
-        }
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| ControlError::Io)?;
-        Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            token,
-            timeout,
-            client,
-        })
-    }
-
-    fn request_json<T: serde::de::DeserializeOwned>(
-        &self,
-        method: &str,
-        path: &str,
-        body: &str,
-    ) -> Result<T, ControlError> {
-        let response = self.send(method, path, body, true)?;
-        read_remote_json(response)
-    }
-
-    fn subscribe(
-        &self,
-        path: &str,
-    ) -> Result<mpsc::Receiver<Result<ControlUpdateEvent, ControlError>>, ControlError> {
-        let response = self.send("GET", path, "", false)?;
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !content_type.starts_with("text/event-stream") {
-            return Err(ControlError::InvalidHttp);
-        }
-        let (sender, receiver) = mpsc::sync_channel(64);
-        thread::spawn(move || read_remote_event_stream(response, sender));
-        Ok(receiver)
-    }
-
-    fn send(
-        &self,
-        method: &str,
-        path: &str,
-        body: &str,
-        bounded: bool,
-    ) -> Result<reqwest::blocking::Response, ControlError> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ControlError::Authentication)?
-            .as_secs();
-        let auth = sign_remote_control_request(
-            self.token.as_str(),
-            method,
-            path,
-            body.as_bytes(),
-            timestamp,
-        )
-        .map_err(|_| ControlError::Authentication)?;
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|_| ControlError::InvalidHttp)?;
-        let mut request = self
-            .client
-            .request(method, format!("{}{path}", self.base_url))
-            .header(reqwest::header::AUTHORIZATION, auth.authorization)
-            .header(REMOTE_CONTROL_TIMESTAMP_HEADER, auth.timestamp)
-            .header(REMOTE_CONTROL_NONCE_HEADER, auth.nonce)
-            .header(REMOTE_CONTROL_SCOPE_HEADER, auth.scope)
-            .header(reqwest::header::ACCEPT, "application/json");
-        if bounded {
-            request = request.timeout(self.timeout);
-        } else {
-            request = request.header(reqwest::header::ACCEPT, "text/event-stream");
-        }
-        if !body.is_empty() {
-            request = request.body(body.to_owned());
-        }
-        let response = request.send().map_err(map_remote_error)?;
-        match response.status().as_u16() {
-            200 | 202 => Ok(response),
-            _ => Err(read_remote_control_error(response)),
-        }
-    }
-}
-
-fn read_remote_control_error(response: reqwest::blocking::Response) -> ControlError {
-    const MAX_REMOTE_ERROR_BYTES: u64 = 8 * 1024;
-    let status = response.status().as_u16();
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_REMOTE_ERROR_BYTES)
-    {
-        return ControlError::ResponseTooLarge;
-    }
-    let mut body = Vec::new();
-    if response
-        .take(MAX_REMOTE_ERROR_BYTES + 1)
-        .read_to_end(&mut body)
-        .is_err()
-    {
-        return ControlError::Io;
-    }
-    if body.len() as u64 > MAX_REMOTE_ERROR_BYTES {
-        return ControlError::ResponseTooLarge;
-    }
-    remote_control_error(status, &body)
-}
-
-fn remote_control_error(status: u16, body: &[u8]) -> ControlError {
-    let code = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| value.get("code")?.as_str().map(str::to_owned));
-    if let Some(error) = code.as_deref().and_then(ControlError::from_code) {
-        return error;
-    }
-    match status {
-        401 | 403 => ControlError::Authentication,
-        408 | 504 => ControlError::Timeout,
-        413 => ControlError::ResponseTooLarge,
-        _ => ControlError::CommandFailed,
-    }
-}
-
-fn read_remote_json<T: serde::de::DeserializeOwned>(
-    response: reqwest::blocking::Response,
-) -> Result<T, ControlError> {
-    const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BYTES)
-    {
-        return Err(ControlError::ResponseTooLarge);
-    }
-    let mut bytes = Vec::new();
-    response
-        .take(MAX_RESPONSE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(map_io_error)?;
-    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(ControlError::ResponseTooLarge);
-    }
-    serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidHttp)
-}
-
-fn read_remote_event_stream(
-    response: reqwest::blocking::Response,
-    sender: mpsc::SyncSender<Result<ControlUpdateEvent, ControlError>>,
-) {
-    const MAX_SSE_BLOCK_BYTES: usize = 64 * 1024;
-    let mut reader = BufReader::new(response);
-    let mut block = Vec::new();
-    let mut block_bytes = 0_usize;
-    loop {
-        let mut line = Vec::new();
-        match read_bounded_sse_line(&mut reader, &mut line) {
-            Ok(0) if block.is_empty() => return,
-            Ok(0) => {
-                let _ = sender.send(Err(ControlError::InvalidHttp));
-                return;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                let _ = sender.send(Err(error));
-                return;
-            }
-        }
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        let line = match std::str::from_utf8(&line) {
-            Ok(line) => line,
-            Err(_) => {
-                let _ = sender.send(Err(ControlError::InvalidHttp));
-                return;
-            }
-        };
-        if line.is_empty() {
-            if let Some(event) = parse_remote_sse_block(&block) {
-                if sender.send(event).is_err() {
-                    return;
-                }
-            }
-            block.clear();
-            block_bytes = 0;
-        } else if !line.starts_with(':') {
-            block_bytes = match block_bytes.checked_add(line.len() + 1) {
-                Some(length) if length <= MAX_SSE_BLOCK_BYTES => length,
-                _ => {
-                    let _ = sender.send(Err(ControlError::ResponseTooLarge));
-                    return;
-                }
-            };
-            block.push(line.to_owned());
-        }
-    }
-}
-
-fn read_bounded_sse_line(
-    reader: &mut impl BufRead,
-    output: &mut Vec<u8>,
-) -> Result<usize, ControlError> {
-    const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
-    output.clear();
-    loop {
-        let available = reader.fill_buf().map_err(map_io_error)?;
-        if available.is_empty() {
-            return Ok(output.len());
-        }
-        let count = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        if output.len().saturating_add(count) > MAX_SSE_LINE_BYTES {
-            return Err(ControlError::ResponseTooLarge);
-        }
-        let ended = available.get(count.saturating_sub(1)) == Some(&b'\n');
-        output.extend_from_slice(&available[..count]);
-        reader.consume(count);
-        if ended {
-            return Ok(output.len());
-        }
-    }
-}
-
-fn parse_remote_sse_block(lines: &[String]) -> Option<Result<ControlUpdateEvent, ControlError>> {
-    if lines.is_empty() {
-        return None;
-    }
-    let mut id = None;
-    let mut event = None;
-    let mut data = None;
-    for line in lines {
-        let Some((field, value)) = line.split_once(':') else {
-            return Some(Err(ControlError::InvalidHttp));
-        };
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        match field {
-            "id" if id.is_none() => id = Some(value.to_owned()),
-            "event" if event.is_none() => event = Some(value.to_owned()),
-            "data" if data.is_none() => data = Some(value.as_bytes().to_vec()),
-            _ => return Some(Err(ControlError::InvalidHttp)),
-        }
-    }
-    match (id, event, data) {
-        (Some(id), Some(event), Some(data))
-            if is_safe_remote_sse_token(&id)
-                && is_safe_remote_sse_token(&event)
-                && !data.contains(&b'\r')
-                && !data.contains(&b'\n') =>
-        {
-            Some(Ok(ControlUpdateEvent { id, event, data }))
-        }
-        _ => Some(Err(ControlError::InvalidHttp)),
-    }
-}
-
-fn is_safe_remote_sse_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-}
-
-fn map_remote_error(error: reqwest::Error) -> ControlError {
-    if error.is_timeout() {
-        ControlError::Timeout
-    } else {
-        ControlError::Io
-    }
-}
-
-fn map_io_error(error: std::io::Error) -> ControlError {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    ) {
-        ControlError::Timeout
-    } else {
-        ControlError::Io
-    }
-}
-
-const fn projection_method(projection: GatewayProjection) -> &'static str {
-    match projection {
-        GatewayProjection::DatabaseIntegrity | GatewayProjection::Backup => "POST",
-        _ => "GET",
-    }
-}
-
-const fn projection_control_path(projection: GatewayProjection) -> &'static str {
-    match projection {
-        GatewayProjection::Meshtastic => "/api/v1/control/gateway/meshtastic",
-        GatewayProjection::Nodes => "/api/v1/control/gateway/nodes",
-        GatewayProjection::Positions => "/api/v1/control/gateway/positions",
-        GatewayProjection::Aprs => "/api/v1/control/gateway/aprs",
-        GatewayProjection::CallMesh => "/api/v1/control/gateway/callmesh",
-        GatewayProjection::Proxy => "/api/v1/control/gateway/proxy",
-        GatewayProjection::RecentEvents => "/api/v1/control/events/recent",
-        GatewayProjection::DatabaseIntegrity => "/api/v1/control/database/integrity-check",
-        GatewayProjection::Backup => "/api/v1/control/backups",
-    }
 }
 
 fn main() -> ProcessExitCode {
@@ -743,7 +269,7 @@ fn command_follows_events(command: &Command) -> bool {
 }
 
 fn manage_secret(
-    client: &CliControlClient,
+    client: &ControlClient,
     command: SecretCommand,
     json: bool,
     quiet: bool,
@@ -860,40 +386,28 @@ fn print_control_result(
     }
 }
 
-fn control_client(value: &str, timeout: Duration) -> Result<CliControlClient, ClientSetupError> {
+fn control_client(value: &str, timeout: Duration) -> Result<ControlClient, ClientSetupError> {
     match parse_endpoint(value).map_err(ClientSetupError::Exit)? {
         cmclient_cli_client::ControlEndpointSpec::Local => {
             let config =
                 AgentConfig::load().map_err(|_| ClientSetupError::Exit(ExitCode::Validation))?;
-            ControlClient::new_with_timeout(
-                default_local_endpoint(&config.paths.run_dir()),
-                timeout,
-            )
-            .map(CliControlClient::Local)
-            .map_err(ClientSetupError::Control)
+            let endpoint = default_local_endpoint(config.paths.root_dir())
+                .map_err(ClientSetupError::Control)?;
+            ControlClient::new_with_timeout(endpoint, timeout).map_err(ClientSetupError::Control)
         }
         cmclient_cli_client::ControlEndpointSpec::UnixSocket(path) => {
             ControlClient::new_with_timeout(ControlEndpoint::unix(path), timeout)
-                .map(CliControlClient::Local)
                 .map_err(ClientSetupError::Control)
         }
         cmclient_cli_client::ControlEndpointSpec::NamedPipe(name) => {
             ControlClient::new_with_timeout(ControlEndpoint::named_pipe(name), timeout)
-                .map(CliControlClient::Local)
-                .map_err(ClientSetupError::Control)
-        }
-        cmclient_cli_client::ControlEndpointSpec::Https(url) => {
-            let token = read_secret_from_standard_input()
-                .ok_or(ClientSetupError::Control(ControlError::Authentication))?;
-            RemoteControlClient::new(url, token, timeout)
-                .map(CliControlClient::Remote)
                 .map_err(ClientSetupError::Control)
         }
     }
 }
 
 fn events_command(
-    client: &CliControlClient,
+    client: &ControlClient,
     follow: bool,
     output: EventOutput,
     json: bool,
@@ -955,7 +469,7 @@ fn print_recent_events(
 }
 
 fn follow_gateway_events(
-    client: &CliControlClient,
+    client: &ControlClient,
     output: EventOutput,
     json: bool,
     quiet: bool,
@@ -1150,7 +664,7 @@ fn print_job_submission(
 }
 
 fn doctor(
-    client: &CliControlClient,
+    client: &ControlClient,
     json_output: bool,
     quiet: bool,
     style: OutputStyle,
@@ -1205,7 +719,7 @@ fn doctor_is_degraded(status: &ControlStatus, diagnostics: &DiagnosticsControlBu
         || diagnostics.update_error_code.is_some()
 }
 
-fn web(client: &CliControlClient, json: bool, quiet: bool, style: OutputStyle) -> ProcessExitCode {
+fn web(client: &ControlClient, json: bool, quiet: bool, style: OutputStyle) -> ProcessExitCode {
     let status = match client.enable_management_web() {
         Ok(status) => status,
         Err(error) => return control_error_exit(error),
@@ -1341,7 +855,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn follow_update_events(
-    client: &CliControlClient,
+    client: &ControlClient,
     json: bool,
     quiet: bool,
     style: OutputStyle,
@@ -1410,7 +924,9 @@ fn control_error_exit(error: ControlError) -> ProcessExitCode {
         | ControlError::ResourceExhausted
         | ControlError::SecretStoreUnavailable
         | ControlError::SecretValueInvalid => ExitCode::OperationFailed,
-        ControlError::InvalidHttp | ControlError::ResponseTooLarge => ExitCode::OperationFailed,
+        ControlError::InvalidEnvelope
+        | ControlError::ProtocolVersionUnsupported
+        | ControlError::ResponseTooLarge => ExitCode::OperationFailed,
     };
     ProcessExitCode::from(code.as_u8())
 }
@@ -1418,20 +934,19 @@ fn control_error_exit(error: ControlError) -> ProcessExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, EventOutput, RemoteControlClient, control_error_exit, doctor_is_degraded,
-        event_matches_output, normalize_secret_input, parse_remote_sse_block, parse_secret_kind,
-        parse_secret_kind_for_set, projection_control_path, read_bounded_sse_line,
-        remote_control_error, secret_kind_error, update_summary,
+        Cli, EventOutput, control_error_exit, doctor_is_degraded, event_matches_output,
+        normalize_secret_input, parse_secret_kind, parse_secret_kind_for_set, secret_kind_error,
+        update_summary,
     };
     use clap::CommandFactory;
     use cmclient_cli_client::ExitCode;
     use cmclient_control_api::{
         ControlError, ControlStatus, DiagnosticsControlBundle, GatewayControlStatus,
-        GatewayProjection, InternalComponent, ManagementWebControlStatus, UpdateControlJob,
-        UpdateControlStatus, compiled_component_identity,
+        InternalComponent, ManagementWebControlStatus, UpdateControlJob, UpdateControlStatus,
+        compiled_component_identity,
     };
     use serde_json::json;
-    use std::{io::Cursor, process::ExitCode as ProcessExitCode, time::Duration};
+    use std::process::ExitCode as ProcessExitCode;
 
     #[test]
     fn renders_an_idle_update_status_without_a_gateway_projection() {
@@ -1469,6 +984,8 @@ mod tests {
         assert!(parse_secret_kind("callmesh-api-key").is_some());
         assert!(parse_secret_kind("aprs-passcode").is_some());
         assert!(parse_secret_kind_for_set("aprs-passcode").is_none());
+        assert!(parse_secret_kind("management-admin-token").is_some());
+        assert!(parse_secret_kind_for_set("management-admin-token").is_none());
         assert!(parse_secret_kind("private-signing-key").is_none());
         assert_eq!(
             secret_kind_error("aprs-passcode"),
@@ -1485,96 +1002,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_endpoint_requires_https_root_and_a_nontrivial_token() {
-        let token = String::from("0123456789abcdef0123456789abcdef");
-        assert!(
-            RemoteControlClient::new(
-                String::from("https://cmclient.example"),
-                token.clone(),
-                Duration::from_secs(1),
-            )
-            .is_ok()
-        );
-        for endpoint in [
-            "http://cmclient.example",
-            "https://user@cmclient.example",
-            "https://cmclient.example/control",
-            "https://cmclient.example?token=forbidden",
-        ] {
-            assert!(
-                RemoteControlClient::new(
-                    String::from(endpoint),
-                    token.clone(),
-                    Duration::from_secs(1),
-                )
-                .is_err()
-            );
-        }
-        assert!(matches!(
-            RemoteControlClient::new(
-                String::from("https://cmclient.example"),
-                String::from("short"),
-                Duration::from_secs(1),
-            ),
-            Err(ControlError::Authentication)
-        ));
-        assert!(matches!(
-            RemoteControlClient::new(
-                String::from("https://cmclient.example"),
-                token,
-                Duration::ZERO,
-            ),
-            Err(ControlError::Timeout)
-        ));
+    fn help_does_not_advertise_a_control_token() {
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.to_ascii_lowercase().contains("token"));
     }
 
     #[test]
-    fn remote_sse_and_callmesh_projection_use_stable_control_contracts() {
-        let event = parse_remote_sse_block(&[
-            String::from("id: event-1"),
-            String::from("event: mesh.position.accepted"),
-            String::from("data: {\"schemaVersion\":1}"),
-        ])
-        .expect("event block should produce a result")
-        .expect("event block should be valid");
-        assert_eq!(event.id, "event-1");
-        assert_eq!(event.event, "mesh.position.accepted");
-        assert_eq!(
-            projection_control_path(GatewayProjection::CallMesh),
-            "/api/v1/control/gateway/callmesh"
-        );
-        assert_eq!(
-            remote_control_error(503, br#"{"code":"AGENT_SECRET_STORE_UNAVAILABLE"}"#),
-            ControlError::SecretStoreUnavailable
-        );
-        assert_eq!(
-            remote_control_error(400, br#"{"code":"AGENT_SECRET_VALUE_INVALID"}"#),
-            ControlError::SecretValueInvalid
-        );
-        assert_eq!(
-            remote_control_error(401, br#"{"code":"UNKNOWN"}"#),
-            ControlError::Authentication
-        );
-        assert_eq!(
-            parse_remote_sse_block(&[
-                String::from("id: event-1"),
-                String::from("id: event-2"),
-                String::from("event: log.entry"),
-                String::from("data: {}"),
-            ]),
-            Some(Err(ControlError::InvalidHttp))
-        );
-    }
-
-    #[test]
-    fn bounds_remote_sse_lines_and_filters_log_output() {
-        let mut oversized = Cursor::new(vec![b'a'; 64 * 1024 + 1]);
-        assert_eq!(
-            read_bounded_sse_line(&mut oversized, &mut Vec::new()),
-            Err(ControlError::ResponseTooLarge)
-        );
+    fn filters_log_output() {
         let log = json!({ "type": "log.entry" });
         let domain = json!({ "type": "position.accepted" });
         assert_eq!(event_matches_output(&log, EventOutput::Logs), Ok(true));

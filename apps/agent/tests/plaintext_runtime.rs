@@ -302,7 +302,7 @@ function shutdown() {
     }
 
     fn endpoint(&self) -> ControlEndpoint {
-        default_local_endpoint(&self.data.join("run"))
+        default_local_endpoint(&self.data).expect("endpoint should derive")
     }
 
     fn wait_for_client(&self, agent: &mut RunningAgent) -> ControlClient {
