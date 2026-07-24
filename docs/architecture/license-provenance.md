@@ -45,11 +45,11 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `d6bfadfa028ad4d128249dc6446f29102039dce5af6fb79e96761de2f2d8706f`.
-- Cargo license inventory: 614 registry packages, 13 workspace packages, zero
+  `8aa7d1ab6e6d00d37a8fc4819d84e4b2015a108ee08ffb933275b7d9760aa841`.
+- Cargo license inventory: 619 registry packages, 13 workspace packages, zero
   Git sources, zero unknown source classifications, and zero unknown licenses;
   inventory SHA-256
-  `e34a3450f05198d6b7309207587b3f753a089499965e79e751ce0ec785f9de0e`.
+  `3fa1a393b6662655aa8707d81dee4b1d8598f3623eafac60fe68b539a24b8853`.
   Its `canonical-json-v2` input is a UTF-8 JSON array with object keys in the
   exact order `name`, `version`, `source`, `checksum`, and `license`.
   Workspace sources are the literal `workspace`; absent checksums and licenses
@@ -67,10 +67,17 @@ The promotion baseline is CMClient commit
   `bytes` own bounded length-delimited framing. No registry package, version,
   checksum, or license row was added at that checkpoint, so the P13-T09
   canonical inventory digest remained unchanged.
-  P13-T10 then adopted exact Axum/Tower Web ingress dependencies. The current
+  P13-T10 then adopted exact Axum/Tower Web ingress dependencies. P14-T01
+  added the Agent-owned `mdns-sd` discovery dependency and its bounded
+  transitive graph. The current
   inventory includes those direct rows and all packages in Cargo's resolved
   graph; the canonical input was regenerated from structured `cargo metadata`
   and `Cargo.lock` data after the package set stabilized.
+  The superseded P13-T10 snapshot retained lock digest
+  `d6bfadfa028ad4d128249dc6446f29102039dce5af6fb79e96761de2f2d8706f`
+  and inventory digest
+  `e34a3450f05198d6b7309207587b3f753a089499965e79e751ce0ec785f9de0e` for
+  historical comparison only.
 - `pnpm-lock.yaml` SHA-256:
   `561ce24da4300bc8c4716874931e944d02eab86bea94fc35c558c892e6a2c7e6`.
 - The P13-T04 Windows production-install evidence contains 183 package versions;
@@ -111,6 +118,7 @@ notices remain part of the target-specific packaging inventory.
 | `fs4` | `1.1.0` | `https://github.com/al8n/fs4` | MIT OR Apache-2.0 | `7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5` | 1.75.0 |
 | `interprocess` | `2.4.2` | `https://github.com/kotauskas/interprocess` | 0BSD OR Apache-2.0 | `069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b` | 1.75 |
 | `libc` | `0.2.186` | `https://github.com/rust-lang/libc` | MIT OR Apache-2.0 | `68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66` | 1.65 |
+| `mdns-sd` | `0.20.2` | `https://github.com/keepsimple1/mdns-sd` | Apache-2.0 OR MIT | `f18d8ec9d1869796fb2910d95f4d957072df0b6a22e247a1d760d8b4c805e17a` | 1.70 |
 | `same-file` | `1.0.6` | `https://github.com/BurntSushi/same-file` | Unlicense/MIT | `93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502` | Not declared |
 | `time` | `0.3.45` | `https://github.com/time-rs/time` | MIT OR Apache-2.0 | `f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd` | 1.83.0 |
 | `tower-http` | `0.7.0` | `https://github.com/tower-rs/tower-http` | MIT | `b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233` | 1.65 |
@@ -136,6 +144,11 @@ streams only. Its MIT declaration and official upstream come from the installed
 package metadata; the archive integrity is pinned by `pnpm-lock.yaml`. Agent
 lifecycle/setup/update streams remain owned by Axum, and shipped-byte scans
 remain a P15 gate.
+
+P14-T01 adopts the exact `mdns-sd` crate for Agent-owned, bounded passive
+Meshtastic discovery before Gateway startup. It is used only for the standard
+`_meshtastic._tcp.local.` browse and never performs a subnet scan or radio
+mutation.
 
 | Package | Exact version | Upstream | License | npm registry integrity |
 | --- | --- | --- | --- | --- |

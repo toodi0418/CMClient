@@ -11,6 +11,7 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::access::ManagementAccessController;
 use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind, SecretStoreError};
+use cmclient_agent_core::setup::{SetupPhase, SetupStore};
 use cmclient_agent_core::web::{
     ActiveGatewayRoute, GATEWAY_CAPABILITY_HEADER, GatewayRoute, GatewaySessionHandle,
     ManagementTlsConfig, ManagementWebConfig, ManagementWebError, ManagementWebProfile,
@@ -304,6 +305,8 @@ struct AgentController {
     management_access: Option<Arc<ManagementAccessController>>,
     control_endpoint: ControlEndpoint,
     secrets: AgentSecretStore,
+    setup: Arc<SetupStore>,
+    setup_gate_required: bool,
     updates: Arc<AgentUpdateService>,
     shutdown_requested: AtomicBool,
     started_at: Instant,
@@ -423,6 +426,41 @@ fn apply_physical_qualification_environment(
     Ok(())
 }
 
+fn physical_source_smoke_enabled() -> bool {
+    std::env::var("CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE")
+        .ok()
+        .is_some_and(|value| {
+            ["1", "true", "yes", "on"]
+                .iter()
+                .any(|enabled| value.trim().eq_ignore_ascii_case(enabled))
+        })
+}
+
+fn setup_gate_required(config: &AgentConfig) -> bool {
+    setup_gate_required_with_profile(config, physical_source_smoke_enabled())
+}
+
+fn setup_gate_required_with_profile(config: &AgentConfig, physical_profile: bool) -> bool {
+    let has_external_configuration = config.callmesh.is_some()
+        || config.meshtastic.is_some()
+        || config.aprs.is_some()
+        || config.proxy.is_some();
+    if !has_external_configuration {
+        return false;
+    }
+    // The physical source-smoke profile is a campaign-only observation path.
+    // It is valid only when CallMesh/APRS/Proxy are absent; P18's product
+    // guard then owns the one Meshtastic socket and its allowlisted write.
+    if physical_profile
+        && config.callmesh.is_none()
+        && config.aprs.is_none()
+        && config.proxy.is_none()
+    {
+        return false;
+    }
+    true
+}
+
 const fn management_web_profile(profile: AgentRuntimeProfile) -> ManagementWebProfile {
     match profile {
         AgentRuntimeProfile::Native => ManagementWebProfile::Native,
@@ -459,6 +497,30 @@ impl AgentController {
     ) -> Result<Self, ControlError> {
         let identity = compiled_component_identity(InternalComponent::Agent)
             .map_err(|_| ControlError::CommandFailed)?;
+        let setup =
+            Arc::new(SetupStore::open(&config.paths).map_err(|_| ControlError::CommandFailed)?);
+        let setup_gate_required = setup_gate_required(config);
+        if setup_gate_required
+            && secrets
+                .read(SecretKind::CallMeshApiKey)
+                .map_err(control_secret_error)?
+                .is_none()
+            && matches!(
+                setup
+                    .snapshot()
+                    .map_err(|_| ControlError::CommandFailed)?
+                    .phase,
+                SetupPhase::Ready
+            )
+        {
+            setup
+                .require_credentials()
+                .map_err(|_| ControlError::CommandFailed)?;
+        }
+        let setup_generation = setup
+            .generation()
+            .map_err(|_| ControlError::CommandFailed)?
+            .generation();
         let mut initial_log_error_code = None;
         let mut initial_agent_log_error_code = None;
         let mut initial_gateway_log_error_code = None;
@@ -671,7 +733,7 @@ impl AgentController {
             enabled: true,
             port: config.management_lan.as_ref().map_or(7080, |lan| lan.port),
             profile: management_web_profile(config.runtime_profile),
-            setup_generation: 1,
+            setup_generation,
             allow_lan: management_access.is_some(),
             allowed_cidrs: config
                 .management_lan
@@ -718,6 +780,8 @@ impl AgentController {
             management_access,
             control_endpoint,
             secrets,
+            setup,
+            setup_gate_required,
             updates,
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
@@ -729,6 +793,7 @@ impl AgentController {
 
     fn status(&self) -> Result<ControlStatus, ControlError> {
         self.tick_supervisor()?;
+        let setup_blocked = self.setup_blocked()?;
         let mut supervisor = self
             .supervisor
             .lock()
@@ -776,7 +841,9 @@ impl AgentController {
             .map_err(|_| ControlError::CommandFailed)?
             .clone()
             .or(self.current_gateway_log_error_code()?);
-        let latest_error_code = if persistent_log_error_code.is_some() {
+        let latest_error_code = if setup_blocked {
+            Some(String::from("SETUP_REQUIRED"))
+        } else if persistent_log_error_code.is_some() {
             persistent_log_error_code
         } else {
             match gateway {
@@ -795,6 +862,17 @@ impl AgentController {
             uptime_seconds: self.started_at.elapsed().as_secs(),
             latest_error_code,
         })
+    }
+
+    fn setup_blocked(&self) -> Result<bool, ControlError> {
+        if !self.setup_gate_required {
+            return Ok(false);
+        }
+        Ok(self
+            .setup
+            .status()
+            .map_err(|_| ControlError::CommandFailed)?
+            .setup_required)
     }
 
     fn enable_management_web(&self) -> Result<ControlStatus, ControlError> {
@@ -1059,6 +1137,12 @@ impl AgentController {
             })
     }
 
+    fn has_setup_required_error(&self) -> bool {
+        self.latest_error_code
+            .lock()
+            .is_ok_and(|latest_error_code| latest_error_code.as_deref() == Some("SETUP_REQUIRED"))
+    }
+
     fn stop_supervisor(&self) -> Result<bool, ControlError> {
         let _transition = self
             .gateway_transition
@@ -1087,6 +1171,10 @@ impl AgentController {
     }
 
     fn start_supervisor(&self) -> Result<bool, ControlError> {
+        if self.setup_blocked()? {
+            self.remember_error_code("SETUP_REQUIRED");
+            return Err(ControlError::CommandFailed);
+        }
         let _transition = self
             .gateway_transition
             .lock()
@@ -1126,6 +1214,10 @@ impl AgentController {
     }
 
     fn tick_supervisor(&self) -> Result<(), ControlError> {
+        if self.setup_blocked()? {
+            self.gateway_session.clear();
+            return Ok(());
+        }
         let _transition = self
             .gateway_transition
             .lock()
@@ -1290,6 +1382,7 @@ impl ControlHandler for AgentController {
         match &result {
             Ok(_) if !matches!(command, ControlCommand::Status) => self.clear_error(),
             Ok(_) => {}
+            Err(ControlError::CommandFailed) if self.has_setup_required_error() => {}
             Err(ControlError::CommandFailed) if self.has_precise_supervisor_error() => {}
             Err(error) => self.remember_error(error),
         }
@@ -2294,7 +2387,8 @@ mod tests {
         bridge_gateway_event_stream, compiled_component_identity, gateway_json_projection,
         legacy_state_candidates, load_agent_config_after_migration_with, management_web_profile,
         normalize_runtime_process_path, push_legacy_source_candidate,
-        resolve_gateway_maintenance_program, verified_gateway_route,
+        resolve_gateway_maintenance_program, setup_gate_required_with_profile,
+        verified_gateway_route,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -2308,7 +2402,9 @@ mod tests {
     };
     #[cfg(not(target_os = "windows"))]
     use cmclient_agent_core::CallMeshConfig;
-    use cmclient_agent_core::{AprsConfig, RuntimePaths};
+    use cmclient_agent_core::{
+        AprsConfig, MeshtasticConfig, MeshtasticConnectionConfig, RuntimePaths,
+    };
     #[cfg(not(target_os = "windows"))]
     use cmclient_control_api::UpdateControlStatus;
     use cmclient_control_api::{
@@ -2381,6 +2477,64 @@ mod tests {
         ) -> Result<GatewayMaintenanceReport, MigrationError> {
             panic!("a configuration-only migration must not start database maintenance")
         }
+    }
+
+    #[test]
+    fn setup_required_blocks_external_gateway_start_and_physical_smoke_is_explicitly_scoped() {
+        let root =
+            std::env::temp_dir().join(format!("cmclient-agent-setup-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fixture root should create");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: root.clone(),
+                config_dir: root.clone(),
+                cache_dir: root.join("cache"),
+                log_dir: root.join("logs"),
+            },
+            config_file: root.join("config.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
+            gateway_command: Some(vec![String::from("cmclient-gateway-fixture")]),
+            callmesh: None,
+            meshtastic: Some(MeshtasticConfig {
+                mesh_network_id: String::from("fixture"),
+                gateway_id: String::from("fixture-gateway"),
+                connection: MeshtasticConnectionConfig::Tcp {
+                    host: String::from("192.0.2.10"),
+                    port: 4_403,
+                },
+            }),
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        assert!(setup_gate_required_with_profile(&config, false));
+        assert!(!setup_gate_required_with_profile(&config, true));
+
+        let controller =
+            AgentController::from_config_with_secrets(&config, AgentSecretStore::memory())
+                .expect("controller should initialize in setup state");
+        let status = controller.status().expect("status should be available");
+        assert_eq!(
+            status.gateway,
+            cmclient_control_api::GatewayControlStatus::Stopped
+        );
+        assert_eq!(status.latest_error_code.as_deref(), Some("SETUP_REQUIRED"));
+        assert_eq!(
+            controller.handle(cmclient_control_api::ControlCommand::Start),
+            Err(cmclient_control_api::ControlError::CommandFailed)
+        );
+        assert_eq!(
+            controller
+                .status()
+                .expect("status should remain available")
+                .latest_error_code
+                .as_deref(),
+            Some("SETUP_REQUIRED")
+        );
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("fixture root should clean up");
     }
 
     #[test]

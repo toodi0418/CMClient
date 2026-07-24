@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod secrets;
+pub mod setup;
 pub mod web;
 
 use crate::access::{LanAccessConfig, ManagementAccessController};

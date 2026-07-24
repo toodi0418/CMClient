@@ -3,6 +3,24 @@
 This file defines the approved target. Implementation and package evidence are
 added by the owning P13-P15 tasks.
 
+## P14-T01 implementation boundary
+
+The Agent owns the durable `state/setup.json` document through
+`cmclient-agent-core::setup::SetupStore`. It persists a versioned state machine
+and a monotonic `setupGeneration`; validation callbacks carry a generation fence
+so a reset or terms-version change makes an older callback stale before it can
+publish readiness. Public setup status contains only booleans and stable reason
+codes.
+
+Meshtastic setup discovery is also Agent-owned. Candidate order is migrated
+non-secret endpoint, loopback `4403`, bounded `_meshtastic._tcp.local.` mDNS
+results, then explicit manual input. The mDNS browse has a fixed event/count
+budget and is stopped before returning; no subnet scan or radio mutation is
+possible through this boundary. Setup wire validation accepts only the
+nonce-correlated configuration request/response actions. The Windows physical
+source-smoke profile remains a separate campaign-only path guarded by the
+product-integrated physical write fence.
+
 ## State Root
 
 ```text
