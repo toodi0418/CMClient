@@ -166,6 +166,31 @@ impl PlaintextSecretDocument {
     }
 }
 
+/// Validate a staged plaintext secret document without creating or changing its parent.
+pub fn validate_migrated_plaintext_secrets(path: &Path) -> Result<(), SecretStoreError> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(SecretStoreError::Unavailable);
+    }
+    let mut input = open_regular_file_no_follow(path)?.ok_or(SecretStoreError::Unavailable)?;
+    let metadata = input
+        .metadata()
+        .map_err(|_| SecretStoreError::Unavailable)?;
+    if metadata.len() > MAX_PLAINTEXT_FILE_BYTES as u64 {
+        return Err(SecretStoreError::Unavailable);
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    Read::by_ref(&mut input)
+        .take(MAX_PLAINTEXT_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SecretStoreError::Unavailable)?;
+    if bytes.len() > MAX_PLAINTEXT_FILE_BYTES {
+        return Err(SecretStoreError::Unavailable);
+    }
+    let document: PlaintextSecretDocument =
+        serde_json::from_slice(bytes.as_slice()).map_err(|_| SecretStoreError::Unavailable)?;
+    document.validate()
+}
+
 impl Drop for PlaintextSecretDocument {
     fn drop(&mut self) {
         for value in [&mut self.callmesh_api_key, &mut self.aprs_passcode] {
@@ -593,7 +618,8 @@ fn validate_secret(value: &str) -> Result<(), SecretStoreError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSecretStore, MAX_PLAINTEXT_FILE_BYTES, SecretBackendKind, SecretKind, SecretStoreError,
+        AgentSecretStore, MAX_PLAINTEXT_FILE_BYTES, SecretBackendKind, SecretKind,
+        SecretStoreError, validate_migrated_plaintext_secrets,
     };
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
@@ -719,6 +745,30 @@ mod tests {
             store.read(SecretKind::CallMeshApiKey),
             Err(SecretStoreError::Unavailable)
         ));
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn migrated_secrets_use_the_production_document_schema() {
+        let root = fixture("migrated-validator");
+        fs::create_dir_all(&root).expect("fixture root should exist");
+        let path = root.join("secrets.json");
+        fs::write(&path, br#"{"version":1,"callmesh-api-key":"fixture-key"}"#)
+            .expect("valid migrated secrets should write");
+        validate_migrated_plaintext_secrets(&path)
+            .expect("production-valid migrated secrets should pass");
+
+        fs::write(&path, br#"{"version":2}"#).expect("invalid version should write");
+        assert_eq!(
+            validate_migrated_plaintext_secrets(&path),
+            Err(SecretStoreError::Unavailable)
+        );
+        fs::write(&path, br#"{"version":1,"unknown":"value"}"#)
+            .expect("unknown field should write");
+        assert_eq!(
+            validate_migrated_plaintext_secrets(&path),
+            Err(SecretStoreError::Unavailable)
+        );
         fs::remove_dir_all(root).expect("fixture should clean up");
     }
 

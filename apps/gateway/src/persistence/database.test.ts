@@ -4,9 +4,11 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  createSqlMigration,
   DatabaseMigrationError,
   GatewayDatabase,
   gatewayMigrations,
+  MigrationManifestError,
   runMigrations,
 } from "./database";
 import { createMeshObservation } from "../observations";
@@ -222,10 +224,10 @@ describe("GatewayDatabase", () => {
     const database = new GatewayDatabase(":memory:");
     expect(() =>
       runMigrations(database.connection, [
-        { version: 3, name: "one", up: () => undefined },
-        { version: 3, name: "two", up: () => undefined },
+        createSqlMigration(1, "one", "SELECT 1;"),
+        createSqlMigration(1, "two", "SELECT 2;"),
       ]),
-    ).toThrow(DatabaseMigrationError);
+    ).toThrow(MigrationManifestError);
     database.close();
   });
 
@@ -564,16 +566,12 @@ describe("GatewayDatabase", () => {
     const database = new GatewayDatabase(":memory:");
     expect(() =>
       runMigrations(database.connection, [
-        {
-          version: 16,
-          name: "broken",
-          up(connection) {
-            connection.exec(
-              "CREATE TABLE migration_rollback_probe (id INTEGER)",
-            );
-            throw new Error("fixture failure");
-          },
-        },
+        ...gatewayMigrations,
+        createSqlMigration(
+          16,
+          "broken",
+          "CREATE TABLE migration_rollback_probe (id INTEGER); SELECT * FROM definitely_missing_table;",
+        ),
       ]),
     ).toThrow(DatabaseMigrationError);
     expect(

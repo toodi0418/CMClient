@@ -1205,6 +1205,9 @@ export async function auditTrackedRepository() {
 }
 
 export function repositoryEntries(cwd = process.cwd()) {
+  const worktreeDeletions = new Set(
+    gitList(["ls-files", "--deleted", "-z"], cwd).split("\0").filter(Boolean),
+  );
   const tracked = gitList(["ls-files", "--stage", "-z"], cwd)
     .split("\0")
     .filter(Boolean)
@@ -1214,7 +1217,8 @@ export function repositoryEntries(cwd = process.cwd()) {
         throw new Error("SECURITY_AUDIT_GIT_ENTRY_INVALID");
       }
       return { mode: match[1], path: match[2] };
-    });
+    })
+    .filter(({ path }) => !worktreeDeletions.has(path));
   const untracked = gitList(
     ["ls-files", "--others", "--exclude-standard", "-z"],
     cwd,

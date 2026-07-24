@@ -7,29 +7,6 @@ const SCANNER_PATH = "scripts/legacy-removal-scan.mjs";
 
 export const ALLOWED_REMOVAL_EVIDENCE = new Map([
   [
-    "crates/legacy-migration/src/lib.rs",
-    [
-      {
-        code: "LEGACY_MAP_REFERENCE",
-        line: 134,
-        count: 1,
-        context: '            "shareWithTenmanMap" => findings.push(finding(',
-      },
-      {
-        code: "LEGACY_MAP_REFERENCE",
-        line: 137,
-        count: 1,
-        context: '                "LEGACY_SETTINGS_REMOVED_TENMAN",',
-      },
-      {
-        code: "LEGACY_MAP_REFERENCE",
-        line: 254,
-        count: 1,
-        context: '            finding.field == "shareWithTenmanMap"',
-      },
-    ],
-  ],
-  [
     "docs/architecture/ARCHITECTURE_DECISIONS.md",
     [
       {
@@ -45,24 +22,6 @@ export const ALLOWED_REMOVAL_EVIDENCE = new Map([
         count: 1,
         context:
           "`@cm` Bot are removed without a compatibility layer. The later Remote Message",
-      },
-    ],
-  ],
-  [
-    "docs/architecture/legacy-settings-migration.md",
-    [
-      {
-        code: "LEGACY_MAP_REFERENCE",
-        line: 24,
-        count: 2,
-        context: "| `shareWithTenmanMap` | `LEGACY_SETTINGS_REMOVED_TENMAN` |",
-      },
-      {
-        code: "LEGACY_MAP_REFERENCE",
-        line: 106,
-        count: 2,
-        context:
-          "claim. CallMesh credentials/mappings, APRS cache/backtrack data, TENMAN/TENMAP",
       },
     ],
   ],

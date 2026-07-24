@@ -157,12 +157,16 @@ describe("PhysicalWriteGuard", () => {
     }
     const fifth = fixture.guard();
     fifth.acquireSession(5);
+    expect(fifth.automaticReconnectAllowed).toBe(true);
     expectCode(
       () => fifth.authorizeConfigRequest(5, wantConfig(5)),
       "PHYSICAL_GUARD_STAGE_REQUEST_LIMIT_EXCEEDED",
     );
+    expect(fifth.automaticReconnectAllowed).toBe(false);
     fifth.releaseSession();
-  });
+    // Four synchronous=FULL SQLite cycles exercise the real durable ledger.
+    // Windows fsync latency can exceed Vitest's 5s default under worker load.
+  }, 15_000);
 
   it("opens a candidate fuse before its seventeenth config request", async () => {
     let now = new Date("2026-07-22T00:00:00.000Z");

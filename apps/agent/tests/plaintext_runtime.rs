@@ -27,6 +27,8 @@ struct Fixture {
     secret_parent: PathBuf,
     secret_file: PathBuf,
     marker: PathBuf,
+    private_node: PathBuf,
+    gateway_entrypoint: PathBuf,
     agent_stdout: PathBuf,
     agent_stderr: PathBuf,
 }
@@ -58,7 +60,7 @@ const OWNERSHIP_CHALLENGE_HEADER =
   "x-cmclient-gateway-ownership-challenge";
 const OWNERSHIP_PROOF_HEADER = "x-cmclient-gateway-ownership-proof";
 
-const marker = process.argv[2];
+const marker = `${process.env.CMCLIENT_RUNTIME_ROOT}/gateway-marker`;
 let boundaryError;
 if (Object.hasOwn(process.env, "CMCLIENT_PLAINTEXT_SECRET_FILE")) {
   boundaryError = "selector-leaked";
@@ -244,15 +246,18 @@ function shutdown() {
         .expect("gateway fixture should write");
         set_private_mode(&gateway_script);
 
-        let marker = root.join("gateway-marker");
+        let marker = data.join("gateway-marker");
         let config = data.join("config.toml");
-        let config_text = format!(
-            "[agent]\ngateway_command = [\"node\", {}, {}]\nmanagement_web_enabled = false\n",
-            toml_string(&gateway_script),
-            toml_string(&marker),
-        );
-        fs::write(&config, config_text).expect("Agent config should write");
+        fs::write(&config, "[agent]\nmanagement_web_enabled = false\n")
+            .expect("Agent config should write");
         set_private_mode(&config);
+        let private_node = std::env::split_paths(
+            &std::env::var_os("PATH").expect("source test PATH should exist"),
+        )
+        .map(|directory| directory.join("node"))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| fs::canonicalize(candidate).ok())
+        .expect("source test Node should resolve to an absolute file");
         let agent_stdout = root.join("agent-stdout.log");
         let agent_stderr = root.join("agent-stderr.log");
 
@@ -263,6 +268,8 @@ function shutdown() {
             logs,
             secret_parent,
             marker,
+            private_node,
+            gateway_entrypoint: gateway_script,
             agent_stdout,
             agent_stderr,
         }
@@ -280,6 +287,8 @@ function shutdown() {
                 "PATH",
                 std::env::var("PATH").expect("source test PATH should exist"),
             )
+            .env("CMCLIENT_PRIVATE_NODE", &self.private_node)
+            .env("CMCLIENT_GATEWAY_ENTRYPOINT", &self.gateway_entrypoint)
             .env("CMCLIENT_PLAINTEXT_SECRET_FILE", &self.secret_file)
             .env("CMCLIENT_CALLMESH_API_KEY", INHERITED_CALLMESH_SECRET)
             .env("CMCLIENT_APRS_PASSCODE", INHERITED_APRS_SECRET)
@@ -509,9 +518,4 @@ fn private_append_file(path: &Path) -> fs::File {
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .expect("fixture output should be private");
     file
-}
-
-fn toml_string(path: &Path) -> String {
-    let value = path.to_str().expect("fixture path should be UTF-8");
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }

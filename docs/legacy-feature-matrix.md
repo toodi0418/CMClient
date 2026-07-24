@@ -64,12 +64,13 @@ the legacy Node.js/Electron implementation.
 
 ## Parity Audit Rule
 
-The Legacy settings reader is isolated in `cmclient-migrate`; its supported
-mapping, dry-run report, and create-only output rule are documented in
-[Legacy Settings Migration](./architecture/legacy-settings-migration.md).
-The same offline tool imports only verified Legacy history projections with a
-backup, post-import verification, and rollback; it never treats Legacy records
-as live packets or position/APRS state.
+The old settings/history importer is superseded by the bounded product-state
+transaction documented in
+[Product State Migration](./architecture/legacy-settings-migration.md). Agent
+runs or resumes it before configuration load and Gateway startup. It migrates
+only known configuration, an existing plaintext secret file, the Gateway
+database, and user backups; it never projects arbitrary Legacy history into a
+populated database or treats old records as live packet/APRS state.
 
 P11 used this matrix and `docs/legacy-inventory.md` to distinguish intentional
 removal from an accidental regression. Every retained capability has an

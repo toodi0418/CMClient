@@ -101,45 +101,29 @@ failure code. Do not delete the journal or staging directory while recovering.
 
 ## Legacy migration
 
-Migration is an explicit, offline operation. It reads only the sanitized legacy
-settings/data shapes approved by the migration contract, writes a new absolute
-Agent configuration, and can dry-run before applying. It never imports secrets,
-raw legacy runtime code, or removed sharing behavior. Inspect settings and data
-with the real subcommands before applying:
+Agent detects and migrates known older product state before it reads
+`~/.cmclient/config.toml` or starts Gateway. Do not run a manual SQLite import
+against a live or populated target. The native database is always
+`$HOME/.cmclient/cmclient.db`. CMClient stages known configuration, plaintext
+secrets, database, and user backup leaves; the pinned private Node Gateway
+performs SQLite backup, forward migration, integrity, foreign-key,
+schema-history, and domain-count verification.
 
-```bash
-cmclient-migrate settings \
-  --source /absolute/legacy/client-preferences.json \
-  --dry-run
-cmclient-migrate settings \
-  --source /absolute/legacy/client-preferences.json \
-  --write-agent-config "$HOME/.cmclient/config.toml"
-cmclient-migrate data import \
-  --source-dir /absolute/legacy \
-  --target-database "$HOME/.cmclient/cmclient.db" \
-  --mesh-network-id local-mesh \
-  --backup-dir "$HOME/.cmclient/backups"
-```
+Progress is recorded at `~/.cmclient/state/migration.json` as `detected`,
+`staged`, `verified`, `activated`, then `complete`. Interrupted work resumes
+automatically. CMClient never modifies or deletes source payload. It may create
+and retain only an empty `agent.lock` coordination file in an existing legacy
+root, or reuse an existing empty root-level or `run/agent.lock`; a non-empty or
+linked lock fails closed. It never imports cache, temporary files, service
+metadata, logs, unknown files, links, junctions, or credentials from an
+operating-system secret store.
 
-Stop Gateway, then repeat the data import with `--apply` and the explicit stop
-confirmation. The JSON report names the backup required for rollback:
-
-```bash
-cmclient-migrate data import \
-  --source-dir /absolute/legacy \
-  --target-database "$HOME/.cmclient/cmclient.db" \
-  --mesh-network-id local-mesh \
-  --backup-dir "$HOME/.cmclient/backups" \
-  --apply --confirm-gateway-stopped
-cmclient-migrate data rollback \
-  --target-database "$HOME/.cmclient/cmclient.db" \
-  --backup-database "$HOME/.cmclient/backups/filename-from-backupFile-field.sqlite" \
-  --confirm-gateway-stopped
-```
-
-The settings writer is create-only. Keep migration backups in the canonical
-`~/.cmclient/backups` directory, never beside or over the live database, and
-verify each JSON report before starting Agent.
+If Agent reports `LEGACY_MIGRATION_TARGET_POPULATED`, preserve both roots and
+use the Web recovery flow; do not move individual files into the new root. Source
+mutation, digest mismatch, or database verification errors likewise require
+preserving the journal and staging tree for diagnosis. The internal
+`cmclient-migrate product` command uses the same transaction for controlled
+recovery and qualification, not for merging arbitrary history.
 
 ## Common stable codes
 

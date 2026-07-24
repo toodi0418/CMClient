@@ -1,124 +1,117 @@
-# Legacy Settings Migration
+# Product State Migration
 
-`cmclient-migrate` is a one-shot offline migration tool. It reads a Legacy
-`client-preferences.json` file (or an Electron response wrapper containing a
-`preferences` object), produces a machine-readable dry-run report, and is the
-only CMClient 2.0 code that understands this legacy shape. The Agent, Gateway,
-Desktop, and normal `cmclient` control client do not parse or retain it.
+CMClient migrates known pre-unified product state before the Agent reads the
+canonical configuration or starts Gateway. Migration is a product startup
+transaction, not a general-purpose Legacy history importer and not a database
+merge command.
 
-```bash
-cmclient-migrate settings \
-  --source /absolute/path/client-preferences.json \
-  --dry-run
-```
+The Agent derives the new `~/.cmclient` root and the platform's known older
+roots from one immutable startup environment snapshot. It then acquires an
+exclusive new-root migration lock and a source-specific lock. If more than one
+eligible source is present, or the new root already contains live product
+state, migration stops with a stable conflict code for the recovery UI. It
+never chooses a source or merges state by guessing.
 
-The report includes stable codes and field names, never legacy values. It is
-bounded to 64 KiB and rejects malformed JSON or a non-object root. The one
-currently safe mapping is deliberately small:
+## Bounded Inventory
 
-| Legacy field | CMClient 2.0 result |
-| --- | --- |
-| `webDashboardEnabled` boolean | `[agent] management_web_enabled` candidate |
-| TCP/serial host, path, baud, mode | `LEGACY_SETTINGS_TRANSPORT_REQUIRES_REVIEW` |
-| APRS endpoint/interval | `LEGACY_SETTINGS_APRS_REQUIRES_REVIEW` |
-| `shareWithTenmanMap` | `LEGACY_SETTINGS_REMOVED_TENMAN` |
-| Legacy traceroute controls | `LEGACY_SETTINGS_REMOVED_LEGACY_RUNTIME_FEATURE` |
-| Keys/tokens/passcodes/passwords/secrets | `LEGACY_SETTINGS_SECRET_SKIPPED` |
+Only these known product leaves are eligible:
 
-No legacy credential is moved to the Agent-selected secret backend automatically. An
-operator must add a current credential through `cmclient secret set` after
-reviewing the report. Transport and APRS fields require current CMClient 2.0
-configuration because their legacy semantics cannot be trusted or mapped to a
-runtime compatibility layer.
+- the Agent configuration, mapped to `config.toml`;
+- an existing plaintext `secrets.json` file;
+- the Gateway SQLite database, mapped to `cmclient.db`;
+- bounded user-created SQLite backup files below `backups/`.
 
-After review, write mode creates a new absolute Agent config path only:
+Known leaves must be regular files. Symlinks, junctions, reparse points,
+unexpected file types, excess files, oversized files, and aggregate size
+overflow fail closed. Cache, temporary files, service metadata, logs, update
+staging, raw captures, and unknown files are never inventoried or copied.
+Unsupported Keychain, Credential Manager/DPAPI, Secret Service, and systemd
+vault entries are not exported. Setup asks for any missing credential again.
 
-```bash
-cmclient-migrate settings \
-  --source /absolute/path/client-preferences.json \
-  --write-agent-config /absolute/path/new-config/agent.toml
-```
+Inventory evidence binds each main database, WAL, configuration, secret, and
+backup leaf to its platform file identity as well as its length and digest.
+Replacing a source leaf with byte-identical content is therefore still a
+source change and fails closed. Existing files are opened without following a
+symbolic-link or reparse-point leaf; the opened handle and final path identity
+must remain equal through the bounded read.
 
-Write mode never merges or overwrites an existing file, touches no SQLite data,
-and uses a synced same-directory temporary file followed by an atomic
-no-clobber target creation. Existing runtime configuration is therefore
-protected from accidental migration changes.
+## Durable Transaction
 
-## Legacy History Migration
+The compact journal at `~/.cmclient/state/migration.json` has exactly these
+durable phases:
 
-`cmclient-migrate data` is a separate, offline import path for Legacy user
-history. It never runs from the Agent, Gateway, Desktop, or normal `cmclient`
-control client. Stop the Gateway first, inspect the report, and only then apply
-with an explicit confirmation:
+1. `detected`
+2. `staged`
+3. `verified`
+4. `activated`
+5. `complete`
 
-```bash
-cmclient-migrate data import \
-  --source-dir /absolute/path/legacy-artifacts \
-  --target-database /absolute/path/gateway.sqlite \
-  --mesh-network-id local-mesh \
-  --backup-dir /absolute/path/migration-backups
+Regular files are copied into the bounded
+`~/.cmclient/cache/migration-stage` tree. The pinned private Node Gateway
+maintenance command creates the SQLite backup, applies the exact compiled
+forward migrations, and reports integrity, foreign keys, schema history, and
+domain counts. Rust coordinates paths, locks, fingerprints, the journal, and
+atomic activation; it does not implement Gateway schema or SQLite backup
+logic.
 
-cmclient-migrate data import \
-  --source-dir /absolute/path/legacy-artifacts \
-  --target-database /absolute/path/gateway.sqlite \
-  --mesh-network-id local-mesh \
-  --backup-dir /absolute/path/migration-backups \
-  --apply --confirm-gateway-stopped
-```
+Before each durable transition and activation, CMClient rechecks source and
+stage fingerprints. Activation publishes only the known target leaves with
+atomic writes. A restart reconciles already-published leaves by their expected
+digests and resumes from the last durable phase. Source mutation, stage
+tampering, a malformed journal, database verification failure, or an
+unexplained target produces a stable recovery state instead of deleting
+evidence or starting Gateway.
 
-The dry-run report contains a deterministic migration ID, source filenames and
-SHA-256 digests, bounded record counts, skipped-record codes, and no Legacy
-payload values. Before mutation the tool checks the target Gateway schema and
-SQLite integrity, then uses SQLite's backup API to create a verified standalone
-snapshot. A `data_version` check brackets snapshot creation and an exclusive
-SQLite transaction prevents writes during import. If another connection writes
-inside the snapshot window, the import fails closed. The supplied backup
-directory must be private and owned by the current user; the tool creates a
-missing final directory with private permissions but never changes an existing
-directory's permissions.
+Atomic-write residue is recognized only in the exact reserved sibling-name
+namespace for a known destination. Gateway maintenance residue is recognized
+only at its deterministic transaction work directory with its fixed flat
+allowlist. Cleanup is bounded and non-recursive, rejects linked or multiply
+linked files, and rechecks the captured directory identity chain immediately
+before each removal. Unknown or unsafe residue is retained and migration fails
+closed.
 
-Each snapshot has a strict JSON proof manifest containing the migration ID,
-Gateway schema version, canonical target-path digest, snapshot filename, and
-snapshot SHA-256. The same manifest is stored in the target import marker. A
-rollback must match all three artifacts before it can mutate a healthy target.
-The backup and manifest form a durable migration journal: a repeated invocation
-returns the already-verified result, a pre-commit orphan is removed only when
-the target proves no import occurred, and ambiguous or tampered state returns
-`LEGACY_DATA_IMPORT_RECOVERY_REQUIRED` without deleting evidence.
+Source payload files and directories are never modified or deleted. The sole
+permitted source mutation is creating and retaining an empty `agent.lock` in an
+existing legacy root when neither supported lock leaf exists; CMClient holds
+that coordination file exclusively while it inventories and migrates. An
+existing root-level or `run/agent.lock` must be an empty regular, single-link
+file and is reused byte-for-byte. A successful migration leaves every legacy
+payload available for operator recovery, and a repeated startup is idempotent.
 
-After commit the tool verifies projected row counts, marker equality, SQLite
-integrity, and foreign keys. Verification failure restores the snapshot
-automatically. `telemetry_time_seconds` values that cannot satisfy the current
-Gateway schema, including zero, are imported as unknown (`NULL`) rather than
-causing the whole migration to fail.
+The `complete` phase is written durably before plaintext staging cleanup. A
+restart may therefore finish cleanup even when the legacy source no longer
+exists. It removes only stage leaves whose identity, size, and digest still
+match journal-owned evidence, with `secrets.json` removed first, followed by
+verified empty directories. Cleanup failure preserves the durable `complete`
+phase, records the stable cleanup recovery code, and is retried on the next
+start; successful retry clears that code.
 
-The importer reads only these Legacy artifacts when present:
+Windows and macOS candidates are single-root sources. Linux treats its legacy
+XDG configuration and data directories as one logical candidate, so config and
+plaintext secrets may come from the config root while the database and backups
+come from the data root. If only one side exists it becomes the single source;
+two distinct populated logical candidates remain an ambiguity. Backup
+inventory is recursive within its fixed depth/count/size bounds, accepts only
+`.sqlite` and `.db` leaves, and preserves their relative subdirectories.
 
-| Source | Imported projection | Deliberately excluded |
-| --- | --- | --- |
-| `callmesh-data.sqlite` or `node-database.json` | Latest valid node identity/metadata | coordinates and legacy position/APRS state |
-| `callmesh-data.sqlite`, `message-log.jsonl`, or its `.migrated` fallback | Valid text-message history with sender, packet ID, channel, and event time | replies as a destination, raw frames, radio metadata, relay details |
-| `telemetry-records.sqlite`, `telemetry-records.jsonl`, or its `.migrated` fallback | Valid scalar telemetry metrics and sample time | arbitrary JSON metric payloads and raw observations |
+When a legacy SQLite `-wal` exists, its exact bytes and length, including a
+valid zero-length WAL, are part of the source evidence. Offline maintenance
+opens only a byte-for-byte staging snapshot; it never opens the live source
+database through SQLite. A present shared-memory file must be a non-empty safe
+regular file and is topology evidence only, including its platform file
+identity; its volatile contents are not hashed. Main, WAL, shared-memory,
+config, secret, and backup evidence is rechecked before each durable
+transition.
 
-Imported message and telemetry history is marked as `backlog` with a minimal
-non-packet observation envelope. It therefore cannot become a current transport
-event, advance APRS high-water state, enqueue APRS Data, or establish a position
-claim. CallMesh credentials/mappings, APRS cache/backtrack data, TENMAN/TENMAP
-state, traceroutes, raw payloads, logs, and all unrecognized artifacts are not
-migrated.
+## Offline Maintenance Boundary
 
-To restore the verified pre-import snapshot, while the Gateway remains stopped:
+Gateway's offline maintenance mode is internal to the Agent and migration
+tooling. It receives a bounded JSON request over private standard input with
+absolute source and staged database paths, performs no network activity, and
+emits one bounded JSON report. It does not start HTTP, CallMesh, Meshtastic,
+APRS, Proxy, or normal background maintenance.
 
-```bash
-cmclient-migrate data rollback \
-  --target-database /absolute/path/gateway.sqlite \
-  --backup-database /absolute/path/migration-backups/legacy-data-<id>.sqlite \
-  --confirm-gateway-stopped
-```
-
-Rollback checks the manifest, target identity, snapshot SHA-256, current Gateway
-schema, SQLite integrity, and foreign keys. A healthy target additionally needs
-the exact import marker. A missing or corrupt target may be recovered from the
-external proof: the tool verifies a private restore candidate, quarantines the
-damaged DB/WAL/SHM files, and atomically switches the candidate into place. It
-does not overwrite a healthy unrelated SQLite database.
+The standalone `cmclient-migrate product` entry point exists for controlled
+recovery and automated kill/resume qualification. It uses the same transaction
+and Gateway maintenance command as Agent startup; it is not an alternate data
+import format or a public way to edit a live database.

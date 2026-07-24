@@ -24,7 +24,7 @@ Legacy runtime paths, gitlinks, and retired direct dependencies.
 | Management Web | Agent serves the compiled Vue bundle and handles Agent-owned routes before proxying Gateway HTTP/SSE | No direct file, process, SQLite, Meshtastic, or updater access | `crates/agent-core/src/web.rs`, `apps/web/src`, `apps/web/e2e/management.spec.ts` |
 | Desktop | Tauri calls the local Agent Control API for lifecycle, Web, update, and bounded service-status projections; portable and native packages carry the complete Agent composition | It does not duplicate the full Web, call Gateway directly, or silently register a privileged Agent service | `apps/desktop/src-tauri/src/main.rs`, `scripts/desktop-native-bundles.mjs`, native package and launch smoke |
 | CLI client | Rust client uses local IPC or the authenticated HTTPS Control bridge for commands and SSE follow | It never opens SQLite or a radio transport; the standalone archive contains only the CLI | `apps/cli/src/main.rs`, `crates/control-api/src/lib.rs` |
-| Headless | Agent, CLI, migration tool, production Gateway, compiled Web, and locked protobuf corpus share one staged layout | A supported Node.js runtime is currently an external runtime prerequisite for Gateway | `scripts/release-artifacts.mjs`, `scripts/release-bundle-smoke.sh` |
+| Native command mode | Agent, CLI, migration tool, production Gateway, compiled Web, locked protobuf corpus, and the target-pinned private Node runtime share one product layout | It is a launch mode of the unified native package, not a separate Headless download, and never uses system Node | P13 runtime staging contract and P15 target-native package smoke |
 | systemd / launchd | The service manager starts the same Agent-owned Headless composition | Installers never accept or manufacture runtime credentials | `scripts/cmclient-systemd.sh`, `scripts/cmclient-launchd.sh` and their tests |
 | Windows Service | SCM Service Host supervises the adjacent Agent and carries the Windows Headless composition | The Service Host does not own Gateway domain logic | `apps/service-host`, `scripts/cmclient-windows-service.ps1`, packaging tests |
 | Docker | Constrained OCI deployment contains Gateway, Web, and a fixed-target Ingress proxy | No Agent, CLI, Desktop, Service Host, serial ownership, or self-update | `Dockerfile`, `docker-compose.yml`, `scripts/docker.test.mjs`, `scripts/docker-smoke.sh` |
@@ -47,7 +47,7 @@ executable as a product surface.
 | Realtime status and logs/events | Gateway emits bounded, replayable domain SSE; Agent bridges it to local and authenticated remote control clients | Web refreshes affected projections from event types. CLI `events`/`logs` support snapshots and `--follow`, reconnect, bounded parsing, and clean Ctrl+C exit. |
 | Lifecycle, diagnostics, backup, and database integrity | Agent owns process/Web lifecycle; Gateway executes integrity and verified SQLite backup operations as persistent Jobs | Desktop provides quick lifecycle/Web controls. CLI provides `status`, `start`, `stop`, `restart`, `doctor`, `web`, `backup`, `diagnostics`, and `database`. |
 | Signed update and rollback visibility | Agent remains the only update owner and persists update state independently of Gateway | Web, Desktop, and CLI consume the Agent snapshot/SSE; no Gateway self-update path is introduced. |
-| Legacy settings and history | Offline `cmclient-migrate` performs dry-run, create-only configuration output, backup, verified import, and rollback | It is included in deployable Headless/Desktop/Service layouts, but never runs inside Agent, Gateway, Desktop, or the ordinary CLI. |
+| Older product state | Agent runs one bounded, resumable transaction before configuration load and Gateway startup; Gateway owns SQLite backup, migration, and reports | Only known config, plaintext secret, DB, and user backup leaves migrate. Populated targets conflict; sources remain untouched. |
 
 The final Legacy `main` dashboard added DOM-only toggles for self packet-summary
 rows and heartbeat log lines. CMClient 2.0 does not recreate that raw packet/log
@@ -58,14 +58,11 @@ Legacy file merge.
 
 ## Release verification boundary
 
-The current portable composition does not embed Node.js. Its staged-bundle
-smoke therefore requires Node.js `^22.18.0` or `>=24.11.0` on the target. This
-is an explicit
-portable-runtime prerequisite and remaining release risk, not a claim that the
-archive is self-contained. The P12 Release Build Matrix produces and inspects
-all native Desktop formats, launches every staged Desktop, starts the final
-staged Windows Service Host through SCM, repeats the service lifecycle from the
-supply-chain final ZIP, and launches the final Linux x64 Desktop archive.
+The P12 portable composition and its external-Node smoke are superseded. P13
+pins the private Node input and P15 must build and load the exact target-native
+Gateway production tree and native addons inside each unified package. The P12
+Release Build Matrix remains historical evidence only; it cannot qualify a P15
+native package.
 Signed/notarized installation, interactive tray and single-instance behaviour,
 hardware transports, and operator evidence remain RC field gates.
 

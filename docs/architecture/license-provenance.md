@@ -45,19 +45,26 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `4313a3ae2a59e7d84786797ed82ff2465b762dd9a582d6f4848e068bb01502e8`.
-- Cargo license inventory: 584 registry packages, 13 workspace packages, zero
+  `5afcf2d027cc345772f20c72d6acac29a4e9da489820f7d28b7fad03d31764b4`.
+- Cargo license inventory: 574 registry packages, 13 workspace packages, zero
   Git sources and zero unknown licenses; inventory SHA-256
-  `b9334626dfa4319244fc28ac141aa73c00a49477f0e2449daf5eb0e48817b028`.
+  `0da4c2e9cc7770b7cccc23e7ce60799d4f43d21998676db9efebcc67f279f5a3`.
   The digest is canonical JSON sorted by package name, version, source,
   checksum, and declared license.
-  P13-T07 removed the obsolete platform keyring and encrypted-vault dependency
-  chain; it introduced no new registry package or license expression.
+  P13-T08 removed the Rust SQLite and obsolete Windows ACL migration chain and
+  made the already-locked `libc` and `winapi-util` packages exact direct
+  platform dependencies. They provide no-follow existing-file opens on Unix
+  and read-only hard-link count inspection on Windows for migration and staged
+  Agent configuration validation.
 - `pnpm-lock.yaml` SHA-256:
-  `99207257e14da5b216e65b9863c11dfcde7fdb58403be094cd93a9ec66fdbca3`.
+  `9b234eb100e287daaf76e9cb13cd07a47205e50ea08adadcfe0e97b933fdc5ab`.
 - The current Windows production install contains 183 package versions;
   inventory SHA-256
-  `1a46ec827117d651b449faf536c353763f642de4550537361358a93b5a22b281`.
+  `632b3ae7d319aede117c8113b1961e23a331d66972f6b59ff2b548b5fc10ca5f`.
+  Its canonical input is one `name@version<TAB>SPDX-expression` row per
+  production version, JavaScript-lexically sorted and encoded as UTF-8 LF with
+  a terminal LF. The previous literal backslash-tab/backslash-newline digest is
+  not retained as evidence.
 - No GPL-2.0-only, AGPL, proprietary, Git-sourced, or unknown dependency license
   expression was found. MPL-2.0 dependencies carry no Exhibit-B incompatible
   notice; their file-level source and notice obligations remain in force.
@@ -79,10 +86,23 @@ notices remain part of the target-specific packaging inventory.
 | `tokio-util` | `0.7.18` | `https://github.com/tokio-rs/tokio` | MIT | `9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098` | 1.71 |
 | `atomic-write-file` | `0.3.0` | `https://github.com/andreacorbellini/rust-atomic-write-file` | BSD-3-Clause | `84790c55b5704b0d35130bf16a4ce22a8e70eb0ea773522557524d9a4852663d` | 1.85 |
 | `fs4` | `1.1.0` | `https://github.com/al8n/fs4` | MIT OR Apache-2.0 | `7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5` | 1.75.0 |
+| `libc` | `0.2.186` | `https://github.com/rust-lang/libc` | MIT OR Apache-2.0 | `68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66` | 1.65 |
 | `same-file` | `1.0.6` | `https://github.com/BurntSushi/same-file` | Unlicense/MIT | `93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502` | Not declared |
 | `time` | `0.3.45` | `https://github.com/time-rs/time` | MIT OR Apache-2.0 | `f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd` | 1.83.0 |
 | `tracing` | `0.1.44` | `https://github.com/tokio-rs/tracing` | MIT | `63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100` | 1.65.0 |
 | `tracing-appender` | `0.2.5` | `https://github.com/tokio-rs/tracing` | MIT | `050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c` | 1.63.0 |
+| `winapi-util` | `0.1.11` | `https://github.com/BurntSushi/winapi-util` | Unlicense OR MIT | `c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22` | not declared |
+
+P13-T08 adopts one exact npm archive reader and its sole transitive dependency
+for bounded private-Node staging. Both are MIT licensed and pinned by registry
+integrity in `pnpm-lock.yaml`; neither is shipped as the private Node runtime.
+Target package license/SBOM scans in P15 remain authoritative for shipped
+bytes.
+
+| Package | Exact version | Upstream | License | npm registry integrity |
+| --- | --- | --- | --- | --- |
+| `yauzl` | `3.4.0` | `https://github.com/thejoshwolfe/yauzl` | MIT | `sha512-jIH9yLR9wqr0wOS0TpBvo/g/2UgZH5qePVbjgRliiF0BYvOZyaBknKsF+x9Iht0O6sqgnB93rCICdOZFecJuDw==` |
+| `pend` | `1.2.0` | `https://github.com/andrewrk/node-pend` | MIT | `sha512-F3asv42UuXchdzt+xXqfW1OGlVBe+mxa2mqI0pg5yAHZPvFmY3Y6drSf/GQ1A86WgWEN9Kzh/WrgKa6iGcHXLg==` |
 
 The workspace MSRV is Rust 1.87.0 and the pinned current toolchain is Rust
 1.96.0. CI checks every workspace target at 1.87 and runs the full workspace

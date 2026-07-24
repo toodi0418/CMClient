@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "runtime": {
+    "name": "node",
+    "version": "24.18.0",
+    "versionOutput": "v24.18.0",
+    "checksumDocument": {
+      "url": "https://nodejs.org/dist/v24.18.0/SHASUMS256.txt",
+      "sha256": "3927bab574a00ca0560c9583fe19655ba19603a1c5851414e4325d34ac50e469",
+      "sizeBytes": 2967
+    }
+  },
+  "limits": {
+    "maxArchiveBytes": 134217728,
+    "maxEntries": 32768,
+    "maxEntryUncompressedBytes": 134217728,
+    "maxTotalUncompressedBytes": 536870912,
+    "maxPathBytes": 512
+  },
+  "targets": [
+    {
+      "target": "windows-x86_64",
+      "archiveFormat": "zip",
+      "archiveFileName": "node-v24.18.0-win-x64.zip",
+      "archiveUrl": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-win-x64.zip",
+      "archiveSha256": "0ae68406b42d7725661da979b1403ec9926da205c6770827f33aac9d8f26e821",
+      "archiveSizeBytes": 37176245,
+      "stageLayout": {
+        "archiveRoot": "node-v24.18.0-win-x64",
+        "stageRelativePath": "runtime/node",
+        "runtimeExecutableRelativePath": "runtime/node/node.exe"
+      },
+      "qualification": "current-host-contract"
+    },
+    {
+      "target": "darwin-x86_64",
+      "archiveFormat": "tar.xz",
+      "archiveFileName": "node-v24.18.0-darwin-x64.tar.xz",
+      "archiveUrl": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-darwin-x64.tar.xz",
+      "archiveSha256": "4a3b6bc81542154430825128d9a279e8b364e8d90581544e506ef7579fd1ab6f",
+      "archiveSizeBytes": 28702492,
+      "stageLayout": {
+        "archiveRoot": "node-v24.18.0-darwin-x64",
+        "stageRelativePath": "runtime/node",
+        "runtimeExecutableRelativePath": "runtime/node/bin/node"
+      },
+      "qualification": "P15-target-native"
+    },
+    {
+      "target": "darwin-aarch64",
+      "archiveFormat": "tar.xz",
+      "archiveFileName": "node-v24.18.0-darwin-arm64.tar.xz",
+      "archiveUrl": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-darwin-arm64.tar.xz",
+      "archiveSha256": "4477b9f78efb77744cf5eb57a0e9594dba66466b38b4e93fa9f35cb907a095a6",
+      "archiveSizeBytes": 27052608,
+      "stageLayout": {
+        "archiveRoot": "node-v24.18.0-darwin-arm64",
+        "stageRelativePath": "runtime/node",
+        "runtimeExecutableRelativePath": "runtime/node/bin/node"
+      },
+      "qualification": "P15-target-native"
+    },
+    {
+      "target": "linux-x86_64",
+      "archiveFormat": "tar.xz",
+      "archiveFileName": "node-v24.18.0-linux-x64.tar.xz",
+      "archiveUrl": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz",
+      "archiveSha256": "55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742",
+      "archiveSizeBytes": 31511588,
+      "stageLayout": {
+        "archiveRoot": "node-v24.18.0-linux-x64",
+        "stageRelativePath": "runtime/node",
+        "runtimeExecutableRelativePath": "runtime/node/bin/node"
+      },
+      "qualification": "P15-target-native"
+    },
+    {
+      "target": "linux-aarch64",
+      "archiveFormat": "tar.xz",
+      "archiveFileName": "node-v24.18.0-linux-arm64.tar.xz",
+      "archiveUrl": "https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-arm64.tar.xz",
+      "archiveSha256": "58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6",
+      "archiveSizeBytes": 30473480,
+      "stageLayout": {
+        "archiveRoot": "node-v24.18.0-linux-arm64",
+        "stageRelativePath": "runtime/node",
+        "runtimeExecutableRelativePath": "runtime/node/bin/node"
+      },
+      "qualification": "P15-target-native"
+    }
+  ],
+  "exclusions": {
+    "windowsArm64": {
+      "supported": false,
+      "reason": "WINDOWS_ARM64_OUT_OF_SCOPE"
+    },
+    "docker": {
+      "consumesNativeArchive": false,
+      "reason": "DOCKER_RUNTIME_IS_BUILT_IN_TARGET_IMAGE",
+      "qualification": "P16"
+    }
+  }
+}

@@ -897,13 +897,19 @@ test("repository entries include tracked and untracked non-ignored files", async
   assert.equal(init.status, 0, init.stderr);
   await writeFile(join(directory, ".gitignore"), "*.ignored\n");
   await writeFile(join(directory, "tracked.txt"), "tracked\n");
+  await writeFile(join(directory, "deleted.txt"), "deleted\n");
   await writeFile(join(directory, "untracked.txt"), "untracked\n");
   await writeFile(join(directory, "local.ignored"), "ignored\n");
-  const add = spawnSync("git", ["add", ".gitignore", "tracked.txt"], {
-    cwd: directory,
-    encoding: "utf8",
-  });
+  const add = spawnSync(
+    "git",
+    ["add", ".gitignore", "tracked.txt", "deleted.txt"],
+    {
+      cwd: directory,
+      encoding: "utf8",
+    },
+  );
   assert.equal(add.status, 0, add.stderr);
+  await rm(join(directory, "deleted.txt"));
 
   assert.deepEqual(
     repositoryEntries(directory).map(({ path }) => path),

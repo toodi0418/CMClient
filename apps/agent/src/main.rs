@@ -7,7 +7,8 @@ use cmclient_agent_core::web::{
     ManagementWebRequest, ManagementWebService, ManagementWebStream, gateway_health_with_route,
 };
 use cmclient_agent_core::{
-    AgentConfig, AgentLease, AprsConfig, MeshtasticConnectionConfig, ensure_runtime_directories,
+    AgentConfig, AgentLease, AprsConfig, MeshtasticConnectionConfig, RuntimePaths,
+    ensure_runtime_directories,
 };
 use cmclient_control_api::{
     ControlClient, ControlCommand, ControlEndpoint, ControlError, ControlHandler,
@@ -18,6 +19,10 @@ use cmclient_control_api::{
     RemoteControlReplayGuard, UpdateControlJob, UpdateControlStatus, compiled_component_identity,
     default_local_endpoint,
 };
+use cmclient_legacy_migration::{
+    ChildGatewayMaintenanceRunner, GatewayMaintenanceRunner, ProductMigrationSourceSet,
+    migrate_detected_product_source_sets,
+};
 use cmclient_runtime_logging::{LogLevel, LogPolicy, StructuredLogSink};
 use cmclient_supervisor::{
     BackoffPolicy, GatewayCommand, GatewayLogHealthUpdate, GatewayReady, GatewayStatus,
@@ -26,6 +31,9 @@ use cmclient_supervisor::{
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
 use std::{
     collections::BTreeMap,
+    env,
+    ffi::OsString,
+    fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
@@ -2182,38 +2190,252 @@ const fn control_secret_error(error: SecretStoreError) -> ControlError {
     }
 }
 
+fn load_agent_config_after_migration() -> Result<AgentConfig, String> {
+    let environment = env::vars().collect::<BTreeMap<_, _>>();
+    let paths =
+        RuntimePaths::from_environment(&environment).map_err(|error| String::from(error.code()))?;
+    let candidates = legacy_state_candidates(&environment);
+    let (program, gateway_entrypoint) = resolve_gateway_maintenance_program(&environment)?;
+    let maintenance = ChildGatewayMaintenanceRunner::new(program, gateway_entrypoint)
+        .map_err(|error| String::from(error.code()))?;
+    load_agent_config_after_migration_with(&environment, &paths, &candidates, &maintenance)
+}
+
+fn load_agent_config_after_migration_with(
+    environment: &BTreeMap<String, String>,
+    paths: &RuntimePaths,
+    candidates: &[ProductMigrationSourceSet],
+    maintenance: &dyn GatewayMaintenanceRunner,
+) -> Result<AgentConfig, String> {
+    migrate_detected_product_source_sets(paths.root_dir(), candidates, maintenance)
+        .map_err(|error| String::from(error.code()))?;
+    AgentConfig::from_environment(environment).map_err(|error| String::from(error.code()))
+}
+
+fn legacy_state_candidates(
+    environment: &BTreeMap<String, String>,
+) -> Vec<ProductMigrationSourceSet> {
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        push_single_root_legacy_candidate(
+            &mut candidates,
+            environment_value(environment, "APPDATA")
+                .map(|root| PathBuf::from(root).join("CMClient")),
+        );
+        push_single_root_legacy_candidate(
+            &mut candidates,
+            environment_value(environment, "PROGRAMDATA")
+                .map(|root| PathBuf::from(root).join("CMClient")),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    push_single_root_legacy_candidate(
+        &mut candidates,
+        environment_value(environment, "HOME")
+            .map(|root| PathBuf::from(root).join("Library/Application Support/CMClient")),
+    );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let home = environment_value(environment, "HOME").map(PathBuf::from);
+        let config_root = environment_value(environment, "XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|root| root.join(".config")))
+            .map(|root| root.join("cmclient"));
+        let data_root = environment_value(environment, "XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|root| root.join(".local/share")))
+            .map(|root| root.join("cmclient"));
+        push_legacy_source_candidate(&mut candidates, config_root, data_root);
+    }
+    candidates
+}
+
+fn push_single_root_legacy_candidate(
+    candidates: &mut Vec<ProductMigrationSourceSet>,
+    candidate: Option<PathBuf>,
+) {
+    push_legacy_source_candidate(candidates, candidate.clone(), candidate);
+}
+
+fn push_legacy_source_candidate(
+    candidates: &mut Vec<ProductMigrationSourceSet>,
+    config_root: Option<PathBuf>,
+    data_root: Option<PathBuf>,
+) {
+    let config_root = config_root.filter(|path| path.is_absolute());
+    let data_root = data_root.filter(|path| path.is_absolute());
+    let (config_root, data_root) = match (config_root, data_root) {
+        (Some(config_root), Some(data_root)) => (config_root, data_root),
+        (Some(root), None) | (None, Some(root)) => (root.clone(), root),
+        (None, None) => return,
+    };
+    let candidate = ProductMigrationSourceSet {
+        config_root,
+        data_root,
+    };
+    if candidates.iter().any(|existing| {
+        paths_equal(&existing.config_root, &candidate.config_root)
+            && paths_equal(&existing.data_root, &candidate.data_root)
+    }) {
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    return left
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy());
+    #[cfg(not(target_os = "windows"))]
+    return left == right;
+}
+
+fn environment_value<'a>(environment: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
+    environment
+        .get(name)
+        .or_else(|| {
+            environment
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value)
+        })
+        .map(String::as_str)
+}
+
+fn resolve_gateway_maintenance_program(
+    environment: &BTreeMap<String, String>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let bundle = bundled_root();
+    let development_entrypoint =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gateway/dist/main.js");
+    let gateway_entrypoint = explicit_runtime_file(
+        environment,
+        "CMCLIENT_GATEWAY_ENTRYPOINT",
+        "AGENT_GATEWAY_ENTRYPOINT_INVALID",
+    )?
+    .or_else(|| {
+        bundle
+            .as_ref()
+            .map(|root| root.join("gateway/dist/main.js"))
+            .filter(|path| path.is_file())
+    })
+    .or_else(|| {
+        (cfg!(debug_assertions) && development_entrypoint.is_file())
+            .then_some(development_entrypoint)
+    })
+    .ok_or_else(|| String::from("AGENT_GATEWAY_ENTRYPOINT_INVALID"))?;
+    let bundled_node = bundle
+        .as_ref()
+        .map(|root| root.join(private_node_relative_path()));
+    let mut private_node = explicit_runtime_file(
+        environment,
+        "CMCLIENT_PRIVATE_NODE",
+        "AGENT_PRIVATE_NODE_INVALID",
+    )?
+    .or_else(|| bundled_node.filter(|path| path.is_file()));
+    if private_node.is_none() && cfg!(debug_assertions) {
+        private_node = find_node_on_path(environment);
+    }
+    let private_node = private_node.ok_or_else(|| String::from("AGENT_PRIVATE_NODE_INVALID"))?;
+    Ok((
+        canonical_file_or_path(private_node),
+        canonical_file_or_path(gateway_entrypoint),
+    ))
+}
+
+fn explicit_runtime_file(
+    environment: &BTreeMap<String, String>,
+    name: &str,
+    error_code: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(value) = environment_value(environment, name) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() || !path.is_file() {
+        return Err(String::from(error_code));
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|_| String::from(error_code))?;
+    if metadata.file_type().is_symlink() {
+        return Err(String::from(error_code));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0400 != 0 {
+            return Err(String::from(error_code));
+        }
+    }
+    fs::canonicalize(path)
+        .map(Some)
+        .map_err(|_| String::from(error_code))
+}
+
+fn find_node_on_path(environment: &BTreeMap<String, String>) -> Option<PathBuf> {
+    let path = environment_value(environment, "PATH")?;
+    let executable = if cfg!(target_os = "windows") {
+        "node.exe"
+    } else {
+        "node"
+    };
+    env::split_paths(&OsString::from(path))
+        .map(|directory| directory.join(executable))
+        .find(|candidate| candidate.is_absolute() && candidate.is_file())
+        .map(canonical_file_or_path)
+}
+
+fn canonical_file_or_path(path: PathBuf) -> PathBuf {
+    if path.is_file() {
+        fs::canonicalize(&path).unwrap_or(path)
+    } else {
+        path
+    }
+}
+
+const fn private_node_relative_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "runtime/node/node.exe"
+    } else {
+        "runtime/node/bin/node"
+    }
+}
+
 fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
         Some("--serve") => serve(),
         Some("--serve-web-once") => serve_web_once(),
-        None | Some("--check-config") | Some("--check-instance") => match AgentConfig::load() {
-            Ok(config) => {
-                if let Err(error) = ensure_runtime_directories(&config.paths) {
-                    eprintln!("{}", error.code());
-                    return ExitCode::from(EX_CONFIG);
-                }
-                if std::env::args()
-                    .skip(1)
-                    .any(|argument| argument == "--check-instance")
-                {
-                    match AgentLease::acquire(&config.paths) {
-                        Ok((_lease, _state)) => println!("agent instance lock valid"),
-                        Err(error) => {
-                            eprintln!("{}", error.code());
-                            return ExitCode::from(EX_CONFIG);
-                        }
+        None | Some("--check-config") | Some("--check-instance") => {
+            match load_agent_config_after_migration() {
+                Ok(config) => {
+                    if let Err(error) = ensure_runtime_directories(&config.paths) {
+                        eprintln!("{}", error.code());
+                        return ExitCode::from(EX_CONFIG);
                     }
-                } else {
-                    println!("agent configuration valid");
+                    if std::env::args()
+                        .skip(1)
+                        .any(|argument| argument == "--check-instance")
+                    {
+                        match AgentLease::acquire(&config.paths) {
+                            Ok((_lease, _state)) => println!("agent instance lock valid"),
+                            Err(error) => {
+                                eprintln!("{}", error.code());
+                                return ExitCode::from(EX_CONFIG);
+                            }
+                        }
+                    } else {
+                        println!("agent configuration valid");
+                    }
+                    ExitCode::SUCCESS
                 }
-                ExitCode::SUCCESS
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(EX_CONFIG)
+                }
             }
-            Err(error) => {
-                eprintln!("{}", error.code());
-                ExitCode::from(EX_CONFIG)
-            }
-        },
+        }
         Some("--version") => {
             println!("cmclient-agent {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -2226,10 +2448,10 @@ fn main() -> ExitCode {
 }
 
 fn serve_web_once() -> ExitCode {
-    let config = match AgentConfig::load() {
+    let config = match load_agent_config_after_migration() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("{}", error.code());
+            eprintln!("{error}");
             return ExitCode::from(EX_CONFIG);
         }
     };
@@ -2316,10 +2538,10 @@ fn install_shutdown_signal_handler(controller: Arc<AgentController>) -> Result<(
 }
 
 fn serve() -> ExitCode {
-    let config = match AgentConfig::load() {
+    let config = match load_agent_config_after_migration() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("{}", error.code());
+            eprintln!("{error}");
             return ExitCode::from(EX_CONFIG);
         }
     };
@@ -2406,25 +2628,18 @@ fn resolve_static_web_root() -> PathBuf {
     bundled.unwrap_or_else(|| PathBuf::from("web"))
 }
 
-fn resolve_gateway_command(config: &AgentConfig) -> Option<Vec<String>> {
-    if let Some(command) = &config.gateway_command {
+fn resolve_gateway_command(_config: &AgentConfig) -> Option<Vec<String>> {
+    #[cfg(test)]
+    if let Some(command) = &_config.gateway_command {
         return Some(command.clone());
     }
-    let configured = std::env::var_os("CMCLIENT_GATEWAY_ENTRYPOINT")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute() && path.is_file());
-    let bundled = bundled_root().map(|root| root.join("gateway/dist/main.js"));
-    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gateway/dist/main.js");
-    [configured, bundled, Some(development)]
-        .into_iter()
-        .flatten()
-        .find(|path| path.is_file())
-        .map(|entrypoint| {
-            vec![
-                String::from("node"),
-                entrypoint.to_string_lossy().into_owned(),
-            ]
-        })
+    let environment = env::vars().collect::<BTreeMap<_, _>>();
+    let (private_node, gateway_entrypoint) =
+        resolve_gateway_maintenance_program(&environment).ok()?;
+    Some(vec![
+        private_node.to_string_lossy().into_owned(),
+        gateway_entrypoint.to_string_lossy().into_owned(),
+    ])
 }
 
 fn bundled_root() -> Option<PathBuf> {
@@ -2442,7 +2657,8 @@ mod tests {
         AgentConfig, AgentController, AgentSecretStore, ControlHandler, GatewayLogHealthUpdate,
         InternalComponent, LogLevel, ManagementWebRequest, SecretKind, apply_aprs_environment,
         apply_physical_qualification_environment, compiled_component_identity,
-        dispatch_remote_control, verified_gateway_route,
+        dispatch_remote_control, legacy_state_candidates, load_agent_config_after_migration_with,
+        push_legacy_source_candidate, resolve_gateway_maintenance_program, verified_gateway_route,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -2473,6 +2689,10 @@ mod tests {
         REMOTE_CONTROL_SCOPE_HEADER, REMOTE_CONTROL_TIMESTAMP_HEADER, StaticControlHandler,
         UpdateControlStatus, sign_remote_control_request,
     };
+    use cmclient_legacy_migration::ProductMigrationSourceSet;
+    use cmclient_legacy_migration::{
+        GatewayMaintenanceReport, GatewayMaintenanceRunner, MigrationError,
+    };
 
     #[cfg(not(target_os = "windows"))]
     use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewaySupervisor};
@@ -2499,10 +2719,19 @@ mod tests {
         },
     };
 
+    #[cfg(not(target_os = "windows"))]
     fn wait_for_fixture_marker(marker: &Path, expected: &str, timeout: Duration) -> String {
+        wait_for_fixture_marker_with(expected, timeout, || std::fs::read_to_string(marker))
+    }
+
+    fn wait_for_fixture_marker_with(
+        expected: &str,
+        timeout: Duration,
+        mut read_marker: impl FnMut() -> std::io::Result<String>,
+    ) -> String {
         let deadline = Instant::now() + timeout;
         loop {
-            match std::fs::read_to_string(marker) {
+            match read_marker() {
                 Ok(contents) if contents == expected || contents == "rejected" => {
                     return contents;
                 }
@@ -2513,6 +2742,189 @@ mod tests {
             assert!(Instant::now() < deadline, "gateway fixture did not report");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    struct NoDatabaseMaintenance;
+
+    impl GatewayMaintenanceRunner for NoDatabaseMaintenance {
+        fn migrate_database(
+            &self,
+            _source_database: &Path,
+            _staged_database: &Path,
+        ) -> Result<GatewayMaintenanceReport, MigrationError> {
+            panic!("a configuration-only migration must not start database maintenance")
+        }
+    }
+
+    #[test]
+    fn startup_migrates_product_state_before_loading_the_canonical_config() {
+        let sequence = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should follow epoch")
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!(
+            "cmclient-agent-startup-migration-{}-{sequence}",
+            std::process::id()
+        ));
+        let home = fixture.join("home");
+        let source = fixture.join("legacy");
+        std::fs::create_dir_all(&home).expect("fixture home should exist");
+        std::fs::create_dir_all(&source).expect("legacy source should exist");
+        let source_config = b"[agent]\nmanagement_web_enabled = false\n";
+        std::fs::write(source.join("config.toml"), source_config)
+            .expect("legacy configuration should write");
+        let mut environment = BTreeMap::from([
+            (String::from("HOME"), home.to_string_lossy().into_owned()),
+            (
+                String::from("USERPROFILE"),
+                home.to_string_lossy().into_owned(),
+            ),
+        ]);
+        if cfg!(target_os = "windows") {
+            environment.insert(
+                String::from("APPDATA"),
+                home.join("AppData/Roaming").to_string_lossy().into_owned(),
+            );
+        }
+        let paths = RuntimePaths::from_environment(&environment)
+            .expect("runtime paths should derive from the immutable snapshot");
+        let source_set = ProductMigrationSourceSet {
+            config_root: source.clone(),
+            data_root: source.clone(),
+        };
+
+        let config = load_agent_config_after_migration_with(
+            &environment,
+            &paths,
+            std::slice::from_ref(&source_set),
+            &NoDatabaseMaintenance,
+        )
+        .expect("startup migration should finish before config parsing");
+
+        assert!(!config.management_web_enabled);
+        assert_eq!(
+            std::fs::read(paths.config_file()).expect("canonical config should activate"),
+            source_config
+        );
+        assert_eq!(
+            std::fs::read(source.join("config.toml")).expect("source should remain"),
+            source_config
+        );
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn platform_legacy_candidates_are_absolute_and_exclude_the_new_root() {
+        let root = std::env::temp_dir().join("cmclient-agent-legacy-candidates");
+        let environment = BTreeMap::from([
+            (
+                String::from("HOME"),
+                root.join("home").to_string_lossy().into_owned(),
+            ),
+            (
+                String::from("USERPROFILE"),
+                root.join("home").to_string_lossy().into_owned(),
+            ),
+            (
+                String::from("APPDATA"),
+                root.join("roaming").to_string_lossy().into_owned(),
+            ),
+            (
+                String::from("PROGRAMDATA"),
+                root.join("program-data").to_string_lossy().into_owned(),
+            ),
+        ]);
+        let paths =
+            RuntimePaths::from_environment(&environment).expect("runtime paths should derive");
+        let candidates = legacy_state_candidates(&environment);
+
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|candidate| {
+            candidate.config_root.is_absolute() && candidate.data_root.is_absolute()
+        }));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.config_root != paths.root_dir()
+                    && candidate.data_root != paths.root_dir())
+        );
+    }
+
+    #[test]
+    fn split_legacy_roots_form_one_logical_candidate() {
+        let root = std::env::temp_dir().join("cmclient-agent-split-legacy-candidate");
+        let config_root = root.join("config/cmclient");
+        let data_root = root.join("data/cmclient");
+        let mut candidates = Vec::new();
+
+        push_legacy_source_candidate(
+            &mut candidates,
+            Some(config_root.clone()),
+            Some(data_root.clone()),
+        );
+        push_legacy_source_candidate(
+            &mut candidates,
+            Some(config_root.clone()),
+            Some(data_root.clone()),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![ProductMigrationSourceSet {
+                config_root,
+                data_root: data_root.clone(),
+            }]
+        );
+
+        let mut data_only = Vec::new();
+        push_legacy_source_candidate(&mut data_only, None, Some(data_root.clone()));
+        assert_eq!(
+            data_only,
+            vec![ProductMigrationSourceSet {
+                config_root: data_root.clone(),
+                data_root,
+            }]
+        );
+    }
+
+    #[test]
+    fn explicit_private_runtime_paths_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "cmclient-agent-private-runtime-paths-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("private runtime fixture should exist");
+        let entrypoint = root.join("main.js");
+        std::fs::write(&entrypoint, b"").expect("entrypoint fixture should write");
+        let executable = std::env::current_exe().expect("test executable should resolve");
+
+        let invalid_node = BTreeMap::from([
+            (
+                String::from("CMCLIENT_GATEWAY_ENTRYPOINT"),
+                entrypoint.to_string_lossy().into_owned(),
+            ),
+            (String::from("CMCLIENT_PRIVATE_NODE"), String::from("node")),
+        ]);
+        assert_eq!(
+            resolve_gateway_maintenance_program(&invalid_node),
+            Err(String::from("AGENT_PRIVATE_NODE_INVALID"))
+        );
+
+        let invalid_entrypoint = BTreeMap::from([
+            (
+                String::from("CMCLIENT_GATEWAY_ENTRYPOINT"),
+                String::from("main.js"),
+            ),
+            (
+                String::from("CMCLIENT_PRIVATE_NODE"),
+                executable.to_string_lossy().into_owned(),
+            ),
+        ]);
+        assert_eq!(
+            resolve_gateway_maintenance_program(&invalid_entrypoint),
+            Err(String::from("AGENT_GATEWAY_ENTRYPOINT_INVALID"))
+        );
+        std::fs::remove_dir_all(root).expect("private runtime fixture should clean up");
     }
 
     #[test]
@@ -2753,27 +3165,17 @@ mod tests {
 
     #[test]
     fn gateway_fixture_marker_waits_for_committed_content() {
-        let data_dir = std::env::temp_dir().join(format!(
-            "cmclient-agent-marker-content-{}",
-            std::process::id(),
-        ));
-        let marker = data_dir.join("gateway-environment");
-        let _ = std::fs::remove_dir_all(&data_dir);
-        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
-        std::fs::File::create(&marker).expect("empty marker should be observable");
-
-        let writer_marker = marker.clone();
-        let writer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            std::fs::write(writer_marker, "ok").expect("marker content should write");
-        });
+        let mut observed_contents = [String::new(), String::from("ok")].into_iter();
 
         assert_eq!(
-            wait_for_fixture_marker(&marker, "ok", Duration::from_secs(2)),
+            wait_for_fixture_marker_with("ok", Duration::from_secs(2), || {
+                Ok(observed_contents
+                    .next()
+                    .expect("marker should be accepted after the committed observation"))
+            }),
             "ok",
         );
-        writer.join().expect("marker writer should join");
-        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
+        assert!(observed_contents.next().is_none());
     }
 
     #[test]

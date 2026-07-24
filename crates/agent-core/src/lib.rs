@@ -8,12 +8,14 @@ use crate::access::{LanAccessConfig, ManagementAccessController};
 use cmclient_runtime_primitives::{
     DocumentError, DocumentFormat, DurableDocument, ExclusiveFileLock, LockError, TypedDocument,
 };
+use same_file::Handle;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fmt::{Display, Formatter},
-    fs,
+    fs::{self, File, Metadata, OpenOptions},
+    io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -21,6 +23,8 @@ use std::{
 
 /// Stable workspace identity for the Agent core boundary.
 pub const COMPONENT: &str = "agent-core";
+
+const MAX_MIGRATED_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
@@ -329,6 +333,16 @@ struct AgentSection {
     management_web_enabled: Option<bool>,
 }
 
+struct ValidatedFileConfig {
+    gateway_command: Option<Vec<String>>,
+    callmesh: Option<CallMeshConfig>,
+    meshtastic: Option<MeshtasticConfig>,
+    aprs: Option<AprsConfig>,
+    proxy: Option<ProxyConfig>,
+    management_web_enabled: bool,
+    management_lan: Option<ManagementLanConfig>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManagementLanSection {
@@ -361,70 +375,204 @@ impl AgentConfig {
         } else {
             FileConfig::default()
         };
-        let agent = file_config.agent.unwrap_or_default();
-        if agent.gateway_command.as_ref().is_some_and(|command| {
-            command.is_empty() || command.iter().any(|argument| argument.is_empty())
-        }) {
-            return Err(ConfigError::EmptyGatewayCommand);
-        }
-        let management_lan = file_config
-            .management_lan
-            .map(|lan| {
-                if lan.bind.is_loopback()
-                    || lan.port == 0
-                    || !lan.certificate_path.is_absolute()
-                    || !lan.private_key_path.is_absolute()
-                {
-                    return Err(ConfigError::InvalidManagementLan);
-                }
-                let access = LanAccessConfig {
-                    password_hash: lan.password_hash,
-                    allowed_origins: lan.allowed_origins.into_iter().collect::<BTreeSet<_>>(),
-                    session_ttl_seconds: lan.session_ttl_seconds.unwrap_or(3_600),
-                    audit_capacity: lan.audit_capacity.unwrap_or(512),
-                };
-                ManagementAccessController::new(access.clone())
-                    .map_err(|_| ConfigError::InvalidManagementLan)?;
-                Ok(ManagementLanConfig {
-                    bind: lan.bind,
-                    port: lan.port,
-                    access,
-                    certificate_path: lan.certificate_path,
-                    private_key_path: lan.private_key_path,
-                })
-            })
-            .transpose()?;
-        let callmesh = file_config
-            .callmesh
-            .map(|callmesh| {
-                let url = callmesh.url.trim();
-                if !is_https_origin(url) {
-                    return Err(ConfigError::InvalidCallMesh);
-                }
-                Ok(CallMeshConfig {
-                    url: url.to_owned(),
-                })
-            })
-            .transpose()?;
-        let meshtastic = file_config
-            .meshtastic
-            .map(parse_meshtastic_config)
-            .transpose()?;
-        let aprs = file_config.aprs.map(parse_aprs_config).transpose()?;
-        let proxy = file_config.proxy.map(parse_proxy_config).transpose()?;
+        let validated = validate_file_config(file_config)?;
 
         Ok(Self {
             paths,
             config_file,
-            gateway_command: agent.gateway_command,
-            callmesh,
-            meshtastic,
-            aprs,
-            proxy,
-            management_web_enabled: agent.management_web_enabled.unwrap_or(true),
-            management_lan,
+            gateway_command: validated.gateway_command,
+            callmesh: validated.callmesh,
+            meshtastic: validated.meshtastic,
+            aprs: validated.aprs,
+            proxy: validated.proxy,
+            management_web_enabled: validated.management_web_enabled,
+            management_lan: validated.management_lan,
         })
     }
+}
+
+/// Validate a staged legacy configuration with the exact production parser and semantics.
+pub fn validate_migrated_agent_config(path: &Path) -> Result<(), ConfigError> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(config_read_error(path));
+    }
+    let contents = read_migrated_config_no_follow(path)?;
+    let file_config =
+        toml::from_str::<FileConfig>(&contents).map_err(|_| ConfigError::InvalidConfig)?;
+    validate_file_config(file_config).map(|_| ())
+}
+
+fn read_migrated_config_no_follow(path: &Path) -> Result<String, ConfigError> {
+    let initial_path_metadata = fs::symlink_metadata(path).map_err(|_| config_read_error(path))?;
+    if !metadata_is_regular_non_reparse(&initial_path_metadata) {
+        return Err(config_read_error(path));
+    }
+
+    let mut input = open_config_no_follow(path)?;
+    let opened_before = input.metadata().map_err(|_| config_read_error(path))?;
+    if !opened_file_is_safe(&input, &opened_before, path)?
+        || opened_before.len() > MAX_MIGRATED_CONFIG_BYTES
+    {
+        return Err(config_read_error(path));
+    }
+    let opened_identity =
+        Handle::from_file(input.try_clone().map_err(|_| config_read_error(path))?)
+            .map_err(|_| config_read_error(path))?;
+
+    let mut bytes = Vec::with_capacity(opened_before.len() as usize);
+    input
+        .by_ref()
+        .take(MAX_MIGRATED_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| config_read_error(path))?;
+    let opened_after = input.metadata().map_err(|_| config_read_error(path))?;
+    let final_path_metadata = fs::symlink_metadata(path).map_err(|_| config_read_error(path))?;
+    let final_input = open_config_no_follow(path)?;
+    let final_metadata = final_input
+        .metadata()
+        .map_err(|_| config_read_error(path))?;
+    let final_identity = Handle::from_file(
+        final_input
+            .try_clone()
+            .map_err(|_| config_read_error(path))?,
+    )
+    .map_err(|_| config_read_error(path))?;
+    if bytes.len() as u64 != opened_before.len()
+        || !opened_file_is_safe(&input, &opened_after, path)?
+        || !metadata_is_regular_non_reparse(&final_path_metadata)
+        || !opened_file_is_safe(&final_input, &final_metadata, path)?
+        || opened_identity != final_identity
+        || opened_before.len() != opened_after.len()
+        || opened_before.modified().ok() != opened_after.modified().ok()
+    {
+        return Err(config_read_error(path));
+    }
+
+    String::from_utf8(bytes).map_err(|_| config_read_error(path))
+}
+
+fn open_config_no_follow(path: &Path) -> Result<File, ConfigError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).map_err(|_| config_read_error(path))
+}
+
+fn metadata_is_regular_non_reparse(metadata: &Metadata) -> bool {
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+    }
+    #[allow(unreachable_code)]
+    true
+}
+
+fn opened_file_is_safe(
+    _file: &File,
+    metadata: &Metadata,
+    _path: &Path,
+) -> Result<bool, ConfigError> {
+    if !metadata_is_regular_non_reparse(metadata) {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Ok(metadata.nlink() == 1);
+    }
+    #[cfg(windows)]
+    {
+        return winapi_util::file::information(_file)
+            .map(|information| information.number_of_links() == 1)
+            .map_err(|_| config_read_error(_path));
+    }
+    #[allow(unreachable_code)]
+    Ok(false)
+}
+
+fn config_read_error(path: &Path) -> ConfigError {
+    ConfigError::ReadConfig {
+        path: path.to_path_buf(),
+    }
+}
+
+fn validate_file_config(file_config: FileConfig) -> Result<ValidatedFileConfig, ConfigError> {
+    let agent = file_config.agent.unwrap_or_default();
+    if agent.gateway_command.as_ref().is_some_and(|command| {
+        command.is_empty() || command.iter().any(|argument| argument.is_empty())
+    }) {
+        return Err(ConfigError::EmptyGatewayCommand);
+    }
+    let management_lan = file_config
+        .management_lan
+        .map(|lan| {
+            if lan.bind.is_loopback()
+                || lan.port == 0
+                || !lan.certificate_path.is_absolute()
+                || !lan.private_key_path.is_absolute()
+            {
+                return Err(ConfigError::InvalidManagementLan);
+            }
+            let access = LanAccessConfig {
+                password_hash: lan.password_hash,
+                allowed_origins: lan.allowed_origins.into_iter().collect::<BTreeSet<_>>(),
+                session_ttl_seconds: lan.session_ttl_seconds.unwrap_or(3_600),
+                audit_capacity: lan.audit_capacity.unwrap_or(512),
+            };
+            ManagementAccessController::new(access.clone())
+                .map_err(|_| ConfigError::InvalidManagementLan)?;
+            Ok(ManagementLanConfig {
+                bind: lan.bind,
+                port: lan.port,
+                access,
+                certificate_path: lan.certificate_path,
+                private_key_path: lan.private_key_path,
+            })
+        })
+        .transpose()?;
+    let callmesh = file_config
+        .callmesh
+        .map(|callmesh| {
+            let url = callmesh.url.trim();
+            if !is_https_origin(url) {
+                return Err(ConfigError::InvalidCallMesh);
+            }
+            Ok(CallMeshConfig {
+                url: url.to_owned(),
+            })
+        })
+        .transpose()?;
+    let meshtastic = file_config
+        .meshtastic
+        .map(parse_meshtastic_config)
+        .transpose()?;
+    let aprs = file_config.aprs.map(parse_aprs_config).transpose()?;
+    let proxy = file_config.proxy.map(parse_proxy_config).transpose()?;
+
+    Ok(ValidatedFileConfig {
+        gateway_command: agent.gateway_command,
+        callmesh,
+        meshtastic,
+        aprs,
+        proxy,
+        management_web_enabled: agent.management_web_enabled.unwrap_or(true),
+        management_lan,
+    })
 }
 
 fn parse_meshtastic_config(section: MeshtasticSection) -> Result<MeshtasticConfig, ConfigError> {
@@ -721,9 +869,9 @@ pub fn is_config_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, AgentLease, AprsConfig, ConfigError, InstanceError, MeshtasticConfig,
-        MeshtasticConnectionConfig, ProxyConfig, RuntimePaths, ensure_runtime_directories,
-        is_config_file,
+        AgentConfig, AgentLease, AprsConfig, ConfigError, InstanceError, MAX_MIGRATED_CONFIG_BYTES,
+        MeshtasticConfig, MeshtasticConnectionConfig, ProxyConfig, RuntimePaths,
+        ensure_runtime_directories, is_config_file, validate_migrated_agent_config,
     };
     use std::{
         collections::BTreeMap,
@@ -857,6 +1005,92 @@ mod tests {
         let snapshot = environment.clone();
         RuntimePaths::from_environment(&environment).expect("paths should load");
         assert_eq!(environment, snapshot);
+    }
+
+    #[test]
+    fn migrated_configuration_uses_the_production_schema_and_semantics() {
+        let (directory, _environment, config_file) = config_fixture("migrated-validator");
+        fs::write(
+            &config_file,
+            "[meshtastic]\ntransport = \"tcp\"\nmesh_network_id = \"mesh\"\ngateway_id = \"gateway\"\ntcp_host = \"127.0.0.1\"\ntcp_port = 4403\n",
+        )
+        .expect("valid migrated configuration should write");
+        validate_migrated_agent_config(&config_file)
+            .expect("production-valid migrated configuration should pass");
+
+        fs::write(&config_file, "[unknown]\nenabled = true\n")
+            .expect("unknown configuration should write");
+        assert_eq!(
+            validate_migrated_agent_config(&config_file),
+            Err(ConfigError::InvalidConfig)
+        );
+
+        fs::write(
+            &config_file,
+            "[callmesh]\nurl = \"http://invalid.example\"\n",
+        )
+        .expect("semantically invalid configuration should write");
+        assert_eq!(
+            validate_migrated_agent_config(&config_file),
+            Err(ConfigError::InvalidCallMesh)
+        );
+        fs::remove_dir_all(directory).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn migrated_configuration_rejects_oversized_and_hardlinked_inputs() {
+        let (directory, _environment, config_file) = config_fixture("migrated-input-safety");
+        fs::write(
+            &config_file,
+            vec![b'a'; MAX_MIGRATED_CONFIG_BYTES as usize + 1],
+        )
+        .expect("oversized configuration should write");
+        assert!(matches!(
+            validate_migrated_agent_config(&config_file),
+            Err(ConfigError::ReadConfig { .. })
+        ));
+
+        fs::write(&config_file, b"[agent]\n")
+            .expect("bounded configuration should replace oversized fixture");
+        let hardlink = config_file.with_file_name("config-hardlink.toml");
+        fs::hard_link(&config_file, &hardlink).expect("hardlink fixture should create");
+        assert!(matches!(
+            validate_migrated_agent_config(&config_file),
+            Err(ConfigError::ReadConfig { .. })
+        ));
+        fs::remove_dir_all(directory).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn migrated_configuration_identity_detects_byte_identical_replacement() {
+        let (directory, _environment, config_file) = config_fixture("migrated-identity");
+        fs::write(&config_file, b"[agent]\n").expect("configuration fixture should write");
+        let original =
+            same_file::Handle::from_path(&config_file).expect("original identity should load");
+        let replacement = config_file.with_file_name("replacement.toml");
+        fs::write(&replacement, b"[agent]\n").expect("replacement fixture should write");
+        fs::remove_file(&config_file).expect("original fixture should remove");
+        fs::rename(&replacement, &config_file).expect("replacement should activate");
+        let replaced =
+            same_file::Handle::from_path(&config_file).expect("replacement identity should load");
+        assert_ne!(original, replaced);
+        fs::remove_dir_all(directory).expect("fixture should clean up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrated_configuration_rejects_symlink_input() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, _environment, config_file) = config_fixture("migrated-symlink");
+        let outside = config_file.with_file_name("outside.toml");
+        fs::write(&outside, b"[agent]\n").expect("outside fixture should write");
+        symlink(&outside, &config_file).expect("symlink fixture should create");
+        assert!(matches!(
+            validate_migrated_agent_config(&config_file),
+            Err(ConfigError::ReadConfig { .. })
+        ));
+        fs::remove_dir_all(directory).expect("fixture should clean up");
     }
 
     #[test]

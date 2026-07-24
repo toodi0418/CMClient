@@ -22,15 +22,17 @@ capability only in memory, rotates both on restart, and routes Web, graphical,
 and command-mode requests through the current session. Operators and clients
 must not probe, reserve, publish, or connect to a raw native Gateway port.
 
-In a staged Headless, Desktop, or Service layout, Agent locates the adjacent
-`gateway/dist/main.js` and `web/` production outputs relative to its own
-executable. An explicit `agent.gateway_command` remains an operator override;
-an absolute `CMCLIENT_GATEWAY_ENTRYPOINT` and `CMCLIENT_WEB_ROOT` are available
-for controlled development or packaging layouts. A missing/invalid Web root
-fails listener startup instead of falling back to a placeholder page. The
-current packaged Gateway command invokes `node`, so Node.js `^22.18.0` or
-`>=24.11.0` must be present; release portability is verified separately from
-this config contract.
+In a staged unified-product layout, Agent locates the adjacent private
+`runtime/node` executable, `gateway/dist/main.js`, and `web/` production output
+relative to its own executable. Native runtime never selects the legacy
+`agent.gateway_command` value. Absolute `CMCLIENT_PRIVATE_NODE`,
+`CMCLIENT_GATEWAY_ENTRYPOINT`, and `CMCLIENT_WEB_ROOT` inputs are available only
+for controlled source and packaging qualification; an explicitly supplied
+missing, relative, linked, or otherwise invalid child path fails closed. Debug
+builds may locate Node from `PATH` when no private runtime input exists, but
+that convenience is not package-portability or no-system-Node evidence. A
+missing or invalid Web root fails listener startup instead of falling back to a
+placeholder page.
 
 CallMesh keys and other approved runtime credentials do not belong in this
 file, command arguments, or environment variables. The only runtime backend is

@@ -1,31 +1,154 @@
-use rusqlite::Connection;
+use cmclient_legacy_migration::{
+    ChildGatewayMaintenanceRunner, GatewayMaintenanceRunner, MigrationError,
+    ProductMigrationRequest, pending_migration_source, run_or_resume_product_migration,
+    source_contains_known_state,
+};
+use cmclient_runtime_primitives::ExclusiveFileLock;
 use std::{
+    collections::BTreeMap,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 fn temporary_directory(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "cmclient-migrate-cli-{name}-{}",
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be available")
+        .as_nanos();
+    let test_root = option_env!("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .expect("test executable should resolve")
+                .parent()
+                .expect("test executable should have a parent")
+                .parent()
+                .expect("test target should have a parent")
+                .join("cmclient-test-tmp")
+        });
+    test_root.join(format!(
+        "cmclient-migrate-cli-{name}-{}-{suffix}",
         std::process::id()
     ))
 }
 
-fn fixture_source(directory: &PathBuf) -> PathBuf {
-    let source = directory.join("client-preferences.json");
-    fs::create_dir_all(directory).expect("temporary directory should exist");
-    fs::write(
-        &source,
-        r#"{"webDashboardEnabled":false,"apiKey":"must-not-appear"}"#,
-    )
-    .expect("fixture should be written");
-    source
+struct Fixture {
+    root: PathBuf,
+    source: PathBuf,
+    target: PathBuf,
+}
+
+impl Fixture {
+    fn new(name: &str) -> Self {
+        let root = temporary_directory(name);
+        let source = root.join("legacy");
+        let target = root.join("home/.cmclient");
+        fs::create_dir_all(source.join("backups")).expect("source should be created");
+        fs::create_dir_all(target.parent().expect("target should have a parent"))
+            .expect("target parent should be created");
+        fs::write(
+            source.join("agent.toml"),
+            b"[agent]\nmanagement_web_enabled = true\n",
+        )
+        .expect("config should be written");
+        fs::write(
+            source.join("secrets.json"),
+            br#"{"version":1,"callmesh-api-key":"fixture-private"}"#,
+        )
+        .expect("secrets should be written");
+        fs::write(source.join("gateway.sqlite"), b"fixture-database")
+            .expect("database should be written");
+        fs::write(source.join("backups/one.sqlite"), b"fixture-backup")
+            .expect("backup should be written");
+        fs::write(source.join("ignored.log"), b"ignored").expect("unknown file should be written");
+        fs::write(source.join("agent.lock"), b"").expect("legacy lock should be written");
+        Self {
+            root,
+            source,
+            target,
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn source_snapshot(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+    let mut snapshot = BTreeMap::new();
+    let mut directories = vec![(root.to_path_buf(), String::new())];
+    while let Some((directory, prefix)) = directories.pop() {
+        for entry in fs::read_dir(directory).expect("source tree should be readable") {
+            let entry = entry.expect("source entry should be readable");
+            let name = entry
+                .file_name()
+                .into_string()
+                .expect("fixture names should be UTF-8");
+            let relative = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry
+                .file_type()
+                .expect("source metadata should be readable")
+                .is_dir()
+            {
+                snapshot.insert(relative.clone(), None);
+                directories.push((entry.path(), relative));
+            } else {
+                snapshot.insert(
+                    relative,
+                    Some(fs::read(entry.path()).expect("source file should be readable")),
+                );
+            }
+        }
+    }
+    snapshot
+}
+
+fn binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_cmclient-migrate"))
+}
+
+fn product_command(fixture: &Fixture) -> Command {
+    let mut command = Command::new(binary());
+    command
+        .args(["product", "--source-root"])
+        .arg(&fixture.source)
+        .arg("--target-root")
+        .arg(&fixture.target)
+        .arg("--gateway-program")
+        .arg(binary())
+        .arg("--test-maintenance-helper");
+    command
+}
+
+fn wait_for_marker(child: &mut Child, marker: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if marker.exists() {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("child status should be readable") {
+            panic!("migration child exited before pause marker: {status}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("migration child did not reach durable phase marker");
 }
 
 #[test]
 fn reports_the_packaged_migration_version() {
-    let output = Command::new(env!("CARGO_BIN_EXE_cmclient-migrate"))
+    let output = Command::new(binary())
         .arg("--version")
         .output()
         .expect("migration command should run");
@@ -40,173 +163,263 @@ fn reports_the_packaged_migration_version() {
 }
 
 #[test]
-fn dry_run_reports_a_safe_candidate_without_echoing_a_legacy_secret() {
-    let directory = temporary_directory("dry-run");
-    let _ = fs::remove_dir_all(&directory);
-    let source = fixture_source(&directory);
-
-    let output = Command::new(env!("CARGO_BIN_EXE_cmclient-migrate"))
-        .args(["settings", "--source"])
-        .arg(source)
-        .arg("--dry-run")
+fn product_requires_explicit_absolute_paths() {
+    let output = Command::new(binary())
+        .args([
+            "product",
+            "--source-root",
+            "relative-source",
+            "--target-root",
+            "relative-target",
+            "--gateway-program",
+        ])
+        .arg(binary())
+        .arg("--test-maintenance-helper")
         .output()
         .expect("migration command should run");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
-    assert!(stdout.contains("\"dryRun\":true"));
-    assert!(stdout.contains("LEGACY_SETTINGS_SECRET_SKIPPED"));
-    assert!(!stdout.contains("must-not-appear"));
-    let _ = fs::remove_dir_all(directory);
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr)
+            .expect("stderr should be UTF-8")
+            .trim(),
+        "LEGACY_MIGRATION_PATH_INVALID"
+    );
 }
 
 #[test]
-fn apply_creates_only_a_new_agent_configuration() {
-    let directory = temporary_directory("apply");
-    let _ = fs::remove_dir_all(&directory);
-    let source = fixture_source(&directory);
-    let target = directory.join("new-config/agent.toml");
+fn real_process_kill_resumes_from_every_durable_phase() {
+    for phase in ["detected", "staged", "verified", "activated", "complete"] {
+        let fixture = Fixture::new(&format!("kill-{phase}"));
+        let before = source_snapshot(&fixture.source);
+        let marker = fixture.root.join(format!("{phase}.marker"));
+        let mut child = product_command(&fixture)
+            .arg("--test-pause-after")
+            .arg(phase)
+            .arg("--test-pause-file")
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("migration child should spawn");
+        wait_for_marker(&mut child, &marker);
+        child.kill().expect("migration child should be killed");
+        child.wait().expect("migration child should be reaped");
+        if phase == "detected" {
+            assert_eq!(
+                pending_migration_source(&fixture.target)
+                    .expect("journal should be readable")
+                    .as_deref(),
+                Some(
+                    fs::canonicalize(&fixture.source)
+                        .expect("source should canonicalize")
+                        .as_path()
+                )
+            );
+        }
+        if phase == "complete" {
+            let journal: serde_json::Value = serde_json::from_slice(
+                &fs::read(fixture.target.join("state/migration.json"))
+                    .expect("complete journal should exist"),
+            )
+            .expect("complete journal should be valid JSON");
+            let stage = fixture
+                .target
+                .join("cache/migration-stage")
+                .join(journal["transactionId"].as_str().expect("transaction id"));
+            assert!(
+                stage.join("secrets.json").exists(),
+                "hard kill after Complete should occur before stage cleanup"
+            );
+        }
 
-    let first = Command::new(env!("CARGO_BIN_EXE_cmclient-migrate"))
-        .args(["settings", "--source"])
-        .arg(&source)
-        .args(["--write-agent-config"])
-        .arg(&target)
-        .output()
-        .expect("migration command should run");
-    assert!(first.status.success());
-    assert_eq!(
-        fs::read_to_string(&target).expect("new config should exist"),
-        "[agent]\nmanagement_web_enabled = false\n"
-    );
-
-    let second = Command::new(env!("CARGO_BIN_EXE_cmclient-migrate"))
-        .args(["settings", "--source"])
-        .arg(source)
-        .args(["--write-agent-config"])
-        .arg(target)
-        .output()
-        .expect("migration command should run");
-    assert!(!second.status.success());
-    assert_eq!(
-        String::from_utf8(second.stderr)
-            .expect("stderr should be UTF-8")
-            .trim(),
-        "LEGACY_SETTINGS_TARGET_EXISTS"
-    );
-    let _ = fs::remove_dir_all(directory);
-}
-
-fn initialize_gateway_target(path: &Path) {
-    let connection = Connection::open(path).expect("target database should open");
-    connection
-        .execute_batch(
-            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-             INSERT INTO schema_migrations (version, name) VALUES (8, 'fixture');
-             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-             CREATE TABLE mesh_observations (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, transport TEXT NOT NULL, session_connected_at TEXT NOT NULL, ingested_at TEXT NOT NULL, server_ingested_at TEXT NOT NULL, device_rx_time_seconds INTEGER, backlog_classification TEXT NOT NULL, normalized_from_radio TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-             CREATE TABLE nodes (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL, user_id TEXT, long_name TEXT, short_name TEXT, hardware_model TEXT, role TEXT, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, last_observation_id TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num));
-             CREATE TABLE messages (id TEXT PRIMARY KEY, observation_id TEXT NOT NULL UNIQUE REFERENCES mesh_observations(id), mesh_network_id TEXT NOT NULL, sender INTEGER NOT NULL, destination INTEGER, packet_id INTEGER, channel INTEGER, text TEXT NOT NULL, observed_at TEXT NOT NULL);
-             CREATE TABLE telemetry (id TEXT PRIMARY KEY, observation_id TEXT NOT NULL UNIQUE REFERENCES mesh_observations(id), mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL, packet_id INTEGER, metric_kind TEXT NOT NULL, metrics TEXT NOT NULL, observed_at TEXT NOT NULL, telemetry_time_seconds INTEGER);",
-        )
-        .expect("target schema should initialize");
-}
-
-fn initialize_legacy_sources(directory: &Path) {
-    let callmesh = Connection::open(directory.join("callmesh-data.sqlite"))
-        .expect("source database should open");
-    callmesh
-        .execute_batch(
-            "CREATE TABLE nodes (mesh_id TEXT PRIMARY KEY, mesh_id_original TEXT, short_name TEXT, long_name TEXT, hw_model TEXT, role TEXT, last_seen_at INTEGER);
-             INSERT INTO nodes VALUES ('!00000042', '!00000042', 'FN', 'Fixture Node', 'T-Echo', 'CLIENT', 1721260800000);
-             CREATE TABLE message_log (flow_id TEXT PRIMARY KEY, channel INTEGER, timestamp_ms INTEGER, type TEXT, detail TEXT, mesh_packet_id INTEGER, reply_id INTEGER);
-             CREATE TABLE message_nodes (flow_id TEXT, role TEXT, mesh_id TEXT);
-             INSERT INTO message_log VALUES ('message-fixture', 2, 1721260801000, 'Text', 'fixture history text', 15, 999);
-             INSERT INTO message_nodes VALUES ('message-fixture', 'from', '!00000042');",
-        )
-        .expect("source schema should initialize");
-    let telemetry = Connection::open(directory.join("telemetry-records.sqlite"))
-        .expect("telemetry source should open");
-    telemetry
-        .execute_batch(
-            "CREATE TABLE telemetry_records (id TEXT PRIMARY KEY, mesh_id TEXT, node_mesh_id TEXT, timestamp_ms INTEGER, telemetry_kind TEXT, telemetry_time_seconds INTEGER);
-             CREATE TABLE telemetry_metrics (record_id TEXT, metric_key TEXT, number_value REAL, text_value TEXT, json_value TEXT);
-             INSERT INTO telemetry_records VALUES ('telemetry-fixture', '!00000042', '!00000042', 1721260802000, 'deviceMetrics', 1721260802);
-             INSERT INTO telemetry_metrics VALUES ('telemetry-fixture', 'batteryLevel', 73, NULL, NULL);",
-        )
-        .expect("telemetry source schema should initialize");
+        let output = product_command(&fixture)
+            .output()
+            .expect("migration resume should run");
+        assert!(
+            output.status.success(),
+            "phase {phase} failed to resume: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("outcome should be JSON");
+        assert_eq!(report["phase"], "complete");
+        assert_eq!(report["migrated"], true);
+        assert_eq!(
+            fs::read(fixture.target.join("cmclient.db")).expect("database should activate"),
+            b"fixture-database"
+        );
+        assert!(!fixture.target.join("ignored.log").exists());
+        assert!(
+            fs::read_dir(fixture.target.join("cache/migration-stage"))
+                .expect("stage root should exist")
+                .next()
+                .is_none(),
+            "phase {phase} resume retained migration stage"
+        );
+        assert_eq!(before, source_snapshot(&fixture.source));
+    }
 }
 
 #[test]
-fn data_import_requires_explicit_gateway_stop_confirmation_and_rolls_back_from_reported_backup() {
-    let directory = temporary_directory("data-import");
-    let _ = fs::remove_dir_all(&directory);
-    let source_dir = directory.join("legacy");
-    fs::create_dir_all(&source_dir).expect("source directory should exist");
-    initialize_legacy_sources(&source_dir);
-    let target = directory.join("cmclient.db");
-    initialize_gateway_target(&target);
-    let backup_dir = directory.join("backups");
-    let binary = env!("CARGO_BIN_EXE_cmclient-migrate");
-
-    let rejected = Command::new(binary)
-        .args(["data", "import", "--source-dir"])
-        .arg(&source_dir)
-        .args(["--target-database"])
-        .arg(&target)
-        .args(["--mesh-network-id", "fixture-network", "--backup-dir"])
-        .arg(&backup_dir)
-        .arg("--apply")
+fn existing_legacy_agent_lock_is_honored_without_modification() {
+    let fixture = Fixture::new("source-lock");
+    let before = source_snapshot(&fixture.source);
+    let lock_path = fixture.source.join("agent.lock");
+    let held = ExclusiveFileLock::try_acquire(&lock_path).expect("fixture lock should acquire");
+    let output = product_command(&fixture)
         .output()
         .expect("migration command should run");
-    assert!(!rejected.status.success());
+    assert!(!output.status.success());
     assert_eq!(
-        String::from_utf8(rejected.stderr)
+        String::from_utf8(output.stderr)
             .expect("stderr should be UTF-8")
             .trim(),
-        "LEGACY_DATA_GATEWAY_STOP_CONFIRMATION_REQUIRED"
+        "LEGACY_MIGRATION_SOURCE_IN_USE"
     );
+    drop(held);
+    assert_eq!(before, source_snapshot(&fixture.source));
+}
 
-    let applied = Command::new(binary)
-        .args(["data", "import", "--source-dir"])
-        .arg(&source_dir)
-        .args(["--target-database"])
-        .arg(&target)
-        .args(["--mesh-network-id", "fixture-network", "--backup-dir"])
-        .arg(&backup_dir)
-        .args(["--apply", "--confirm-gateway-stopped"])
+#[test]
+fn nested_legacy_agent_lock_is_reused_without_modification() {
+    let fixture = Fixture::new("nested-source-lock");
+    fs::remove_file(fixture.source.join("agent.lock")).expect("root lock should be removed");
+    fs::create_dir_all(fixture.source.join("run")).expect("run directory should be created");
+    fs::write(fixture.source.join("run/agent.lock"), b"").expect("nested lock should be written");
+    let before = source_snapshot(&fixture.source);
+    let output = product_command(&fixture)
         .output()
         .expect("migration command should run");
-    assert!(applied.status.success());
-    let report: serde_json::Value =
-        serde_json::from_slice(&applied.stdout).expect("data report should be JSON");
-    assert_eq!(report["dryRun"], false);
-    assert_eq!(report["records"]["messages"], 1);
-    let backup = backup_dir.join(
-        report["backupFile"]
-            .as_str()
-            .expect("backup filename should be reported"),
+    assert!(
+        output.status.success(),
+        "nested source lock migration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let migrated = Connection::open(&target).expect("migrated target should open");
-    let destination: Option<i64> = migrated
-        .query_row("SELECT destination FROM messages", [], |row| row.get(0))
-        .expect("message should exist");
-    assert_eq!(destination, None);
-    drop(migrated);
+    assert_eq!(before, source_snapshot(&fixture.source));
+}
 
-    let rolled_back = Command::new(binary)
-        .args(["data", "rollback", "--target-database"])
-        .arg(&target)
-        .args(["--backup-database"])
-        .arg(backup)
-        .arg("--confirm-gateway-stopped")
-        .output()
-        .expect("rollback command should run");
-    assert!(rolled_back.status.success());
-    let restored = Connection::open(&target).expect("restored target should open");
-    let messages: i64 = restored
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .expect("count should query");
-    assert_eq!(messages, 0);
-    let _ = fs::remove_dir_all(directory);
+#[test]
+fn discovery_is_bounded_to_known_state() {
+    let root = temporary_directory("discovery");
+    let missing = root.join("missing");
+    assert!(!source_contains_known_state(&missing).expect("missing root should be absent"));
+    fs::create_dir_all(&root).expect("root should be created");
+    fs::write(root.join("unknown.log"), b"ignored").expect("unknown file should be written");
+    assert!(!source_contains_known_state(&root).expect("unknown file should be ignored"));
+    fs::write(root.join("config.toml"), b"[agent]\n").expect("known file should be written");
+    assert!(source_contains_known_state(&root).expect("known state should be detected"));
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+fn maintenance_runner(mode: &str, timeout: Duration) -> ChildGatewayMaintenanceRunner {
+    ChildGatewayMaintenanceRunner::with_prefix_and_timeout(
+        binary(),
+        vec![
+            OsString::from("__test-maintenance"),
+            OsString::from("--test-mode"),
+            OsString::from(mode),
+        ],
+        timeout,
+    )
+    .expect("test maintenance runner should be valid")
+}
+
+#[test]
+fn child_maintenance_contract_is_strict_retryable_and_bounded() {
+    let root = temporary_directory("maintenance-contract");
+    fs::create_dir_all(&root).expect("fixture root should be created");
+    let source = root.join("source.sqlite");
+    fs::write(&source, b"fixture-database").expect("source should be written");
+
+    let success_stage = root.join("success.sqlite");
+    let report = maintenance_runner("success", Duration::from_secs(5))
+        .migrate_database(&source, &success_stage)
+        .expect("valid helper report should pass");
+    assert_eq!(report.message_type, "gateway.offline-maintenance-report");
+    assert_eq!(report.operation, "backup_migrate_verify");
+    assert_eq!(
+        fs::read(success_stage).expect("stage should exist"),
+        b"fixture-database"
+    );
+
+    for (mode, expected) in [
+        ("retryable", MigrationError::MaintenanceRetryable),
+        ("failure", MigrationError::MaintenanceFailed),
+        ("malformed", MigrationError::MaintenanceReportInvalid),
+        ("oversize", MigrationError::MaintenanceReportInvalid),
+    ] {
+        assert_eq!(
+            maintenance_runner(mode, Duration::from_secs(5))
+                .migrate_database(&source, &root.join(format!("{mode}.sqlite"))),
+            Err(expected)
+        );
+    }
+    assert_eq!(
+        maintenance_runner("timeout", Duration::from_millis(150))
+            .migrate_database(&source, &root.join("timeout.sqlite")),
+        Err(MigrationError::MaintenanceTimedOut)
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn child_failure_prioritizes_a_concurrent_source_identity_change() {
+    let fixture = Fixture::new("child-source-change");
+    let source = fixture.source.join("gateway.sqlite");
+    let stage_root = fixture.target.join("cache/migration-stage");
+    let mutator = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if fs::read_dir(&stage_root)
+                .ok()
+                .and_then(|mut entries| entries.next())
+                .is_some()
+            {
+                let contents = fs::read(&source).expect("source should remain readable");
+                let replacement = source.with_extension("replacement");
+                fs::write(&replacement, contents).expect("replacement should be written");
+                fs::remove_file(&source).expect("source should be replaced");
+                fs::rename(replacement, source).expect("replacement should activate");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("migration did not enter staging before child timeout");
+    });
+    let runner = maintenance_runner("timeout", Duration::from_millis(500));
+    let result = run_or_resume_product_migration(
+        &ProductMigrationRequest {
+            source_root: fixture.source.clone(),
+            target_root: fixture.target.clone(),
+        },
+        &runner,
+    );
+    mutator.join().expect("source mutator should finish");
+    assert_eq!(result, Err(MigrationError::SourceChanged));
+    let journal: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.target.join("state/migration.json"))
+            .expect("recovery journal should exist"),
+    )
+    .expect("recovery journal should be valid JSON");
+    assert_eq!(journal["recoveryCode"], "LEGACY_MIGRATION_SOURCE_CHANGED");
+}
+
+#[cfg(windows)]
+#[test]
+fn reparse_known_leaf_is_rejected_when_windows_allows_test_symlinks() {
+    use std::os::windows::fs::symlink_file;
+
+    let root = temporary_directory("windows-reparse");
+    fs::create_dir_all(&root).expect("fixture root should be created");
+    fs::write(root.join("actual.toml"), b"[agent]\n").expect("target should be written");
+    if symlink_file(root.join("actual.toml"), root.join("config.toml")).is_err() {
+        fs::remove_dir_all(root).expect("fixture should be removed");
+        return;
+    }
+    assert_eq!(
+        source_contains_known_state(&root),
+        Err(MigrationError::SourceUnsafe)
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
 }

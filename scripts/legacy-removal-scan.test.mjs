@@ -112,22 +112,25 @@ test("scanner does not confuse workspace package names with the retired command"
   );
 });
 
-test("scanner allows only exact removal evidence and migration rejection inputs", async () => {
-  const path = "crates/legacy-migration/src/lib.rs";
-  const migration = await readFile(path);
+test("scanner allows only exact removal evidence", async () => {
+  const migrationPath = "crates/legacy-migration/src/lib.rs";
+  const migration = await readFile(migrationPath);
   const releaseNotesPath = "docs/releases/2.0.0-rc.1.md";
   const releaseNotes = await readFile(releaseNotesPath);
+  assert.equal(ALLOWED_REMOVAL_EVIDENCE.has(migrationPath), false);
+  assert.equal(
+    ALLOWED_REMOVAL_EVIDENCE.has(
+      "docs/architecture/legacy-settings-migration.md",
+    ),
+    false,
+  );
   assert.equal(
     ALLOWED_REMOVAL_EVIDENCE.has("docs/legacy-feature-matrix.md"),
     true,
   );
   assert.equal(ALLOWED_REMOVAL_EVIDENCE.has(releaseNotesPath), true);
-  assert.deepEqual(scanEntry(path, migration), []);
+  assert.deepEqual(scanEntry(migrationPath, migration), []);
   assert.deepEqual(scanEntry(releaseNotesPath, releaseNotes), []);
-  assert.notDeepEqual(
-    scanEntry(path, Buffer.concat([Buffer.from("\n"), migration])),
-    [],
-  );
   assert.notDeepEqual(
     scanEntry(
       releaseNotesPath,

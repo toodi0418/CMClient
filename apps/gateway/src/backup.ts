@@ -21,6 +21,25 @@ export class GatewayBackupError extends Error {
   }
 }
 
+export async function backupDatabaseToPath(
+  source: DatabaseSync,
+  destination: string,
+  signal?: AbortSignal,
+): Promise<number> {
+  if (!isAbsolute(destination)) {
+    throw new GatewayBackupError();
+  }
+  try {
+    signal?.throwIfAborted();
+    const pages = await backup(source, destination);
+    signal?.throwIfAborted();
+    return pages;
+  } catch (error) {
+    await removeDatabaseFiles(destination);
+    throw error;
+  }
+}
+
 export async function createVerifiedGatewayBackup(
   source: DatabaseSync,
   backupDirectory: string,
@@ -37,7 +56,7 @@ export async function createVerifiedGatewayBackup(
     await mkdir(backupDirectory, { recursive: true, mode: 0o700 });
     await chmod(backupDirectory, 0o700);
     signal?.throwIfAborted();
-    const pages = await backup(source, destination);
+    const pages = await backupDatabaseToPath(source, destination, signal);
     signal?.throwIfAborted();
     await chmod(destination, 0o600);
     verifyBackup(destination);
@@ -71,11 +90,31 @@ function verifyBackup(path: string): void {
   }
 }
 
-async function sha256File(path: string, signal?: AbortSignal): Promise<string> {
+export async function sha256File(
+  path: string,
+  signal?: AbortSignal,
+  maximumBytes = Number.MAX_SAFE_INTEGER,
+): Promise<string> {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+    throw new GatewayBackupError();
+  }
   const hash = createHash("sha256");
+  let bytes = 0;
   for await (const chunk of createReadStream(path)) {
     signal?.throwIfAborted();
+    bytes += chunk.length;
+    if (!Number.isSafeInteger(bytes) || bytes > maximumBytes) {
+      throw new GatewayBackupError();
+    }
     hash.update(chunk);
   }
   return hash.digest("hex");
+}
+
+export async function removeDatabaseFiles(path: string): Promise<void> {
+  await Promise.all([
+    rm(path, { force: true }),
+    rm(`${path}-wal`, { force: true }),
+    rm(`${path}-shm`, { force: true }),
+  ]);
 }

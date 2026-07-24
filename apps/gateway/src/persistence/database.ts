@@ -17,15 +17,43 @@ import {
 import { PositionRepository } from "../position.js";
 import { AprsOutboxRepository } from "../aprs-outbox.js";
 import { CallMeshMappingRepository } from "../callmesh.js";
+import {
+  gatewayMigrations,
+  validateMigrationManifest,
+  type SqlMigration,
+} from "./migrations.js";
 
-export interface Migration {
-  version: number;
-  name: string;
-  up(database: DatabaseSync): void;
-}
+export {
+  createSqlMigration,
+  gatewayMigrations,
+  MigrationManifestError,
+  validateMigrationManifest,
+} from "./migrations.js";
+
+export type Migration = SqlMigration;
 
 export class DatabaseMigrationError extends Error {
-  readonly code = "DATABASE_MIGRATION_FAILED";
+  readonly code: string;
+
+  constructor(code = "DATABASE_MIGRATION_FAILED") {
+    super(code);
+    this.code = code;
+    this.name = "DatabaseMigrationError";
+  }
+}
+
+export class DatabaseMigrationRetryableError extends DatabaseMigrationError {
+  constructor() {
+    super("DATABASE_MIGRATION_RETRYABLE");
+    this.name = "DatabaseMigrationRetryableError";
+  }
+}
+
+export class DatabaseSchemaHistoryError extends DatabaseMigrationError {
+  constructor() {
+    super("DATABASE_SCHEMA_HISTORY_DRIFT");
+    this.name = "DatabaseSchemaHistoryError";
+  }
 }
 
 export class DatabaseIntegrityError extends Error {
@@ -42,6 +70,22 @@ export interface WalCheckpointResult {
   logFrames: number;
 }
 
+export interface GatewayDatabaseOptions {
+  readonly atomicMigrationBatch?: boolean;
+  readonly busyTimeoutMilliseconds?: number;
+}
+
+export interface SchemaHistoryEntry {
+  readonly version: number;
+  readonly name: string;
+  readonly sha256: string;
+}
+
+export interface SchemaHistoryReport {
+  readonly digestStatus: "recorded" | "legacy_name_only" | "absent";
+  readonly entries: readonly SchemaHistoryEntry[];
+}
+
 export class GatewayDatabase {
   readonly connection: DatabaseSync;
   readonly jobs: JobRepository;
@@ -54,15 +98,37 @@ export class GatewayDatabase {
   readonly callmeshMappings: CallMeshMappingRepository;
   readonly settings: SettingsRepository;
 
-  constructor(path: string, migrations: Migration[] = gatewayMigrations) {
+  constructor(
+    path: string,
+    migrations: readonly Migration[] = gatewayMigrations,
+    options: GatewayDatabaseOptions = {},
+  ) {
     if (path !== ":memory:") {
       mkdirSync(dirname(path), { recursive: true });
     }
+    const busyTimeoutMilliseconds = options.busyTimeoutMilliseconds ?? 5_000;
+    if (
+      !Number.isInteger(busyTimeoutMilliseconds) ||
+      busyTimeoutMilliseconds < 0 ||
+      busyTimeoutMilliseconds > 1_800_000
+    ) {
+      throw new DatabaseMigrationError();
+    }
     this.connection = new DatabaseSync(path);
-    this.connection.exec("PRAGMA journal_mode = WAL");
-    this.connection.exec("PRAGMA foreign_keys = ON");
-    this.connection.exec("PRAGMA busy_timeout = 5000");
-    runMigrations(this.connection, migrations);
+    try {
+      this.connection.exec(`PRAGMA busy_timeout = ${busyTimeoutMilliseconds}`);
+      this.connection.exec("PRAGMA journal_mode = WAL");
+      this.connection.exec("PRAGMA foreign_keys = ON");
+      runMigrations(
+        this.connection,
+        migrations,
+        options.atomicMigrationBatch ?? false,
+      );
+      inspectMigrationHistory(this.connection, migrations, true);
+    } catch (error) {
+      this.connection.close();
+      throw error;
+    }
     this.jobs = new JobRepository(this.connection);
     this.meshMessages = new MeshMessageRepository(this.connection);
     this.meshNodes = new MeshNodeRepository(this.connection);
@@ -110,43 +176,324 @@ export class GatewayDatabase {
 
 export function runMigrations(
   database: DatabaseSync,
-  migrations: Migration[],
+  migrations: readonly Migration[],
+  atomicBatch = false,
 ): void {
-  database.exec(
-    "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-  );
-  const ordered = [...migrations].sort(
-    (left, right) => left.version - right.version,
-  );
-  if (
-    new Set(ordered.map((migration) => migration.version)).size !==
-    ordered.length
-  ) {
+  validateMigrationManifest(migrations);
+  if (atomicBatch) {
+    runAtomicMigrationBatch(database, migrations);
+    return;
+  }
+
+  runMigrationTransaction(database, "IMMEDIATE", () => {
+    ensureMigrationHistory(database, migrations);
+  });
+  const history = inspectMigrationHistory(database, migrations, false);
+  for (const migration of migrations.slice(history.entries.length)) {
+    runMigrationTransaction(database, "IMMEDIATE", () => {
+      applyMigration(database, migration);
+    });
+  }
+  inspectMigrationHistory(database, migrations, true);
+}
+
+export function inspectMigrationHistory(
+  database: DatabaseSync,
+  migrations: readonly Migration[] = gatewayMigrations,
+  requireComplete = true,
+): SchemaHistoryReport {
+  validateMigrationManifest(migrations);
+  if (!hasSchemaMigrationTable(database)) {
+    if (requireComplete) {
+      throw new DatabaseSchemaHistoryError();
+    }
+    return { digestStatus: "absent", entries: [] };
+  }
+
+  const columns = database
+    .prepare("PRAGMA table_info(schema_migrations)")
+    .all()
+    .map((row) => String(row.name));
+  const columnSet = new Set(columns);
+  const legacyColumns = ["version", "name", "applied_at"];
+  const digestColumns = [...legacyColumns, "sha256"];
+  const hasDigest = exactColumnSet(columnSet, digestColumns);
+  if (!hasDigest && !exactColumnSet(columnSet, legacyColumns)) {
+    throw new DatabaseSchemaHistoryError();
+  }
+
+  const rows = database
+    .prepare(
+      hasDigest
+        ? "SELECT version, name, sha256 FROM schema_migrations ORDER BY version ASC"
+        : "SELECT version, name FROM schema_migrations ORDER BY version ASC",
+    )
+    .all();
+  if (rows.length > migrations.length) {
+    throw new DatabaseSchemaHistoryError();
+  }
+  const entries = rows.map((row, index) => {
+    const expected = migrations[index];
+    const version = Number(row.version);
+    const name = String(row.name);
+    if (!expected || version !== expected.version || name !== expected.name) {
+      throw new DatabaseSchemaHistoryError();
+    }
+    if (hasDigest && String(row.sha256) !== expected.sha256) {
+      throw new DatabaseSchemaHistoryError();
+    }
+    return Object.freeze({
+      version,
+      name,
+      sha256: expected.sha256,
+    });
+  });
+  if (requireComplete && entries.length !== migrations.length) {
+    throw new DatabaseSchemaHistoryError();
+  }
+  return Object.freeze({
+    digestStatus: hasDigest ? "recorded" : "legacy_name_only",
+    entries: Object.freeze(entries),
+  });
+}
+
+function runAtomicMigrationBatch(
+  database: DatabaseSync,
+  migrations: readonly Migration[],
+): void {
+  try {
+    database.exec("BEGIN EXCLUSIVE");
+    ensureMigrationHistory(database, migrations);
+    const history = inspectMigrationHistory(database, migrations, false);
+    for (const migration of migrations.slice(history.entries.length)) {
+      applyMigration(database, migration);
+    }
+    inspectMigrationHistory(database, migrations, true);
+    database.exec("COMMIT");
+  } catch (error) {
+    rollbackMigration(database);
+    if (isSqliteBusyOrLocked(error)) {
+      throw new DatabaseMigrationRetryableError();
+    }
+    if (error instanceof DatabaseMigrationError) {
+      throw error;
+    }
     throw new DatabaseMigrationError();
   }
-  const applied = new Set(
-    database
-      .prepare("SELECT version FROM schema_migrations ORDER BY version")
-      .all()
-      .map((row) => Number(row.version)),
-  );
+}
 
-  for (const migration of ordered) {
-    if (applied.has(migration.version)) {
-      continue;
+function runMigrationTransaction(
+  database: DatabaseSync,
+  mode: "IMMEDIATE" | "EXCLUSIVE",
+  operation: () => void,
+): void {
+  try {
+    database.exec(`BEGIN ${mode}`);
+    operation();
+    database.exec("COMMIT");
+  } catch (error) {
+    rollbackMigration(database);
+    if (error instanceof DatabaseMigrationError) {
+      throw error;
     }
-    try {
-      database.exec("BEGIN IMMEDIATE");
-      migration.up(database);
-      database
-        .prepare("INSERT INTO schema_migrations (version, name) VALUES (?, ?)")
-        .run(migration.version, migration.name);
-      database.exec("COMMIT");
-    } catch {
-      database.exec("ROLLBACK");
-      throw new DatabaseMigrationError();
+    throw new DatabaseMigrationError();
+  }
+}
+
+function ensureMigrationHistory(
+  database: DatabaseSync,
+  migrations: readonly Migration[],
+): void {
+  if (!hasSchemaMigrationTable(database)) {
+    database.exec(
+      "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^a-f0-9]*'), applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    );
+    return;
+  }
+  const report = inspectMigrationHistory(database, migrations, false);
+  if (report.digestStatus !== "legacy_name_only") {
+    return;
+  }
+  assertLegacySchemaPrefix(database, migrations, report.entries.length);
+  database.exec("ALTER TABLE schema_migrations ADD COLUMN sha256 TEXT");
+  const update = database.prepare(
+    "UPDATE schema_migrations SET sha256 = ? WHERE version = ? AND name = ? AND sha256 IS NULL",
+  );
+  for (const entry of report.entries) {
+    const result = update.run(entry.sha256, entry.version, entry.name);
+    if (Number(result.changes) !== 1) {
+      throw new DatabaseSchemaHistoryError();
     }
   }
+  inspectMigrationHistory(database, migrations, false);
+}
+
+function assertLegacySchemaPrefix(
+  database: DatabaseSync,
+  migrations: readonly Migration[],
+  appliedMigrationCount: number,
+): void {
+  const reference = new DatabaseSync(":memory:");
+  try {
+    reference.exec("PRAGMA foreign_keys = ON");
+    for (const migration of migrations.slice(0, appliedMigrationCount)) {
+      reference.exec(migration.sql);
+    }
+    if (schemaPrefixSnapshot(database) !== schemaPrefixSnapshot(reference)) {
+      throw new DatabaseSchemaHistoryError();
+    }
+  } catch (error) {
+    if (error instanceof DatabaseSchemaHistoryError) {
+      throw error;
+    }
+    throw new DatabaseSchemaHistoryError();
+  } finally {
+    reference.close();
+  }
+}
+
+function schemaPrefixSnapshot(database: DatabaseSync): string {
+  const catalog = database
+    .prepare(
+      "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name <> 'schema_migrations' AND tbl_name <> 'schema_migrations' AND name NOT LIKE 'sqlite_%' ORDER BY type ASC, name ASC",
+    )
+    .all()
+    .map((row) => ({
+      name: String(row.name),
+      sql: normalizeSchemaSql(row.sql),
+      table: String(row.tbl_name),
+      type: String(row.type),
+    }));
+  const tables = catalog
+    .filter((entry) => entry.type === "table")
+    .map((entry) => {
+      const columns = database
+        .prepare(
+          'SELECT cid, name, type, "notnull" AS not_null, dflt_value, pk, hidden FROM pragma_table_xinfo(?) ORDER BY cid ASC',
+        )
+        .all(entry.name)
+        .map((row) => ({
+          cid: Number(row.cid),
+          defaultValue: nullableSchemaString(row.dflt_value),
+          hidden: Number(row.hidden),
+          name: String(row.name),
+          notNull: Number(row.not_null),
+          primaryKey: Number(row.pk),
+          type: String(row.type),
+        }));
+      const foreignKeys = database
+        .prepare(
+          'SELECT id, seq, "table" AS target_table, "from" AS source_column, "to" AS target_column, on_update, on_delete, match FROM pragma_foreign_key_list(?) ORDER BY id ASC, seq ASC',
+        )
+        .all(entry.name)
+        .map((row) => ({
+          id: Number(row.id),
+          match: String(row.match),
+          onDelete: String(row.on_delete),
+          onUpdate: String(row.on_update),
+          sequence: Number(row.seq),
+          sourceColumn: String(row.source_column),
+          targetColumn: nullableSchemaString(row.target_column),
+          targetTable: String(row.target_table),
+        }));
+      const indexes = database
+        .prepare(
+          'SELECT name, "unique" AS is_unique, origin, partial FROM pragma_index_list(?) ORDER BY name ASC',
+        )
+        .all(entry.name)
+        .map((row) => {
+          const name = String(row.name);
+          const sqlRow = database
+            .prepare(
+              "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            )
+            .get(name);
+          const columns = database
+            .prepare(
+              "SELECT seqno, cid, name, desc, coll, key FROM pragma_index_xinfo(?) ORDER BY seqno ASC",
+            )
+            .all(name)
+            .map((column) => ({
+              cid: Number(column.cid),
+              collation: nullableSchemaString(column.coll),
+              descending: Number(column.desc),
+              key: Number(column.key),
+              name: nullableSchemaString(column.name),
+              sequence: Number(column.seqno),
+            }));
+          return {
+            columns,
+            name,
+            origin: String(row.origin),
+            partial: Number(row.partial),
+            sql: normalizeSchemaSql(sqlRow?.sql),
+            unique: Number(row.is_unique),
+          };
+        });
+      return { columns, foreignKeys, indexes, name: entry.name };
+    });
+  return JSON.stringify({ catalog, tables });
+}
+
+function normalizeSchemaSql(value: unknown): string | null {
+  return value === null || value === undefined
+    ? null
+    : String(value).trim().replace(/\s+/g, " ");
+}
+
+function nullableSchemaString(value: unknown): string | null {
+  return value === null || value === undefined ? null : String(value);
+}
+
+function hasSchemaMigrationTable(database: DatabaseSync): boolean {
+  return Boolean(
+    database
+      .prepare(
+        "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migrations'",
+      )
+      .get()?.present,
+  );
+}
+
+function exactColumnSet(
+  actual: Set<string>,
+  expected: readonly string[],
+): boolean {
+  return (
+    actual.size === expected.length &&
+    expected.every((column) => actual.has(column))
+  );
+}
+
+function applyMigration(database: DatabaseSync, migration: Migration): void {
+  database.exec(migration.sql);
+  database
+    .prepare(
+      "INSERT INTO schema_migrations (version, name, sha256) VALUES (?, ?, ?)",
+    )
+    .run(migration.version, migration.name, migration.sha256);
+}
+
+function rollbackMigration(database: DatabaseSync): void {
+  try {
+    database.exec("ROLLBACK");
+  } catch {
+    // BEGIN can fail before a transaction exists.
+  }
+}
+
+export function isSqliteBusyOrLocked(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+  const errcode = "errcode" in error ? Number(error.errcode) : Number.NaN;
+  const code = "code" in error ? String(error.code) : "";
+  return (
+    errcode === 5 ||
+    errcode === 6 ||
+    code.includes("BUSY") ||
+    code.includes("LOCKED")
+  );
 }
 
 export class SettingsRepository {
@@ -958,278 +1305,3 @@ function parseNormalizedFromRadio(
     throw new MeshObservationPersistenceError();
   }
 }
-
-export const gatewayMigrations: Migration[] = [
-  {
-    version: 1,
-    name: "settings",
-    up(database) {
-      database.exec(
-        "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-      );
-    },
-  },
-  {
-    version: 2,
-    name: "jobs",
-    up(database) {
-      database.exec(
-        "CREATE TABLE jobs (id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'waiting', 'succeeded', 'failed', 'cancelling', 'cancelled', 'rolling_back', 'rolled_back')), input TEXT NOT NULL, result TEXT, error_code TEXT, error_params TEXT, idempotency_key TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0, 1)), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT, completed_at TEXT)",
-      );
-      database.exec(
-        "CREATE UNIQUE INDEX jobs_type_idempotency_key_unique ON jobs (type, idempotency_key) WHERE idempotency_key IS NOT NULL",
-      );
-      database.exec(
-        "CREATE INDEX jobs_status_updated_at_index ON jobs (status, updated_at)",
-      );
-    },
-  },
-  {
-    version: 3,
-    name: "mesh_observations",
-    up(database) {
-      database.exec(
-        "CREATE TABLE mesh_observations (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL CHECK (schema_version = 1), transport TEXT NOT NULL CHECK (transport IN ('tcp', 'serial', 'simulator')), session_connected_at TEXT NOT NULL, ingested_at TEXT NOT NULL, server_ingested_at TEXT NOT NULL, device_rx_time_seconds INTEGER CHECK (device_rx_time_seconds IS NULL OR (device_rx_time_seconds >= 0 AND device_rx_time_seconds <= 4294967295)), backlog_classification TEXT NOT NULL CHECK (backlog_classification IN ('backlog', 'live', 'unknown')), normalized_from_radio TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-      );
-      database.exec(
-        "CREATE INDEX mesh_observations_session_ingested_at_index ON mesh_observations (session_connected_at, ingested_at)",
-      );
-    },
-  },
-  {
-    version: 4,
-    name: "mesh_domain_records",
-    up(database) {
-      database.exec(
-        "CREATE TABLE nodes (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), user_id TEXT, long_name TEXT, short_name TEXT, hardware_model TEXT, role TEXT, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, last_observation_id TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num))",
-      );
-      database.exec(
-        "CREATE INDEX nodes_last_seen_at_index ON nodes (mesh_network_id, last_seen_at DESC)",
-      );
-      database.exec(
-        "CREATE TABLE messages (id TEXT PRIMARY KEY, observation_id TEXT NOT NULL UNIQUE REFERENCES mesh_observations(id), mesh_network_id TEXT NOT NULL, sender INTEGER NOT NULL CHECK (sender >= 0 AND sender <= 4294967295), destination INTEGER CHECK (destination IS NULL OR (destination >= 0 AND destination <= 4294967295)), packet_id INTEGER CHECK (packet_id IS NULL OR (packet_id >= 0 AND packet_id <= 4294967295)), channel INTEGER CHECK (channel IS NULL OR (channel >= 0 AND channel <= 255)), text TEXT NOT NULL, observed_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-      );
-      database.exec(
-        "CREATE INDEX messages_network_sender_observed_at_index ON messages (mesh_network_id, sender, observed_at DESC)",
-      );
-      database.exec(
-        "CREATE TABLE telemetry (id TEXT PRIMARY KEY, observation_id TEXT NOT NULL UNIQUE REFERENCES mesh_observations(id), mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), packet_id INTEGER CHECK (packet_id IS NULL OR (packet_id >= 0 AND packet_id <= 4294967295)), metric_kind TEXT NOT NULL, metrics TEXT NOT NULL, observed_at TEXT NOT NULL, telemetry_time_seconds INTEGER CHECK (telemetry_time_seconds IS NULL OR (telemetry_time_seconds > 0 AND telemetry_time_seconds <= 4294967295)), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-      );
-      database.exec(
-        "CREATE INDEX telemetry_network_node_observed_at_index ON telemetry (mesh_network_id, node_num, observed_at DESC)",
-      );
-    },
-  },
-  {
-    version: 5,
-    name: "position_domain_records",
-    up(database) {
-      database.exec(
-        "CREATE TABLE position_observations (id TEXT PRIMARY KEY, mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), mesh_observation_id TEXT NOT NULL REFERENCES mesh_observations(id), gateway_id TEXT NOT NULL, transport TEXT NOT NULL CHECK (transport IN ('tcp', 'serial', 'simulator')), session_connected_at TEXT NOT NULL, ingested_at TEXT NOT NULL, server_ingested_at TEXT NOT NULL, device_rx_time_seconds INTEGER CHECK (device_rx_time_seconds IS NULL OR (device_rx_time_seconds >= 0 AND device_rx_time_seconds <= 4294967295)), backlog_classification TEXT NOT NULL CHECK (backlog_classification IN ('backlog', 'live', 'unknown')), packet_id INTEGER CHECK (packet_id IS NULL OR (packet_id >= 0 AND packet_id <= 4294967295)), payload_hash TEXT NOT NULL, via_mqtt INTEGER CHECK (via_mqtt IS NULL OR via_mqtt IN (0, 1)), rx_snr REAL, rx_rssi INTEGER, hop_limit INTEGER CHECK (hop_limit IS NULL OR hop_limit >= 0), hop_start INTEGER CHECK (hop_start IS NULL OR hop_start >= 0), position TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-      );
-      database.exec(
-        "CREATE INDEX position_observations_network_node_ingested_at_index ON position_observations (mesh_network_id, node_num, ingested_at DESC)",
-      );
-      database.exec(
-        "CREATE TABLE position_events (id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL UNIQUE, mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), source_observation_id TEXT NOT NULL REFERENCES position_observations(id), payload_hash TEXT NOT NULL, event_time TEXT, event_time_source TEXT CHECK (event_time_source IS NULL OR event_time_source IN ('position_timestamp', 'position_time', 'sequence')), sequence_epoch INTEGER CHECK (sequence_epoch IS NULL OR sequence_epoch >= 0), sequence_number INTEGER CHECK (sequence_number IS NULL OR (sequence_number >= 0 AND sequence_number <= 4294967295)), position TEXT NOT NULL, created_at TEXT NOT NULL)",
-      );
-      database.exec(
-        "CREATE INDEX position_events_network_node_event_time_index ON position_events (mesh_network_id, node_num, event_time DESC)",
-      );
-      database.exec(
-        "CREATE TABLE position_decisions (id TEXT PRIMARY KEY, observation_id TEXT NOT NULL REFERENCES position_observations(id), canonical_event_id TEXT REFERENCES position_events(id), code TEXT NOT NULL, decided_at TEXT NOT NULL, parameters TEXT NOT NULL)",
-      );
-      database.exec(
-        "CREATE INDEX position_decisions_observation_decided_at_index ON position_decisions (observation_id, decided_at DESC)",
-      );
-      database.exec(
-        "CREATE TABLE node_position_state (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, mapping_version TEXT NOT NULL, latest_canonical_event_id TEXT REFERENCES position_events(id), latest_event_time TEXT, latest_sequence_epoch INTEGER CHECK (latest_sequence_epoch IS NULL OR latest_sequence_epoch >= 0), latest_sequence_number INTEGER CHECK (latest_sequence_number IS NULL OR (latest_sequence_number >= 0 AND latest_sequence_number <= 4294967295)), latest_latitude_i INTEGER, latest_longitude_i INTEGER, updated_at TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num, callsign, mapping_version))",
-      );
-    },
-  },
-  {
-    version: 6,
-    name: "aprs_outbox",
-    up(database) {
-      database.exec(
-        "CREATE TABLE aprs_outbox (id TEXT PRIMARY KEY, callsign TEXT NOT NULL, canonical_event_id TEXT NOT NULL REFERENCES position_events(id), data TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('queued', 'sending', 'sent', 'failed')), attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0), next_attempt_at TEXT NOT NULL, last_error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, sent_at TEXT, UNIQUE (callsign, canonical_event_id))",
-      );
-      database.exec(
-        "CREATE INDEX aprs_outbox_due_index ON aprs_outbox (status, next_attempt_at)",
-      );
-    },
-  },
-  {
-    version: 7,
-    name: "aprs_remote_high_water",
-    up(database) {
-      database.exec(
-        "CREATE TABLE aprs_remote_high_water (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, mapping_version TEXT NOT NULL, latest_event_time TEXT NOT NULL, latest_event_marker TEXT NOT NULL, received_at TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num, callsign, mapping_version))",
-      );
-      database.exec(
-        "CREATE INDEX aprs_remote_high_water_callsign_event_time_index ON aprs_remote_high_water (callsign, latest_event_time DESC)",
-      );
-    },
-  },
-  {
-    version: 8,
-    name: "callmesh_mappings",
-    up(database) {
-      database.exec(
-        "CREATE TABLE callmesh_mappings (version TEXT NOT NULL, effective_at TEXT NOT NULL, mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, PRIMARY KEY (version, effective_at, mesh_network_id, node_num, callsign))",
-      );
-      database.exec(
-        "CREATE INDEX callmesh_mappings_target_index ON callmesh_mappings (mesh_network_id, node_num, effective_at DESC)",
-      );
-    },
-  },
-  {
-    version: 9,
-    name: "telemetry_range_query_index",
-    up(database) {
-      database.exec(
-        "CREATE INDEX telemetry_metric_observed_at_index ON telemetry (metric_kind, observed_at DESC)",
-      );
-    },
-  },
-  {
-    version: 10,
-    name: "load_retention_indexes",
-    up(database) {
-      database.exec(
-        "CREATE INDEX mesh_observations_ingested_at_index ON mesh_observations (ingested_at, id)",
-      );
-      database.exec(
-        "CREATE INDEX nodes_last_observation_id_index ON nodes (last_observation_id)",
-      );
-      database.exec(
-        "CREATE INDEX position_observations_mesh_observation_id_index ON position_observations (mesh_observation_id)",
-      );
-      database.exec(
-        "CREATE INDEX telemetry_observed_at_index ON telemetry (observed_at, id)",
-      );
-      database.exec(
-        "CREATE INDEX jobs_terminal_retention_index ON jobs (completed_at, id) WHERE status IN ('succeeded', 'failed', 'cancelled', 'rolled_back')",
-      );
-      database.exec(
-        "CREATE INDEX jobs_queued_created_at_index ON jobs (created_at, id) WHERE status = 'queued'",
-      );
-    },
-  },
-  {
-    version: 11,
-    name: "read_projection_indexes",
-    up(database) {
-      database.exec(
-        "CREATE INDEX nodes_recent_projection_index ON nodes (last_seen_at DESC, node_num ASC)",
-      );
-      database.exec(
-        "CREATE INDEX messages_recent_projection_index ON messages (observed_at DESC, id ASC)",
-      );
-      database.exec(
-        "CREATE INDEX telemetry_recent_projection_index ON telemetry (observed_at DESC, id ASC)",
-      );
-      database.exec(
-        "CREATE INDEX position_events_recent_projection_index ON position_events (COALESCE(event_time, created_at) DESC, id ASC)",
-      );
-      database.exec(
-        "CREATE INDEX aprs_outbox_recent_projection_index ON aprs_outbox (updated_at DESC, id ASC)",
-      );
-      database.exec(
-        "CREATE INDEX aprs_outbox_due_order_index ON aprs_outbox (next_attempt_at ASC, created_at ASC, id ASC) WHERE status IN ('queued', 'failed')",
-      );
-      database.exec(
-        "CREATE INDEX aprs_outbox_sent_retention_index ON aprs_outbox (sent_at ASC, id ASC) WHERE status = 'sent'",
-      );
-    },
-  },
-  {
-    version: 12,
-    name: "bounded_domain_retention_and_delivery_high_water",
-    up(database) {
-      database.exec(
-        "CREATE TABLE aprs_delivery_high_water (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, latest_canonical_event_id TEXT NOT NULL REFERENCES position_events(id), latest_event_time TEXT NOT NULL, latest_sequence_epoch INTEGER CHECK (latest_sequence_epoch IS NULL OR latest_sequence_epoch >= 0), latest_sequence_number INTEGER CHECK (latest_sequence_number IS NULL OR (latest_sequence_number >= 0 AND latest_sequence_number <= 4294967295)), delivered_at TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num, callsign))",
-      );
-      database.exec(
-        "INSERT INTO aprs_delivery_high_water (mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_event_time, latest_sequence_epoch, latest_sequence_number, delivered_at) SELECT mesh_network_id, node_num, callsign, canonical_event_id, event_time, sequence_epoch, sequence_number, sent_at FROM (SELECT event.mesh_network_id, event.node_num, outbox.callsign, event.id AS canonical_event_id, event.event_time, event.sequence_epoch, event.sequence_number, outbox.sent_at, ROW_NUMBER() OVER (PARTITION BY event.mesh_network_id, event.node_num, outbox.callsign ORDER BY event.event_time DESC, outbox.sent_at DESC, event.id DESC) AS delivery_rank FROM aprs_outbox AS outbox JOIN position_events AS event ON event.id = outbox.canonical_event_id WHERE outbox.status = 'sent' AND outbox.sent_at IS NOT NULL AND event.event_time IS NOT NULL) WHERE delivery_rank = 1",
-      );
-      database.exec(
-        "CREATE INDEX aprs_delivery_high_water_latest_event_id_index ON aprs_delivery_high_water (latest_canonical_event_id)",
-      );
-      database.exec(
-        "CREATE INDEX node_position_state_latest_event_id_index ON node_position_state (latest_canonical_event_id)",
-      );
-      database.exec(
-        "CREATE INDEX jobs_queued_type_created_at_index ON jobs (type, created_at ASC, id ASC) WHERE status = 'queued'",
-      );
-
-      database.exec(
-        "CREATE INDEX messages_retention_index ON messages (observed_at ASC, id ASC)",
-      );
-      database.exec(
-        "CREATE INDEX position_decisions_retention_index ON position_decisions (decided_at ASC, id ASC)",
-      );
-      database.exec(
-        "CREATE INDEX position_decisions_canonical_event_id_index ON position_decisions (canonical_event_id)",
-      );
-      database.exec(
-        "CREATE INDEX position_events_retention_index ON position_events (created_at ASC, id ASC)",
-      );
-      database.exec(
-        "CREATE INDEX position_events_source_observation_id_index ON position_events (source_observation_id)",
-      );
-      database.exec(
-        "CREATE INDEX position_observations_retention_index ON position_observations (ingested_at ASC, id ASC)",
-      );
-      database.exec(
-        "CREATE INDEX aprs_outbox_canonical_event_id_index ON aprs_outbox (canonical_event_id)",
-      );
-    },
-  },
-  {
-    version: 13,
-    name: "aprs_outbox_order_snapshots",
-    up(database) {
-      database.exec("ALTER TABLE aprs_outbox ADD COLUMN mesh_network_id TEXT");
-      database.exec("ALTER TABLE aprs_outbox ADD COLUMN node_num INTEGER");
-      database.exec("ALTER TABLE aprs_outbox ADD COLUMN mapping_version TEXT");
-      database.exec("ALTER TABLE aprs_outbox ADD COLUMN event_time TEXT");
-      database.exec(
-        "ALTER TABLE aprs_outbox ADD COLUMN sequence_epoch INTEGER",
-      );
-      database.exec(
-        "ALTER TABLE aprs_outbox ADD COLUMN sequence_number INTEGER",
-      );
-      database.exec(
-        "UPDATE aprs_outbox SET mesh_network_id = (SELECT event.mesh_network_id FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id), node_num = (SELECT event.node_num FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id), event_time = (SELECT event.event_time FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id), sequence_epoch = (SELECT event.sequence_epoch FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id), sequence_number = (SELECT event.sequence_number FROM position_events AS event WHERE event.id = aprs_outbox.canonical_event_id)",
-      );
-      database.exec(
-        "ALTER TABLE aprs_delivery_high_water ADD COLUMN latest_mapping_version TEXT",
-      );
-      database.exec(
-        "CREATE INDEX aprs_outbox_active_order_index ON aprs_outbox (mesh_network_id, node_num, callsign, event_time DESC, sequence_epoch DESC, sequence_number DESC, id ASC) WHERE status IN ('queued', 'sending', 'failed')",
-      );
-    },
-  },
-  {
-    version: 14,
-    name: "callmesh_sync_high_water",
-    up(database) {
-      database.exec(
-        "CREATE TABLE callmesh_sync_state (id INTEGER PRIMARY KEY CHECK (id = 1), active INTEGER NOT NULL CHECK (active IN (0, 1)), mapping_hash TEXT NOT NULL CHECK (length(mapping_hash) BETWEEN 1 AND 128), accepted_server_time TEXT NOT NULL, mappings_fingerprint TEXT NOT NULL CHECK (length(mappings_fingerprint) = 64), last_heartbeat_at TEXT NOT NULL, mapping_synced_at TEXT NOT NULL, provision_json TEXT, provision_expires_at TEXT, provision_fingerprint TEXT CHECK (provision_fingerprint IS NULL OR length(provision_fingerprint) = 64), updated_at TEXT NOT NULL, CHECK ((provision_json IS NULL AND provision_expires_at IS NULL AND provision_fingerprint IS NULL) OR (provision_json IS NOT NULL AND provision_expires_at IS NOT NULL AND provision_fingerprint IS NOT NULL)))",
-      );
-      database.exec(
-        "CREATE TABLE callmesh_sync_history (mapping_hash TEXT PRIMARY KEY CHECK (length(mapping_hash) BETWEEN 1 AND 128), first_server_time TEXT NOT NULL, last_server_time TEXT NOT NULL, mappings_fingerprint TEXT NOT NULL CHECK (length(mappings_fingerprint) = 64))",
-      );
-    },
-  },
-  {
-    version: 15,
-    name: "aprs_outbox_provision_authorization",
-    up(database) {
-      database.exec(
-        "ALTER TABLE aprs_outbox ADD COLUMN provision_fingerprint TEXT CHECK (provision_fingerprint IS NULL OR (length(provision_fingerprint) = 64 AND provision_fingerprint NOT GLOB '*[^a-f0-9]*'))",
-      );
-    },
-  },
-];

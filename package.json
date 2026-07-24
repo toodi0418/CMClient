@@ -17,7 +17,7 @@
     "typecheck": "pnpm --filter @cmclient/contracts run build && pnpm --recursive --if-present run typecheck",
     "build": "node scripts/source-build.mjs javascript",
     "build:source:windows": "node scripts/source-build.mjs windows",
-    "test": "pnpm --filter @cmclient/contracts run build && pnpm run test:workspace-tools && pnpm run test:fixtures && pnpm run test:legacy-removal && pnpm run test:security-audit && pnpm run test:release-artifacts && pnpm run test:supply-chain && pnpm run test:rc-readiness && pnpm run test:documentation && pnpm run test:p13-feasibility && pnpm run test:systemd && pnpm run test:windows-service && pnpm run test:launchd && pnpm run test:docker && pnpm run test:load-contract && pnpm run test:source-build && vitest run",
+    "test": "pnpm --filter @cmclient/contracts run build && pnpm run test:workspace-tools && pnpm run test:fixtures && pnpm run test:legacy-removal && pnpm run test:security-audit && pnpm run test:release-artifacts && pnpm run test:supply-chain && pnpm run test:rc-readiness && pnpm run test:documentation && pnpm run test:p13-feasibility && pnpm run test:private-node && pnpm run test:systemd && pnpm run test:windows-service && pnpm run test:launchd && pnpm run test:docker && pnpm run test:load-contract && pnpm run test:source-build && vitest run",
     "test:workspace-tools": "bash ./scripts/test-workspace-tools.sh",
     "test:load": "node scripts/load-soak.mjs",
     "test:load-contract": "node --test scripts/load-soak.test.mjs",
@@ -29,6 +29,7 @@
     "test:rc-readiness": "node --test scripts/rc-readiness.test.mjs",
     "test:documentation": "node --test scripts/documentation-contract.test.mjs",
     "test:p13-feasibility": "node --test scripts/p13-feasibility-decision.test.mjs scripts/p13-gateway-bootstrap-lab.test.mjs scripts/p13-updater-driver-fixture.test.mjs scripts/p13-updater-artifact-evidence.test.mjs scripts/p13-updater-live-matrix.test.mjs scripts/p13-updater-windows-install-lab.test.mjs scripts/p13-nsis-path-hooks.test.mjs",
+    "test:private-node": "node --test scripts/private-node-runtime.test.mjs",
     "rc:check": "node scripts/rc-readiness.mjs check-sources && node scripts/rc-readiness.mjs check-plan --input docs/testing/rc-field-validation-plan.json",
     "test:systemd": "node --test scripts/cmclient-systemd.test.mjs",
     "test:windows-service": "node --test scripts/cmclient-windows-service.test.mjs",
@@ -49,8 +50,9 @@
     "prettier": "^3.9.5",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.64.0",
+    "vitest": "^4.1.10",
     "vue-eslint-parser": "^10.4.1",
     "yaml": "2.9.0",
-    "vitest": "^4.1.10"
+    "yauzl": "3.4.0"
   }
 }

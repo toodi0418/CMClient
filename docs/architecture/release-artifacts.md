@@ -31,6 +31,33 @@ UAC. macOS uses one drag-to-Applications Universal DMG with user-level terminal
 integration. Linux uses one AppImage per CPU and documents
 `--appimage-extract-and-run` as the operator fallback when FUSE cannot mount.
 
+## Private Node Staging Input
+
+`packaging/runtime/private-node-runtime.json` is the canonical native-package
+input manifest. It exact-pins Node `24.18.0`, the official Node.js
+`SHASUMS256.txt` source, and the official Windows x86-64, macOS x86-64/ARM64,
+and Linux x86-64/ARM64 archives. Windows ARM64 is explicitly unsupported.
+Docker builds their runtime into each target image and do not consume these
+native archives.
+
+The staging tool never downloads an archive. An operator supplies the official
+archive below the persisted campaign root, then runs:
+
+```powershell
+node scripts/private-node-runtime.mjs stage-windows `
+  --archive <campaign>\inputs\node-v24.18.0-win-x64.zip `
+  --campaign-root <campaign> `
+  --stage-root <campaign>\package
+```
+
+The tool streams the path-backed ZIP through exact size/SHA-256, bounded-entry,
+path-collision, traversal, link/reparse, and extracted-inventory checks. It
+stages atomically only after `node.exe --version` reports `v24.18.0` and an
+in-memory `node:sqlite` smoke succeeds. The native package paths are
+`runtime/node/node.exe` on Windows and `runtime/node/bin/node` on Unix. P13
+qualifies this current-host Windows staging contract; P15 still owns real
+target-native archive and addon qualification for every release target.
+
 ## Candidate Identity
 
 - `runtimeCandidate` identifies the exact source/tree and executable/image that
