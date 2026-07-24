@@ -55,9 +55,9 @@ runtime.
 
 CallMesh's non-secret endpoint is optional Agent configuration. Its URL must be
 an exact HTTPS origin with no path, query, fragment, or embedded credential. At
-Gateway launch Agent drops inherited application configuration, retaining only
-launcher variables such as `PATH` and required Windows runtime paths. It passes
-the non-secret URL in the bounded child environment and sends an optional
+Gateway launch Agent drops inherited application configuration and `PATH`,
+retaining only required Windows runtime variables. It passes the non-secret URL
+in the bounded child environment and sends an optional
 CallMesh API key only inside the private bootstrap frame. Gateway therefore
 cannot inherit a legacy API key from the parent shell.
 
@@ -100,11 +100,11 @@ mode = "monitor"
 allow_lan = false
 ```
 
-Agent clears inherited application configuration before it passes validated
-non-secret configuration and exact absolute runtime paths to Gateway. The
-small launcher allowlist retains `PATH` and required Windows runtime paths so
-the configured process can start. The required CallMesh key uses the private
-bootstrap pipe, never argv or environment. Gateway then owns transport,
+Agent clears inherited application configuration and `PATH` before it passes
+validated non-secret configuration and exact absolute runtime paths to Gateway.
+Only required Windows runtime variables remain in the launcher allowlist; the
+private Node executable is always addressed absolutely. The required CallMesh
+key uses the private bootstrap pipe, never argv or environment. Gateway then owns transport,
 protobuf/domain persistence, Position and APRS processing, CallMesh, Proxy,
 retention, Jobs, and domain SSE. See
 [Gateway Production Runtime](./gateway-runtime.md).

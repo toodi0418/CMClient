@@ -43,7 +43,7 @@ const GATEWAY_OWNERSHIP_PROOF_HEADER: &str = "x-cmclient-gateway-ownership-proof
 const GATEWAY_OWNERSHIP_PROTOCOL: &str = "cmclient-bootstrap-ownership-v1";
 const GATEWAY_OWNERSHIP_DOMAIN: &str = "cmclient.gateway.bootstrap-ownership.v1";
 const CALLMESH_API_KEY_ENVIRONMENT_NAME: &str = "CMCLIENT_CALLMESH_API_KEY";
-const INHERITED_RUNTIME_ENVIRONMENT_NAMES: [&str; 4] = ["PATH", "SystemRoot", "WINDIR", "ComSpec"];
+const INHERITED_RUNTIME_ENVIRONMENT_NAMES: [&str; 3] = ["SystemRoot", "WINDIR", "ComSpec"];
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy)]
@@ -1361,9 +1361,10 @@ mod tests {
     }
 
     #[test]
-    fn inherited_child_environment_excludes_plaintext_secret_paths() {
+    fn inherited_child_environment_excludes_path_and_plaintext_secret_inputs() {
         let source = BTreeMap::from([
             (String::from("PATH"), String::from("/fixture/bin")),
+            (String::from("SystemRoot"), String::from("C:\\Windows")),
             (
                 String::from("CMCLIENT_PLAINTEXT_SECRET_FILE"),
                 String::from("/private/fixture/secrets.json"),
@@ -1378,7 +1379,7 @@ mod tests {
 
         assert_eq!(
             filtered,
-            BTreeMap::from([(String::from("PATH"), String::from("/fixture/bin"))])
+            BTreeMap::from([(String::from("SystemRoot"), String::from("C:\\Windows"),)])
         );
     }
 

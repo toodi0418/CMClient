@@ -127,10 +127,54 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cmclient-source-target
         run: pnpm build:source:windows
+      - name: Stage exact private Node
+        id: private-node
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & node scripts/private-node-runtime.mjs validate-manifest
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Private Node manifest validation failed'
+          }
+
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'packaging/runtime/private-node-runtime.json'
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          $targets = @($manifest.targets | Where-Object { $_.target -eq 'windows-x86_64' })
+          if ($targets.Count -ne 1) {
+            throw 'Private Node manifest must contain exactly one Windows x86-64 target'
+          }
+          $target = $targets[0]
+          $campaignRoot = Join-Path $env:RUNNER_TEMP 'cmclient-private-node'
+          $archivePath = Join-Path $campaignRoot ([string]$target.archiveFileName)
+          $stageRoot = Join-Path $campaignRoot 'stage'
+          New-Item -ItemType Directory -Force -Path $campaignRoot | Out-Null
+          Invoke-WebRequest -Uri ([string]$target.archiveUrl) -OutFile $archivePath
+
+          $stageOutput = & node scripts/private-node-runtime.mjs stage-windows `
+            --archive $archivePath `
+            --campaign-root $campaignRoot `
+            --stage-root $stageRoot
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Private Node staging failed'
+          }
+          $stage = $stageOutput | ConvertFrom-Json
+          $executable = [System.IO.Path]::GetFullPath([string]$stage.executable)
+          if (-not [System.IO.Path]::IsPathFullyQualified($executable) -or
+              -not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw 'Private Node staging did not return an absolute executable'
+          }
+          "executable=$executable" >> $env:GITHUB_OUTPUT
       - name: Test the real Agent to Gateway private session
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/cmclient-source-target
+          CMCLIENT_PRIVATE_NODE: ${{ steps.private-node.outputs.executable }}
         run: cargo test --locked --target x86_64-pc-windows-msvc -p cmclient-agent tests::supervised_real_gateway_uses_private_dynamic_session -- --ignored --exact
+      - name: Test the staged private Node source runtime
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cmclient-source-target
+          CMCLIENT_PRIVATE_NODE: ${{ steps.private-node.outputs.executable }}
+          CMCLIENT_CAMPAIGN_ROOT: ${{ runner.temp }}/cmclient-private-node/campaign
+        run: cargo test --locked --target x86_64-pc-windows-msvc -p cmclient-agent --test windows_source_runtime production_agent_uses_staged_private_node_control_and_web -- --ignored --exact --nocapture
 
   desktop-smoke:
     name: Desktop smoke (${{ matrix.name }})

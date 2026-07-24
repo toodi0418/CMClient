@@ -76,6 +76,10 @@ test("CI keeps the Windows source gate separate from package generation", () => 
   const job = workflow.jobs["windows-source-build"];
   assert.equal(job["runs-on"], "windows-latest");
   assert.equal(job["timeout-minutes"], 30);
+  const nodeSetup = job.steps.find((step) =>
+    step.uses?.startsWith("actions/setup-node@"),
+  );
+  assert.equal(nodeSetup?.with?.["node-version"], "22.23.1");
   const build = job.steps.find(
     (step) => step.run === "pnpm build:source:windows",
   );
@@ -95,8 +99,53 @@ test("CI keeps the Windows source gate separate from package generation", () => 
     privateGateway.env.CARGO_TARGET_DIR,
     "${{ runner.temp }}/cmclient-source-target",
   );
+  assert.equal(
+    privateGateway.env.CMCLIENT_PRIVATE_NODE,
+    "${{ steps.private-node.outputs.executable }}",
+  );
+  const privateNode = job.steps.find((step) => step.id === "private-node");
+  assert.equal(privateNode.shell, "pwsh");
+  assert.match(
+    privateNode.run,
+    /packaging\/runtime\/private-node-runtime\.json/,
+  );
+  assert.match(privateNode.run, /validate-manifest/);
+  assert.match(privateNode.run, /\.target -eq 'windows-x86_64'/);
+  assert.match(privateNode.run, /\.archiveFileName/);
+  assert.match(privateNode.run, /\.archiveUrl/);
+  assert.match(privateNode.run, /\$env:RUNNER_TEMP/);
+  assert.match(privateNode.run, /Invoke-WebRequest/);
+  assert.match(privateNode.run, /private-node-runtime\.mjs stage-windows/);
+  assert.match(privateNode.run, /--archive \$archivePath/);
+  assert.match(privateNode.run, /--campaign-root \$campaignRoot/);
+  assert.match(privateNode.run, /--stage-root \$stageRoot/);
+  assert.match(privateNode.run, /IsPathFullyQualified\(\$executable\)/);
+  assert.match(privateNode.run, /"executable=\$executable"/);
+  assert.doesNotMatch(privateNode.run, /Get-Command node\.exe/);
+
+  const sourceRuntime = job.steps.find((step) =>
+    step.run?.includes("--test windows_source_runtime"),
+  );
+  assert.ok(sourceRuntime);
+  assert.equal(
+    sourceRuntime.env.CARGO_TARGET_DIR,
+    "${{ runner.temp }}/cmclient-source-target",
+  );
+  assert.equal(
+    sourceRuntime.env.CMCLIENT_PRIVATE_NODE,
+    "${{ steps.private-node.outputs.executable }}",
+  );
+  assert.equal(
+    sourceRuntime.env.CMCLIENT_CAMPAIGN_ROOT,
+    "${{ runner.temp }}/cmclient-private-node/campaign",
+  );
+  assert.match(
+    sourceRuntime.run,
+    /production_agent_uses_staged_private_node_control_and_web/,
+  );
+  assert.match(sourceRuntime.run, /--ignored --exact --nocapture$/);
   const serialized = JSON.stringify(job).toLowerCase();
-  for (const forbidden of ["tauri build", "nsis", "stage", "updater payload"]) {
+  for (const forbidden of ["tauri build", "nsis", "updater payload"]) {
     assert.equal(serialized.includes(forbidden), false, forbidden);
   }
 });

@@ -2083,11 +2083,29 @@ fn find_node_on_path(environment: &BTreeMap<String, String>) -> Option<PathBuf> 
 }
 
 fn canonical_file_or_path(path: PathBuf) -> PathBuf {
-    if path.is_file() {
+    let canonical = if path.is_file() {
         fs::canonicalize(&path).unwrap_or(path)
     } else {
         path
+    };
+    normalize_runtime_process_path(canonical)
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_runtime_process_path(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(unc_path) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc_path}"));
     }
+    if let Some(drive_path) = value.strip_prefix(r"\\?\") {
+        return PathBuf::from(drive_path);
+    }
+    path
+}
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_runtime_process_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 const fn private_node_relative_path() -> &'static str {
@@ -2275,7 +2293,8 @@ mod tests {
         agent_web_router, apply_aprs_environment, apply_physical_qualification_environment,
         bridge_gateway_event_stream, compiled_component_identity, gateway_json_projection,
         legacy_state_candidates, load_agent_config_after_migration_with, management_web_profile,
-        push_legacy_source_candidate, resolve_gateway_maintenance_program, verified_gateway_route,
+        normalize_runtime_process_path, push_legacy_source_candidate,
+        resolve_gateway_maintenance_program, verified_gateway_route,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -2566,6 +2585,23 @@ mod tests {
             Err(String::from("AGENT_GATEWAY_ENTRYPOINT_INVALID"))
         );
         std::fs::remove_dir_all(root).expect("private runtime fixture should clean up");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn private_runtime_process_paths_use_node_compatible_win32_prefixes() {
+        assert_eq!(
+            normalize_runtime_process_path(std::path::PathBuf::from(
+                r"\\?\C:\Program Files\CMClient\runtime\node.exe",
+            )),
+            std::path::PathBuf::from(r"C:\Program Files\CMClient\runtime\node.exe"),
+        );
+        assert_eq!(
+            normalize_runtime_process_path(std::path::PathBuf::from(
+                r"\\?\UNC\server\share\CMClient\gateway\main.js",
+            )),
+            std::path::PathBuf::from(r"\\server\share\CMClient\gateway\main.js"),
+        );
     }
 
     #[test]
@@ -2874,6 +2910,36 @@ mod tests {
     #[test]
     #[ignore = "requires a built production Gateway and Node; run by Windows source qualification"]
     fn supervised_real_gateway_uses_private_dynamic_session() {
+        let private_node = std::env::var_os("CMCLIENT_PRIVATE_NODE")
+            .map(std::path::PathBuf::from)
+            .expect("Windows source qualification requires CMCLIENT_PRIVATE_NODE");
+        assert!(private_node.is_absolute(), "private Node must be absolute");
+        let private_node_metadata =
+            std::fs::symlink_metadata(&private_node).expect("private Node metadata should load");
+        assert!(
+            private_node_metadata.is_file() && !private_node_metadata.file_type().is_symlink(),
+            "private Node must be a regular non-link file"
+        );
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(
+            private_node_metadata.file_attributes() & 0x0400,
+            0,
+            "private Node must not be a reparse point"
+        );
+        let private_node =
+            std::fs::canonicalize(private_node).expect("private Node should canonicalize");
+        let version = std::process::Command::new(&private_node)
+            .arg("--version")
+            .env_clear()
+            .output()
+            .expect("private Node should start without PATH");
+        assert!(version.status.success(), "private Node version should run");
+        assert_eq!(
+            String::from_utf8(version.stdout)
+                .expect("private Node version should be UTF-8")
+                .trim(),
+            "v24.18.0"
+        );
         let data_dir = std::env::temp_dir().join(format!(
             "cmclient-agent-private-gateway-{}",
             std::process::id(),
@@ -2901,7 +2967,7 @@ mod tests {
             config_file: data_dir.join("agent.toml"),
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
-                String::from("node"),
+                private_node.to_string_lossy().into_owned(),
                 gateway_entry.to_string_lossy().into_owned(),
             ]),
             callmesh: None,
@@ -2911,9 +2977,7 @@ mod tests {
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller =
-            AgentController::from_config_with_secrets(&config, AgentSecretStore::memory())
-                .expect("controller should build");
+        let controller = AgentController::from_config(&config).expect("controller should build");
 
         let started = controller
             .handle(super::ControlCommand::Start)

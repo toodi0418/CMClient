@@ -243,11 +243,13 @@ export class GatewayApiClient {
         headers: {
           accept: "application/json",
           "x-trace-id": traceId,
+          ...(method === "POST" ? { "content-type": "application/json" } : {}),
           ...(managementCsrfToken
             ? { "x-csrf-token": managementCsrfToken }
             : {}),
           ...additionalHeaders,
         },
+        ...(method === "POST" ? { body: "{}" } : {}),
       });
     } catch (error) {
       throw createNetworkError(error);

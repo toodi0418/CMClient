@@ -549,11 +549,8 @@ fn validate_file_config(file_config: FileConfig) -> Result<ValidatedFileConfig, 
             }
             match (&lan.certificate_path, &lan.private_key_path) {
                 (Some(certificate), Some(private_key))
-                    if certificate.is_absolute() && private_key.is_absolute() =>
-                {
-                    ()
-                }
-                (None, None) => (),
+                    if certificate.is_absolute() && private_key.is_absolute() => {}
+                (None, None) => {}
                 _ => return Err(ConfigError::InvalidManagementLan),
             }
             let mut allowed_cidrs = lan.allowed_cidrs.unwrap_or_default();

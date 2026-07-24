@@ -86,10 +86,12 @@ describe("gateway API client", () => {
 
   it("submits diagnostics with a client-generated idempotency key", async () => {
     let headers: Headers | undefined;
+    let body: BodyInit | null | undefined;
     const client = new GatewayApiClient({
       traceIdFactory: () => "diagnostics-42",
       fetch: async (_input, init) => {
         headers = new Headers(init?.headers);
+        body = init?.body;
         return jsonResponse({ jobId: "job-1", reused: false }, 202);
       },
     });
@@ -99,6 +101,8 @@ describe("gateway API client", () => {
       reused: false,
     });
     expect(headers?.get("idempotency-key")).toBe("diagnostics-42");
+    expect(headers?.get("content-type")).toBe("application/json");
+    expect(body).toBe("{}");
   });
 
   it("adds the in-memory management CSRF token without persisting credentials", async () => {

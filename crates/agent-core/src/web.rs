@@ -13,7 +13,7 @@ use bytes::Bytes;
 use hyper::body::{Body as HttpBody, Frame};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
+    rt::{TokioExecutor, TokioTimer},
 };
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -717,6 +717,7 @@ fn configure_http1<A>(server: &mut axum_server::Server<SocketAddr, A>) {
     server
         .http_builder()
         .http1()
+        .timer(TokioTimer::new())
         .max_headers(MAX_REQUEST_HEADERS)
         .header_read_timeout(REQUEST_HEADER_TIMEOUT)
         .max_buf_size(MAX_HTTP1_BUFFER_BYTES);
@@ -954,7 +955,7 @@ async fn authorize_request(
         || !role_allowed
         || generation != Some(policy.generation.load(Ordering::Acquire))
         || setup_generation != Some(policy.setup_generation.load(Ordering::Acquire))
-        || !expires_at.is_some_and(|expires_at| expires_at > now)
+        || expires_at.is_none_or(|expires_at| expires_at <= now)
     {
         let _ = session.delete().await;
         audit_policy(&policy, "request", "session_denied");
