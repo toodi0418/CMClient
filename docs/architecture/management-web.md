@@ -4,43 +4,66 @@ The Agent owns the optional Management Web listener. It is separate from the
 always-on local Control API: disabling the web listener cannot disable Agent,
 CLI, update, or recovery control.
 
-By default it binds `127.0.0.1:7080`, serves the static shell, and
-reverse-proxies `/api/*` to the Agent-supervised loopback Gateway. Agent-owned
-routes are handled before that proxy: `GET /api/v1/updates` and
-`GET /api/v1/updates/events` expose the durable update-journal projection/SSE
-even while Gateway is stopped. `/api/v1/control/*` is deliberately absent and
-returns `CONTROL_ROUTE_NOT_FOUND`; CLI and Desktop use the independent local
-framed IPC documented in [Local Agent Control IPC](../api/local-control.md).
-The proxy streams every other upstream response, including Gateway SSE, and
-forces the upstream connection to close after ordinary responses. If the
-Gateway cannot be reached it returns the stable
-`GATEWAY_PROXY_UNAVAILABLE` code without exposing transport details.
+Native installations bind separate IPv4 `0.0.0.0:7080` and, where the address
+family is available, IPv6 `[::]:7080` listeners. The IPv6 socket is v6-only so a
+real conflict on either family is deterministic; a partial start rolls back the
+other listener. The advertised URL remains `http://127.0.0.1:7080`. Binding a
+wildcard address does not grant LAN access: the default `local_only` admission
+policy uses the socket peer address and rejects non-loopback peers before static
+files, login, API routes, SSE, or the Gateway proxy. `Forwarded` and
+`X-Forwarded-*` never influence this decision.
 
-The listener admits at most 64 active connections. Excess connections receive
-`503 MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED`; each admitted socket owns an
-RAII slot and a shutdown handle. Disabling or stopping the listener first ends
-acceptance and then shuts down every active socket, so stalled requests and SSE
-clients cannot leave an unbounded thread or keep the service alive.
+Axum `0.8.9`, Tower HTTP `0.7.0`, Axum Server `0.8.0`, tower-sessions `0.15.0`,
+and tower_governor `0.8.0` own HTTP parsing, static delivery, TLS, bounded
+concurrency/body handling, memory-only sessions, and request-rate mechanics.
+The Agent retains only product policy: exact Host/Origin admission, CSRF,
+setup-generation and role checks, CIDR policy, stable errors, and redacted
+audit outcomes. There is no second Web authentication authority in Gateway.
+Disabling Web closes both listeners and revokes the in-memory session
+generation while Agent and local Control IPC remain available.
 
-The Agent checks `GET /api/v1/system/health` before reporting a running Gateway
-through local Control API; a live process that fails the probe is `degraded`.
-Non-loopback binds fail closed. A LAN bind is permitted only with the complete
-`[management_lan]` configuration, including a readable PEM certificate and
-private key; it serves HTTPS and never silently downgrades to plaintext HTTP.
+Agent-owned routes are handled before the private Gateway proxy:
+`GET /api/v1/auth/session` bootstraps a local browser session only for a
+loopback peer using an exact local Host. `GET /api/v1/updates` and
+`GET /api/v1/updates/events` expose the durable update-journal projection and
+an Axum-owned SSE namespace even while Gateway is stopped.
+`/api/v1/control/*` is deliberately absent and returns
+`CONTROL_ROUTE_NOT_FOUND`; CLI and Desktop use the independent local framed IPC
+documented in [Local Agent Control IPC](../api/local-control.md). Gateway owns
+domain and durable-Job SSE through `@fastify/sse`. The Agent proxy streams those
+response bodies without reframing them, preserves `Last-Event-ID`, and keeps
+Agent and Gateway event IDs and replay stores in separate route namespaces.
 
-When `[management_lan]` is configured, the Agent's management handler owns the
-browser authentication gate before Agent browser routes or Gateway proxy
-requests. `POST /api/v1/auth/login` accepts only the configured HTTPS Origin and an
-Argon2-verified password, then issues a short-lived Secure/HttpOnly session
-cookie plus CSRF token. Reads require a valid session; writes require the
-session, an allowed Origin, and the CSRF header. Repeated failed logins are
-rate-limited without emitting password or token material. The audit ring is
-bounded and code-only, so it records allow/deny/rate-limit decisions without
-storing source addresses, request payloads, cookies, or credentials.
-The browser cookie and CSRF token never authorize local Control. There is no
-remote Control token, request-signing scheme, HTTPS Control bridge, or raw
-Control protocol forwarding through this listener. Agent-owned Web actions call
-the same application services in-process after their own Web authorization.
+The streaming proxy removes every browser-supplied reserved capability header
+and every hop-by-hop or forwarded header. Only after peer and browser
+authorization does it inject the current Agent-held, memory-only Gateway
+capability. Gateway requires that capability for health, HTTP, and SSE, removes
+it before route handling, and never reflects it. Rotation revokes an old route
+before its port can be reused. If no verified Gateway session is published, the
+Agent returns `GATEWAY_PROXY_UNAVAILABLE` without exposing transport details.
+The Agent checks the same private health route before reporting a running
+Gateway through local Control; a live process that fails the probe is
+`degraded`.
+
+LAN access is an explicit authenticated mode with an optional CIDR allowlist.
+`POST /api/v1/auth/login` accepts only an exact configured Origin and an
+Argon2-verified password, cycles the opaque server-side session ID, and returns
+a separate CSRF token. Cookies are HttpOnly and SameSite=Strict; they are Secure
+when TLS is active. Reads require a valid role/setup generation and writes also
+require an allowed Origin and CSRF token. Login is rate limited by peer address
+without trusting forwarding headers. Disabling LAN, resetting credentials,
+changing setup generation, requiring terms again, restarting Agent, or stopping
+Web invalidates sessions. The bounded code-only audit never stores addresses,
+payloads, cookies, credentials, or precise identity/location values.
+
+TLS is optional for LAN mode. Plain HTTP LAN access carries a persistent warning
+and a redacted audit outcome because credentials and session traffic are not
+encrypted; operators should use TLS, a trusted VPN, or a correctly configured
+reverse proxy on untrusted networks. Docker binds `0.0.0.0:8080` but never
+treats its bridge peer as local, so every Docker browser session requires
+application authentication. No mode permits wildcard Host or wildcard CORS.
+The browser cookie and CSRF token never authorize local Control, and the Web
+listener never forwards the local Control protocol.
 
 `apps/web` is the Vue 3/Vite management shell. It owns presentation-only
 navigation, responsive rail/drawer state, and route composition; it does not

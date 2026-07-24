@@ -219,9 +219,23 @@ const REQUIRED_DOCUMENT_TOKENS = new Map([
       "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
       "762fc01e0e6520b03487c6cc7b4afbafeadc39f10a66fa17def966e9ea428602",
       "ce3d3f9376b9a2552fc22c7d962ee9b25ebeda9e748301284be730fbff21b8f1",
-      "9b234eb100e287daaf76e9cb13cd07a47205e50ea08adadcfe0e97b933fdc5ab",
-      "0da4c2e9cc7770b7cccc23e7ce60799d4f43d21998676db9efebcc67f279f5a3",
+      "d6bfadfa028ad4d128249dc6446f29102039dce5af6fb79e96761de2f2d8706f",
+      "561ce24da4300bc8c4716874931e944d02eab86bea94fc35c558c892e6a2c7e6",
+      "e34a3450f05198d6b7309207587b3f753a089499965e79e751ce0ec785f9de0e",
       "632b3ae7d319aede117c8113b1961e23a331d66972f6b59ff2b548b5fc10ca5f",
+      "canonical-json-v2",
+      "| `axum` |",
+      "axum-server",
+      "tower-http",
+      "tower-sessions",
+      "tower_governor",
+      "@fastify/sse",
+      "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90",
+      "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc",
+      "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233",
+      "518dca34b74a17cadfcee06e616a09d2bd0c3984eff1769e1e76d58df978fc78",
+      "44de9b94d849d3c46e06a883d72d408c2de6403367b39df2b1c9d9e7b6736fe6",
+      "sha512-VLNPXtmmMA2+g5qlTlDhjzZZzFm2tIazfioZ20DyBvs516mcMmDImtjfHN2cCUhf2nfxmWeLK3aMlqv4FSM+5Q==",
       "winapi-util",
       "yauzl",
       "d491d358344f842685c1b1585970999db65fe30ecf7ef3867af8814f4016c016",
@@ -512,15 +526,24 @@ export async function checkDocumentation(repositoryRoot = resolve(".")) {
   errors.push(...gatewayAnalysis.errors);
   checkRouteCoverage(gatewayRoutes, documentedRoutes, "Gateway", errors);
 
-  const agentSource = await readFile(
-    join(repositoryRoot, "apps/agent/src/main.rs"),
-    "utf8",
-  );
+  const [agentSource, agentWebSource] = await Promise.all([
+    readFile(join(repositoryRoot, "apps/agent/src/main.rs"), "utf8"),
+    readFile(join(repositoryRoot, "crates/agent-core/src/web.rs"), "utf8"),
+  ]);
   const controlSource = await readFile(
     join(repositoryRoot, "crates/control-api/src/lib.rs"),
     "utf8",
   );
-  const agentRoutes = extractAgentRoutes(agentSource);
+  const agentRoutes = [
+    ...extractAgentRoutes(agentSource),
+    ...extractAgentRoutes(agentWebSource),
+  ].filter(
+    (route, index, routes) =>
+      routes.findIndex(
+        (candidate) =>
+          candidate.method === route.method && candidate.path === route.path,
+      ) === index,
+  );
   checkRouteCoverage(agentRoutes, documentedRoutes, "Agent", errors);
   checkUnexpectedDocumentedRoutes(
     [...gatewayRoutes, ...agentRoutes],
@@ -895,6 +918,9 @@ function analyzeGatewayRoutes(source) {
 }
 
 export function extractAgentRoutes(agentSource) {
+  const testModule = agentSource.search(/#\[cfg\(test\)\]\s*mod\s+tests\s*\{/);
+  const productionSource =
+    testModule === -1 ? agentSource : agentSource.slice(0, testModule);
   const routes = new Map();
   const addRoute = (method, path) => {
     if (HTTP_METHODS.has(method) && path.startsWith("/api/v1/")) {
@@ -902,15 +928,22 @@ export function extractAgentRoutes(agentSource) {
     }
   };
 
-  for (const match of agentSource.matchAll(
+  for (const match of productionSource.matchAll(
     /\(\s*"([A-Z]+)"\s*,\s*"(\/api\/v1\/[^"\s]+)"\s*\)/g,
   )) {
     addRoute(match[1], match[2]);
   }
-  for (const match of agentSource.matchAll(
+  for (const match of productionSource.matchAll(
     /request\.method\s*==\s*"([A-Z]+)"\s*&&\s*request\.path\s*==\s*"(\/api\/v1\/[^"\s]+)"/g,
   )) {
     addRoute(match[1], match[2]);
+  }
+  for (const match of productionSource.matchAll(
+    /\.route\(\s*"(\/api\/v1\/[^"\s]+)"\s*,\s*(get|post|put|patch|delete|head|options|any)\s*\(/g,
+  )) {
+    const method = match[2].toUpperCase();
+    // `any` is reserved for proxy and deny fallbacks, not a concrete route contract.
+    if (method !== "ANY") addRoute(method, match[1]);
   }
   return [...routes.values()];
 }

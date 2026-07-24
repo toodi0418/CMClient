@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 
-import { checkDocumentation } from "./documentation-contract.mjs";
+import {
+  checkDocumentation,
+  extractAgentRoutes,
+  extractGatewayRoutes,
+} from "./documentation-contract.mjs";
 
 const REPOSITORY_ROOT = resolve(".");
 const FIXTURE_PATHS = [
@@ -25,6 +29,7 @@ const FIXTURE_PATHS = [
   "apps/gateway/src/maintenance.ts",
   "apps/gateway/src/mesh-runtime.ts",
   "apps/gateway/src/proxy/runtime.ts",
+  "crates/agent-core/src/web.rs",
   "crates/control-api/src/lib.rs",
   "docs",
   "package.json",
@@ -34,6 +39,93 @@ const FIXTURE_PATHS = [
 
 test("documentation covers production routes, events, artifacts, and local links", async () => {
   assert.deepEqual(await checkDocumentation(), []);
+});
+
+test("pins Gateway SSE ownership and excludes handwritten wire framing", async () => {
+  const [packageSource, appSource, runtimeDocumentation, eventDocumentation] =
+    await Promise.all([
+      readFile(join(REPOSITORY_ROOT, "apps/gateway/package.json"), "utf8"),
+      readFile(join(REPOSITORY_ROOT, "apps/gateway/src/app.ts"), "utf8"),
+      readFile(
+        join(REPOSITORY_ROOT, "docs/architecture/gateway-runtime.md"),
+        "utf8",
+      ),
+      readFile(join(REPOSITORY_ROOT, "docs/api/events.md"), "utf8"),
+    ]);
+  const gatewayPackage = JSON.parse(packageSource);
+  const normalizedRuntimeDocumentation = runtimeDocumentation.replace(
+    /\s+/g,
+    " ",
+  );
+  const normalizedEventDocumentation = eventDocumentation.replace(/\s+/g, " ");
+
+  assert.equal(gatewayPackage.dependencies?.["@fastify/sse"], "0.5.0");
+  assert.ok(appSource.includes('from "@fastify/sse"'));
+  assert.ok(appSource.includes("app.register(fastifySSE"));
+  const gatewayRouteKeys = new Set(
+    extractGatewayRoutes(appSource).map(
+      ({ method, path }) => `${method} ${path}`,
+    ),
+  );
+  assert.ok(gatewayRouteKeys.has("GET /api/v1/events"));
+  assert.ok(gatewayRouteKeys.has("GET /api/v1/jobs/:jobId/events"));
+
+  for (const token of [
+    "exact `@fastify/sse` `0.5.0` pin",
+    "wire framing",
+    "writable-stream backpressure",
+    "CMClient owns event IDs",
+    "without parsing or reframing",
+    "separate route namespaces, event-ID spaces, and replay stores",
+  ]) {
+    assert.ok(normalizedRuntimeDocumentation.includes(token), token);
+    assert.ok(normalizedEventDocumentation.includes(token), token);
+  }
+
+  const forbiddenFragments = [
+    ["reply", ".hijack"].join(""),
+    ["write", "Head"].join(""),
+    ["format", "Sse"].join(""),
+    ["text/event", "-stream"].join(""),
+    [": heart", "beat\\n\\n"].join(""),
+  ];
+  for (const fragment of forbiddenFragments) {
+    assert.equal(appSource.includes(fragment), false, fragment);
+  }
+});
+
+test("extracts concrete Axum Agent routes and excludes any fallbacks", () => {
+  const routes = extractAgentRoutes(`
+    Router::new()
+      .route("/api/v1/status", get(status))
+      .route(
+        "/api/v1/actions",
+        post(create_action),
+      )
+      .route("/api/v1/config", put(replace_config))
+      .route("/api/v1/config", patch(update_config))
+      .route("/api/v1/config", delete(delete_config))
+      .route("/api/v1/status", head(status_headers))
+      .route("/api/v1/status", options(status_options))
+      .route("/api/v1/{*path}", any(proxy_or_deny));
+
+    #[cfg(test)]
+    mod tests {
+      fn fixture_router() -> Router {
+        Router::new().route("/api/v1/test-only", get(test_only))
+      }
+    }
+  `);
+
+  assert.deepEqual(routes, [
+    { method: "GET", path: "/api/v1/status" },
+    { method: "POST", path: "/api/v1/actions" },
+    { method: "PUT", path: "/api/v1/config" },
+    { method: "PATCH", path: "/api/v1/config" },
+    { method: "DELETE", path: "/api/v1/config" },
+    { method: "HEAD", path: "/api/v1/status" },
+    { method: "OPTIONS", path: "/api/v1/status" },
+  ]);
 });
 
 test("rejects altered GPL license bytes and manifest license drift", async () => {

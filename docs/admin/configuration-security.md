@@ -1,9 +1,5 @@
 # Configuration and Security
 
-> Historical P12 snapshot. Where this file conflicts with
-> [Documentation Authority](../READ_ORDER.md), it is implementation/evidence
-> history rather than the current install or release contract.
-
 The Agent accepts a strict, `deny_unknown_fields` `~/.cmclient/config.toml`.
 Every mutable path is derived from that one home root; arbitrary path overrides
 are rejected. Never put secret values in this file.
@@ -130,35 +126,81 @@ parameters, and values outside those bounds.
 
 ## Management LAN boundary
 
-The default Web listener is loopback HTTP and may be disabled. A non-loopback
-listener requires the complete strict section:
+The Management Web listener may be disabled with
+`agent.management_web_enabled = false`. When enabled, Agent binds separate
+IPv4 `0.0.0.0:<port>` and IPv6 `[::]:<port>` sockets; the IPv6 socket is
+v6-only and address reuse is disabled. The default port is `7080`. Both binds
+must succeed on the same port, so a conflict or unavailable address family
+fails the complete listener start and leaves no partial one-family listener.
+The URL advertised to local clients remains `http://127.0.0.1:7080/` (or the
+configured scheme and port).
+
+Wildcard sockets do not enable wildcard access. Native mode admits only a
+loopback socket peer by default and ignores `Forwarded`, `X-Forwarded-*`, and
+similar client-supplied addresses. LAN access is enabled only by a valid
+`management_lan` section and always requires application authentication. CIDR
+filtering is optional; an empty `allowed_cidrs` list permits any socket peer
+that passes the authenticated LAN policy, so deployments should configure the
+narrowest practical networks:
 
 ```toml
 [management_lan]
-bind = "192.168.1.10"
 port = 7443
+allowed_cidrs = ["192.168.1.0/24"]
+allowed_hosts = ["cmclient.example:7443"]
 password_hash = "$argon2id$..."
-allowed_origins = ["https://cmclient.example"]
+allowed_origins = ["https://cmclient.example:7443"]
 session_ttl_seconds = 3600
 audit_capacity = 512
 certificate_path = "/absolute/path/management-cert.pem"
 private_key_path = "/absolute/path/management-key.pem"
 ```
 
-The certificate and private key must be readable PEM files. TLS is never
-downgraded. Browser login accepts only an allowed HTTPS Origin, verifies the
-Argon2id PHC hash, and issues a short-lived `Secure; HttpOnly; SameSite=Strict`
-session cookie plus a separate CSRF token. Reads require a session; writes
-require the session, matching Origin, and CSRF header. Login attempts and
-sessions are bounded and pruned, and the audit ring stores only stable action
-and result codes.
+`allowed_hosts` adds exact case-insensitive HTTP Host authorities; wildcard,
+missing, duplicated, malformed, or unlisted Host values are rejected before
+static files, login, API, SSE, or proxy handling. The exact authority of every
+`allowed_origins` entry is added to the Host allowlist automatically. An
+optional non-loopback `bind` value is only admission shorthand: it contributes
+one `/32` or `/128` CIDR and its `<address>:<port>` Host authority, but the
+actual sockets remain the two wildcard listeners above.
+
+TLS is optional. `certificate_path` and `private_key_path` must either both be
+absent or both be absolute paths to readable PEM material; invalid material
+fails startup and is never downgraded to HTTP. Without TLS, authenticated LAN
+HTTP remains available but every response carries the stable
+`MANAGEMENT_HTTP_LAN_WARNING`, and Agent records the same code-only audit
+outcome. Use TLS or a trusted private transport wherever credentials or session
+traffic could be observed.
+
+Browser login accepts only an exact configured HTTP or HTTPS Origin, verifies
+the Argon2id PHC hash, cycles the server-side session ID, and returns a separate
+CSRF token. The session cookie is `HttpOnly; SameSite=Strict` and is also
+`Secure` when Agent serves TLS. LAN reads require a valid admin session; writes
+also require an exact allowed Origin and the matching `x-csrf-token` header.
+Native loopback writes use the corresponding exact local Origin, local session,
+and CSRF token. No route emits wildcard CORS. Request and login rate limits are
+keyed from the socket peer, not forwarding headers.
+
+Docker Web startup also requires a valid `management_lan` access controller,
+and Docker never grants the Native loopback/local-session bypass to its bridge
+peer. Its protected APIs therefore always require the authenticated admin
+session, with the same Host, Origin, CSRF, CIDR, and rate policies.
+
+The bounded in-memory audit ring stores only timestamp, stable action, and
+stable outcome code. It never stores the peer address, password, cookie, CSRF
+token, request body, raw header, credential, identity, or location, and it is
+not a persisted audit log. Stopping Web or changing its setup/session generation
+revokes existing sessions while the separate local Control IPC remains
+available.
 
 The Gateway Fastify routes are not an independent LAN security boundary. In a
 native deployment they are bound to an OS-assigned loopback port behind Agent,
 authenticated with a per-generation capability, and never configured or
-published directly. Docker's standalone composition retains its fixed internal
-Ingress as a separate deployment boundary. Do not publish a raw Gateway port
-and assume browser session/CSRF protection still applies.
+published directly. Docker has the same Agent-issued capability boundary; a
+standalone Gateway is not a supported Docker topology. Until the unified Agent
+container entrypoint replaces the superseded multi-service Compose descriptor,
+that descriptor fails closed with `GATEWAY_SUPERVISION_REQUIRED`. Do not
+publish a raw Gateway port and assume browser session/CSRF protection applies.
 
 ## Remote command access
 
@@ -170,9 +212,11 @@ boundary owned by Agent; no Control credential is persisted separately.
 ## Fail-closed rules
 
 Invalid paths, unknown TOML fields (including legacy `gateway_port`), mixed
-transports, missing TLS files, weak Argon2 parameters, invalid origins, expired
-sessions, malformed HMAC headers, replayed nonces or stale ownership proofs,
-insufficient GPS precision, and unprovable position freshness are rejected.
+transports, dual-stack bind conflicts, malformed CIDRs or Host authorities,
+incomplete or invalid TLS material, weak Argon2 parameters, invalid origins,
+expired sessions, missing or mismatched CSRF tokens, malformed HMAC headers,
+replayed nonces or stale ownership proofs, insufficient GPS precision, and
+unprovable position freshness are rejected.
 Secrets and raw packet payloads are redacted from structured logs and
 diagnostics. Error handling uses stable codes and bounded parameters rather
 than backend prose.

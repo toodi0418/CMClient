@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+axum.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cmclient-agent-core = { path = "../../crates/agent-core" }
 cmclient-control-api = { path = "../../crates/control-api" }
@@ -17,10 +18,13 @@ ctrlc = { version = "3.5", features = ["termination"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde = "1"
 serde_json = "1"
+tokio.workspace = true
+tokio-stream = { version = "=0.1.18", features = ["sync"] }
 
 [dev-dependencies]
-argon2 = "0.5"
 cmclient-agent-core = { path = "../../crates/agent-core", features = ["test-support"] }
+http-body-util.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true

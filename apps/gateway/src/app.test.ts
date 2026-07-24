@@ -7,39 +7,51 @@ import {
   GatewayConfigurationError,
   GatewayRuntime,
   createGatewayApp,
-  parseGatewayListenOptions,
 } from "./app";
 import { MemoryLogger, redact } from "./observability";
 import {
   DEFAULT_EVENT_PAYLOAD_MAX_BYTES,
   DEFAULT_SSE_FRAME_MAX_BYTES,
   DomainEventBus,
+  formatSseEvent,
 } from "./events";
 import { JobEngine, JobQueueFullError } from "./jobs";
 import { GatewayDatabase } from "./persistence/database";
 import { GATEWAY_CAPABILITY_HEADER } from "./bootstrap";
 
 describe("GatewayRuntime", () => {
-  it("fails closed for a non-loopback bind", () => {
-    expect(() =>
-      parseGatewayListenOptions({ CMCLIENT_GATEWAY_HOST: "0.0.0.0" }),
-    ).toThrow(GatewayConfigurationError);
+  it("allows only an OS-assigned IPv4 loopback bind", () => {
+    for (const options of [
+      { host: "0.0.0.0", port: 0 },
+      { host: "localhost", port: 0 },
+      { host: "::1", port: 0 },
+      { host: "127.0.0.1", port: 8081 },
+    ]) {
+      expect(() => new GatewayRuntime(options)).toThrow(
+        GatewayConfigurationError,
+      );
+    }
   });
 
-  it("allows a wildcard bind only for the constrained Docker runtime", () => {
-    expect(
-      parseGatewayListenOptions({
-        CMCLIENT_RUNTIME_PROFILE: "docker",
-        CMCLIENT_GATEWAY_HOST: "0.0.0.0",
-        CMCLIENT_GATEWAY_PORT: "8081",
-      }),
-    ).toEqual({ host: "0.0.0.0", port: 8081 });
-    expect(() =>
-      parseGatewayListenOptions({
-        CMCLIENT_RUNTIME_PROFILE: "native",
-        CMCLIENT_GATEWAY_HOST: "0.0.0.0",
-      }),
-    ).toThrow(GatewayConfigurationError);
+  it("requires a valid private capability in the production runtime", () => {
+    for (const capability of [undefined, "", "g".repeat(64), "c".repeat(63)]) {
+      expect(
+        () =>
+          new GatewayRuntime(
+            { host: "127.0.0.1", port: 0 },
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            capability === undefined ? undefined : { capability },
+          ),
+      ).toThrow(GatewayAccessConfigurationError);
+    }
   });
 
   it("propagates request IDs and redacts structured fields", async () => {
@@ -123,6 +135,42 @@ describe("GatewayRuntime", () => {
     await app.close();
   });
 
+  it("normalizes Fastify validation, routing, and SSE negotiation errors", async () => {
+    const app = createGatewayApp(new MemoryLogger());
+    const responses = await Promise.all([
+      app.inject("/api/v1/nodes?limit=0"),
+      app.inject("/api/v1/not-a-route"),
+      app.inject({ method: "POST", url: "/api/v1/system/health" }),
+      app.inject({
+        method: "GET",
+        url: "/api/v1/events",
+        headers: { accept: "application/json" },
+      }),
+    ]);
+    const expected = [
+      [400, "GATEWAY_REQUEST_SCHEMA_INVALID"],
+      [404, "GATEWAY_ROUTE_NOT_FOUND"],
+      [405, "GATEWAY_METHOD_NOT_ALLOWED"],
+      [406, "GATEWAY_SSE_NOT_ACCEPTABLE"],
+    ] as const;
+
+    for (const [index, response] of responses.entries()) {
+      const [statusCode, code] = expected[index] ?? [];
+      const traceId = response.headers["x-trace-id"];
+      expect(response.statusCode).toBe(statusCode);
+      expect(response.json()).toEqual({ code, params: {}, traceId });
+      expect(Object.keys(response.json()).sort()).toEqual([
+        "code",
+        "params",
+        "traceId",
+      ]);
+      expect(response.body).not.toContain("message");
+      expect(response.body).not.toContain("Not Acceptable");
+    }
+    expect(responses[2]?.headers.allow).toContain("GET");
+    await app.close();
+  });
+
   it("rejects direct and spoofed access on health, HTTP, SSE, and unmatched routes", async () => {
     const capability = "c".repeat(64);
     const app = createGatewayApp(
@@ -146,7 +194,11 @@ describe("GatewayRuntime", () => {
     ]) {
       const direct = await app.inject({ method: "GET", url });
       expect(direct.statusCode, url).toBe(403);
-      expect(direct.json()).toEqual({ code: "GATEWAY_CAPABILITY_REJECTED" });
+      expect(direct.json()).toEqual({
+        code: "GATEWAY_CAPABILITY_REJECTED",
+        params: {},
+        traceId: direct.headers["x-trace-id"],
+      });
 
       const spoofed = await app.inject({
         method: "GET",
@@ -439,7 +491,9 @@ describe("GatewayRuntime", () => {
       source: "gateway",
       payload: { port: 4810 },
     });
-    const app = createGatewayApp(new MemoryLogger(), undefined, events);
+    const app = createGatewayApp(new MemoryLogger(), undefined, events, {
+      heartbeatIntervalMs: 1_000,
+    });
     await app.listen({ host: "127.0.0.1", port: 0 });
     const address = app.server.address();
     if (!address || typeof address === "string") {
@@ -475,7 +529,9 @@ describe("GatewayRuntime", () => {
         ),
       },
     });
-    const app = createGatewayApp(logger, undefined, events);
+    const app = createGatewayApp(logger, undefined, events, {
+      heartbeatIntervalMs: 1_000,
+    });
     await app.listen({ host: "127.0.0.1", port: 0 });
     const address = app.server.address();
     if (!address || typeof address === "string") {
@@ -506,23 +562,40 @@ describe("GatewayRuntime", () => {
     }
   });
 
-  it("closes a replay client when bounded SSE buffering is exhausted", async () => {
+  it("replays multiple near-limit events before live events without sharing the live buffer", async () => {
     let sequence = 0;
     const logger = new MemoryLogger();
     const events = new DomainEventBus({
       eventIdFactory: () => `burst-${++sequence}`,
     });
+    const checkpoint = events.publish({
+      type: "gateway.checkpoint",
+      source: "gateway",
+      payload: {},
+    });
     const sample = "x".repeat(
       DEFAULT_EVENT_PAYLOAD_MAX_BYTES -
         Buffer.byteLength('{"sample":""}', "utf8"),
     );
-    for (let index = 0; index < 32; index += 1) {
+    const replay = [
       events.publish({
         type: "gateway.load_sample",
         source: "gateway",
         payload: { sample },
-      });
-    }
+      }),
+      events.publish({
+        type: "gateway.load_sample",
+        source: "gateway",
+        payload: { sample },
+      }),
+    ];
+    expect(
+      replay.reduce(
+        (bytes, event) =>
+          bytes + Buffer.byteLength(formatSseEvent(event), "utf8"),
+        0,
+      ),
+    ).toBeGreaterThan(DEFAULT_SSE_FRAME_MAX_BYTES);
     const app = createGatewayApp(logger, undefined, events);
     await app.listen({ host: "127.0.0.1", port: 0 });
     const address = app.server.address();
@@ -532,13 +605,81 @@ describe("GatewayRuntime", () => {
 
     let stream: Awaited<ReturnType<typeof openSse>> | undefined;
     try {
-      stream = await openSse(address.port, "/api/v1/events", "missing");
-      const responseClosed = stream.response.destroyed
-        ? Promise.resolve()
-        : new Promise<void>((resolve) => {
-            stream?.response.once("error", () => resolve());
-            stream?.response.once("close", () => resolve());
-          });
+      stream = await openSse(
+        address.port,
+        "/api/v1/events",
+        checkpoint.eventId,
+      );
+      const live = events.publish({
+        type: "gateway.live",
+        source: "gateway",
+        payload: {},
+      });
+      const body = await settlesWithin(
+        readUntil(stream.response, `id: ${live.eventId}`),
+        2_000,
+      );
+      const firstReplay = body.indexOf(`id: ${replay[0]?.eventId}`);
+      const secondReplay = body.indexOf(`id: ${replay[1]?.eventId}`);
+      const liveEvent = body.indexOf(`id: ${live.eventId}`);
+
+      expect(firstReplay).toBeGreaterThanOrEqual(0);
+      expect(secondReplay).toBeGreaterThan(firstReplay);
+      expect(liveEvent).toBeGreaterThan(secondReplay);
+      expect(events.metricsSnapshot.subscriberCount).toBe(1);
+      expect(logger.entries).not.toContainEqual(
+        expect.objectContaining({
+          fields: { reason: "SSE_SLOW_CONSUMER" },
+        }),
+      );
+    } finally {
+      stream?.request.destroy();
+      stream?.response.destroy();
+      await app.close();
+    }
+  });
+
+  it("closes a live SSE client when its bounded pending queue is exhausted", async () => {
+    let sequence = 0;
+    const logger = new MemoryLogger();
+    const events = new DomainEventBus({
+      eventIdFactory: () => `live-burst-${++sequence}`,
+    });
+    const checkpoint = events.publish({
+      type: "gateway.checkpoint",
+      source: "gateway",
+      payload: {},
+    });
+    const sample = "x".repeat(
+      DEFAULT_EVENT_PAYLOAD_MAX_BYTES -
+        Buffer.byteLength('{"sample":""}', "utf8"),
+    );
+    const app = createGatewayApp(logger, undefined, events);
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Gateway did not bind a TCP address");
+    }
+
+    let stream: Awaited<ReturnType<typeof openSse>> | undefined;
+    try {
+      stream = await openSse(
+        address.port,
+        "/api/v1/events",
+        checkpoint.eventId,
+      );
+      const responseClosed = new Promise<void>((resolve) => {
+        stream?.response.once("error", () => resolve());
+        stream?.response.once("close", () => resolve());
+      });
+      stream.response.resume();
+      for (let index = 0; index < 3; index += 1) {
+        events.publish({
+          type: "gateway.load_sample",
+          source: "gateway",
+          payload: { sample },
+        });
+      }
       await settlesWithin(responseClosed, 1_000);
 
       expect(events.metricsSnapshot.subscriberCount).toBe(0);
@@ -651,7 +792,19 @@ describe("GatewayRuntime", () => {
   });
 
   it("listens and closes gracefully", async () => {
-    const runtime = new GatewayRuntime({ host: "127.0.0.1", port: 0 });
+    const runtime = new GatewayRuntime(
+      { host: "127.0.0.1", port: 0 },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { capability: "c".repeat(64) },
+    );
     let closed = false;
     runtime.app.addHook("onClose", () => {
       closed = true;
@@ -673,10 +826,22 @@ describe("GatewayRuntime", () => {
       logger,
       undefined,
       events,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { capability: "c".repeat(64) },
     );
     const address = await runtime.start();
-    const stream = await openSse(address.port, "/api/v1/events", "missing");
-    await readUntil(stream.response, ": heartbeat\n\n");
+    const stream = await openSse(
+      address.port,
+      "/api/v1/events",
+      "missing",
+      "c".repeat(64),
+    );
+    stream.response.resume();
     expect(events.metricsSnapshot.subscriberCount).toBe(1);
     const responseClosed = new Promise<void>((resolve) => {
       stream.response.once("close", resolve);
@@ -708,13 +873,17 @@ function openSse(
   port: number,
   path: string,
   lastEventId: string,
+  capability?: string,
 ): Promise<{ request: ReturnType<typeof request>; response: IncomingMessage }> {
   return new Promise((resolve, reject) => {
     const client = request({
       host: "127.0.0.1",
       port,
       path,
-      headers: { "last-event-id": lastEventId },
+      headers: {
+        "last-event-id": lastEventId,
+        ...(capability ? { [GATEWAY_CAPABILITY_HEADER]: capability } : {}),
+      },
     });
     client.once("response", (response) =>
       resolve({ request: client, response }),

@@ -1,4 +1,4 @@
-import { GatewayRuntime, parseGatewayListenOptions } from "./app.js";
+import { GatewayRuntime } from "./app.js";
 import { createVerifiedGatewayBackup } from "./backup.js";
 import { DomainEventBus } from "./events.js";
 import { JobEngine } from "./jobs.js";
@@ -26,19 +26,19 @@ import {
 import { TcpMeshtasticTransport } from "./transport/tcp.js";
 import { compiledGatewayBuildVersion } from "./system.js";
 import {
+  GatewayBootstrapError,
   readGatewayBootstrap,
   registerGatewayOwnershipProofEndpoint,
   startSupervisedGateway,
-  type GatewayBootstrapFrame,
 } from "./bootstrap.js";
 import { ConsoleStructuredLogger } from "./observability.js";
 import { gatewayRuntimePaths } from "./runtime-paths.js";
 
 export async function runGateway(): Promise<void> {
-  const supervised = process.env.CMCLIENT_SUPERVISED === "1";
-  const bootstrap: GatewayBootstrapFrame | undefined = supervised
-    ? await readGatewayBootstrap(process.stdin)
-    : undefined;
+  if (process.env.CMCLIENT_SUPERVISED !== "1") {
+    throw new GatewayBootstrapError("GATEWAY_SUPERVISION_REQUIRED");
+  }
+  const bootstrap = await readGatewayBootstrap(process.stdin);
   let database: GatewayDatabase | undefined;
   let events: DomainEventBus | undefined;
   let jobs: JobEngine | undefined;
@@ -97,25 +97,22 @@ export async function runGateway(): Promise<void> {
 
   process.once("SIGINT", terminateAfterShutdown);
   process.once("SIGTERM", terminateAfterShutdown);
-  if (supervised) {
-    const supervisorInput = createGatewaySupervisorShutdownInput(
-      terminateAfterShutdown,
-    );
-    const onData = (chunk: Buffer | string): void =>
-      supervisorInput.push(chunk);
-    const onEnd = (): void => supervisorInput.end();
-    process.stdin.on("data", onData);
-    process.stdin.once("end", onEnd);
-    process.stdin.once("error", onEnd);
-    process.stdin.resume();
-    detachSupervisorInput = () => {
-      process.stdin.off("data", onData);
-      process.stdin.off("end", onEnd);
-      process.stdin.off("error", onEnd);
-      process.stdin.pause();
-      detachSupervisorInput = (): void => undefined;
-    };
-  }
+  const supervisorInput = createGatewaySupervisorShutdownInput(
+    terminateAfterShutdown,
+  );
+  const onData = (chunk: Buffer | string): void => supervisorInput.push(chunk);
+  const onEnd = (): void => supervisorInput.end();
+  process.stdin.on("data", onData);
+  process.stdin.once("end", onEnd);
+  process.stdin.once("error", onEnd);
+  process.stdin.resume();
+  detachSupervisorInput = () => {
+    process.stdin.off("data", onData);
+    process.stdin.off("end", onEnd);
+    process.stdin.off("error", onEnd);
+    process.stdin.pause();
+    detachSupervisorInput = (): void => undefined;
+  };
 
   const startup = await lifecycle.start(async (context) => {
     const paths = gatewayRuntimePaths(process.env);
@@ -157,14 +154,11 @@ export async function runGateway(): Promise<void> {
       callMeshOptionsFromRuntime(
         process.env,
         compiledGatewayBuildVersion(),
-        bootstrap?.callMeshApiKey,
+        bootstrap.callMeshApiKey,
       ),
       activeDatabase.callmeshMappings,
     );
     context.throwIfShutdownRequested();
-    const listenOptions = bootstrap
-      ? { host: "127.0.0.1", port: 0 }
-      : parseGatewayListenOptions(process.env);
     const verifiedAprsState = () => callmesh.getAprsState();
 
     proxy = await createConfiguredProxyRuntime(process.env, activeEvents);
@@ -191,8 +185,8 @@ export async function runGateway(): Promise<void> {
     context.throwIfShutdownRequested();
 
     const activeRuntime = new GatewayRuntime(
-      listenOptions,
-      bootstrap ? new ConsoleStructuredLogger(process.stderr) : undefined,
+      { host: "127.0.0.1", port: 0 },
+      new ConsoleStructuredLogger(process.stderr),
       undefined,
       activeEvents,
       {
@@ -239,7 +233,7 @@ export async function runGateway(): Promise<void> {
             failedOutbox: 0,
           },
       },
-      bootstrap ? { capability: bootstrap.capability } : undefined,
+      { capability: bootstrap.capability },
     );
     runtime = activeRuntime;
     context.throwIfShutdownRequested();
@@ -259,27 +253,21 @@ export async function runGateway(): Promise<void> {
       context.throwIfShutdownRequested();
     };
 
-    if (bootstrap) {
-      await startSupervisedGateway(
-        process.stdout,
-        bootstrap,
-        async () => {
-          const address = await activeRuntime.start();
-          context.throwIfShutdownRequested();
-          registerGatewayOwnershipProofEndpoint(
-            activeRuntime.app.server,
-            bootstrap,
-            address,
-          );
-          return address;
-        },
-        startExternalRuntimes,
-      );
-    } else {
-      await startExternalRuntimes();
-      await activeRuntime.start();
-      context.throwIfShutdownRequested();
-    }
+    await startSupervisedGateway(
+      process.stdout,
+      bootstrap,
+      async () => {
+        const address = await activeRuntime.start();
+        context.throwIfShutdownRequested();
+        registerGatewayOwnershipProofEndpoint(
+          activeRuntime.app.server,
+          bootstrap,
+          address,
+        );
+        return address;
+      },
+      startExternalRuntimes,
+    );
 
     callmeshTimer = setInterval(() => {
       void callmeshRefresh.run(async () => {

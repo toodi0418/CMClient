@@ -2,6 +2,8 @@ import { setManagementCsrfToken } from "@cmclient/api-client";
 import { defineStore } from "pinia";
 
 const LOGIN_URL = "/api/v1/auth/login";
+const LOCAL_SESSION_URL = "/api/v1/auth/session";
+const LOCAL_SESSION_DENIED = "MANAGEMENT_LOCAL_SESSION_DENIED";
 const SESSION_ERROR_CODES = new Set([
   "MANAGEMENT_SESSION_INVALID",
   "MANAGEMENT_SESSION_EXPIRED",
@@ -18,6 +20,7 @@ export class ManagementAuthError extends Error {
 }
 
 export interface ManagementAuthClient {
+  localSession(): Promise<{ csrfToken: string; expiresAt: number }>;
   login(password: string): Promise<{ csrfToken: string; expiresAt: number }>;
 }
 
@@ -27,20 +30,35 @@ export class BrowserManagementAuthClient implements ManagementAuthClient {
       globalThis.fetch(input, init),
   ) {}
 
+  async localSession(): Promise<{ csrfToken: string; expiresAt: number }> {
+    return this.requestSession(LOCAL_SESSION_URL, {
+      method: "GET",
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+    });
+  }
+
   async login(
     password: string,
   ): Promise<{ csrfToken: string; expiresAt: number }> {
+    return this.requestSession(LOGIN_URL, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ password }),
+    });
+  }
+
+  private async requestSession(
+    url: string,
+    init: RequestInit,
+  ): Promise<{ csrfToken: string; expiresAt: number }> {
     let response: Response;
     try {
-      response = await this.fetchImplementation(LOGIN_URL, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: {
-          accept: "application/json",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ password }),
-      });
+      response = await this.fetchImplementation(url, init);
     } catch {
       throw new ManagementAuthError("MANAGEMENT_AUTH_UNAVAILABLE");
     }
@@ -67,10 +85,32 @@ export function createManagementAuthStore(
       csrfToken: undefined as string | undefined,
       expiresAt: undefined as number | undefined,
       loading: false,
+      initialized: false,
       errorCode: undefined as string | undefined,
       required: false,
     }),
     actions: {
+      async initialize() {
+        if (this.loading || this.initialized) {
+          return;
+        }
+        this.loading = true;
+        this.errorCode = undefined;
+        try {
+          this.applySession(await client.localSession());
+        } catch (error) {
+          const code =
+            error instanceof ManagementAuthError
+              ? error.code
+              : "MANAGEMENT_AUTH_UNAVAILABLE";
+          this.errorCode = code;
+          this.required = code === LOCAL_SESSION_DENIED;
+          setManagementCsrfToken(undefined);
+        } finally {
+          this.initialized = true;
+          this.loading = false;
+        }
+      },
       requireLogin() {
         this.csrfToken = undefined;
         this.expiresAt = undefined;
@@ -84,11 +124,7 @@ export function createManagementAuthStore(
         this.loading = true;
         this.errorCode = undefined;
         try {
-          const session = await client.login(password);
-          this.csrfToken = session.csrfToken;
-          this.expiresAt = session.expiresAt;
-          this.required = false;
-          setManagementCsrfToken(session.csrfToken);
+          this.applySession(await client.login(password));
         } catch (error) {
           this.errorCode =
             error instanceof ManagementAuthError
@@ -97,6 +133,13 @@ export function createManagementAuthStore(
         } finally {
           this.loading = false;
         }
+      },
+      applySession(session: { csrfToken: string; expiresAt: number }) {
+        this.csrfToken = session.csrfToken;
+        this.expiresAt = session.expiresAt;
+        this.required = false;
+        this.errorCode = undefined;
+        setManagementCsrfToken(session.csrfToken);
       },
     },
   });

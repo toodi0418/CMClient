@@ -1,56 +1,215 @@
-use rustls::{
-    ServerConfig, ServerConnection, StreamOwned,
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+use crate::access::{ManagementAccessController, ManagementAccessError};
+use axum::{
+    Json, Router,
+    body::Body,
+    error_handling::HandleErrorLayer,
+    extract::{ConnectInfo, Extension, Request, rejection::JsonRejection},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{any, get, post},
 };
+use bytes::Bytes;
+use hyper::body::{Body as HttpBody, Frame};
+use hyper_util::{
+    client::legacy::{Client, connect::HttpConnector},
+    rt::TokioExecutor,
+};
+use ipnet::IpNet;
+use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    collections::BTreeMap,
+    collections::BTreeSet,
     fmt,
-    io::{self, Read, Write},
-    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
+    pin::Pin,
+    str::FromStr,
     sync::{
-        Arc, Mutex, RwLock, RwLockReadGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use time::Duration as CookieDuration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
+use tower::{
+    BoxError, ServiceBuilder, ServiceExt, limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer,
+};
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor,
+};
+use tower_http::{
+    limit::RequestBodyLimitLayer,
+    request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
+    services::{ServeDir, ServeFile},
+    timeout::{RequestBodyTimeoutLayer, TimeoutError},
+    trace::TraceLayer,
+};
+use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer, cookie::SameSite};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-const MAX_GATEWAY_HEALTH_RESPONSE_BYTES: usize = 4096;
-const MAX_ACTIVE_CONNECTIONS: usize = 64;
-const GATEWAY_TIMEOUT: Duration = Duration::from_secs(2);
-const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const PROXY_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CONNECTION_LIMIT_BODY: &str = r#"{"code":"MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED"}"#;
+const GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const GATEWAY_LEASE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const WEB_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const SESSION_AUTHENTICATED: &str = "management.authenticated";
+const SESSION_CSRF: &str = "management.csrf";
+const SESSION_EXPIRES_AT: &str = "management.expires_at";
+const SESSION_GENERATION: &str = "management.generation";
+const SESSION_ROLE: &str = "management.role";
+const SESSION_SETUP_GENERATION: &str = "management.setup_generation";
+const SESSION_COOKIE_NAME: &str = "cmclient.sid";
+const CSRF_HEADER_NAME: &str = "x-csrf-token";
+const LOGIN_MAX_PASSWORD_BYTES: usize = 1024;
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_millis(50);
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
+const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_REQUEST_HEADERS: usize = 64;
+const MAX_HTTP1_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_CONCURRENT_REQUESTS: usize = 64;
+const MAX_RESPONSE_BODIES: usize = 64;
 pub const GATEWAY_CAPABILITY_HEADER: &str = "x-cmclient-gateway-capability";
+const AUTH_CACHE_CONTROL: &str = "no-store";
+const SHELL_CACHE_CONTROL: &str = "no-cache";
+const IMMUTABLE_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const MANAGEMENT_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; style-src-elem 'self' 'unsafe-inline'; \
+     style-src-attr 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'";
+
+const GATEWAY_REQUEST_HEADER_ALLOWLIST: &[&str] = &[
+    "accept",
+    "content-type",
+    "content-length",
+    "last-event-id",
+    "x-trace-id",
+    "x-correlation-id",
+    "idempotency-key",
+    "range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+];
+const GATEWAY_RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "content-disposition",
+    "cache-control",
+    "etag",
+    "last-modified",
+    "content-range",
+    "accept-ranges",
+    "retry-after",
+    "x-trace-id",
+];
+
+static NEXT_WEB_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct GatewayLeaseState {
+    active: bool,
+    readers: usize,
+}
 
 #[derive(Debug)]
 struct GatewayRouteLease {
-    active: RwLock<bool>,
+    state: Mutex<GatewayLeaseState>,
+    drained: Condvar,
+    cancelled: CancellationToken,
 }
 
 impl GatewayRouteLease {
     fn new() -> Self {
         Self {
-            active: RwLock::new(true),
+            state: Mutex::new(GatewayLeaseState {
+                active: true,
+                readers: 0,
+            }),
+            drained: Condvar::new(),
+            cancelled: CancellationToken::new(),
         }
     }
 
-    fn acquire(&self) -> Option<RwLockReadGuard<'_, bool>> {
-        let guard = self
-            .active
-            .read()
+    fn acquire(self: &Arc<Self>) -> Option<GatewayLeaseToken> {
+        let mut state = self
+            .state
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (*guard).then_some(guard)
+        if !state.active {
+            return None;
+        }
+        state.readers = state.readers.saturating_add(1);
+        Some(GatewayLeaseToken {
+            lease: Arc::clone(self),
+        })
     }
 
-    fn revoke(&self) {
-        *self
+    fn is_active(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+
+    fn deactivate(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = false;
+        self.cancelled.cancel();
+    }
+
+    fn drain(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now() + GATEWAY_LEASE_DRAIN_TIMEOUT;
+        while state.readers != 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, wait_result) = self
+                .drained
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if wait_result.timed_out() {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GatewayLeaseToken {
+    lease: Arc<GatewayRouteLease>,
+}
+
+impl Drop for GatewayLeaseToken {
+    fn drop(&mut self) {
+        let mut state = self
+            .lease
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.readers = state.readers.saturating_sub(1);
+        if state.readers == 0 {
+            self.lease.drained.notify_all();
+        }
     }
 }
 
@@ -67,7 +226,7 @@ impl GatewayRoute {
         capability: impl Into<String>,
     ) -> Result<Self, ManagementWebError> {
         let capability = Zeroizing::new(capability.into());
-        if address.ip() != IpAddr::from([127, 0, 0, 1])
+        if address.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST)
             || address.port() == 0
             || !valid_gateway_capability(&capability)
         {
@@ -84,23 +243,17 @@ impl GatewayRoute {
         self.address
     }
 
-    /// Reports whether this route still belongs to the current Gateway session.
-    ///
-    /// Callers that send the capability should use [`GatewayRoute::active`] so the session
-    /// cannot be revoked between checking this value and writing the secret to the socket.
     pub fn is_active(&self) -> bool {
-        self.lease.acquire().is_some()
+        self.lease.is_active()
     }
 
-    pub fn active(&self) -> Option<ActiveGatewayRoute<'_>> {
+    pub fn active(&self) -> Option<ActiveGatewayRoute> {
         self.lease.acquire().map(|lease| ActiveGatewayRoute {
-            route: self,
+            address: self.address,
+            capability: Arc::clone(&self.capability),
+            cancellation: self.lease.cancelled.clone(),
             _lease: lease,
         })
-    }
-
-    fn revoke(&self) {
-        self.lease.revoke();
     }
 }
 
@@ -114,35 +267,42 @@ impl PartialEq for GatewayRoute {
 
 impl Eq for GatewayRoute {}
 
-pub struct ActiveGatewayRoute<'a> {
-    route: &'a GatewayRoute,
-    _lease: RwLockReadGuard<'a, bool>,
-}
-
-impl ActiveGatewayRoute<'_> {
-    pub const fn address(&self) -> SocketAddr {
-        self.route.address
-    }
-
-    pub fn capability(&self) -> &str {
-        self.route.capability.as_str()
-    }
-}
-
-impl fmt::Debug for ActiveGatewayRoute<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ActiveGatewayRoute")
-            .field("address", &self.route.address)
-            .field("capability", &"[REDACTED]")
-            .finish()
-    }
-}
-
 impl fmt::Debug for GatewayRoute {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GatewayRoute")
+            .field("address", &self.address)
+            .field("capability", &"[REDACTED]")
+            .field("active", &self.is_active())
+            .finish()
+    }
+}
+
+pub struct ActiveGatewayRoute {
+    address: SocketAddr,
+    capability: Arc<Zeroizing<String>>,
+    cancellation: CancellationToken,
+    _lease: GatewayLeaseToken,
+}
+
+impl ActiveGatewayRoute {
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub fn capability(&self) -> &str {
+        self.capability.as_str()
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+impl fmt::Debug for ActiveGatewayRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveGatewayRoute")
             .field("address", &self.address)
             .field("capability", &"[REDACTED]")
             .finish()
@@ -166,23 +326,34 @@ impl GatewaySessionHandle {
     }
 
     pub fn set(&self, route: GatewayRoute) {
-        let mut current = self
-            .route
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(previous) = current.take() {
-            previous.revoke();
+        let previous = {
+            let mut current = self
+                .route
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(previous) = current.as_ref() {
+                previous.lease.deactivate();
+            }
+            current.replace(route)
+        };
+        if let Some(previous) = previous {
+            previous.lease.drain();
         }
-        *current = route.is_active().then_some(route);
     }
 
     pub fn clear(&self) {
-        let mut current = self
-            .route
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(previous) = current.take() {
-            previous.revoke();
+        let previous = {
+            let mut current = self
+                .route
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(previous) = current.as_ref() {
+                previous.lease.deactivate();
+            }
+            current.take()
+        };
+        if let Some(previous) = previous {
+            previous.lease.drain();
         }
     }
 
@@ -192,6 +363,10 @@ impl GatewaySessionHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .filter(GatewayRoute::is_active)
+    }
+
+    fn active(&self) -> Option<ActiveGatewayRoute> {
+        self.snapshot()?.active()
     }
 }
 
@@ -204,62 +379,22 @@ impl fmt::Debug for GatewaySessionHandle {
     }
 }
 
-#[derive(Clone)]
-enum GatewayRouteSource {
-    Static {
-        address: SocketAddr,
-        capability: Option<Arc<Zeroizing<String>>>,
-    },
-    Dynamic(GatewaySessionHandle),
-}
-
-#[derive(Clone)]
-struct ResolvedGatewayRoute {
-    address: SocketAddr,
-    capability: Option<Arc<Zeroizing<String>>>,
-    lease: Option<Arc<GatewayRouteLease>>,
-}
-
-impl ResolvedGatewayRoute {
-    fn acquire(&self) -> Option<Option<RwLockReadGuard<'_, bool>>> {
-        self.lease
-            .as_ref()
-            .map_or(Some(None), |lease| lease.acquire().map(Some))
-    }
-}
-
-impl GatewayRouteSource {
-    fn dynamic(session: GatewaySessionHandle) -> Self {
-        Self::Dynamic(session)
-    }
-
-    fn snapshot(&self) -> Option<ResolvedGatewayRoute> {
-        match self {
-            Self::Static {
-                address,
-                capability,
-            } => Some(ResolvedGatewayRoute {
-                address: *address,
-                capability: capability.clone(),
-                lease: None,
-            }),
-            Self::Dynamic(session) => session.snapshot().map(|route| ResolvedGatewayRoute {
-                address: route.address,
-                capability: Some(Arc::clone(&route.capability)),
-                lease: Some(Arc::clone(&route.lease)),
-            }),
-        }
-    }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManagementWebProfile {
+    #[default]
+    Native,
+    Docker,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ManagementWebConfig {
     pub enabled: bool,
-    pub bind: IpAddr,
     pub port: u16,
-    pub gateway: SocketAddr,
-    pub gateway_capability: Option<String>,
+    pub profile: ManagementWebProfile,
+    pub setup_generation: u64,
     pub allow_lan: bool,
+    pub allowed_cidrs: Vec<String>,
+    pub allowed_hosts: BTreeSet<String>,
     pub tls: Option<ManagementTlsConfig>,
     pub static_web_root: Option<PathBuf>,
 }
@@ -269,17 +404,31 @@ impl fmt::Debug for ManagementWebConfig {
         formatter
             .debug_struct("ManagementWebConfig")
             .field("enabled", &self.enabled)
-            .field("bind", &self.bind)
             .field("port", &self.port)
-            .field("gateway", &self.gateway)
-            .field(
-                "gateway_capability",
-                &self.gateway_capability.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("profile", &self.profile)
+            .field("setup_generation", &self.setup_generation)
             .field("allow_lan", &self.allow_lan)
+            .field("allowed_cidrs", &self.allowed_cidrs)
+            .field("allowed_hosts", &self.allowed_hosts)
             .field("tls", &self.tls)
             .field("static_web_root", &self.static_web_root)
             .finish()
+    }
+}
+
+impl Default for ManagementWebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 7080,
+            profile: ManagementWebProfile::Native,
+            setup_generation: 1,
+            allow_lan: false,
+            allowed_cidrs: Vec::new(),
+            allowed_hosts: BTreeSet::new(),
+            tls: None,
+            static_web_root: None,
+        }
     }
 }
 
@@ -289,25 +438,11 @@ pub struct ManagementTlsConfig {
     pub private_key_path: PathBuf,
 }
 
-impl Default for ManagementWebConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            bind: IpAddr::from([127, 0, 0, 1]),
-            port: 7080,
-            gateway: SocketAddr::from(([127, 0, 0, 1], 4810)),
-            gateway_capability: None,
-            allow_lan: false,
-            tls: None,
-            static_web_root: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagementWebError {
     Disabled,
     NonLoopbackBind,
+    InvalidConfiguration,
     Io,
     InvalidHttp,
     RequestTooLarge,
@@ -319,6 +454,7 @@ impl ManagementWebError {
         match self {
             Self::Disabled => "MANAGEMENT_WEB_DISABLED",
             Self::NonLoopbackBind => "MANAGEMENT_WEB_NON_LOOPBACK_DENIED",
+            Self::InvalidConfiguration => "MANAGEMENT_WEB_CONFIGURATION_INVALID",
             Self::Io => "MANAGEMENT_WEB_IO_FAILED",
             Self::InvalidHttp => "MANAGEMENT_WEB_HTTP_INVALID",
             Self::RequestTooLarge => "MANAGEMENT_WEB_REQUEST_TOO_LARGE",
@@ -327,2395 +463,2810 @@ impl ManagementWebError {
     }
 }
 
-/// Handles a small Agent-owned API surface before a request is forwarded to Gateway.
-///
-/// The management listener remains transport-only: ownership of the actual state stays with
-/// the Agent application that installs this handler.
-pub trait ManagementWebApiHandler: Send + Sync {
-    /// Returns `true` after writing a complete response to `client`.
-    fn handle(
-        &self,
-        client: &mut dyn ManagementWebStream,
-        request: &ManagementWebRequest,
-    ) -> Result<bool, ManagementWebError>;
-}
-
-pub trait ManagementWebStream: Read + Write {}
-
-impl<T: Read + Write> ManagementWebStream for T {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagementWebRequest {
-    pub method: String,
-    pub path: String,
-    pub headers: BTreeMap<String, String>,
-    pub body: Vec<u8>,
-    pub remote_addr: SocketAddr,
-}
-
-impl ManagementWebRequest {
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .get(&name.to_ascii_lowercase())
-            .map(String::as_str)
+impl fmt::Display for ManagementWebError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
     }
 }
 
-pub struct ManagementWebListener {
-    listener: TcpListener,
-    gateway_route: GatewayRouteSource,
-    api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
-    tls: Option<Arc<ServerConfig>>,
+impl std::error::Error for ManagementWebError {}
+
+type GatewayClient = Client<HttpConnector, Body>;
+
+struct WebPolicy {
+    profile: ManagementWebProfile,
+    allow_lan: bool,
+    allowed_cidrs: Vec<IpNet>,
+    allowed_hosts: BTreeSet<String>,
+    local_hosts: BTreeSet<String>,
+    allowed_local_origins: BTreeSet<String>,
+    http_lan_warning: bool,
     static_web_root: Option<PathBuf>,
+    access: Option<Arc<ManagementAccessController>>,
+    generation: Arc<AtomicU64>,
+    setup_generation: Arc<AtomicU64>,
+    response_slots: Arc<Semaphore>,
+    gateway_session: GatewaySessionHandle,
+    gateway_client: GatewayClient,
+}
+
+impl fmt::Debug for WebPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebPolicy")
+            .field("profile", &self.profile)
+            .field("allow_lan", &self.allow_lan)
+            .field("allowed_cidrs", &self.allowed_cidrs)
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("local_hosts", &self.local_hosts)
+            .field("http_lan_warning", &self.http_lan_warning)
+            .field("access", &self.access.is_some())
+            .field("generation", &self.generation.load(Ordering::Acquire))
+            .field(
+                "setup_generation",
+                &self.setup_generation.load(Ordering::Acquire),
+            )
+            .field(
+                "available_response_slots",
+                &self.response_slots.available_permits(),
+            )
+            .field("gateway_session", &self.gateway_session)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct ManagementWebService {
-    address: SocketAddr,
-    shutdown: Arc<AtomicBool>,
-    connections: Arc<ActiveConnectionRegistry>,
-    connection_workers: Arc<ConnectionWorkerRegistry>,
+    addresses: Vec<SocketAddr>,
+    advertised_url: String,
+    generation: Arc<AtomicU64>,
+    setup_generation: Arc<AtomicU64>,
+    rate_limit_cleanup: CancellationToken,
+    handles: Vec<axum_server::Handle<SocketAddr>>,
     worker: Option<JoinHandle<Result<(), ManagementWebError>>>,
 }
 
-#[derive(Debug)]
-struct ActiveConnectionRegistry {
-    limit: usize,
-    next_id: AtomicU64,
-    streams: Mutex<BTreeMap<u64, TcpStream>>,
-}
-
-#[derive(Debug)]
-struct ActiveConnectionSlot {
-    id: u64,
-    registry: Arc<ActiveConnectionRegistry>,
-}
-
-#[derive(Debug, Default)]
-struct ConnectionWorkerRegistry {
-    workers: Mutex<Vec<JoinHandle<()>>>,
-}
-
-#[derive(Debug)]
-enum ConnectionRegistrationError {
-    Full,
-    Io,
-}
-
-impl ActiveConnectionRegistry {
-    fn new(limit: usize) -> Self {
-        debug_assert!(limit > 0);
-        Self {
-            limit,
-            next_id: AtomicU64::new(1),
-            streams: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    fn try_register(
-        self: &Arc<Self>,
-        stream: &TcpStream,
-    ) -> Result<ActiveConnectionSlot, ConnectionRegistrationError> {
-        let mut streams = self
-            .streams
-            .lock()
-            .map_err(|_| ConnectionRegistrationError::Io)?;
-        if streams.len() >= self.limit {
-            return Err(ConnectionRegistrationError::Full);
-        }
-        let shutdown_handle = stream
-            .try_clone()
-            .map_err(|_| ConnectionRegistrationError::Io)?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        streams.insert(id, shutdown_handle);
-        Ok(ActiveConnectionSlot {
-            id,
-            registry: Arc::clone(self),
-        })
-    }
-
-    fn shutdown_all(&self) {
-        let streams = self
-            .streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for stream in streams.values() {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-    }
-
-    #[cfg(test)]
-    fn active_count(&self) -> usize {
-        self.streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-    }
-}
-
-impl Drop for ActiveConnectionSlot {
-    fn drop(&mut self) {
-        self.registry
-            .streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
-    }
-}
-
-impl ConnectionWorkerRegistry {
-    fn track(&self, worker: JoinHandle<()>) {
-        self.workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(worker);
-    }
-
-    fn reap_finished(&self) -> Result<(), ManagementWebError> {
-        let finished = {
-            let mut workers = self
-                .workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut finished = Vec::new();
-            let mut index = 0;
-            while index < workers.len() {
-                if workers[index].is_finished() {
-                    finished.push(workers.swap_remove(index));
-                } else {
-                    index += 1;
-                }
-            }
-            finished
-        };
-        join_connection_workers(finished)
-    }
-
-    fn join_all(&self) -> Result<(), ManagementWebError> {
-        let workers = std::mem::take(
-            &mut *self
-                .workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        join_connection_workers(workers)
-    }
-
-    #[cfg(test)]
-    fn tracked_count(&self) -> usize {
-        self.workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-    }
-}
-
-fn join_connection_workers(workers: Vec<JoinHandle<()>>) -> Result<(), ManagementWebError> {
-    let mut failed = false;
-    for worker in workers {
-        failed |= worker.join().is_err();
-    }
-    if failed {
-        Err(ManagementWebError::Io)
-    } else {
-        Ok(())
-    }
-}
-
 impl ManagementWebService {
-    pub fn start(config: &ManagementWebConfig) -> Result<Self, ManagementWebError> {
-        let listener = ManagementWebListener::bind(config)?;
-        Self::start_listener(listener)
-    }
-
-    pub fn start_with_gateway_session(
+    pub fn start(
         config: &ManagementWebConfig,
+        agent_routes: Router,
+        access: Option<Arc<ManagementAccessController>>,
         gateway_session: GatewaySessionHandle,
     ) -> Result<Self, ManagementWebError> {
-        let listener = ManagementWebListener::bind_with_gateway_session(config, gateway_session)?;
-        Self::start_listener(listener)
-    }
+        if !config.enabled {
+            return Err(ManagementWebError::Disabled);
+        }
+        validate_access_configuration(config, access.as_deref())?;
+        let allowed_cidrs = config
+            .allowed_cidrs
+            .iter()
+            .map(|cidr| IpNet::from_str(cidr).map_err(|_| ManagementWebError::InvalidConfiguration))
+            .collect::<Result<Vec<_>, _>>()?;
+        let static_web_root = canonical_static_root(config.static_web_root.as_deref())?;
 
-    pub fn start_with_api_handler(
-        config: &ManagementWebConfig,
-        api_handler: Arc<dyn ManagementWebApiHandler>,
-    ) -> Result<Self, ManagementWebError> {
-        let listener = ManagementWebListener::bind_with_api_handler(config, api_handler)?;
-        Self::start_listener(listener)
-    }
-
-    pub fn start_with_api_handler_and_gateway_session(
-        config: &ManagementWebConfig,
-        api_handler: Arc<dyn ManagementWebApiHandler>,
-        gateway_session: GatewaySessionHandle,
-    ) -> Result<Self, ManagementWebError> {
-        let listener = ManagementWebListener::bind_with_api_handler_and_gateway_session(
-            config,
-            api_handler,
+        let (ipv4, ipv6, addresses) = bind_dual_stack(config.port)?;
+        let port = addresses[0].port();
+        let local_hosts = local_hosts(port);
+        let allowed_hosts = allowed_hosts(config, port)?;
+        let scheme = if config.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let allowed_local_origins = local_hosts
+            .iter()
+            .map(|host| format!("{scheme}://{host}"))
+            .collect();
+        let advertised_url = format!("{scheme}://127.0.0.1:{port}/");
+        let generation = Arc::new(AtomicU64::new(
+            NEXT_WEB_GENERATION.fetch_add(1, Ordering::AcqRel),
+        ));
+        let setup_generation = Arc::new(AtomicU64::new(config.setup_generation));
+        let http_lan_warning = config.allow_lan && config.tls.is_none();
+        if http_lan_warning {
+            if let Some(access) = &access {
+                access.audit(unix_time(), "listener", "http_lan_warning");
+            }
+        }
+        let policy = Arc::new(WebPolicy {
+            profile: config.profile,
+            allow_lan: config.allow_lan,
+            allowed_cidrs,
+            allowed_hosts,
+            local_hosts,
+            allowed_local_origins,
+            http_lan_warning,
+            static_web_root,
+            access,
+            generation: Arc::clone(&generation),
+            setup_generation: Arc::clone(&setup_generation),
+            response_slots: Arc::new(Semaphore::new(MAX_RESPONSE_BODIES)),
             gateway_session,
-        )?;
-        Self::start_listener(listener)
-    }
-
-    fn start_listener(listener: ManagementWebListener) -> Result<Self, ManagementWebError> {
-        Self::start_listener_with_connection_limit(listener, MAX_ACTIVE_CONNECTIONS)
-    }
-
-    fn start_listener_with_connection_limit(
-        listener: ManagementWebListener,
-        connection_limit: usize,
-    ) -> Result<Self, ManagementWebError> {
-        let address = listener.local_addr()?;
-        let shutdown = Arc::new(AtomicBool::new(true));
-        let worker_shutdown = Arc::clone(&shutdown);
-        let connections = Arc::new(ActiveConnectionRegistry::new(connection_limit));
-        let worker_connections = Arc::clone(&connections);
-        let connection_workers = Arc::new(ConnectionWorkerRegistry::default());
-        let listener_workers = Arc::clone(&connection_workers);
+            gateway_client: Client::builder(TokioExecutor::new()).build_http(),
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ManagementWebError::Io)?;
+        let rate_limit_cleanup = CancellationToken::new();
+        let app = {
+            let _runtime_guard = runtime.enter();
+            management_router(
+                agent_routes,
+                Arc::clone(&policy),
+                config.tls.is_some(),
+                rate_limit_cleanup.clone(),
+            )
+        };
+        let tls = config
+            .tls
+            .as_ref()
+            .map(|tls| {
+                runtime.block_on(axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                    &tls.certificate_path,
+                    &tls.private_key_path,
+                ))
+            })
+            .transpose()
+            .map_err(|_| ManagementWebError::TlsConfiguration)?;
+        let handles = vec![
+            axum_server::Handle::<SocketAddr>::new(),
+            axum_server::Handle::<SocketAddr>::new(),
+        ];
+        let worker_handles = handles.clone();
         let worker = thread::Builder::new()
             .name(String::from("cmclient-management-web"))
-            .spawn(move || {
-                listener.serve_until(worker_shutdown, worker_connections, listener_workers)
-            })
+            .spawn(move || runtime.block_on(run_servers(ipv4, ipv6, app, tls, worker_handles)))
             .map_err(|_| ManagementWebError::Io)?;
+
         Ok(Self {
-            address,
-            shutdown,
-            connections,
-            connection_workers,
+            addresses,
+            advertised_url,
+            generation,
+            setup_generation,
+            rate_limit_cleanup,
+            handles,
             worker: Some(worker),
         })
     }
 
-    pub const fn local_addr(&self) -> SocketAddr {
-        self.address
+    pub fn local_addr(&self) -> Result<SocketAddr, ManagementWebError> {
+        self.addresses
+            .first()
+            .copied()
+            .ok_or(ManagementWebError::Io)
     }
 
-    pub fn stop(mut self) -> Result<(), ManagementWebError> {
-        self.shutdown_and_join()
+    pub fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
     }
 
-    fn shutdown_and_join(&mut self) -> Result<(), ManagementWebError> {
-        self.shutdown.store(false, Ordering::Release);
-        let listener_result = self.worker.take().map_or(Ok(()), |worker| {
-            worker.join().map_err(|_| ManagementWebError::Io)?
-        });
-        self.connections.shutdown_all();
-        let connections_result = self.connection_workers.join_all();
-        listener_result.and(connections_result)
+    pub fn advertised_url(&self) -> &str {
+        &self.advertised_url
+    }
+
+    pub fn revoke_sessions(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn set_setup_generation(&self, generation: u64) {
+        if self.setup_generation.swap(generation, Ordering::AcqRel) != generation {
+            self.revoke_sessions();
+        }
+    }
+
+    pub fn stop(&mut self) -> Result<(), ManagementWebError> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        self.revoke_sessions();
+        self.rate_limit_cleanup.cancel();
+        for handle in &self.handles {
+            handle.graceful_shutdown(Some(WEB_SHUTDOWN_TIMEOUT));
+        }
+        worker.join().map_err(|_| ManagementWebError::Io)??;
+        Ok(())
     }
 }
 
 impl Drop for ManagementWebService {
     fn drop(&mut self) {
-        let _ = self.shutdown_and_join();
+        let _ = self.stop();
     }
 }
 
-fn static_gateway_route(
-    config: &ManagementWebConfig,
-) -> Result<GatewayRouteSource, ManagementWebError> {
-    if !config.gateway.ip().is_loopback() {
-        return Err(ManagementWebError::NonLoopbackBind);
-    }
-    if config
-        .gateway_capability
-        .as_deref()
-        .is_some_and(|value| !valid_gateway_capability(value))
-    {
-        return Err(ManagementWebError::InvalidHttp);
-    }
-    Ok(GatewayRouteSource::Static {
-        address: config.gateway,
-        capability: config
-            .gateway_capability
-            .clone()
-            .map(Zeroizing::new)
-            .map(Arc::new),
-    })
-}
-
-impl ManagementWebListener {
-    pub fn bind(config: &ManagementWebConfig) -> Result<Self, ManagementWebError> {
-        if !config.enabled {
-            return Err(ManagementWebError::Disabled);
-        }
-        Self::bind_internal(config, None, static_gateway_route(config)?)
-    }
-
-    pub fn bind_with_gateway_session(
-        config: &ManagementWebConfig,
-        gateway_session: GatewaySessionHandle,
-    ) -> Result<Self, ManagementWebError> {
-        Self::bind_internal(config, None, GatewayRouteSource::dynamic(gateway_session))
-    }
-
-    pub fn bind_with_api_handler(
-        config: &ManagementWebConfig,
-        api_handler: Arc<dyn ManagementWebApiHandler>,
-    ) -> Result<Self, ManagementWebError> {
-        if !config.enabled {
-            return Err(ManagementWebError::Disabled);
-        }
-        Self::bind_internal(config, Some(api_handler), static_gateway_route(config)?)
-    }
-
-    pub fn bind_with_api_handler_and_gateway_session(
-        config: &ManagementWebConfig,
-        api_handler: Arc<dyn ManagementWebApiHandler>,
-        gateway_session: GatewaySessionHandle,
-    ) -> Result<Self, ManagementWebError> {
-        Self::bind_internal(
-            config,
-            Some(api_handler),
-            GatewayRouteSource::dynamic(gateway_session),
-        )
-    }
-
-    fn bind_internal(
-        config: &ManagementWebConfig,
-        api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
-        gateway_route: GatewayRouteSource,
-    ) -> Result<Self, ManagementWebError> {
-        if !config.enabled {
-            return Err(ManagementWebError::Disabled);
-        }
-        if !config.bind.is_loopback()
-            && (!config.allow_lan || api_handler.is_none() || config.tls.is_none())
-        {
-            return Err(ManagementWebError::NonLoopbackBind);
-        }
-        let listener = TcpListener::bind(SocketAddr::new(config.bind, config.port))
-            .map_err(|_| ManagementWebError::Io)?;
-        let tls = config.tls.as_ref().map(load_tls_config).transpose()?;
-        let static_web_root = config
-            .static_web_root
-            .as_ref()
-            .map(|root| {
-                let root = std::fs::canonicalize(root).map_err(|_| ManagementWebError::Io)?;
-                if !root.is_dir() {
-                    return Err(ManagementWebError::Io);
-                }
-                Ok(root)
-            })
-            .transpose()?;
-        Ok(Self {
-            listener,
-            gateway_route,
-            api_handler,
-            tls,
-            static_web_root,
-        })
-    }
-
-    pub fn local_addr(&self) -> Result<SocketAddr, ManagementWebError> {
-        self.listener
-            .local_addr()
-            .map_err(|_| ManagementWebError::Io)
-    }
-
-    pub fn serve(self) -> Result<(), ManagementWebError> {
-        let running = Arc::new(AtomicBool::new(true));
-        let connections = Arc::new(ActiveConnectionRegistry::new(MAX_ACTIVE_CONNECTIONS));
-        let connection_workers = Arc::new(ConnectionWorkerRegistry::default());
-        let serve_result: Result<(), ManagementWebError> = (|| {
-            loop {
-                connection_workers.reap_finished()?;
-                let (stream, remote_addr) =
-                    self.listener.accept().map_err(|_| ManagementWebError::Io)?;
-                self.dispatch_connection(
-                    stream,
-                    remote_addr,
-                    Arc::clone(&connections),
-                    Arc::clone(&connection_workers),
-                    Arc::clone(&running),
-                )?;
-            }
-        })();
-        running.store(false, Ordering::Release);
-        connections.shutdown_all();
-        serve_result.and(connection_workers.join_all())
-    }
-
-    pub fn serve_once(&self) -> Result<(), ManagementWebError> {
-        let (stream, remote_addr) = self.listener.accept().map_err(|_| ManagementWebError::Io)?;
-        serve_connection(
-            stream,
-            remote_addr,
-            self.gateway_route.clone(),
-            self.api_handler.clone(),
-            self.tls.clone(),
-            self.static_web_root.clone(),
-            Arc::new(AtomicBool::new(true)),
-        )
-    }
-
-    fn serve_until(
-        self,
-        shutdown: Arc<AtomicBool>,
-        connections: Arc<ActiveConnectionRegistry>,
-        connection_workers: Arc<ConnectionWorkerRegistry>,
-    ) -> Result<(), ManagementWebError> {
-        self.listener
-            .set_nonblocking(true)
-            .map_err(|_| ManagementWebError::Io)?;
-        while shutdown.load(Ordering::Acquire) {
-            connection_workers.reap_finished()?;
-            match self.listener.accept() {
-                Ok((stream, remote_addr)) => {
-                    self.dispatch_connection(
-                        stream,
-                        remote_addr,
-                        Arc::clone(&connections),
-                        Arc::clone(&connection_workers),
-                        Arc::clone(&shutdown),
-                    )?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(SERVICE_POLL_INTERVAL);
-                }
-                Err(_) => return Err(ManagementWebError::Io),
-            }
-        }
-        Ok(())
-    }
-
-    fn dispatch_connection(
-        &self,
-        mut stream: TcpStream,
-        remote_addr: SocketAddr,
-        connections: Arc<ActiveConnectionRegistry>,
-        connection_workers: Arc<ConnectionWorkerRegistry>,
-        running: Arc<AtomicBool>,
-    ) -> Result<(), ManagementWebError> {
-        stream
-            .set_nonblocking(false)
-            .map_err(|_| ManagementWebError::Io)?;
-        let slot = match connections.try_register(&stream) {
-            Ok(slot) => slot,
-            Err(ConnectionRegistrationError::Full) => {
-                let _ = stream.set_write_timeout(Some(GATEWAY_TIMEOUT));
-                let _ = write_response(
-                    &mut stream,
-                    "503 Service Unavailable",
-                    "application/json",
-                    CONNECTION_LIMIT_BODY,
-                );
-                return Ok(());
-            }
-            Err(ConnectionRegistrationError::Io) => return Err(ManagementWebError::Io),
-        };
-        let gateway_route = self.gateway_route.clone();
-        let api_handler = self.api_handler.clone();
-        let tls = self.tls.clone();
-        let static_web_root = self.static_web_root.clone();
-        let worker = thread::Builder::new()
-            .name(String::from("cmclient-management-web-connection"))
-            .spawn(move || {
-                let _slot = slot;
-                let _ = serve_connection(
-                    stream,
-                    remote_addr,
-                    gateway_route,
-                    api_handler,
-                    tls,
-                    static_web_root,
-                    running,
-                );
-            })
-            .map_err(|_| ManagementWebError::Io)?;
-        connection_workers.track(worker);
-        Ok(())
-    }
-}
-
-pub fn gateway_health(gateway: SocketAddr) -> bool {
-    gateway_health_request(gateway, None, GATEWAY_TIMEOUT)
-}
-
-pub fn gateway_health_with_route(route: &GatewayRoute) -> bool {
-    let Some(route) = route.active() else {
-        return false;
-    };
-    gateway_health_request(route.address(), Some(route.capability()), GATEWAY_TIMEOUT)
-}
-
-fn gateway_health_request(
-    gateway: SocketAddr,
-    capability: Option<&str>,
-    timeout: Duration,
-) -> bool {
-    let Some(deadline) = Instant::now().checked_add(timeout) else {
-        return false;
-    };
-    let Some(connect_timeout) = remaining_until(deadline) else {
-        return false;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&gateway, connect_timeout) else {
-        return false;
-    };
-    let request = Zeroizing::new(if let Some(capability) = capability {
-        if !valid_gateway_capability(capability) {
-            return false;
-        }
-        format!(
-            "GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n{GATEWAY_CAPABILITY_HEADER}: {capability}\r\nconnection: close\r\n\r\n"
-        )
-        .into_bytes()
+async fn run_servers(
+    ipv4: TcpListener,
+    ipv6: TcpListener,
+    app: Router,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    handles: Vec<axum_server::Handle<SocketAddr>>,
+) -> Result<(), ManagementWebError> {
+    let make_ipv4 = app
+        .clone()
+        .into_make_service_with_connect_info::<SocketAddr>();
+    let make_ipv6 = app.into_make_service_with_connect_info::<SocketAddr>();
+    let result = if let Some(tls) = tls {
+        let mut ipv4_server = axum_server::from_tcp_rustls(ipv4, tls.clone())
+            .map_err(|_| ManagementWebError::Io)?
+            .http1_only()
+            .handle(handles[0].clone());
+        configure_http1(&mut ipv4_server);
+        let mut ipv6_server = axum_server::from_tcp_rustls(ipv6, tls)
+            .map_err(|_| ManagementWebError::Io)?
+            .http1_only()
+            .handle(handles[1].clone());
+        configure_http1(&mut ipv6_server);
+        tokio::try_join!(ipv4_server.serve(make_ipv4), ipv6_server.serve(make_ipv6)).map(|_| ())
     } else {
-        b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
-            .to_vec()
+        let mut ipv4_server = axum_server::from_tcp(ipv4)
+            .map_err(|_| ManagementWebError::Io)?
+            .http1_only()
+            .handle(handles[0].clone());
+        configure_http1(&mut ipv4_server);
+        let mut ipv6_server = axum_server::from_tcp(ipv6)
+            .map_err(|_| ManagementWebError::Io)?
+            .http1_only()
+            .handle(handles[1].clone());
+        configure_http1(&mut ipv6_server);
+        tokio::try_join!(ipv4_server.serve(make_ipv4), ipv6_server.serve(make_ipv6)).map(|_| ())
+    };
+    result.map_err(|_| ManagementWebError::Io)
+}
+
+fn configure_http1<A>(server: &mut axum_server::Server<SocketAddr, A>) {
+    server
+        .http_builder()
+        .http1()
+        .max_headers(MAX_REQUEST_HEADERS)
+        .header_read_timeout(REQUEST_HEADER_TIMEOUT)
+        .max_buf_size(MAX_HTTP1_BUFFER_BYTES);
+}
+
+fn management_router(
+    agent_routes: Router,
+    policy: Arc<WebPolicy>,
+    secure_cookie: bool,
+    cleanup: CancellationToken,
+) -> Router {
+    let mut login_governor = GovernorConfigBuilder::default().key_extractor(PeerIpKeyExtractor);
+    login_governor.per_second(12).burst_size(5);
+    let login_governor = Arc::new(
+        login_governor
+            .finish()
+            .expect("non-zero login governor configuration"),
+    );
+    let login = Router::new()
+        .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/session", get(local_session))
+        .layer(middleware::from_fn(login_timeout))
+        .layer(
+            GovernorLayer::new(Arc::clone(&login_governor)).error_handler(|_| {
+                stable_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    ManagementAccessError::LoginRateLimited.code(),
+                )
+            }),
+        );
+
+    let mut api_governor = GovernorConfigBuilder::default().key_extractor(PeerIpKeyExtractor);
+    api_governor.per_second(1).burst_size(120);
+    let api_governor = Arc::new(
+        api_governor
+            .finish()
+            .expect("non-zero API governor configuration"),
+    );
+    let login_limiter = Arc::clone(&login_governor);
+    let api_limiter = Arc::clone(&api_governor);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RATE_LIMIT_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cleanup.cancelled() => break,
+                _ = interval.tick() => {
+                    login_limiter.limiter().retain_recent();
+                    api_limiter.limiter().retain_recent();
+                }
+            }
+        }
     });
-    if !write_all_until(&mut stream, request.as_slice(), deadline) {
-        return false;
-    }
-    let mut response = Vec::with_capacity(512);
-    let mut buffer = [0_u8; 512];
-    loop {
-        match validate_gateway_health_response(&response) {
-            Ok(true) => return true,
-            Ok(false) => {}
-            Err(()) => return false,
-        }
-        let remaining_capacity = MAX_GATEWAY_HEALTH_RESPONSE_BYTES.saturating_sub(response.len());
-        if remaining_capacity == 0 {
-            return false;
-        }
-        let Some(read_timeout) = remaining_until(deadline) else {
-            return false;
-        };
-        if stream.set_read_timeout(Some(read_timeout)).is_err() {
-            return false;
-        }
-        let read_length = remaining_capacity.min(buffer.len());
-        let count = match stream.read(&mut buffer[..read_length]) {
-            Ok(0) | Err(_) => return false,
-            Ok(count) => count,
-        };
-        response.extend_from_slice(&buffer[..count]);
-    }
+    let api = Router::new()
+        .merge(agent_routes)
+        .merge(login)
+        .route("/api/v1/{*path}", any(proxy_gateway))
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(
+            GovernorLayer::new(Arc::clone(&api_governor)).error_handler(|_| {
+                stable_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "MANAGEMENT_REQUEST_RATE_LIMITED",
+                )
+            }),
+        )
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
+        .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_TIMEOUT))
+        .layer(middleware::from_fn(validate_request_body_headers))
+        .layer(middleware::from_fn(auth_cache_control));
+
+    let app = api.fallback(static_fallback);
+
+    let ttl = policy
+        .access
+        .as_ref()
+        .map_or(3_600, |access| access.session_ttl_seconds());
+    let session_layer = SessionManagerLayer::new(MemoryStore::default())
+        .with_name(SESSION_COOKIE_NAME)
+        .with_http_only(true)
+        .with_same_site(SameSite::Strict)
+        .with_secure(secure_cookie)
+        .with_expiry(Expiry::OnInactivity(CookieDuration::seconds(
+            i64::try_from(ttl).unwrap_or(3_600),
+        )));
+
+    let app = app
+        .layer(middleware::from_fn(authorize_request))
+        .layer(session_layer);
+
+    let capacity_limited = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_capacity_error))
+        .layer(LoadShedLayer::new())
+        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
+        .service(app);
+    Router::new()
+        .fallback_service(capacity_limited)
+        .layer(middleware::from_fn(response_lifetime_limit))
+        .layer(middleware::from_fn(admit_peer_and_host))
+        .layer(middleware::from_fn(security_headers))
+        .layer(Extension(policy))
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<Body>| {
+                tracing::info_span!("management_web_request", method = %request.method())
+            },
+        ))
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(middleware::from_fn(scrub_client_headers))
 }
 
-fn remaining_until(deadline: Instant) -> Option<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
+async fn handle_capacity_error(_error: BoxError) -> Response {
+    stable_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED",
+    )
 }
 
-fn write_all_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> bool {
-    while !bytes.is_empty() {
-        let Some(write_timeout) = remaining_until(deadline) else {
-            return false;
-        };
-        if stream.set_write_timeout(Some(write_timeout)).is_err() {
-            return false;
+async fn response_lifetime_limit(
+    Extension(policy): Extension<Arc<WebPolicy>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(permit) = Arc::clone(&policy.response_slots).try_acquire_owned() else {
+        audit_policy(&policy, "request", "response_capacity_denied");
+        return stable_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED",
+        );
+    };
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, Body::new(ResponsePermitBody::new(body, permit)))
+}
+
+async fn admit_peer_and_host(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(policy): Extension<Arc<WebPolicy>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !host_allowed(request.headers(), &policy.allowed_hosts) {
+        audit_policy(&policy, "request", "host_denied");
+        return stable_error(StatusCode::FORBIDDEN, "MANAGEMENT_HOST_DENIED");
+    }
+    let peer_allowed = match policy.profile {
+        ManagementWebProfile::Native if peer.ip().is_loopback() => true,
+        ManagementWebProfile::Native => {
+            policy.allow_lan
+                && policy.access.is_some()
+                && (policy.allowed_cidrs.is_empty()
+                    || policy
+                        .allowed_cidrs
+                        .iter()
+                        .any(|network| network.contains(&peer.ip())))
         }
-        match stream.write(bytes) {
-            Ok(0) | Err(_) => return false,
-            Ok(count) => bytes = &bytes[count..],
+        ManagementWebProfile::Docker => {
+            policy.access.is_some()
+                && (policy.allowed_cidrs.is_empty()
+                    || policy
+                        .allowed_cidrs
+                        .iter()
+                        .any(|network| network.contains(&peer.ip())))
+        }
+    };
+    if !peer_allowed {
+        audit_policy(&policy, "request", "peer_denied");
+        return stable_error(StatusCode::FORBIDDEN, "MANAGEMENT_PEER_DENIED");
+    }
+    next.run(request).await
+}
+
+async fn authorize_request(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(policy): Extension<Arc<WebPolicy>>,
+    session: Session,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let is_api = path == "/api" || path.starts_with("/api/");
+    if !is_api || path == "/api/v1/auth/login" || path == "/api/v1/auth/session" {
+        return next.run(request).await;
+    }
+    let local_host = exact_header(request.headers(), header::HOST)
+        .is_some_and(|host| policy.local_hosts.contains(&host.to_ascii_lowercase()));
+    let is_loopback =
+        peer.ip().is_loopback() && local_host && policy.profile == ManagementWebProfile::Native;
+    let write = is_write_method(request.method());
+    if is_loopback && !write {
+        return next.run(request).await;
+    }
+    let now = unix_time();
+    let origin = exact_header(request.headers(), header::ORIGIN);
+    if is_loopback {
+        if origin.is_none_or(|origin| !policy.allowed_local_origins.contains(origin)) {
+            audit_policy(&policy, "request", "origin_denied");
+            return access_error(ManagementAccessError::OriginDenied);
+        }
+    } else {
+        let Some(access) = &policy.access else {
+            return access_error(ManagementAccessError::SessionInvalid);
+        };
+        if let Some(origin) = origin {
+            if let Err(error) = access.require_origin(origin, now) {
+                return access_error(error);
+            }
+        } else if write {
+            access.audit(now, "request", "origin_denied");
+            return access_error(ManagementAccessError::OriginDenied);
         }
     }
-    true
+    let authenticated = session
+        .get::<bool>(SESSION_AUTHENTICATED)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    let generation = session.get::<u64>(SESSION_GENERATION).await.ok().flatten();
+    let setup_generation = session
+        .get::<u64>(SESSION_SETUP_GENERATION)
+        .await
+        .ok()
+        .flatten();
+    let role = session.get::<String>(SESSION_ROLE).await.ok().flatten();
+    let expires_at = session.get::<u64>(SESSION_EXPIRES_AT).await.ok().flatten();
+    if expires_at.is_some_and(|expires_at| expires_at <= now) {
+        let _ = session.delete().await;
+        audit_policy(&policy, "request", "session_expired");
+        return access_error(ManagementAccessError::SessionExpired);
+    }
+    let role_allowed = matches!(role.as_deref(), Some("admin"))
+        || (is_loopback && matches!(role.as_deref(), Some("local")));
+    if !authenticated
+        || !role_allowed
+        || generation != Some(policy.generation.load(Ordering::Acquire))
+        || setup_generation != Some(policy.setup_generation.load(Ordering::Acquire))
+        || !expires_at.is_some_and(|expires_at| expires_at > now)
+    {
+        let _ = session.delete().await;
+        audit_policy(&policy, "request", "session_denied");
+        return access_error(ManagementAccessError::SessionInvalid);
+    }
+    if write {
+        let expected = session.get::<String>(SESSION_CSRF).await.ok().flatten();
+        let supplied = exact_header(request.headers(), HeaderName::from_static(CSRF_HEADER_NAME));
+        if !matches!((expected.as_deref(), supplied), (Some(expected), Some(supplied)) if expected == supplied)
+        {
+            audit_policy(&policy, "request", "csrf_denied");
+            return access_error(ManagementAccessError::CsrfInvalid);
+        }
+    }
+    audit_policy(&policy, "request", "allowed");
+    next.run(request).await
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GatewayHealthResponse {
-    status: String,
+struct LoginBody {
+    password: String,
 }
 
-fn validate_gateway_health_response(response: &[u8]) -> Result<bool, ()> {
-    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return Ok(false);
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginResponse {
+    schema_version: u8,
+    csrf_token: String,
+    expires_at: u64,
+}
+
+async fn login(
+    Extension(policy): Extension<Arc<WebPolicy>>,
+    session: Session,
+    headers: HeaderMap,
+    body: Result<Json<LoginBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return login_body_error(&error),
     };
-    let header = std::str::from_utf8(&response[..header_end]).map_err(|_| ())?;
-    let mut lines = header.split("\r\n");
-    if lines.next() != Some("HTTP/1.1 200 OK") {
-        return Err(());
+    let Some(access) = &policy.access else {
+        return stable_error(StatusCode::NOT_FOUND, "MANAGEMENT_AUTH_NOT_CONFIGURED");
+    };
+    if body.password.is_empty() || body.password.len() > LOGIN_MAX_PASSWORD_BYTES {
+        return access_error(ManagementAccessError::CredentialsInvalid);
     }
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        let (name, value) = parse_header_field(line).map_err(|_| ())?;
-        if headers.insert(name, value).is_some() {
-            return Err(());
-        }
+    let Some(origin) = exact_header(&headers, header::ORIGIN) else {
+        return access_error(ManagementAccessError::OriginDenied);
+    };
+    let now = unix_time();
+    if let Err(error) = access.verify_password(origin, &body.password, now).await {
+        return access_error(error);
     }
-    if headers.contains_key("transfer-encoding") {
-        return Err(());
-    }
-    let content_type = headers.get("content-type").ok_or(())?;
-    if !matches!(
-        content_type.to_ascii_lowercase().as_str(),
-        "application/json" | "application/json; charset=utf-8"
-    ) {
-        return Err(());
-    }
-    let content_length = headers.get("content-length").ok_or(())?;
-    if content_length.is_empty() || !content_length.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(());
-    }
-    let content_length = content_length.parse::<usize>().map_err(|_| ())?;
-    let body_start = header_end.checked_add(4).ok_or(())?;
-    let response_length = body_start
-        .checked_add(content_length)
-        .filter(|length| *length <= MAX_GATEWAY_HEALTH_RESPONSE_BYTES)
-        .ok_or(())?;
-    if response.len() < response_length {
-        return Ok(false);
-    }
-    if response.len() != response_length {
-        return Err(());
-    }
-    let health: GatewayHealthResponse =
-        serde_json::from_slice(&response[body_start..]).map_err(|_| ())?;
-    (health.status == "ok").then_some(true).ok_or(())
+    issue_session(
+        &session,
+        &policy,
+        "admin",
+        access.session_ttl_seconds(),
+        now,
+    )
+    .await
 }
 
-fn serve_connection(
-    mut client: TcpStream,
-    remote_addr: SocketAddr,
-    gateway_route: GatewayRouteSource,
-    api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
-    tls: Option<Arc<ServerConfig>>,
-    static_web_root: Option<PathBuf>,
-    running: Arc<AtomicBool>,
-) -> Result<(), ManagementWebError> {
-    client
-        .set_read_timeout(Some(GATEWAY_TIMEOUT))
-        .map_err(|_| ManagementWebError::Io)?;
-    client
-        .set_write_timeout(Some(GATEWAY_TIMEOUT))
-        .map_err(|_| ManagementWebError::Io)?;
-    if let Some(tls) = tls {
-        let connection =
-            ServerConnection::new(tls).map_err(|_| ManagementWebError::TlsConfiguration)?;
-        let mut stream = StreamOwned::new(connection, client);
-        return serve_http_connection(
-            &mut stream,
-            remote_addr,
-            &gateway_route,
-            api_handler,
-            static_web_root.as_deref(),
-            &running,
+async fn local_session(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(policy): Extension<Arc<WebPolicy>>,
+    session: Session,
+    headers: HeaderMap,
+) -> Response {
+    let local_host = exact_header(&headers, header::HOST)
+        .is_some_and(|host| policy.local_hosts.contains(&host.to_ascii_lowercase()));
+    if policy.profile != ManagementWebProfile::Native || !peer.ip().is_loopback() || !local_host {
+        return stable_error(StatusCode::FORBIDDEN, "MANAGEMENT_LOCAL_SESSION_DENIED");
+    }
+    let ttl = policy
+        .access
+        .as_ref()
+        .map_or(3_600, |access| access.session_ttl_seconds());
+    issue_session(&session, &policy, "local", ttl, unix_time()).await
+}
+
+async fn issue_session(
+    session: &Session,
+    policy: &WebPolicy,
+    role: &'static str,
+    ttl_seconds: u64,
+    now: u64,
+) -> Response {
+    let csrf_token = Uuid::new_v4().simple().to_string();
+    let expires_at = now.saturating_add(ttl_seconds);
+    let stored = session.cycle_id().await.is_ok()
+        && session.insert(SESSION_AUTHENTICATED, true).await.is_ok()
+        && session.insert(SESSION_ROLE, role).await.is_ok()
+        && session
+            .insert(
+                SESSION_GENERATION,
+                policy.generation.load(Ordering::Acquire),
+            )
+            .await
+            .is_ok()
+        && session
+            .insert(
+                SESSION_SETUP_GENERATION,
+                policy.setup_generation.load(Ordering::Acquire),
+            )
+            .await
+            .is_ok()
+        && session.insert(SESSION_CSRF, &csrf_token).await.is_ok()
+        && session.insert(SESSION_EXPIRES_AT, expires_at).await.is_ok();
+    if !stored {
+        let _ = session.delete().await;
+        return stable_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MANAGEMENT_SESSION_STORE_FAILED",
         );
     }
-    serve_http_connection(
-        &mut client,
-        remote_addr,
-        &gateway_route,
-        api_handler,
-        static_web_root.as_deref(),
-        &running,
+    Json(LoginResponse {
+        schema_version: 1,
+        csrf_token,
+        expires_at,
+    })
+    .into_response()
+}
+
+async fn proxy_gateway(Extension(policy): Extension<Arc<WebPolicy>>, request: Request) -> Response {
+    let Some(active) = policy.gateway_session.active() else {
+        return stable_error(StatusCode::SERVICE_UNAVAILABLE, "GATEWAY_PROXY_UNAVAILABLE");
+    };
+    let cancellation = active.cancellation_token();
+    let outbound = match gateway_request(request, &active) {
+        Ok(request) => request,
+        Err(error) => return stable_error(StatusCode::BAD_REQUEST, error.code()),
+    };
+    let response = tokio::select! {
+        () = cancellation.cancelled() => None,
+        response = tokio::time::timeout(
+            GATEWAY_RESPONSE_TIMEOUT,
+            policy.gateway_client.request(outbound),
+        ) => response.ok().and_then(Result::ok),
+    };
+    let Some(response) = response else {
+        return stable_error(StatusCode::SERVICE_UNAVAILABLE, "GATEWAY_PROXY_UNAVAILABLE");
+    };
+    let (mut parts, body) = response.into_parts();
+    strip_hop_headers(&mut parts.headers);
+    parts.headers = allowlisted_headers(&parts.headers, GATEWAY_RESPONSE_HEADER_ALLOWLIST);
+    parts.extensions.clear();
+    axum::http::Response::from_parts(
+        parts,
+        Body::new(RevocableBody::new(body, cancellation, active)),
     )
 }
 
-fn serve_http_connection(
-    client: &mut dyn ManagementWebStream,
-    remote_addr: SocketAddr,
-    gateway_route: &GatewayRouteSource,
-    api_handler: Option<Arc<dyn ManagementWebApiHandler>>,
-    static_web_root: Option<&Path>,
-    running: &AtomicBool,
-) -> Result<(), ManagementWebError> {
-    let request = match read_request(client) {
-        Ok(request) => request,
-        Err(ManagementWebError::InvalidHttp) => {
-            return write_response(
-                client,
-                "400 Bad Request",
-                "application/json",
-                r#"{"code":"MANAGEMENT_WEB_HTTP_INVALID"}"#,
-            );
-        }
-        Err(ManagementWebError::RequestTooLarge) => {
-            return write_response(
-                client,
-                "413 Content Too Large",
-                "application/json",
-                r#"{"code":"MANAGEMENT_WEB_REQUEST_TOO_LARGE"}"#,
-            );
-        }
-        Err(error) => return Err(error),
-    };
-    let request_context = match parse_request(&request, remote_addr) {
-        Ok(request) => request,
-        Err(ManagementWebError::InvalidHttp) => {
-            return write_response(
-                client,
-                "400 Bad Request",
-                "application/json",
-                r#"{"code":"MANAGEMENT_WEB_HTTP_INVALID"}"#,
-            );
-        }
-        Err(error) => return Err(error),
-    };
-    if let Some(api_handler) = api_handler {
-        if api_handler.handle(client, &request_context)? {
-            return Ok(());
+fn gateway_request(
+    request: Request,
+    active: &ActiveGatewayRoute,
+) -> Result<axum::http::Request<Body>, ManagementWebError> {
+    let (mut parts, body) = request.into_parts();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    parts.uri = Uri::from_str(&format!("http://{}{path_and_query}", active.address()))
+        .map_err(|_| ManagementWebError::InvalidHttp)?;
+    parts.extensions.clear();
+    strip_hop_headers(&mut parts.headers);
+    parts.headers = allowlisted_headers(&parts.headers, GATEWAY_REQUEST_HEADER_ALLOWLIST);
+    parts.headers.insert(
+        header::HOST,
+        HeaderValue::from_str(&active.address().to_string())
+            .map_err(|_| ManagementWebError::InvalidHttp)?,
+    );
+    parts.headers.insert(
+        HeaderName::from_static(GATEWAY_CAPABILITY_HEADER),
+        HeaderValue::from_str(active.capability()).map_err(|_| ManagementWebError::InvalidHttp)?,
+    );
+    let body = Body::new(RevocableBody::new(body, active.cancellation_token(), ()));
+    Ok(axum::http::Request::from_parts(parts, body))
+}
+
+type CancellationWait = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+struct RevocableBody<B, H> {
+    body: B,
+    cancellation: CancellationToken,
+    cancelled: CancellationWait,
+    hold: Option<H>,
+    ended: bool,
+}
+
+impl<B, H> RevocableBody<B, H> {
+    fn new(body: B, cancellation: CancellationToken, hold: H) -> Self {
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+        Self {
+            body,
+            cancellation,
+            cancelled,
+            hold: Some(hold),
+            ended: false,
         }
     }
-    let routed_path = request_path(&request_context.path);
-    if routed_path == "/api" || routed_path.starts_with("/api/") {
-        let Some(gateway_route) = gateway_route.snapshot() else {
-            return write_gateway_unavailable(client);
+}
+
+impl<B, H> HttpBody for RevocableBody<B, H>
+where
+    B: HttpBody + Unpin,
+    H: Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.ended {
+            return Poll::Ready(None);
+        }
+        if this.cancelled.as_mut().poll(context).is_ready() {
+            this.ended = true;
+            this.hold.take();
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut this.body).poll_frame(context) {
+            Poll::Ready(None) => {
+                this.ended = true;
+                this.hold.take();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.ended = true;
+                this.hold.take();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.is_trailers() {
+                    // Trailers are terminal metadata here; ending the body avoids both leakage and
+                    // returning Pending after consuming a ready frame without registering a waker.
+                    this.ended = true;
+                    this.hold.take();
+                    return Poll::Ready(None);
+                }
+                if this.body.is_end_stream() {
+                    this.ended = true;
+                    this.hold.take();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended || self.cancellation.is_cancelled() || self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+struct ResponsePermitBody {
+    body: Body,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ResponsePermitBody {
+    fn new(body: Body, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            body,
+            permit: Some(permit),
+        }
+    }
+}
+
+impl HttpBody for ResponsePermitBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.body).poll_frame(context) {
+            Poll::Ready(None) => {
+                this.permit.take();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.permit.take();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if this.body.is_end_stream() {
+                    this.permit.take();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+async fn static_fallback(
+    Extension(policy): Extension<Arc<WebPolicy>>,
+    request: Request,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if path == "/api" || path.starts_with("/api/") {
+        stable_error(StatusCode::NOT_FOUND, "API_ROUTE_NOT_FOUND")
+    } else if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        stable_error(StatusCode::METHOD_NOT_ALLOWED, "WEB_METHOD_NOT_ALLOWED")
+    } else {
+        let Some(root) = &policy.static_web_root else {
+            return stable_error(StatusCode::NOT_FOUND, "WEB_ASSET_NOT_FOUND");
         };
-        return proxy_api(client, &gateway_route, &request, running);
-    }
-    if let Some(static_web_root) = static_web_root {
-        return serve_static_web(client, &request_context, static_web_root);
-    }
-    match (
-        request_context.method.as_str(),
-        request_path(&request_context.path),
-    ) {
-        ("GET" | "HEAD", "/" | "/index.html") => write_bytes_response(
-            client,
-            "200 OK",
-            "text/html; charset=utf-8",
-            "no-cache",
-            b"<!doctype html><title>CMClient</title><main id=app>CMClient management web</main>",
-            request_context.method == "HEAD",
-        ),
-        (_, _) => write_response(
-            client,
-            "404 Not Found",
-            "application/json",
-            r#"{"code":"WEB_ROUTE_NOT_FOUND"}"#,
-        ),
+        let method = request.method().clone();
+        let asset_like = path
+            .rsplit('/')
+            .next()
+            .is_some_and(|segment| segment.contains('.'));
+        let response = match ServeDir::new(root).oneshot(request).await {
+            Ok(response) => response,
+            Err(error) => match error {},
+        };
+        if response.status() != StatusCode::NOT_FOUND {
+            return static_cache_response(response.map(Body::new), &path);
+        }
+        if asset_like {
+            return stable_error(StatusCode::NOT_FOUND, "WEB_ASSET_NOT_FOUND");
+        }
+        let index_request = axum::http::Request::builder()
+            .method(method)
+            .uri("/")
+            .body(Body::empty());
+        let Ok(index_request) = index_request else {
+            return stable_error(StatusCode::INTERNAL_SERVER_ERROR, "WEB_ASSET_READ_FAILED");
+        };
+        match ServeFile::new(root.join("index.html"))
+            .oneshot(index_request)
+            .await
+        {
+            Ok(response) => static_cache_response(response.map(Body::new), &path),
+            Err(error) => match error {},
+        }
     }
 }
 
-fn serve_static_web(
-    client: &mut dyn ManagementWebStream,
-    request: &ManagementWebRequest,
-    root: &Path,
-) -> Result<(), ManagementWebError> {
-    if request.method != "GET" && request.method != "HEAD" {
-        return write_bytes_response(
-            client,
-            "405 Method Not Allowed",
-            "application/json",
-            "no-store",
-            br#"{"code":"WEB_METHOD_NOT_ALLOWED"}"#,
-            false,
-        );
-    }
-
-    let path = request_path(&request.path);
-    let relative_path = path.strip_prefix('/').unwrap_or(path);
-    let requested_file = if relative_path.is_empty() {
-        root.join("index.html")
+fn static_cache_response(mut response: Response, request_path: &str) -> Response {
+    let policy = if is_clearly_hashed_vite_asset(request_path) {
+        IMMUTABLE_ASSET_CACHE_CONTROL
     } else {
-        root.join(relative_path)
+        SHELL_CACHE_CONTROL
     };
-    if let Some(file) = readable_static_file(root, &requested_file) {
-        return write_static_file(client, request, &file, path == "/index.html" || path == "/");
-    }
-
-    if looks_like_asset_path(path) {
-        return write_bytes_response(
-            client,
-            "404 Not Found",
-            "application/json",
-            "no-store",
-            br#"{"code":"WEB_ASSET_NOT_FOUND"}"#,
-            request.method == "HEAD",
-        );
-    }
-
-    let index = root.join("index.html");
-    let Some(index) = readable_static_file(root, &index) else {
-        return write_bytes_response(
-            client,
-            "404 Not Found",
-            "application/json",
-            "no-store",
-            br#"{"code":"WEB_ROUTE_NOT_FOUND"}"#,
-            request.method == "HEAD",
-        );
-    };
-    write_static_file(client, request, &index, true)
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+    response
 }
 
-fn readable_static_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
-    let candidate = std::fs::canonicalize(candidate).ok()?;
-    (candidate.starts_with(root) && candidate.is_file()).then_some(candidate)
-}
-
-fn write_static_file(
-    client: &mut dyn ManagementWebStream,
-    request: &ManagementWebRequest,
-    file: &Path,
-    is_index: bool,
-) -> Result<(), ManagementWebError> {
-    let mut body = std::fs::File::open(file).map_err(|_| ManagementWebError::Io)?;
-    let content_length = body.metadata().map_err(|_| ManagementWebError::Io)?.len();
-    let content_type = static_content_type(file);
-    let cache_control = if is_index {
-        "no-cache"
-    } else if has_vite_content_hash(file) {
-        "public, max-age=31536000, immutable"
-    } else {
-        "no-cache"
-    };
-    write_response_header(
-        client,
-        "200 OK",
-        content_type,
-        cache_control,
-        content_length,
-    )?;
-    if request.method != "HEAD" {
-        io::copy(&mut body, client).map_err(|_| ManagementWebError::Io)?;
-    }
-    Ok(())
-}
-
-fn request_path(target: &str) -> &str {
-    target.split_once('?').map_or(target, |(path, _)| path)
-}
-
-fn looks_like_asset_path(path: &str) -> bool {
-    path == "/assets"
-        || path.starts_with("/assets/")
-        || Path::new(path)
-            .file_name()
-            .and_then(|name| Path::new(name).extension())
-            .is_some()
-}
-
-fn has_vite_content_hash(path: &Path) -> bool {
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+fn is_clearly_hashed_vite_asset(path: &str) -> bool {
+    let Some(file_name) = path.strip_prefix("/assets/") else {
         return false;
     };
-    let bytes = stem.as_bytes();
-    (8..=64.min(bytes.len().saturating_sub(1))).any(|hash_length| {
-        let separator = bytes.len() - hash_length - 1;
-        matches!(bytes[separator], b'-' | b'.')
-            && bytes[separator + 1..]
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
-    })
+    if file_name.contains('/') {
+        return false;
+    }
+    let Some((stem, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    let Some((logical_name, hash)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    !logical_name.is_empty()
+        && !extension.is_empty()
+        && (8..=64).contains(&hash.len())
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn static_content_type(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("html") => "text/html; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("js" | "mjs") => "text/javascript; charset=utf-8",
-        Some("json" | "map") => "application/json; charset=utf-8",
-        Some("webmanifest") => "application/manifest+json",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("avif") => "image/avif",
-        Some("ico") => "image/x-icon",
-        Some("woff") => "font/woff",
-        Some("woff2") => "font/woff2",
-        Some("ttf") => "font/ttf",
-        Some("otf") => "font/otf",
-        Some("wasm") => "application/wasm",
-        Some("txt") => "text/plain; charset=utf-8",
-        Some("xml") => "application/xml; charset=utf-8",
-        _ => "application/octet-stream",
+async fn security_headers(
+    Extension(policy): Extension<Arc<WebPolicy>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(MANAGEMENT_CONTENT_SECURITY_POLICY),
+    );
+    headers.remove(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+    if policy.http_lan_warning {
+        headers.insert(
+            header::WARNING,
+            HeaderValue::from_static("299 CMClient \"MANAGEMENT_HTTP_LAN_WARNING\""),
+        );
+        headers.insert(
+            HeaderName::from_static("x-cmclient-management-warning"),
+            HeaderValue::from_static("MANAGEMENT_HTTP_LAN_WARNING"),
+        );
+    }
+    response
+}
+
+async fn auth_cache_control(request: Request, next: Next) -> Response {
+    let auth_response = matches!(
+        request.uri().path(),
+        "/api/v1/auth/login" | "/api/v1/auth/session"
+    );
+    let mut response = next.run(request).await;
+    if auth_response {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(AUTH_CACHE_CONTROL),
+        );
+    }
+    response
+}
+
+async fn login_timeout(request: Request, next: Next) -> Response {
+    complete_login_request(next.run(request), LOGIN_TIMEOUT).await
+}
+
+async fn complete_login_request(
+    request: impl Future<Output = Response>,
+    timeout: Duration,
+) -> Response {
+    match tokio::time::timeout(timeout, request).await {
+        Ok(response) => response,
+        Err(_) => stable_error(StatusCode::REQUEST_TIMEOUT, "MANAGEMENT_WEB_LOGIN_TIMEOUT"),
     }
 }
 
-fn proxy_api(
-    client: &mut dyn ManagementWebStream,
-    gateway: &ResolvedGatewayRoute,
-    request: &[u8],
-    running: &AtomicBool,
-) -> Result<(), ManagementWebError> {
-    // A dynamic session cannot be revoked while its capability is in flight. `clear` and `set`
-    // take the lease's write lock, so after either returns every stale snapshot fails here.
-    let Some(lease) = gateway.acquire() else {
-        return write_gateway_unavailable(client);
+async fn validate_request_body_headers(request: Request, next: Next) -> Response {
+    let content_lengths = request.headers().get_all(header::CONTENT_LENGTH);
+    let mut values = content_lengths.iter();
+    let Some(value) = values.next() else {
+        return next.run(request).await;
     };
-    let Some(deadline) = Instant::now().checked_add(GATEWAY_TIMEOUT) else {
-        return write_gateway_unavailable(client);
-    };
-    let Some(connect_timeout) = remaining_until(deadline) else {
-        return write_gateway_unavailable(client);
-    };
-    let mut upstream = match TcpStream::connect_timeout(&gateway.address, connect_timeout) {
-        Ok(stream) => stream,
-        Err(_) => return write_gateway_unavailable(client),
-    };
-    upstream
-        .set_read_timeout(Some(PROXY_READ_POLL_INTERVAL))
-        .map_err(|_| ManagementWebError::Io)?;
-    let request = Zeroizing::new(with_gateway_headers(
-        request,
-        gateway
-            .capability
-            .as_ref()
-            .map(|capability| capability.as_str()),
-    )?);
-    if !write_all_until(&mut upstream, request.as_slice(), deadline) {
-        return write_gateway_unavailable(client);
+    if values.next().is_some() || request.headers().contains_key(header::TRANSFER_ENCODING) {
+        return stable_error(
+            StatusCode::BAD_REQUEST,
+            ManagementWebError::InvalidHttp.code(),
+        );
     }
-    drop(lease);
-    copy_proxy_response(&mut upstream, client, running)
+    let Ok(value) = value.to_str() else {
+        return stable_error(
+            StatusCode::BAD_REQUEST,
+            ManagementWebError::InvalidHttp.code(),
+        );
+    };
+    let Ok(length) = value.parse::<u64>() else {
+        return stable_error(
+            StatusCode::BAD_REQUEST,
+            ManagementWebError::InvalidHttp.code(),
+        );
+    };
+    if length > MAX_REQUEST_BYTES as u64 {
+        return stable_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ManagementWebError::RequestTooLarge.code(),
+        );
+    }
+    next.run(request).await
 }
 
-fn write_gateway_unavailable(
-    client: &mut dyn ManagementWebStream,
-) -> Result<(), ManagementWebError> {
-    write_response(
-        client,
-        "503 Service Unavailable",
-        "application/json",
-        r#"{"code":"GATEWAY_PROXY_UNAVAILABLE"}"#,
+async fn method_not_allowed() -> Response {
+    stable_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "MANAGEMENT_WEB_METHOD_NOT_ALLOWED",
     )
 }
 
-fn copy_proxy_response(
-    upstream: &mut TcpStream,
-    client: &mut dyn ManagementWebStream,
-    running: &AtomicBool,
+#[derive(Clone, Copy, Debug)]
+struct MakeRequestUuid;
+
+impl MakeRequestId for MakeRequestUuid {
+    fn make_request_id<B>(&mut self, _request: &axum::http::Request<B>) -> Option<RequestId> {
+        HeaderValue::from_str(&Uuid::new_v4().simple().to_string())
+            .ok()
+            .map(RequestId::new)
+    }
+}
+
+async fn scrub_client_headers(mut request: Request, next: Next) -> Response {
+    for name in [
+        GATEWAY_CAPABILITY_HEADER,
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "x-request-id",
+    ] {
+        request.headers_mut().remove(name);
+    }
+    next.run(request).await
+}
+
+fn validate_access_configuration(
+    config: &ManagementWebConfig,
+    access: Option<&ManagementAccessController>,
 ) -> Result<(), ManagementWebError> {
-    let mut buffer = [0_u8; 16 * 1024];
-    while running.load(Ordering::Acquire) {
-        match upstream.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(count) => client
-                .write_all(&buffer[..count])
-                .map_err(|_| ManagementWebError::Io)?,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) => {}
-            Err(_) => return Err(ManagementWebError::Io),
+    if config.profile == ManagementWebProfile::Docker && access.is_none() {
+        return Err(ManagementWebError::InvalidConfiguration);
+    }
+    if config.profile == ManagementWebProfile::Native {
+        if config.allow_lan && access.is_none() {
+            return Err(ManagementWebError::InvalidConfiguration);
+        }
+        if !config.allow_lan && !config.allowed_cidrs.is_empty() {
+            return Err(ManagementWebError::InvalidConfiguration);
+        }
+    }
+    if let Some(tls) = &config.tls {
+        if !tls.certificate_path.is_absolute() || !tls.private_key_path.is_absolute() {
+            return Err(ManagementWebError::TlsConfiguration);
         }
     }
     Ok(())
 }
 
-fn read_request(stream: &mut dyn ManagementWebStream) -> Result<Vec<u8>, ManagementWebError> {
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = stream
-            .read(&mut buffer)
+fn canonical_static_root(root: Option<&Path>) -> Result<Option<PathBuf>, ManagementWebError> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    validate_static_tree(root)?;
+    let root = std::fs::canonicalize(root).map_err(|_| ManagementWebError::Io)?;
+    if !root.is_dir() || !root.join("index.html").is_file() {
+        return Err(ManagementWebError::Io);
+    }
+    Ok(Some(root))
+}
+
+fn validate_static_tree(path: &Path) -> Result<(), ManagementWebError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ManagementWebError::Io)?;
+    if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
+        return Err(ManagementWebError::InvalidConfiguration);
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path).map_err(|_| ManagementWebError::Io)? {
+            let entry = entry.map_err(|_| ManagementWebError::Io)?;
+            validate_static_tree(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn is_windows_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn allowed_hosts(
+    config: &ManagementWebConfig,
+    port: u16,
+) -> Result<BTreeSet<String>, ManagementWebError> {
+    let mut hosts = local_hosts(port);
+    for host in &config.allowed_hosts {
+        let host = host.to_ascii_lowercase();
+        if host.is_empty()
+            || host == "*"
+            || host.contains(['/', '\\', '@'])
+            || host.contains(char::is_whitespace)
+        {
+            return Err(ManagementWebError::InvalidConfiguration);
+        }
+        hosts.insert(host);
+    }
+    Ok(hosts)
+}
+
+fn local_hosts(port: u16) -> BTreeSet<String> {
+    BTreeSet::from([
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+    ])
+}
+
+fn host_allowed(headers: &HeaderMap, allowed_hosts: &BTreeSet<String>) -> bool {
+    let mut values = headers.get_all(header::HOST).iter();
+    let Some(host) = values.next().and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    values.next().is_none() && allowed_hosts.contains(&host.to_ascii_lowercase())
+}
+
+fn exact_header<N>(headers: &HeaderMap, name: N) -> Option<&str>
+where
+    N: axum::http::header::AsHeaderName,
+{
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+fn allowlisted_headers(headers: &HeaderMap, allowlist: &[&'static str]) -> HeaderMap {
+    let mut allowed = HeaderMap::new();
+    for &name in allowlist {
+        let name = HeaderName::from_static(name);
+        for value in headers.get_all(&name) {
+            allowed.append(name.clone(), value.clone());
+        }
+    }
+    allowed
+}
+
+fn strip_hop_headers(headers: &mut HeaderMap) {
+    let connection_headers = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect::<Vec<_>>();
+    for name in connection_headers {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
+}
+
+fn bind_dual_stack(
+    requested_port: u16,
+) -> Result<(TcpListener, TcpListener, Vec<SocketAddr>), ManagementWebError> {
+    let ipv4 = bind_socket(
+        Domain::IPV4,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), requested_port),
+        false,
+    )?;
+    let port = ipv4
+        .local_addr()
+        .map_err(|_| ManagementWebError::Io)?
+        .port();
+    let ipv6 = bind_socket(
+        Domain::IPV6,
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+        true,
+    )?;
+    let addresses = vec![
+        ipv4.local_addr().map_err(|_| ManagementWebError::Io)?,
+        ipv6.local_addr().map_err(|_| ManagementWebError::Io)?,
+    ];
+    Ok((ipv4, ipv6, addresses))
+}
+
+fn bind_socket(
+    domain: Domain,
+    address: SocketAddr,
+    ipv6_only: bool,
+) -> Result<TcpListener, ManagementWebError> {
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|_| ManagementWebError::Io)?;
+    socket
+        .set_reuse_address(false)
+        .map_err(|_| ManagementWebError::Io)?;
+    if domain == Domain::IPV6 {
+        socket
+            .set_only_v6(ipv6_only)
             .map_err(|_| ManagementWebError::Io)?;
-        if count == 0 {
-            return Err(ManagementWebError::InvalidHttp);
-        }
-        request.extend_from_slice(&buffer[..count]);
-        if request.len() > MAX_REQUEST_BYTES {
-            return Err(ManagementWebError::RequestTooLarge);
-        }
-        let Some(header_end) = header_end(&request) else {
-            continue;
-        };
-        let content_length = content_length(&request[..header_end])?;
-        let request_length = header_end + content_length;
-        if request_length > MAX_REQUEST_BYTES {
-            return Err(ManagementWebError::RequestTooLarge);
-        }
-        if request.len() >= request_length {
-            request.truncate(request_length);
-            return Ok(request);
-        }
     }
-}
-
-fn parse_request(
-    request: &[u8],
-    remote_addr: SocketAddr,
-) -> Result<ManagementWebRequest, ManagementWebError> {
-    let header_end = header_end(request).ok_or(ManagementWebError::InvalidHttp)?;
-    let header =
-        std::str::from_utf8(&request[..header_end]).map_err(|_| ManagementWebError::InvalidHttp)?;
-    let header = header
-        .strip_suffix("\r\n\r\n")
-        .ok_or(ManagementWebError::InvalidHttp)?;
-    let line = header
-        .split("\r\n")
-        .next()
-        .ok_or(ManagementWebError::InvalidHttp)?;
-    let mut parts = line.split_whitespace();
-    let method = parts.next().ok_or(ManagementWebError::InvalidHttp)?;
-    let path = parts.next().ok_or(ManagementWebError::InvalidHttp)?;
-    let version = parts.next().ok_or(ManagementWebError::InvalidHttp)?;
-    if parts.next().is_some() || !version.starts_with("HTTP/") || !path.starts_with('/') {
-        return Err(ManagementWebError::InvalidHttp);
-    }
-    validate_request_target(path)?;
-    let mut headers = BTreeMap::new();
-    for line in header.split("\r\n").skip(1) {
-        let (name, value) = parse_header_field(line)?;
-        if headers.insert(name, value.to_owned()).is_some() {
-            return Err(ManagementWebError::InvalidHttp);
-        }
-    }
-    Ok(ManagementWebRequest {
-        method: String::from(method),
-        path: String::from(path),
-        headers,
-        body: request[header_end..].to_vec(),
-        remote_addr,
-    })
-}
-
-fn validate_request_target(target: &str) -> Result<(), ManagementWebError> {
-    if target.contains('#') {
-        return Err(ManagementWebError::InvalidHttp);
-    }
-    let (path, query) = target
-        .split_once('?')
-        .map_or((target, None), |(path, query)| (path, Some(query)));
-    if path.is_empty() || path.contains('\\') {
-        return Err(ManagementWebError::InvalidHttp);
-    }
-    let decoded_path = percent_decode_component(path, true)?;
-    let decoded_path =
-        std::str::from_utf8(&decoded_path).map_err(|_| ManagementWebError::InvalidHttp)?;
-    if decoded_path.starts_with("//")
-        || decoded_path
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
-    {
-        return Err(ManagementWebError::InvalidHttp);
-    }
-    if let Some(query) = query {
-        percent_decode_component(query, false)?;
-    }
-    Ok(())
-}
-
-fn percent_decode_component(
-    component: &str,
-    reject_encoded_separator: bool,
-) -> Result<Vec<u8>, ManagementWebError> {
-    let bytes = component.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        let decoded_byte = if byte == b'%' {
-            let high = bytes
-                .get(index + 1)
-                .and_then(|byte| hex_value(*byte))
-                .ok_or(ManagementWebError::InvalidHttp)?;
-            let low = bytes
-                .get(index + 2)
-                .and_then(|byte| hex_value(*byte))
-                .ok_or(ManagementWebError::InvalidHttp)?;
-            index += 3;
-            let decoded = high * 16 + low;
-            if reject_encoded_separator && matches!(decoded, b'/' | b'\\') {
-                return Err(ManagementWebError::InvalidHttp);
-            }
-            decoded
-        } else {
-            index += 1;
-            byte
-        };
-        if decoded_byte == 0 || decoded_byte.is_ascii_control() {
-            return Err(ManagementWebError::InvalidHttp);
-        }
-        decoded.push(decoded_byte);
-    }
-    Ok(decoded)
-}
-
-const fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn content_length(header: &[u8]) -> Result<usize, ManagementWebError> {
-    let header = std::str::from_utf8(header).map_err(|_| ManagementWebError::InvalidHttp)?;
-    let header = header
-        .strip_suffix("\r\n\r\n")
-        .ok_or(ManagementWebError::InvalidHttp)?;
-    let mut length = None;
-    for line in header.split("\r\n").skip(1) {
-        let (name, value) = parse_header_field(line)?;
-        if name == "transfer-encoding" {
-            return Err(ManagementWebError::InvalidHttp);
-        }
-        if name == "content-length" {
-            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(ManagementWebError::InvalidHttp);
-            }
-            let parsed = value
-                .parse::<usize>()
-                .map_err(|_| ManagementWebError::InvalidHttp);
-            if length.replace(parsed?).is_some() {
-                return Err(ManagementWebError::InvalidHttp);
-            }
-        }
-    }
-    Ok(length.unwrap_or(0))
-}
-
-fn with_gateway_headers(
-    request: &[u8],
-    gateway_capability: Option<&str>,
-) -> Result<Vec<u8>, ManagementWebError> {
-    let header_end = header_end(request).ok_or(ManagementWebError::InvalidHttp)?;
-    let header =
-        std::str::from_utf8(&request[..header_end]).map_err(|_| ManagementWebError::InvalidHttp)?;
-    let header = header
-        .strip_suffix("\r\n\r\n")
-        .ok_or(ManagementWebError::InvalidHttp)?;
-    let mut rewritten = String::new();
-    for (index, line) in header.split("\r\n").enumerate() {
-        if index > 0 {
-            let (name, _) = parse_header_field(line)?;
-            if matches!(
-                name.as_str(),
-                "connection" | "proxy-connection" | GATEWAY_CAPABILITY_HEADER
-            ) {
-                continue;
-            }
-        }
-        rewritten.push_str(line);
-        rewritten.push_str("\r\n");
-    }
-    rewritten.push_str("connection: close\r\n\r\n");
-    if let Some(capability) = gateway_capability {
-        if !valid_gateway_capability(capability) {
-            return Err(ManagementWebError::InvalidHttp);
-        }
-        let insertion = rewritten.len() - 2;
-        rewritten.insert_str(
-            insertion,
-            &format!("{GATEWAY_CAPABILITY_HEADER}: {capability}\r\n"),
-        );
-    }
-    let mut rewritten = rewritten.into_bytes();
-    rewritten.extend_from_slice(&request[header_end..]);
-    Ok(rewritten)
+    socket
+        .bind(&address.into())
+        .map_err(|_| ManagementWebError::Io)?;
+    socket.listen(128).map_err(|_| ManagementWebError::Io)?;
+    let listener: TcpListener = socket.into();
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| ManagementWebError::Io)?;
+    Ok(listener)
 }
 
 fn valid_gateway_capability(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn canonical_header_name(name: &str) -> Result<String, ManagementWebError> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        return Err(ManagementWebError::InvalidHttp);
+fn is_write_method(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn audit_policy(policy: &WebPolicy, action: &'static str, outcome: &'static str) {
+    if let Some(access) = &policy.access {
+        access.audit(unix_time(), action, outcome);
     }
-    Ok(name.to_ascii_lowercase())
 }
 
-fn parse_header_field(line: &str) -> Result<(String, &str), ManagementWebError> {
-    let (name, value) = line
-        .split_once(':')
-        .ok_or(ManagementWebError::InvalidHttp)?;
-    let name = canonical_header_name(name)?;
-    if value
-        .bytes()
-        .any(|byte| byte == b'\r' || byte == b'\n' || (byte.is_ascii_control() && byte != b'\t'))
-    {
-        return Err(ManagementWebError::InvalidHttp);
+fn access_error(error: ManagementAccessError) -> Response {
+    let status = match error {
+        ManagementAccessError::CredentialsInvalid
+        | ManagementAccessError::SessionInvalid
+        | ManagementAccessError::SessionExpired => StatusCode::UNAUTHORIZED,
+        ManagementAccessError::LoginRateLimited => StatusCode::TOO_MANY_REQUESTS,
+        ManagementAccessError::OriginDenied | ManagementAccessError::CsrfInvalid => {
+            StatusCode::FORBIDDEN
+        }
+        ManagementAccessError::InvalidConfiguration => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    stable_error(status, error.code())
+}
+
+fn login_body_error(error: &JsonRejection) -> Response {
+    if error_chain_contains::<TimeoutError>(error) {
+        return stable_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "MANAGEMENT_WEB_REQUEST_BODY_TIMEOUT",
+        );
     }
-    Ok((name, value.trim()))
-}
-
-fn header_end(request: &[u8]) -> Option<usize> {
-    request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
-}
-
-fn write_response(
-    stream: &mut dyn ManagementWebStream,
-    status: &str,
-    content_type: &str,
-    body: &str,
-) -> Result<(), ManagementWebError> {
-    write_bytes_response(
-        stream,
-        status,
-        content_type,
-        "no-store",
-        body.as_bytes(),
-        false,
-    )
-}
-
-fn write_bytes_response(
-    stream: &mut dyn ManagementWebStream,
-    status: &str,
-    content_type: &str,
-    cache_control: &str,
-    body: &[u8],
-    head_only: bool,
-) -> Result<(), ManagementWebError> {
-    write_response_header(
-        stream,
-        status,
-        content_type,
-        cache_control,
-        body.len() as u64,
-    )?;
-    if !head_only {
-        stream.write_all(body).map_err(|_| ManagementWebError::Io)?;
+    match error {
+        JsonRejection::MissingJsonContentType(_) => stable_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "MANAGEMENT_WEB_JSON_CONTENT_TYPE_REQUIRED",
+        ),
+        JsonRejection::JsonSyntaxError(_) => {
+            stable_error(StatusCode::BAD_REQUEST, "MANAGEMENT_WEB_JSON_INVALID")
+        }
+        JsonRejection::JsonDataError(_) => stable_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "MANAGEMENT_WEB_JSON_SCHEMA_INVALID",
+        ),
+        JsonRejection::BytesRejection(_) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            stable_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ManagementWebError::RequestTooLarge.code(),
+            )
+        }
+        JsonRejection::BytesRejection(_) => stable_error(
+            StatusCode::BAD_REQUEST,
+            "MANAGEMENT_WEB_REQUEST_BODY_INVALID",
+        ),
+        _ => stable_error(
+            StatusCode::BAD_REQUEST,
+            "MANAGEMENT_WEB_REQUEST_BODY_INVALID",
+        ),
     }
-    Ok(())
 }
 
-fn write_response_header(
-    stream: &mut dyn ManagementWebStream,
-    status: &str,
-    content_type: &str,
-    cache_control: &str,
-    content_length: u64,
-) -> Result<(), ManagementWebError> {
-    let header = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncache-control: {cache_control}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        content_length
-    );
-    stream
-        .write_all(header.as_bytes())
-        .map_err(|_| ManagementWebError::Io)
-}
-
-fn load_tls_config(config: &ManagementTlsConfig) -> Result<Arc<ServerConfig>, ManagementWebError> {
-    let certificates = CertificateDer::pem_file_iter(&config.certificate_path)
-        .map_err(|_| ManagementWebError::TlsConfiguration)?;
-    let certificates = certificates
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ManagementWebError::TlsConfiguration)?;
-    if certificates.is_empty() {
-        return Err(ManagementWebError::TlsConfiguration);
+fn error_chain_contains<T>(error: &(dyn std::error::Error + 'static)) -> bool
+where
+    T: std::error::Error + 'static,
+{
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<T>() {
+            return true;
+        }
+        current = error.source();
     }
-    let key = PrivateKeyDer::from_pem_file(&config.private_key_path)
-        .map_err(|_| ManagementWebError::TlsConfiguration)?;
-    ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates, key)
-        .map(Arc::new)
-        .map_err(|_| ManagementWebError::TlsConfiguration)
+    false
+}
+
+#[derive(Serialize)]
+struct StableErrorBody {
+    code: &'static str,
+}
+
+fn stable_error(status: StatusCode, code: &'static str) -> Response {
+    (status, Json(StableErrorBody { code })).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveConnectionRegistry, ConnectionRegistrationError, GatewayRoute, GatewaySessionHandle,
-        ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
-        ManagementWebService, ManagementWebStream, gateway_health, gateway_health_with_route,
-        with_gateway_headers,
+        AUTH_CACHE_CONTROL, CSRF_HEADER_NAME, GATEWAY_CAPABILITY_HEADER,
+        GATEWAY_LEASE_DRAIN_TIMEOUT, GATEWAY_RESPONSE_HEADER_ALLOWLIST, GatewayRoute,
+        GatewaySessionHandle, IMMUTABLE_ASSET_CACHE_CONTROL, MANAGEMENT_CONTENT_SECURITY_POLICY,
+        MAX_REQUEST_BYTES, MAX_RESPONSE_BODIES, ManagementWebConfig, ManagementWebError,
+        ManagementWebProfile, ManagementWebService, RevocableBody, SHELL_CACHE_CONTROL, WebPolicy,
+        allowlisted_headers, canonical_static_root, complete_login_request, gateway_request,
+        local_hosts, management_router, strip_hop_headers,
     };
-
-    #[test]
-    fn strips_client_gateway_capabilities_and_injects_one_agent_value() {
-        let capability = "a".repeat(64);
-        let request = b"POST /api/v1/jobs HTTP/1.1\r\nhost: localhost\r\nX-CMClient-Gateway-Capability: spoofed\r\nconnection: keep-alive\r\ncontent-length: 4\r\n\r\nbody";
-        let rewritten =
-            with_gateway_headers(request, Some(&capability)).expect("request should rewrite");
-        let rewritten = String::from_utf8(rewritten).expect("request should remain UTF-8");
-
-        assert!(!rewritten.contains("spoofed"));
-        assert!(!rewritten.contains("keep-alive"));
-        assert_eq!(
-            rewritten.matches("x-cmclient-gateway-capability:").count(),
-            1
-        );
-        assert!(rewritten.contains(&format!("x-cmclient-gateway-capability: {capability}\r\n")));
-        assert!(rewritten.ends_with("\r\n\r\nbody"));
-        assert!(with_gateway_headers(request, Some(&"A".repeat(64))).is_err());
-    }
-
-    #[test]
-    fn rejects_whitespace_obfuscated_gateway_capability_headers_consistently() {
-        let remote = "127.0.0.1:12345"
-            .parse()
-            .expect("remote address should parse");
-        for request in [
-            b"GET /api/v1/system/health HTTP/1.1\r\n X-CMClient-Gateway-Capability: spoofed\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"GET /api/v1/system/health HTTP/1.1\r\nX-CMClient-Gateway-Capability : spoofed\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"POST /api/v1/jobs HTTP/1.1\r\nhost: localhost\r\n transfer-encoding: chunked\r\n\r\n".as_slice(),
-            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\nX-CMClient-Gateway-Capability: spoofed\r\n\r\n".as_slice(),
-        ] {
-            assert!(matches!(
-                super::parse_request(request, remote),
-                Err(ManagementWebError::InvalidHttp)
-            ));
-            assert!(matches!(
-                with_gateway_headers(request, Some(&"a".repeat(64))),
-                Err(ManagementWebError::InvalidHttp)
-            ));
-            let header_end = super::header_end(request).expect("request should have a header");
-            assert!(matches!(
-                super::content_length(&request[..header_end]),
-                Err(ManagementWebError::InvalidHttp)
-            ));
-        }
-    }
+    use crate::access::{LanAccessConfig, ManagementAccessController};
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        extract::ConnectInfo,
+        http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
+        response::Response,
+        routing::{get, post},
+    };
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use hyper::body::{Body as HttpBody, Frame};
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+    use ipnet::IpNet;
+    use serde_json::Value;
     use std::{
-        fs,
-        io::{Cursor, Read, Write},
-        net::{SocketAddr, TcpListener, TcpStream},
+        collections::BTreeSet,
+        convert::Infallible,
+        net::SocketAddr,
         path::{Path, PathBuf},
-        sync::{Arc, atomic::AtomicBool, mpsc},
+        pin::Pin,
+        str::FromStr,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc,
+        },
+        task::{Context, Poll},
         thread,
         time::{Duration, Instant},
     };
+    use tokio::sync::Semaphore;
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
+    use uuid::Uuid;
 
-    struct AgentRoute;
+    const TEST_PORT: u16 = 7_080;
 
-    struct RejectEveryRequest;
+    struct TestDirectory(PathBuf);
 
-    struct StaticWebFixture {
-        root: PathBuf,
-    }
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cmclient-agent-core-{label}-{}-{}",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).expect("test directory should be created");
+            Self(path)
+        }
 
-    impl StaticWebFixture {
-        fn new() -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("cmclient-management-web-{}", uuid::Uuid::new_v4()));
-            fs::create_dir_all(root.join("assets")).expect("fixture directories should exist");
-            fs::write(
-                root.join("index.html"),
-                b"<!doctype html><main id=app>production bundle</main>",
-            )
-            .expect("index should write");
-            fs::write(
-                root.join("assets/app-BWWK_6zJ.js"),
-                b"globalThis.cmclient=true;",
-            )
-            .expect("JavaScript asset should write");
-            fs::write(root.join("assets/app-a1b2c3d4.css"), b"#app{display:block}")
-                .expect("CSS asset should write");
-            fs::write(root.join("favicon.ico"), [0_u8, 1, 2, 3]).expect("icon should write");
-            Self { root }
+        fn path(&self) -> &Path {
+            &self.0
         }
     }
 
-    impl Drop for StaticWebFixture {
+    impl Drop for TestDirectory {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    fn static_response(root: &Path, request: &[u8]) -> Vec<u8> {
-        static_response_with_handler(root, request, None)
-    }
-
-    fn static_response_with_handler(
-        root: &Path,
-        request: &[u8],
-        handler: Option<Arc<dyn ManagementWebApiHandler>>,
-    ) -> Vec<u8> {
-        let config = ManagementWebConfig {
-            port: 0,
-            static_web_root: Some(root.to_owned()),
-            ..Default::default()
-        };
-        let listener = match handler {
-            Some(handler) => ManagementWebListener::bind_with_api_handler(&config, handler),
-            None => ManagementWebListener::bind(&config),
-        }
-        .expect("management listener should bind");
-        let address = listener.local_addr().expect("listener address should load");
-        let server = thread::spawn(move || listener.serve_once());
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        client.write_all(request).expect("request should write");
-        let mut response = Vec::new();
-        client
-            .read_to_end(&mut response)
-            .expect("response should read");
-        server
-            .join()
-            .expect("server should join")
-            .expect("server should respond");
-        response
-    }
-
-    fn response_body(response: &[u8]) -> &[u8] {
-        let body_start = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("response should have a header")
-            + 4;
-        &response[body_start..]
-    }
-
-    fn send_request(address: SocketAddr, request: &[u8]) -> String {
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        client.write_all(request).expect("request should write");
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("response should read");
-        response
-    }
-
-    fn spawn_gateway(
-        expected_capability: String,
-        response_body: &'static str,
-    ) -> (SocketAddr, thread::JoinHandle<()>) {
-        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
-        let address = gateway.local_addr().expect("gateway address should load");
-        let worker = thread::spawn(move || {
-            let (mut stream, _) = gateway.accept().expect("gateway should accept");
-            let mut request = [0_u8; 4096];
-            let count = stream.read(&mut request).expect("request should read");
-            let request = String::from_utf8(request[..count].to_vec())
-                .expect("gateway request should be UTF-8");
-            assert!(!request.contains("spoofed"));
-            assert_eq!(request.matches("x-cmclient-gateway-capability:").count(), 1);
-            assert!(request.contains(&format!(
-                "x-cmclient-gateway-capability: {expected_capability}\r\n"
-            )));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("gateway response should write");
-        });
-        (address, worker)
-    }
-
-    fn tcp_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("pair listener should bind");
-        let client = TcpStream::connect(listener.local_addr().expect("pair address should load"))
-            .expect("pair client should connect");
-        let (server, _) = listener.accept().expect("pair server should accept");
-        (client, server)
-    }
-
-    fn wait_for_active_count(registry: &ActiveConnectionRegistry, expected: usize) {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while registry.active_count() != expected {
-            assert!(
-                Instant::now() < deadline,
-                "active connection count did not become {expected}"
-            );
-            thread::yield_now();
-        }
-    }
-
-    impl ManagementWebApiHandler for AgentRoute {
-        fn handle(
-            &self,
-            client: &mut dyn ManagementWebStream,
-            request: &super::ManagementWebRequest,
-        ) -> Result<bool, ManagementWebError> {
-            if request.method == "GET" && request.path == "/api/v1/updates" {
-                client
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 16\r\nconnection: close\r\n\r\n{\"schemaVersion\":1}",
-                    )
-                    .map_err(|_| ManagementWebError::Io)?;
-                return Ok(true);
-            }
-            Ok(false)
-        }
-    }
-
-    impl ManagementWebApiHandler for RejectEveryRequest {
-        fn handle(
-            &self,
-            client: &mut dyn ManagementWebStream,
-            _request: &super::ManagementWebRequest,
-        ) -> Result<bool, ManagementWebError> {
-            super::write_response(
-                client,
-                "401 Unauthorized",
-                "application/json",
-                r#"{"code":"AUTH_REQUIRED"}"#,
-            )?;
-            Ok(true)
-        }
-    }
-
-    #[test]
-    fn gateway_routes_are_loopback_capability_bound_and_redacted() {
-        let capability = "a".repeat(64);
-        let route = GatewayRoute::new(
-            "127.0.0.1:4810".parse().expect("address should parse"),
-            capability.clone(),
+    fn test_access(origin: &str) -> Arc<ManagementAccessController> {
+        let salt =
+            SaltString::encode_b64(b"cmclient-web-fixture").expect("fixture salt should encode");
+        let password_hash = Argon2::default()
+            .hash_password(b"password", &salt)
+            .expect("fixture password should hash")
+            .to_string();
+        Arc::new(
+            ManagementAccessController::new(LanAccessConfig {
+                password_hash,
+                allowed_origins: BTreeSet::from([origin.to_owned()]),
+                session_ttl_seconds: 600,
+                audit_capacity: 64,
+            })
+            .expect("fixture access policy should be valid"),
         )
-        .expect("valid route should construct");
-        assert_eq!(route.address().to_string(), "127.0.0.1:4810");
-        let active = route.active().expect("route should be active");
-        assert_eq!(active.capability(), capability);
-        drop(active);
-        assert!(!format!("{route:?}").contains(&capability));
-
-        let session = GatewaySessionHandle::with_route(route.clone());
-        assert_eq!(session.snapshot(), Some(route));
-        assert!(!format!("{session:?}").contains(&capability));
-        let stale = session.snapshot().expect("route should snapshot");
-        session.clear();
-        assert!(session.snapshot().is_none());
-        assert!(!stale.is_active());
-        assert!(stale.active().is_none());
-
-        assert!(matches!(
-            GatewayRoute::new(
-                "192.0.2.1:4810".parse().expect("address should parse"),
-                "b".repeat(64),
-            ),
-            Err(ManagementWebError::InvalidHttp)
-        ));
-        assert!(matches!(
-            GatewayRoute::new(
-                "127.0.0.1:4810".parse().expect("address should parse"),
-                "B".repeat(64),
-            ),
-            Err(ManagementWebError::InvalidHttp)
-        ));
-        assert!(matches!(
-            GatewayRoute::new(
-                "127.0.0.1:0".parse().expect("address should parse"),
-                "c".repeat(64),
-            ),
-            Err(ManagementWebError::InvalidHttp)
-        ));
-        assert!(matches!(
-            GatewayRoute::new(
-                "[::1]:4810".parse().expect("address should parse"),
-                "d".repeat(64),
-            ),
-            Err(ManagementWebError::InvalidHttp)
-        ));
     }
 
-    #[test]
-    fn session_rotation_revokes_old_snapshots_and_waits_for_capability_users() {
-        let first = GatewayRoute::new(
-            "127.0.0.1:4810".parse().expect("address should parse"),
-            "1".repeat(64),
-        )
-        .expect("first route should construct");
-        let session = GatewaySessionHandle::with_route(first);
-        let stale = session.snapshot().expect("first route should snapshot");
-        let active = stale.active().expect("first route should be active");
-        let (started_sender, started_receiver) = mpsc::sync_channel(1);
-        let (cleared_sender, cleared_receiver) = mpsc::sync_channel(1);
-        let clear_session = session.clone();
-        let clearer = thread::spawn(move || {
-            started_sender.send(()).expect("start signal should send");
-            clear_session.clear();
-            cleared_sender.send(()).expect("clear signal should send");
-        });
-        started_receiver.recv().expect("clear should start");
-        assert!(
-            cleared_receiver
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "clear must wait until the capability write lease is released"
+    fn test_policy(
+        profile: ManagementWebProfile,
+        allow_lan: bool,
+        allowed_cidrs: Vec<IpNet>,
+        extra_hosts: &[&str],
+        access: Option<Arc<ManagementAccessController>>,
+        static_web_root: Option<PathBuf>,
+        http_lan_warning: bool,
+    ) -> Arc<WebPolicy> {
+        let local_hosts = local_hosts(TEST_PORT);
+        let mut allowed_hosts = local_hosts.clone();
+        allowed_hosts.extend(extra_hosts.iter().map(|host| (*host).to_owned()));
+        Arc::new(WebPolicy {
+            profile,
+            allow_lan,
+            allowed_cidrs,
+            allowed_hosts,
+            local_hosts: local_hosts.clone(),
+            allowed_local_origins: local_hosts
+                .iter()
+                .map(|host| format!("http://{host}"))
+                .collect(),
+            http_lan_warning,
+            static_web_root,
+            access,
+            generation: Arc::new(AtomicU64::new(1)),
+            setup_generation: Arc::new(AtomicU64::new(1)),
+            response_slots: Arc::new(Semaphore::new(MAX_RESPONSE_BODIES)),
+            gateway_session: GatewaySessionHandle::new(),
+            gateway_client: Client::builder(TokioExecutor::new()).build_http(),
+        })
+    }
+
+    fn test_router(agent_routes: Router, policy: Arc<WebPolicy>) -> (Router, CancellationToken) {
+        let cleanup = CancellationToken::new();
+        let router = management_router(agent_routes, policy, false, cleanup.clone());
+        (router, cleanup)
+    }
+
+    fn test_request(
+        method: Method,
+        uri: &str,
+        host: &str,
+        peer: SocketAddr,
+        body: Body,
+    ) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, host)
+            .body(body)
+            .expect("request should build");
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    fn response_cookie(response: &Response) -> String {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("cmclient.sid="))
+            .and_then(|value| value.split(';').next())
+            .expect("session response should set the management cookie")
+            .to_owned()
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body should read");
+        serde_json::from_slice(&body).expect("response should contain JSON")
+    }
+
+    async fn assert_error(response: Response, status: StatusCode, code: &str) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({"code": code})
         );
-        drop(active);
-        cleared_receiver
+    }
+
+    fn bounded_sync_operation(operation: impl FnOnce() + Send + 'static) -> Duration {
+        let (finished, completion) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let started = Instant::now();
+            operation();
+            finished
+                .send(started.elapsed())
+                .expect("completion receiver should remain available");
+        });
+        let elapsed = completion
             .recv_timeout(Duration::from_secs(1))
-            .expect("clear should finish after the lease is released");
-        clearer.join().expect("clear thread should join");
-        assert!(!stale.is_active());
-
-        let second = GatewayRoute::new(
-            "127.0.0.1:4811".parse().expect("address should parse"),
-            "2".repeat(64),
-        )
-        .expect("second route should construct");
-        session.set(second);
-        let rotated = session.snapshot().expect("second route should snapshot");
-        assert_eq!(rotated.address().port(), 4811);
-        assert!(rotated.is_active());
-        session.set(
-            GatewayRoute::new(
-                "127.0.0.1:4812".parse().expect("address should parse"),
-                "4".repeat(64),
-            )
-            .expect("third route should construct"),
-        );
-        assert!(!rotated.is_active());
-        assert!(
-            session
-                .snapshot()
-                .is_some_and(|route| route.address().port() == 4812 && route.is_active())
-        );
+            .expect("lease revocation must have a deterministic upper bound");
+        worker.join().expect("revocation worker should not panic");
+        elapsed
     }
 
-    #[test]
-    fn stale_dynamic_proxy_snapshot_never_sends_capability_to_reused_port() {
-        let original = TcpListener::bind("127.0.0.1:0").expect("original port should bind");
-        let address = original.local_addr().expect("original address should load");
-        let route = GatewayRoute::new(address, "3".repeat(64)).expect("route should construct");
-        let session = GatewaySessionHandle::with_route(route.clone());
-        let stale = super::GatewayRouteSource::dynamic(session.clone())
-            .snapshot()
-            .expect("route should resolve before clear");
-
-        drop(original);
-        session.clear();
-        let reused = TcpListener::bind(address).expect("cleared port should be reusable");
-        reused
-            .set_nonblocking(true)
-            .expect("reused listener should be nonblocking");
-        assert!(!gateway_health_with_route(&route));
-        let mut response = Cursor::new(Vec::new());
-        super::proxy_api(
-            &mut response,
-            &stale,
-            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n\r\n",
-            &AtomicBool::new(true),
-        )
-        .expect("stale proxy should fail closed");
-        assert!(
-            String::from_utf8(response.into_inner())
-                .expect("response should be UTF-8")
-                .starts_with("HTTP/1.1 503 Service Unavailable")
-        );
-        assert!(matches!(
-            reused.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
+    struct PendingBody {
+        polled: Option<Arc<AtomicBool>>,
     }
 
-    #[test]
-    fn dynamic_gateway_session_rotates_without_restarting_management_web() {
-        let session = GatewaySessionHandle::new();
-        let service = ManagementWebService::start_with_api_handler_and_gateway_session(
-            &ManagementWebConfig {
-                port: 0,
-                gateway: "192.0.2.1:9".parse().expect("address should parse"),
-                gateway_capability: Some(String::from("ignored-static-value")),
-                ..Default::default()
-            },
-            Arc::new(AgentRoute),
-            session.clone(),
-        )
-        .expect("dynamic management service should start");
-        let management_address = service.local_addr();
-
-        let agent_response = send_request(
-            management_address,
-            b"GET /api/v1/updates HTTP/1.1\r\nhost: localhost\r\n\r\n",
-        );
-        assert!(agent_response.starts_with("HTTP/1.1 200 OK"));
-        assert!(agent_response.contains("{\"schemaVersion\":1}"));
-
-        let unavailable = send_request(
-            management_address,
-            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n\r\n",
-        );
-        assert!(unavailable.starts_with("HTTP/1.1 503 Service Unavailable"));
-        assert_eq!(
-            response_body(unavailable.as_bytes()),
-            br#"{"code":"GATEWAY_PROXY_UNAVAILABLE"}"#
-        );
-
-        let first_capability = "1".repeat(64);
-        let (first_address, first_gateway) =
-            spawn_gateway(first_capability.clone(), r#"{"generation":1}"#);
-        session.set(
-            GatewayRoute::new(first_address, first_capability)
-                .expect("first route should construct"),
-        );
-        let first = send_request(
-            management_address,
-            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\nX-CMClient-Gateway-Capability: spoofed\r\n\r\n",
-        );
-        assert!(first.starts_with("HTTP/1.1 200 OK"));
-        assert!(first.ends_with(r#"{"generation":1}"#));
-        first_gateway.join().expect("first gateway should join");
-
-        session.clear();
-        let unavailable = send_request(
-            management_address,
-            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n\r\n",
-        );
-        assert!(unavailable.starts_with("HTTP/1.1 503 Service Unavailable"));
-
-        let second_capability = "2".repeat(64);
-        let (second_address, second_gateway) =
-            spawn_gateway(second_capability.clone(), r#"{"generation":2}"#);
-        session.set(
-            GatewayRoute::new(second_address, second_capability)
-                .expect("second route should construct"),
-        );
-        let second = send_request(
-            management_address,
-            b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\nX-CMClient-Gateway-Capability: spoofed\r\n\r\n",
-        );
-        assert!(second.starts_with("HTTP/1.1 200 OK"));
-        assert!(second.ends_with(r#"{"generation":2}"#));
-        assert_eq!(service.local_addr(), management_address);
-        second_gateway.join().expect("second gateway should join");
-        service.stop().expect("management service should stop");
-    }
-
-    #[test]
-    fn gateway_health_with_route_authenticates_with_the_exact_capability() {
-        let capability = "3".repeat(64);
-        let (address, gateway) = spawn_gateway(capability.clone(), r#"{"status":"ok"}"#);
-        let route = GatewayRoute::new(address, capability).expect("route should construct");
-
-        assert!(gateway_health_with_route(&route));
-        gateway.join().expect("gateway should join");
-    }
-
-    #[test]
-    fn gateway_health_requires_an_exact_bounded_http_json_response() {
-        let valid = b"HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: 15\r\nconnection: close\r\n\r\n{\"status\":\"ok\"}";
-        assert_eq!(super::validate_gateway_health_response(valid), Ok(true));
-
-        for body in [
-            r#"{"status":"bad","message":"{\"status\":\"ok\"}"}"#,
-            r#"{"status":"ok","extra":true}"#,
-        ] {
-            let invalid = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            assert_eq!(
-                super::validate_gateway_health_response(invalid.as_bytes()),
-                Err(())
-            );
+    impl PendingBody {
+        fn idle() -> Self {
+            Self { polled: None }
         }
-        for invalid in [
-            b"HTTP/1.0 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"status\":\"ok\"}".as_slice(),
-            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\nf\r\n{\"status\":\"ok\"}\r\n0\r\n\r\n".as_slice(),
-            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 5000\r\n\r\n".as_slice(),
-            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"status\":\"ok\"}trailing".as_slice(),
-        ] {
-            assert_eq!(super::validate_gateway_health_response(invalid), Err(()));
-        }
-        assert_eq!(
-            super::validate_gateway_health_response(
-                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"status\":"
-            ),
-            Ok(false)
-        );
-    }
 
-    #[test]
-    fn gateway_health_uses_one_total_deadline_against_drip_responses() {
-        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
-        let address = gateway.local_addr().expect("gateway address should load");
-        let worker = thread::spawn(move || {
-            let (mut stream, _) = gateway.accept().expect("gateway should accept");
-            let mut request = [0_u8; 1024];
-            let _ = stream
-                .read(&mut request)
-                .expect("health request should read");
-            for _ in 0..30 {
-                if stream.write_all(b"H").is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(10));
+        fn observed(polled: Arc<AtomicBool>) -> Self {
+            Self {
+                polled: Some(polled),
             }
-        });
-        let started = Instant::now();
-        assert!(!super::gateway_health_request(
-            address,
+        }
+    }
+
+    impl HttpBody for PendingBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if let Some(polled) = &self.get_mut().polled {
+                polled.store(true, Ordering::Release);
+            }
+            Poll::Pending
+        }
+    }
+
+    struct TrailerBody {
+        trailers: Option<HeaderMap>,
+    }
+
+    impl TrailerBody {
+        fn new(trailers: HeaderMap) -> Self {
+            Self {
+                trailers: Some(trailers),
+            }
+        }
+    }
+
+    impl HttpBody for TrailerBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match self.get_mut().trailers.take() {
+                Some(trailers) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
+                None => Poll::Ready(None),
+            }
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.trailers.is_none()
+        }
+    }
+
+    fn forbidden_trailers() -> HeaderMap {
+        let mut trailers = HeaderMap::new();
+        for (name, value) in [
+            (GATEWAY_CAPABILITY_HEADER, "capability-must-not-cross"),
+            ("cookie", "cmclient.sid=must-not-cross"),
+            (CSRF_HEADER_NAME, "csrf-must-not-cross"),
+            ("origin", "https://must-not-cross.example"),
+            ("access-control-allow-origin", "*"),
+            ("x-private-trailer", "must-not-cross"),
+        ] {
+            trailers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        trailers
+    }
+
+    #[tokio::test]
+    async fn local_session_uses_the_existing_payload_and_csrf_contract_and_revokes() {
+        let policy = test_policy(
+            ManagementWebProfile::Native,
+            false,
+            Vec::new(),
+            &[],
             None,
-            Duration::from_millis(80)
-        ));
+            None,
+            false,
+        );
+        let routes = Router::new().route(
+            "/api/v1/test-write",
+            post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let (router, cleanup) = test_router(routes, Arc::clone(&policy));
+        let peer = SocketAddr::from(([127, 0, 0, 1], 49_100));
+
+        let session = router
+            .clone()
+            .oneshot(test_request(
+                Method::GET,
+                "/api/v1/auth/session",
+                "localhost:7080",
+                peer,
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+        assert_eq!(session.status(), StatusCode::OK);
+        assert_eq!(
+            session
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(AUTH_CACHE_CONTROL)
+        );
+        let cookie = response_cookie(&session);
+        let payload = response_json(session).await;
+        assert_eq!(payload["schemaVersion"], 1);
+        assert_eq!(payload.as_object().map(serde_json::Map::len), Some(3));
+        let csrf = payload["csrfToken"]
+            .as_str()
+            .expect("session should contain CSRF")
+            .to_owned();
+        assert_eq!(csrf.len(), 32);
+        assert!(payload["expiresAt"].as_u64().is_some_and(|value| value > 0));
+
+        let mut legacy_header = test_request(
+            Method::POST,
+            "/api/v1/test-write",
+            "localhost:7080",
+            peer,
+            Body::empty(),
+        );
+        legacy_header.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:7080"),
+        );
+        legacy_header.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookie).expect("cookie should encode"),
+        );
+        legacy_header.headers_mut().insert(
+            "x-cmclient-csrf",
+            HeaderValue::from_str(&csrf).expect("CSRF should encode"),
+        );
+        assert_error(
+            router
+                .clone()
+                .oneshot(legacy_header)
+                .await
+                .expect("router should respond"),
+            StatusCode::FORBIDDEN,
+            "MANAGEMENT_CSRF_INVALID",
+        )
+        .await;
+
+        let mut protected = test_request(
+            Method::POST,
+            "/api/v1/test-write",
+            "localhost:7080",
+            peer,
+            Body::empty(),
+        );
+        protected.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:7080"),
+        );
+        protected.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookie).expect("cookie should encode"),
+        );
+        protected.headers_mut().insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(&csrf).expect("CSRF should encode"),
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(protected)
+                .await
+                .expect("router should respond")
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        policy.generation.fetch_add(1, Ordering::AcqRel);
+        let mut revoked = test_request(
+            Method::POST,
+            "/api/v1/test-write",
+            "localhost:7080",
+            peer,
+            Body::empty(),
+        );
+        revoked.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:7080"),
+        );
+        revoked.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookie).expect("cookie should encode"),
+        );
+        revoked.headers_mut().insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(&csrf).expect("CSRF should encode"),
+        );
+        assert_error(
+            router
+                .clone()
+                .oneshot(revoked)
+                .await
+                .expect("router should respond"),
+            StatusCode::UNAUTHORIZED,
+            "MANAGEMENT_SESSION_INVALID",
+        )
+        .await;
+        cleanup.cancel();
+    }
+
+    #[tokio::test]
+    async fn host_admission_does_not_turn_loopback_reverse_proxies_into_local_clients() {
+        let policy = test_policy(
+            ManagementWebProfile::Native,
+            false,
+            Vec::new(),
+            &["proxy.example:7080"],
+            None,
+            None,
+            false,
+        );
+        let routes = Router::new().route("/api/v1/test-read", get(|| async { "ok" }));
+        let (router, cleanup) = test_router(routes, policy);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 49_101));
+
+        let mut spoofed = test_request(
+            Method::GET,
+            "/api/v1/test-read",
+            "evil.example:7080",
+            peer,
+            Body::empty(),
+        );
+        spoofed.headers_mut().insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("localhost:7080"),
+        );
+        let denied = router
+            .clone()
+            .oneshot(spoofed)
+            .await
+            .expect("router should respond");
+        assert_eq!(
+            denied
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+        assert!(denied.headers().contains_key("x-request-id"));
+        assert_eq!(
+            denied
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some(MANAGEMENT_CONTENT_SECURITY_POLICY)
+        );
+        assert_error(denied, StatusCode::FORBIDDEN, "MANAGEMENT_HOST_DENIED").await;
+
+        assert_error(
+            router
+                .clone()
+                .oneshot(test_request(
+                    Method::GET,
+                    "/api/v1/test-read",
+                    "proxy.example:7080",
+                    peer,
+                    Body::empty(),
+                ))
+                .await
+                .expect("router should respond"),
+            StatusCode::UNAUTHORIZED,
+            "MANAGEMENT_SESSION_INVALID",
+        )
+        .await;
+
+        let mut duplicate_host = test_request(
+            Method::GET,
+            "/api/v1/test-read",
+            "localhost:7080",
+            peer,
+            Body::empty(),
+        );
+        duplicate_host
+            .headers_mut()
+            .append(header::HOST, HeaderValue::from_static("localhost:7080"));
+        assert_error(
+            router
+                .oneshot(duplicate_host)
+                .await
+                .expect("router should respond"),
+            StatusCode::FORBIDDEN,
+            "MANAGEMENT_HOST_DENIED",
+        )
+        .await;
+        cleanup.cancel();
+    }
+
+    #[tokio::test]
+    async fn login_framework_rejections_use_stable_json_errors() {
+        let origin = "http://localhost:7080";
+        let policy = test_policy(
+            ManagementWebProfile::Native,
+            false,
+            Vec::new(),
+            &[],
+            Some(test_access(origin)),
+            None,
+            false,
+        );
+        let (router, cleanup) = test_router(Router::new(), policy);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 49_108));
+
+        let mut malformed = test_request(
+            Method::POST,
+            "/api/v1/auth/login",
+            "localhost:7080",
+            peer,
+            Body::from(r#"{"password":"#),
+        );
+        malformed
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static(origin));
+        malformed.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_error(
+            router
+                .clone()
+                .oneshot(malformed)
+                .await
+                .expect("router should respond"),
+            StatusCode::BAD_REQUEST,
+            "MANAGEMENT_WEB_JSON_INVALID",
+        )
+        .await;
+
+        let mut wrong_content_type = test_request(
+            Method::POST,
+            "/api/v1/auth/login",
+            "localhost:7080",
+            peer,
+            Body::from(r#"{"password":"password"}"#),
+        );
+        wrong_content_type
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static(origin));
+        assert_error(
+            router
+                .clone()
+                .oneshot(wrong_content_type)
+                .await
+                .expect("router should respond"),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "MANAGEMENT_WEB_JSON_CONTENT_TYPE_REQUIRED",
+        )
+        .await;
+
+        let mut oversized = test_request(
+            Method::POST,
+            "/api/v1/auth/login",
+            "localhost:7080",
+            peer,
+            Body::empty(),
+        );
+        oversized
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static(origin));
+        oversized.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        oversized.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&(MAX_REQUEST_BYTES + 1).to_string())
+                .expect("content length should encode"),
+        );
+        let oversized = router
+            .clone()
+            .oneshot(oversized)
+            .await
+            .expect("router should respond");
+        assert_eq!(
+            oversized
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(AUTH_CACHE_CONTROL),
+        );
+        assert_error(
+            oversized,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "MANAGEMENT_WEB_REQUEST_TOO_LARGE",
+        )
+        .await;
+
+        let mut slow = test_request(
+            Method::POST,
+            "/api/v1/auth/login",
+            "localhost:7080",
+            peer,
+            Body::new(PendingBody::idle()),
+        );
+        slow.headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static(origin));
+        slow.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_error(
+            router
+                .clone()
+                .oneshot(slow)
+                .await
+                .expect("router should respond"),
+            StatusCode::REQUEST_TIMEOUT,
+            "MANAGEMENT_WEB_REQUEST_BODY_TIMEOUT",
+        )
+        .await;
+
+        let method = router
+            .oneshot(test_request(
+                Method::DELETE,
+                "/api/v1/auth/login",
+                "localhost:7080",
+                peer,
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+        assert_eq!(
+            method
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(AUTH_CACHE_CONTROL),
+        );
+        assert_error(
+            method,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MANAGEMENT_WEB_METHOD_NOT_ALLOWED",
+        )
+        .await;
+        cleanup.cancel();
+    }
+
+    #[tokio::test]
+    async fn login_total_timeout_has_a_distinct_stable_error() {
+        let response =
+            complete_login_request(std::future::pending::<Response>(), Duration::from_millis(1))
+                .await;
+        assert_error(
+            response,
+            StatusCode::REQUEST_TIMEOUT,
+            "MANAGEMENT_WEB_LOGIN_TIMEOUT",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_lan_allows_optional_cidr_and_exact_https_origin_on_http() {
+        let origin = "https://cmclient.example";
+        let access = test_access(origin);
+        let policy = test_policy(
+            ManagementWebProfile::Native,
+            true,
+            Vec::new(),
+            &["cmclient.example"],
+            Some(Arc::clone(&access)),
+            None,
+            true,
+        );
+        let routes = Router::new().route(
+            "/api/v1/test-write",
+            post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let (router, cleanup) = test_router(routes, policy);
+        let peer = SocketAddr::from(([192, 0, 2, 10], 49_102));
+        let mut login = test_request(
+            Method::POST,
+            "/api/v1/auth/login",
+            "cmclient.example",
+            peer,
+            Body::from(r#"{"password":"password"}"#),
+        );
+        login
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static(origin));
+        login.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        login
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        let response = router
+            .clone()
+            .oneshot(login)
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(AUTH_CACHE_CONTROL)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-cmclient-management-warning")
+                .and_then(|value| value.to_str().ok()),
+            Some("MANAGEMENT_HTTP_LAN_WARNING")
+        );
+        let cookie = response_cookie(&response);
+        let payload = response_json(response).await;
+        assert_eq!(payload["schemaVersion"], 1);
+        let csrf = payload["csrfToken"]
+            .as_str()
+            .expect("login should contain CSRF");
+
+        let mut protected = test_request(
+            Method::POST,
+            "/api/v1/test-write",
+            "cmclient.example",
+            peer,
+            Body::empty(),
+        );
+        protected
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static(origin));
+        protected.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookie).expect("cookie should encode"),
+        );
+        protected.headers_mut().insert(
+            CSRF_HEADER_NAME,
+            HeaderValue::from_str(csrf).expect("CSRF should encode"),
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(protected)
+                .await
+                .expect("router should respond")
+                .status(),
+            StatusCode::NO_CONTENT
+        );
         assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "health probe exceeded its single total deadline"
+            access
+                .audit_snapshot()
+                .iter()
+                .any(|entry| entry.action == "login" && entry.outcome == "allowed")
         );
-        worker.join().expect("gateway should join");
+
+        let restricted = test_policy(
+            ManagementWebProfile::Native,
+            true,
+            vec![IpNet::from_str("198.51.100.0/24").expect("CIDR should parse")],
+            &["cmclient.example"],
+            Some(access),
+            None,
+            false,
+        );
+        let (restricted, restricted_cleanup) = test_router(Router::new(), restricted);
+        assert_error(
+            restricted
+                .oneshot(test_request(
+                    Method::POST,
+                    "/api/v1/auth/login",
+                    "cmclient.example",
+                    peer,
+                    Body::from(r#"{"password":"password"}"#),
+                ))
+                .await
+                .expect("router should respond"),
+            StatusCode::FORBIDDEN,
+            "MANAGEMENT_PEER_DENIED",
+        )
+        .await;
+        cleanup.cancel();
+        restricted_cleanup.cancel();
     }
 
-    #[test]
-    fn rejects_lan_bind_without_the_security_layer() {
-        let config = ManagementWebConfig {
-            bind: "0.0.0.0".parse().expect("IP should parse"),
-            ..Default::default()
-        };
-        assert!(matches!(
-            ManagementWebListener::bind(&config),
-            Err(ManagementWebError::NonLoopbackBind)
-        ));
-    }
-
-    #[test]
-    fn rejects_lan_bind_when_tls_files_are_missing() {
-        let missing = std::env::temp_dir().join(format!(
-            "cmclient-management-tls-missing-{}",
-            std::process::id()
-        ));
-        let config = ManagementWebConfig {
-            bind: "0.0.0.0".parse().expect("IP should parse"),
-            port: 0,
-            allow_lan: true,
-            tls: Some(super::ManagementTlsConfig {
-                certificate_path: missing.join("certificate.pem"),
-                private_key_path: missing.join("private-key.pem"),
-            }),
-            ..Default::default()
-        };
-
-        assert!(matches!(
-            ManagementWebListener::bind_with_api_handler(&config, Arc::new(AgentRoute)),
-            Err(ManagementWebError::TlsConfiguration)
-        ));
-    }
-
-    #[test]
-    fn rejects_chunked_requests_before_they_reach_the_gateway() {
-        assert!(matches!(
-            super::content_length(
-                b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\ntransfer-encoding: chunked\r\n\r\n"
-            ),
-            Err(ManagementWebError::InvalidHttp)
-        ));
-    }
-
-    #[test]
-    fn serves_vite_bundle_files_with_mime_and_cache_headers() {
-        let fixture = StaticWebFixture::new();
-        let index = static_response(&fixture.root, b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n");
-        let index = String::from_utf8(index).expect("index response should be UTF-8");
-        assert!(index.starts_with("HTTP/1.1 200 OK"));
-        assert!(index.contains("content-type: text/html; charset=utf-8\r\n"));
-        assert!(index.contains("cache-control: no-cache\r\n"));
-        assert!(index.ends_with("<!doctype html><main id=app>production bundle</main>"));
-
-        let javascript = static_response(
-            &fixture.root,
-            b"GET /assets/app-BWWK_6zJ.js?v=1 HTTP/1.1\r\nhost: localhost\r\n\r\n",
+    #[tokio::test]
+    async fn forwarded_addresses_cannot_evade_the_login_rate_limit() {
+        let policy = test_policy(
+            ManagementWebProfile::Native,
+            false,
+            Vec::new(),
+            &[],
+            None,
+            None,
+            false,
         );
-        let javascript =
-            String::from_utf8(javascript).expect("JavaScript response should be UTF-8");
-        assert!(javascript.starts_with("HTTP/1.1 200 OK"));
-        assert!(javascript.contains("content-type: text/javascript; charset=utf-8\r\n"));
-        assert!(javascript.contains("cache-control: public, max-age=31536000, immutable\r\n"));
-        assert!(javascript.ends_with("globalThis.cmclient=true;"));
-
-        let css = static_response(
-            &fixture.root,
-            b"GET /assets/app-a1b2c3d4.css HTTP/1.1\r\nhost: localhost\r\n\r\n",
-        );
-        let css = String::from_utf8(css).expect("CSS response should be UTF-8");
-        assert!(css.contains("content-type: text/css; charset=utf-8\r\n"));
-        assert!(css.contains("cache-control: public, max-age=31536000, immutable\r\n"));
-
-        let icon = static_response(
-            &fixture.root,
-            b"GET /favicon.ico HTTP/1.1\r\nhost: localhost\r\n\r\n",
-        );
-        assert!(icon.starts_with(b"HTTP/1.1 200 OK"));
-        assert!(
-            icon.windows(b"content-type: image/x-icon\r\n".len())
-                .any(|window| window == b"content-type: image/x-icon\r\n")
-        );
-        assert!(
-            icon.windows(b"cache-control: no-cache\r\n".len())
-                .any(|window| window == b"cache-control: no-cache\r\n")
-        );
-        assert_eq!(response_body(&icon), [0_u8, 1, 2, 3]);
-    }
-
-    #[test]
-    fn recognizes_common_vite_asset_content_types() {
-        for (file, expected) in [
-            ("app.mjs", "text/javascript; charset=utf-8"),
-            ("data.json", "application/json; charset=utf-8"),
-            ("logo.svg", "image/svg+xml"),
-            ("logo.png", "image/png"),
-            ("photo.webp", "image/webp"),
-            ("font.woff2", "font/woff2"),
-            ("module.wasm", "application/wasm"),
-            ("site.webmanifest", "application/manifest+json"),
-            ("opaque.bin", "application/octet-stream"),
-        ] {
-            assert_eq!(super::static_content_type(Path::new(file)), expected);
+        let (router, cleanup) = test_router(Router::new(), policy);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 49_103));
+        let mut requests = Vec::new();
+        for index in 0..6 {
+            let mut request = test_request(
+                Method::GET,
+                "/api/v1/auth/session",
+                "localhost:7080",
+                peer,
+                Body::empty(),
+            );
+            request.headers_mut().insert(
+                "x-forwarded-for",
+                HeaderValue::from_str(&format!("198.51.100.{index}"))
+                    .expect("forwarded address should encode"),
+            );
+            let router = router.clone();
+            requests.push(tokio::spawn(async move {
+                router
+                    .oneshot(request)
+                    .await
+                    .expect("router should respond")
+            }));
         }
-    }
-
-    #[test]
-    fn rejects_a_configured_static_root_that_does_not_exist() {
-        let missing =
-            std::env::temp_dir().join(format!("cmclient-web-missing-{}", uuid::Uuid::new_v4()));
-        let result = ManagementWebListener::bind(&ManagementWebConfig {
-            port: 0,
-            static_web_root: Some(missing),
-            ..Default::default()
-        });
-        assert!(matches!(result, Err(ManagementWebError::Io)));
-    }
-
-    #[test]
-    fn head_reports_static_length_without_sending_a_body() {
-        let fixture = StaticWebFixture::new();
-        let response = static_response(
-            &fixture.root,
-            b"HEAD /assets/app-BWWK_6zJ.js HTTP/1.1\r\nhost: localhost\r\n\r\n",
-        );
-        let header = String::from_utf8(response.clone()).expect("HEAD response should be UTF-8");
-        assert!(header.starts_with("HTTP/1.1 200 OK"));
-        assert!(header.contains("content-length: 25\r\n"));
-        assert!(response_body(&response).is_empty());
-    }
-
-    #[test]
-    fn falls_back_to_index_for_spa_routes_but_not_missing_assets() {
-        let fixture = StaticWebFixture::new();
-        let route = static_response(
-            &fixture.root,
-            b"GET /nodes/meshtastic-1?tab=telemetry HTTP/1.1\r\nhost: localhost\r\n\r\n",
-        );
-        let route = String::from_utf8(route).expect("route response should be UTF-8");
-        assert!(route.starts_with("HTTP/1.1 200 OK"));
-        assert!(route.contains("cache-control: no-cache\r\n"));
-        assert!(route.ends_with("<!doctype html><main id=app>production bundle</main>"));
-
-        for missing in [
-            b"GET /assets/missing.js HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"GET /missing.css HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-        ] {
-            let response = static_response(&fixture.root, missing);
-            let response = String::from_utf8(response).expect("error response should be UTF-8");
-            assert!(response.starts_with("HTTP/1.1 404 Not Found"));
-            assert!(response.contains("WEB_ASSET_NOT_FOUND"));
-            assert!(!response.contains("production bundle"));
+        let mut responses = Vec::new();
+        for request in requests {
+            responses.push(request.await.expect("request task should complete"));
         }
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.status() == StatusCode::OK)
+                .count(),
+            5
+        );
+        let limited = responses
+            .into_iter()
+            .find(|response| response.status() == StatusCode::TOO_MANY_REQUESTS)
+            .expect("sixth request should be rate limited by peer IP");
+        assert_eq!(
+            limited
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(AUTH_CACHE_CONTROL)
+        );
+        assert_error(
+            limited,
+            StatusCode::TOO_MANY_REQUESTS,
+            "MANAGEMENT_LOGIN_RATE_LIMITED",
+        )
+        .await;
+        cleanup.cancel();
+    }
+
+    #[tokio::test]
+    async fn static_fallback_preserves_api_and_asset_misses_and_serves_spa_routes() {
+        let directory = TestDirectory::new("static");
+        std::fs::write(directory.path().join("index.html"), "<main>CMClient</main>")
+            .expect("index should write");
+        let assets = directory.path().join("assets");
+        std::fs::create_dir_all(&assets).expect("asset directory should be created");
+        std::fs::write(assets.join("index-BRHyKwF0.js"), "console.log('hashed')")
+            .expect("hashed asset should write");
+        std::fs::write(assets.join("app.js"), "console.log('plain')")
+            .expect("non-hashed asset should write");
+        let root = canonical_static_root(Some(directory.path()))
+            .expect("static root should validate")
+            .expect("static root should be configured");
+        let policy = test_policy(
+            ManagementWebProfile::Native,
+            false,
+            Vec::new(),
+            &[],
+            None,
+            Some(root),
+            false,
+        );
+        let (router, cleanup) = test_router(Router::new(), policy);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 49_104));
+
+        let direct_index = router
+            .clone()
+            .oneshot(test_request(
+                Method::GET,
+                "/index.html",
+                "localhost:7080",
+                peer,
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+        assert_eq!(direct_index.status(), StatusCode::OK);
+        assert_eq!(
+            direct_index
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(SHELL_CACHE_CONTROL)
+        );
+        drop(
+            to_bytes(direct_index.into_body(), 1_024)
+                .await
+                .expect("index response should read"),
+        );
+
+        let hashed = router
+            .clone()
+            .oneshot(test_request(
+                Method::GET,
+                "/assets/index-BRHyKwF0.js",
+                "localhost:7080",
+                peer,
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+        assert_eq!(hashed.status(), StatusCode::OK);
+        assert_eq!(
+            hashed
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(IMMUTABLE_ASSET_CACHE_CONTROL)
+        );
+        drop(
+            to_bytes(hashed.into_body(), 1_024)
+                .await
+                .expect("hashed response should read"),
+        );
+
+        let non_hashed = router
+            .clone()
+            .oneshot(test_request(
+                Method::GET,
+                "/assets/app.js",
+                "localhost:7080",
+                peer,
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+        assert_eq!(non_hashed.status(), StatusCode::OK);
+        assert_eq!(
+            non_hashed
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(SHELL_CACHE_CONTROL)
+        );
+        drop(
+            to_bytes(non_hashed.into_body(), 1_024)
+                .await
+                .expect("non-hashed response should read"),
+        );
+
+        assert_error(
+            router
+                .clone()
+                .oneshot(test_request(
+                    Method::GET,
+                    "/api",
+                    "localhost:7080",
+                    peer,
+                    Body::empty(),
+                ))
+                .await
+                .expect("router should respond"),
+            StatusCode::NOT_FOUND,
+            "API_ROUTE_NOT_FOUND",
+        )
+        .await;
+        assert_error(
+            router
+                .clone()
+                .oneshot(test_request(
+                    Method::GET,
+                    "/missing.js",
+                    "localhost:7080",
+                    peer,
+                    Body::empty(),
+                ))
+                .await
+                .expect("router should respond"),
+            StatusCode::NOT_FOUND,
+            "WEB_ASSET_NOT_FOUND",
+        )
+        .await;
+        let spa = router
+            .oneshot(test_request(
+                Method::GET,
+                "/settings/advanced",
+                "localhost:7080",
+                peer,
+                Body::empty(),
+            ))
+            .await
+            .expect("router should respond");
+        assert_eq!(spa.status(), StatusCode::OK);
+        assert_eq!(
+            spa.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some(SHELL_CACHE_CONTROL)
+        );
+        assert_eq!(
+            to_bytes(spa.into_body(), 1_024)
+                .await
+                .expect("SPA response should read"),
+            "<main>CMClient</main>"
+        );
+        cleanup.cancel();
     }
 
     #[test]
-    fn rejects_malformed_and_traversal_request_targets() {
-        let fixture = StaticWebFixture::new();
-        for request in [
-            b"GET /../secret HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"GET /%2e%2e/secret HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"GET /assets%2fapp-BWWK_6zJ.js HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"GET /assets/app.js%00 HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"GET /assets/app.js?value=%ZZ HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"GET //outside HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-            b"GET /assets\\outside.js HTTP/1.1\r\nhost: localhost\r\n\r\n".as_slice(),
-        ] {
-            let response = static_response(&fixture.root, request);
-            let response = String::from_utf8(response).expect("error response should be UTF-8");
-            assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
-            assert!(response.contains("MANAGEMENT_WEB_HTTP_INVALID"));
-            assert!(!response.contains("production bundle"));
+    fn static_root_rejects_links_and_windows_reparse_points() {
+        let directory = TestDirectory::new("static-link");
+        let root = directory.path().join("web");
+        let target = directory.path().join("outside");
+        std::fs::create_dir_all(&root).expect("web root should be created");
+        std::fs::create_dir_all(&target).expect("link target should be created");
+        std::fs::write(root.join("index.html"), "index").expect("index should write");
+        std::fs::write(target.join("secret.txt"), "secret").expect("target should write");
+        let link = root.join("linked");
+        create_directory_link(&target, &link);
+
+        assert!(matches!(
+            canonical_static_root(Some(&root)),
+            Err(ManagementWebError::InvalidConfiguration)
+        ));
+        remove_directory_link(&link);
+    }
+
+    #[tokio::test]
+    async fn response_body_lifetime_limit_returns_the_stable_capacity_error() {
+        let routes = Router::new().route(
+            "/api/v1/stream",
+            get(|| async { Response::new(Body::new(PendingBody::idle())) }),
+        );
+        let policy = test_policy(
+            ManagementWebProfile::Native,
+            false,
+            Vec::new(),
+            &[],
+            None,
+            None,
+            false,
+        );
+        let (router, cleanup) = test_router(routes, policy);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 49_105));
+        let mut active = Vec::new();
+        for _ in 0..MAX_RESPONSE_BODIES {
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                router.clone().oneshot(test_request(
+                    Method::GET,
+                    "/api/v1/stream",
+                    "localhost:7080",
+                    peer,
+                    Body::empty(),
+                )),
+            )
+            .await
+            .expect("stream response headers should not wait")
+            .expect("router should respond");
+            assert_eq!(response.status(), StatusCode::OK);
+            active.push(response);
         }
+
+        let overloaded = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.oneshot(test_request(
+                Method::GET,
+                "/api/v1/stream",
+                "localhost:7080",
+                peer,
+                Body::empty(),
+            )),
+        )
+        .await
+        .expect("overloaded request must not wait for a response body slot")
+        .expect("router should return capacity response");
+        assert_eq!(
+            overloaded
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+        assert!(overloaded.headers().contains_key("x-request-id"));
+        assert_error(
+            overloaded,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED",
+        )
+        .await;
+        drop(active);
+        cleanup.cancel();
     }
 
     #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("directory symlink should be created");
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(link: &Path) {
+        std::fs::remove_file(link).expect("directory symlink should be removed");
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("junction command should run");
+        assert!(status.success(), "directory junction should be created");
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(link: &Path) {
+        std::fs::remove_dir(link).expect("directory junction should be removed");
+    }
+
     #[test]
-    fn refuses_static_symlinks_that_escape_the_bundle_root() {
-        use std::os::unix::fs::symlink;
-
-        let fixture = StaticWebFixture::new();
-        let outside = fixture.root.with_extension("secret.txt");
-        fs::write(&outside, b"must not escape").expect("outside file should write");
-        symlink(&outside, fixture.root.join("assets/leak.txt")).expect("symlink should create");
-
-        let response = static_response(
-            &fixture.root,
-            b"GET /assets/leak.txt HTTP/1.1\r\nhost: localhost\r\n\r\n",
+    fn route_capability_is_redacted_and_rotation_revokes_owned_lease() {
+        let first = GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4810)), "a".repeat(64))
+            .expect("route should construct");
+        assert!(!format!("{first:?}").contains(&"a".repeat(64)));
+        let session = GatewaySessionHandle::with_route(first.clone());
+        let active = first.active().expect("route should be active");
+        let session_for_rotation = session.clone();
+        let rotation = thread::spawn(move || {
+            session_for_rotation.set(
+                GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4811)), "b".repeat(64))
+                    .expect("replacement route should construct"),
+            );
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(!first.is_active());
+        assert!(!rotation.is_finished());
+        drop(active);
+        rotation.join().expect("rotation should finish");
+        assert_eq!(
+            session.snapshot().expect("new route").address().port(),
+            4811
         );
-        let response = String::from_utf8(response).expect("error response should be UTF-8");
-        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(!response.contains("must not escape"));
-        fs::remove_file(outside).expect("outside file should remove");
     }
 
     #[test]
-    fn runs_access_handler_before_static_file_serving() {
-        let fixture = StaticWebFixture::new();
-        let response = static_response_with_handler(
-            &fixture.root,
-            b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n",
-            Some(Arc::new(RejectEveryRequest)),
-        );
-        let response = String::from_utf8(response).expect("auth response should be UTF-8");
-        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
-        assert!(response.contains("AUTH_REQUIRED"));
-        assert!(!response.contains("production bundle"));
-    }
+    fn replacement_is_not_snapshot_visible_until_previous_route_is_inactive() {
+        let previous = GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4_810)), "a".repeat(64))
+            .expect("previous route should construct");
+        let session = GatewaySessionHandle::with_route(previous.clone());
+        let replacement =
+            GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4_811)), "b".repeat(64))
+                .expect("replacement route should construct");
 
-    #[test]
-    fn retains_minimal_shell_when_static_root_is_not_configured() {
-        let listener = ManagementWebListener::bind(&ManagementWebConfig {
-            port: 0,
-            ..Default::default()
-        })
-        .expect("listener should bind");
-        let address = listener.local_addr().expect("address should load");
-        let server = thread::spawn(move || listener.serve_once());
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        client
-            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("request should write");
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("response should read");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.contains("CMClient management web"));
-        server
-            .join()
-            .expect("server should join")
-            .expect("server should respond");
-    }
+        let previous_state = previous
+            .lease
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session_for_set = session.clone();
+        let set_worker = thread::spawn(move || session_for_set.set(replacement));
 
-    #[test]
-    fn proxies_gateway_sse_streams_and_health_checks() {
-        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
-        let gateway_address = gateway.local_addr().expect("gateway address should load");
-        let gateway_thread = thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = gateway.accept().expect("gateway should accept");
-                let mut request = [0_u8; 4096];
-                let count = stream.read(&mut request).expect("request should read");
-                if request[..count].starts_with(b"GET /api/v1/events ") {
-                    let body = ": heartbeat\n\nevent: gateway.ready\ndata: {}\n\n";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
+        let observation_deadline = Instant::now() + Duration::from_secs(2);
+        let replacement_published_before_deactivation = loop {
+            match session.route.try_read() {
+                Ok(current) => {
+                    if current
+                        .as_ref()
+                        .is_some_and(|route| route.address().port() == 4_811)
+                    {
+                        break true;
+                    }
+                    assert!(
+                        Instant::now() < observation_deadline,
+                        "route replacement did not enter its cutover"
                     );
-                    stream
-                        .write_all(response.as_bytes())
-                        .expect("SSE response should write");
-                } else {
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\nconnection: close\r\n\r\n{\"status\":\"ok\"}",
-                        )
-                        .expect("health response should write");
+                    thread::yield_now();
+                }
+                Err(std::sync::TryLockError::WouldBlock) => break false,
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    panic!("route lock was poisoned: {error}")
                 }
             }
-        });
-        let config = ManagementWebConfig {
-            port: 0,
-            gateway: gateway_address,
-            ..Default::default()
         };
-        let listener = ManagementWebListener::bind(&config).expect("listener should bind");
-        let address = listener.local_addr().expect("address should load");
-        let server = thread::spawn(move || listener.serve_once());
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        client
-            .write_all(b"GET /api/v1/events HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("request should write");
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("response should read");
-        assert!(response.starts_with("HTTP/1.1 200"));
-        assert!(response.contains("event: gateway.ready"));
-        assert!(gateway_health(gateway_address));
-        server
-            .join()
-            .expect("server should join")
-            .expect("server should respond");
-        gateway_thread.join().expect("gateway should join");
-    }
-
-    #[test]
-    fn proxies_api_requests_before_considering_spa_fallback() {
-        let fixture = StaticWebFixture::new();
-        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
-        let gateway_address = gateway.local_addr().expect("gateway address should load");
-        let gateway_thread = thread::spawn(move || {
-            let (mut stream, _) = gateway.accept().expect("gateway should accept");
-            let mut request = [0_u8; 4096];
-            let count = stream
-                .read(&mut request)
-                .expect("gateway request should read");
-            let request = &request[..count];
-            assert!(request.starts_with(b"GET /api/v1/nodes?limit=1 HTTP/1.1\r\n"));
-            assert!(
-                request
-                    .windows(b"connection: close\r\n".len())
-                    .any(|window| window == b"connection: close\r\n")
-            );
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 12\r\nconnection: close\r\n\r\n{\"nodes\":[]}",
+        let session_for_snapshot = session.clone();
+        let (snapshot_sender, snapshot_receiver) = std::sync::mpsc::sync_channel(1);
+        let snapshot_worker = thread::spawn(move || {
+            snapshot_sender
+                .send(
+                    session_for_snapshot
+                        .snapshot()
+                        .expect("replacement route should become visible"),
                 )
-                .expect("gateway response should write");
+                .expect("snapshot receiver should remain available");
         });
-        let listener = ManagementWebListener::bind(&ManagementWebConfig {
-            port: 0,
-            gateway: gateway_address,
-            static_web_root: Some(fixture.root.clone()),
-            ..Default::default()
+
+        let visible_before_deactivation = snapshot_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .ok();
+        assert!(previous_state.active);
+        drop(previous_state);
+
+        let published = visible_before_deactivation.clone().unwrap_or_else(|| {
+            snapshot_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("replacement snapshot should publish after deactivation")
+        });
+        set_worker.join().expect("route replacement should finish");
+        snapshot_worker
+            .join()
+            .expect("snapshot observer should finish");
+
+        assert!(
+            !replacement_published_before_deactivation,
+            "replacement route was published while the previous route was still active"
+        );
+        assert!(
+            visible_before_deactivation.is_none(),
+            "replacement became snapshot-visible before the previous route was deactivated"
+        );
+        assert!(!previous.is_active());
+        assert_eq!(published.address().port(), 4_811);
+    }
+
+    #[test]
+    fn clear_and_set_are_bounded_when_a_stale_lease_is_never_dropped() {
+        assert!(GATEWAY_LEASE_DRAIN_TIMEOUT <= Duration::from_secs(2));
+
+        let cleared_route =
+            GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4_810)), "e".repeat(64))
+                .expect("route should construct");
+        let cleared_session = GatewaySessionHandle::with_route(cleared_route.clone());
+        let stale_clear_lease = cleared_route.active().expect("route should be active");
+        let clear_cancellation = stale_clear_lease.cancellation_token();
+        let session_to_clear = cleared_session.clone();
+        let clear_elapsed = bounded_sync_operation(move || session_to_clear.clear());
+        assert!(clear_elapsed < Duration::from_secs(1));
+        assert!(clear_cancellation.is_cancelled());
+        assert!(!cleared_route.is_active());
+        assert!(cleared_session.snapshot().is_none());
+
+        let replaced_route =
+            GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4_811)), "f".repeat(64))
+                .expect("route should construct");
+        let replaced_session = GatewaySessionHandle::with_route(replaced_route.clone());
+        let stale_set_lease = replaced_route.active().expect("route should be active");
+        let set_cancellation = stale_set_lease.cancellation_token();
+        let replacement =
+            GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4_812)), "0".repeat(64))
+                .expect("replacement should construct");
+        let session_to_set = replaced_session.clone();
+        let set_elapsed = bounded_sync_operation(move || session_to_set.set(replacement));
+        assert!(set_elapsed < Duration::from_secs(1));
+        assert!(set_cancellation.is_cancelled());
+        assert!(!replaced_route.is_active());
+        assert_eq!(
+            replaced_session
+                .snapshot()
+                .expect("replacement should be installed")
+                .address()
+                .port(),
+            4_812
+        );
+
+        drop(stale_clear_lease);
+        drop(stale_set_lease);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_rotation_wakes_an_idle_body_and_releases_its_owned_lease() {
+        let route = GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4_810)), "d".repeat(64))
+            .expect("route should construct");
+        let session = GatewaySessionHandle::with_route(route);
+        let active = session.active().expect("route should be active");
+        let cancellation = active.cancellation_token();
+        let polled = Arc::new(AtomicBool::new(false));
+        let mut body = RevocableBody::new(
+            PendingBody::observed(Arc::clone(&polled)),
+            cancellation,
+            active,
+        );
+        let body_task = tokio::spawn(async move {
+            let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+                .await
+                .expect("rotation should wake an idle body");
+            assert!(frame.is_none(), "rotation should terminate the body");
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !polled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
         })
-        .expect("listener should bind");
-        let address = listener.local_addr().expect("address should load");
-        let server = thread::spawn(move || listener.serve_once());
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        client
-            .write_all(b"GET /api/v1/nodes?limit=1 HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("request should write");
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("response should read");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.ends_with("{\"nodes\":[]}"));
-        assert!(!response.contains("production bundle"));
-        server
-            .join()
-            .expect("server should join")
-            .expect("server should proxy");
-        gateway_thread.join().expect("gateway should join");
+        .await
+        .expect("body should register its cancellation waker");
+
+        let session_to_clear = session.clone();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || session_to_clear.clear()),
+        )
+        .await
+        .expect("clear should finish after the idle body wakes")
+        .expect("clear task should not panic");
+        body_task.await.expect("body task should not panic");
+        assert!(session.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn request_and_response_trailers_cannot_bypass_gateway_header_allowlists() {
+        let route = GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4_810)), "1".repeat(64))
+            .expect("route should construct");
+        let active = route.active().expect("route should be active");
+        let request = Request::builder()
+            .uri("/api/v1/events")
+            .body(Body::new(TrailerBody::new(forbidden_trailers())))
+            .expect("request should construct");
+        let outbound = gateway_request(request, &active).expect("request should sanitize");
+        let mut request_body = outbound.into_body();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), request_body.frame())
+                .await
+                .expect("request trailer filtering should make bounded progress")
+                .is_none(),
+            "request trailer frame must be dropped entirely"
+        );
+
+        let response_active = route.active().expect("route should remain active");
+        let cancellation = response_active.cancellation_token();
+        let mut response_body = RevocableBody::new(
+            TrailerBody::new(forbidden_trailers()),
+            cancellation,
+            response_active,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), response_body.frame())
+                .await
+                .expect("response trailer filtering should make bounded progress")
+                .is_none(),
+            "response trailer frame must be dropped entirely"
+        );
     }
 
     #[test]
-    fn reports_gateway_unavailable_without_exposing_transport_errors() {
-        let reserved = TcpListener::bind("127.0.0.1:0").expect("port should bind");
-        let gateway: SocketAddr = reserved.local_addr().expect("address should load");
-        drop(reserved);
-        let config = ManagementWebConfig {
-            port: 0,
-            gateway,
-            ..Default::default()
-        };
-        let listener = ManagementWebListener::bind(&config).expect("listener should bind");
-        let address = listener.local_addr().expect("address should load");
-        let server = thread::spawn(move || listener.serve_once());
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        client
-            .write_all(b"GET /api/v1/system/health HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("request should write");
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("response should read");
-        assert!(response.starts_with("HTTP/1.1 503"));
-        assert!(response.contains("GATEWAY_PROXY_UNAVAILABLE"));
-        server
-            .join()
-            .expect("server should join")
-            .expect("server should respond");
+    fn gateway_request_strips_spoofed_and_hop_headers_but_preserves_event_cursor() {
+        let route = GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4810)), "c".repeat(64))
+            .expect("route should construct");
+        let active = route.active().expect("route should be active");
+        let request = Request::builder()
+            .uri("/api/v1/events?after=9")
+            .header(header::HOST, "localhost:7080")
+            .header(GATEWAY_CAPABILITY_HEADER, "spoofed")
+            .header(header::CONNECTION, "x-private, keep-alive")
+            .header("x-private", "remove-me")
+            .header("last-event-id", "domain:9")
+            .header("x-trace-id", "trace-9")
+            .header(header::RANGE, "bytes=0-99")
+            .header(header::IF_NONE_MATCH, "\"event-9\"")
+            .header(header::COOKIE, "cmclient.sid=must-not-cross")
+            .header(header::AUTHORIZATION, "Bearer must-not-cross")
+            .header(header::ORIGIN, "https://must-not-cross.example")
+            .header(header::REFERER, "https://must-not-cross.example/page")
+            .header(CSRF_HEADER_NAME, "must-not-cross")
+            .body(Body::empty())
+            .expect("request should construct");
+        let outbound = gateway_request(request, &active).expect("request should sanitize");
+        assert_eq!(
+            outbound.headers()[GATEWAY_CAPABILITY_HEADER],
+            HeaderValue::from_str(&"c".repeat(64)).expect("capability header")
+        );
+        assert_eq!(outbound.headers()["last-event-id"], "domain:9");
+        assert_eq!(outbound.headers()["x-trace-id"], "trace-9");
+        assert_eq!(outbound.headers()[header::RANGE], "bytes=0-99");
+        assert_eq!(outbound.headers()[header::IF_NONE_MATCH], "\"event-9\"");
+        assert!(!outbound.headers().contains_key("x-private"));
+        assert!(!outbound.headers().contains_key(header::CONNECTION));
+        assert!(!outbound.headers().contains_key(header::COOKIE));
+        assert!(!outbound.headers().contains_key(header::AUTHORIZATION));
+        assert!(!outbound.headers().contains_key(header::ORIGIN));
+        assert!(!outbound.headers().contains_key(header::REFERER));
+        assert!(!outbound.headers().contains_key(CSRF_HEADER_NAME));
+        assert_eq!(outbound.uri().path(), "/api/v1/events");
+        assert_eq!(outbound.uri().query(), Some("after=9"));
+
+        let mut response_headers = axum::http::HeaderMap::new();
+        response_headers.insert(
+            GATEWAY_CAPABILITY_HEADER,
+            HeaderValue::from_static("must-not-reflect"),
+        );
+        response_headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        response_headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        response_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response_headers.insert(header::ETAG, HeaderValue::from_static("\"event-9\""));
+        response_headers.insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("gateway=denied"),
+        );
+        response_headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        response_headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        strip_hop_headers(&mut response_headers);
+        let response_headers =
+            allowlisted_headers(&response_headers, GATEWAY_RESPONSE_HEADER_ALLOWLIST);
+        assert_eq!(response_headers[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(response_headers[header::ETAG], "\"event-9\"");
+        assert!(!response_headers.contains_key(GATEWAY_CAPABILITY_HEADER));
+        assert!(!response_headers.contains_key(header::CONNECTION));
+        assert!(!response_headers.contains_key(header::SET_COOKIE));
+        assert!(!response_headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        assert!(!response_headers.contains_key(header::WWW_AUTHENTICATE));
     }
 
     #[test]
-    fn serves_agent_owned_routes_when_gateway_is_unavailable() {
-        let reserved = TcpListener::bind("127.0.0.1:0").expect("port should bind");
-        let gateway = reserved.local_addr().expect("gateway address should load");
-        drop(reserved);
-        let listener = ManagementWebListener::bind_with_api_handler(
+    fn binds_both_wildcard_families_and_stops_without_custom_socket_workers() {
+        let mut service = ManagementWebService::start(
             &ManagementWebConfig {
                 port: 0,
-                gateway,
-                ..Default::default()
+                ..ManagementWebConfig::default()
             },
-            Arc::new(AgentRoute),
+            Router::new().route("/health", get(|| async { "ok" })),
+            None,
+            GatewaySessionHandle::new(),
         )
-        .expect("listener should bind");
-        let address = listener.local_addr().expect("address should load");
-        let server = thread::spawn(move || listener.serve_once());
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        client
-            .write_all(b"GET /api/v1/updates HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("request should write");
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("response should read");
-        assert!(response.starts_with("HTTP/1.1 200"));
-        assert!(response.contains("{\"schemaVersion\":1}"));
-        server
-            .join()
-            .expect("server should join")
-            .expect("server should respond");
-    }
-
-    #[test]
-    fn active_connection_registry_enforces_and_releases_slots() {
-        let registry = Arc::new(ActiveConnectionRegistry::new(1));
-        let (_first_client, first_server) = tcp_pair();
-        let first_slot = registry
-            .try_register(&first_server)
-            .expect("first connection should reserve the only slot");
-        assert_eq!(registry.active_count(), 1);
-
-        let (_second_client, second_server) = tcp_pair();
-        assert!(matches!(
-            registry.try_register(&second_server),
-            Err(ConnectionRegistrationError::Full)
-        ));
-        assert_eq!(registry.active_count(), 1);
-
-        drop(first_slot);
-        assert_eq!(registry.active_count(), 0);
-        let second_slot = registry
-            .try_register(&second_server)
-            .expect("released capacity should be reusable");
-        assert_eq!(registry.active_count(), 1);
-        drop(second_slot);
-        assert_eq!(registry.active_count(), 0);
-    }
-
-    #[test]
-    fn service_rejects_excess_connections_with_a_stable_response() {
-        let listener = ManagementWebListener::bind(&ManagementWebConfig {
-            port: 0,
-            ..Default::default()
-        })
-        .expect("listener should bind");
-        let service = ManagementWebService::start_listener_with_connection_limit(listener, 1)
-            .expect("service should start");
-        let address = service.local_addr();
-
-        let stalled = TcpStream::connect(address).expect("first connection should connect");
-        wait_for_active_count(&service.connections, 1);
-
-        let mut rejected = TcpStream::connect(address).expect("excess connection should connect");
-        rejected
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("read timeout should configure");
-        let mut response = String::new();
-        rejected
-            .read_to_string(&mut response)
-            .expect("capacity response should read");
-        assert!(
-            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
-            "unexpected capacity response: {response:?}"
-        );
-        assert_eq!(
-            response_body(response.as_bytes()),
-            br#"{"code":"MANAGEMENT_WEB_CONNECTION_LIMIT_REACHED"}"#
-        );
-        assert_eq!(service.connections.active_count(), 1);
-
-        drop(stalled);
-        wait_for_active_count(&service.connections, 0);
-        let mut recovered = TcpStream::connect(address).expect("released slot should accept");
-        recovered
-            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("request should write");
-        let mut response = String::new();
-        recovered
-            .read_to_string(&mut response)
-            .expect("response should read");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        .expect("dual-stack service should start");
+        assert_eq!(service.addresses().len(), 2);
+        assert!(service.addresses()[0].ip().is_unspecified());
+        assert!(service.addresses()[1].ip().is_unspecified());
+        assert_eq!(service.addresses()[0].port(), service.addresses()[1].port());
+        assert!(service.advertised_url().starts_with("http://127.0.0.1:"));
         service.stop().expect("service should stop");
     }
 
     #[test]
-    fn stop_and_drop_shutdown_stalled_connections() {
-        for explicit_stop in [true, false] {
-            let service = ManagementWebService::start(&ManagementWebConfig {
+    fn docker_and_native_lan_fail_closed_without_auth_and_cidr() {
+        let docker = ManagementWebService::start(
+            &ManagementWebConfig {
                 port: 0,
-                ..Default::default()
-            })
-            .expect("service should start");
-            let registry = Arc::clone(&service.connections);
-            let mut stalled = TcpStream::connect(service.local_addr())
-                .expect("stalled connection should connect");
-            stalled
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .expect("read timeout should configure");
-            wait_for_active_count(&registry, 1);
+                profile: ManagementWebProfile::Docker,
+                ..ManagementWebConfig::default()
+            },
+            Router::new(),
+            None,
+            GatewaySessionHandle::new(),
+        );
+        assert!(matches!(
+            docker,
+            Err(ManagementWebError::InvalidConfiguration)
+        ));
+        let native_lan = ManagementWebService::start(
+            &ManagementWebConfig {
+                port: 0,
+                allow_lan: true,
+                ..ManagementWebConfig::default()
+            },
+            Router::new(),
+            None,
+            GatewaySessionHandle::new(),
+        );
+        assert!(matches!(
+            native_lan,
+            Err(ManagementWebError::InvalidConfiguration)
+        ));
+    }
 
-            if explicit_stop {
-                service.stop().expect("service should stop");
-            } else {
-                drop(service);
-            }
-
-            let mut byte = [0_u8; 1];
-            match stalled.read(&mut byte) {
-                Ok(0) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionAborted
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::NotConnected
-                    ) => {}
-                result => panic!("stalled connection was not shut down: {result:?}"),
-            }
-            wait_for_active_count(&registry, 0);
+    #[test]
+    fn forbidden_handwritten_web_and_access_machinery_does_not_return() {
+        let web_source = include_str!("web.rs");
+        for forbidden in [
+            concat!("ManagementWeb", "ApiHandler"),
+            concat!("ManagementWeb", "Listener"),
+            concat!("ManagementWeb", "Request"),
+            concat!("ManagementWeb", "Stream"),
+            concat!("Server", "Connection"),
+            concat!("Stream", "Owned"),
+            concat!("read", "_request"),
+            concat!("parse", "_request"),
+            concat!("write", "_response"),
+        ] {
+            assert!(
+                !web_source.contains(forbidden),
+                "forbidden token: {forbidden}"
+            );
         }
-    }
-
-    #[test]
-    fn service_stop_drains_a_connection_blocked_on_the_gateway() {
-        let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
-        let gateway_address = gateway.local_addr().expect("gateway address should load");
-        let (accepted_sender, accepted_receiver) = mpsc::sync_channel(1);
-        let (release_sender, release_receiver) = mpsc::sync_channel(1);
-        let gateway_thread = thread::spawn(move || {
-            let (mut stream, _) = gateway.accept().expect("gateway should accept");
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).expect("request should read");
-            accepted_sender
-                .send(())
-                .expect("accepted signal should send");
-            let _ = release_receiver.recv_timeout(Duration::from_secs(2));
-        });
-        let service = ManagementWebService::start(&ManagementWebConfig {
-            port: 0,
-            gateway: gateway_address,
-            ..Default::default()
-        })
-        .expect("service should start");
-        let connections = Arc::clone(&service.connections);
-        let workers = Arc::clone(&service.connection_workers);
-        let mut client = TcpStream::connect(service.local_addr()).expect("client should connect");
-        client
-            .write_all(b"GET /api/v1/events HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("proxy request should write");
-        accepted_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("gateway should receive the request");
-        wait_for_active_count(&connections, 1);
-        assert_eq!(workers.tracked_count(), 1);
-
-        let (stopped_sender, stopped_receiver) = mpsc::sync_channel(1);
-        let stop_thread = thread::spawn(move || {
-            let _ = stopped_sender.send(service.stop());
-        });
-        let stopped = match stopped_receiver.recv_timeout(Duration::from_secs(1)) {
-            Ok(stopped) => stopped,
-            Err(error) => {
-                let _ = release_sender.send(());
-                let _ = stop_thread.join();
-                panic!("service did not drain the blocked proxy: {error}");
-            }
-        };
-        stopped.expect("service should stop cleanly");
-        stop_thread.join().expect("stop thread should join");
-        assert_eq!(connections.active_count(), 0);
-        assert_eq!(workers.tracked_count(), 0);
-
-        let _ = release_sender.send(());
-        gateway_thread.join().expect("gateway should join");
-    }
-
-    #[test]
-    fn service_stops_and_releases_its_listener() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("port should bind");
-        let gateway = listener.local_addr().expect("gateway address should load");
-        let service = ManagementWebService::start(&ManagementWebConfig {
-            port: 0,
-            gateway,
-            ..Default::default()
-        })
-        .expect("service should start");
-        let address = service.local_addr();
-        service.stop().expect("service should stop");
-        TcpListener::bind(address).expect("service should release listener");
+        let access_source = include_str!("access.rs");
+        for forbidden in [
+            concat!("Session", "Record"),
+            concat!("Failure", "Window"),
+            concat!("PasswordVerification", "Limiter"),
+        ] {
+            assert!(
+                !access_source.contains(forbidden),
+                "forbidden token: {forbidden}"
+            );
+        }
     }
 }

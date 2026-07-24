@@ -109,37 +109,71 @@ protobuf/domain persistence, Position and APRS processing, CallMesh, Proxy,
 retention, Jobs, and domain SSE. See
 [Gateway Production Runtime](./gateway-runtime.md).
 
-LAN Management Web is opt-in through a separate strict section. It requires a
-non-loopback bind, absolute paths to a PEM certificate and private key, an
-Argon2 PHC password hash, one or more HTTPS browser origins, a bounded session
-lifetime, and bounded audit capacity. A missing or invalid value rejects Agent
-configuration; it never falls back to an unauthenticated LAN listener.
+Management Web is independently switchable with
+`agent.management_web_enabled`. When enabled, Agent binds separate
+`0.0.0.0:<port>` and v6-only `[::]:<port>` sockets with address reuse disabled;
+the default port is `7080`. Both families must bind the same port. A conflict or
+unavailable family fails the complete start and drops the other socket rather
+than leaving a partial listener. Agent still advertises the loopback URL, and
+Native admission rejects non-loopback socket peers by default before static,
+login, API, SSE, or proxy routing. Forwarding headers never affect peer
+classification.
+
+LAN Management Web is opt-in through a separate strict section. It requires an
+Argon2 PHC password hash and at least one exact HTTP or HTTPS browser Origin.
+CIDRs, additional Host authorities, and TLS are optional. Invalid input rejects
+Agent configuration; it never falls back to an unauthenticated LAN policy.
 
 ```toml
 [management_lan]
-bind = "192.168.1.10"
 port = 7443
+allowed_cidrs = ["192.168.1.0/24"]
+allowed_hosts = ["cmclient.example:7443"]
 password_hash = "$argon2id$..."
-allowed_origins = ["https://cmclient.example"]
+allowed_origins = ["https://cmclient.example:7443"]
 session_ttl_seconds = 3600
 audit_capacity = 512
 certificate_path = "/absolute/path/to/management-cert.pem"
 private_key_path = "/absolute/path/to/management-key.pem"
 ```
 
-The listener serves TLS only when this section is enabled; the configured
-certificate must cover the browser origin's host. The password itself is never
-accepted as an Agent argument, retained in the audit trail, or returned through
-an API. Successful login issues a short-lived
-`Secure; HttpOnly; SameSite=Strict` session cookie and a separate CSRF token.
-All proxied API requests require a session; writes additionally require a
-matching allowed Origin and CSRF token. Login attempts reserve the per-source
-budget before password verification, and at most two Argon2 verifications run
-concurrently. Expired source windows and sessions are pruned; source windows
-are capped at 4,096 and live sessions at 1,024. Password PHC input must be
-Argon2id version 19 with bounded memory, iteration, and lane parameters. The
-bounded audit projection records only timestamp, action, and stable outcome
-code, never addresses, credentials, cookies, or tokens.
+The actual sockets remain wildcard listeners. `allowed_cidrs` constrains
+non-loopback socket peers after LAN authentication is enabled; an empty list
+means no CIDR restriction. The optional non-loopback `bind` field is admission
+shorthand that adds one `/32` or `/128` CIDR and its exact Host authority, not a
+socket-bind selector. Local authorities for `localhost`, `127.0.0.1`, and
+`[::1]` are always allowed on the selected port. Authorities extracted from
+`allowed_origins` are added automatically, while `allowed_hosts` supplies any
+additional exact case-insensitive values. Missing, duplicate, wildcard, or
+unlisted Host headers fail before route handling; wildcard CORS is never
+emitted.
+
+TLS is enabled only when both absolute PEM paths are supplied and successfully
+loaded; otherwise the listener serves HTTP. Plain authenticated LAN HTTP adds a
+stable warning header to every response and a redacted `http_lan_warning` audit
+outcome. The configured certificate must cover the browser origin's host. The
+password itself is never accepted as an Agent argument, retained in the audit
+trail, or returned through an API.
+
+Successful login requires an exact configured Origin, cycles the opaque
+server-side session ID, and returns a separate CSRF token. The cookie is
+`HttpOnly; SameSite=Strict` and becomes `Secure` under TLS. LAN reads require a
+valid admin role and current Web/setup generation; writes additionally require
+the exact Origin and matching `x-csrf-token`. Native loopback writes receive the
+same Origin/session/CSRF enforcement through a local-role session. Login and API
+rate limits use the socket peer address, reserve capacity before Argon2 work,
+and at most two password verifications run concurrently. Password PHC input
+must be Argon2id version 19 with bounded memory, iteration, and lane parameters.
+The bounded in-memory audit projection records only timestamp, stable action,
+and stable outcome code, never addresses, credentials, cookies, tokens,
+payloads, identities, or locations.
+
+Docker uses the same listener implementation but has no Native local-session
+bypass: starting its Web listener without the authenticated access controller
+fails closed, and protected APIs always require an admin session. Its optional
+CIDR, exact Host, Origin, CSRF, rate, and TLS policies are otherwise identical.
+Stopping Web or changing its setup/session generation revokes sessions without
+disabling the separate local Control IPC.
 
 The Agent delivers a bounded memory-only bootstrap frame through the supervised
 Gateway's inherited private pipe; the frame carries the startup nonce,

@@ -6,6 +6,13 @@
 `GET /api/v1/events/recent` returns the same envelope type in a process-local,
 bounded JSON snapshot. It is not durable event history.
 
+Gateway domain and durable-Job SSE use the exact `@fastify/sse` `0.5.0` pin.
+The plugin owns content negotiation, SSE response headers and wire framing,
+heartbeat scheduling, disconnect cleanup, and writable-stream backpressure.
+CMClient owns event IDs, replay and unknown-ID semantics, domain/Job filters,
+payload and frame caps, subscriber admission, the bounded pending queue, and the
+stable slow-consumer close policy.
+
 ```text
 id: 550e8400-e29b-41d4-a716-446655440000
 event: mesh.transport.state
@@ -26,23 +33,31 @@ first. The local Agent Control `RecentEvents` projection forwards the default
 snapshot only and has no query input. Neither snapshot can reconstruct events
 older than the current process buffer.
 
-The stream sends `: heartbeat` comments every 15 seconds, including once when
-the connection opens. A socket that applies backpressure is closed immediately;
-the Gateway records the stable reason `SSE_SLOW_CONSUMER` in structured logs.
-This prevents one stalled browser from growing unbounded memory. Event payloads
-are JSON-cloned and deeply frozen on publish, and event IDs are stable for
-client-side deduplication. Payloads are limited to 56 KiB and complete SSE
-frames to 60 KiB by UTF-8 byte count. These limits cannot be configured above
-the protocol caps, and the event bus validates the complete encoded frame
-before admitting an event to replay or live delivery. The shared browser parser
-enforces the same per-frame limit even when a peer never sends a frame delimiter;
-one large transport chunk may still contain any number of individually bounded
-frames. Parsed events are deeply frozen and delivered from a listener snapshot;
-one state, error, or event observer failure cannot skip later observers or
-restart the transport.
+After the SSE headers are committed, the plugin sends `: heartbeat` comments
+every 15 seconds; the first comment is sent when that interval elapses. The
+plugin waits for socket drain instead of writing through transport backpressure.
+Replay and live events share CMClient's 60 KiB pending-data bound; queuing an
+event beyond that bound closes the stream and records the stable reason
+`SSE_SLOW_CONSUMER` in structured logs. This prevents one stalled browser from
+growing unbounded memory. Event payloads are JSON-cloned and deeply frozen on
+publish, and event IDs are stable for client-side deduplication. Payloads are
+limited to 56 KiB and complete SSE frames to 60 KiB by UTF-8 byte count. These
+limits cannot be configured above the protocol caps, and the event bus validates
+the complete encoded frame before admitting an event to replay or live delivery.
+The shared browser parser enforces the same per-frame limit even when a peer
+never sends a frame delimiter; one large transport chunk may still contain any
+number of individually bounded frames. Parsed events are deeply frozen and
+delivered from a listener snapshot; one state, error, or event observer failure
+cannot skip later observers or restart the transport.
 Gateway admits at most 128 simultaneous event subscribers, including Job event
 streams. Excess requests receive `503 SSE_SUBSCRIBER_LIMIT_REACHED` before SSE
 headers are sent, and unsubscribe/disconnect immediately returns the slot.
+
+After authorization, the Agent streaming proxy injects the memory-only Gateway
+capability and forwards these response bytes without parsing or reframing them.
+Gateway domain/Job SSE and Agent-owned setup, lifecycle, and update SSE use
+separate route namespaces, event-ID spaces, and replay stores. A
+`Last-Event-ID` value is meaningful only within the namespace that issued it.
 
 Each bounded retention cycle emits `telemetry.retention.completed`. Its payload
 reports `deleted` telemetry rows, `observationsDeleted` orphan observations,
@@ -112,8 +127,9 @@ job.status_changed
 `GET /api/v1/jobs/:jobId/events` filters the same stream to that Job's
 `job.created` and `job.status_changed` events. It does not send an initial Job
 snapshot; fetch `GET /api/v1/jobs/:jobId` before subscribing and after any
-reconnect. The Agent's typed local Gateway-event subscription adds
-`gateway.heartbeat` and is not byte-identical to the direct Gateway SSE stream.
+reconnect. The byte-preserving Agent HTTP streaming proxy is distinct from the
+Agent's typed local Gateway-event subscription, which adds `gateway.heartbeat`
+and is not byte-identical to the direct Gateway SSE stream.
 
 `log.entry` remains a reserved CLI filter, but no production Gateway publisher
 emits that type in this RC. Use the domain events above and the host service

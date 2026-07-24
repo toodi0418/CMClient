@@ -41,6 +41,9 @@ export function gatewayEnvironment(environment = process.env) {
     "CMCLIENT_CONTROL_TOKEN",
     "CMCLIENT_PLAINTEXT_SECRET_FILE",
     "CMCLIENT_SYSTEMD_SECRET_STORE",
+    "CMCLIENT_GATEWAY_HOST",
+    "CMCLIENT_GATEWAY_PORT",
+    "CMCLIENT_SUPERVISED",
     "CREDENTIALS_DIRECTORY",
   ]) {
     delete safeEnvironment[name];
@@ -53,8 +56,6 @@ export function gatewayEnvironment(environment = process.env) {
     CMCLIENT_RUNTIME_ROOT: "/home/cmclient/.cmclient",
     CMCLIENT_DB_PATH: "/home/cmclient/.cmclient/cmclient.db",
     CMCLIENT_BACKUP_DIR: "/home/cmclient/.cmclient/backups",
-    CMCLIENT_GATEWAY_HOST: "0.0.0.0",
-    CMCLIENT_GATEWAY_PORT: environment.CMCLIENT_GATEWAY_PORT?.trim() || "8081",
   };
 }
 

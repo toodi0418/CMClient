@@ -8,6 +8,7 @@ use crate::access::{LanAccessConfig, ManagementAccessController};
 use cmclient_runtime_primitives::{
     DocumentError, DocumentFormat, DurableDocument, ExclusiveFileLock, LockError, TypedDocument,
 };
+use ipnet::IpNet;
 use same_file::Handle;
 use serde::Deserialize;
 use std::{
@@ -124,6 +125,7 @@ impl RuntimePaths {
 pub struct AgentConfig {
     pub paths: RuntimePaths,
     pub config_file: PathBuf,
+    pub runtime_profile: AgentRuntimeProfile,
     pub gateway_command: Option<Vec<String>>,
     pub callmesh: Option<CallMeshConfig>,
     pub meshtastic: Option<MeshtasticConfig>,
@@ -131,6 +133,22 @@ pub struct AgentConfig {
     pub proxy: Option<ProxyConfig>,
     pub management_web_enabled: bool,
     pub management_lan: Option<ManagementLanConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRuntimeProfile {
+    Native,
+    Docker,
+}
+
+impl AgentRuntimeProfile {
+    fn from_environment(environment: &BTreeMap<String, String>) -> Self {
+        if is_docker_profile(environment) {
+            Self::Docker
+        } else {
+            Self::Native
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,11 +192,12 @@ pub struct ProxyConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagementLanConfig {
-    pub bind: IpAddr,
     pub port: u16,
+    pub allowed_cidrs: Vec<String>,
+    pub allowed_hosts: BTreeSet<String>,
     pub access: LanAccessConfig,
-    pub certificate_path: PathBuf,
-    pub private_key_path: PathBuf,
+    pub certificate_path: Option<PathBuf>,
+    pub private_key_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -346,14 +365,16 @@ struct ValidatedFileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManagementLanSection {
-    bind: IpAddr,
+    bind: Option<IpAddr>,
     port: u16,
+    allowed_cidrs: Option<Vec<String>>,
+    allowed_hosts: Option<Vec<String>>,
     password_hash: String,
     allowed_origins: Vec<String>,
     session_ttl_seconds: Option<u64>,
     audit_capacity: Option<usize>,
-    certificate_path: PathBuf,
-    private_key_path: PathBuf,
+    certificate_path: Option<PathBuf>,
+    private_key_path: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -363,6 +384,7 @@ impl AgentConfig {
     }
 
     pub fn from_environment(environment: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        let runtime_profile = AgentRuntimeProfile::from_environment(environment);
         let paths = RuntimePaths::from_environment(environment)?;
         let config_file = config_file_override(environment, &paths)?;
 
@@ -380,6 +402,7 @@ impl AgentConfig {
         Ok(Self {
             paths,
             config_file,
+            runtime_profile,
             gateway_command: validated.gateway_command,
             callmesh: validated.callmesh,
             meshtastic: validated.meshtastic,
@@ -521,10 +544,55 @@ fn validate_file_config(file_config: FileConfig) -> Result<ValidatedFileConfig, 
     let management_lan = file_config
         .management_lan
         .map(|lan| {
-            if lan.bind.is_loopback()
-                || lan.port == 0
-                || !lan.certificate_path.is_absolute()
-                || !lan.private_key_path.is_absolute()
+            if lan.port == 0 {
+                return Err(ConfigError::InvalidManagementLan);
+            }
+            match (&lan.certificate_path, &lan.private_key_path) {
+                (Some(certificate), Some(private_key))
+                    if certificate.is_absolute() && private_key.is_absolute() =>
+                {
+                    ()
+                }
+                (None, None) => (),
+                _ => return Err(ConfigError::InvalidManagementLan),
+            }
+            let mut allowed_cidrs = lan.allowed_cidrs.unwrap_or_default();
+            if allowed_cidrs
+                .iter()
+                .any(|cidr| cidr.parse::<IpNet>().is_err())
+            {
+                return Err(ConfigError::InvalidManagementLan);
+            }
+            let mut allowed_hosts = lan
+                .allowed_hosts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|host| host.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>();
+            if let Some(bind) = lan.bind {
+                if bind.is_loopback() {
+                    return Err(ConfigError::InvalidManagementLan);
+                }
+                let prefix = if bind.is_ipv4() { 32 } else { 128 };
+                allowed_cidrs.push(format!("{bind}/{prefix}"));
+                allowed_hosts.insert(match bind {
+                    IpAddr::V4(address) => format!("{address}:{}", lan.port),
+                    IpAddr::V6(address) => format!("[{address}]:{}", lan.port),
+                });
+            }
+            for origin in &lan.allowed_origins {
+                let Some(authority) = origin
+                    .strip_prefix("https://")
+                    .or_else(|| origin.strip_prefix("http://"))
+                else {
+                    return Err(ConfigError::InvalidManagementLan);
+                };
+                allowed_hosts.insert(authority.to_ascii_lowercase());
+            }
+            if allowed_hosts.is_empty()
+                || allowed_hosts
+                    .iter()
+                    .any(|host| !valid_management_host(host))
             {
                 return Err(ConfigError::InvalidManagementLan);
             }
@@ -537,8 +605,9 @@ fn validate_file_config(file_config: FileConfig) -> Result<ValidatedFileConfig, 
             ManagementAccessController::new(access.clone())
                 .map_err(|_| ConfigError::InvalidManagementLan)?;
             Ok(ManagementLanConfig {
-                bind: lan.bind,
                 port: lan.port,
+                allowed_cidrs,
+                allowed_hosts,
                 access,
                 certificate_path: lan.certificate_path,
                 private_key_path: lan.private_key_path,
@@ -677,6 +746,13 @@ fn is_bounded_text(value: &str, maximum_length: usize) -> bool {
 
 fn is_endpoint_host(value: &str) -> bool {
     is_bounded_text(value, 255) && !value.contains(char::is_whitespace)
+}
+
+fn valid_management_host(value: &str) -> bool {
+    is_bounded_text(value, 512)
+        && value != "*"
+        && !value.contains(['/', '\\', '@'])
+        && !value.contains(char::is_whitespace)
 }
 
 fn is_aprs_destination(value: &str) -> bool {
@@ -869,9 +945,9 @@ pub fn is_config_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, AgentLease, AprsConfig, ConfigError, InstanceError, MAX_MIGRATED_CONFIG_BYTES,
-        MeshtasticConfig, MeshtasticConnectionConfig, ProxyConfig, RuntimePaths,
-        ensure_runtime_directories, is_config_file, validate_migrated_agent_config,
+        AgentConfig, AgentLease, AgentRuntimeProfile, AprsConfig, ConfigError, InstanceError,
+        MAX_MIGRATED_CONFIG_BYTES, MeshtasticConfig, MeshtasticConnectionConfig, ProxyConfig,
+        RuntimePaths, ensure_runtime_directories, is_config_file, validate_migrated_agent_config,
     };
     use std::{
         collections::BTreeMap,
@@ -955,6 +1031,20 @@ mod tests {
             paths.config_file(),
             PathBuf::from("/home/cmclient/.cmclient/config.toml")
         );
+        assert_eq!(
+            AgentRuntimeProfile::from_environment(&environment),
+            AgentRuntimeProfile::Docker
+        );
+
+        environment.remove("CMCLIENT_RUNTIME_PROFILE");
+        environment.insert(
+            String::from("CMCLIENT_PACKAGE_PROFILE"),
+            String::from("oci"),
+        );
+        assert_eq!(
+            AgentRuntimeProfile::from_environment(&environment),
+            AgentRuntimeProfile::Docker
+        );
     }
 
     #[test]
@@ -1001,10 +1091,12 @@ mod tests {
 
     #[test]
     fn environment_snapshot_is_immutable() {
-        let environment = environment();
+        let (directory, environment, _) = config_fixture("environment-snapshot");
         let snapshot = environment.clone();
-        RuntimePaths::from_environment(&environment).expect("paths should load");
+        let config = AgentConfig::from_environment(&environment).expect("config should load");
+        assert_eq!(config.runtime_profile, AgentRuntimeProfile::Native);
         assert_eq!(environment, snapshot);
+        fs::remove_dir_all(directory).expect("fixture should clean up");
     }
 
     #[test]

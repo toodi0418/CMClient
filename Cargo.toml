@@ -24,12 +24,23 @@ rust-version = "1.87"
 
 [workspace.dependencies]
 atomic-write-file = "=0.3.0"
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "macros", "matched-path", "original-uri", "query", "tokio"] }
+axum-server = { version = "=0.8.0", default-features = false, features = ["tls-rustls"] }
 bytes = "=1.12.1"
 fs4 = { version = "=1.1.0", features = ["sync"] }
+http-body-util = "=0.1.4"
+hyper = { version = "=1.10.1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+ipnet = "=2.11.0"
 same-file = "=1.0.6"
+socket2 = "=0.6.5"
 time = { version = "=0.3.45", default-features = false, features = ["formatting"] }
-tokio = { version = "=1.53.1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.18", features = ["rt"] }
+tower = { version = "=0.5.3", default-features = false, features = ["limit", "load-shed", "util"] }
+tower-http = { version = "=0.7.0", default-features = false, features = ["catch-panic", "cors", "fs", "limit", "request-id", "sensitive-headers", "set-header", "timeout", "trace"] }
+tower-sessions = { version = "=0.15.0", default-features = false, features = ["axum-core", "memory-store"] }
+tower_governor = { version = "=0.8.0", default-features = false, features = ["axum"] }
 tracing = "=0.1.44"
 tracing-appender = "=0.2.5"
 

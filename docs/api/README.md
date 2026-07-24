@@ -5,7 +5,7 @@ security of one surface from another.
 
 | Surface | Base | Authentication | Owner |
 | --- | --- | --- | --- |
-| Gateway public projection | Agent loopback `/api/v1/*` or Docker Ingress | Agent browser session/CSRF when reached through LAN Management Web; Docker Ingress topology; no raw LAN Gateway | Gateway, behind Agent |
+| Gateway public projection | Agent loopback `/api/v1/*` | Agent browser session/CSRF when reached through Management Web; Docker uses the same Agent boundary; no raw Gateway listener | Gateway, behind Agent |
 | Local Agent Control | Unix socket `<root>/run/control.sock` or a root-hashed Windows local named pipe | Private POSIX endpoint or remote-rejected current-user Windows pipe; no token | Agent |
 
 The local socket is always available while Agent is running. The optional Web
@@ -61,6 +61,7 @@ proxies the remaining `/api/*` requests to loopback Gateway:
 | Method and path | Contract |
 | --- | --- |
 | `POST /api/v1/auth/login` | Management LAN login; the body must contain exactly one `password` string |
+| `GET /api/v1/auth/session` | Loopback-only local browser session bootstrap; denied to LAN and Docker peers |
 | `GET /api/v1/updates` | Agent-owned durable update projection |
 | `GET /api/v1/updates/events` | Agent-owned update SSE with an immediate snapshot |
 

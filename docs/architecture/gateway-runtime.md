@@ -10,8 +10,12 @@ atomically binds `127.0.0.1:0`, and reports its port, PID, and startup nonce bac
 through that channel. The address and capability are per-generation,
 memory-only native session state; no native configuration owns or publishes a
 Gateway port. It never reads Agent configuration, manages a service, or updates
-itself. The standalone Docker composition retains its fixed internal Ingress,
-which is not a fallback for native Agent supervision.
+itself. The production entrypoint rejects every non-supervised start with
+`GATEWAY_SUPERVISION_REQUIRED` before opening the database or a listener. The
+fixed `--offline-maintenance` command is the only direct-process exception and
+does not start the runtime. Docker uses the same Agent-issued bootstrap and
+capability boundary; the superseded multi-service Compose descriptor therefore
+fails closed until its unified Agent entrypoint is delivered.
 
 ## Startup and shutdown
 
@@ -149,6 +153,21 @@ ingest, domain, Position, APRS, CallMesh, Proxy, retention, and Job events to th
 bounded SSE bus. Agent proxies those endpoints for Web and bridges selected
 projections/SSE to Desktop and CLI; clients do not connect to the Gateway
 listener directly in an Agent deployment.
+
+Gateway domain and durable-Job SSE use the exact `@fastify/sse` `0.5.0` pin.
+The plugin owns content negotiation, response headers, wire framing, heartbeat
+scheduling, socket disconnect lifecycle, and writable-stream backpressure.
+CMClient owns event IDs, replay semantics, domain/Job filters, payload and frame
+caps, the subscriber cap, the bounded pending queue, and the stable
+slow-consumer close policy. Replay snapshot selection and live subscription are
+registered in one synchronous Gateway turn so an event cannot enter between
+those operations.
+
+After Web authorization, the Agent streaming proxy injects the memory-only
+Gateway capability and forwards the Gateway stream bytes without parsing or
+reframing them. Gateway domain/Job SSE and Agent-owned setup, lifecycle, and
+update SSE retain separate route namespaces, event-ID spaces, and replay stores;
+`Last-Event-ID` from one namespace is never replayed in the other.
 
 The event bus rejects payloads larger than 56 KiB by UTF-8 byte count, and SSE
 formatting rejects frames larger than 60 KiB. Listener failures are isolated so

@@ -11,12 +11,27 @@ test-support = []
 [dependencies]
 atomic-write-file = "=0.3.0"
 argon2 = "0.5"
+axum.workspace = true
+axum-server.workspace = true
+bytes.workspace = true
 cmclient-runtime-primitives = { path = "../runtime-primitives" }
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+ipnet.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
-rustls = "0.23"
 same-file.workspace = true
+socket2.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tower-sessions.workspace = true
+tower_governor.workspace = true
+tracing.workspace = true
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1.8"
 

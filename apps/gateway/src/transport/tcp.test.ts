@@ -4,7 +4,21 @@ import net, { type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("node:sqlite", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:sqlite")>();
+  class FixtureDatabaseSync extends actual.DatabaseSync {
+    override exec(sql: string): void {
+      if (/^\s*PRAGMA\s+synchronous\s*=\s*FULL\s*;?\s*$/i.test(sql)) {
+        super.exec("PRAGMA synchronous = OFF");
+        return;
+      }
+      super.exec(sql);
+    }
+  }
+  return { ...actual, DatabaseSync: FixtureDatabaseSync };
+});
 
 import { MeshtasticProtobufCodec } from "../protobuf/protobuf";
 import { loadMeshtasticSchema } from "../protobuf/schema";
@@ -517,7 +531,7 @@ describe("TcpMeshtasticTransport", () => {
       await close(server);
       await rm(directory, { recursive: true, force: true });
     }
-  }, 30_000);
+  });
 
   it("opens no socket when the physical attempt fuse rejects before connect", async () => {
     const directory = await mkdtemp(join(tmpdir(), "cmclient-physical-tcp-"));

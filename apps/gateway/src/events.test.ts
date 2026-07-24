@@ -59,6 +59,38 @@ describe("DomainEventBus", () => {
     );
   });
 
+  it("takes replay and registers the live subscriber in one synchronous turn", () => {
+    let sequence = 0;
+    const bus = new DomainEventBus({
+      eventIdFactory: () => `event-${++sequence}`,
+    });
+    const checkpoint = bus.publish({
+      type: "gateway.started",
+      source: "gateway",
+      payload: {},
+    });
+    const replayed = bus.publish({
+      type: "gateway.ready",
+      source: "gateway",
+      payload: {},
+    });
+    const received: string[] = [];
+
+    const subscription = bus.subscribeWithReplay(checkpoint.eventId, (event) =>
+      received.push(event.eventId),
+    );
+    const live = bus.publish({
+      type: "system.health_changed",
+      source: "gateway",
+      payload: { status: "ok" },
+    });
+
+    expect(subscription.replay).toEqual([replayed]);
+    expect(received).toEqual([live.eventId]);
+    subscription.unsubscribe();
+    expect(bus.metricsSnapshot.subscriberCount).toBe(0);
+  });
+
   it("rejects invalid event names and non-serializable payloads", () => {
     const bus = new DomainEventBus();
     expect(() =>

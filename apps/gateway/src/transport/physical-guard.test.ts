@@ -1,9 +1,30 @@
+import { createHash } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const physicalGuardTestState = vi.hoisted(() => ({
+  fullDurabilityRequests: 0,
+}));
+
+vi.mock("node:sqlite", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:sqlite")>();
+  class FixtureDatabaseSync extends actual.DatabaseSync {
+    override exec(sql: string): void {
+      if (/^\s*PRAGMA\s+synchronous\s*=\s*FULL\s*;?\s*$/i.test(sql)) {
+        physicalGuardTestState.fullDurabilityRequests += 1;
+        super.exec("PRAGMA synchronous = OFF");
+        return;
+      }
+      super.exec(sql);
+    }
+  }
+  return { ...actual, DatabaseSync: FixtureDatabaseSync };
+});
 
 import {
   PhysicalWriteGuard,
@@ -14,6 +35,7 @@ import {
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  physicalGuardTestState.fullDurabilityRequests = 0;
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -49,6 +71,16 @@ describe("PhysicalWriteGuard", () => {
     );
     guard.recordConfigSuccess();
     guard.releaseSession();
+  });
+
+  it("requests FULL synchronization for every physical ledger connection", async () => {
+    const fixture = await guardFixture();
+    const guard = fixture.guard();
+
+    guard.acquireSession(1);
+    guard.releaseSession("aborted");
+
+    expect(physicalGuardTestState.fullDurabilityRequests).toBe(1);
   });
 
   it("rejects a mismatched nonce without consuming the config request", async () => {
@@ -164,22 +196,15 @@ describe("PhysicalWriteGuard", () => {
     );
     expect(fifth.automaticReconnectAllowed).toBe(false);
     fifth.releaseSession();
-    // Four synchronous=FULL SQLite cycles exercise the real durable ledger.
-    // Windows fsync latency can exceed Vitest's 5s default under worker load.
-  }, 15_000);
+  });
 
   it("opens a candidate fuse before its seventeenth config request", async () => {
     let now = new Date("2026-07-22T00:00:00.000Z");
     const fixture = await guardFixture({ clock: () => now });
-    for (let attempt = 0; attempt < 16; attempt += 1) {
-      completeSession(
-        fixture.guard({
-          qualificationStage: `stage-${Math.floor(attempt / 4)}`,
-        }),
-        attempt + 1,
-      );
-      now = new Date(now.getTime() + 11 * 60_000);
-    }
+    completeSession(fixture.guard({ qualificationStage: "stage-0" }), 1);
+    expect(seedCandidateRequestHistory(fixture.ledgerPath, now, 15)).toBe(16);
+    now = new Date(now.getTime() + 11 * 60_000);
+
     const seventeenth = fixture.guard({ qualificationStage: "stage-4" });
     seventeenth.acquireSession(17);
     expectCode(
@@ -187,7 +212,7 @@ describe("PhysicalWriteGuard", () => {
       "PHYSICAL_GUARD_CANDIDATE_REQUEST_LIMIT_EXCEEDED",
     );
     seventeenth.releaseSession();
-  }, 30_000);
+  });
 
   it("fails closed on a corrupt existing ledger", async () => {
     const fixture = await guardFixture();
@@ -293,6 +318,70 @@ function completeSession(guard: PhysicalWriteGuard, nonce: number): void {
   guard.authorizeConfigRequest(nonce, wantConfig(nonce));
   guard.recordConfigSuccess();
   guard.releaseSession();
+}
+
+function seedCandidateRequestHistory(
+  ledgerPath: string,
+  startedAt: Date,
+  additionalRequests: number,
+): number {
+  const database = new DatabaseSync(ledgerPath);
+  try {
+    database.exec("PRAGMA synchronous = OFF");
+    const candidateDigest = database
+      .prepare(
+        "SELECT candidate_digest FROM physical_attempt ORDER BY id DESC LIMIT 1",
+      )
+      .get()?.candidate_digest;
+    if (typeof candidateDigest !== "string") {
+      throw new Error("Physical guard fixture has no candidate history");
+    }
+
+    database.exec("BEGIN IMMEDIATE");
+    const insert = database.prepare(
+      "INSERT INTO physical_attempt (session_digest, candidate_digest, stage_digest, started_at_ms, config_request_count, outcome) VALUES (?, ?, ?, ?, 1, 'success')",
+    );
+    for (let index = 1; index <= additionalRequests; index += 1) {
+      const stageDigest = fixtureDigest(
+        "stage",
+        `stage-${Math.floor(index / 4)}`,
+      );
+      const ownerToken = `fixture-history-${String(index).padStart(8, "0")}`;
+      insert.run(
+        fixtureDigest(
+          "session",
+          `${candidateDigest}:${stageDigest}:${ownerToken}`,
+        ),
+        candidateDigest,
+        stageDigest,
+        startedAt.getTime() + index,
+      );
+    }
+    database.exec("COMMIT");
+    return Number(
+      database
+        .prepare(
+          "SELECT COUNT(*) AS value FROM physical_attempt WHERE candidate_digest = ? AND config_request_count = 1",
+        )
+        .get(candidateDigest)?.value,
+    );
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the fixture setup error.
+    }
+    throw error;
+  } finally {
+    database.close();
+  }
+}
+
+function fixtureDigest(kind: string, value: string): string {
+  return createHash("sha256")
+    .update(`cmclient-physical-guard-v1:${kind}:`, "utf8")
+    .update(value, "utf8")
+    .digest("hex");
 }
 
 function expectCode(operation: () => void, code: string): void {

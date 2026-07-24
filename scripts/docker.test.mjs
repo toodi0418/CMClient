@@ -15,6 +15,7 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
     compose,
     entrypoint,
     runtime,
+    gatewayRuntime,
     smoke,
     releaseWorkflow,
   ] = await Promise.all([
@@ -26,6 +27,10 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
       "utf8",
     ),
     readFile(new URL("scripts/container-runtime.mjs", repositoryRoot), "utf8"),
+    readFile(
+      new URL("apps/gateway/src/runtime-main.ts", repositoryRoot),
+      "utf8",
+    ),
     readFile(new URL("scripts/docker-smoke.sh", repositoryRoot), "utf8"),
     readFile(
       new URL(".github/workflows/release-build.yml", repositoryRoot),
@@ -67,7 +72,11 @@ test("Docker deployment uses the CMClient runtime and mandatory restrictions", a
   assert.match(runtime, /CMCLIENT_PACKAGE_PROFILE: "oci"/);
   assert.match(compose, /CMCLIENT_RUNTIME_PROFILE: docker/);
   assert.match(compose, /CMCLIENT_PACKAGE_PROFILE: oci/);
-  assert.match(compose, /CMCLIENT_GATEWAY_HOST: 0\.0\.0\.0/);
+  assert.doesNotMatch(compose, /CMCLIENT_GATEWAY_(?:HOST|PORT)/);
+  assert.doesNotMatch(runtime, /CMCLIENT_GATEWAY_(?:HOST|PORT):/);
+  assert.match(runtime, /"CMCLIENT_SUPERVISED"/);
+  assert.match(gatewayRuntime, /GATEWAY_SUPERVISION_REQUIRED/);
+  assert.match(gatewayRuntime, /process\.env\.CMCLIENT_SUPERVISED\s*!==\s*"1"/);
   assert.match(compose, /cmclient-internal:\n {4}internal: true/);
   assert.match(compose, /cmclient-web:\n {4}internal: true/);
   const gatewayService = composeService(compose, "gateway");

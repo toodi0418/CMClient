@@ -3,6 +3,7 @@ import Fastify, {
   type FastifyReply,
   type FastifyRequest,
 } from "fastify";
+import { fastifySSE, type SSEMessage } from "@fastify/sse";
 import { Type } from "@sinclair/typebox";
 import {
   ApiErrorSchema,
@@ -45,14 +46,12 @@ import {
 } from "./observability.js";
 import {
   defaultGatewaySystemState,
-  isDockerDeployment,
   type GatewaySystemState,
 } from "./system.js";
 import {
   DEFAULT_SSE_FRAME_MAX_BYTES,
   DomainEventBus,
-  formatSseEvent,
-  formatSseHeartbeat,
+  DomainEventSubscriberLimitError,
 } from "./events.js";
 import {
   GATEWAY_CAPABILITY_HEADER,
@@ -61,6 +60,16 @@ import {
 } from "./bootstrap.js";
 
 const SSE_HTTP_HIGH_WATER_MARK_BYTES = DEFAULT_SSE_FRAME_MAX_BYTES + 4 * 1024;
+const SSE_PENDING_EVENT_MAX_BYTES = DEFAULT_SSE_FRAME_MAX_BYTES;
+const GATEWAY_ROUTE_METHODS = [
+  "DELETE",
+  "GET",
+  "HEAD",
+  "OPTIONS",
+  "PATCH",
+  "POST",
+  "PUT",
+] as const;
 
 export interface GatewayJobApi {
   get(jobId: string): JobDetail | undefined;
@@ -167,33 +176,6 @@ export class GatewayAccessConfigurationError extends Error {
   }
 }
 
-export function parseGatewayListenOptions(
-  environment: Record<string, string | undefined>,
-): GatewayListenOptions {
-  const host = environment.CMCLIENT_GATEWAY_HOST?.trim() || "127.0.0.1";
-  const portValue = environment.CMCLIENT_GATEWAY_PORT?.trim() || "0";
-  const port = Number(portValue);
-  if (
-    !isGatewayHostAllowed(host, environment) ||
-    !Number.isInteger(port) ||
-    port < 0 ||
-    port > 65_535
-  ) {
-    throw new GatewayConfigurationError();
-  }
-  return { host, port };
-}
-
-function isGatewayHostAllowed(
-  host: string,
-  environment: Record<string, string | undefined>,
-): boolean {
-  return (
-    isLoopbackHost(host) ||
-    (isDockerDeployment(environment) && host === "0.0.0.0")
-  );
-}
-
 export class GatewayRuntime {
   readonly app: FastifyInstance;
   private readonly options: GatewayListenOptions;
@@ -212,6 +194,12 @@ export class GatewayRuntime {
     aprs?: GatewayAprsReadApi,
     access?: GatewayAccessOptions,
   ) {
+    if (options.host !== "127.0.0.1" || options.port !== 0) {
+      throw new GatewayConfigurationError();
+    }
+    if (!isGatewayCapability(access?.capability)) {
+      throw new GatewayAccessConfigurationError();
+    }
     this.options = options;
     this.app = createGatewayApp(
       logger,
@@ -282,6 +270,7 @@ export function createGatewayApp(
     http: { highWaterMark: SSE_HTTP_HIGH_WATER_MARK_BYTES },
   });
   const sseSessions = new Set<GatewaySseSessionCloser>();
+  app.register(fastifySSE, { heartbeatInterval: heartbeatIntervalMs });
   app.decorate("eventBus", eventBus);
   app.decorateRequest("traceId", "");
   app.addHook("preClose", () => {
@@ -290,6 +279,8 @@ export function createGatewayApp(
     }
   });
   app.addHook("onRequest", (request, reply, done) => {
+    request.traceId = resolveTraceId(request.headers["x-trace-id"]);
+    reply.header("x-trace-id", request.traceId);
     if (
       access.capability !== undefined &&
       !gatewayCapabilityMatches(
@@ -300,19 +291,59 @@ export function createGatewayApp(
       reply
         .header("cache-control", "no-store")
         .code(403)
-        .send({ code: "GATEWAY_CAPABILITY_REJECTED" });
+        .send(
+          gatewayErrorEnvelope(request, reply, "GATEWAY_CAPABILITY_REJECTED"),
+        );
       return;
     }
     delete request.headers[GATEWAY_CAPABILITY_HEADER];
-    request.traceId = resolveTraceId(request.headers["x-trace-id"]);
     const correlationId = resolveCorrelationId(
       request.headers["x-correlation-id"],
     );
     if (correlationId) {
       request.correlationId = correlationId;
     }
-    reply.header("x-trace-id", request.traceId);
     done();
+  });
+  app.setErrorHandler((error, request, reply) => {
+    const statusCode = frameworkStatusCode(error);
+    const code = isFrameworkValidationError(error)
+      ? "GATEWAY_REQUEST_SCHEMA_INVALID"
+      : frameworkErrorCode(statusCode);
+    return reply
+      .code(statusCode)
+      .send(gatewayErrorEnvelope(request, reply, code));
+  });
+  app.setNotFoundHandler((request, reply) => {
+    const allowedMethods = allowedMethodsForPath(app, request.url);
+    if (allowedMethods.length > 0) {
+      reply.header("allow", allowedMethods.join(", "));
+      return reply
+        .code(405)
+        .send(
+          gatewayErrorEnvelope(request, reply, "GATEWAY_METHOD_NOT_ALLOWED"),
+        );
+    }
+    return reply
+      .code(404)
+      .send(gatewayErrorEnvelope(request, reply, "GATEWAY_ROUTE_NOT_FOUND"));
+  });
+  app.addHook("onSend", (request, reply, payload, done) => {
+    if (reply.statusCode < 400 || isGatewayErrorEnvelope(payload)) {
+      done(null, payload);
+      return;
+    }
+    reply.type("application/json; charset=utf-8");
+    done(
+      null,
+      JSON.stringify(
+        gatewayErrorEnvelope(
+          request,
+          reply,
+          frameworkErrorCode(reply.statusCode),
+        ),
+      ),
+    );
   });
   app.addHook("onResponse", (request, reply, done) => {
     logger.log({
@@ -502,16 +533,6 @@ export function createGatewayApp(
         ? { items: domain.listPositions(resolveListLimit(request.query.limit)) }
         : sendDomainDataUnavailable(request, reply),
   );
-  app.get("/api/v1/events", (request, reply) => {
-    openSseStream(
-      request,
-      reply,
-      eventBus,
-      logger,
-      heartbeatIntervalMs,
-      sseSessions,
-    );
-  });
   app.get<{ Querystring: ListQuery }>(
     "/api/v1/events/recent",
     {
@@ -639,33 +660,124 @@ export function createGatewayApp(
       return reply.code(202).send(job);
     },
   );
-  app.get<{ Params: JobIdParams }>(
-    "/api/v1/jobs/:jobId/events",
-    { schema: { params: jobIdParamsSchema() } },
-    (request, reply) => {
-      if (!jobs) {
-        return sendJobEngineUnavailable(request, reply);
-      }
-      const job = jobs.get(request.params.jobId);
-      if (!job) {
-        return sendJobNotFound(request, reply);
-      }
-      openSseStream(
-        request,
-        reply,
-        eventBus,
-        logger,
-        heartbeatIntervalMs,
-        sseSessions,
-        (event) => isJobEvent(event, job.id),
-      );
-    },
-  );
+  app.register(async function gatewaySseRoutes(app) {
+    app.get("/api/v1/events", { sse: "only" }, async (request, reply) =>
+      openSseStream(request, reply, eventBus, logger, sseSessions),
+    );
+    app.get<{ Params: JobIdParams }>(
+      "/api/v1/jobs/:jobId/events",
+      { sse: "only", schema: { params: jobIdParamsSchema() } },
+      async (request, reply) => {
+        if (!jobs) {
+          return sendJobEngineUnavailable(request, reply);
+        }
+        const job = jobs.get(request.params.jobId);
+        if (!job) {
+          return sendJobNotFound(request, reply);
+        }
+        return openSseStream(
+          request,
+          reply,
+          eventBus,
+          logger,
+          sseSessions,
+          (event) => isJobEvent(event, job.id),
+        );
+      },
+    );
+  });
   return app;
 }
 
-function isLoopbackHost(host: string): boolean {
-  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+function frameworkStatusCode(error: unknown): number {
+  const statusCode =
+    error && typeof error === "object" && "statusCode" in error
+      ? error.statusCode
+      : undefined;
+  return typeof statusCode === "number" &&
+    statusCode >= 400 &&
+    statusCode <= 599
+    ? statusCode
+    : 500;
+}
+
+function isFrameworkValidationError(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    "validation" in error &&
+    Array.isArray(error.validation)
+  );
+}
+
+function frameworkErrorCode(statusCode: number): string {
+  switch (statusCode) {
+    case 400:
+      return "GATEWAY_REQUEST_INVALID";
+    case 404:
+      return "GATEWAY_ROUTE_NOT_FOUND";
+    case 405:
+      return "GATEWAY_METHOD_NOT_ALLOWED";
+    case 406:
+      return "GATEWAY_SSE_NOT_ACCEPTABLE";
+    case 413:
+      return "GATEWAY_REQUEST_TOO_LARGE";
+    case 415:
+      return "GATEWAY_MEDIA_TYPE_UNSUPPORTED";
+    default:
+      return statusCode >= 500
+        ? "GATEWAY_INTERNAL_ERROR"
+        : "GATEWAY_REQUEST_REJECTED";
+  }
+}
+
+function gatewayErrorEnvelope(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  code: string,
+) {
+  const traceId = request.traceId || createTraceId();
+  request.traceId = traceId;
+  reply.header("x-trace-id", traceId);
+  return { code, params: {}, traceId };
+}
+
+function isGatewayErrorEnvelope(payload: unknown): boolean {
+  let value = payload;
+  if (Buffer.isBuffer(value)) {
+    value = value.toString("utf8");
+  }
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value) as unknown;
+    } catch {
+      return false;
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const envelope = value as Record<string, unknown>;
+  const keys = Object.keys(envelope).sort();
+  return (
+    keys.length === 3 &&
+    keys[0] === "code" &&
+    keys[1] === "params" &&
+    keys[2] === "traceId" &&
+    typeof envelope.code === "string" &&
+    envelope.params !== null &&
+    typeof envelope.params === "object" &&
+    !Array.isArray(envelope.params) &&
+    typeof envelope.traceId === "string" &&
+    envelope.traceId.length > 0
+  );
+}
+
+function allowedMethodsForPath(app: FastifyInstance, url: string): string[] {
+  const path = url.split("?", 1)[0] || "/";
+  return GATEWAY_ROUTE_METHODS.filter(
+    (method) => app.findRoute({ method, url: path }) !== null,
+  );
 }
 
 function parseLastEventId(
@@ -832,55 +944,26 @@ function isJobEvent(event: DomainEvent, jobId: string): boolean {
   return event.type.startsWith("job.") && event.payload.jobId === jobId;
 }
 
-function openSseStream(
+async function openSseStream(
   request: FastifyRequest,
   reply: FastifyReply,
   eventBus: DomainEventBus,
   logger: StructuredLogger,
-  heartbeatIntervalMs: number,
   sessions: Set<GatewaySseSessionCloser>,
   filter: (event: DomainEvent) => boolean = () => true,
-): void {
-  try {
-    eventBus.assertSubscriberCapacity();
-  } catch {
-    logger.log({
-      level: "warn",
-      message: "gateway.sse_client_rejected",
-      traceId: request.traceId || createTraceId(),
-      ...(request.correlationId
-        ? { correlationId: request.correlationId }
-        : {}),
-      fields: { reason: "SSE_SUBSCRIBER_LIMIT_REACHED" },
-    });
-    void reply.code(503).send({
-      code: "SSE_SUBSCRIBER_LIMIT_REACHED",
-      params: {},
-      traceId: request.traceId,
-    });
-    return;
-  }
-  reply.hijack();
-  const response = reply.raw;
-  const replay = eventBus
-    .replayAfter(parseLastEventId(request.headers["last-event-id"]))
-    .filter(filter);
+): Promise<void> {
+  const source = new GatewaySseEventSource();
+  let unsubscribe = (): void => undefined;
   let closed = false;
-  const session: {
-    heartbeat?: NodeJS.Timeout;
-    unsubscribe?: () => void;
-  } = {};
 
   const close = (reason: string): void => {
     if (closed) {
       return;
     }
     closed = true;
-    if (session.heartbeat) {
-      clearInterval(session.heartbeat);
-    }
-    session.unsubscribe?.();
+    unsubscribe();
     sessions.delete(close);
+    source.close();
     logger.log({
       level:
         reason.startsWith("SSE_") &&
@@ -894,54 +977,139 @@ function openSseStream(
         : {}),
       fields: { reason },
     });
-    if (!response.destroyed) {
-      response.destroy();
+    if (reply.sse.isConnected) {
+      reply.sse.close();
     }
   };
-  const send = (message: string): boolean => {
-    if (closed || response.destroyed || response.writableEnded) {
-      return false;
-    }
-    if (!response.write(message)) {
+  const enqueue = (event: DomainEvent): void => {
+    if (filter(event) && !source.push(event)) {
       close("SSE_SLOW_CONSUMER");
-      return false;
-    }
-    return true;
-  };
-  const sendEvent = (event: DomainEvent): boolean => {
-    try {
-      return send(formatSseEvent(event));
-    } catch {
-      close("SSE_FRAME_TOO_LARGE");
-      return false;
     }
   };
 
-  response.once("close", () => close("SSE_CLIENT_DISCONNECTED"));
-  response.once("error", () => close("SSE_CLIENT_ERROR"));
-  sessions.add(close);
-  response.writeHead(200, {
-    "cache-control": "no-cache, no-transform",
-    connection: "keep-alive",
-    "content-type": "text/event-stream; charset=utf-8",
-    "x-accel-buffering": "no",
-  });
-  response.flushHeaders();
-  session.unsubscribe = eventBus.subscribe((event) => {
-    if (filter(event)) {
-      sendEvent(event);
+  let replay: DomainEvent[];
+  try {
+    const subscription = eventBus.subscribeWithReplay(
+      parseLastEventId(reply.sse.lastEventId ?? undefined),
+      enqueue,
+    );
+    replay = subscription.replay;
+    unsubscribe = subscription.unsubscribe;
+  } catch (error) {
+    if (!(error instanceof DomainEventSubscriberLimitError)) {
+      throw error;
     }
-  });
-  for (const event of replay) {
-    if (!sendEvent(event)) {
-      return;
-    }
-  }
-  if (!send(formatSseHeartbeat())) {
+    logger.log({
+      level: "warn",
+      message: "gateway.sse_client_rejected",
+      traceId: request.traceId || createTraceId(),
+      ...(request.correlationId
+        ? { correlationId: request.correlationId }
+        : {}),
+      fields: { reason: "SSE_SUBSCRIBER_LIMIT_REACHED" },
+    });
+    await reply.code(503).send({
+      code: "SSE_SUBSCRIBER_LIMIT_REACHED",
+      params: {},
+      traceId: request.traceId,
+    });
     return;
   }
-  session.heartbeat = setInterval(() => {
-    send(formatSseHeartbeat());
-  }, heartbeatIntervalMs);
-  session.heartbeat.unref();
+
+  reply.sse.onClose(() => close("SSE_CLIENT_DISCONNECTED"));
+  sessions.add(close);
+  reply.sse.sendHeaders();
+  reply.raw.flushHeaders();
+  await reply.sse.send(replayThenLive(replay, source, filter));
+}
+
+async function* replayThenLive(
+  replay: readonly DomainEvent[],
+  live: GatewaySseEventSource,
+  filter: (event: DomainEvent) => boolean,
+): AsyncGenerator<SSEMessage> {
+  for (const event of replay) {
+    if (live.isClosed) {
+      return;
+    }
+    if (filter(event)) {
+      yield sseMessage(event);
+    }
+  }
+  for await (const message of live) {
+    yield message;
+  }
+}
+
+function sseMessage(event: DomainEvent): SSEMessage {
+  return {
+    id: event.eventId,
+    event: event.type,
+    data: event,
+  };
+}
+
+class GatewaySseEventSource implements AsyncIterable<SSEMessage> {
+  private readonly pending: Array<{ bytes: number; message: SSEMessage }> = [];
+  private pendingBytes = 0;
+  private closed = false;
+  private waiter: ((result: IteratorResult<SSEMessage>) => void) | undefined;
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  push(event: DomainEvent): boolean {
+    if (this.closed) {
+      return false;
+    }
+    const message = sseMessage(event);
+    const bytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+    if (this.waiter) {
+      const resolve = this.waiter;
+      this.waiter = undefined;
+      resolve({ done: false, value: message });
+      return true;
+    }
+    if (this.pendingBytes + bytes > SSE_PENDING_EVENT_MAX_BYTES) {
+      return false;
+    }
+    this.pending.push({ bytes, message });
+    this.pendingBytes += bytes;
+    return true;
+  }
+
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.pending.length = 0;
+    this.pendingBytes = 0;
+    const resolve = this.waiter;
+    this.waiter = undefined;
+    resolve?.({ done: true, value: undefined });
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SSEMessage> {
+    return {
+      next: () => {
+        const entry = this.pending.shift();
+        if (entry) {
+          this.pendingBytes -= entry.bytes;
+          return Promise.resolve({ done: false, value: entry.message });
+        }
+        if (this.closed) {
+          return Promise.resolve({ done: true, value: undefined });
+        }
+        return new Promise<IteratorResult<SSEMessage>>((resolve) => {
+          this.waiter = resolve;
+        });
+      },
+      return: () => {
+        this.close();
+        return Promise.resolve({ done: true, value: undefined });
+      },
+    };
+  }
 }

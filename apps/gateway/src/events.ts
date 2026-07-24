@@ -43,6 +43,11 @@ export interface DomainEventBusOptions {
 
 export type DomainEventListener = (event: DomainEvent) => void;
 
+export interface DomainEventReplaySubscription {
+  replay: DomainEvent[];
+  unsubscribe: () => void;
+}
+
 /**
  * A bounded, process-local journal. Durable event history is added by the job
  * and domain persistence layers; this buffer only bridges short SSE reconnects.
@@ -185,6 +190,21 @@ export class DomainEventBus {
     }
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  subscribeWithReplay(
+    lastEventId: string | undefined,
+    listener: DomainEventListener,
+  ): DomainEventReplaySubscription {
+    if (!this.listeners.has(listener)) {
+      this.assertSubscriberCapacity();
+    }
+    const replay = this.replayAfter(lastEventId);
+    this.listeners.add(listener);
+    return {
+      replay,
+      unsubscribe: () => this.listeners.delete(listener),
+    };
   }
 
   assertSubscriberCapacity(): void {

@@ -45,12 +45,17 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `4534621e40451977c6c364ffd26f65ea4aaa921a7798469d151d5fa6e078e54a`.
-- Cargo license inventory: 574 registry packages, 13 workspace packages, zero
-  Git sources and zero unknown licenses; inventory SHA-256
-  `0da4c2e9cc7770b7cccc23e7ce60799d4f43d21998676db9efebcc67f279f5a3`.
-  The digest is canonical JSON sorted by package name, version, source,
-  checksum, and declared license.
+  `d6bfadfa028ad4d128249dc6446f29102039dce5af6fb79e96761de2f2d8706f`.
+- Cargo license inventory: 614 registry packages, 13 workspace packages, zero
+  Git sources, zero unknown source classifications, and zero unknown licenses;
+  inventory SHA-256
+  `e34a3450f05198d6b7309207587b3f753a089499965e79e751ce0ec785f9de0e`.
+  Its `canonical-json-v2` input is a UTF-8 JSON array with object keys in the
+  exact order `name`, `version`, `source`, `checksum`, and `license`.
+  Workspace sources are the literal `workspace`; absent checksums and licenses
+  are JSON `null`. Rows sort by all five fields using UTF-8 byte order with
+  `null` before text. The encoding has no insignificant whitespace and has one
+  terminal LF. The digest covers that LF.
   P13-T08 removed the Rust SQLite and obsolete Windows ACL migration chain and
   made the already-locked `libc` and `winapi-util` packages exact direct
   platform dependencies. They provide no-follow existing-file opens on Unix
@@ -60,17 +65,26 @@ The promotion baseline is CMClient commit
   packages direct Control IPC dependencies. `interprocess` owns the Unix local
   socket and remote-rejected Windows named-pipe transport; `tokio-util` and
   `bytes` own bounded length-delimited framing. No registry package, version,
-  checksum, or license row was added to the 574-package inventory, so its
-  canonical inventory digest is unchanged.
+  checksum, or license row was added at that checkpoint, so the P13-T09
+  canonical inventory digest remained unchanged.
+  P13-T10 then adopted exact Axum/Tower Web ingress dependencies. The current
+  inventory includes those direct rows and all packages in Cargo's resolved
+  graph; the canonical input was regenerated from structured `cargo metadata`
+  and `Cargo.lock` data after the package set stabilized.
 - `pnpm-lock.yaml` SHA-256:
-  `9b234eb100e287daaf76e9cb13cd07a47205e50ea08adadcfe0e97b933fdc5ab`.
-- The current Windows production install contains 183 package versions;
+  `561ce24da4300bc8c4716874931e944d02eab86bea94fc35c558c892e6a2c7e6`.
+- The P13-T04 Windows production-install evidence contains 183 package versions;
   inventory SHA-256
   `632b3ae7d319aede117c8113b1961e23a331d66972f6b59ff2b548b5fc10ca5f`.
   Its canonical input is one `name@version<TAB>SPDX-expression` row per
   production version, JavaScript-lexically sorted and encoded as UTF-8 LF with
   a terminal LF. The previous literal backslash-tab/backslash-newline digest is
-  not retained as evidence.
+  not retained as evidence. That inventory was generated against
+  `pnpm-lock.yaml`
+  `9b234eb100e287daaf76e9cb13cd07a47205e50ea08adadcfe0e97b933fdc5ab`;
+  it remains historical Windows evidence and is not presented as the current
+  P13-T10 Node production graph. The exact new SSE source is recorded below,
+  while final target package scans remain a P15 gate.
 - No GPL-2.0-only, AGPL, proprietary, Git-sourced, or unknown dependency license
   expression was found. MPL-2.0 dependencies carry no Exhibit-B incompatible
   notice; their file-level source and notice obligations remain in force.
@@ -91,12 +105,17 @@ notices remain part of the target-specific packaging inventory.
 | `tokio` | `1.53.1` | `https://github.com/tokio-rs/tokio` | MIT | `202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed` | 1.71 |
 | `tokio-util` | `0.7.18` | `https://github.com/tokio-rs/tokio` | MIT | `9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098` | 1.71 |
 | `atomic-write-file` | `0.3.0` | `https://github.com/andreacorbellini/rust-atomic-write-file` | BSD-3-Clause | `84790c55b5704b0d35130bf16a4ce22a8e70eb0ea773522557524d9a4852663d` | 1.85 |
+| `axum` | `0.8.9` | `https://github.com/tokio-rs/axum` | MIT | `31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90` | 1.80 |
+| `axum-server` | `0.8.0` | `https://github.com/programatik29/axum-server` | MIT | `b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc` | 1.82 |
 | `bytes` | `1.12.1` | `https://github.com/tokio-rs/bytes` | MIT | `fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04` | 1.57 |
 | `fs4` | `1.1.0` | `https://github.com/al8n/fs4` | MIT OR Apache-2.0 | `7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5` | 1.75.0 |
 | `interprocess` | `2.4.2` | `https://github.com/kotauskas/interprocess` | 0BSD OR Apache-2.0 | `069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b` | 1.75 |
 | `libc` | `0.2.186` | `https://github.com/rust-lang/libc` | MIT OR Apache-2.0 | `68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66` | 1.65 |
 | `same-file` | `1.0.6` | `https://github.com/BurntSushi/same-file` | Unlicense/MIT | `93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502` | Not declared |
 | `time` | `0.3.45` | `https://github.com/time-rs/time` | MIT OR Apache-2.0 | `f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd` | 1.83.0 |
+| `tower-http` | `0.7.0` | `https://github.com/tower-rs/tower-http` | MIT | `b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233` | 1.65 |
+| `tower-sessions` | `0.15.0` | `https://github.com/maxcountryman/tower-sessions` | MIT | `518dca34b74a17cadfcee06e616a09d2bd0c3984eff1769e1e76d58df978fc78` | Not declared |
+| `tower_governor` | `0.8.0` | `https://github.com/benwis/tower-governor` | MIT OR Apache-2.0 | `44de9b94d849d3c46e06a883d72d408c2de6403367b39df2b1c9d9e7b6736fe6` | Not declared |
 | `tracing` | `0.1.44` | `https://github.com/tokio-rs/tracing` | MIT | `63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100` | 1.65.0 |
 | `tracing-appender` | `0.2.5` | `https://github.com/tokio-rs/tracing` | MIT | `050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c` | 1.63.0 |
 | `winapi-util` | `0.1.11` | `https://github.com/BurntSushi/winapi-util` | Unlicense OR MIT | `c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22` | not declared |
@@ -111,6 +130,16 @@ bytes.
 | --- | --- | --- | --- | --- |
 | `yauzl` | `3.4.0` | `https://github.com/thejoshwolfe/yauzl` | MIT | `sha512-jIH9yLR9wqr0wOS0TpBvo/g/2UgZH5qePVbjgRliiF0BYvOZyaBknKsF+x9Iht0O6sqgnB93rCICdOZFecJuDw==` |
 | `pend` | `1.2.0` | `https://github.com/andrewrk/node-pend` | MIT | `sha512-F3asv42UuXchdzt+xXqfW1OGlVBe+mxa2mqI0pg5yAHZPvFmY3Y6drSf/GQ1A86WgWEN9Kzh/WrgKa6iGcHXLg==` |
+
+P13-T10 adopts the exact Fastify SSE plugin for Gateway domain and durable-Job
+streams only. Its MIT declaration and official upstream come from the installed
+package metadata; the archive integrity is pinned by `pnpm-lock.yaml`. Agent
+lifecycle/setup/update streams remain owned by Axum, and shipped-byte scans
+remain a P15 gate.
+
+| Package | Exact version | Upstream | License | npm registry integrity |
+| --- | --- | --- | --- | --- |
+| `@fastify/sse` | `0.5.0` | `https://github.com/fastify/sse` | MIT | `sha512-VLNPXtmmMA2+g5qlTlDhjzZZzFm2tIazfioZ20DyBvs516mcMmDImtjfHN2cCUhf2nfxmWeLK3aMlqv4FSM+5Q==` |
 
 The workspace MSRV is Rust 1.87.0 and the pinned current toolchain is Rust
 1.96.0. CI checks every workspace target at 1.87 and runs the full workspace

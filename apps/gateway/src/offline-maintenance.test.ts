@@ -299,10 +299,17 @@ describe("Gateway offline maintenance", { timeout: 20_000 }, () => {
       sourcePath,
       gatewayMigrations.filter((migration) => migration.version <= 7),
     );
-    source.settings.set("orphaned", true);
-    source.connection.exec("PRAGMA writable_schema = ON");
-    source.connection.exec("DELETE FROM sqlite_schema WHERE name = 'settings'");
-    source.close();
+    try {
+      source.settings.set("orphaned", true);
+      disableDefensiveModeForCorruptionFixture(source.connection);
+      source.connection.exec("PRAGMA writable_schema = ON");
+      source.connection.exec(
+        "DELETE FROM sqlite_schema WHERE name = 'settings'",
+      );
+      source.connection.exec("PRAGMA writable_schema = OFF");
+    } finally {
+      source.close();
+    }
 
     await expect(
       runOfflineMaintenance(maintenanceRequest(sourcePath, stagedPath)),
@@ -856,6 +863,15 @@ async function temporaryDirectory(prefix: string): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), prefix));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+function disableDefensiveModeForCorruptionFixture(
+  database: DatabaseSync,
+): void {
+  const enableDefensive = Reflect.get(database, "enableDefensive");
+  if (typeof enableDefensive === "function") {
+    Reflect.apply(enableDefensive, database, [false]);
+  }
 }
 
 async function fileSnapshot(path: string): Promise<{

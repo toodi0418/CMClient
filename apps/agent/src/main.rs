@@ -1,14 +1,24 @@
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{any, get},
+};
 use chrono::{SecondsFormat, Utc};
-use cmclient_agent_core::access::{ManagementAccessController, ManagementAccessError};
+use cmclient_agent_core::access::ManagementAccessController;
 use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind, SecretStoreError};
 use cmclient_agent_core::web::{
-    GATEWAY_CAPABILITY_HEADER, GatewayRoute, GatewaySessionHandle, ManagementTlsConfig,
-    ManagementWebApiHandler, ManagementWebConfig, ManagementWebError, ManagementWebListener,
-    ManagementWebRequest, ManagementWebService, ManagementWebStream, gateway_health_with_route,
+    ActiveGatewayRoute, GATEWAY_CAPABILITY_HEADER, GatewayRoute, GatewaySessionHandle,
+    ManagementTlsConfig, ManagementWebConfig, ManagementWebError, ManagementWebProfile,
+    ManagementWebService,
 };
 use cmclient_agent_core::{
-    AgentConfig, AgentLease, AprsConfig, MeshtasticConnectionConfig, RuntimePaths,
-    ensure_runtime_directories,
+    AgentConfig, AgentLease, AgentRuntimeProfile, AprsConfig, MeshtasticConnectionConfig,
+    RuntimePaths, ensure_runtime_directories,
 };
 use cmclient_control_api::{
     ControlClient, ControlCommand, ControlEndpoint, ControlError, ControlHandler,
@@ -31,18 +41,18 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
+        mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -61,14 +71,17 @@ const MAX_GATEWAY_IDENTITY_BYTES: u64 = 64 * 1024;
 struct AgentUpdateService {
     journal: UpdateJournalStore,
     subscribers: Mutex<Vec<SyncSender<ControlUpdateEvent>>>,
+    web_events: tokio::sync::broadcast::Sender<ControlUpdateEvent>,
     next_event_id: AtomicU64,
 }
 
 impl AgentUpdateService {
     fn new(data_dir: &Path) -> Result<Self, ControlError> {
+        let (web_events, _) = tokio::sync::broadcast::channel(UPDATE_EVENT_BUFFER);
         Ok(Self {
             journal: UpdateJournalStore::new(data_dir).map_err(|_| ControlError::CommandFailed)?,
             subscribers: Mutex::new(Vec::new()),
+            web_events,
             next_event_id: AtomicU64::new(1),
         })
     }
@@ -113,16 +126,39 @@ impl AgentUpdateService {
         Ok(receiver)
     }
 
+    fn subscribe_web(
+        &self,
+    ) -> Result<
+        (
+            ControlUpdateEvent,
+            tokio::sync::broadcast::Receiver<ControlUpdateEvent>,
+        ),
+        ControlError,
+    > {
+        let _event_order = self
+            .subscribers
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?;
+        let receiver = self.web_events.subscribe();
+        Ok((self.web_snapshot()?, receiver))
+    }
+
+    fn web_snapshot(&self) -> Result<ControlUpdateEvent, ControlError> {
+        self.event_for(&self.status()?)
+    }
+
     fn publish(&self, job: &PersistentUpdateJob) -> Result<(), ControlError> {
         let status = UpdateControlStatus {
             schema_version: 1,
             job: Some(update_control_job(job.clone())),
         };
-        let event = self.event_for(&status)?;
-        self.subscribers
+        let mut subscribers = self
+            .subscribers
             .lock()
-            .map_err(|_| ControlError::CommandFailed)?
-            .retain(|sender| sender.try_send(event.clone()).is_ok());
+            .map_err(|_| ControlError::CommandFailed)?;
+        let event = self.event_for(&status)?;
+        subscribers.retain(|sender| sender.try_send(event.clone()).is_ok());
+        let _ = self.web_events.send(event);
         Ok(())
     }
 
@@ -165,233 +201,84 @@ fn utc_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-struct AgentManagementWebApi {
-    updates: Arc<AgentUpdateService>,
-    access: Option<Arc<ManagementAccessController>>,
-}
-
-impl ManagementWebApiHandler for AgentManagementWebApi {
-    fn handle(
-        &self,
-        client: &mut dyn ManagementWebStream,
-        request: &ManagementWebRequest,
-    ) -> Result<bool, ManagementWebError> {
-        if request.path.starts_with("/api/v1/control/") {
-            write_management_json(
-                client,
-                "404 Not Found",
-                br#"{"code":"CONTROL_ROUTE_NOT_FOUND"}"#,
-            )?;
-            return Ok(true);
-        }
-        if let Some(access) = &self.access {
-            if request.method == "POST" && request.path == "/api/v1/auth/login" {
-                return handle_management_login(client, request, access);
-            }
-            let public_static = matches!(request.method.as_str(), "GET" | "HEAD")
-                && !request.path.starts_with("/api/");
-            if !public_static {
-                let write = !matches!(request.method.as_str(), "GET" | "HEAD" | "OPTIONS");
-                let session = request.header("cookie").and_then(management_session_cookie);
-                let result = session
-                    .ok_or(ManagementAccessError::SessionInvalid)
-                    .and_then(|session| {
-                        access.authorize(
-                            request.header("origin"),
-                            session,
-                            request.header("x-csrf-token"),
-                            write,
-                            unix_now_seconds(),
-                        )
-                    });
-                if let Err(error) = result {
-                    write_management_access_error(client, error)?;
-                    return Ok(true);
-                }
-            }
-        }
-        match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/api/v1/updates") => {
-                let status = match self.updates.status() {
-                    Ok(status) => status,
-                    Err(_) => {
-                        write_management_error(client, "CONTROL_COMMAND_FAILED")?;
-                        return Ok(true);
-                    }
-                };
-                let body = serde_json::to_vec(&status).map_err(|_| ManagementWebError::Io)?;
-                write_management_json(client, "200 OK", &body)?;
-                Ok(true)
-            }
-            ("GET", "/api/v1/updates/events") => {
-                let events = match self.updates.subscribe() {
-                    Ok(events) => events,
-                    Err(_) => {
-                        write_management_error(client, "CONTROL_COMMAND_FAILED")?;
-                        return Ok(true);
-                    }
-                };
-                write_management_update_events(client, events)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-}
-
-fn handle_management_login(
-    client: &mut dyn ManagementWebStream,
-    request: &ManagementWebRequest,
-    access: &ManagementAccessController,
-) -> Result<bool, ManagementWebError> {
-    let password = serde_json::from_slice::<serde_json::Value>(&request.body)
-        .ok()
-        .and_then(|value| {
-            let object = value.as_object()?;
-            if object.len() != 1 {
-                return None;
-            }
-            object.get("password")?.as_str().map(str::to_owned)
-        })
-        .filter(|password| !password.is_empty() && password.len() <= 1024);
-    let result = password
-        .ok_or(ManagementAccessError::CredentialsInvalid)
-        .and_then(|password| {
-            access.login(
-                &request.remote_addr.ip().to_string(),
-                request.header("origin").unwrap_or_default(),
-                &password,
-                unix_now_seconds(),
-            )
-        });
-    match result {
-        Ok(session) => {
-            let body = serde_json::json!({
-                "schemaVersion": 1,
-                "csrfToken": session.csrf_token,
-                "expiresAt": session.expires_at_unix_seconds,
-            });
-            let body = serde_json::to_vec(&body).map_err(|_| ManagementWebError::Io)?;
-            let max_age = session
-                .expires_at_unix_seconds
-                .saturating_sub(unix_now_seconds());
-            write_management_json_with_headers(
-                client,
-                "200 OK",
-                &body,
-                &[format!(
-                    "set-cookie: cmclient_session={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={max_age}",
-                    session.id
-                )],
-            )?;
-            Ok(true)
-        }
-        Err(error) => {
-            write_management_access_error(client, error)?;
-            Ok(true)
-        }
-    }
-}
-
-fn management_session_cookie(value: &str) -> Option<&str> {
-    value.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        (name == "cmclient_session"
-            && value.len() == 32
-            && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then_some(value)
-    })
-}
-
-fn unix_now_seconds() -> u64 {
-    Utc::now().timestamp().max(0) as u64
-}
-
-fn write_management_access_error(
-    client: &mut dyn ManagementWebStream,
-    error: ManagementAccessError,
-) -> Result<(), ManagementWebError> {
-    let status = match error {
-        ManagementAccessError::CredentialsInvalid
-        | ManagementAccessError::SessionInvalid
-        | ManagementAccessError::SessionExpired => "401 Unauthorized",
-        ManagementAccessError::LoginRateLimited => "429 Too Many Requests",
-        ManagementAccessError::OriginDenied | ManagementAccessError::CsrfInvalid => "403 Forbidden",
-        ManagementAccessError::InvalidConfiguration => "500 Internal Server Error",
-    };
-    let body = format!(r#"{{"code":"{}"}}"#, error.code());
-    write_management_json(client, status, body.as_bytes())
-}
-
-fn write_management_json(
-    client: &mut dyn ManagementWebStream,
-    status: &str,
-    body: &[u8],
-) -> Result<(), ManagementWebError> {
-    write_management_json_with_headers(client, status, body, &[])
-}
-
-fn write_management_json_with_headers(
-    client: &mut dyn ManagementWebStream,
-    status: &str,
-    body: &[u8],
-    headers: &[String],
-) -> Result<(), ManagementWebError> {
-    let header = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncache-control: no-store\r\n{}content-length: {}\r\nconnection: close\r\n\r\n",
-        headers
-            .iter()
-            .map(|header| format!("{header}\r\n"))
-            .collect::<String>(),
-        body.len(),
-    );
-    client
-        .write_all(header.as_bytes())
-        .and_then(|_| client.write_all(body))
-        .map_err(|_| ManagementWebError::Io)
-}
-
-fn write_management_error(
-    client: &mut dyn ManagementWebStream,
-    code: &str,
-) -> Result<(), ManagementWebError> {
-    let body = format!(r#"{{"code":"{code}"}}"#);
-    write_management_json(client, "503 Service Unavailable", body.as_bytes())
-}
-
-fn write_management_update_events(
-    client: &mut dyn ManagementWebStream,
-    events: mpsc::Receiver<ControlUpdateEvent>,
-) -> Result<(), ManagementWebError> {
-    client
-        .write_all(
-            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
+fn agent_web_router(updates: Arc<AgentUpdateService>) -> Router {
+    Router::new()
+        .route("/api/v1/updates", get(management_update_status))
+        .route("/api/v1/updates/events", get(management_update_events))
+        .route(
+            "/api/v1/control/{*path}",
+            any(management_control_route_not_found),
         )
-        .map_err(|_| ManagementWebError::Io)?;
-    loop {
-        match events.recv_timeout(Duration::from_secs(15)) {
-            Ok(event) => {
-                if !is_safe_sse_token(&event.id)
-                    || !is_safe_sse_token(&event.event)
-                    || event.data.len() > MAX_SSE_EVENT_BYTES
-                    || event.data.iter().any(|byte| matches!(*byte, b'\r' | b'\n'))
-                {
-                    return Err(ManagementWebError::InvalidHttp);
-                }
-                client
-                    .write_all(
-                        format!("id: {}\nevent: {}\ndata: ", event.id, event.event).as_bytes(),
-                    )
-                    .and_then(|_| client.write_all(&event.data))
-                    .and_then(|_| client.write_all(b"\n\n"))
-                    .map_err(|_| ManagementWebError::Io)?;
-            }
-            Err(RecvTimeoutError::Timeout) => client
-                .write_all(b": heartbeat\n\n")
-                .map_err(|_| ManagementWebError::Io)?,
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
-        }
+        .route("/api/v1/control", any(management_control_route_not_found))
+        .with_state(updates)
+}
+
+async fn management_update_status(State(updates): State<Arc<AgentUpdateService>>) -> Response {
+    match tokio::task::spawn_blocking(move || updates.status()).await {
+        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(Err(_)) | Err(_) => management_control_failed_response(),
     }
+}
+
+async fn management_update_events(State(updates): State<Arc<AgentUpdateService>>) -> Response {
+    let subscription = tokio::task::spawn_blocking(move || updates.subscribe_web()).await;
+    let (snapshot, receiver) = match subscription {
+        Ok(Ok(subscription)) => subscription,
+        Ok(Err(_)) | Err(_) => return management_control_failed_response(),
+    };
+    let snapshot = match update_web_sse_event(snapshot) {
+        Ok(event) => event,
+        Err(_) => return management_control_failed_response(),
+    };
+    let events = tokio_stream::once(Ok::<_, std::io::Error>(snapshot)).chain(
+        BroadcastStream::new(receiver).map(|event| match event {
+            Ok(event) => update_web_sse_event(event),
+            Err(_) => Err(std::io::Error::other("update event subscriber lagged")),
+        }),
+    );
+    Sse::new(events)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("heartbeat"),
+        )
+        .into_response()
+}
+
+async fn management_control_route_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"code": "CONTROL_ROUTE_NOT_FOUND"})),
+    )
+        .into_response()
+}
+
+fn management_control_failed_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"code": "CONTROL_COMMAND_FAILED"})),
+    )
+        .into_response()
+}
+
+fn update_web_sse_event(event: ControlUpdateEvent) -> Result<Event, std::io::Error> {
+    if !is_safe_sse_token(&event.id)
+        || !is_safe_sse_token(&event.event)
+        || event.data.len() > MAX_SSE_EVENT_BYTES
+        || event.data.iter().any(|byte| matches!(*byte, b'\r' | b'\n'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "update event is not valid SSE data",
+        ));
+    }
+    let data = String::from_utf8(event.data).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "update event data is not UTF-8",
+        )
+    })?;
+    Ok(Event::default().id(event.id).event(event.event).data(data))
 }
 
 fn is_safe_sse_token(value: &str) -> bool {
@@ -534,6 +421,13 @@ fn apply_physical_qualification_environment(
         stage.to_owned(),
     );
     Ok(())
+}
+
+const fn management_web_profile(profile: AgentRuntimeProfile) -> ManagementWebProfile {
+    match profile {
+        AgentRuntimeProfile::Native => ManagementWebProfile::Native,
+        AgentRuntimeProfile::Docker => ManagementWebProfile::Docker,
+    }
 }
 
 impl AgentController {
@@ -762,37 +656,43 @@ impl AgentController {
                     .map_err(|_| ControlError::CommandFailed)
             })
             .transpose()?;
+        let management_tls = match config.management_lan.as_ref() {
+            Some(lan) => match (&lan.certificate_path, &lan.private_key_path) {
+                (Some(certificate_path), Some(private_key_path)) => Some(ManagementTlsConfig {
+                    certificate_path: certificate_path.clone(),
+                    private_key_path: private_key_path.clone(),
+                }),
+                (None, None) => None,
+                _ => return Err(ControlError::CommandFailed),
+            },
+            None => None,
+        };
         let management_web_config = ManagementWebConfig {
             enabled: true,
-            // Production requests resolve only through gateway_session.
-            gateway: SocketAddr::from(([127, 0, 0, 1], 1)),
-            bind: config
-                .management_lan
-                .as_ref()
-                .map_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]), |lan| lan.bind),
             port: config.management_lan.as_ref().map_or(7080, |lan| lan.port),
+            profile: management_web_profile(config.runtime_profile),
+            setup_generation: 1,
             allow_lan: management_access.is_some(),
-            tls: config
+            allowed_cidrs: config
                 .management_lan
                 .as_ref()
-                .map(|lan| ManagementTlsConfig {
-                    certificate_path: lan.certificate_path.clone(),
-                    private_key_path: lan.private_key_path.clone(),
-                }),
+                .map_or_else(Vec::new, |lan| lan.allowed_cidrs.clone()),
+            allowed_hosts: config
+                .management_lan
+                .as_ref()
+                .map_or_else(Default::default, |lan| lan.allowed_hosts.clone()),
+            tls: management_tls,
             static_web_root: Some(resolve_static_web_root()),
-            gateway_capability: None,
         };
         let gateway_session = GatewaySessionHandle::new();
         let updates = Arc::new(AgentUpdateService::new(config.paths.root_dir())?);
         updates.recover()?;
         let management_web = if config.management_web_enabled {
             Some(
-                ManagementWebService::start_with_api_handler_and_gateway_session(
+                ManagementWebService::start(
                     &management_web_config,
-                    Arc::new(AgentManagementWebApi {
-                        updates: Arc::clone(&updates),
-                        access: management_access.clone(),
-                    }),
+                    agent_web_router(Arc::clone(&updates)),
+                    management_access.clone(),
                     gateway_session.clone(),
                 )
                 .map_err(|_| ControlError::CommandFailed)?,
@@ -854,11 +754,6 @@ impl AgentController {
             GatewayControlStatus::Running => GatewayControlStatus::Degraded,
             status => status,
         };
-        let management_web_scheme = if self.management_web_config.tls.is_some() {
-            "https"
-        } else {
-            "http"
-        };
         let (management_web, management_web_url) = self
             .management_web
             .lock()
@@ -867,10 +762,7 @@ impl AgentController {
             .map_or((ManagementWebControlStatus::Disabled, None), |service| {
                 (
                     ManagementWebControlStatus::Running,
-                    Some(format!(
-                        "{management_web_scheme}://{}",
-                        service.local_addr()
-                    )),
+                    Some(service.advertised_url().trim_end_matches('/').to_owned()),
                 )
             });
         let remembered_error_code = self
@@ -917,12 +809,10 @@ impl AgentController {
         self.ensure_resource_start_allowed()?;
         if management_web.is_none() {
             *management_web = Some(
-                ManagementWebService::start_with_api_handler_and_gateway_session(
+                ManagementWebService::start(
                     &self.management_web_config,
-                    Arc::new(AgentManagementWebApi {
-                        updates: Arc::clone(&self.updates),
-                        access: self.management_access.clone(),
-                    }),
+                    agent_web_router(Arc::clone(&self.updates)),
+                    self.management_access.clone(),
                     self.gateway_session.clone(),
                 )
                 .map_err(|_| ControlError::CommandFailed)?,
@@ -945,7 +835,10 @@ impl AgentController {
         if let Some(service) = service {
             let worker = thread::Builder::new()
                 .name(String::from("cmclient-management-web-shutdown"))
-                .spawn(move || service.stop())
+                .spawn(move || {
+                    let mut service = service;
+                    service.stop()
+                })
                 .map_err(|_| ControlError::CommandFailed)?;
             *self
                 .management_web_shutdown
@@ -985,7 +878,7 @@ impl AgentController {
             .lock()
             .map_err(|_| ControlError::CommandFailed)?
             .take();
-        let service_result = service.map_or(Ok(()), |service| {
+        let service_result = service.map_or(Ok(()), |mut service| {
             service.stop().map_err(|_| ControlError::CommandFailed)
         });
         let worker = self
@@ -1501,7 +1394,6 @@ fn verified_gateway_route(
         .header(GATEWAY_CAPABILITY_HEADER, active_route.capability())
         .send()
         .map_err(map_gateway_request_error)?;
-    drop(active_route);
     if !response.status().is_success()
         || response
             .content_length()
@@ -1514,17 +1406,22 @@ fn verified_gateway_route(
         .take(MAX_GATEWAY_IDENTITY_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(map_gateway_io_error)?;
+    if !route.is_active() {
+        return Err(ControlError::CommandFailed);
+    }
     if bytes.len() as u64 > MAX_GATEWAY_IDENTITY_BYTES {
         return Err(ControlError::ResponseTooLarge);
     }
     let actual: cmclient_control_api::ComponentIdentityReport =
         serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidEnvelope)?;
-    if actual.validate().is_err()
+    if !route.is_active()
+        || actual.validate().is_err()
         || actual.component != InternalComponent::Gateway
         || actual.identity != expected.identity
     {
         return Err(ControlError::CommandFailed);
     }
+    drop(active_route);
     Ok(route)
 }
 
@@ -1560,7 +1457,6 @@ fn gateway_json_projection(
         .header(GATEWAY_CAPABILITY_HEADER, active_route.capability())
         .send()
         .map_err(map_gateway_request_error)?;
-    drop(active_route);
     if matches!(response.status().as_u16(), 408 | 504) {
         return Err(ControlError::Timeout);
     }
@@ -1578,10 +1474,66 @@ fn gateway_json_projection(
         .take(MAX_GATEWAY_PROJECTION_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(map_gateway_io_error)?;
+    if !route.is_active() {
+        return Err(ControlError::CommandFailed);
+    }
     if bytes.len() as u64 > MAX_GATEWAY_PROJECTION_BYTES {
         return Err(ControlError::ResponseTooLarge);
     }
-    serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidEnvelope)
+    let projection = serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidEnvelope)?;
+    if !route.is_active() {
+        return Err(ControlError::CommandFailed);
+    }
+    drop(active_route);
+    Ok(projection)
+}
+
+fn gateway_health_with_route(route: &GatewayRoute) -> bool {
+    const MAX_GATEWAY_HEALTH_BYTES: u64 = 4 * 1024;
+    let Some(active_route) = route.active() else {
+        return false;
+    };
+    let result = (|| {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .ok()?;
+        let response = client
+            .get(format!(
+                "http://{}/api/v1/system/health",
+                active_route.address()
+            ))
+            .header("accept", "application/json")
+            .header(GATEWAY_CAPABILITY_HEADER, active_route.capability())
+            .send()
+            .ok()?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > MAX_GATEWAY_HEALTH_BYTES)
+        {
+            return None;
+        }
+        let mut body = Vec::new();
+        response
+            .take(MAX_GATEWAY_HEALTH_BYTES + 1)
+            .read_to_end(&mut body)
+            .ok()?;
+        if !route.is_active() {
+            return None;
+        }
+        if body.len() as u64 > MAX_GATEWAY_HEALTH_BYTES {
+            return None;
+        }
+        let body = serde_json::from_slice::<serde_json::Value>(&body).ok()?;
+        (route.is_active() && body.get("status").and_then(serde_json::Value::as_str) == Some("ok"))
+            .then_some(())
+    })();
+    drop(active_route);
+    result.is_some()
 }
 
 fn map_gateway_request_error(error: reqwest::Error) -> ControlError {
@@ -1593,14 +1545,21 @@ fn map_gateway_request_error(error: reqwest::Error) -> ControlError {
 }
 
 fn map_gateway_io_error(error: std::io::Error) -> ControlError {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    ) {
+    if gateway_io_is_timeout(&error) {
         ControlError::Timeout
     } else {
         ControlError::CommandFailed
     }
+}
+
+fn gateway_io_is_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) || error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<reqwest::Error>())
+        .is_some_and(reqwest::Error::is_timeout)
 }
 
 fn bridge_gateway_events(
@@ -1655,6 +1614,9 @@ fn bridge_gateway_event_stream(
     let mut data: Option<Vec<u8>> = None;
     let mut next_receiver_probe = Instant::now() + read_poll;
     loop {
+        if !reader.is_current() {
+            return true;
+        }
         if Instant::now() >= next_receiver_probe {
             if !probe_gateway_event_receiver(sender) {
                 return false;
@@ -1663,9 +1625,12 @@ fn bridge_gateway_event_stream(
         }
         let mut line = Vec::new();
         let count = loop {
-            match read_bounded_gateway_sse_line(&mut reader, &mut line) {
+            match reader.read_line(&mut line) {
                 Ok(count) => break count,
                 Err(GatewaySseLineReadError::Poll) => {
+                    if !reader.is_current() {
+                        return true;
+                    }
                     if !probe_gateway_event_receiver(sender) {
                         return false;
                     }
@@ -1674,8 +1639,12 @@ fn bridge_gateway_event_stream(
                 Err(GatewaySseLineReadError::Invalid) => {
                     return probe_gateway_event_receiver(sender);
                 }
+                Err(GatewaySseLineReadError::Stale) => return true,
             }
         };
+        if !reader.is_current() {
+            return true;
+        }
         if count == 0 {
             break;
         }
@@ -1689,13 +1658,20 @@ fn bridge_gateway_event_stream(
             return probe_gateway_event_receiver(sender);
         };
         if line.starts_with(':') {
+            if !reader.is_current() {
+                return true;
+            }
             if !try_forward_gateway_event(sender, gateway_heartbeat()) {
                 return false;
             }
             continue;
         }
         if line.is_empty() {
-            if let (Some(id), Some(event), Some(data)) = (id.take(), event.take(), data.take()) {
+            let completed = (id.take(), event.take(), data.take());
+            if let (Some(id), Some(event), Some(data)) = completed {
+                if !reader.is_current() {
+                    return true;
+                }
                 if !try_forward_gateway_event(
                     sender,
                     ControlUpdateEvent {
@@ -1727,98 +1703,78 @@ fn bridge_gateway_event_stream(
             _ => {}
         }
     }
-    probe_gateway_event_receiver(sender)
+    if reader.is_current() {
+        probe_gateway_event_receiver(sender)
+    } else {
+        true
+    }
+}
+
+struct GatewayEventStreamReader {
+    reader: BufReader<reqwest::blocking::Response>,
+    route: GatewayRoute,
+    _active_route: ActiveGatewayRoute,
+}
+
+impl GatewayEventStreamReader {
+    fn is_current(&self) -> bool {
+        self.route.is_active()
+    }
+
+    fn read_line(&mut self, output: &mut Vec<u8>) -> Result<usize, GatewaySseLineReadError> {
+        if !self.is_current() {
+            return Err(GatewaySseLineReadError::Stale);
+        }
+        let result = read_bounded_gateway_sse_line(&mut self.reader, output);
+        if !self.is_current() {
+            return Err(GatewaySseLineReadError::Stale);
+        }
+        result
+    }
 }
 
 fn open_gateway_event_stream(
     route: &GatewayRoute,
     read_poll: Duration,
     last_event_id: Option<&str>,
-) -> Result<BufReader<TcpStream>, ()> {
-    const MAX_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+) -> Result<GatewayEventStreamReader, ()> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(read_poll)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| ())?;
     let active_route = route.active().ok_or(())?;
-    let mut stream = TcpStream::connect_timeout(&active_route.address(), Duration::from_secs(3))
-        .map_err(|_| ())?;
-    stream
-        .set_read_timeout(Some(read_poll))
-        .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(3))))
-        .map_err(|_| ())?;
-    let replay_header = last_event_id
-        .filter(|value| is_safe_sse_token(value))
-        .map_or_else(String::new, |value| format!("last-event-id: {value}\r\n"));
-    stream
-        .write_all(
-            format!(
-                "GET /api/v1/events HTTP/1.0\r\nhost: {}\r\naccept: text/event-stream\r\n{replay_header}{GATEWAY_CAPABILITY_HEADER}: ",
-                active_route.address()
-            )
-            .as_bytes(),
-        )
-        .and_then(|()| stream.write_all(active_route.capability().as_bytes()))
-        .and_then(|()| stream.write_all(b"\r\nconnection: close\r\n\r\n"))
-        .map_err(|_| ())?;
-    drop(active_route);
-
-    let mut reader = BufReader::new(stream);
-    let mut header_bytes = 0_usize;
-    let mut content_type_valid = false;
-    let mut transfer_encoding_present = false;
-    for index in 0..128 {
-        let mut line = Vec::new();
-        let count = read_bounded_gateway_sse_line(&mut reader, &mut line).map_err(|_| ())?;
-        if count == 0 {
-            return Err(());
-        }
-        header_bytes = header_bytes.checked_add(count).ok_or(())?;
-        if header_bytes > MAX_RESPONSE_HEADER_BYTES {
-            return Err(());
-        }
-        trim_http_line(&mut line);
-        if index == 0 {
-            if line != b"HTTP/1.1 200 OK" && line != b"HTTP/1.0 200 OK" {
-                return Err(());
-            }
-            continue;
-        }
-        if line.is_empty() {
-            return (content_type_valid && !transfer_encoding_present)
-                .then_some(reader)
-                .ok_or(());
-        }
-        let Some(separator) = line.iter().position(|byte| *byte == b':') else {
-            return Err(());
-        };
-        let name = &line[..separator];
-        let value = line[separator + 1..]
-            .iter()
-            .copied()
-            .skip_while(|byte| byte.is_ascii_whitespace())
-            .collect::<Vec<_>>();
-        if name.eq_ignore_ascii_case(b"content-type") {
-            content_type_valid = value
-                .split(|byte| *byte == b';')
-                .next()
-                .is_some_and(|media_type| media_type.eq_ignore_ascii_case(b"text/event-stream"));
-        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-            transfer_encoding_present = true;
-        }
+    let mut request = client
+        .get(format!("http://{}/api/v1/events", active_route.address()))
+        .header("accept", "text/event-stream")
+        .header(GATEWAY_CAPABILITY_HEADER, active_route.capability());
+    if let Some(last_event_id) = last_event_id.filter(|value| is_safe_sse_token(value)) {
+        request = request.header("last-event-id", last_event_id);
     }
-    Err(())
-}
-
-fn trim_http_line(line: &mut Vec<u8>) {
-    if line.last() == Some(&b'\n') {
-        line.pop();
+    let response = request.send().map_err(|_| ())?;
+    let content_type_valid = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    if response.status() != reqwest::StatusCode::OK || !content_type_valid || !route.is_active() {
+        return Err(());
     }
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
+    Ok(GatewayEventStreamReader {
+        reader: BufReader::new(response),
+        route: route.clone(),
+        _active_route: active_route,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewaySseLineReadError {
     Poll,
     Invalid,
+    Stale,
 }
 
 fn read_bounded_gateway_sse_line(
@@ -1828,10 +1784,7 @@ fn read_bounded_gateway_sse_line(
     const MAX_GATEWAY_SSE_LINE_BYTES: usize = 64 * 1024;
     loop {
         let available = reader.fill_buf().map_err(|error| {
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ) {
+            if gateway_io_is_timeout(&error) {
                 GatewaySseLineReadError::Poll
             } else {
                 GatewaySseLineReadError::Invalid
@@ -2149,7 +2102,6 @@ fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
         Some("--serve") => serve(),
-        Some("--serve-web-once") => serve_web_once(),
         None | Some("--check-config") | Some("--check-instance") => {
             match load_agent_config_after_migration() {
                 Ok(config) => {
@@ -2188,81 +2140,6 @@ fn main() -> ExitCode {
             ExitCode::from(EX_USAGE)
         }
     }
-}
-
-fn serve_web_once() -> ExitCode {
-    let config = match load_agent_config_after_migration() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(EX_CONFIG);
-        }
-    };
-    if let Err(error) = ensure_runtime_directories(&config.paths) {
-        eprintln!("{}", error.code());
-        return ExitCode::from(EX_CONFIG);
-    }
-    let web_config = ManagementWebConfig {
-        enabled: config.management_web_enabled,
-        gateway: SocketAddr::from(([127, 0, 0, 1], 1)),
-        bind: config
-            .management_lan
-            .as_ref()
-            .map_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]), |lan| lan.bind),
-        port: config.management_lan.as_ref().map_or(7080, |lan| lan.port),
-        allow_lan: config.management_lan.is_some(),
-        tls: config
-            .management_lan
-            .as_ref()
-            .map(|lan| ManagementTlsConfig {
-                certificate_path: lan.certificate_path.clone(),
-                private_key_path: lan.private_key_path.clone(),
-            }),
-        static_web_root: Some(resolve_static_web_root()),
-        gateway_capability: None,
-    };
-    let management_access = match config.management_lan.as_ref() {
-        Some(lan) => match ManagementAccessController::new(lan.access.clone()) {
-            Ok(access) => Some(Arc::new(access)),
-            Err(_) => {
-                eprintln!("MANAGEMENT_LAN_AUTH_CONFIGURATION_INVALID");
-                return ExitCode::from(EX_CONFIG);
-            }
-        },
-        None => None,
-    };
-    let updates = match AgentUpdateService::new(config.paths.root_dir()) {
-        Ok(updates) => Arc::new(updates),
-        Err(error) => {
-            eprintln!("{}", error.code());
-            return ExitCode::from(EX_CONFIG);
-        }
-    };
-    if let Err(error) = updates.recover() {
-        eprintln!("{}", error.code());
-        return ExitCode::from(EX_CONFIG);
-    }
-    let listener = match ManagementWebListener::bind_with_api_handler_and_gateway_session(
-        &web_config,
-        Arc::new(AgentManagementWebApi {
-            updates,
-            access: management_access,
-        }),
-        GatewaySessionHandle::new(),
-    ) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("{}", error.code());
-            return ExitCode::from(EX_CONFIG);
-        }
-    };
-    listener.serve_once().map_or_else(
-        |error| {
-            eprintln!("{}", error.code());
-            ExitCode::from(EX_CONFIG)
-        },
-        |_| ExitCode::SUCCESS,
-    )
 }
 
 fn install_shutdown_signal_handler(controller: Arc<AgentController>) -> Result<(), ControlError> {
@@ -2392,28 +2269,27 @@ fn bundled_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, AgentController, AgentManagementWebApi, AgentSecretStore, AgentUpdateService,
-        ControlHandler, GatewayLogHealthUpdate, InternalComponent, LogLevel,
-        ManagementWebApiHandler, ManagementWebRequest, SecretKind, apply_aprs_environment,
-        apply_physical_qualification_environment, compiled_component_identity,
-        legacy_state_candidates, load_agent_config_after_migration_with,
+        AgentConfig, AgentController, AgentRuntimeProfile, AgentSecretStore, AgentUpdateService,
+        ControlHandler, GatewayLogHealthUpdate, GatewaySessionHandle, InternalComponent, LogLevel,
+        ManagementWebConfig, ManagementWebError, ManagementWebService, SecretKind,
+        agent_web_router, apply_aprs_environment, apply_physical_qualification_environment,
+        bridge_gateway_event_stream, compiled_component_identity, gateway_json_projection,
+        legacy_state_candidates, load_agent_config_after_migration_with, management_web_profile,
         push_legacy_source_candidate, resolve_gateway_maintenance_program, verified_gateway_route,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
-        ControlCommand, GatewayControlStatus, ManagementWebControlStatus, ManagementWebService,
-        SupervisorWorker, active_gateway_event_bridge_count, bridge_gateway_event_stream,
-        bridge_gateway_events_with_read_poll, gateway_heartbeat, gateway_json_projection,
+        ControlCommand, GatewayControlStatus, ManagementWebControlStatus, SupervisorWorker,
+        active_gateway_event_bridge_count, bridge_gateway_events_with_read_poll, gateway_heartbeat,
         read_bounded_gateway_sse_line, shutdown_agent_runtime, try_forward_gateway_event,
     };
-    #[cfg(not(target_os = "windows"))]
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-    use cmclient_agent_core::{AprsConfig, RuntimePaths};
-    #[cfg(not(target_os = "windows"))]
-    use cmclient_agent_core::{
-        CallMeshConfig,
-        access::{LanAccessConfig, ManagementAccessController},
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
     };
+    #[cfg(not(target_os = "windows"))]
+    use cmclient_agent_core::CallMeshConfig;
+    use cmclient_agent_core::{AprsConfig, RuntimePaths};
     #[cfg(not(target_os = "windows"))]
     use cmclient_control_api::UpdateControlStatus;
     use cmclient_control_api::{
@@ -2423,6 +2299,8 @@ mod tests {
     use cmclient_legacy_migration::{
         GatewayMaintenanceReport, GatewayMaintenanceRunner, MigrationError,
     };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
 
     #[cfg(not(target_os = "windows"))]
     use cmclient_supervisor::{BackoffPolicy, GatewayCommand, GatewaySupervisor};
@@ -2432,7 +2310,6 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::{
         collections::BTreeMap,
-        io::Cursor,
         path::Path,
         sync::Arc,
         thread,
@@ -2440,8 +2317,8 @@ mod tests {
     };
     #[cfg(not(target_os = "windows"))]
     use std::{
-        io::{Read, Write},
-        net::{SocketAddr, TcpListener, TcpStream},
+        io::{Cursor, Read, Write},
+        net::{TcpListener, TcpStream},
         path::PathBuf,
         sync::{
             Mutex,
@@ -2485,6 +2362,38 @@ mod tests {
         ) -> Result<GatewayMaintenanceReport, MigrationError> {
             panic!("a configuration-only migration must not start database maintenance")
         }
+    }
+
+    #[test]
+    fn management_web_profile_mapping_keeps_docker_fail_closed() {
+        let mut native_service = ManagementWebService::start(
+            &ManagementWebConfig {
+                port: 0,
+                profile: management_web_profile(AgentRuntimeProfile::Native),
+                ..ManagementWebConfig::default()
+            },
+            axum::Router::new(),
+            None,
+            GatewaySessionHandle::new(),
+        )
+        .expect("native loopback management must not require LAN credentials");
+        native_service
+            .stop()
+            .expect("native management service should stop");
+
+        let config = ManagementWebConfig {
+            profile: management_web_profile(AgentRuntimeProfile::Docker),
+            ..ManagementWebConfig::default()
+        };
+        assert!(matches!(
+            ManagementWebService::start(
+                &config,
+                axum::Router::new(),
+                None,
+                GatewaySessionHandle::new(),
+            ),
+            Err(ManagementWebError::InvalidConfiguration)
+        ));
     }
 
     #[test]
@@ -2533,6 +2442,7 @@ mod tests {
         .expect("startup migration should finish before config parsing");
 
         assert!(!config.management_web_enabled);
+        assert_eq!(config.runtime_profile, AgentRuntimeProfile::Native);
         assert_eq!(
             std::fs::read(paths.config_file()).expect("canonical config should activate"),
             source_config
@@ -2676,6 +2586,7 @@ mod tests {
                 log_dir: log_dir.to_path_buf(),
             },
             config_file: data_dir.join("config").join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
             meshtastic: None,
@@ -2831,6 +2742,7 @@ mod tests {
                 log_dir: root.join("logs"),
             },
             config_file: root.join("config").join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
             meshtastic: None,
@@ -2987,6 +2899,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("node"),
                 gateway_entry.to_string_lossy().into_owned(),
@@ -3254,6 +3167,7 @@ mod tests {
                 log_dir: directory.join("logs"),
             },
             config_file: directory.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
             meshtastic: None,
@@ -3285,38 +3199,130 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 
-    #[test]
-    fn management_web_never_exposes_the_local_control_protocol() {
+    #[tokio::test]
+    async fn management_web_never_exposes_the_local_control_protocol() {
         let directory = std::env::temp_dir().join(format!(
             "cmclient-agent-no-network-control-{}",
             std::process::id(),
         ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let api = AgentManagementWebApi {
-            updates: Arc::new(
-                AgentUpdateService::new(&directory).expect("update service should initialize"),
-            ),
-            access: None,
-        };
-        let request = ManagementWebRequest {
-            method: String::from("GET"),
-            path: String::from("/api/v1/control/status"),
-            headers: BTreeMap::new(),
-            body: Vec::new(),
-            remote_addr: "127.0.0.1:48100"
-                .parse()
-                .expect("fixture address should parse"),
-        };
-        let mut response = Cursor::new(Vec::new());
+        let router = agent_web_router(Arc::new(
+            AgentUpdateService::new(&directory).expect("update service should initialize"),
+        ));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/control/status")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
 
-        assert!(
-            api.handle(&mut response, &request)
-                .expect("request should be handled")
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("response body should read");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response)
+                .expect("response should be JSON"),
+            serde_json::json!({"code": "CONTROL_ROUTE_NOT_FOUND"}),
         );
-        let response = String::from_utf8(response.into_inner()).expect("response should be UTF-8");
-        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(response.contains("CONTROL_ROUTE_NOT_FOUND"));
+        let login = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(
+            login.status(),
+            StatusCode::NOT_FOUND,
+            "login authority belongs only to agent-core middleware",
+        );
+
+        std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn management_update_routes_are_axum_json_and_sse() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-axum-updates-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let router = agent_web_router(Arc::new(
+            AgentUpdateService::new(&directory).expect("update service should initialize"),
+        ));
+
+        let status = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/updates")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = to_bytes(status.into_body(), 4_096)
+            .await
+            .expect("status body should read");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("status should be JSON"),
+            serde_json::json!({"schemaVersion": 1, "job": null}),
+        );
+
+        let events = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/updates/events")
+                    .header("last-event-id", "gateway-999")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(events.status(), StatusCode::OK);
+        assert_eq!(
+            events
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream"),
+        );
+        let mut body = events.into_body();
+        let first_event = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut encoded = Vec::new();
+            loop {
+                let frame = body
+                    .frame()
+                    .await
+                    .expect("SSE stream should yield an initial snapshot")
+                    .expect("SSE frame should encode");
+                if let Ok(data) = frame.into_data() {
+                    encoded.extend_from_slice(&data);
+                    if encoded.windows(2).any(|window| window == b"\n\n") {
+                        return encoded;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("initial SSE snapshot should not block");
+        let first_event =
+            String::from_utf8(first_event).expect("initial SSE snapshot should be UTF-8");
+        assert!(first_event.contains("id: update-"));
+        assert!(first_event.contains("event: update.status_changed"));
+        assert!(!first_event.contains("gateway-999"));
+        drop(body);
 
         std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
@@ -3343,6 +3349,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -3407,6 +3414,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -3455,34 +3463,6 @@ mod tests {
     }
 
     #[cfg(not(target_os = "windows"))]
-    struct DisableManagementWebRoute {
-        controller: Arc<AgentController>,
-        completed: mpsc::SyncSender<()>,
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    impl ManagementWebApiHandler for DisableManagementWebRoute {
-        fn handle(
-            &self,
-            client: &mut dyn super::ManagementWebStream,
-            _request: &ManagementWebRequest,
-        ) -> Result<bool, super::ManagementWebError> {
-            self.controller
-                .disable_management_web()
-                .map_err(|_| super::ManagementWebError::Io)?;
-            self.completed
-                .send(())
-                .map_err(|_| super::ManagementWebError::Io)?;
-            client
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                )
-                .map_err(|_| super::ManagementWebError::Io)?;
-            Ok(true)
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn reports_running_only_after_gateway_health_succeeds() {
         let gateway = TcpListener::bind("127.0.0.1:0").expect("gateway should bind");
@@ -3507,6 +3487,7 @@ mod tests {
                 log_dir: PathBuf::from("/tmp/cmclient-agent-health/logs"),
             },
             config_file: PathBuf::from("/tmp/cmclient-agent-health/agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -3563,6 +3544,7 @@ mod tests {
                 log_dir: PathBuf::from("/tmp/cmclient-agent-supervisor/logs"),
             },
             config_file: PathBuf::from("/tmp/cmclient-agent-supervisor/agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -3625,6 +3607,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -3690,6 +3673,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -3764,6 +3748,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -3842,6 +3827,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
             meshtastic: None,
@@ -3901,6 +3887,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -3982,80 +3969,6 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn management_web_can_disable_itself_without_a_worker_join_deadlock() {
-        let data_dir =
-            std::env::temp_dir().join(format!("cmclient-agent-web-disable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&data_dir);
-        std::fs::create_dir_all(&data_dir).expect("test directory should exist");
-        let config = AgentConfig {
-            paths: RuntimePaths {
-                data_dir: data_dir.clone(),
-                config_dir: data_dir.clone(),
-                cache_dir: data_dir.join("cache"),
-                log_dir: data_dir.join("logs"),
-            },
-            config_file: data_dir.join("agent.toml"),
-            gateway_command: None,
-            callmesh: None,
-            meshtastic: None,
-            aprs: None,
-            proxy: None,
-            management_web_enabled: false,
-            management_lan: None,
-        };
-        let controller =
-            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
-        let (completed_sender, completed_receiver) = mpsc::sync_channel(1);
-        let service = ManagementWebService::start_with_api_handler(
-            &cmclient_agent_core::web::ManagementWebConfig {
-                port: 0,
-                static_web_root: None,
-                ..Default::default()
-            },
-            Arc::new(DisableManagementWebRoute {
-                controller: Arc::clone(&controller),
-                completed: completed_sender,
-            }),
-        )
-        .expect("management service should start");
-        let address = service.local_addr();
-        *controller
-            .management_web
-            .lock()
-            .expect("management service should lock") = Some(service);
-
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        client
-            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
-            .expect("request should write");
-        completed_receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("disable handler should return");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while !controller
-            .reap_management_web_shutdown()
-            .expect("shutdown should reap")
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "management shutdown did not drain its request worker"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            controller
-                .management_web
-                .lock()
-                .expect("management service should lock")
-                .is_none()
-        );
-
-        drop(client);
-        std::fs::remove_dir_all(data_dir).expect("test directory should remove");
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
     fn status_tick_preserves_the_precise_supervisor_error_code() {
         let data_dir = std::env::temp_dir().join(format!(
             "cmclient-agent-supervisor-error-{}",
@@ -4072,6 +3985,7 @@ mod tests {
                 log_dir: data_dir.join("logs"),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![missing_program.to_string_lossy().into_owned()]),
             callmesh: None,
             meshtastic: None,
@@ -4138,6 +4052,7 @@ mod tests {
                 log_dir: log_dir.clone(),
             },
             config_file: data_dir.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
@@ -4233,124 +4148,234 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
-    fn lan_api_requires_a_session_and_csrf_before_gateway_proxying() {
-        let data_dir =
-            std::env::temp_dir().join(format!("cmclient-agent-access-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&data_dir);
-        let salt = SaltString::encode_b64(b"cmclient-agent-access-test")
-            .expect("fixture salt should encode");
-        let password_hash = Argon2::default()
-            .hash_password(b"password", &salt)
-            .expect("fixture password should hash")
-            .to_string();
-        let access = Arc::new(
-            ManagementAccessController::new(LanAccessConfig {
-                password_hash,
-                allowed_origins: std::collections::BTreeSet::from([String::from(
-                    "https://cmclient.example",
-                )]),
-                session_ttl_seconds: 60,
-                audit_capacity: 32,
-            })
-            .expect("access configuration should load"),
-        );
-        let api = Arc::new(AgentManagementWebApi {
-            updates: Arc::new(
-                AgentUpdateService::new(&data_dir).expect("update service should initialize"),
-            ),
-            access: Some(access),
+    fn gateway_projection_rejects_a_body_completed_after_route_rotation() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Gateway fixture should bind");
+        let address = listener.local_addr().expect("fixture address should load");
+        let (partial_body_sent, partial_body_observed) = std::sync::mpsc::sync_channel(1);
+        let (finish_body, finish_body_requested) = std::sync::mpsc::sync_channel(1);
+        let fixture = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("projection request should connect");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2_048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).expect("request should read");
+                assert!(count > 0, "projection request ended before headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8(request)
+                .expect("request should be UTF-8")
+                .to_ascii_lowercase();
+            assert!(request.contains(&format!(
+                "{}: {}\r\n",
+                super::GATEWAY_CAPABILITY_HEADER,
+                "e".repeat(64)
+            )));
+
+            let body = br#"{"generation":"old"}"#;
+            let midpoint = body.len() / 2;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len(),
+            )
+            .and_then(|()| stream.write_all(&body[..midpoint]))
+            .and_then(|()| stream.flush())
+            .expect("partial projection should write");
+            partial_body_sent
+                .send(())
+                .expect("partial body marker should send");
+            finish_body_requested
+                .recv_timeout(Duration::from_secs(2))
+                .expect("rotation should release the fixture body");
+            let _ = stream.write_all(&body[midpoint..]);
+            let _ = stream.flush();
         });
-        let remote_addr: SocketAddr = "192.168.1.20:54000"
-            .parse()
-            .expect("fixture address should parse");
 
-        let control_blocked = invoke_management_api(
-            Arc::clone(&api),
-            ManagementWebRequest {
-                method: String::from("GET"),
-                path: String::from("/api/v1/control/status"),
-                headers: BTreeMap::new(),
-                body: Vec::new(),
-                remote_addr,
-            },
-        );
-        assert!(control_blocked.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(control_blocked.contains("CONTROL_ROUTE_NOT_FOUND"));
+        let route = cmclient_agent_core::web::GatewayRoute::new(address, "e".repeat(64))
+            .expect("Gateway route should be valid");
+        let session = GatewaySessionHandle::with_route(route.clone());
+        let projection_route = route.clone();
+        let projection = thread::spawn(move || {
+            gateway_json_projection(
+                &projection_route,
+                cmclient_control_api::GatewayProjection::Nodes,
+            )
+        });
+        partial_body_observed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("projection should start reading the old body");
 
-        let denied = invoke_management_api(
-            Arc::clone(&api),
-            ManagementWebRequest {
-                method: String::from("GET"),
-                path: String::from("/api/v1/updates"),
-                headers: BTreeMap::new(),
-                body: Vec::new(),
-                remote_addr,
-            },
-        );
-        assert!(denied.starts_with("HTTP/1.1 401 Unauthorized"));
-        assert!(denied.contains("MANAGEMENT_SESSION_INVALID"));
+        let replacement = cmclient_agent_core::web::GatewayRoute::new(address, "f".repeat(64))
+            .expect("replacement route should be valid");
+        let rotation = thread::spawn(move || session.set(replacement));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while route.is_active() {
+            assert!(
+                Instant::now() < deadline,
+                "route rotation did not revoke the in-flight generation"
+            );
+            thread::yield_now();
+        }
+        finish_body
+            .send(())
+            .expect("fixture should finish the old body");
 
-        let login = invoke_management_api(
-            Arc::clone(&api),
-            ManagementWebRequest {
-                method: String::from("POST"),
-                path: String::from("/api/v1/auth/login"),
-                headers: BTreeMap::from([(
-                    String::from("origin"),
-                    String::from("https://cmclient.example"),
-                )]),
-                body: br#"{"password":"password"}"#.to_vec(),
-                remote_addr,
-            },
+        assert_eq!(
+            projection.join().expect("projection worker should join"),
+            Err(cmclient_control_api::ControlError::CommandFailed),
+            "a complete stale projection must fail closed",
         );
-        assert!(login.starts_with("HTTP/1.1 200 OK"));
-        assert!(login.contains("HttpOnly; Secure; SameSite=Strict"));
-        let cookie = login
-            .lines()
-            .find(|line| line.starts_with("set-cookie:"))
-            .and_then(|line| {
-                line.split_once('=')
-                    .map(|(_, value)| value.split(';').next().unwrap_or_default())
-            })
-            .expect("login should issue a session cookie");
+        rotation.join().expect("route rotation should drain");
+        fixture.join().expect("Gateway fixture should join");
+    }
 
-        let allowed = invoke_management_api(
-            Arc::clone(&api),
-            ManagementWebRequest {
-                method: String::from("GET"),
-                path: String::from("/api/v1/updates"),
-                headers: BTreeMap::from([(
-                    String::from("cookie"),
-                    format!("cmclient_session={cookie}"),
-                )]),
-                body: Vec::new(),
-                remote_addr,
-            },
-        );
-        assert!(allowed.starts_with("HTTP/1.1 200 OK"));
-        assert!(allowed.contains(r#"{"schemaVersion":1,"job":null}"#));
+    #[test]
+    fn route_rotation_prevents_old_gateway_events_from_reaching_control() {
+        use std::io::{Read as _, Write as _};
 
-        let csrf_denied = invoke_management_api(
-            api,
-            ManagementWebRequest {
-                method: String::from("POST"),
-                path: String::from("/api/v1/updates"),
-                headers: BTreeMap::from([
-                    (String::from("cookie"), format!("cmclient_session={cookie}")),
-                    (
-                        String::from("origin"),
-                        String::from("https://cmclient.example"),
-                    ),
-                ]),
-                body: Vec::new(),
-                remote_addr,
-            },
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Gateway fixture should bind");
+        let address = listener.local_addr().expect("fixture address should load");
+        let (write_stale_event, stale_event_requested) = std::sync::mpsc::sync_channel(1);
+        let fixture = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("event request should connect");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2_048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).expect("request should read");
+                assert!(count > 0, "event request ended before headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\nconnection: close\r\n\r\n: ready\n\n",
+                )
+                .and_then(|()| stream.flush())
+                .expect("event response should start");
+            stale_event_requested
+                .recv_timeout(Duration::from_secs(2))
+                .expect("rotation should release the stale event");
+            let _ = stream.write_all(
+                b"id: stale-1\nevent: mesh.position\ndata: {\"generation\":\"old\"}\n\n",
+            );
+            let _ = stream.flush();
+        });
+
+        let route = cmclient_agent_core::web::GatewayRoute::new(address, "1".repeat(64))
+            .expect("Gateway route should be valid");
+        let session = GatewaySessionHandle::with_route(route.clone());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(16);
+        let bridge_route = route.clone();
+        let bridge = thread::spawn(move || {
+            let mut last_event_id = None;
+            bridge_gateway_event_stream(
+                &bridge_route,
+                &sender,
+                Duration::from_millis(100),
+                &mut last_event_id,
+            )
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("ready heartbeat should prove the stream is active")
+                .event,
+            "gateway.heartbeat"
         );
-        assert!(csrf_denied.starts_with("HTTP/1.1 403 Forbidden"));
-        assert!(csrf_denied.contains("MANAGEMENT_CSRF_INVALID"));
-        let _ = std::fs::remove_dir_all(data_dir);
+
+        let replacement = cmclient_agent_core::web::GatewayRoute::new(address, "2".repeat(64))
+            .expect("replacement route should be valid");
+        let rotation = thread::spawn(move || session.set(replacement));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while route.is_active() {
+            assert!(
+                Instant::now() < deadline,
+                "route rotation did not revoke the event generation"
+            );
+            thread::yield_now();
+        }
+        write_stale_event
+            .send(())
+            .expect("fixture should attempt the stale event");
+
+        assert!(bridge.join().expect("event bridge should join"));
+        rotation.join().expect("route rotation should drain");
+        fixture.join().expect("Gateway fixture should join");
+        assert!(
+            receiver
+                .try_iter()
+                .all(|event| event.event != "mesh.position"),
+            "an event from the revoked generation reached Control subscribers",
+        );
+    }
+
+    #[test]
+    fn incomplete_gateway_sse_fields_do_not_leak_across_event_boundaries() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Gateway fixture should bind");
+        let address = listener.local_addr().expect("fixture address should load");
+        let fixture = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("event request should connect");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2_048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).expect("request should read");
+                assert!(count > 0, "event request ended before headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nid: incomplete-1\nevent: mesh.position\n\ndata: {\"mustNotForward\":true}\n\n",
+                )
+                .expect("incomplete events should write");
+        });
+
+        let route = cmclient_agent_core::web::GatewayRoute::new(address, "3".repeat(64))
+            .expect("Gateway route should be valid");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut last_event_id = None;
+        assert!(bridge_gateway_event_stream(
+            &route,
+            &sender,
+            Duration::from_millis(100),
+            &mut last_event_id,
+        ));
+
+        fixture.join().expect("Gateway fixture should join");
+        assert_eq!(last_event_id, None);
+        assert!(
+            receiver
+                .try_iter()
+                .all(|event| { event.event != "mesh.position" && event.id != "incomplete-1" }),
+            "fields from two incomplete SSE records were combined into an event",
+        );
+    }
+
+    #[test]
+    fn handwritten_gateway_outbound_http_does_not_return() {
+        let source = include_str!("main.rs");
+        let outbound = source
+            .split_once("fn open_gateway_event_stream(")
+            .and_then(|(_, source)| source.split_once("fn probe_gateway_event_receiver("))
+            .map(|(source, _)| source)
+            .expect("Gateway event client source should be bounded by stable functions");
+        for forbidden in [
+            "TcpStream::",
+            "write_all(",
+            "HTTP/1.",
+            "MAX_RESPONSE_HEADER_BYTES",
+            "trim_http_line(",
+        ] {
+            assert!(
+                !outbound.contains(forbidden),
+                "Gateway outbound HTTP must stay owned by reqwest: {forbidden}",
+            );
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -4562,26 +4587,5 @@ mod tests {
             assert!(Instant::now() < deadline, "{message}");
             thread::sleep(Duration::from_millis(10));
         }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn invoke_management_api(
-        api: Arc<AgentManagementWebApi>,
-        request: ManagementWebRequest,
-    ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let address = listener.local_addr().expect("address should load");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("listener should accept");
-            api.handle(&mut stream, &request)
-                .expect("handler should respond");
-        });
-        let mut client = TcpStream::connect(address).expect("client should connect");
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("response should read");
-        server.join().expect("server should join");
-        response
     }
 }

@@ -10,8 +10,6 @@ services:
     environment:
       CMCLIENT_RUNTIME_PROFILE: docker
       CMCLIENT_PACKAGE_PROFILE: oci
-      CMCLIENT_GATEWAY_HOST: 0.0.0.0
-      CMCLIENT_GATEWAY_PORT: "8081"
       CMCLIENT_RUNTIME_ROOT: /home/cmclient/.cmclient
       CMCLIENT_DB_PATH: /home/cmclient/.cmclient/cmclient.db
       CMCLIENT_BACKUP_DIR: /home/cmclient/.cmclient/backups

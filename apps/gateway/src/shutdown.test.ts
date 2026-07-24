@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { GatewayConfigurationError, parseGatewayListenOptions } from "./app";
+import { GatewayConfigurationError, GatewayRuntime } from "./app";
 import {
   createGatewaySupervisorShutdownInput,
   createShutdownCoordinator,
@@ -207,7 +207,7 @@ describe("Gateway shutdown", () => {
     const result = await lifecycle.start(() => {
       databaseAcquired = true;
       jobsAcquired = true;
-      parseGatewayListenOptions({ CMCLIENT_GATEWAY_HOST: "0.0.0.0" });
+      new GatewayRuntime({ host: "0.0.0.0", port: 0 });
     });
 
     expect(result).toMatchObject({
