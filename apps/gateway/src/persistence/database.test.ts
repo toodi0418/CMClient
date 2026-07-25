@@ -48,7 +48,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT version FROM schema_migrations")
         .all(),
-    ).toHaveLength(18);
+    ).toHaveLength(gatewayMigrations.length);
     for (const [table, primaryKey] of [
       [
         "node_position_state",
@@ -59,8 +59,16 @@ describe("GatewayDatabase", () => {
         ["mesh_network_id", "node_num", "callsign", "mapping_version"],
       ],
       ["aprs_delivery_high_water", ["mesh_network_id", "node_num", "callsign"]],
+      [
+        "aprs_legacy_submission_barriers",
+        ["mesh_network_id", "node_num", "callsign"],
+      ],
+      ["aprs_observed_packets", ["callsign", "destination", "info"]],
+      ["aprs_local_transmissions", ["callsign", "destination", "info"]],
       ["callmesh_sync_state", ["id"]],
       ["callmesh_sync_history", ["mapping_hash"]],
+      ["aprs_igate_state", ["callsign"]],
+      ["aprs_igate_submissions", ["id"]],
     ] as const) {
       expect(
         database.connection
@@ -400,21 +408,32 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 18 });
+    ).toEqual({ version: gatewayMigrations.at(-1)?.version });
     expect(
       database.connection
         .prepare("SELECT * FROM aprs_delivery_high_water")
+        .all(),
+    ).toEqual([]);
+    expect(
+      database.connection
+        .prepare(
+          "SELECT latest_canonical_event_id, submitted_at FROM aprs_legacy_submission_barriers",
+        )
         .get(),
-    ).toMatchObject({
-      mesh_network_id: "fixture-network",
-      node_num: 42,
-      callsign: "N0CALL-7",
+    ).toEqual({
       latest_canonical_event_id: second.id,
-      latest_event_time: "2026-07-18T00:00:00.000Z",
-      latest_sequence_epoch: 0,
-      latest_sequence_number: 11,
-      latest_mapping_version: null,
+      submitted_at: "2026-07-18T00:00:04.000Z",
     });
+    expect(
+      database.connection
+        .prepare(
+          "SELECT id, delivery_status FROM aprs_outbox WHERE status = 'sent' ORDER BY id",
+        )
+        .all(),
+    ).toEqual([
+      { id: "outbox-first", delivery_status: "observation_expired" },
+      { id: "outbox-second", delivery_status: "observation_expired" },
+    ]);
     expect(
       database.connection
         .prepare(
@@ -464,8 +483,8 @@ describe("GatewayDatabase", () => {
     expect(reenqueues).toBe(0);
     expect(
       database.aprsOutbox.deleteSentBefore("2027-01-01T00:00:00.000Z", 10),
-    ).toBe(1);
-    expect(database.aprsOutbox.find("outbox-first")?.status).toBe("sent");
+    ).toBe(2);
+    expect(database.aprsOutbox.find("outbox-first")).toBeUndefined();
     database.positions.deleteHistoryBefore("2027-01-01T00:00:00.000Z", 100);
     expect(
       database.connection
@@ -475,6 +494,42 @@ describe("GatewayDatabase", () => {
     expect(
       database.connection.prepare("PRAGMA foreign_key_check").all(),
     ).toEqual([]);
+    expect(database.integrityCheck()).toBe("ok");
+    database.close();
+  });
+
+  it("migrates destinationless APRS caches as conservative wildcards", () => {
+    const database = new GatewayDatabase(
+      ":memory:",
+      gatewayMigrations.filter((migration) => migration.version <= 18),
+    );
+    database.connection
+      .prepare(
+        "INSERT INTO aprs_observed_packets (callsign, info, first_observed_at, last_observed_at) VALUES ('N0CALL-7', 'same-info', '2026-07-18T00:00:00.000Z', '2026-07-18T00:00:01.000Z')",
+      )
+      .run();
+    database.connection
+      .prepare(
+        "INSERT INTO aprs_local_transmissions (callsign, info, transmitted_at) VALUES ('N0CALL-7', 'same-info', '2026-07-18T00:00:02.000Z')",
+      )
+      .run();
+
+    runMigrations(database.connection, gatewayMigrations);
+
+    expect(
+      database.connection
+        .prepare(
+          "SELECT callsign, destination, info FROM aprs_observed_packets",
+        )
+        .all(),
+    ).toEqual([{ callsign: "N0CALL-7", destination: "", info: "same-info" }]);
+    expect(
+      database.connection
+        .prepare(
+          "SELECT callsign, destination, info FROM aprs_local_transmissions",
+        )
+        .all(),
+    ).toEqual([{ callsign: "N0CALL-7", destination: "", info: "same-info" }]);
     expect(database.integrityCheck()).toBe("ok");
     database.close();
   });
@@ -498,7 +553,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 18 });
+    ).toEqual({ version: gatewayMigrations.at(-1)?.version });
     const firstFingerprint = "a".repeat(64);
     const secondFingerprint = "b".repeat(64);
     const insertState = database.connection.prepare(
@@ -586,7 +641,7 @@ describe("GatewayDatabase", () => {
     database.close();
   });
 
-  it("keeps same-time legacy snapshots fail-closed when mapping cannot be recovered", async () => {
+  it("never sends an older queued snapshot after migrating a newer legacy submission", async () => {
     const database = new GatewayDatabase(
       ":memory:",
       gatewayMigrations.filter((migration) => migration.version <= 11),
@@ -594,7 +649,7 @@ describe("GatewayDatabase", () => {
     const delivered = insertMigrationPosition(
       database,
       "legacy-delivered",
-      1_784_332_800,
+      1_784_332_801,
       10,
       0,
     );
@@ -629,6 +684,11 @@ describe("GatewayDatabase", () => {
       null,
     );
     runMigrations(database.connection, gatewayMigrations);
+    database.connection
+      .prepare(
+        "UPDATE aprs_outbox SET provision_fingerprint = ? WHERE id = 'legacy-pending'",
+      )
+      .run(PROVISION_FINGERPRINT);
     let sends = 0;
 
     await expect(
@@ -650,14 +710,16 @@ describe("GatewayDatabase", () => {
     expect(database.aprsOutbox.deleteSuperseded(10)).toBe(0);
     expect(
       database.connection
+        .prepare("SELECT * FROM aprs_delivery_high_water")
+        .all(),
+    ).toEqual([]);
+    expect(
+      database.connection
         .prepare(
-          "SELECT latest_canonical_event_id, latest_mapping_version FROM aprs_delivery_high_water",
+          "SELECT latest_canonical_event_id FROM aprs_legacy_submission_barriers",
         )
         .get(),
-    ).toEqual({
-      latest_canonical_event_id: delivered.id,
-      latest_mapping_version: null,
-    });
+    ).toEqual({ latest_canonical_event_id: delivered.id });
     expect(
       database.aprsOutbox.deleteSentBefore("2027-01-01T00:00:00.000Z", 10),
     ).toBe(1);
@@ -671,7 +733,7 @@ describe("GatewayDatabase", () => {
       runMigrations(database.connection, [
         ...gatewayMigrations,
         createSqlMigration(
-          19,
+          21,
           "broken",
           "CREATE TABLE migration_rollback_probe (id INTEGER); SELECT * FROM definitely_missing_table;",
         ),
@@ -679,7 +741,7 @@ describe("GatewayDatabase", () => {
     ).toThrow(DatabaseMigrationError);
     expect(
       database.connection
-        .prepare("SELECT version FROM schema_migrations WHERE version = 19")
+        .prepare("SELECT version FROM schema_migrations WHERE version = 21")
         .get(),
     ).toBeUndefined();
     expect(

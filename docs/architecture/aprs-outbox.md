@@ -10,12 +10,18 @@ time, sequence epoch, and sequence number beside that Data. The mapping-scoped
 epoch is frozen when the row is accepted and is never recovered by mutating or
 rereading the shared canonical position event.
 
-The worker atomically claims due queued or failed entries, transmits each
-single APRS Data line through an APRS-IS TCP connection, and records either a
-sent timestamp or the stable `APRS_TX_FAILED` error with exponential backoff.
+The worker atomically claims due queued or failed entries and transmits each
+single APRS Data line through an APRS-IS TCP connection. A completed socket
+write records transport `status = sent` and delivery
+`delivery_status = submitted`; it does not prove APRS-IS observation. A failed
+write records the stable `APRS_TX_FAILED` error with exponential backoff.
+Every stored and transmitted Data line is limited to 510 UTF-8 bytes so its
+required CRLF remains inside APRS-IS's inclusive 512-byte line limit. Rows from
+an older database that exceed that limit are discarded before transport.
 Immediately before transport I/O it compares the row's durable snapshot with
-the remote APRS high-water, the delivery watermark, and active snapshots for
-the same Mesh network, node, and callsign. A provably older row is deleted
+the remote APRS high-water, the observer-confirmed delivery watermark, the
+permanent legacy-submission order barrier, and active snapshots for the same
+Mesh network, node, and callsign. A provably older row is deleted
 without being reported as sent. An exact remote marker remains eligible for
 byte-identical multi-iGate delivery. Equal-time rows without comparable
 mapping-scoped sequence evidence receive `APRS_ORDER_UNPROVEN` and remain
@@ -23,6 +29,11 @@ fail-closed.
 An entry left in `sending` by an interrupted process is returned to `failed`
 on the next worker flush with `APRS_TX_INTERRUPTED`, then retried. This makes
 crash recovery explicit without treating a local write as a confirmed upload.
+The runtime also supplies a per-entry observer-readiness gate to the worker and
+the concrete TCP writer. If the verified RX session terminates during a claimed
+batch, the writer performs no later Data write and the worker releases every
+unwritten claim back to `queued` without incrementing attempts. A fenced write
+does not tear down a still-valid provision-scoped TX session.
 
 Enqueue and local position-state advancement share one SQLite transaction. A
 strictly newer event removes older queued or failed rows for its identity, so
@@ -38,15 +49,37 @@ when trusted event time, exact identity, or a non-null equal mapping version
 proves they were superseded. Missing legacy mapping versions are never treated
 as comparable merely because both database values are `NULL`.
 
-Marking an entry sent also advances `aprs_delivery_high_water` in the same
-SQLite transaction. This bounded record is keyed by Mesh network, node, and
-callsign and compares trusted event time before mapping-scoped sequence
-epoch/number. Sent outbox rows may be deleted after the configured 90-day
-default only when that
-watermark proves the exact event or an ordered successor was delivered. The
-proof survives outbox retention and blocks re-enqueue after a mapping-version
-rotation. Active entries are never age-retention candidates; only queued or
-failed entries with durable supersession proof are removed.
+The receive-only monitor confirms a submitted entry only when source callsign,
+destination, and information are byte-identical, the submission belongs to the
+current provision fingerprint, the observation is inside its submission
+window, and exactly one pending row matches. Ambiguity confirms nothing.
+Exact observer evidence is durable, so connect/restart reconciliation can
+complete a confirmation missed after persistence. If exact evidence arrives
+after the local write begins but before its socket callback completes,
+`markSubmitted` reconciles it in the same transaction; this is allowed only
+when exactly one active row matches, so an ambiguous payload confirms nothing.
+Destinationless cache rows
+upgraded from older schemas act only as conservative duplicate-suppression
+wildcards and can never confirm delivery. Confirmation and advancement of
+`aprs_delivery_high_water` share one SQLite transaction. This bounded record is
+keyed by Mesh network, node, and callsign and compares trusted event time before
+mapping-scoped sequence epoch/number. It is never advanced by socket success.
+An unobserved submission becomes `observation_expired` after three hours and
+does not gain a delivery watermark or automatic duplicate-producing retry.
+
+Observer-confirmed outbox rows may be deleted after the configured 90-day
+default only when their watermark proves that exact event or an ordered
+successor. The proof survives outbox retention and blocks re-enqueue after a
+mapping-version rotation. Observation-expired rows are terminal retention
+candidates but are not delivery proof. Active entries are never age-retention
+candidates; only queued or failed entries with durable supersession proof are
+removed.
+
+Migration preserves each legacy socket-success watermark separately in
+`aprs_legacy_submission_barriers`. It is permanent ordering evidence, not
+delivery evidence: enqueue, position admission, maintenance, and the final
+pre-send transaction all fail closed against it, while it never advances
+`aprs_delivery_high_water` or labels a packet observer-confirmed.
 
 The client keeps one provision-scoped persistent TX connection. It writes one
 CRLF-terminated canonical iGate login, waits for the exact matching verified

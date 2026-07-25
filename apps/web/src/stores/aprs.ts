@@ -1,9 +1,16 @@
 import { GatewayApiClient, isGatewayApiError } from "@cmclient/api-client";
-import type { AprsOutboxEntry, AprsRuntimeStatus } from "@cmclient/contracts";
+import type {
+  AprsIgateSubmission,
+  AprsOutboxEntry,
+  AprsRuntimeStatus,
+} from "@cmclient/contracts";
 import { defineStore } from "pinia";
 
 export interface AprsClient {
-  aprs: Pick<GatewayApiClient["aprs"], "outbox" | "status">;
+  aprs: Pick<
+    GatewayApiClient["aprs"],
+    "outbox" | "stationSubmissions" | "status"
+  >;
 }
 
 export function createAprsStore(client: AprsClient = new GatewayApiClient()) {
@@ -12,8 +19,10 @@ export function createAprsStore(client: AprsClient = new GatewayApiClient()) {
       loading: false,
       runtimeErrorCode: undefined as string | undefined,
       outboxErrorCode: undefined as string | undefined,
+      stationErrorCode: undefined as string | undefined,
       status: undefined as AprsRuntimeStatus | undefined,
       entries: [] as AprsOutboxEntry[],
+      stationSubmissions: [] as AprsIgateSubmission[],
     }),
     actions: {
       async refresh() {
@@ -22,9 +31,10 @@ export function createAprsStore(client: AprsClient = new GatewayApiClient()) {
         }
         this.loading = true;
         try {
-          const [runtime, outbox] = await Promise.allSettled([
+          const [runtime, outbox, station] = await Promise.allSettled([
             client.aprs.status(),
             client.aprs.outbox(),
+            client.aprs.stationSubmissions(),
           ]);
           if (runtime.status === "fulfilled") {
             this.status = runtime.value;
@@ -37,6 +47,12 @@ export function createAprsStore(client: AprsClient = new GatewayApiClient()) {
             this.outboxErrorCode = undefined;
           } else {
             this.outboxErrorCode = stableClientError(outbox.reason);
+          }
+          if (station.status === "fulfilled") {
+            this.stationSubmissions = station.value.items;
+            this.stationErrorCode = undefined;
+          } else {
+            this.stationErrorCode = stableClientError(station.reason);
           }
         } finally {
           this.loading = false;

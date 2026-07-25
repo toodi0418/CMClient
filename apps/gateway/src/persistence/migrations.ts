@@ -35,6 +35,8 @@ const EXPECTED_SHA256 = [
   "fce433ea3bd2fe3dca5118e41db6940340c3c80d9eba7769cfb794946b81e018",
   "b3a2bbd54b00d92b12d3ee1152176748e64d642f291758eaf70b7a48d62e36e2",
   "3195acde77470f80ce1d6cf6764676863733c6d6fdef8fac9e46654fe8b779b6",
+  "a0e68a9f124b7aa1ea84e00486574dcc445c5d09ac8e922d55d6df4d85424475",
+  "b5da29496eafe700ec3b42c8ecdeaebd9b72fb58afaf8d5a0138f56d6f9255e1",
 ] as const;
 
 function migration(
@@ -181,6 +183,38 @@ export const gatewayMigrations: readonly SqlMigration[] = Object.freeze([
     "CREATE INDEX aprs_observed_packets_retention_index ON aprs_observed_packets (last_observed_at ASC)",
     "CREATE TABLE aprs_local_transmissions (callsign TEXT NOT NULL, info TEXT NOT NULL, transmitted_at TEXT NOT NULL, PRIMARY KEY (callsign, info))",
     "CREATE INDEX aprs_local_transmissions_retention_index ON aprs_local_transmissions (transmitted_at ASC)",
+  ]),
+  migration(19, "aprs_observer_confirmed_delivery", [
+    "ALTER TABLE aprs_outbox ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'queued' CHECK (delivery_status IN ('queued', 'sending', 'failed', 'submitted', 'observer_confirmed', 'observation_expired'))",
+    "ALTER TABLE aprs_outbox ADD COLUMN submitted_at TEXT",
+    "ALTER TABLE aprs_outbox ADD COLUMN observer_confirmed_at TEXT",
+    "ALTER TABLE aprs_outbox ADD COLUMN observation_expires_at TEXT",
+    "DROP INDEX aprs_observed_packets_retention_index",
+    "ALTER TABLE aprs_observed_packets RENAME TO aprs_observed_packets_legacy",
+    "CREATE TABLE aprs_observed_packets (callsign TEXT NOT NULL, destination TEXT NOT NULL, info TEXT NOT NULL, first_observed_at TEXT NOT NULL, last_observed_at TEXT NOT NULL, PRIMARY KEY (callsign, destination, info))",
+    "INSERT INTO aprs_observed_packets (callsign, destination, info, first_observed_at, last_observed_at) SELECT callsign, '', info, first_observed_at, last_observed_at FROM aprs_observed_packets_legacy",
+    "DROP TABLE aprs_observed_packets_legacy",
+    "CREATE INDEX aprs_observed_packets_retention_index ON aprs_observed_packets (last_observed_at ASC)",
+    "DROP INDEX aprs_local_transmissions_retention_index",
+    "ALTER TABLE aprs_local_transmissions RENAME TO aprs_local_transmissions_legacy",
+    "CREATE TABLE aprs_local_transmissions (callsign TEXT NOT NULL, destination TEXT NOT NULL, info TEXT NOT NULL, transmitted_at TEXT NOT NULL, PRIMARY KEY (callsign, destination, info))",
+    "INSERT INTO aprs_local_transmissions (callsign, destination, info, transmitted_at) SELECT callsign, '', info, transmitted_at FROM aprs_local_transmissions_legacy",
+    "DROP TABLE aprs_local_transmissions_legacy",
+    "CREATE INDEX aprs_local_transmissions_retention_index ON aprs_local_transmissions (transmitted_at ASC)",
+    "UPDATE aprs_outbox SET delivery_status = CASE WHEN status = 'queued' THEN 'queued' WHEN status = 'sending' THEN 'sending' WHEN status = 'failed' THEN 'failed' ELSE 'observation_expired' END, submitted_at = CASE WHEN status = 'sent' THEN sent_at ELSE NULL END, observer_confirmed_at = NULL, observation_expires_at = CASE WHEN status = 'sent' THEN strftime('%Y-%m-%dT%H:%M:%fZ', sent_at, '+3 hours') ELSE NULL END",
+    "CREATE TABLE aprs_legacy_submission_barriers (mesh_network_id TEXT NOT NULL, node_num INTEGER NOT NULL CHECK (node_num >= 0 AND node_num <= 4294967295), callsign TEXT NOT NULL, latest_canonical_event_id TEXT NOT NULL REFERENCES position_events(id), latest_event_time TEXT NOT NULL, latest_sequence_epoch INTEGER CHECK (latest_sequence_epoch IS NULL OR latest_sequence_epoch >= 0), latest_sequence_number INTEGER CHECK (latest_sequence_number IS NULL OR (latest_sequence_number >= 0 AND latest_sequence_number <= 4294967295)), latest_mapping_version TEXT, submitted_at TEXT NOT NULL, PRIMARY KEY (mesh_network_id, node_num, callsign))",
+    "INSERT INTO aprs_legacy_submission_barriers (mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_event_time, latest_sequence_epoch, latest_sequence_number, latest_mapping_version, submitted_at) SELECT mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_event_time, latest_sequence_epoch, latest_sequence_number, latest_mapping_version, delivered_at FROM aprs_delivery_high_water",
+    "CREATE INDEX aprs_legacy_submission_barriers_latest_event_id_index ON aprs_legacy_submission_barriers (latest_canonical_event_id)",
+    "DELETE FROM aprs_delivery_high_water",
+    "CREATE INDEX aprs_outbox_observation_expiry_index ON aprs_outbox (observation_expires_at ASC, id ASC) WHERE delivery_status = 'submitted'",
+  ]),
+  migration(20, "aprs_igate_family_state", [
+    "CREATE TABLE aprs_igate_state (callsign TEXT PRIMARY KEY, provision_fingerprint TEXT NOT NULL CHECK (length(provision_fingerprint) = 64 AND provision_fingerprint NOT GLOB '*[^a-f0-9]*'), last_successful_telemetry_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_successful_telemetry_sequence >= 0 AND last_successful_telemetry_sequence <= 999), updated_at TEXT NOT NULL)",
+    "CREATE TABLE aprs_igate_submissions (id TEXT PRIMARY KEY, callsign TEXT NOT NULL, destination TEXT NOT NULL, info TEXT NOT NULL, packet_kind TEXT NOT NULL CHECK (packet_kind IN ('beacon', 'status', 'telemetry-parm', 'telemetry-unit', 'telemetry-eqns', 'telemetry-data')), provision_fingerprint TEXT NOT NULL CHECK (length(provision_fingerprint) = 64 AND provision_fingerprint NOT GLOB '*[^a-f0-9]*'), delivery_status TEXT NOT NULL CHECK (delivery_status IN ('sending', 'transmission_uncertain', 'submitted', 'observer_confirmed', 'observation_expired')), attempted_at TEXT NOT NULL, submitted_at TEXT, observer_confirmed_at TEXT, observation_expires_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+    "CREATE UNIQUE INDEX aprs_igate_submissions_active_exact_index ON aprs_igate_submissions (provision_fingerprint, callsign, destination, info) WHERE delivery_status IN ('sending', 'transmission_uncertain', 'submitted')",
+    "CREATE INDEX aprs_igate_submissions_confirmation_index ON aprs_igate_submissions (provision_fingerprint, callsign, destination, info, attempted_at ASC, id ASC) WHERE delivery_status IN ('sending', 'transmission_uncertain', 'submitted')",
+    "CREATE INDEX aprs_igate_submissions_expiry_index ON aprs_igate_submissions (observation_expires_at ASC, id ASC) WHERE delivery_status IN ('sending', 'transmission_uncertain', 'submitted')",
+    "CREATE INDEX aprs_igate_submissions_retention_index ON aprs_igate_submissions (updated_at ASC, id ASC) WHERE delivery_status IN ('observer_confirmed', 'observation_expired')",
   ]),
 ]);
 

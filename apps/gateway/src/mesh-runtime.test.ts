@@ -44,8 +44,17 @@ describe("MeshGatewayRuntime", () => {
       eventIdFactory: sequentialFactory("event"),
     });
     const observedTypes: string[] = [];
+    const aprsSummaries: Array<{ type: string; timestampMs: number }> = [];
     events.subscribe((event) => observedTypes.push(event.type));
-    const runtime = createRuntime(database, schema, transport, events);
+    const runtime = createRuntime(
+      database,
+      schema,
+      transport,
+      events,
+      undefined,
+      undefined,
+      (type, timestampMs) => aprsSummaries.push({ type, timestampMs }),
+    );
 
     runtime.start();
     transport.emit({
@@ -111,6 +120,12 @@ describe("MeshGatewayRuntime", () => {
       ]),
     );
     expect(events.replayBufferSize).toBeGreaterThanOrEqual(6);
+    expect(aprsSummaries).toEqual([
+      {
+        type: "position",
+        timestampMs: Date.parse("2026-07-18T00:00:10.000Z"),
+      },
+    ]);
 
     await runtime.stop();
     database.close();
@@ -712,6 +727,12 @@ function createRuntime(
   stateProvider: () => AprsRuntimeState | undefined = () => ({
     mappings: database.callmeshMappings.list(),
     mappingsFingerprint: "b".repeat(64),
+    provision: {
+      callsignBase: "TEST01",
+      ssid: -7,
+      symbolTable: "/",
+      symbolCode: ">",
+    },
     identity: deriveAprsRuntimeIdentity({
       callsignBase: "TEST01",
       ssid: -7,
@@ -721,6 +742,7 @@ function createRuntime(
     provisionFingerprint: PROVISION_FINGERPRINT,
   }),
   packetRecorder?: PacketRecorder,
+  onDecodedSummary?: (type: string, timestampMs: number) => void,
 ): MeshGatewayRuntime {
   return new MeshGatewayRuntime({
     applicationDecoder: new MeshtasticApplicationDecoder(schema),
@@ -730,7 +752,10 @@ function createRuntime(
     gatewayId: "fixture-gateway",
     meshNetworkId: "fixture-network",
     transport,
-    aprs: { stateProvider },
+    aprs: {
+      stateProvider,
+      ...(onDecodedSummary ? { onDecodedSummary } : {}),
+    },
     clock: () => new Date("2026-07-18T00:00:10.000Z"),
     idFactory: sequentialFactory("observation"),
     ...(packetRecorder ? { packetRecorder } : {}),

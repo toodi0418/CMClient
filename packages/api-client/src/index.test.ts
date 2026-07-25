@@ -255,6 +255,8 @@ describe("gateway API client", () => {
               mappedCallsigns: 2,
               pendingOutbox: 1,
               failedOutbox: 0,
+              pendingStationSubmissions: 1,
+              failedStationSubmissions: 0,
             });
       },
     });
@@ -267,6 +269,38 @@ describe("gateway API client", () => {
       mappedCallsigns: 2,
     });
     expect(requested).toEqual(["/api/v1/meshtastic", "/api/v1/aprs"]);
+  });
+
+  it("reads sanitized station delivery without accepting APRS identity or Data", async () => {
+    let url: string | undefined;
+    const client = new GatewayApiClient({
+      fetch: async (input) => {
+        url = String(input);
+        return jsonResponse({
+          items: [
+            {
+              id: "aprs-igate-00000000-0000-4000-8000-000000000001",
+              packetKind: "telemetry-data",
+              deliveryStatus: "observer_confirmed",
+              attemptedAt: "2026-07-18T00:00:00.000Z",
+              submittedAt: "2026-07-18T00:00:01.000Z",
+              observerConfirmedAt: "2026-07-18T00:00:02.000Z",
+              updatedAt: "2026-07-18T00:00:02.000Z",
+              observationExpiresAt: "2026-07-18T03:00:00.000Z",
+            },
+          ],
+        });
+      },
+    });
+
+    const projection = await client.aprs.stationSubmissions();
+    expect(url).toBe("/api/v1/aprs/station-submissions");
+    expect(projection.items[0]).toMatchObject({
+      packetKind: "telemetry-data",
+      deliveryStatus: "observer_confirmed",
+    });
+    expect(projection.items[0]).not.toHaveProperty("callsign");
+    expect(projection.items[0]).not.toHaveProperty("info");
   });
 
   it("encodes bounded telemetry range queries and rejects ambiguous nodes", async () => {

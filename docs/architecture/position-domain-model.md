@@ -18,11 +18,20 @@ Position processing persists four distinct records before any APRS operation:
 
 `aprs_delivery_high_water` is a separate delivery proof keyed by
 `(mesh_network_id, node_num, callsign)`. It advances only when a durable outbox
-send is marked successful, in the same SQLite transaction, and retains the
-canonical event time plus sequence order. It prevents an already delivered
+submission is later observed by the receive monitor with an exact source,
+destination, and information match. Confirmation and advancement share one
+SQLite transaction and retain the canonical event time plus sequence order; a
+socket write alone never advances it. It prevents an already delivered
 event from becoming eligible again after sent-outbox retention or a mapping
 version change. It never merges or replaces the per-mapping local state or
 remote monitor state.
+
+`aprs_legacy_submission_barriers` separately retains the newest ordering
+snapshot that an older release recorded after a socket write. It is not proof
+of APRS-IS delivery and never populates `aprs_delivery_high_water`, but it is a
+permanent fail-closed boundary for position admission, enqueue, and final
+pre-send authorization. This prevents downgrade replay after migration without
+misrepresenting legacy transport success as observer confirmation.
 
 SQLite stores observations, events, decisions, and node state in independent
 tables. Later P05 slices fill canonical identity, sequence epochs, validation,

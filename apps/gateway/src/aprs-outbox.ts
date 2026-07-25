@@ -12,6 +12,16 @@ import {
 import { parseCmClientAprsLine } from "./aprs-monitor.js";
 
 export type AprsOutboxStatus = "queued" | "sending" | "sent" | "failed";
+export type AprsDeliveryStatus =
+  | "queued"
+  | "sending"
+  | "failed"
+  | "submitted"
+  | "observer_confirmed"
+  | "observation_expired";
+
+const APRS_OBSERVATION_WINDOW_MS = 3 * 60 * 60 * 1_000;
+const MAX_APRS_DATA_BYTES = 510;
 
 export interface AprsOutboxEntry extends PublicAprsOutboxEntry {
   data: string;
@@ -49,8 +59,20 @@ export interface EnqueueAprsResult {
 }
 
 export interface AprsTransport {
-  send(data: string, provisionFingerprint: string): Promise<void>;
+  prepareVerifiedSession?(
+    provisionFingerprint: string,
+  ): Promise<AprsVerifiedTransportSession>;
+  send(
+    data: string,
+    provisionFingerprint: string,
+    expectedSession?: AprsVerifiedTransportSession,
+    transmissionGate?: () => boolean,
+  ): Promise<void>;
   close?(): Promise<void>;
+}
+
+export interface AprsVerifiedTransportSession {
+  readonly generation: number;
 }
 
 export interface AprsRetryOptions {
@@ -90,6 +112,15 @@ export class AprsAuthorizationError extends Error {
   }
 }
 
+export class AprsTransmissionFencedError extends Error {
+  readonly code = "APRS_TX_FENCED";
+
+  constructor() {
+    super("APRS_TX_FENCED");
+    this.name = "AprsTransmissionFencedError";
+  }
+}
+
 export class AprsOutboxRepository {
   constructor(private readonly database: DatabaseSync) {}
 
@@ -97,8 +128,7 @@ export class AprsOutboxRepository {
     if (
       !/^[A-Z0-9]{1,6}(?:-[0-9]{1,2})?$/.test(input.callsign) ||
       !input.canonicalEventId.trim() ||
-      !input.data.trim() ||
-      /[\r\n]/.test(input.data) ||
+      !isValidAprsData(input.data) ||
       !isTimestamp(input.now) ||
       !PROVISION_FINGERPRINT_PATTERN.test(input.provisionFingerprint)
     ) {
@@ -150,13 +180,14 @@ export class AprsOutboxRepository {
         );
       this.database
         .prepare(
-          "INSERT OR IGNORE INTO aprs_outbox (id, callsign, canonical_event_id, data, status, attempts, next_attempt_at, last_error_code, created_at, updated_at, mesh_network_id, node_num, mapping_version, event_time, sequence_epoch, sequence_number, provision_fingerprint) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT OR IGNORE INTO aprs_outbox (id, callsign, canonical_event_id, data, status, delivery_status, attempts, next_attempt_at, last_error_code, created_at, updated_at, mesh_network_id, node_num, mapping_version, event_time, sequence_epoch, sequence_number, provision_fingerprint) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run(
           id,
           input.callsign,
           input.canonicalEventId,
           input.data,
+          disposition === "conflict" ? "failed" : "queued",
           disposition === "conflict" ? "failed" : "queued",
           input.now,
           disposition === "conflict" ? "APRS_ORDER_UNPROVEN" : null,
@@ -223,7 +254,7 @@ export class AprsOutboxRepository {
         }
         this.database
           .prepare(
-            "UPDATE aprs_outbox SET status = 'sending', updated_at = ? WHERE id = ?",
+            "UPDATE aprs_outbox SET status = 'sending', delivery_status = 'sending', updated_at = ? WHERE id = ?",
           )
           .run(now, id);
         const entry = this.find(id);
@@ -262,6 +293,12 @@ export class AprsOutboxRepository {
       const entry = this.required(id);
       if (entry.status !== "sending") {
         throw new AprsOutboxError();
+      }
+      if (!isValidAprsData(entry.data)) {
+        this.database.prepare("DELETE FROM aprs_outbox WHERE id = ?").run(id);
+        this.database.exec("COMMIT");
+        transactionOpen = false;
+        return { authorized: false };
       }
       if (
         !entry.provisionFingerprint ||
@@ -305,7 +342,7 @@ export class AprsOutboxRepository {
     }
   }
 
-  markSent(
+  markSubmitted(
     id: string,
     now: string,
     provisionFingerprint: string,
@@ -333,33 +370,80 @@ export class AprsOutboxRepository {
       }
       this.database
         .prepare(
-          "INSERT INTO aprs_local_transmissions (callsign, info, transmitted_at) VALUES (?, ?, ?) ON CONFLICT(callsign, info) DO UPDATE SET transmitted_at = excluded.transmitted_at",
+          "INSERT INTO aprs_local_transmissions (callsign, destination, info, transmitted_at) VALUES (?, ?, ?, ?) ON CONFLICT(callsign, destination, info) DO UPDATE SET transmitted_at = excluded.transmitted_at",
         )
-        .run(packet.callsign, packet.info, now);
+        .run(packet.callsign, packet.destination, packet.info, now);
+      const observationExpiresAt = new Date(
+        Date.parse(now) + APRS_OBSERVATION_WINDOW_MS,
+      ).toISOString();
       this.database
         .prepare(
-          "UPDATE aprs_outbox SET status = 'sent', sent_at = ?, updated_at = ?, last_error_code = NULL WHERE id = ? AND status = 'sending'",
+          "UPDATE aprs_outbox SET status = 'sent', delivery_status = 'submitted', sent_at = ?, submitted_at = ?, observation_expires_at = ?, observer_confirmed_at = NULL, updated_at = ?, last_error_code = NULL WHERE id = ? AND status = 'sending'",
         )
-        .run(now, now, id);
+        .run(now, now, observationExpiresAt, now, id);
+      const evidence = this.database
+        .prepare(
+          "SELECT first_observed_at, last_observed_at FROM aprs_observed_packets WHERE callsign = ? AND destination = ? AND info = ?",
+        )
+        .get(packet.callsign, packet.destination, packet.info) as
+        Record<string, unknown> | undefined;
+      const observerConfirmedAt = evidence
+        ? [
+            String(evidence.first_observed_at),
+            String(evidence.last_observed_at),
+          ]
+            .filter(
+              (observedAt, index, values) =>
+                values.indexOf(observedAt) === index &&
+                isTimestamp(observedAt) &&
+                Date.parse(observedAt) >= Date.parse(current.updatedAt) &&
+                Date.parse(observedAt) <= Date.parse(observationExpiresAt),
+            )
+            .sort()[0]
+        : undefined;
+      const exactPending = this.database
+        .prepare(
+          "SELECT * FROM aprs_outbox WHERE callsign = ? AND provision_fingerprint = ? AND delivery_status IN ('sending', 'submitted') ORDER BY created_at ASC, id ASC",
+        )
+        .all(packet.callsign, provisionFingerprint)
+        .map((row) => toEntry(row as Record<string, unknown>))
+        .filter((candidate) => {
+          const candidatePacket = parseCmClientAprsLine(candidate.data);
+          return (
+            candidatePacket?.destination === packet.destination &&
+            candidatePacket.info === packet.info
+          );
+        });
+      if (
+        observerConfirmedAt &&
+        exactPending.length === 1 &&
+        exactPending[0]!.id === id
+      ) {
+        this.database
+          .prepare(
+            "UPDATE aprs_outbox SET delivery_status = 'observer_confirmed', observer_confirmed_at = ?, updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END WHERE id = ? AND delivery_status = 'submitted'",
+          )
+          .run(
+            observerConfirmedAt,
+            observerConfirmedAt,
+            observerConfirmedAt,
+            id,
+          );
+      }
       const entry = this.required(id);
-      if (entry.status !== "sent" || !hasCompleteSourceSnapshot(entry)) {
+      if (
+        entry.status !== "sent" ||
+        !["submitted", "observer_confirmed"].includes(entry.deliveryStatus) ||
+        !hasCompleteSourceSnapshot(entry)
+      ) {
         throw new AprsOutboxError();
       }
-      this.database
-        .prepare(
-          "INSERT INTO aprs_delivery_high_water (mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_event_time, latest_sequence_epoch, latest_sequence_number, delivered_at, latest_mapping_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(mesh_network_id, node_num, callsign) DO UPDATE SET latest_canonical_event_id = excluded.latest_canonical_event_id, latest_event_time = excluded.latest_event_time, latest_sequence_epoch = excluded.latest_sequence_epoch, latest_sequence_number = excluded.latest_sequence_number, delivered_at = excluded.delivered_at, latest_mapping_version = excluded.latest_mapping_version WHERE excluded.latest_event_time > aprs_delivery_high_water.latest_event_time OR (excluded.latest_event_time = aprs_delivery_high_water.latest_event_time AND (excluded.latest_canonical_event_id = aprs_delivery_high_water.latest_canonical_event_id OR (excluded.latest_mapping_version IS NOT NULL AND aprs_delivery_high_water.latest_mapping_version IS NOT NULL AND excluded.latest_mapping_version = aprs_delivery_high_water.latest_mapping_version AND excluded.latest_sequence_epoch IS NOT NULL AND excluded.latest_sequence_number IS NOT NULL AND aprs_delivery_high_water.latest_sequence_epoch IS NOT NULL AND aprs_delivery_high_water.latest_sequence_number IS NOT NULL AND (excluded.latest_sequence_epoch > aprs_delivery_high_water.latest_sequence_epoch OR (excluded.latest_sequence_epoch = aprs_delivery_high_water.latest_sequence_epoch AND excluded.latest_sequence_number > aprs_delivery_high_water.latest_sequence_number)))))",
-        )
-        .run(
-          entry.meshNetworkId,
-          entry.nodeNum,
-          entry.callsign,
-          entry.canonicalEventId,
-          entry.eventTime,
-          entry.sequenceEpoch ?? null,
-          entry.sequenceNumber ?? null,
-          now,
-          entry.mappingVersion ?? null,
-        );
+      if (
+        observerConfirmedAt &&
+        entry.deliveryStatus === "observer_confirmed"
+      ) {
+        this.advanceDeliveryHighWater(entry, observerConfirmedAt);
+      }
       this.database.exec("COMMIT");
       transactionOpen = false;
       return entry;
@@ -369,6 +453,155 @@ export class AprsOutboxRepository {
       }
       throw new AprsOutboxError();
     }
+  }
+
+  /** @deprecated Use markSubmitted; a socket write is not delivery proof. */
+  markSent(
+    id: string,
+    now: string,
+    provisionFingerprint: string,
+  ): AprsOutboxEntry {
+    return this.markSubmitted(id, now, provisionFingerprint);
+  }
+
+  confirmObserved(
+    callsign: string,
+    destination: string,
+    info: string,
+    observedAt: string,
+    currentProvisionFingerprint: string,
+  ): AprsOutboxEntry[] {
+    if (
+      !/^[A-Z0-9]{1,6}(?:-[0-9]{1,2})?$/.test(callsign) ||
+      !/^[A-Z0-9]{1,6}(?:-[0-9]{1,2})?$/.test(destination) ||
+      !info ||
+      /[\r\n]/.test(info) ||
+      !isTimestamp(observedAt) ||
+      !PROVISION_FINGERPRINT_PATTERN.test(currentProvisionFingerprint)
+    ) {
+      throw new AprsOutboxError();
+    }
+    let transactionOpen = false;
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const candidates = this.database
+        .prepare(
+          "SELECT * FROM aprs_outbox WHERE callsign = ? AND provision_fingerprint = ? AND status = 'sent' AND delivery_status = 'submitted' AND submitted_at IS NOT NULL AND submitted_at <= ? AND observation_expires_at IS NOT NULL AND observation_expires_at >= ? ORDER BY submitted_at ASC, id ASC",
+        )
+        .all(callsign, currentProvisionFingerprint, observedAt, observedAt)
+        .map((row) => toEntry(row as Record<string, unknown>));
+      const matching = candidates.filter((candidate) => {
+        const packet = parseCmClientAprsLine(candidate.data);
+        return packet?.destination === destination && packet.info === info;
+      });
+      if (matching.length !== 1) {
+        this.database.exec("COMMIT");
+        transactionOpen = false;
+        return [];
+      }
+      const candidate = matching[0]!;
+      this.database
+        .prepare(
+          "UPDATE aprs_outbox SET delivery_status = 'observer_confirmed', observer_confirmed_at = ?, updated_at = ? WHERE id = ? AND delivery_status = 'submitted'",
+        )
+        .run(observedAt, observedAt, candidate.id);
+      const entry = this.required(candidate.id);
+      if (entry.deliveryStatus !== "observer_confirmed") {
+        throw new AprsOutboxError();
+      }
+      this.advanceDeliveryHighWater(entry, observedAt);
+      this.database.exec("COMMIT");
+      transactionOpen = false;
+      return [entry];
+    } catch {
+      if (transactionOpen) {
+        this.database.exec("ROLLBACK");
+      }
+      throw new AprsOutboxError();
+    }
+  }
+
+  reconcileObservedCache(
+    currentProvisionFingerprint: string,
+  ): AprsOutboxEntry[] {
+    if (!PROVISION_FINGERPRINT_PATTERN.test(currentProvisionFingerprint)) {
+      throw new AprsOutboxError();
+    }
+    try {
+      const evidence = this.database
+        .prepare(
+          "SELECT callsign, destination, info, first_observed_at, last_observed_at FROM aprs_observed_packets WHERE destination <> '' ORDER BY first_observed_at ASC, callsign ASC, destination ASC, info ASC",
+        )
+        .all();
+      const confirmed = new Map<string, AprsOutboxEntry>();
+      for (const row of evidence) {
+        const firstObservedAt = String(row.first_observed_at);
+        const lastObservedAt = String(row.last_observed_at);
+        const observedAtValues =
+          firstObservedAt === lastObservedAt
+            ? [firstObservedAt]
+            : [firstObservedAt, lastObservedAt];
+        for (const observedAt of observedAtValues) {
+          for (const entry of this.confirmObserved(
+            String(row.callsign),
+            String(row.destination),
+            String(row.info),
+            observedAt,
+            currentProvisionFingerprint,
+          )) {
+            confirmed.set(entry.id, entry);
+          }
+        }
+      }
+      return [...confirmed.values()];
+    } catch (error) {
+      if (error instanceof AprsOutboxError) {
+        throw error;
+      }
+      throw new AprsOutboxError();
+    }
+  }
+
+  expireSubmitted(now: string): number {
+    if (!isTimestamp(now)) {
+      throw new AprsOutboxError();
+    }
+    try {
+      return Number(
+        this.database
+          .prepare(
+            "UPDATE aprs_outbox SET delivery_status = 'observation_expired', updated_at = ? WHERE delivery_status = 'submitted' AND observation_expires_at IS NOT NULL AND observation_expires_at <= ?",
+          )
+          .run(now, now).changes,
+      );
+    } catch {
+      throw new AprsOutboxError();
+    }
+  }
+
+  private advanceDeliveryHighWater(
+    entry: AprsOutboxEntry,
+    deliveredAt: string,
+  ): void {
+    if (!hasCompleteSourceSnapshot(entry)) {
+      throw new AprsOutboxError();
+    }
+    this.database
+      .prepare(
+        "INSERT INTO aprs_delivery_high_water (mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_event_time, latest_sequence_epoch, latest_sequence_number, delivered_at, latest_mapping_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(mesh_network_id, node_num, callsign) DO UPDATE SET latest_canonical_event_id = excluded.latest_canonical_event_id, latest_event_time = excluded.latest_event_time, latest_sequence_epoch = excluded.latest_sequence_epoch, latest_sequence_number = excluded.latest_sequence_number, delivered_at = excluded.delivered_at, latest_mapping_version = excluded.latest_mapping_version WHERE excluded.latest_event_time > aprs_delivery_high_water.latest_event_time OR (excluded.latest_event_time = aprs_delivery_high_water.latest_event_time AND (excluded.latest_canonical_event_id = aprs_delivery_high_water.latest_canonical_event_id OR (excluded.latest_mapping_version IS NOT NULL AND aprs_delivery_high_water.latest_mapping_version IS NOT NULL AND excluded.latest_mapping_version = aprs_delivery_high_water.latest_mapping_version AND excluded.latest_sequence_epoch IS NOT NULL AND excluded.latest_sequence_number IS NOT NULL AND aprs_delivery_high_water.latest_sequence_epoch IS NOT NULL AND aprs_delivery_high_water.latest_sequence_number IS NOT NULL AND (excluded.latest_sequence_epoch > aprs_delivery_high_water.latest_sequence_epoch OR (excluded.latest_sequence_epoch = aprs_delivery_high_water.latest_sequence_epoch AND excluded.latest_sequence_number > aprs_delivery_high_water.latest_sequence_number)))))",
+      )
+      .run(
+        entry.meshNetworkId,
+        entry.nodeNum,
+        entry.callsign,
+        entry.canonicalEventId,
+        entry.eventTime,
+        entry.sequenceEpoch ?? null,
+        entry.sequenceNumber ?? null,
+        deliveredAt,
+        entry.mappingVersion ?? null,
+      );
   }
 
   markFailed(
@@ -404,7 +637,7 @@ export class AprsOutboxRepository {
       ).toISOString();
       this.database
         .prepare(
-          "UPDATE aprs_outbox SET status = 'failed', attempts = ?, next_attempt_at = ?, last_error_code = ?, updated_at = ? WHERE id = ? AND status = 'sending'",
+          "UPDATE aprs_outbox SET status = 'failed', delivery_status = 'failed', attempts = ?, next_attempt_at = ?, last_error_code = ?, updated_at = ? WHERE id = ? AND status = 'sending'",
         )
         .run(current.attempts + 1, nextAttemptAt, errorCode, now, id);
       const entry = this.required(id);
@@ -422,13 +655,45 @@ export class AprsOutboxRepository {
     }
   }
 
+  releaseClaim(id: string, now: string): AprsOutboxEntry {
+    if (!isTimestamp(now)) {
+      throw new AprsOutboxError();
+    }
+    let transactionOpen = false;
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const current = this.required(id);
+      if (current.status !== "sending") {
+        throw new AprsOutboxError();
+      }
+      const result = this.database
+        .prepare(
+          "UPDATE aprs_outbox SET status = 'queued', delivery_status = 'queued', updated_at = ?, last_error_code = NULL WHERE id = ? AND status = 'sending'",
+        )
+        .run(now, id);
+      if (Number(result.changes) !== 1) {
+        throw new AprsOutboxError();
+      }
+      const released = this.required(id);
+      this.database.exec("COMMIT");
+      transactionOpen = false;
+      return released;
+    } catch {
+      if (transactionOpen) {
+        this.database.exec("ROLLBACK");
+      }
+      throw new AprsOutboxError();
+    }
+  }
+
   resumeInterrupted(now: string): number {
     if (!isTimestamp(now)) {
       throw new AprsOutboxError();
     }
     const result = this.database
       .prepare(
-        "UPDATE aprs_outbox SET status = 'failed', attempts = attempts + 1, next_attempt_at = ?, last_error_code = 'APRS_TX_INTERRUPTED', updated_at = ? WHERE status = 'sending'",
+        "UPDATE aprs_outbox SET status = 'failed', delivery_status = 'failed', attempts = attempts + 1, next_attempt_at = ?, last_error_code = 'APRS_TX_INTERRUPTED', updated_at = ? WHERE status = 'sending'",
       )
       .run(now, now);
     return Number(result.changes);
@@ -485,7 +750,7 @@ export class AprsOutboxRepository {
     try {
       const result = this.database
         .prepare(
-          "DELETE FROM aprs_outbox WHERE id IN (SELECT outbox.id FROM aprs_outbox AS outbox INDEXED BY aprs_outbox_sent_retention_index WHERE outbox.status = 'sent' AND outbox.sent_at IS NOT NULL AND outbox.sent_at < ? AND EXISTS (SELECT 1 FROM aprs_delivery_high_water AS delivery WHERE delivery.mesh_network_id = outbox.mesh_network_id AND delivery.node_num = outbox.node_num AND delivery.callsign = outbox.callsign AND outbox.event_time IS NOT NULL AND (delivery.latest_canonical_event_id = outbox.canonical_event_id OR delivery.latest_event_time > outbox.event_time OR (delivery.latest_event_time = outbox.event_time AND delivery.latest_mapping_version IS NOT NULL AND outbox.mapping_version IS NOT NULL AND delivery.latest_mapping_version = outbox.mapping_version AND delivery.latest_sequence_epoch IS NOT NULL AND delivery.latest_sequence_number IS NOT NULL AND outbox.sequence_epoch IS NOT NULL AND outbox.sequence_number IS NOT NULL AND (delivery.latest_sequence_epoch > outbox.sequence_epoch OR (delivery.latest_sequence_epoch = outbox.sequence_epoch AND delivery.latest_sequence_number > outbox.sequence_number))))) ORDER BY outbox.sent_at ASC, outbox.id ASC LIMIT ?)",
+          "DELETE FROM aprs_outbox WHERE id IN (SELECT outbox.id FROM aprs_outbox AS outbox INDEXED BY aprs_outbox_sent_retention_index WHERE outbox.status = 'sent' AND outbox.sent_at IS NOT NULL AND outbox.sent_at < ? AND (outbox.delivery_status = 'observation_expired' OR (outbox.delivery_status = 'observer_confirmed' AND EXISTS (SELECT 1 FROM aprs_delivery_high_water AS delivery WHERE delivery.mesh_network_id = outbox.mesh_network_id AND delivery.node_num = outbox.node_num AND delivery.callsign = outbox.callsign AND outbox.event_time IS NOT NULL AND (delivery.latest_canonical_event_id = outbox.canonical_event_id OR delivery.latest_event_time > outbox.event_time OR (delivery.latest_event_time = outbox.event_time AND delivery.latest_mapping_version IS NOT NULL AND outbox.mapping_version IS NOT NULL AND delivery.latest_mapping_version = outbox.mapping_version AND delivery.latest_sequence_epoch IS NOT NULL AND delivery.latest_sequence_number IS NOT NULL AND outbox.sequence_epoch IS NOT NULL AND outbox.sequence_number IS NOT NULL AND (delivery.latest_sequence_epoch > outbox.sequence_epoch OR (delivery.latest_sequence_epoch = outbox.sequence_epoch AND delivery.latest_sequence_number > outbox.sequence_number))))))) ORDER BY outbox.sent_at ASC, outbox.id ASC LIMIT ?)",
         )
         .run(cutoffExclusive, limit);
       return Number(result.changes);
@@ -501,7 +766,81 @@ export class AprsOutboxRepository {
     try {
       const result = this.database
         .prepare(
-          "DELETE FROM aprs_outbox WHERE id IN (SELECT older.id FROM aprs_outbox AS older WHERE older.status IN ('queued', 'failed') AND (EXISTS (SELECT 1 FROM aprs_delivery_high_water AS delivery WHERE delivery.mesh_network_id = older.mesh_network_id AND delivery.node_num = older.node_num AND delivery.callsign = older.callsign AND older.event_time IS NOT NULL AND (delivery.latest_canonical_event_id = older.canonical_event_id OR delivery.latest_event_time > older.event_time OR (delivery.latest_event_time = older.event_time AND delivery.latest_mapping_version IS NOT NULL AND older.mapping_version IS NOT NULL AND delivery.latest_mapping_version = older.mapping_version AND delivery.latest_sequence_epoch IS NOT NULL AND delivery.latest_sequence_number IS NOT NULL AND older.sequence_epoch IS NOT NULL AND older.sequence_number IS NOT NULL AND (delivery.latest_sequence_epoch > older.sequence_epoch OR (delivery.latest_sequence_epoch = older.sequence_epoch AND delivery.latest_sequence_number > older.sequence_number))))) OR EXISTS (SELECT 1 FROM aprs_outbox AS newer INDEXED BY aprs_outbox_active_order_index WHERE newer.mesh_network_id = older.mesh_network_id AND newer.node_num = older.node_num AND newer.callsign = older.callsign AND newer.id <> older.id AND newer.status IN ('queued', 'sending', 'failed') AND newer.event_time IS NOT NULL AND older.event_time IS NOT NULL AND (newer.event_time > older.event_time OR (newer.event_time = older.event_time AND newer.mapping_version IS NOT NULL AND older.mapping_version IS NOT NULL AND newer.mapping_version = older.mapping_version AND newer.sequence_epoch IS NOT NULL AND newer.sequence_number IS NOT NULL AND older.sequence_epoch IS NOT NULL AND older.sequence_number IS NOT NULL AND (newer.sequence_epoch > older.sequence_epoch OR (newer.sequence_epoch = older.sequence_epoch AND newer.sequence_number > older.sequence_number)))))) ORDER BY older.updated_at ASC, older.id ASC LIMIT ?)",
+          `DELETE FROM aprs_outbox WHERE id IN (
+            SELECT older.id
+            FROM aprs_outbox AS older
+            WHERE older.status IN ('queued', 'failed')
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM (
+                    SELECT mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number
+                    FROM aprs_delivery_high_water
+                    UNION ALL
+                    SELECT mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number
+                    FROM aprs_legacy_submission_barriers
+                  ) AS barrier
+                  WHERE barrier.mesh_network_id = older.mesh_network_id
+                    AND barrier.node_num = older.node_num
+                    AND barrier.callsign = older.callsign
+                    AND older.event_time IS NOT NULL
+                    AND (
+                      barrier.latest_canonical_event_id = older.canonical_event_id
+                      OR barrier.latest_event_time > older.event_time
+                      OR (
+                        barrier.latest_event_time = older.event_time
+                        AND barrier.latest_mapping_version IS NOT NULL
+                        AND older.mapping_version IS NOT NULL
+                        AND barrier.latest_mapping_version = older.mapping_version
+                        AND barrier.latest_sequence_epoch IS NOT NULL
+                        AND barrier.latest_sequence_number IS NOT NULL
+                        AND older.sequence_epoch IS NOT NULL
+                        AND older.sequence_number IS NOT NULL
+                        AND (
+                          barrier.latest_sequence_epoch > older.sequence_epoch
+                          OR (
+                            barrier.latest_sequence_epoch = older.sequence_epoch
+                            AND barrier.latest_sequence_number > older.sequence_number
+                          )
+                        )
+                      )
+                    )
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM aprs_outbox AS newer INDEXED BY aprs_outbox_active_order_index
+                  WHERE newer.mesh_network_id = older.mesh_network_id
+                    AND newer.node_num = older.node_num
+                    AND newer.callsign = older.callsign
+                    AND newer.id <> older.id
+                    AND newer.status IN ('queued', 'sending', 'failed')
+                    AND newer.event_time IS NOT NULL
+                    AND older.event_time IS NOT NULL
+                    AND (
+                      newer.event_time > older.event_time
+                      OR (
+                        newer.event_time = older.event_time
+                        AND newer.mapping_version IS NOT NULL
+                        AND older.mapping_version IS NOT NULL
+                        AND newer.mapping_version = older.mapping_version
+                        AND newer.sequence_epoch IS NOT NULL
+                        AND newer.sequence_number IS NOT NULL
+                        AND older.sequence_epoch IS NOT NULL
+                        AND older.sequence_number IS NOT NULL
+                        AND (
+                          newer.sequence_epoch > older.sequence_epoch
+                          OR (
+                            newer.sequence_epoch = older.sequence_epoch
+                            AND newer.sequence_number > older.sequence_number
+                          )
+                        )
+                      )
+                    )
+                )
+              )
+            ORDER BY older.updated_at ASC, older.id ASC
+            LIMIT ?
+          )`,
         )
         .run(limit);
       return Number(result.changes);
@@ -578,11 +917,10 @@ export class AprsOutboxRepository {
     callsign: string,
     canonicalEventId: string,
   ): "enqueue" | "conflict" | "suppress" {
-    const delivery = this.findDelivery(snapshot, callsign);
-    if (delivery) {
-      const comparison = compareOrder(snapshot, delivery);
+    for (const barrier of this.findOrderBarriers(snapshot, callsign)) {
+      const comparison = compareOrder(snapshot, barrier);
       if (
-        delivery.canonicalEventId === canonicalEventId ||
+        barrier.canonicalEventId === canonicalEventId ||
         comparison !== "newer"
       ) {
         return "suppress";
@@ -618,12 +956,11 @@ export class AprsOutboxRepository {
       return "ambiguous";
     }
     let ambiguous = false;
-    const delivery = this.findDelivery(snapshot, entry.callsign);
-    if (delivery) {
-      if (delivery.canonicalEventId === entry.canonicalEventId) {
+    for (const barrier of this.findOrderBarriers(snapshot, entry.callsign)) {
+      if (barrier.canonicalEventId === entry.canonicalEventId) {
         return "stale";
       }
-      const comparison = compareOrder(snapshot, delivery);
+      const comparison = compareOrder(snapshot, barrier);
       if (comparison === "older") {
         return "stale";
       }
@@ -661,44 +998,55 @@ export class AprsOutboxRepository {
     return Boolean(
       this.database
         .prepare(
-          "SELECT 1 FROM aprs_observed_packets WHERE callsign = ? AND info = ? AND last_observed_at >= ?",
+          "SELECT 1 FROM aprs_observed_packets WHERE callsign = ? AND info = ? AND (destination = ? OR destination = '') AND last_observed_at >= ?",
         )
-        .get(packet.callsign, packet.info, observerCutoff) ||
+        .get(
+          packet.callsign,
+          packet.info,
+          packet.destination,
+          observerCutoff,
+        ) ||
       this.database
         .prepare(
-          "SELECT 1 FROM aprs_local_transmissions WHERE callsign = ? AND info = ? AND transmitted_at >= ?",
+          "SELECT 1 FROM aprs_local_transmissions WHERE callsign = ? AND info = ? AND (destination = ? OR destination = '') AND transmitted_at >= ?",
         )
-        .get(packet.callsign, packet.info, localCutoff),
+        .get(packet.callsign, packet.info, packet.destination, localCutoff),
     );
   }
 
-  private findDelivery(
+  private findOrderBarriers(
     snapshot: OrderSnapshot,
     callsign: string,
-  ): OrderSnapshot | undefined {
-    const row = this.database
+  ): OrderSnapshot[] {
+    const rows = this.database
       .prepare(
-        "SELECT latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number FROM aprs_delivery_high_water WHERE mesh_network_id = ? AND node_num = ? AND callsign = ?",
+        "SELECT latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number FROM aprs_delivery_high_water WHERE mesh_network_id = ? AND node_num = ? AND callsign = ? UNION ALL SELECT latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number FROM aprs_legacy_submission_barriers WHERE mesh_network_id = ? AND node_num = ? AND callsign = ?",
       )
-      .get(snapshot.meshNetworkId, snapshot.nodeNum, callsign);
-    if (!row) {
-      return undefined;
-    }
-    const sequenceEpoch = optionalInteger(row.latest_sequence_epoch);
-    const sequenceNumber = optionalInteger(row.latest_sequence_number);
-    return {
-      canonicalEventId: String(row.latest_canonical_event_id),
-      meshNetworkId: snapshot.meshNetworkId,
-      nodeNum: snapshot.nodeNum,
-      ...(typeof row.latest_mapping_version === "string"
-        ? { mappingVersion: row.latest_mapping_version }
-        : {}),
-      ...(optionalTimestamp(row.latest_event_time)
-        ? { eventTime: optionalTimestamp(row.latest_event_time)! }
-        : {}),
-      ...(typeof sequenceEpoch === "number" ? { sequenceEpoch } : {}),
-      ...(typeof sequenceNumber === "number" ? { sequenceNumber } : {}),
-    };
+      .all(
+        snapshot.meshNetworkId,
+        snapshot.nodeNum,
+        callsign,
+        snapshot.meshNetworkId,
+        snapshot.nodeNum,
+        callsign,
+      );
+    return rows.map((row) => {
+      const sequenceEpoch = optionalInteger(row.latest_sequence_epoch);
+      const sequenceNumber = optionalInteger(row.latest_sequence_number);
+      return {
+        canonicalEventId: String(row.latest_canonical_event_id),
+        meshNetworkId: snapshot.meshNetworkId,
+        nodeNum: snapshot.nodeNum,
+        ...(typeof row.latest_mapping_version === "string"
+          ? { mappingVersion: row.latest_mapping_version }
+          : {}),
+        ...(optionalTimestamp(row.latest_event_time)
+          ? { eventTime: optionalTimestamp(row.latest_event_time)! }
+          : {}),
+        ...(typeof sequenceEpoch === "number" ? { sequenceEpoch } : {}),
+        ...(typeof sequenceNumber === "number" ? { sequenceNumber } : {}),
+      };
+    });
   }
 
   private deferUnproven(
@@ -711,7 +1059,7 @@ export class AprsOutboxRepository {
     ).toISOString();
     this.database
       .prepare(
-        "UPDATE aprs_outbox SET status = 'failed', attempts = ?, next_attempt_at = ?, last_error_code = 'APRS_ORDER_UNPROVEN', updated_at = ? WHERE id = ? AND status = 'sending'",
+        "UPDATE aprs_outbox SET status = 'failed', delivery_status = 'failed', attempts = ?, next_attempt_at = ?, last_error_code = 'APRS_ORDER_UNPROVEN', updated_at = ? WHERE id = ? AND status = 'sending'",
       )
       .run(entry.attempts + 1, nextAttemptAt, now, entry.id);
     return this.required(entry.id);
@@ -724,12 +1072,20 @@ function publicEntry(entry: AprsOutboxEntry): PublicAprsOutboxEntry {
     callsign: entry.callsign,
     canonicalEventId: entry.canonicalEventId,
     status: entry.status,
+    deliveryStatus: entry.deliveryStatus,
     attempts: entry.attempts,
     nextAttemptAt: entry.nextAttemptAt,
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     ...(entry.lastErrorCode ? { lastErrorCode: entry.lastErrorCode } : {}),
     ...(entry.sentAt ? { sentAt: entry.sentAt } : {}),
+    ...(entry.submittedAt ? { submittedAt: entry.submittedAt } : {}),
+    ...(entry.observerConfirmedAt
+      ? { observerConfirmedAt: entry.observerConfirmedAt }
+      : {}),
+    ...(entry.observationExpiresAt
+      ? { observationExpiresAt: entry.observationExpiresAt }
+      : {}),
   };
 }
 
@@ -758,11 +1114,14 @@ export class AprsOutboxWorker {
     }
   }
 
-  flush(limit?: number): Promise<AprsOutboxEntry[]> {
+  flush(
+    limit?: number,
+    shouldContinue?: () => boolean,
+  ): Promise<AprsOutboxEntry[]> {
     if (this.activeFlush) {
       return this.activeFlush;
     }
-    const operation = this.runFlush(limit);
+    const operation = this.runFlush(limit, shouldContinue);
     this.activeFlush = operation;
     void operation.then(
       () => this.completeFlush(operation),
@@ -776,13 +1135,26 @@ export class AprsOutboxWorker {
     await this.transport.close?.();
   }
 
-  private async runFlush(limit?: number): Promise<AprsOutboxEntry[]> {
+  private async runFlush(
+    limit?: number,
+    shouldContinue: () => boolean = () => true,
+  ): Promise<AprsOutboxEntry[]> {
+    const batchLimit = limit ?? 10;
+    if (!Number.isInteger(batchLimit) || batchLimit < 1) {
+      throw new AprsOutboxError();
+    }
     const now = this.clock().toISOString();
+    this.repository.expireSubmitted(now);
     this.repository.resumeInterrupted(now);
     this.repository.deleteSuperseded(1_000);
-    const entries = this.repository.claimDue(now, limit);
+    const entries = this.repository.claimDue(now, batchLimit);
     const results: AprsOutboxEntry[] = [];
-    for (const entry of entries) {
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index]!;
+      if (!shouldContinue()) {
+        this.releaseRemainingClaims(entries, index);
+        break;
+      }
       const retryDelayMs = retryDelay(entry.attempts + 1, this.retry);
       const currentFingerprint = resolveCurrentProvisionFingerprint(
         this.options.authorizationProvider,
@@ -808,15 +1180,21 @@ export class AprsOutboxWorker {
         await this.transport.send(
           authorization.entry.data,
           provisionFingerprint,
+          undefined,
+          shouldContinue,
         );
         results.push(
-          this.repository.markSent(
+          this.repository.markSubmitted(
             authorization.entry.id,
             this.clock().toISOString(),
             provisionFingerprint,
           ),
         );
       } catch (error) {
+        if (error instanceof AprsTransmissionFencedError) {
+          this.releaseRemainingClaims(entries, index);
+          break;
+        }
         const current = resolveCurrentProvisionFingerprint(
           this.options.authorizationProvider,
         );
@@ -842,6 +1220,18 @@ export class AprsOutboxWorker {
     return results;
   }
 
+  private releaseRemainingClaims(
+    entries: readonly AprsOutboxEntry[],
+    startIndex: number,
+  ): void {
+    for (let index = startIndex; index < entries.length; index += 1) {
+      this.repository.releaseClaim(
+        entries[index]!.id,
+        this.clock().toISOString(),
+      );
+    }
+  }
+
   private completeFlush(operation: Promise<AprsOutboxEntry[]>): void {
     if (this.activeFlush === operation) {
       this.activeFlush = undefined;
@@ -852,6 +1242,7 @@ export class AprsOutboxWorker {
 export class AprsIsTcpClient implements AprsTransport {
   private session: AprsTxSession | undefined;
   private operationTail: Promise<void> = Promise.resolve();
+  private verifiedSessionGeneration = 0;
 
   constructor(
     private readonly options: {
@@ -874,9 +1265,33 @@ export class AprsIsTcpClient implements AprsTransport {
     }
   }
 
-  send(data: string, provisionFingerprint: string): Promise<void> {
+  prepareVerifiedSession(
+    provisionFingerprint: string,
+  ): Promise<AprsVerifiedTransportSession> {
+    const operation = this.operationTail.then(async () => {
+      const session = await this.requireVerifiedSession(provisionFingerprint);
+      return { generation: session.generation };
+    });
+    this.operationTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  send(
+    data: string,
+    provisionFingerprint: string,
+    expectedSession?: AprsVerifiedTransportSession,
+    transmissionGate?: () => boolean,
+  ): Promise<void> {
     const operation = this.operationTail.then(() =>
-      this.sendSerialized(data, provisionFingerprint),
+      this.sendSerialized(
+        data,
+        provisionFingerprint,
+        expectedSession,
+        transmissionGate,
+      ),
     );
     this.operationTail = operation.then(
       () => undefined,
@@ -897,11 +1312,36 @@ export class AprsIsTcpClient implements AprsTransport {
   private async sendSerialized(
     data: string,
     provisionFingerprint: string,
+    expectedSession?: AprsVerifiedTransportSession,
+    transmissionGate?: () => boolean,
   ): Promise<void> {
+    if (!isValidAprsData(data)) {
+      throw new AprsOutboxError();
+    }
+    const session = await this.requireVerifiedSession(
+      provisionFingerprint,
+      expectedSession,
+    );
+    if (transmissionGate && !transmissionGate()) {
+      throw new AprsTransmissionFencedError();
+    }
+    try {
+      await write(session.socket, `${data}\r\n`);
+    } catch {
+      await this.closeCurrentSession();
+      throw new AprsOutboxError();
+    }
+  }
+
+  private async requireVerifiedSession(
+    provisionFingerprint: string,
+    expectedSession?: AprsVerifiedTransportSession,
+  ): Promise<AprsTxSession> {
     if (
-      !data.trim() ||
-      /[\r\n]/.test(data) ||
-      !PROVISION_FINGERPRINT_PATTERN.test(provisionFingerprint)
+      !PROVISION_FINGERPRINT_PATTERN.test(provisionFingerprint) ||
+      (expectedSession !== undefined &&
+        (!Number.isInteger(expectedSession.generation) ||
+          expectedSession.generation < 1))
     ) {
       throw new AprsOutboxError();
     }
@@ -914,7 +1354,7 @@ export class AprsIsTcpClient implements AprsTransport {
       );
       callsign = authorizationCallsign(authorization);
     } catch (error) {
-      await this.closeCurrentSession();
+      await this.closeCurrentProvisionSession(provisionFingerprint);
       throw error;
     }
     let session = this.session;
@@ -924,6 +1364,18 @@ export class AprsIsTcpClient implements AprsTransport {
     } else if (session && !authorizationMatches(session, authorization)) {
       await this.closeCurrentSession();
       throw new AprsAuthorizationError();
+    }
+
+    if (
+      expectedSession &&
+      (!session ||
+        !isVerifiedSession(session) ||
+        session.generation !== expectedSession.generation)
+    ) {
+      if (session && !isVerifiedSession(session)) {
+        await this.closeCurrentSession();
+      }
+      throw new AprsOutboxError();
     }
 
     if (!session || !isVerifiedSession(session)) {
@@ -944,7 +1396,7 @@ export class AprsIsTcpClient implements AprsTransport {
         provisionFingerprint,
       );
     } catch (error) {
-      await this.closeCurrentSession();
+      await this.closeCurrentProvisionSession(provisionFingerprint);
       throw error;
     }
     if (
@@ -955,12 +1407,10 @@ export class AprsIsTcpClient implements AprsTransport {
       await this.closeCurrentSession();
       throw new AprsAuthorizationError();
     }
-    try {
-      await write(session.socket, `${data}\r\n`);
-    } catch {
-      await this.closeCurrentSession();
+    if (expectedSession && session.generation !== expectedSession.generation) {
       throw new AprsOutboxError();
     }
+    return session;
   }
 
   private async openVerifiedSession(
@@ -975,6 +1425,7 @@ export class AprsIsTcpClient implements AprsTransport {
     const session: AprsTxSession = {
       socket,
       state: "connecting",
+      generation: 0,
       callsign,
       loginLine: authorization.loginLine,
       provisionFingerprint,
@@ -1015,6 +1466,7 @@ export class AprsIsTcpClient implements AprsTransport {
         throw new AprsAuthorizationError();
       }
       session.state = "verified";
+      session.generation = ++this.verifiedSessionGeneration;
       socket.unref();
       return session;
     } catch (error) {
@@ -1046,6 +1498,16 @@ export class AprsIsTcpClient implements AprsTransport {
     await this.closeSession(session);
   }
 
+  private async closeCurrentProvisionSession(
+    provisionFingerprint: string,
+  ): Promise<void> {
+    const session = this.session;
+    if (!session || session.provisionFingerprint !== provisionFingerprint) {
+      return;
+    }
+    await this.closeSession(session);
+  }
+
   private async closeSession(session: AprsTxSession): Promise<void> {
     if (this.session === session) {
       this.session = undefined;
@@ -1061,10 +1523,19 @@ type AprsTxSessionState =
 
 interface AprsTxSession {
   callsign: string;
+  generation: number;
   loginLine: string;
   provisionFingerprint: string;
   socket: Socket;
   state: AprsTxSessionState;
+}
+
+function isValidAprsData(data: string): boolean {
+  return (
+    data.trim().length > 0 &&
+    !/[\r\n]/.test(data) &&
+    Buffer.byteLength(data, "utf8") <= MAX_APRS_DATA_BYTES
+  );
 }
 
 function retryDelay(
@@ -1310,6 +1781,19 @@ function toEntry(row: Record<string, unknown>): AprsOutboxEntry {
   if (!["queued", "sending", "sent", "failed"].includes(status)) {
     throw new AprsOutboxError();
   }
+  const deliveryStatus = String(row.delivery_status);
+  if (
+    ![
+      "queued",
+      "sending",
+      "failed",
+      "submitted",
+      "observer_confirmed",
+      "observation_expired",
+    ].includes(deliveryStatus)
+  ) {
+    throw new AprsOutboxError();
+  }
   const nodeNum = optionalInteger(row.node_num);
   const sequenceEpoch = optionalInteger(row.sequence_epoch);
   const sequenceNumber = optionalInteger(row.sequence_number);
@@ -1326,6 +1810,7 @@ function toEntry(row: Record<string, unknown>): AprsOutboxEntry {
     canonicalEventId: String(row.canonical_event_id),
     data: String(row.data),
     status: status as AprsOutboxStatus,
+    deliveryStatus: deliveryStatus as AprsDeliveryStatus,
     attempts: Number(row.attempts),
     nextAttemptAt: String(row.next_attempt_at),
     createdAt: String(row.created_at),
@@ -1350,6 +1835,15 @@ function toEntry(row: Record<string, unknown>): AprsOutboxEntry {
       ? { lastErrorCode: row.last_error_code }
       : {}),
     ...(typeof row.sent_at === "string" ? { sentAt: row.sent_at } : {}),
+    ...(typeof row.submitted_at === "string"
+      ? { submittedAt: row.submitted_at }
+      : {}),
+    ...(typeof row.observer_confirmed_at === "string"
+      ? { observerConfirmedAt: row.observer_confirmed_at }
+      : {}),
+    ...(typeof row.observation_expires_at === "string"
+      ? { observationExpiresAt: row.observation_expires_at }
+      : {}),
   };
 }
 

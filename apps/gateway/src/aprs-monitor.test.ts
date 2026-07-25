@@ -65,6 +65,14 @@ describe("APRS-IS monitor", () => {
     const highWater = new AprsRemoteHighWaterStore(database.connection);
     const monitor = new AprsIsMonitor([target], highWater);
     const encoded = encode(event("2026-07-18T00:00:35.000Z"));
+    const packet = parseCmClientAprsLine(encoded);
+    if (!packet) {
+      throw new Error("fixture APRS packet did not parse");
+    }
+    const alternateDestination = encoded.replace(
+      `>${packet.destination}`,
+      ">APCM20",
+    );
     const qArObserved = encoded.replace(",qAO,", ",qAR,");
     monitor.observeLine(qArObserved, "2026-07-18T00:01:00.000Z");
 
@@ -77,6 +85,30 @@ describe("APRS-IS monitor", () => {
     ).toBe(false);
     expect(
       highWater.canUploadData(
+        alternateDestination,
+        target,
+        "2026-07-18T00:01:30.000Z",
+      ),
+    ).toBe(true);
+    database.connection
+      .prepare(
+        "INSERT INTO aprs_observed_packets (callsign, destination, info, first_observed_at, last_observed_at) VALUES (?, '', ?, ?, ?)",
+      )
+      .run(
+        packet.callsign,
+        packet.info,
+        "2026-07-18T00:01:00.000Z",
+        "2026-07-18T00:01:00.000Z",
+      );
+    expect(
+      highWater.canUploadData(
+        alternateDestination,
+        target,
+        "2026-07-18T00:01:30.000Z",
+      ),
+    ).toBe(false);
+    expect(
+      highWater.canUploadData(
         encoded.replace(/:!.*/, ":!2500.01N/12130.00E>"),
         target,
         "2026-07-18T00:01:30.000Z",
@@ -86,6 +118,34 @@ describe("APRS-IS monitor", () => {
       highWater.canUploadData(encoded, target, "2026-07-18T03:01:01.000Z"),
     ).toBe(true);
     expect(highWater.canUploadData(encoded, target, "not-a-time")).toBe(false);
+    database.close();
+  });
+
+  it("keys new local-transmission suppression by exact destination and Info", () => {
+    const database = new GatewayDatabase(":memory:");
+    const highWater = new AprsRemoteHighWaterStore(database.connection);
+    const encoded = encode(event("2026-07-18T00:00:35.000Z"));
+    const packet = parseCmClientAprsLine(encoded);
+    if (!packet) {
+      throw new Error("fixture APRS packet did not parse");
+    }
+    const alternateDestination = encoded.replace(
+      `>${packet.destination}`,
+      ">APCM20",
+    );
+
+    highWater.recordLocalTransmission(encoded, "2026-07-18T00:01:00.000Z");
+
+    expect(
+      highWater.canUploadData(encoded, target, "2026-07-18T00:01:01.000Z"),
+    ).toBe(false);
+    expect(
+      highWater.canUploadData(
+        alternateDestination,
+        target,
+        "2026-07-18T00:01:01.000Z",
+      ),
+    ).toBe(true);
     database.close();
   });
 });
@@ -102,9 +162,9 @@ describe("AprsIsRxClient", () => {
         buffer = parts.pop() ?? "";
         loginLines.push(...parts.filter(Boolean));
         if (loginLines.length === 1) {
-          socket.write("# logresp TEST");
+          socket.write("# logresp TEST01-");
           socket.write(
-            `01 verified, fixture\r\n${encode(event("2026-07-18T00:00:35.000Z"))}\r\n`,
+            `CM verified, fixture\r\n${encode(event("2026-07-18T00:00:35.000Z"))}\r\n`,
           );
         }
       });
@@ -119,7 +179,7 @@ describe("AprsIsRxClient", () => {
       host: "127.0.0.1",
       port: address.port,
       authorizationProvider: authorization(
-        "user TEST01 pass 11111 vers CMClient 2.0",
+        "user TEST01-CM pass 17602 vers CMClient 2.0",
       ),
       provisionFingerprint: PROVISION_FINGERPRINT,
       filterExpression: "b/TEST01-7",
@@ -129,10 +189,162 @@ describe("AprsIsRxClient", () => {
     await waitFor(() => loginLines.length === 1 && received.length === 1);
 
     expect(loginLines).toEqual([
-      "user TEST01 pass 11111 vers CMClient 2.0 filter b/TEST01-7",
+      "user TEST01-CM pass 17602 vers CMClient 2.0 filter b/TEST01-7",
     ]);
     expect(received).toEqual([encode(event("2026-07-18T00:00:35.000Z"))]);
     await session.close();
+    await close(server);
+  });
+
+  it.each(["end", "reset", "destroy"] as const)(
+    "signals one post-login termination when the peer uses %s",
+    async (terminationMode) => {
+      let peer: Socket | undefined;
+      const server = net.createServer((socket) => {
+        peer = socket;
+        socket.on("error", () => undefined);
+        socket.once("data", () => {
+          socket.write("# logresp TEST01-CM verified, fixture\r\n");
+        });
+      });
+      server.listen({ host: "127.0.0.1", port: 0 });
+      await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("fixture APRS server did not bind");
+      }
+      const errors: unknown[] = [];
+      const client = new AprsIsRxClient({
+        host: "127.0.0.1",
+        port: address.port,
+        authorizationProvider: authorization(
+          "user TEST01-CM pass 17602 vers CMClient 2.0",
+        ),
+        provisionFingerprint: PROVISION_FINGERPRINT,
+        filterExpression: "b/TEST01-7",
+      });
+
+      const session = await client.connect(
+        () => undefined,
+        (error) => errors.push(error),
+      );
+      const terminated = session.terminated;
+      if (!terminated || !peer) {
+        throw new Error("fixture monitor session did not expose termination");
+      }
+      let terminationSignals = 0;
+      void terminated.then(() => {
+        terminationSignals += 1;
+      });
+
+      if (terminationMode === "end") {
+        peer.end();
+      } else if (terminationMode === "reset") {
+        peer.resetAndDestroy();
+      } else {
+        peer.destroy();
+      }
+      await settlesWithin(terminated, 1_000);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(terminationSignals).toBe(1);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({ code: "APRS_MONITOR_INVALID" });
+      await session.close();
+      expect(terminationSignals).toBe(1);
+      await close(server);
+    },
+  );
+
+  it.each([
+    ["observer", "user TEST01-CM pass 17602 vers CMClient 2.0"],
+    ["transmitter", "user TEST01 pass 11111 vers CMClient 2.0"],
+  ] as const)(
+    "rejects an unverified %s logresp status",
+    async (_mode, loginLine) => {
+      const server = net.createServer((socket) => {
+        socket.once("data", () => {
+          const callsign = /^user\s+(\S+)/.exec(loginLine)?.[1];
+          socket.write(`# logresp ${callsign} unverified, fixture\r\n`);
+        });
+      });
+      server.listen({ host: "127.0.0.1", port: 0 });
+      await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("fixture APRS server did not bind");
+      }
+      const client = new AprsIsRxClient({
+        host: "127.0.0.1",
+        port: address.port,
+        authorizationProvider: authorization(loginLine),
+        provisionFingerprint: PROVISION_FINGERPRINT,
+        filterExpression: "b/TEST01-7",
+      });
+
+      await expect(client.connect(() => undefined)).rejects.toMatchObject({
+        code: "APRS_MONITOR_INVALID",
+      });
+      await close(server);
+    },
+  );
+
+  it("keeps termination signals isolated between rotated sessions", async () => {
+    const peers: Socket[] = [];
+    const server = net.createServer((socket) => {
+      peers.push(socket);
+      socket.on("error", () => undefined);
+      socket.once("data", (chunk: Buffer) => {
+        const callsign = /^user\s+(\S+)/.exec(chunk.toString("utf8"))?.[1];
+        if (callsign) {
+          socket.write(`# logresp ${callsign} verified, fixture\r\n`);
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const createClient = (loginLine: string, provisionFingerprint: string) =>
+      new AprsIsRxClient({
+        host: "127.0.0.1",
+        port: address.port,
+        authorizationProvider: authorization(loginLine, provisionFingerprint),
+        provisionFingerprint,
+        filterExpression: "b/TEST01-7",
+      });
+    const first = await createClient(
+      "user TEST01-CM pass 17602 vers CMClient 2.0",
+      PROVISION_FINGERPRINT,
+    ).connect(() => undefined);
+    const received: string[] = [];
+    const second = await createClient(
+      "user AB12CD-CM pass 16598 vers CMClient 2.0",
+      ROTATED_PROVISION_FINGERPRINT,
+    ).connect((line) => received.push(line));
+    if (!first.terminated || !second.terminated || peers.length !== 2) {
+      throw new Error("fixture monitor sessions were not established");
+    }
+    let secondTerminated = false;
+    void second.terminated.then(() => {
+      secondTerminated = true;
+    });
+
+    peers[0]!.destroy();
+    await settlesWithin(first.terminated, 1_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(secondTerminated).toBe(false);
+
+    const line = encode(event("2026-07-18T00:00:35.000Z"));
+    peers[1]!.write(`${line}\r\n`);
+    await waitFor(() => received.length === 1);
+    expect(received).toEqual([line]);
+
+    await second.close();
+    await settlesWithin(second.terminated, 1_000);
+    expect(secondTerminated).toBe(true);
     await close(server);
   });
 
@@ -163,7 +375,7 @@ describe("AprsIsRxClient", () => {
       host: "127.0.0.1",
       port: address.port,
       authorizationProvider: authorization(
-        "user TEST01 pass 11111 vers CMClient 2.0",
+        "user A-CM pass 13026 vers CMClient 2.0",
       ),
       provisionFingerprint: PROVISION_FINGERPRINT,
       filterExpression: "b/TEST01-7",
@@ -176,7 +388,7 @@ describe("AprsIsRxClient", () => {
       host: "127.0.0.1",
       port: address.port,
       authorizationProvider: authorization(
-        "user AB12CD-7 pass 22222 vers CMClient 2.0",
+        "user AB-CM pass 12960 vers CMClient 2.0",
         ROTATED_PROVISION_FINGERPRINT,
       ),
       provisionFingerprint: ROTATED_PROVISION_FINGERPRINT,
@@ -187,8 +399,8 @@ describe("AprsIsRxClient", () => {
     await second.close();
 
     expect(sessions.map((lines) => lines[0])).toEqual([
-      "user TEST01 pass 11111 vers CMClient 2.0 filter b/TEST01-7",
-      "user AB12CD-7 pass 22222 vers CMClient 2.0 filter b/TEST01-7",
+      "user A-CM pass 13026 vers CMClient 2.0 filter b/TEST01-7",
+      "user AB-CM pass 12960 vers CMClient 2.0 filter b/TEST01-7",
     ]);
     await close(server);
   });
@@ -266,6 +478,10 @@ describe("AprsIsRxClient", () => {
       },
       authorization("user TEST01 pass 11111\r\nuser injected"),
       authorization("x".repeat(513)),
+      authorization("user AB-CM pass -1 vers CMClient 2.0"),
+      authorization("user TEST01-CM pass -1 vers CMClient 2.0"),
+      authorization("user TEST01-CM pass invalid vers CMClient 2.0"),
+      authorization("user TEST01-CM pass 32768 vers CMClient 2.0"),
       authorization(
         "user TEST01 pass 11111 vers CMClient 2.0",
         ROTATED_PROVISION_FINGERPRINT,

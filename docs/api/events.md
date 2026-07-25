@@ -128,9 +128,14 @@ callmesh.status
 callmesh.error
 callmesh.mapping.conflict
 aprs.outbox.queued
-aprs.outbox.sent
+aprs.outbox.submitted
+aprs.outbox.observer_confirmed
 aprs.outbox.failed
 aprs.outbox.error
+aprs.igate.submitted
+aprs.igate.observer_confirmed
+aprs.igate.error
+aprs.igate.counter.error
 aprs.monitor.idle
 aprs.monitor.connected
 aprs.monitor.observed
@@ -146,6 +151,18 @@ telemetry.retention.completed
 job.created
 job.status_changed
 ```
+
+`aprs.outbox.submitted` means the local socket write completed; it is not
+server acceptance or delivery proof. `aprs.outbox.observer_confirmed` is emitted only after the
+separate receive monitor observes an exact source, destination, and information
+match at or after submission. Consumers must refresh the REST projection for
+the durable `deliveryStatus`; they must not translate `status: sent` into a
+confirmed delivery.
+
+The iGate-family equivalents carry only the station packet kind or a stable
+error code. They never expose the packet line, provision identity, coordinates,
+or comment. `aprs.igate.submitted` is likewise transport-only;
+`aprs.igate.observer_confirmed` is the corresponding exact receive observation.
 
 `GET /api/v1/jobs/:jobId/events` filters the same stream to that Job's
 `job.created` and `job.status_changed` events. It does not send an initial Job

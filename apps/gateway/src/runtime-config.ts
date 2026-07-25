@@ -24,6 +24,7 @@ import { MeshtasticProtobufCodec } from "./protobuf/protobuf.js";
 import { loadMeshtasticSchema } from "./protobuf/schema.js";
 import { projectSyntheticCapture } from "./protobuf/synthetic-capture.js";
 import { PacketRecorder } from "./recorder.js";
+import { compiledGatewayBuildVersion } from "./system.js";
 import {
   NativeSerialPortAdapter,
   SerialMeshtasticTransport,
@@ -133,6 +134,7 @@ export async function createConfiguredMeshGatewayRuntime(
   database: GatewayDatabase,
   eventBus: DomainEventBus,
   aprsStateProvider?: () => CallMeshAprsState | undefined,
+  aprsRuntime?: Pick<AprsGatewayRuntime, "recordDecodedSummary">,
 ): Promise<MeshGatewayRuntime | undefined> {
   const kind =
     environment.CMCLIENT_MESHTASTIC_TRANSPORT?.trim().toLowerCase() ||
@@ -214,6 +216,12 @@ export async function createConfiguredMeshGatewayRuntime(
       ...(aprsStateProvider
         ? { stateProvider: createAprsRuntimeStateProvider(aprsStateProvider) }
         : {}),
+      ...(aprsRuntime
+        ? {
+            onDecodedSummary: (type: string, timestampMs: number) =>
+              aprsRuntime.recordDecodedSummary(type, timestampMs),
+          }
+        : {}),
     },
   });
 }
@@ -293,28 +301,30 @@ export function createConfiguredAprsGatewayRuntime(
   const monitorAuthorizationProvider =
     observerConnectionAuthorization(stateProvider);
   const { host, port, timeoutMs } = parseAprsEndpointOptions(environment);
-  const worker = new AprsOutboxWorker(
-    database.aprsOutbox,
-    new AprsIsTcpClient({
-      host,
-      port,
-      authorizationProvider,
-      timeoutMs,
-    }),
-    {
-      authorizationProvider: () => stateProvider()?.provisionFingerprint,
-      clock: () => new Date(),
-      initialDelayMs: 1_000,
-      maximumDelayMs: 60_000,
-    },
-  );
+  const transport = new AprsIsTcpClient({
+    host,
+    port,
+    authorizationProvider,
+    timeoutMs,
+  });
+  const worker = new AprsOutboxWorker(database.aprsOutbox, transport, {
+    authorizationProvider: () => stateProvider()?.provisionFingerprint,
+    clock: () => new Date(),
+    initialDelayMs: 1_000,
+    maximumDelayMs: 60_000,
+  });
   return new AprsGatewayRuntime({
     database,
     eventBus,
     stateProvider,
     outbox: worker,
+    stationTransport: transport,
+    version: compiledGatewayBuildVersion(),
     monitorClientFactory: (filterExpression, provisionFingerprint) => ({
-      connect: (onLine: (line: string) => void): Promise<AprsIsRxSession> =>
+      connect: (
+        onLine: (line: string) => void,
+        onLineError?: (error: unknown) => void,
+      ): Promise<AprsIsRxSession> =>
         new AprsIsRxClient({
           host,
           port,
@@ -322,7 +332,7 @@ export function createConfiguredAprsGatewayRuntime(
           provisionFingerprint: provisionFingerprint ?? "",
           filterExpression,
           timeoutMs,
-        }).connect(onLine),
+        }).connect(onLine, onLineError),
     }),
     flushIntervalMs: parsePositiveInteger(
       environment.CMCLIENT_APRS_FLUSH_INTERVAL_MS,

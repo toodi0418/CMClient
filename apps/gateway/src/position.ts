@@ -198,7 +198,7 @@ export class PositionRepository {
       const eventsDeleted = Number(
         this.database
           .prepare(
-            "DELETE FROM position_events WHERE id IN (SELECT event.id FROM position_events AS event INDEXED BY position_events_retention_index WHERE event.created_at < ? AND NOT EXISTS (SELECT 1 FROM position_decisions AS decision WHERE decision.canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM node_position_state AS state WHERE state.latest_canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM aprs_delivery_high_water AS delivery WHERE delivery.latest_canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM aprs_outbox AS outbox WHERE outbox.canonical_event_id = event.id) ORDER BY event.created_at ASC, event.id ASC LIMIT ?)",
+            "DELETE FROM position_events WHERE id IN (SELECT event.id FROM position_events AS event INDEXED BY position_events_retention_index WHERE event.created_at < ? AND NOT EXISTS (SELECT 1 FROM position_decisions AS decision WHERE decision.canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM node_position_state AS state WHERE state.latest_canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM aprs_delivery_high_water AS delivery WHERE delivery.latest_canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM aprs_legacy_submission_barriers AS barrier WHERE barrier.latest_canonical_event_id = event.id) AND NOT EXISTS (SELECT 1 FROM aprs_outbox AS outbox WHERE outbox.canonical_event_id = event.id) ORDER BY event.created_at ASC, event.id ASC LIMIT ?)",
           )
           .run(cutoff, limit).changes,
       );
@@ -308,7 +308,7 @@ export class PositionHighWaterStore {
         observation.backlogClassification === "backlog"
           ? { advance: false, code: "POSITION_BACKLOG" as const }
           : localPlan.advance &&
-              this.isCoveredByDeliveryHighWater(eventWithEpoch, target)
+              this.isCoveredByAprsOrderBarrier(eventWithEpoch, target)
             ? { advance: false, code: "APRS_SKIPPED_OUT_OF_ORDER" as const }
             : localPlan;
       const state = plan.advance
@@ -357,18 +357,30 @@ export class PositionHighWaterStore {
     return row ? toNodePositionState(row) : undefined;
   }
 
-  private isCoveredByDeliveryHighWater(
+  private isCoveredByAprsOrderBarrier(
     event: PositionCanonicalEvent,
     target: PositionMappingTarget,
   ): boolean {
-    const row = this.database
+    const rows = this.database
       .prepare(
-        "SELECT latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number FROM aprs_delivery_high_water WHERE mesh_network_id = ? AND node_num = ? AND callsign = ?",
+        "SELECT latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number FROM aprs_delivery_high_water WHERE mesh_network_id = ? AND node_num = ? AND callsign = ? UNION ALL SELECT latest_canonical_event_id, latest_mapping_version, latest_event_time, latest_sequence_epoch, latest_sequence_number FROM aprs_legacy_submission_barriers WHERE mesh_network_id = ? AND node_num = ? AND callsign = ?",
       )
-      .get(event.meshNetworkId, event.nodeNum, target.callsign);
-    if (!row) {
-      return false;
-    }
+      .all(
+        event.meshNetworkId,
+        event.nodeNum,
+        target.callsign,
+        event.meshNetworkId,
+        event.nodeNum,
+        target.callsign,
+      );
+    return rows.some((row) => this.orderBarrierCovers(row, event, target));
+  }
+
+  private orderBarrierCovers(
+    row: Record<string, unknown>,
+    event: PositionCanonicalEvent,
+    target: PositionMappingTarget,
+  ): boolean {
     const latestEventTime = String(row.latest_event_time);
     if (
       !event.eventTime ||

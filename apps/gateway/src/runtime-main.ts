@@ -182,6 +182,7 @@ export async function runGateway(): Promise<void> {
       activeDatabase,
       activeEvents,
       verifiedAprsState,
+      aprs,
     );
     context.throwIfShutdownRequested();
 
@@ -224,6 +225,8 @@ export async function runGateway(): Promise<void> {
         status: () => mesh?.status() ?? { configured: false },
       },
       {
+        listStationSubmissions: (limit) =>
+          aprs?.listStationSubmissions(limit) ?? [],
         status: () =>
           aprs?.status() ?? {
             configured: false,
@@ -232,6 +235,8 @@ export async function runGateway(): Promise<void> {
             mappedCallsigns: 0,
             pendingOutbox: 0,
             failedOutbox: 0,
+            pendingStationSubmissions: 0,
+            failedStationSubmissions: 0,
           },
       },
       { capability: bootstrap.capability },

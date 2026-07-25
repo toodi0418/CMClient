@@ -20,6 +20,7 @@ describe("Gateway OpenAPI contract", () => {
     expect(Object.keys(document.paths).sort()).toEqual([
       "/api/v1/aprs",
       "/api/v1/aprs/outbox",
+      "/api/v1/aprs/station-submissions",
       "/api/v1/backups",
       "/api/v1/callmesh",
       "/api/v1/diagnostics/integrity-check",
@@ -117,7 +118,7 @@ describe("Gateway OpenAPI contract", () => {
     );
     expect(JSON.stringify(document)).not.toContain(capability);
     expect(gatewayOpenApiDocumentDigest(document)).toBe(
-      "5767de40ace8b01abb0f06387d823790671f1b1f341a4eb467206f64af214de2",
+      "6c19501f8ad259113993ea3e30949b69f650bb7df5c7e647e5a8889ceb2a3c98",
     );
 
     await app.close();

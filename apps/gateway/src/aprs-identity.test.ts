@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AprsRuntimeIdentityError,
+  connectionAuthorization,
   deriveAprsPasscode,
   deriveAprsRuntimeIdentity,
   deriveAprsRuntimeState,
@@ -56,10 +57,82 @@ describe("CallMesh provision APRS identity", () => {
       mappingsFingerprint: "b".repeat(64),
     });
 
-    expect(observerConnectionAuthorization(() => state)()).toEqual({
+    const transmitter = connectionAuthorization(() => state)();
+    const observer = observerConnectionAuthorization(() => state)();
+
+    expect(observer).toEqual({
       loginLine: "user TEST01-CM pass 17602 vers CMClient 2.0",
       provisionFingerprint: "a".repeat(64),
     });
+    expect(observer?.loginLine).not.toBe(transmitter?.loginLine);
+    expect(/^user\s+(\S+)/.exec(observer?.loginLine ?? "")?.[1]).toHaveLength(
+      9,
+    );
+  });
+
+  it("returns no observer authorization while provision state is unavailable", () => {
+    expect(observerConnectionAuthorization(() => undefined)()).toBeUndefined();
+  });
+
+  it.each([
+    ["A", 13_026],
+    ["AB", 12_960],
+  ])(
+    "supports a %s short base callsign for the verified observer login",
+    (callsignBase, passcode) => {
+      const state = deriveAprsRuntimeState({
+        provision: { ...baseProvision, callsignBase },
+        provisionFingerprint: "a".repeat(64),
+        mappings: [],
+        mappingsFingerprint: "b".repeat(64),
+      });
+
+      expect(observerConnectionAuthorization(() => state)()).toEqual({
+        loginLine: `user ${callsignBase}-CM pass ${passcode} vers CMClient 2.0`,
+        provisionFingerprint: "a".repeat(64),
+      });
+    },
+  );
+
+  it("fails closed for invalid or colliding observer identities", () => {
+    const state = deriveAprsRuntimeState({
+      provision: baseProvision,
+      provisionFingerprint: "a".repeat(64),
+      mappings: [],
+      mappingsFingerprint: "b".repeat(64),
+    });
+    const invalidStates = [
+      {
+        ...state,
+        identity: {
+          ...state.identity,
+          callsignBase: "TOOLONG",
+          callsign: "TOOLONG-7",
+        },
+      },
+      {
+        ...state,
+        identity: { ...state.identity, callsign: "TEST01-CM" },
+      },
+      {
+        ...state,
+        mappings: [
+          {
+            version: "mapping-v1",
+            effectiveAt: "2026-07-25T00:00:00.000Z",
+            meshNetworkId: "fixture-network",
+            nodeNum: 42,
+            callsign: "TEST01-CM",
+          },
+        ],
+      },
+    ];
+
+    for (const invalidState of invalidStates) {
+      expect(() =>
+        observerConnectionAuthorization(() => invalidState)(),
+      ).toThrow(AprsRuntimeIdentityError);
+    }
   });
 
   it("normalizes comment whitespace and resolves a symbol overlay for the wire", () => {

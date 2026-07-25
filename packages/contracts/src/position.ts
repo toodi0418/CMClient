@@ -112,24 +112,85 @@ export const AprsOutboxStatusSchema = Type.Union(
   ["queued", "sending", "sent", "failed"].map((status) => Type.Literal(status)),
 );
 
+export const AprsDeliveryStatusSchema = Type.Union(
+  [
+    "queued",
+    "sending",
+    "failed",
+    "submitted",
+    "observer_confirmed",
+    "observation_expired",
+  ].map((status) => Type.Literal(status)),
+);
+
 export const AprsOutboxEntrySchema = Type.Object(
   {
     id: Type.String({ minLength: 1, maxLength: 128 }),
     callsign: Type.String({ minLength: 1, maxLength: 16 }),
     canonicalEventId: Type.String({ minLength: 1, maxLength: 128 }),
     status: AprsOutboxStatusSchema,
+    deliveryStatus: AprsDeliveryStatusSchema,
     attempts: Type.Integer({ minimum: 0 }),
     nextAttemptAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
     createdAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
     updatedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
     lastErrorCode: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
     sentAt: Type.Optional(Type.String({ pattern: UTC_ISO_TIMESTAMP })),
+    submittedAt: Type.Optional(Type.String({ pattern: UTC_ISO_TIMESTAMP })),
+    observerConfirmedAt: Type.Optional(
+      Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    ),
+    observationExpiresAt: Type.Optional(
+      Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    ),
   },
   { additionalProperties: false },
 );
 
 export const AprsOutboxEntryListSchema = Type.Object(
   { items: Type.Array(AprsOutboxEntrySchema, { maxItems: 200 }) },
+  { additionalProperties: false },
+);
+
+export const APRS_IGATE_PACKET_KINDS = [
+  "beacon",
+  "status",
+  "telemetry-parm",
+  "telemetry-unit",
+  "telemetry-eqns",
+  "telemetry-data",
+] as const;
+
+export const APRS_IGATE_DELIVERY_STATUSES = [
+  "sending",
+  "transmission_uncertain",
+  "submitted",
+  "observer_confirmed",
+  "observation_expired",
+] as const;
+
+export const AprsIgateSubmissionSchema = Type.Object(
+  {
+    id: Type.String({ minLength: 1, maxLength: 128 }),
+    packetKind: Type.Union(
+      APRS_IGATE_PACKET_KINDS.map((kind) => Type.Literal(kind)),
+    ),
+    deliveryStatus: Type.Union(
+      APRS_IGATE_DELIVERY_STATUSES.map((status) => Type.Literal(status)),
+    ),
+    attemptedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    updatedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    submittedAt: Type.Optional(Type.String({ pattern: UTC_ISO_TIMESTAMP })),
+    observerConfirmedAt: Type.Optional(
+      Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    ),
+    observationExpiresAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+  },
+  { additionalProperties: false },
+);
+
+export const AprsIgateSubmissionListSchema = Type.Object(
+  { items: Type.Array(AprsIgateSubmissionSchema, { maxItems: 200 }) },
   { additionalProperties: false },
 );
 
@@ -150,6 +211,8 @@ export const AprsRuntimeStatusSchema = Type.Object(
     mappedCallsigns: Type.Integer({ minimum: 0 }),
     pendingOutbox: Type.Integer({ minimum: 0 }),
     failedOutbox: Type.Integer({ minimum: 0 }),
+    pendingStationSubmissions: Type.Integer({ minimum: 0 }),
+    failedStationSubmissions: Type.Integer({ minimum: 0 }),
     lastErrorCode: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
   },
   { additionalProperties: false },
@@ -217,6 +280,13 @@ export type PositionCanonicalEventList = Static<
 >;
 export type AprsOutboxEntry = Static<typeof AprsOutboxEntrySchema>;
 export type AprsOutboxEntryList = Static<typeof AprsOutboxEntryListSchema>;
+export type AprsIgatePacketKind = (typeof APRS_IGATE_PACKET_KINDS)[number];
+export type AprsIgateDeliveryStatus =
+  (typeof APRS_IGATE_DELIVERY_STATUSES)[number];
+export type AprsIgateSubmission = Static<typeof AprsIgateSubmissionSchema>;
+export type AprsIgateSubmissionList = Static<
+  typeof AprsIgateSubmissionListSchema
+>;
 export type AprsMonitorStatus = (typeof APRS_MONITOR_STATUSES)[number];
 export type AprsRuntimeStatus = Static<typeof AprsRuntimeStatusSchema>;
 export type PositionDecision = Static<typeof PositionDecisionSchema>;

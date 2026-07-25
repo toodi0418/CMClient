@@ -2,7 +2,7 @@ import type { PositionCanonicalEvent } from "@cmclient/contracts";
 
 const APRS_DESTINATION = "APTMAG";
 const APRS_TRACKER_PATH = "MESHD*,qAO";
-const MAX_APRS_LINE_BYTES = 512;
+const MAX_APRS_DATA_BYTES = 510;
 const APRS_CALLSIGN = /^[A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?$/;
 const APRS_PRINTABLE_CHARACTER = /^[ -~]$/;
 
@@ -14,6 +14,7 @@ export interface AprsPositionEncodingOptions {
   mappingSymbolOverlay?: string | null;
   mappingComment?: string;
   mappingAltitudeMeters?: number;
+  provisionAltitudeMeters?: number;
   provisionIgateCallsign: string;
 }
 
@@ -51,13 +52,20 @@ export function encodeAprsPosition(
     options.mappingSymbolOverlay ?? options.mappingSymbolTable;
   const courseSpeed = formatCourseSpeed(position);
   const altitude = formatAltitude(
-    position.altitudeMslMeters ?? options.mappingAltitudeMeters,
+    position.altitudeMslMeters ??
+      options.mappingAltitudeMeters ??
+      (options.mappingCallsign === options.provisionIgateCallsign
+        ? options.provisionAltitudeMeters
+        : undefined),
   );
-  const comment = sanitizeComment(options.mappingComment);
-  const info = `!${latitude}${symbolTable}${longitude}${options.mappingSymbolCode}${courseSpeed}${altitude}${comment}`;
-  const data = `${options.mappingCallsign}>${APRS_DESTINATION},${APRS_TRACKER_PATH},${options.provisionIgateCallsign}:${info}`;
+  const mandatory = `${options.mappingCallsign}>${APRS_DESTINATION},${APRS_TRACKER_PATH},${options.provisionIgateCallsign}:!${latitude}${symbolTable}${longitude}${options.mappingSymbolCode}${courseSpeed}${altitude}`;
+  const comment = truncateOptionalComment(
+    sanitizeComment(options.mappingComment),
+    mandatory,
+  );
+  const data = `${mandatory}${comment}`;
 
-  if (Buffer.byteLength(data, "utf8") > MAX_APRS_LINE_BYTES) {
+  if (Buffer.byteLength(data, "utf8") > MAX_APRS_DATA_BYTES) {
     throw new AprsPositionEncodingError();
   }
   return { data };
@@ -75,7 +83,9 @@ function validateOptions(options: AprsPositionEncodingOptions): void {
     (options.mappingComment !== undefined &&
       typeof options.mappingComment !== "string") ||
     (options.mappingAltitudeMeters !== undefined &&
-      !Number.isFinite(options.mappingAltitudeMeters))
+      !Number.isFinite(options.mappingAltitudeMeters)) ||
+    (options.provisionAltitudeMeters !== undefined &&
+      !Number.isFinite(options.provisionAltitudeMeters))
   ) {
     throw new AprsPositionEncodingError();
   }
@@ -149,6 +159,23 @@ function sanitizeComment(comment: string | undefined): string {
     .replace(/[\r\n]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function truncateOptionalComment(comment: string, mandatory: string): string {
+  let bytes = Buffer.byteLength(mandatory, "utf8");
+  if (bytes > MAX_APRS_DATA_BYTES) {
+    throw new AprsPositionEncodingError();
+  }
+  let retained = "";
+  for (const codePoint of comment) {
+    const codePointBytes = Buffer.byteLength(codePoint, "utf8");
+    if (bytes + codePointBytes > MAX_APRS_DATA_BYTES) {
+      break;
+    }
+    retained += codePoint;
+    bytes += codePointBytes;
+  }
+  return retained;
 }
 
 function isTimestamp(value: string | undefined): value is string {

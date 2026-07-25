@@ -13,11 +13,21 @@ sequence-only cold start, remote marker reconciliation, and mapping-version
 isolation. It also locks precision 32, MSL altitude zero, and partial
 speed/track behavior.
 
-Outbox retention regression coverage sends a canonical event, expires its sent
-row, rotates the mapping version, and replays the same event. The durable
-delivery watermark must keep the replay ineligible, produce no new outbox row,
-and perform no second APRS upload while the mapping-version-scoped position
-states remain isolated.
+Outbox retention regression coverage submits a canonical event, independently
+observes the exact source, destination, and information tuple, expires its
+observer-confirmed row, rotates the mapping version, and replays the same
+event. The durable delivery watermark must keep the replay ineligible, produce
+no new outbox row, and perform no second APRS upload while the
+mapping-version-scoped position states remain isolated. A separate regression
+expires an unobserved submission and proves that it creates no delivery
+watermark.
+
+Migration regression coverage also upgrades a newer legacy `sent` snapshot
+beside an older queued snapshot. The old watermark becomes a permanent order
+barrier rather than delivery proof; the worker flush performs zero transport
+writes, and replay admission remains fail-closed. Destinationless observer and
+local caches migrate as suppression wildcards but are never accepted as
+confirmation evidence.
 
 Ordering regressions also freeze a queued snapshot across a pre-send mapping
 rotation, preserve a reboot-generated epoch across a new store instance, and

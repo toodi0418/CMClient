@@ -25,6 +25,7 @@ export interface AprsMonitorTarget {
 
 export interface AprsRemotePosition {
   callsign: string;
+  destination: string;
   info: string;
   infoDigest: string;
 }
@@ -43,7 +44,7 @@ export interface AprsMonitorResult {
 
 export interface AprsIsRxSession {
   close(): Promise<void>;
-  terminated?: Promise<void>;
+  readonly terminated?: Promise<void>;
 }
 
 export class AprsMonitorError extends Error {
@@ -93,15 +94,21 @@ export class AprsRemoteHighWaterStore {
       transactionOpen = true;
       const existing = this.database
         .prepare(
-          "SELECT last_observed_at FROM aprs_observed_packets WHERE callsign = ? AND info = ?",
+          "SELECT last_observed_at FROM aprs_observed_packets WHERE callsign = ? AND destination = ? AND info = ?",
         )
-        .get(remote.callsign, remote.info);
+        .get(remote.callsign, remote.destination, remote.info);
       const advanced = !existing;
       this.database
         .prepare(
-          "INSERT INTO aprs_observed_packets (callsign, info, first_observed_at, last_observed_at) VALUES (?, ?, ?, ?) ON CONFLICT(callsign, info) DO UPDATE SET last_observed_at = excluded.last_observed_at",
+          "INSERT INTO aprs_observed_packets (callsign, destination, info, first_observed_at, last_observed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(callsign, destination, info) DO UPDATE SET last_observed_at = excluded.last_observed_at",
         )
-        .run(remote.callsign, remote.info, receivedAt, receivedAt);
+        .run(
+          remote.callsign,
+          remote.destination,
+          remote.info,
+          receivedAt,
+          receivedAt,
+        );
       this.pruneInsideTransaction(receivedAt);
       this.database.exec("COMMIT");
       transactionOpen = false;
@@ -143,14 +150,14 @@ export class AprsRemoteHighWaterStore {
       ).toISOString();
       const observed = this.database
         .prepare(
-          "SELECT 1 FROM aprs_observed_packets WHERE callsign = ? AND info = ? AND last_observed_at >= ?",
+          "SELECT 1 FROM aprs_observed_packets WHERE callsign = ? AND info = ? AND (destination = ? OR destination = '') AND last_observed_at >= ?",
         )
-        .get(packet.callsign, packet.info, observerCutoff);
+        .get(packet.callsign, packet.info, packet.destination, observerCutoff);
       const transmitted = this.database
         .prepare(
-          "SELECT 1 FROM aprs_local_transmissions WHERE callsign = ? AND info = ? AND transmitted_at >= ?",
+          "SELECT 1 FROM aprs_local_transmissions WHERE callsign = ? AND info = ? AND (destination = ? OR destination = '') AND transmitted_at >= ?",
         )
-        .get(packet.callsign, packet.info, localCutoff);
+        .get(packet.callsign, packet.info, packet.destination, localCutoff);
       return !observed && !transmitted;
     } catch {
       return false;
@@ -165,9 +172,9 @@ export class AprsRemoteHighWaterStore {
     try {
       this.database
         .prepare(
-          "INSERT INTO aprs_local_transmissions (callsign, info, transmitted_at) VALUES (?, ?, ?) ON CONFLICT(callsign, info) DO UPDATE SET transmitted_at = excluded.transmitted_at",
+          "INSERT INTO aprs_local_transmissions (callsign, destination, info, transmitted_at) VALUES (?, ?, ?, ?) ON CONFLICT(callsign, destination, info) DO UPDATE SET transmitted_at = excluded.transmitted_at",
         )
-        .run(packet.callsign, packet.info, transmittedAt);
+        .run(packet.callsign, packet.destination, packet.info, transmittedAt);
     } catch {
       throw new AprsMonitorPersistenceError();
     }
@@ -270,14 +277,15 @@ export class AprsIsRxClient {
       this.options.authorizationProvider,
       this.options.provisionFingerprint,
     );
-    const callsign = authorizationCallsign(authorization);
+    const login = authorizationLogin(authorization);
     const socket = net.createConnection({
       host: this.options.host,
       port: this.options.port,
     });
     const reader = attachVerifiedLineReader(
       socket,
-      callsign,
+      login.callsign,
+      login.expectedStatus,
       this.options.timeoutMs ?? 10_000,
       onLine,
       onLineError,
@@ -335,18 +343,24 @@ export function parseCmClientAprsLine(
     return undefined;
   }
   const header =
-    /^([A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?)>[A-Z0-9]{1,6}(?:-[0-9]{1,2})?(?:,[^:\r\n]*)?:(.*)$/i.exec(
+    /^([A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?)>([A-Z0-9]{1,6}(?:-[0-9]{1,2})?)(?:,[^:\r\n]*)?:(.*)$/i.exec(
       line,
     );
   if (!header) {
     return undefined;
   }
   const callsign = header[1]!.toUpperCase();
-  const info = header[2]!;
+  const destination = header[2]!.toUpperCase();
+  const info = header[3]!;
   if (!APRS_CALLSIGN_PATTERN.test(callsign) || info.length === 0) {
     return undefined;
   }
-  return { callsign, info, infoDigest: digestInfo(callsign, info) };
+  return {
+    callsign,
+    destination,
+    info,
+    infoDigest: digestInfo(callsign, info),
+  };
 }
 
 function digestInfo(callsign: string, info: string): string {
@@ -437,16 +451,27 @@ function isValidLoginLine(value: unknown): value is string {
   );
 }
 
-function authorizationCallsign(
-  authorization: AprsConnectionAuthorization,
-): string {
-  const match = /^user\s+([^\s]+)\s+pass\s+[^\s]+(?:\s|$)/.exec(
+function authorizationLogin(authorization: AprsConnectionAuthorization): {
+  callsign: string;
+  expectedStatus: "verified";
+} {
+  const match = /^user\s+([^\s]+)\s+pass\s+([0-9]{1,5})(?:\s|$)/.exec(
     authorization.loginLine,
   );
-  if (!match || !APRS_LOGIN_CALLSIGN_PATTERN.test(match[1]!)) {
+  const passcode = Number(match?.[2]);
+  if (
+    !match ||
+    !APRS_LOGIN_CALLSIGN_PATTERN.test(match[1]!) ||
+    !Number.isInteger(passcode) ||
+    passcode < 0 ||
+    passcode > 32_767
+  ) {
     throw new AprsMonitorAuthorizationError();
   }
-  return match[1]!;
+  return {
+    callsign: match[1]!,
+    expectedStatus: "verified",
+  };
 }
 
 function authorizationMatches(
@@ -482,6 +507,7 @@ function parseLogresp(
 function attachVerifiedLineReader(
   socket: Socket,
   expectedCallsign: string,
+  expectedStatus: "verified",
   timeoutMs: number,
   onLine: (line: string) => void,
   onLineError: (error: unknown) => void,
@@ -540,7 +566,7 @@ function attachVerifiedLineReader(
       if (
         logresp === "malformed" ||
         logresp.callsign !== expectedCallsign ||
-        logresp.status !== "verified"
+        logresp.status !== expectedStatus
       ) {
         fail();
         return;

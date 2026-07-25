@@ -101,14 +101,24 @@ without opening a monitor session.
 - configured/running state;
 - monitor state (`stopped`, `idle`, `connecting`, `connected`, or `error`);
 - mapped callsign count;
-- pending and failed durable outbox counts; and
+- pending and failed durable Tracker outbox counts;
+- pending and failed durable station-submission counts; and
 - an optional stable last error code.
 
 `GET /api/v1/aprs/outbox` remains the bounded per-entry projection and excludes
-the deterministic APRS Data line. The Agent's APRS control projection, Web,
+the deterministic APRS Data line. It exposes transport and delivery state
+separately: a completed socket write is `submitted`, while only an exact later
+RX-monitor observation is `observer_confirmed` and may advance delivery
+high-water. The Agent's APRS control projection, Web,
 Desktop, and CLI consume the runtime endpoint rather than deriving connection
 health from outbox rows. Web loads runtime and outbox independently, so one
 failed projection does not erase the last valid state from the other.
+
+`GET /api/v1/aprs/station-submissions` exposes only station packet kind,
+delivery state, and lifecycle timestamps. A `sending` row exists before I/O;
+an interrupted write becomes `transmission_uncertain` and waits for exact
+observer-cache reconciliation. The projection never returns station identity,
+APRS Data, coordinates, comment, or provision fingerprint.
 
 ## Telemetry and maintenance
 
@@ -123,10 +133,10 @@ Telemetry, Message, and Position-history retention run in independent bounded
 batches and default to 30 days. Position cleanup preserves canonical history
 referenced by mapping high-water state, the APRS delivery watermark, or any
 outbox row; unreferenced Mesh observations are scanned last. Terminal Job and
-sent APRS outbox retention default to 90 days and use independent bounded
-batches. Sent outbox cleanup requires a durable delivery-order proof, so
-expiring a sent row cannot make the same canonical event eligible after a
-mapping-version rotation. The final orphan scan uses the latest of the three
+terminal APRS outbox retention default to 90 days and use independent bounded
+batches. Observer-confirmed cleanup requires a durable delivery-order proof,
+so expiring a confirmed row cannot make the same canonical event eligible after
+a mapping-version rotation. The final orphan scan uses the latest of the three
 domain cutoffs. Queued or failed APRS rows proven older than another active or
 delivered snapshot are removed in the same bounded maintenance cycle.
 

@@ -114,13 +114,17 @@ Leaflet position plot uses a generated offline grid and persisted coordinates,
 so opening the management interface does not disclose Mesh locations to an
 external map tile provider.
 
-The APRS page consumes both the schema-backed `GET /api/v1/aprs` runtime state
-and bounded `GET /api/v1/aprs/outbox` projection. It shows monitor, mapping and
-queue totals, delivery state, retry count, event identity, and stable error
-codes, but the deterministic APRS Data line is deliberately excluded from the
-contract. Runtime and outbox requests retain independent error state, so a
-partial failure does not discard the other projection. APRS SSE events refresh
-both.
+The APRS page consumes the schema-backed `GET /api/v1/aprs` runtime state plus
+bounded Tracker outbox and station-submission projections. It shows monitor,
+mapping and queue totals, transport state, observer-confirmed delivery state,
+retry count, event identity, station packet kind, and stable error codes. A
+completed local socket write remains `submitted` until the receive monitor sees
+an exact match; the UI does not call that state accepted or delivered. A
+`transmission_uncertain` station intent is shown as unconfirmed and is not
+blindly retried. APRS Data, station identity, coordinates, comment, and
+provision fingerprint are deliberately excluded. Runtime, outbox, and station
+requests retain independent error state, so a partial failure does not discard
+another projection. APRS SSE events refresh all three.
 The CallMesh page consumes `GET /api/v1/callmesh`; Gateway starts its isolated
 client independently of the global runtime and exposes only synchronization
 status plus validated mappings. Missing configuration never initiates an

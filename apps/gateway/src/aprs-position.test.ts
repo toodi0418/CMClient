@@ -72,6 +72,12 @@ describe("legacy-compatible APRS Tracker position encoder", () => {
   it("carries rounded minutes while retaining modern coordinate bounds", () => {
     expect(
       encodeAprsPosition(
+        event({ latitudeI: 250_002_500 }),
+        optionsWithoutComment,
+      ).data,
+    ).toContain(":!2500.02N/");
+    expect(
+      encodeAprsPosition(
         event({ latitudeI: 249_999_167, longitudeI: 1_219_999_167 }),
         optionsWithoutComment,
       ).data,
@@ -85,6 +91,18 @@ describe("legacy-compatible APRS Tracker position encoder", () => {
     ).toThrow(AprsPositionEncodingError);
   });
 
+  it("retains the Legacy post-modulo course rounding boundary", () => {
+    expect(
+      encodeAprsPosition(
+        event({
+          groundTrackDegrees: 359.5,
+          groundSpeedMetersPerSecond: undefined,
+        }),
+        optionsWithoutComment,
+      ).data,
+    ).toContain("360/000");
+  });
+
   it("fails closed without full precision or a trusted event time", () => {
     expect(() =>
       encodeAprsPosition(event({ precisionBits: 31 }), options),
@@ -96,9 +114,9 @@ describe("legacy-compatible APRS Tracker position encoder", () => {
     );
   });
 
-  it("enforces the 512-byte APRS line limit using UTF-8 bytes", () => {
+  it("reserves CRLF inside the 512-byte limit and truncates only comments", () => {
     const base = encodeAprsPosition(event(), optionsWithoutComment).data;
-    const exactLimitComment = "x".repeat(512 - Buffer.byteLength(base, "utf8"));
+    const exactLimitComment = "x".repeat(510 - Buffer.byteLength(base, "utf8"));
     expect(
       Buffer.byteLength(
         encodeAprsPosition(event(), {
@@ -107,19 +125,39 @@ describe("legacy-compatible APRS Tracker position encoder", () => {
         }).data,
         "utf8",
       ),
-    ).toBe(512);
-    expect(() =>
+    ).toBe(510);
+    expect(
       encodeAprsPosition(event(), {
         ...options,
-        mappingComment: `${exactLimitComment}x`,
-      }),
-    ).toThrow(AprsPositionEncodingError);
-    expect(() =>
-      encodeAprsPosition(event(), {
-        ...options,
-        mappingComment: "測".repeat(200),
-      }),
-    ).toThrow(AprsPositionEncodingError);
+        mappingComment: `${exactLimitComment}extra`,
+      }).data,
+    ).toBe(`${base}${exactLimitComment}`);
+
+    const multibyte = encodeAprsPosition(event(), {
+      ...options,
+      mappingComment: "測".repeat(200),
+    }).data;
+    expect(Buffer.byteLength(multibyte, "utf8")).toBeLessThanOrEqual(510);
+    expect(Buffer.byteLength(`${multibyte}\r\n`, "utf8")).toBeLessThanOrEqual(
+      512,
+    );
+  });
+
+  it("uses provision altitude only for the self Mesh callsign", () => {
+    const withoutPacketAltitude = event({ altitudeMslMeters: undefined });
+    expect(
+      encodeAprsPosition(withoutPacketAltitude, {
+        ...optionsWithoutComment,
+        mappingCallsign: "N1GATE-10",
+        provisionAltitudeMeters: 10,
+      }).data,
+    ).toContain("/A=000033");
+    expect(
+      encodeAprsPosition(withoutPacketAltitude, {
+        ...optionsWithoutComment,
+        provisionAltitudeMeters: 10,
+      }).data,
+    ).not.toContain("/A=");
   });
 
   it("rejects unsafe callsigns and symbols", () => {

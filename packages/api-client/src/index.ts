@@ -1,5 +1,6 @@
 import {
   ApiErrorSchema,
+  AprsIgateSubmissionListSchema,
   AprsOutboxEntryListSchema,
   AprsRuntimeStatusSchema,
   ComponentIdentityReportSchema,
@@ -22,6 +23,7 @@ import {
   type ComponentIdentityReport,
   type CallMeshOverview,
   type ApiError,
+  type AprsIgateSubmissionList,
   type AprsOutboxEntryList,
   type AprsRuntimeStatus,
   type JobAccepted,
@@ -242,6 +244,11 @@ export class GatewayApiClient {
       this.request<AprsOutboxEntryList>(
         "/aprs/outbox",
         AprsOutboxEntryListSchema,
+      ),
+    stationSubmissions: () =>
+      this.request<AprsIgateSubmissionList>(
+        "/aprs/station-submissions",
+        AprsIgateSubmissionListSchema,
       ),
   };
 

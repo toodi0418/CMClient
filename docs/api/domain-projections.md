@@ -56,9 +56,25 @@ backlog, imprecise, or unverifiable remain decisions rather than being silently
 uploaded.
 
 `GET /api/v1/aprs/outbox?limit=100` returns entries with callsign, canonical
-event ID, `queued|sending|sent|failed` status, attempt count, next-attempt time,
-and stable last-error code. It never returns APRS Data. APRS upload requires
-`precisionBits === 32`, valid coordinates, and provably new position state.
+event ID, transport `status` (`queued|sending|sent|failed`), observer delivery
+`deliveryStatus`
+(`queued|sending|failed|submitted|observer_confirmed|observation_expired`),
+attempt count, bounded lifecycle timestamps, and stable last-error code. A
+transport status of `sent` means only that the socket write completed. Only
+`observer_confirmed` proves that the receive monitor later saw an exact source,
+destination, and information match. `observation_expired` is terminal and does
+not create a delivery high-water proof. The projection never returns APRS Data.
+APRS upload requires `precisionBits === 32`, valid coordinates, and provably
+new position state.
+
+`GET /api/v1/aprs/station-submissions?limit=100` returns the station packet
+kind, durable delivery state, and bounded lifecycle timestamps. Its state is
+`sending|transmission_uncertain|submitted|observer_confirmed|observation_expired`.
+`sending` is a durable pre-I/O intent. `transmission_uncertain` means the local
+write outcome could not be proven and is held for exact observer
+reconciliation instead of being resent blindly. The projection excludes
+callsign, destination, information field, provision fingerprint, coordinates,
+and comment.
 
 ## CallMesh mapping
 

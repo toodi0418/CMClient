@@ -58,6 +58,7 @@ describe("GatewayMaintenanceRuntime", () => {
         aprsOutboxCutoff: "2026-04-19T00:00:00.000Z",
         sentAprsOutboxDeleted: 0,
         supersededAprsOutboxDeleted: 0,
+        igateSubmissionsDeleted: 0,
         aprsOutboxBatchSize: 1_000,
         positionCutoff: "2026-06-18T00:00:00.000Z",
         positionDecisionsDeleted: 0,
@@ -82,6 +83,7 @@ describe("GatewayMaintenanceRuntime", () => {
         aprsOutboxCutoff: "2026-04-19T00:00:00.000Z",
         sentAprsOutboxDeleted: 0,
         supersededAprsOutboxDeleted: 0,
+        igateSubmissionsDeleted: 0,
         aprsOutboxBatchSize: 1_000,
         positionCutoff: "2026-06-18T00:00:00.000Z",
         positionDecisionsDeleted: 0,
@@ -268,11 +270,20 @@ describe("GatewayMaintenanceRuntime", () => {
     }
     const deliveredOutbox = deliveredResult.entry;
     database.aprsOutbox.claimDue(expiredAt, 1);
-    database.aprsOutbox.markSent(
+    database.aprsOutbox.markSubmitted(
       deliveredOutbox.id,
       expiredAt,
       PROVISION_FINGERPRINT,
     );
+    expect(
+      database.aprsOutbox.confirmObserved(
+        "N2CALL-7",
+        "APCM20",
+        "delivered",
+        expiredAt,
+        PROVISION_FINGERPRINT,
+      ),
+    ).toHaveLength(1);
     const activeOutboxEvent = insertPositionHistory(
       database,
       "retained-outbox",

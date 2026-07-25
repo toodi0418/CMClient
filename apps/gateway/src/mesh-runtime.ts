@@ -46,6 +46,7 @@ export interface MeshGatewayRuntimeOptions {
   transport: MeshtasticTransport;
   aprs?: {
     stateProvider?: () => AprsRuntimeState | undefined;
+    onDecodedSummary?: (type: string, timestampMs: number) => void;
   };
   clock?: () => Date;
   idFactory?: () => string;
@@ -281,6 +282,16 @@ export class MeshGatewayRuntime {
       this.options.meshNetworkId,
       observation,
     );
+    try {
+      this.options.aprs?.onDecodedSummary?.(
+        aprsSummaryType(normalizedFromRadio.packet?.portNum, payload.kind),
+        Date.parse(serverIngestedAt),
+      );
+    } catch (error) {
+      this.publish("aprs.igate.counter.error", {
+        code: stableErrorCode(error, "APRS_IGATE_COUNTER_FAILED"),
+      });
+    }
     this.publish("mesh.observation.persisted", {
       observationId: observation.id,
       transport: observation.transport,
@@ -487,6 +498,9 @@ export class MeshGatewayRuntime {
       ...(typeof activeMapping.altitudeMeters === "number"
         ? { mappingAltitudeMeters: activeMapping.altitudeMeters }
         : {}),
+      ...(typeof aprsState.provision.altitudeMeters === "number"
+        ? { provisionAltitudeMeters: aprsState.provision.altitudeMeters }
+        : {}),
     });
     const monitorTarget = {
       ...target,
@@ -683,6 +697,26 @@ export class MeshGatewayRuntime {
     }
     return `${prefix}-${value}`;
   }
+}
+
+function aprsSummaryType(
+  portNum: string | undefined,
+  payloadKind: StoredApplicationPayload["kind"],
+): string {
+  const normalizedPort = portNum
+    ?.toLowerCase()
+    .replace(/_app$/u, "")
+    .replaceAll("_", "");
+  if (normalizedPort === "textmessage") {
+    return "text";
+  }
+  if (normalizedPort) {
+    return normalizedPort;
+  }
+  if (payloadKind === "node") {
+    return "nodeinfo";
+  }
+  return payloadKind;
 }
 
 async function settleBefore<T>(

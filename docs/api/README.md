@@ -101,6 +101,7 @@ public status or event contracts.
 | `GET /api/v1/callmesh` | [domain-projections.md](./domain-projections.md) |
 | `GET /api/v1/proxy` | [domain-projections.md](./domain-projections.md) |
 | `GET /api/v1/aprs/outbox` | [domain-projections.md](./domain-projections.md) |
+| `GET /api/v1/aprs/station-submissions` | [domain-projections.md](./domain-projections.md) |
 | `GET /api/v1/events` | [events.md](./events.md) |
 | `GET /api/v1/events/recent` | [events.md](./events.md) |
 | `POST /api/v1/diagnostics/integrity-check` | [diagnostics.md](./diagnostics.md) |

@@ -786,7 +786,7 @@ h2 {
 
 .status-badge[data-state="ready"],
 .status-badge[data-state="connected"],
-.status-badge[data-state="sent"] {
+.status-badge[data-state="observer_confirmed"] {
   color: var(--cm-on-accent);
   border-color: var(--cm-accent);
   background: var(--cm-accent);
@@ -799,7 +799,9 @@ h2 {
 .status-badge[data-state="idle"],
 .status-badge[data-state="stopped"],
 .status-badge[data-state="queued"],
-.status-badge[data-state="sending"] {
+.status-badge[data-state="sending"],
+.status-badge[data-state="sent"],
+.status-badge[data-state="submitted"] {
   color: var(--cm-warning);
 }
 
@@ -807,6 +809,8 @@ h2 {
 .status-badge[data-state="disconnected"],
 .status-badge[data-state="error"],
 .status-badge[data-state="failed"],
+.status-badge[data-state="transmission_uncertain"],
+.status-badge[data-state="observation_expired"],
 .status-badge[data-state="unavailable"] {
   color: var(--cm-danger);
   border-color: var(--cm-danger);

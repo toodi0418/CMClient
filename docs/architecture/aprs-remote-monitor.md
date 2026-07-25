@@ -1,17 +1,25 @@
 # APRS-IS Remote High-Water Monitoring
 
-Each iGate independently subscribes with an APRS-IS buddy filter made only from
-its mapped APRS callsigns. TX uses the provision's canonical iGate callsign.
-The separate receive-only monitor derives the provision-scoped login
-`<callsignBase>-CM`, using the same base-callsign passcode. This distinct
-APRS-IS client identity never enters APRS Data, the iGate path, mapping state,
-or public status.
+Each iGate independently subscribes with an APRS-IS buddy filter made from its
+mapped APRS callsigns plus the provision's canonical iGate callsign. TX uses
+that canonical iGate callsign. The separate receive-only monitor derives the
+provision-scoped login `<callsignBase>-CM`, authenticates it with the same
+base-callsign passcode as TX, and accepts only that exact callsign's `verified`
+logresp. CMClient never writes APRS Data on this application-level receive-only
+socket, and its distinct identity never enters APRS Data, the iGate path,
+mapping state, or public status.
 
-Incoming data is accepted for collaboration only when it has a mapped source
-callsign and a valid Legacy-compatible untimestamped `!` position. The monitor
-persists exact source-plus-information observations for three hours and exact
-local transmissions for 30 seconds. Receive time is observation metadata only;
-it never establishes source-event order. Malformed or unmapped data is ignored.
+Incoming packets participate in delivery confirmation only when their source is
+in the current receive filter and the APRS line is parseable. Only a valid
+Legacy-compatible untimestamped `!` position participates in cross-iGate
+ordering. New monitor observations and local transmissions are keyed by the
+exact source, destination, and information tuple for three hours and 30
+seconds respectively. Destinationless records upgraded from an older schema
+remain conservative source-plus-information wildcards for duplicate
+suppression only; they are excluded from delivery reconciliation. Destination
+must match when an observation confirms a submitted outbox entry.
+Receive time is observation metadata only; it never establishes source-event
+order. Malformed or unwatched data is ignored.
 
 The outbox repeats this comparison inside its final synchronous authorization
 transaction immediately before transport I/O. This closes the interval between
@@ -34,6 +42,10 @@ callsign, and mapping version. They intentionally do not write a synthetic
 `position_events` or `node_position_state` row: an APRS marker is a compact
 remote observation, not a full canonical event with a local source observation
 foreign key. They also remain distinct from the mapping-independent local
-`aprs_delivery_high_water`, which proves only this Gateway's completed outbox
-sends. This preserves mapping state isolation and avoids a central server or an
-elected primary iGate.
+`aprs_delivery_high_water`, which proves only submitted entries later seen by
+the receive monitor. Persisted exact observer-cache evidence can be reconciled
+after reconnect or restart, but only for the current provision fingerprint and
+only when one pending submission matches the observation window. Socket write
+completion alone never advances it. This
+preserves mapping state isolation and avoids a central server or an elected
+primary iGate.

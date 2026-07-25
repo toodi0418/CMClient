@@ -7,6 +7,8 @@ import {
   DomainEventSchema,
   AgentEventSchema,
   AgentLifecycleStatusSchema,
+  AprsIgateSubmissionSchema,
+  AprsOutboxEntrySchema,
   ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
   JobDetailSchema,
@@ -725,6 +727,75 @@ describe("packet recording contract", () => {
 });
 
 describe("position domain contracts", () => {
+  it.each([
+    "sending",
+    "transmission_uncertain",
+    "submitted",
+    "observer_confirmed",
+    "observation_expired",
+  ] as const)(
+    "accepts sanitized %s station delivery state",
+    (deliveryStatus) => {
+      const submission = TypeCompiler.Compile(AprsIgateSubmissionSchema);
+      const value = {
+        id: "aprs-igate-00000000-0000-4000-8000-000000000001",
+        packetKind: "beacon",
+        deliveryStatus,
+        attemptedAt: "2026-07-18T00:00:00.000Z",
+        updatedAt: "2026-07-18T00:00:01.000Z",
+        observationExpiresAt: "2026-07-18T03:00:00.000Z",
+        ...(deliveryStatus === "submitted" ||
+        deliveryStatus === "observer_confirmed"
+          ? { submittedAt: "2026-07-18T00:00:01.000Z" }
+          : {}),
+        ...(deliveryStatus === "observer_confirmed"
+          ? { observerConfirmedAt: "2026-07-18T00:00:02.000Z" }
+          : {}),
+      };
+
+      expect(submission.Check(value)).toBe(true);
+      expect(submission.Check({ ...value, callsign: "N0CALL-7" })).toBe(false);
+      expect(submission.Check({ ...value, info: "private-packet" })).toBe(
+        false,
+      );
+      expect(
+        submission.Check({ ...value, provisionFingerprint: "a".repeat(64) }),
+      ).toBe(false);
+    },
+  );
+
+  it.each([
+    "queued",
+    "sending",
+    "failed",
+    "submitted",
+    "observer_confirmed",
+    "observation_expired",
+  ] as const)("accepts the %s APRS delivery state", (deliveryStatus) => {
+    const outboxEntry = TypeCompiler.Compile(AprsOutboxEntrySchema);
+    const entry = {
+      id: "outbox-1",
+      callsign: "N0CALL-7",
+      canonicalEventId: "position-event-1",
+      status:
+        deliveryStatus === "queued"
+          ? "queued"
+          : deliveryStatus === "sending"
+            ? "sending"
+            : deliveryStatus === "failed"
+              ? "failed"
+              : "sent",
+      deliveryStatus,
+      attempts: 0,
+      nextAttemptAt: "2026-07-18T00:00:00.000Z",
+      createdAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    };
+
+    expect(outboxEntry.Check(entry)).toBe(true);
+    expect(outboxEntry.Check({ ...entry, deliveryStatus: "sent" })).toBe(false);
+  });
+
   it("keeps local observations, canonical events, decisions, and high-water state separate", () => {
     const observation = TypeCompiler.Compile(PositionObservationSchema);
     const event = TypeCompiler.Compile(PositionCanonicalEventSchema);

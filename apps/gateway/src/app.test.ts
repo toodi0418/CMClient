@@ -136,6 +136,8 @@ describe("GatewayRuntime", () => {
       mappedCallsigns: 0,
       pendingOutbox: 0,
       failedOutbox: 0,
+      pendingStationSubmissions: 0,
+      failedStationSubmissions: 0,
     });
     await app.close();
   });
@@ -302,6 +304,70 @@ describe("GatewayRuntime", () => {
       code: "GATEWAY_DOMAIN_DATA_UNAVAILABLE",
     });
     await unavailable.close();
+  });
+
+  it("serves a sanitized bounded station-delivery projection", async () => {
+    const limits: number[] = [];
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      undefined,
+      {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        status: () => ({
+          configured: true,
+          running: true,
+          monitorStatus: "connected",
+          mappedCallsigns: 1,
+          pendingOutbox: 0,
+          failedOutbox: 0,
+          pendingStationSubmissions: 1,
+          failedStationSubmissions: 0,
+        }),
+        listStationSubmissions: (limit) => {
+          limits.push(limit);
+          return [
+            {
+              id: "aprs-igate-00000000-0000-4000-8000-000000000001",
+              packetKind: "beacon",
+              deliveryStatus: "submitted",
+              attemptedAt: "2026-07-18T00:00:00.000Z",
+              submittedAt: "2026-07-18T00:00:01.000Z",
+              updatedAt: "2026-07-18T00:00:01.000Z",
+              observationExpiresAt: "2026-07-18T03:00:00.000Z",
+            },
+          ];
+        },
+      },
+    );
+
+    const response = await app.inject(
+      "/api/v1/aprs/station-submissions?limit=7",
+    );
+    expect(response.statusCode).toBe(200);
+    expect(limits).toEqual([7]);
+    expect(response.json()).toEqual({
+      items: [
+        {
+          id: "aprs-igate-00000000-0000-4000-8000-000000000001",
+          packetKind: "beacon",
+          deliveryStatus: "submitted",
+          attemptedAt: "2026-07-18T00:00:00.000Z",
+          submittedAt: "2026-07-18T00:00:01.000Z",
+          updatedAt: "2026-07-18T00:00:01.000Z",
+          observationExpiresAt: "2026-07-18T03:00:00.000Z",
+        },
+      ],
+    });
+    expect(JSON.stringify(response.json())).not.toMatch(
+      /callsign|destination|info|fingerprint|latitude|longitude/iu,
+    );
+    await app.close();
   });
 
   it("projects CallMesh state without exposing upstream credentials", async () => {

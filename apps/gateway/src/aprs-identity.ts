@@ -8,6 +8,10 @@ import {
 import type { CallMeshAprsState } from "./callmesh.js";
 
 const APRS_CALLSIGN_BASE = /^[A-Z0-9]{1,6}$/;
+const APRS_LOGIN_CALLSIGN_BASE = /^[A-Z0-9]{1,6}$/;
+const APRS_LOGIN_CALLSIGN = /^[A-Z0-9]{1,6}(?:-[A-Z0-9]{1,2})?$/;
+const APRS_OBSERVER_SUFFIX = "CM";
+const MAX_APRS_LOGIN_CALLSIGN_BYTES = 9;
 const APRS_PRINTABLE_CHARACTER = /^[ -~]$/;
 const MAX_APRS_COMMENT_LENGTH = 80;
 export const PROVISION_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/;
@@ -28,10 +32,11 @@ export interface AprsRuntimeState {
   readonly mappings: readonly CallMeshMapping[];
   readonly mappingsFingerprint: string;
   readonly identity: AprsRuntimeIdentity;
+  readonly provision: CallMeshProvision;
   readonly provisionFingerprint: string;
 }
 
-/** Authorization material used by both APRS TCP clients. */
+/** Provision-scoped authorization material for an APRS-IS connection. */
 export interface AprsConnectionAuthorization {
   readonly loginLine: string;
   readonly provisionFingerprint: string;
@@ -95,6 +100,7 @@ export function deriveAprsRuntimeState(
     mappings: state.mappings.map((mapping) => ({ ...mapping })),
     mappingsFingerprint: state.mappingsFingerprint,
     identity,
+    provision: { ...state.provision },
     provisionFingerprint: state.provisionFingerprint,
   };
 }
@@ -122,8 +128,9 @@ export function observerConnectionAuthorization(
     if (!state) {
       return undefined;
     }
+    const callsign = observerCallsign(state);
     return {
-      loginLine: `user ${state.identity.callsignBase}-CM pass ${state.identity.passcode} vers CMClient 2.0`,
+      loginLine: `user ${callsign} pass ${state.identity.passcode} vers CMClient 2.0`,
       provisionFingerprint: state.provisionFingerprint,
     };
   };
@@ -151,6 +158,34 @@ function normalizeCallsignBase(value: unknown): string {
     throw new AprsRuntimeIdentityError();
   }
   return normalized;
+}
+
+function observerCallsign(state: AprsRuntimeState): string {
+  const { callsignBase, callsign, ssid } = state.identity;
+  if (
+    !APRS_LOGIN_CALLSIGN_BASE.test(callsignBase) ||
+    !Number.isInteger(ssid) ||
+    ssid < -15 ||
+    ssid > 15
+  ) {
+    throw new AprsRuntimeIdentityError();
+  }
+  const expectedTransmitterCallsign =
+    ssid === 0 ? callsignBase : `${callsignBase}-${Math.abs(ssid)}`;
+  const observerCallsign = `${callsignBase}-${APRS_OBSERVER_SUFFIX}`;
+  if (
+    callsign !== expectedTransmitterCallsign ||
+    observerCallsign === callsign ||
+    !APRS_LOGIN_CALLSIGN.test(observerCallsign) ||
+    Buffer.byteLength(observerCallsign, "ascii") >
+      MAX_APRS_LOGIN_CALLSIGN_BYTES ||
+    state.mappings.some(
+      (mapping) => mapping.callsign.toUpperCase() === observerCallsign,
+    )
+  ) {
+    throw new AprsRuntimeIdentityError();
+  }
+  return observerCallsign;
 }
 
 function normalizeSymbol(value: unknown): string {

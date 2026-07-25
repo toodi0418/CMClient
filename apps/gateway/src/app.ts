@@ -10,6 +10,7 @@ import { Type } from "@sinclair/typebox";
 import {
   AGENT_CONTRACT_SCHEMAS,
   ApiErrorSchema,
+  AprsIgateSubmissionListSchema,
   AprsOutboxEntryListSchema,
   AprsRuntimeStatusSchema,
   ComponentIdentityReportSchema,
@@ -28,6 +29,7 @@ import {
   SystemHealthSchema,
   SystemStatusSchema,
   type DomainEvent,
+  type AprsIgateSubmission,
   type AprsOutboxEntry,
   type AprsRuntimeStatus,
   type CallMeshOverview,
@@ -128,6 +130,7 @@ export interface GatewayMeshtasticReadApi {
 
 export interface GatewayAprsReadApi {
   status(): AprsRuntimeStatus;
+  listStationSubmissions?(limit: number): AprsIgateSubmission[];
 }
 
 declare module "fastify" {
@@ -412,6 +415,8 @@ export function createGatewayApp(
           mappedCallsigns: 0,
           pendingOutbox: 0,
           failedOutbox: 0,
+          pendingStationSubmissions: 0,
+          failedStationSubmissions: 0,
         },
     );
     app.get(
@@ -514,6 +519,26 @@ export function createGatewayApp(
         domain
           ? {
               items: domain.listAprsOutbox(
+                resolveListLimit(request.query.limit),
+              ),
+            }
+          : sendDomainDataUnavailable(request, reply),
+    );
+    app.get<{ Querystring: ListQuery }>(
+      "/api/v1/aprs/station-submissions",
+      {
+        schema: {
+          querystring: listQuerySchema(),
+          response: {
+            200: AprsIgateSubmissionListSchema,
+            503: ApiErrorSchema,
+          },
+        },
+      },
+      (request, reply) =>
+        aprs?.listStationSubmissions
+          ? {
+              items: aprs.listStationSubmissions(
                 resolveListLimit(request.query.limit),
               ),
             }

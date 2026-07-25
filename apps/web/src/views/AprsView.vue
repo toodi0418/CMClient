@@ -95,6 +95,14 @@ onMounted(() => void aprs.refresh());
             <dd>{{ aprs.status.failedOutbox }}</dd>
           </div>
           <div>
+            <dt>{{ t("aprs.stationPending") }}</dt>
+            <dd>{{ aprs.status.pendingStationSubmissions }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("aprs.stationFailed") }}</dt>
+            <dd>{{ aprs.status.failedStationSubmissions }}</dd>
+          </div>
+          <div>
             <dt>{{ t("aprs.configured") }}</dt>
             <dd>
               {{
@@ -148,14 +156,38 @@ onMounted(() => void aprs.refresh());
             >
           </div>
           <div>
-            <span>{{ t("aprs.state") }}</span>
+            <span>{{ t("aprs.transportState") }}</span>
             <span class="status-badge" :data-state="entry.status">
               {{ t(`aprs.status.${entry.status}`) }}
+            </span>
+            <span>{{ t("aprs.deliveryState") }}</span>
+            <span class="status-badge" :data-state="entry.deliveryStatus">
+              {{ t(`aprs.deliveryStatus.${entry.deliveryStatus}`) }}
             </span>
           </div>
           <div>
             <span>{{ t("aprs.attempts") }}: {{ entry.attempts }}</span>
-            <time>{{ entry.sentAt ?? entry.nextAttemptAt }}</time>
+            <template v-if="entry.observerConfirmedAt">
+              <span>{{ t("aprs.observerConfirmedAt") }}</span>
+              <time>{{ entry.observerConfirmedAt }}</time>
+            </template>
+            <template
+              v-else-if="
+                entry.deliveryStatus === 'observation_expired' &&
+                entry.observationExpiresAt
+              "
+            >
+              <span>{{ t("aprs.observationExpiresAt") }}</span>
+              <time>{{ entry.observationExpiresAt }}</time>
+            </template>
+            <template v-else-if="entry.submittedAt ?? entry.sentAt">
+              <span>{{ t("aprs.submittedAt") }}</span>
+              <time>{{ entry.submittedAt ?? entry.sentAt }}</time>
+            </template>
+            <template v-else>
+              <span>{{ t("aprs.nextAttemptAt") }}</span>
+              <time>{{ entry.nextAttemptAt }}</time>
+            </template>
             <code v-if="entry.lastErrorCode" class="stable-code">{{
               entry.lastErrorCode
             }}</code>
@@ -164,6 +196,67 @@ onMounted(() => void aprs.refresh());
       </div>
       <code v-if="aprs.outboxErrorCode" class="stable-code">{{
         aprs.outboxErrorCode
+      }}</code>
+    </div>
+
+    <div class="status-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-placeholder__eyebrow">{{ t("navigation.aprs") }}</p>
+          <h2>{{ t("aprs.stationDelivery") }}</h2>
+        </div>
+      </div>
+      <p
+        v-if="aprs.loading && !aprs.stationSubmissions.length"
+        class="status-message"
+      >
+        {{ t("common.loading") }}
+      </p>
+      <p
+        v-else-if="aprs.stationErrorCode && !aprs.stationSubmissions.length"
+        class="status-message"
+      >
+        {{ t("common.unavailable") }}
+        <code class="stable-code">{{ aprs.stationErrorCode }}</code>
+      </p>
+      <p v-else-if="!aprs.stationSubmissions.length" class="status-message">
+        {{ t("aprs.stationEmpty") }}
+      </p>
+      <div v-else class="record-list">
+        <article
+          v-for="submission in aprs.stationSubmissions"
+          :key="submission.id"
+          class="record-row"
+        >
+          <div>
+            <strong>{{
+              t(`aprs.stationPacketKind.${submission.packetKind}`)
+            }}</strong>
+          </div>
+          <div>
+            <span>{{ t("aprs.deliveryState") }}</span>
+            <span class="status-badge" :data-state="submission.deliveryStatus">
+              {{ t(`aprs.stationDeliveryStatus.${submission.deliveryStatus}`) }}
+            </span>
+          </div>
+          <div>
+            <template v-if="submission.observerConfirmedAt">
+              <span>{{ t("aprs.observerConfirmedAt") }}</span>
+              <time>{{ submission.observerConfirmedAt }}</time>
+            </template>
+            <template v-else-if="submission.submittedAt">
+              <span>{{ t("aprs.submittedAt") }}</span>
+              <time>{{ submission.submittedAt }}</time>
+            </template>
+            <template v-else>
+              <span>{{ t("aprs.attemptedAt") }}</span>
+              <time>{{ submission.attemptedAt }}</time>
+            </template>
+          </div>
+        </article>
+      </div>
+      <code v-if="aprs.stationErrorCode" class="stable-code">{{
+        aprs.stationErrorCode
       }}</code>
     </div>
   </section>

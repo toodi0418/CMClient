@@ -1,4 +1,5 @@
 import { DomainEventBus } from "./events.js";
+import { AprsIgateRepository } from "./aprs-igate.js";
 import { GatewayDatabase } from "./persistence/database.js";
 
 export const OBSERVATION_RETENTION_HEADROOM = 1_000;
@@ -45,10 +46,12 @@ export class GatewayMaintenanceRuntime {
   private readonly retentionDays: number;
   private readonly telemetryBatchSize: number;
   private readonly intervalMs: number;
+  private readonly igateRepository: AprsIgateRepository;
   private timer: NodeJS.Timeout | undefined;
   private started = false;
 
   constructor(private readonly options: GatewayMaintenanceRuntimeOptions) {
+    this.igateRepository = new AprsIgateRepository(options.database.connection);
     this.clock = options.clock ?? (() => new Date());
     this.aprsOutboxRetentionDays = positiveInteger(
       options.aprsOutboxRetentionDays ?? 90,
@@ -155,6 +158,10 @@ export class GatewayMaintenanceRuntime {
       this.options.database.aprsOutbox.deleteSuperseded(
         this.aprsOutboxBatchSize,
       );
+    const igateSubmissionsDeleted = this.igateRepository.deleteTerminalBefore(
+      aprsOutboxCutoff,
+      this.aprsOutboxBatchSize,
+    );
     const positionCutoff = new Date(
       now.getTime() - this.positionRetentionDays * 24 * 60 * 60 * 1_000,
     ).toISOString();
@@ -193,6 +200,7 @@ export class GatewayMaintenanceRuntime {
         aprsOutboxCutoff,
         sentAprsOutboxDeleted,
         supersededAprsOutboxDeleted,
+        igateSubmissionsDeleted,
         aprsOutboxBatchSize: this.aprsOutboxBatchSize,
         positionCutoff,
         positionDecisionsDeleted: positionRetention.decisionsDeleted,

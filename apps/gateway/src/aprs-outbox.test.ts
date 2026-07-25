@@ -14,6 +14,7 @@ import {
   AprsIsTcpClient,
   AprsOutboxRepository,
   AprsOutboxWorker,
+  type AprsOutboxEntry,
   type EnqueueAprsResult,
   type AprsOutboxWorkerOptions,
   type AprsTransport,
@@ -59,7 +60,91 @@ function newWorker(
   });
 }
 
+function confirmEntry(
+  repository: AprsOutboxRepository,
+  entry: AprsOutboxEntry | undefined,
+  observedAt: string,
+): void {
+  if (!entry) {
+    throw new Error("fixture APRS outbox entry was not found");
+  }
+  const packet = parseCmClientAprsLine(entry.data);
+  if (!packet) {
+    throw new Error("fixture APRS packet did not parse");
+  }
+  expect(
+    repository.confirmObserved(
+      packet.callsign,
+      packet.destination,
+      packet.info,
+      observedAt,
+      PROVISION_FINGERPRINT,
+    ),
+  ).toHaveLength(1);
+}
+
 describe("APRS outbox", () => {
+  it("enforces the 510-byte APRS Data boundary before persistence", () => {
+    const database = new GatewayDatabase(":memory:");
+    const repository = new AprsOutboxRepository(database.connection);
+    const prefix = "N0CALL-7>APTMAG:";
+    const validData = `${prefix}${"x".repeat(510 - Buffer.byteLength(prefix))}`;
+    const oversizedData = `${prefix}${"x".repeat(511 - Buffer.byteLength(prefix))}`;
+
+    expect(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: persistedPositionEvent(database, "wire-510").id,
+        data: validData,
+        now: "2026-07-18T00:00:00.000Z",
+      }).created,
+    ).toBe(true);
+    expect(() =>
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: persistedPositionEvent(database, "wire-511").id,
+        data: oversizedData,
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    ).toThrow("APRS_OUTBOX_FAILED");
+    database.close();
+  });
+
+  it("discards an oversized row left by an older database before transport", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const repository = new AprsOutboxRepository(database.connection);
+    const queued = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: persistedPositionEvent(
+          database,
+          "legacy-oversized-wire",
+        ).id,
+        data: "N0CALL-7>APTMAG:valid",
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+    const prefix = "N0CALL-7>APTMAG:";
+    database.connection
+      .prepare("UPDATE aprs_outbox SET data = ? WHERE id = ?")
+      .run(
+        `${prefix}${"x".repeat(511 - Buffer.byteLength(prefix))}`,
+        queued.id,
+      );
+    let sends = 0;
+
+    await expect(
+      newWorker(repository, {
+        send: async () => {
+          sends += 1;
+        },
+      }).flush(),
+    ).resolves.toEqual([]);
+    expect(sends).toBe(0);
+    expect(repository.find(queued.id)).toBeUndefined();
+    database.close();
+  });
+
   it("lists a bounded public projection without exposing APRS Data", () => {
     const database = new GatewayDatabase(":memory:");
     const event = persistedPositionEvent(database);
@@ -158,6 +243,318 @@ describe("APRS outbox", () => {
     const recovered = repository.find(storedEntry.id);
     expect(recovered).toMatchObject({ status: "sent", attempts: 1 });
     expect(recovered?.lastErrorCode).toBeUndefined();
+    database.close();
+  });
+
+  it("advances delivery high-water only after an exact independent observation", () => {
+    const database = new GatewayDatabase(":memory:");
+    const event = persistedPositionEvent(database, "observer-confirmation");
+    const repository = new AprsOutboxRepository(database.connection);
+    const queued = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: event.id,
+        data: "N0CALL-7>APTMAG,MESHD*,qAO,TEST01:!2500.00N/12130.00E>fixture",
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+
+    repository.claimDue("2026-07-18T00:00:00.000Z", 1);
+    const submitted = repository.markSubmitted(
+      queued.id,
+      "2026-07-18T00:00:01.000Z",
+      PROVISION_FINGERPRINT,
+    );
+
+    expect(submitted.deliveryStatus).toBe("submitted");
+    expect(
+      database.connection
+        .prepare("SELECT COUNT(*) AS count FROM aprs_delivery_high_water")
+        .get(),
+    ).toEqual({ count: 0 });
+    expect(
+      repository.confirmObserved(
+        "N0CALL-7",
+        "OTHER",
+        "!2500.00N/12130.00E>fixture",
+        "2026-07-18T00:00:02.000Z",
+        PROVISION_FINGERPRINT,
+      ),
+    ).toEqual([]);
+
+    const confirmed = repository.confirmObserved(
+      "N0CALL-7",
+      "APTMAG",
+      "!2500.00N/12130.00E>fixture",
+      "2026-07-18T00:00:03.000Z",
+      PROVISION_FINGERPRINT,
+    );
+    expect(confirmed).toHaveLength(1);
+    expect(confirmed[0]).toMatchObject({
+      id: queued.id,
+      deliveryStatus: "observer_confirmed",
+    });
+    expect(
+      database.connection
+        .prepare(
+          "SELECT latest_canonical_event_id FROM aprs_delivery_high_water",
+        )
+        .get(),
+    ).toEqual({ latest_canonical_event_id: event.id });
+    database.close();
+  });
+
+  it("atomically preserves exact observer evidence received before socket completion", () => {
+    const database = new GatewayDatabase(":memory:");
+    const event = persistedPositionEvent(database, "observer-before-submit");
+    const repository = new AprsOutboxRepository(database.connection);
+    const data =
+      "N0CALL-7>APTMAG,MESHD*,qAO,TEST01:!2500.00N/12130.00E>early-observer";
+    const packet = parseCmClientAprsLine(data);
+    if (!packet) {
+      throw new Error("fixture APRS packet did not parse");
+    }
+    const queued = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: packet.callsign,
+        canonicalEventId: event.id,
+        data,
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+    repository.claimDue("2026-07-18T00:00:01.000Z", 1);
+    new AprsRemoteHighWaterStore(database.connection).apply(
+      packet,
+      {
+        callsign: packet.callsign,
+        mappingVersion: "mapping-v1",
+        meshNetworkId: event.meshNetworkId,
+        nodeNum: event.nodeNum,
+      },
+      "2026-07-18T00:00:02.000Z",
+    );
+
+    expect(
+      repository.markSubmitted(
+        queued.id,
+        "2026-07-18T00:00:03.000Z",
+        PROVISION_FINGERPRINT,
+      ),
+    ).toMatchObject({
+      deliveryStatus: "observer_confirmed",
+      observerConfirmedAt: "2026-07-18T00:00:02.000Z",
+      submittedAt: "2026-07-18T00:00:03.000Z",
+    });
+    expect(
+      database.connection
+        .prepare(
+          "SELECT latest_canonical_event_id FROM aprs_delivery_high_water",
+        )
+        .get(),
+    ).toEqual({ latest_canonical_event_id: event.id });
+    database.close();
+  });
+
+  it("isolates observer confirmation to the current provision fingerprint", () => {
+    const database = new GatewayDatabase(":memory:");
+    const event = persistedPositionEvent(database, "observer-provision");
+    const repository = new AprsOutboxRepository(database.connection);
+    const queued = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: event.id,
+        data: "N0CALL-7>APTMAG,MESHD*,qAO,TEST01:!2500.00N/12130.00E>provision",
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+    repository.claimDue("2026-07-18T00:00:00.000Z", 1);
+    repository.markSubmitted(
+      queued.id,
+      "2026-07-18T00:00:01.000Z",
+      PROVISION_FINGERPRINT,
+    );
+
+    expect(
+      repository.confirmObserved(
+        "N0CALL-7",
+        "APTMAG",
+        "!2500.00N/12130.00E>provision",
+        "2026-07-18T00:00:02.000Z",
+        ROTATED_PROVISION_FINGERPRINT,
+      ),
+    ).toEqual([]);
+    expect(repository.find(queued.id)?.deliveryStatus).toBe("submitted");
+    expect(
+      repository.confirmObserved(
+        "N0CALL-7",
+        "APTMAG",
+        "!2500.00N/12130.00E>provision",
+        "2026-07-18T00:00:02.000Z",
+        PROVISION_FINGERPRINT,
+      ),
+    ).toHaveLength(1);
+    database.close();
+  });
+
+  it("reconciles exact persisted observer evidence but never a legacy wildcard", () => {
+    const database = new GatewayDatabase(":memory:");
+    const event = persistedPositionEvent(database, "observer-reconcile");
+    const repository = new AprsOutboxRepository(database.connection);
+    const data =
+      "N0CALL-7>APTMAG,MESHD*,qAO,TEST01:!2500.00N/12130.00E>reconcile";
+    const packet = parseCmClientAprsLine(data);
+    if (!packet) {
+      throw new Error("fixture APRS packet did not parse");
+    }
+    const queued = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: packet.callsign,
+        canonicalEventId: event.id,
+        data,
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+    repository.claimDue("2026-07-18T00:00:00.000Z", 1);
+    repository.markSubmitted(
+      queued.id,
+      "2026-07-18T00:00:01.000Z",
+      PROVISION_FINGERPRINT,
+    );
+    database.connection
+      .prepare(
+        "INSERT INTO aprs_observed_packets (callsign, destination, info, first_observed_at, last_observed_at) VALUES (?, '', ?, ?, ?)",
+      )
+      .run(
+        packet.callsign,
+        packet.info,
+        "2026-07-18T00:00:02.000Z",
+        "2026-07-18T00:00:02.000Z",
+      );
+
+    expect(repository.reconcileObservedCache(PROVISION_FINGERPRINT)).toEqual(
+      [],
+    );
+    new AprsRemoteHighWaterStore(database.connection).apply(
+      packet,
+      {
+        callsign: packet.callsign,
+        mappingVersion: "mapping-v1",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+      },
+      "2026-07-18T00:00:03.000Z",
+    );
+    expect(
+      repository.reconcileObservedCache(ROTATED_PROVISION_FINGERPRINT),
+    ).toEqual([]);
+    expect(repository.reconcileObservedCache(PROVISION_FINGERPRINT)).toEqual([
+      expect.objectContaining({
+        id: queued.id,
+        deliveryStatus: "observer_confirmed",
+      }),
+    ]);
+    database.close();
+  });
+
+  it("fails closed when one observation matches multiple pending submissions", () => {
+    const database = new GatewayDatabase(":memory:");
+    const firstEvent = persistedPositionEvent(
+      database,
+      "observer-ambiguous-first",
+      1_784_332_800,
+      undefined,
+      42,
+    );
+    const secondEvent = persistedPositionEvent(
+      database,
+      "observer-ambiguous-second",
+      1_784_332_800,
+      undefined,
+      43,
+    );
+    const repository = new AprsOutboxRepository(database.connection);
+    const data =
+      "N0CALL-7>APTMAG,MESHD*,qAO,TEST01:!2500.00N/12130.00E>ambiguous";
+    const first = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: firstEvent.id,
+        data,
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+    const second = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: secondEvent.id,
+        data,
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+    repository.claimDue("2026-07-18T00:00:00.000Z", 2);
+    const packet = parseCmClientAprsLine(data);
+    if (!packet) {
+      throw new Error("fixture APRS packet did not parse");
+    }
+    new AprsRemoteHighWaterStore(database.connection).apply(
+      packet,
+      {
+        callsign: packet.callsign,
+        mappingVersion: "mapping-v1",
+        meshNetworkId: firstEvent.meshNetworkId,
+        nodeNum: firstEvent.nodeNum,
+      },
+      "2026-07-18T00:00:00.500Z",
+    );
+    repository.markSubmitted(
+      first.id,
+      "2026-07-18T00:00:01.000Z",
+      PROVISION_FINGERPRINT,
+    );
+    repository.markSubmitted(
+      second.id,
+      "2026-07-18T00:00:02.000Z",
+      PROVISION_FINGERPRINT,
+    );
+
+    expect(repository.reconcileObservedCache(PROVISION_FINGERPRINT)).toEqual(
+      [],
+    );
+    expect(repository.find(first.id)?.deliveryStatus).toBe("submitted");
+    expect(repository.find(second.id)?.deliveryStatus).toBe("submitted");
+    database.close();
+  });
+
+  it("expires an unobserved submission without advancing delivery high-water", () => {
+    const database = new GatewayDatabase(":memory:");
+    const event = persistedPositionEvent(database, "observer-expiry");
+    const repository = new AprsOutboxRepository(database.connection);
+    const queued = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: event.id,
+        data: "N0CALL-7>APTMAG,MESHD*,qAO,TEST01:!2500.00N/12130.00E>expiry",
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+
+    repository.claimDue("2026-07-18T00:00:00.000Z", 1);
+    repository.markSubmitted(
+      queued.id,
+      "2026-07-18T00:00:01.000Z",
+      PROVISION_FINGERPRINT,
+    );
+
+    expect(repository.expireSubmitted("2026-07-18T03:00:00.999Z")).toBe(0);
+    expect(repository.expireSubmitted("2026-07-18T03:00:01.000Z")).toBe(1);
+    expect(repository.find(queued.id)?.deliveryStatus).toBe(
+      "observation_expired",
+    );
+    expect(
+      database.connection
+        .prepare("SELECT COUNT(*) AS count FROM aprs_delivery_high_water")
+        .get(),
+    ).toEqual({ count: 0 });
     database.close();
   });
 
@@ -283,6 +680,60 @@ describe("APRS outbox", () => {
     database.close();
   });
 
+  it("stops an active batch and releases remaining work when its gate closes", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const repository = new AprsOutboxRepository(database.connection);
+    const first = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: persistedPositionEvent(
+          database,
+          "batch-fence-first",
+          1_784_332_800,
+          undefined,
+          42,
+        ).id,
+        data: "N0CALL-7>APCM20:first",
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+    const second = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N1CALL-7",
+        canonicalEventId: persistedPositionEvent(
+          database,
+          "batch-fence-second",
+          1_784_332_801,
+          undefined,
+          43,
+        ).id,
+        data: "N1CALL-7>APCM20:second",
+        now: "2026-07-18T00:00:00.001Z",
+      }),
+    );
+    let allowed = true;
+    const transmitted: string[] = [];
+    const worker = newWorker(repository, {
+      send: async (data, _fingerprint, _session, transmissionGate) => {
+        expect(transmissionGate?.()).toBe(true);
+        transmitted.push(data);
+        allowed = false;
+      },
+    });
+
+    await expect(worker.flush(undefined, () => allowed)).resolves.toEqual([
+      expect.objectContaining({ id: first.id, deliveryStatus: "submitted" }),
+    ]);
+    expect(transmitted).toEqual([first.data]);
+    expect(repository.find(first.id)?.deliveryStatus).toBe("submitted");
+    expect(repository.find(second.id)).toMatchObject({
+      status: "queued",
+      deliveryStatus: "queued",
+      attempts: 0,
+    });
+    database.close();
+  });
+
   it("deletes only sent outbox rows older than the retention cutoff", () => {
     const database = new GatewayDatabase(":memory:");
     const repository = new AprsOutboxRepository(database.connection);
@@ -306,6 +757,7 @@ describe("APRS outbox", () => {
       "2026-01-01T00:00:01.000Z",
       PROVISION_FINGERPRINT,
     );
+    confirmEntry(repository, old, "2026-01-01T00:00:02.000Z");
 
     const recent = requiredOutbox(
       enqueueProvisioned(repository, {
@@ -325,6 +777,7 @@ describe("APRS outbox", () => {
       "2026-07-17T00:00:01.000Z",
       PROVISION_FINGERPRINT,
     );
+    confirmEntry(repository, recent, "2026-07-17T00:00:02.000Z");
     const queued = requiredOutbox(
       enqueueProvisioned(repository, {
         callsign: "N1CALL-7",
@@ -374,6 +827,11 @@ describe("APRS outbox", () => {
       firstOutboxId,
       "2026-07-18T00:00:03.000Z",
       PROVISION_FINGERPRINT,
+    );
+    confirmEntry(
+      repository,
+      repository.find(firstOutboxId),
+      "2026-07-18T00:00:04.000Z",
     );
     expect(repository.deleteSentBefore("2027-01-01T00:00:00.000Z", 1)).toBe(1);
     expect(repository.find(firstOutboxId)).toBeUndefined();
@@ -669,7 +1127,7 @@ describe("APRS outbox", () => {
       }),
     );
     const remote = parseCmClientAprsLine(
-      "N0CALL-7>APTMAG,MESHD*,qAR,N1GATE-10:remote-exact",
+      "N0CALL-7>APCM20,MESHD*,qAR,N1GATE-10:remote-exact",
     );
     if (!remote) {
       throw new Error("invalid observer fixture");
@@ -698,6 +1156,64 @@ describe("APRS outbox", () => {
 
     expect(sends).toBe(0);
     expect(repository.find(entry.id)).toBeUndefined();
+    database.close();
+  });
+
+  it("checks the permanent legacy barrier at enqueue and final pre-send", () => {
+    const database = new GatewayDatabase(":memory:");
+    const repository = database.aprsOutbox;
+    const older = persistedPositionEvent(
+      database,
+      "legacy-barrier-older",
+      1_784_332_800,
+      10,
+    );
+    const newer = persistedPositionEvent(
+      database,
+      "legacy-barrier-newer",
+      1_784_332_801,
+      11,
+    );
+    const first = requiredOutbox(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: older.id,
+        data: "N0CALL-7>APCM20:legacy-barrier",
+        now: "2026-07-18T00:00:00.000Z",
+      }),
+    );
+    expect(repository.claimDue("2026-07-18T00:00:00.000Z", 1)).toHaveLength(1);
+    database.connection
+      .prepare(
+        "INSERT INTO aprs_legacy_submission_barriers (mesh_network_id, node_num, callsign, latest_canonical_event_id, latest_event_time, latest_sequence_epoch, latest_sequence_number, latest_mapping_version, submitted_at) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)",
+      )
+      .run(
+        newer.meshNetworkId,
+        newer.nodeNum,
+        "N0CALL-7",
+        newer.id,
+        newer.eventTime!,
+        newer.sequenceNumber!,
+        "2026-07-18T00:00:01.000Z",
+      );
+
+    expect(
+      repository.prepareSend(
+        first.id,
+        "2026-07-18T00:00:01.000Z",
+        1_000,
+        PROVISION_FINGERPRINT,
+      ),
+    ).toEqual({ authorized: false });
+    expect(repository.find(first.id)).toBeUndefined();
+    expect(
+      enqueueProvisioned(repository, {
+        callsign: "N0CALL-7",
+        canonicalEventId: older.id,
+        data: "N0CALL-7>APCM20:legacy-barrier",
+        now: "2026-07-18T00:00:02.000Z",
+      }),
+    ).toEqual({ created: false, suppressed: true });
     database.close();
   });
 
@@ -804,6 +1320,10 @@ describe("APRS outbox", () => {
     expect(second.decision.code).toBe("POSITION_ACCEPTED");
     expect(firstEnqueue).toMatchObject({ created: true, suppressed: false });
     expect(secondEnqueue).toMatchObject({ created: true, suppressed: true });
+    expect(secondEnqueue?.entry).toMatchObject({
+      status: "failed",
+      deliveryStatus: "failed",
+    });
     expect(thirdEnqueue).toEqual({ created: false, suppressed: true });
     expect(transmitted).toEqual([]);
     expect(repository.list(10)).toHaveLength(2);
@@ -899,6 +1419,11 @@ describe("APRS outbox", () => {
         clock: () => new Date("2026-07-18T00:00:02.000Z"),
       },
     ).flush();
+    confirmEntry(
+      repository,
+      repository.find(rebootOutbox.id),
+      "2026-07-18T00:00:03.000Z",
+    );
     expect(
       database.connection
         .prepare(
@@ -1000,11 +1525,20 @@ describe("APRS outbox", () => {
         .get(rebootEvent.id),
     ).toEqual({ sequence_epoch: null });
     let sends = 0;
-    await newWorker(repository, {
-      send: async () => {
-        sends += 1;
+    await newWorker(
+      repository,
+      {
+        send: async () => {
+          sends += 1;
+        },
       },
-    }).flush();
+      { clock: () => new Date("2026-07-18T00:00:03.000Z") },
+    ).flush();
+    confirmEntry(
+      repository,
+      repository.find(queued.id),
+      "2026-07-18T00:00:04.000Z",
+    );
     expect(sends).toBe(1);
     expect(
       database.connection
@@ -1059,6 +1593,104 @@ describe("AprsIsTcpClient", () => {
         "N0CALL-7>APCM20:fixture-one",
         "N0CALL-7>APCM20:fixture-two",
       ],
+    ]);
+    await client.close();
+    await close(server);
+  });
+
+  it("requires the prepared verified session instead of silently reopening", async () => {
+    const sessions: string[][] = [];
+    const server = net.createServer((socket) => {
+      const lines: string[] = [];
+      sessions.push(lines);
+      collectFixtureLines(socket, lines, (line) => {
+        if (line.startsWith("user ")) {
+          socket.write("# logresp TEST01 verified, server fixture\r\n");
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+    });
+
+    const first = await client.prepareVerifiedSession(PROVISION_FINGERPRINT);
+    expect(first).toEqual({ generation: 1 });
+    await client.close();
+    await expect(
+      client.send(
+        "N0CALL-7>APCM20:must-not-send",
+        PROVISION_FINGERPRINT,
+        first,
+      ),
+    ).rejects.toMatchObject({ code: "APRS_OUTBOX_FAILED" });
+    expect(sessions).toEqual([["user TEST01 pass 11111 vers CMClient 2.0"]]);
+
+    const second = await client.prepareVerifiedSession(PROVISION_FINGERPRINT);
+    expect(second).toEqual({ generation: 2 });
+    await client.send("N0CALL-7>APCM20:fixture", PROVISION_FINGERPRINT, second);
+    await waitFor(() => sessions[1]?.length === 2);
+    expect(sessions[1]).toEqual([
+      "user TEST01 pass 11111 vers CMClient 2.0",
+      "N0CALL-7>APCM20:fixture",
+    ]);
+
+    await client.close();
+    await close(server);
+  });
+
+  it("checks the transmission gate at the socket write and preserves the verified session", async () => {
+    const sessions: string[][] = [];
+    const server = net.createServer((socket) => {
+      const lines: string[] = [];
+      sessions.push(lines);
+      collectFixtureLines(socket, lines, (line) => {
+        if (line.startsWith("user ")) {
+          socket.write("# logresp TEST01 verified, server fixture\r\n");
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+    });
+    const session = await client.prepareVerifiedSession(PROVISION_FINGERPRINT);
+
+    await expect(
+      client.send(
+        "N0CALL-7>APCM20:must-not-send",
+        PROVISION_FINGERPRINT,
+        session,
+        () => false,
+      ),
+    ).rejects.toMatchObject({ code: "APRS_TX_FENCED" });
+    await client.send(
+      "N0CALL-7>APCM20:fixture",
+      PROVISION_FINGERPRINT,
+      session,
+      () => true,
+    );
+    await waitFor(() => sessions[0]?.length === 2);
+    expect(sessions).toEqual([
+      ["user TEST01 pass 11111 vers CMClient 2.0", "N0CALL-7>APCM20:fixture"],
     ]);
     await client.close();
     await close(server);
@@ -1389,6 +2021,62 @@ describe("AprsIsTcpClient", () => {
     await close(server);
   });
 
+  it("does not let a stale provision request close the current verified session", async () => {
+    const sessions: string[][] = [];
+    const server = net.createServer((socket) => {
+      const lines: string[] = [];
+      sessions.push(lines);
+      collectFixtureLines(socket, lines, (line) => {
+        const callsign = /^user ([^ ]+) /.exec(line)?.[1];
+        if (callsign) {
+          socket.write(`# logresp ${callsign} verified, server fixture\r\n`);
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    let current = {
+      loginLine: "user TEST01 pass 11111 vers CMClient 2.0",
+      provisionFingerprint: PROVISION_FINGERPRINT,
+    };
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: () => ({ ...current }),
+    });
+    const staleSession = await client.prepareVerifiedSession(
+      PROVISION_FINGERPRINT,
+    );
+    current = {
+      loginLine: "user AB12CD-7 pass 22222 vers CMClient 2.0",
+      provisionFingerprint: ROTATED_PROVISION_FINGERPRINT,
+    };
+    const currentSession = await client.prepareVerifiedSession(
+      ROTATED_PROVISION_FINGERPRINT,
+    );
+
+    await expect(
+      client.send("TEST01-7>APCM20:stale", PROVISION_FINGERPRINT, staleSession),
+    ).rejects.toMatchObject({ code: "APRS_PROVISION_UNAVAILABLE" });
+    await client.send(
+      "AB12CD-7>APCM20:current",
+      ROTATED_PROVISION_FINGERPRINT,
+      currentSession,
+    );
+    await waitFor(() => sessions[1]?.length === 2);
+    expect(sessions).toHaveLength(2);
+    expect(sessions[1]).toEqual([
+      "user AB12CD-7 pass 22222 vers CMClient 2.0",
+      "AB12CD-7>APCM20:current",
+    ]);
+    await client.close();
+    await close(server);
+  });
+
   it("rejects invalid login providers before opening a socket", async () => {
     let connections = 0;
     const server = net.createServer(() => {
@@ -1429,7 +2117,7 @@ describe("AprsIsTcpClient", () => {
     await close(server);
   });
 
-  it("rejects line injection in APRS-IS login and Data", async () => {
+  it("rejects line injection and oversized APRS-IS login and Data", async () => {
     const injectedLoginClient = new AprsIsTcpClient({
       host: "127.0.0.1",
       port: 14580,
@@ -1466,6 +2154,13 @@ describe("AprsIsTcpClient", () => {
     ).rejects.toMatchObject({
       code: "APRS_OUTBOX_FAILED",
     });
+    const prefix = "TEST01-7>APTMAG:";
+    await expect(
+      client.send(
+        `${prefix}${"x".repeat(511 - Buffer.byteLength(prefix))}`,
+        PROVISION_FINGERPRINT,
+      ),
+    ).rejects.toMatchObject({ code: "APRS_OUTBOX_FAILED" });
   });
 });
 
@@ -1474,6 +2169,7 @@ function persistedPositionEvent(
   suffix = "fixture",
   positionTimestampSeconds = 1_784_332_800,
   sequenceNumber?: number,
+  nodeNum = 42,
 ) {
   const meshObservation = createMeshObservation({
     id: `mesh-observation-${suffix}`,
@@ -1489,7 +2185,7 @@ function persistedPositionEvent(
     schemaVersion: 1,
     id: `position-observation-${suffix}`,
     meshNetworkId: "fixture-network",
-    nodeNum: 42,
+    nodeNum,
     meshObservationId: meshObservation.id,
     gatewayId: "fixture-gateway",
     transport: "simulator",
