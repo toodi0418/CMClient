@@ -117,7 +117,7 @@ describe("Gateway OpenAPI contract", () => {
     );
     expect(JSON.stringify(document)).not.toContain(capability);
     expect(gatewayOpenApiDocumentDigest(document)).toBe(
-      "a1e88c4cd5e9c5bbe02fe801a69ce47d03b9017c384c29eef2a04ff4844b5226",
+      "5767de40ace8b01abb0f06387d823790671f1b1f341a4eb467206f64af214de2",
     );
 
     await app.close();

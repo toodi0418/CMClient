@@ -65,6 +65,43 @@ export const CallMeshMappingSchema = Type.Object(
     meshNetworkId: Type.String({ minLength: 1, maxLength: 128 }),
     nodeNum: Type.Integer({ minimum: 0, maximum: 4_294_967_295 }),
     callsign: Type.String({ minLength: 1, maxLength: 16 }),
+    symbolTable: Type.Optional(
+      Type.Union([
+        Type.String({
+          minLength: 1,
+          maxLength: 1,
+          pattern: APRS_PRINTABLE_CHARACTER,
+        }),
+        Type.Null(),
+      ]),
+    ),
+    symbolCode: Type.Optional(
+      Type.Union([
+        Type.String({
+          minLength: 1,
+          maxLength: 1,
+          pattern: APRS_PRINTABLE_CHARACTER,
+        }),
+        Type.Null(),
+      ]),
+    ),
+    symbolOverlay: Type.Optional(
+      Type.Union([
+        Type.String({
+          minLength: 1,
+          maxLength: 1,
+          pattern: APRS_PRINTABLE_CHARACTER,
+        }),
+        Type.Null(),
+      ]),
+    ),
+    comment: Type.Optional(
+      Type.Union([
+        Type.String({ maxLength: 80, pattern: "^[^\\r\\n]*$" }),
+        Type.Null(),
+      ]),
+    ),
+    altitudeMeters: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
   },
   { additionalProperties: false },
 );

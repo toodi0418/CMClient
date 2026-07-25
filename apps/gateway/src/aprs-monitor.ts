@@ -1,7 +1,6 @@
+import { createHash } from "node:crypto";
 import net, { type Socket } from "node:net";
 import { DatabaseSync } from "node:sqlite";
-
-import type { PositionCanonicalEvent } from "@cmclient/contracts";
 
 import {
   PROVISION_FINGERPRINT_PATTERN,
@@ -10,6 +9,11 @@ import {
 } from "./aprs-identity.js";
 
 const DEFAULT_SESSION_CLOSE_TIMEOUT_MS = 5_000;
+const APRS_OBSERVER_TTL_MS = 3 * 60 * 60 * 1_000;
+const APRS_LOCAL_TX_TTL_MS = 30_000;
+const MAX_APRS_LINE_BYTES = 512;
+const MAX_APRS_BUFFER_BYTES = 1_024;
+const APRS_CALLSIGN_PATTERN = /^[A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?$/;
 
 export interface AprsMonitorTarget {
   callsign: string;
@@ -20,13 +24,12 @@ export interface AprsMonitorTarget {
 
 export interface AprsRemotePosition {
   callsign: string;
-  eventMarker: string;
-  eventTime: string;
+  info: string;
+  infoDigest: string;
 }
 
 export interface AprsRemoteHighWaterState extends AprsMonitorTarget {
-  latestEventMarker: string;
-  latestEventTime: string;
+  latestInfoDigest: string;
   receivedAt: string;
 }
 
@@ -77,8 +80,7 @@ export class AprsRemoteHighWaterStore {
     validateTarget(target);
     if (
       remote.callsign !== target.callsign ||
-      !isMarker(remote.eventMarker) ||
-      !isTimestamp(remote.eventTime) ||
+      remote.infoDigest !== digestInfo(remote.callsign, remote.info) ||
       !isTimestamp(receivedAt)
     ) {
       throw new AprsMonitorError();
@@ -87,82 +89,101 @@ export class AprsRemoteHighWaterStore {
     try {
       this.database.exec("BEGIN IMMEDIATE");
       transactionOpen = true;
-      const current = this.find(target);
-      if (
-        current &&
-        remote.eventTime.localeCompare(current.latestEventTime) <= 0
-      ) {
-        this.database.exec("COMMIT");
-        transactionOpen = false;
-        return { advanced: false, state: current };
-      }
+      const existing = this.database
+        .prepare(
+          "SELECT last_observed_at FROM aprs_observed_packets WHERE callsign = ? AND info = ?",
+        )
+        .get(remote.callsign, remote.info);
+      const advanced = !existing;
       this.database
         .prepare(
-          "INSERT INTO aprs_remote_high_water (mesh_network_id, node_num, callsign, mapping_version, latest_event_time, latest_event_marker, received_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(mesh_network_id, node_num, callsign, mapping_version) DO UPDATE SET latest_event_time = excluded.latest_event_time, latest_event_marker = excluded.latest_event_marker, received_at = excluded.received_at",
+          "INSERT INTO aprs_observed_packets (callsign, info, first_observed_at, last_observed_at) VALUES (?, ?, ?, ?) ON CONFLICT(callsign, info) DO UPDATE SET last_observed_at = excluded.last_observed_at",
         )
-        .run(
-          target.meshNetworkId,
-          target.nodeNum,
-          target.callsign,
-          target.mappingVersion,
-          remote.eventTime,
-          remote.eventMarker,
-          receivedAt,
-        );
-      const state = this.find(target);
-      if (!state) {
-        throw new AprsMonitorError();
-      }
+        .run(remote.callsign, remote.info, receivedAt, receivedAt);
+      this.pruneInsideTransaction(receivedAt);
       this.database.exec("COMMIT");
       transactionOpen = false;
-      return { advanced: true, state };
+      return {
+        advanced,
+        state: {
+          ...target,
+          latestInfoDigest: remote.infoDigest,
+          receivedAt,
+        },
+      };
     } catch {
       if (transactionOpen) {
         try {
           this.database.exec("ROLLBACK");
         } catch {
-          // Preserve the stable persistence error even if SQLite cannot roll back.
+          // Keep the stable persistence error.
         }
       }
       throw new AprsMonitorPersistenceError();
     }
   }
 
-  find(target: AprsMonitorTarget): AprsRemoteHighWaterState | undefined {
+  canUploadData(data: string, target: AprsMonitorTarget, at: string): boolean {
     validateTarget(target);
-    const row = this.database
-      .prepare(
-        "SELECT * FROM aprs_remote_high_water WHERE mesh_network_id = ? AND node_num = ? AND callsign = ? AND mapping_version = ?",
-      )
-      .get(
-        target.meshNetworkId,
-        target.nodeNum,
-        target.callsign,
-        target.mappingVersion,
-      );
-    return row ? toRemoteState(row) : undefined;
-  }
-
-  canUpload(event: PositionCanonicalEvent, target: AprsMonitorTarget): boolean {
-    const remote = this.find(target);
-    if (!event.eventTime || !isTimestamp(event.eventTime)) {
+    if (!isTimestamp(at)) {
       return false;
     }
-    if (!remote) {
-      return true;
+    const packet = parseCmClientAprsLine(data);
+    if (!packet || packet.callsign !== target.callsign) {
+      return false;
     }
-    const localMarker = `CM2/${event.canonicalKey.slice(0, 12)}`;
-    const localMinute = new Date(event.eventTime);
-    localMinute.setUTCSeconds(0, 0);
-    if (
-      localMarker === remote.latestEventMarker &&
-      localMinute.toISOString() === remote.latestEventTime
-    ) {
-      return true;
+    try {
+      const observerCutoff = new Date(
+        Date.parse(at) - APRS_OBSERVER_TTL_MS,
+      ).toISOString();
+      const localCutoff = new Date(
+        Date.parse(at) - APRS_LOCAL_TX_TTL_MS,
+      ).toISOString();
+      const observed = this.database
+        .prepare(
+          "SELECT 1 FROM aprs_observed_packets WHERE callsign = ? AND info = ? AND last_observed_at >= ?",
+        )
+        .get(packet.callsign, packet.info, observerCutoff);
+      const transmitted = this.database
+        .prepare(
+          "SELECT 1 FROM aprs_local_transmissions WHERE callsign = ? AND info = ? AND transmitted_at >= ?",
+        )
+        .get(packet.callsign, packet.info, localCutoff);
+      return !observed && !transmitted;
+    } catch {
+      return false;
     }
-    return (
-      Date.parse(event.eventTime) >= Date.parse(remote.latestEventTime) + 60_000
-    );
+  }
+
+  recordLocalTransmission(data: string, transmittedAt: string): void {
+    const packet = parseCmClientAprsLine(data);
+    if (!packet || !isTimestamp(transmittedAt)) {
+      throw new AprsMonitorError();
+    }
+    try {
+      this.database
+        .prepare(
+          "INSERT INTO aprs_local_transmissions (callsign, info, transmitted_at) VALUES (?, ?, ?) ON CONFLICT(callsign, info) DO UPDATE SET transmitted_at = excluded.transmitted_at",
+        )
+        .run(packet.callsign, packet.info, transmittedAt);
+    } catch {
+      throw new AprsMonitorPersistenceError();
+    }
+  }
+
+  private pruneInsideTransaction(at: string): void {
+    const observerCutoff = new Date(
+      Date.parse(at) - APRS_OBSERVER_TTL_MS,
+    ).toISOString();
+    const localCutoff = new Date(
+      Date.parse(at) - APRS_LOCAL_TX_TTL_MS,
+    ).toISOString();
+    this.database
+      .prepare("DELETE FROM aprs_observed_packets WHERE last_observed_at < ?")
+      .run(observerCutoff);
+    this.database
+      .prepare("DELETE FROM aprs_local_transmissions WHERE transmitted_at < ?")
+      .run(localCutoff);
   }
 }
 
@@ -192,8 +213,8 @@ export class AprsIsMonitor {
   }
 
   observeLine(line: string, receivedAt: string): AprsMonitorResult {
-    const remote = parseCmClientAprsLine(line, receivedAt);
-    if (!remote) {
+    const remote = parseCmClientAprsLine(line);
+    if (!remote || !isTimestamp(receivedAt)) {
       return { kind: "ignored", reason: "malformed" };
     }
     const target = this.targetsByCallsign.get(remote.callsign);
@@ -243,33 +264,55 @@ export class AprsIsRxClient {
     onLine: (line: string) => void,
     onLineError: (error: unknown) => void = () => undefined,
   ): Promise<AprsIsRxSession> {
-    resolveAuthorization(
+    const authorization = resolveAuthorization(
       this.options.authorizationProvider,
       this.options.provisionFingerprint,
     );
+    const callsign = authorizationCallsign(authorization);
     const socket = net.createConnection({
       host: this.options.host,
       port: this.options.port,
     });
+    const reader = attachVerifiedLineReader(
+      socket,
+      callsign,
+      this.options.timeoutMs ?? 10_000,
+      onLine,
+      onLineError,
+    );
     try {
       await onceConnected(socket, this.options.timeoutMs ?? 10_000);
-      const authorization = resolveAuthorization(
+      const connectedAuthorization = resolveAuthorization(
         this.options.authorizationProvider,
         this.options.provisionFingerprint,
       );
+      if (!authorizationMatches(authorization, connectedAuthorization)) {
+        throw new AprsMonitorAuthorizationError();
+      }
       await write(
         socket,
         `${authorization.loginLine} filter ${this.options.filterExpression}\r\n`,
       );
-      attachLineReader(socket, onLine, onLineError);
+      await reader.verified;
+      const verifiedAuthorization = resolveAuthorization(
+        this.options.authorizationProvider,
+        this.options.provisionFingerprint,
+      );
+      if (!authorizationMatches(authorization, verifiedAuthorization)) {
+        throw new AprsMonitorAuthorizationError();
+      }
+      socket.unref();
       return {
-        close: () =>
-          closeSocket(
+        close: async () => {
+          reader.beginClose();
+          await closeSocket(
             socket,
             this.options.closeTimeoutMs ?? DEFAULT_SESSION_CLOSE_TIMEOUT_MS,
-          ),
+          );
+        },
       };
     } catch (error) {
+      reader.beginClose();
       socket.destroy();
       if (error instanceof AprsMonitorAuthorizationError) {
         throw error;
@@ -281,99 +324,39 @@ export class AprsIsRxClient {
 
 export function parseCmClientAprsLine(
   line: string,
-  receivedAt: string,
 ): AprsRemotePosition | undefined {
-  if (line.length > 512 || /[\r\n]/.test(line) || !isTimestamp(receivedAt)) {
+  if (
+    Buffer.byteLength(line, "utf8") > MAX_APRS_LINE_BYTES ||
+    /[\r\n]/.test(line)
+  ) {
     return undefined;
   }
   const header =
-    /^([A-Z0-9]{1,6}(?:-[0-9]{1,2})?)>[A-Z0-9]{1,6}(?:-[0-9]{1,2})?(?:,[^:\r\n]*)?:(.*)$/.exec(
+    /^([A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?)>[A-Z0-9]{1,6}(?:-[0-9]{1,2})?(?:,[^:\r\n]*)?:(.*)$/i.exec(
       line,
     );
   if (!header) {
     return undefined;
   }
-  const data = header[2]!;
-  const position =
-    /^\/(\d{2})(\d{2})(\d{2})z(\d{2})(\d{2}\.\d{2})[NS][ -~](\d{3})(\d{2}\.\d{2})[EW][ -~]/.exec(
-      data,
-    );
-  const marker = /(?:^|\s)(CM2\/[a-f0-9]{12})$/.exec(data);
-  if (!position || !marker || !validPosition(position)) {
+  const callsign = header[1]!.toUpperCase();
+  const info = header[2]!;
+  if (!APRS_CALLSIGN_PATTERN.test(callsign) || info.length === 0) {
     return undefined;
   }
-  const eventTime = resolveAprsTimestamp(
-    Number(position[1]),
-    Number(position[2]),
-    Number(position[3]),
-    receivedAt,
-  );
-  if (!eventTime) {
-    return undefined;
-  }
-  return {
-    callsign: header[1]!,
-    eventMarker: marker[1]!,
-    eventTime,
-  };
+  return { callsign, info, infoDigest: digestInfo(callsign, info) };
 }
 
-function validPosition(position: RegExpExecArray): boolean {
-  const latitudeDegrees = Number(position[4]);
-  const latitudeMinutes = Number(position[5]);
-  const longitudeDegrees = Number(position[6]);
-  const longitudeMinutes = Number(position[7]);
-  return (
-    latitudeDegrees <= 90 &&
-    latitudeMinutes < 60 &&
-    !(latitudeDegrees === 90 && latitudeMinutes > 0) &&
-    longitudeDegrees <= 180 &&
-    longitudeMinutes < 60 &&
-    !(longitudeDegrees === 180 && longitudeMinutes > 0)
-  );
-}
-
-function resolveAprsTimestamp(
-  day: number,
-  hour: number,
-  minute: number,
-  receivedAt: string,
-): string | undefined {
-  if (day < 1 || day > 31 || hour > 23 || minute > 59) {
-    return undefined;
-  }
-  const received = new Date(receivedAt);
-  const candidates = [-1, 0, 1]
-    .map(
-      (monthOffset) =>
-        new Date(
-          Date.UTC(
-            received.getUTCFullYear(),
-            received.getUTCMonth() + monthOffset,
-            day,
-            hour,
-            minute,
-          ),
-        ),
-    )
-    .filter((candidate) => candidate.getUTCDate() === day);
-  const candidate = candidates.sort(
-    (left, right) =>
-      Math.abs(left.getTime() - received.getTime()) -
-      Math.abs(right.getTime() - received.getTime()),
-  )[0];
-  if (
-    !candidate ||
-    Math.abs(candidate.getTime() - received.getTime()) > 36 * 60 * 60 * 1_000
-  ) {
-    return undefined;
-  }
-  return candidate.toISOString();
+function digestInfo(callsign: string, info: string): string {
+  return createHash("sha256")
+    .update(callsign, "utf8")
+    .update("\u0000", "utf8")
+    .update(info, "utf8")
+    .digest("hex");
 }
 
 function validateTarget(target: AprsMonitorTarget): void {
   if (
-    !/^[A-Z0-9]{1,6}(?:-[0-9]{1,2})?$/.test(target.callsign) ||
+    !APRS_CALLSIGN_PATTERN.test(target.callsign) ||
     !target.mappingVersion.trim() ||
     !target.meshNetworkId.trim() ||
     !Number.isInteger(target.nodeNum) ||
@@ -382,31 +365,6 @@ function validateTarget(target: AprsMonitorTarget): void {
   ) {
     throw new AprsMonitorError();
   }
-}
-
-function toRemoteState(row: Record<string, unknown>): AprsRemoteHighWaterState {
-  const state: AprsRemoteHighWaterState = {
-    callsign: String(row.callsign),
-    mappingVersion: String(row.mapping_version),
-    meshNetworkId: String(row.mesh_network_id),
-    nodeNum: Number(row.node_num),
-    latestEventMarker: String(row.latest_event_marker),
-    latestEventTime: String(row.latest_event_time),
-    receivedAt: String(row.received_at),
-  };
-  validateTarget(state);
-  if (
-    !isMarker(state.latestEventMarker) ||
-    !isTimestamp(state.latestEventTime) ||
-    !isTimestamp(state.receivedAt)
-  ) {
-    throw new AprsMonitorError();
-  }
-  return state;
-}
-
-function isMarker(value: string): boolean {
-  return /^CM2\/[a-f0-9]{12}$/.test(value);
 }
 
 function isFilterExpression(value: string): boolean {
@@ -421,18 +379,22 @@ function isTimestamp(value: string): boolean {
 
 function onceConnected(socket: Socket, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new AprsMonitorError());
-    }, timeoutMs);
-    socket.once("connect", () => {
+    const finish = (error?: AprsMonitorError) => {
       clearTimeout(timer);
-      resolve();
-    });
-    socket.once("error", () => {
-      clearTimeout(timer);
-      reject(new AprsMonitorError());
-    });
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const onConnect = () => finish();
+    const onError = () => finish(new AprsMonitorError());
+    const timer = setTimeout(onError, timeoutMs);
+    timer.unref();
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
   });
 }
 
@@ -441,8 +403,6 @@ function write(socket: Socket, value: string): Promise<void> {
     socket.write(value, (error) => (error ? reject(error) : resolve())),
   );
 }
-
-const MAX_APRS_LOGIN_LINE_BYTES = 512;
 
 function resolveAuthorization(
   provider: AprsAuthorizationProvider,
@@ -470,40 +430,162 @@ function isValidLoginLine(value: unknown): value is string {
     typeof value === "string" &&
     value.trim().length > 0 &&
     !/[\r\n]/.test(value) &&
-    Buffer.byteLength(value, "utf8") <= MAX_APRS_LOGIN_LINE_BYTES
+    Buffer.byteLength(value, "utf8") <= MAX_APRS_LINE_BYTES
   );
 }
 
-function attachLineReader(
+function authorizationCallsign(
+  authorization: AprsConnectionAuthorization,
+): string {
+  const match = /^user\s+([^\s]+)\s+pass\s+[^\s]+(?:\s|$)/.exec(
+    authorization.loginLine,
+  );
+  if (!match || !APRS_CALLSIGN_PATTERN.test(match[1]!)) {
+    throw new AprsMonitorAuthorizationError();
+  }
+  return match[1]!;
+}
+
+function authorizationMatches(
+  expected: AprsConnectionAuthorization,
+  current: AprsConnectionAuthorization,
+): boolean {
+  return (
+    expected.provisionFingerprint === current.provisionFingerprint &&
+    expected.loginLine === current.loginLine
+  );
+}
+
+function parseLogresp(
+  line: string,
+):
+  | { callsign: string; status: "verified" | "unverified" }
+  | "malformed"
+  | undefined {
+  if (!/^#\s*logresp\b/i.test(line)) {
+    return undefined;
+  }
+  const match =
+    /^#\s*logresp\s+([^\s,]+)\s+(verified|unverified)(?:[\s,]|$)/i.exec(line);
+  if (!match || !APRS_CALLSIGN_PATTERN.test(match[1]!)) {
+    return "malformed";
+  }
+  return {
+    callsign: match[1]!,
+    status: match[2]!.toLowerCase() as "verified" | "unverified",
+  };
+}
+
+function attachVerifiedLineReader(
   socket: Socket,
+  expectedCallsign: string,
+  timeoutMs: number,
   onLine: (line: string) => void,
   onLineError: (error: unknown) => void,
-): void {
+): { verified: Promise<void>; beginClose: () => void } {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
-  socket.on("data", (chunk: Buffer) => {
-    buffer += chunk.toString("utf8");
+  let state: "awaiting" | "verified" | "failed" | "closing" = "awaiting";
+  let resolveVerified!: () => void;
+  let rejectVerified!: (error: AprsMonitorError) => void;
+  const verified = new Promise<void>((resolve, reject) => {
+    resolveVerified = resolve;
+    rejectVerified = reject;
+  });
+  void verified.catch(() => undefined);
+  const fail = (error = new AprsMonitorError()) => {
+    if (state === "failed" || state === "closing") {
+      return;
+    }
+    const wasAwaiting = state === "awaiting";
+    state = "failed";
+    clearTimeout(timer);
+    if (wasAwaiting) {
+      rejectVerified(error);
+    } else {
+      try {
+        onLineError(error);
+      } catch {
+        // Consumer reporting must not escape a socket callback.
+      }
+    }
+    socket.destroy();
+  };
+  const processLine = (line: string) => {
+    if (Buffer.byteLength(line, "utf8") > MAX_APRS_LINE_BYTES) {
+      fail();
+      return;
+    }
+    const logresp = parseLogresp(line);
+    if (logresp !== undefined) {
+      if (
+        logresp === "malformed" ||
+        logresp.callsign !== expectedCallsign ||
+        logresp.status !== "verified"
+      ) {
+        fail();
+        return;
+      }
+      if (state === "awaiting") {
+        state = "verified";
+        clearTimeout(timer);
+        resolveVerified();
+      }
+      return;
+    }
+    if (state !== "verified" || line.startsWith("#")) {
+      return;
+    }
+    try {
+      onLine(line);
+    } catch (error) {
+      try {
+        onLineError(error);
+      } catch {
+        // Keep callback failures isolated from the socket EventEmitter.
+      }
+    }
+  };
+  const onData = (chunk: Buffer) => {
+    if (state === "failed" || state === "closing") {
+      return;
+    }
+    try {
+      buffer += decoder.decode(chunk, { stream: true });
+    } catch {
+      fail();
+      return;
+    }
     let lineEnd = buffer.indexOf("\n");
     while (lineEnd >= 0) {
       const line = buffer.slice(0, lineEnd).replace(/\r$/, "");
       buffer = buffer.slice(lineEnd + 1);
-      if (line.length <= 512) {
-        try {
-          onLine(line);
-        } catch (error) {
-          try {
-            onLineError(error);
-          } catch {
-            // Consumer failures must never escape the socket EventEmitter.
-          }
-        }
+      processLine(line);
+      if (socket.destroyed) {
+        return;
       }
       lineEnd = buffer.indexOf("\n");
     }
-    if (buffer.length > 1_024) {
-      buffer = "";
-      socket.destroy();
+    if (Buffer.byteLength(buffer, "utf8") > MAX_APRS_BUFFER_BYTES) {
+      fail();
     }
-  });
+  };
+  const timer = setTimeout(() => fail(), timeoutMs);
+  timer.unref();
+  socket.on("data", onData);
+  socket.on("error", () => fail());
+  socket.on("end", () => fail());
+  socket.on("close", () => fail());
+  return {
+    verified,
+    beginClose: () => {
+      if (state === "awaiting") {
+        rejectVerified(new AprsMonitorError());
+      }
+      state = "closing";
+      clearTimeout(timer);
+    },
+  };
 }
 
 function closeSocket(socket: Socket, timeoutMs: number): Promise<void> {

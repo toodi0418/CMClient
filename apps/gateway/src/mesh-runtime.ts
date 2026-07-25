@@ -45,7 +45,6 @@ export interface MeshGatewayRuntimeOptions {
   meshNetworkId: string;
   transport: MeshtasticTransport;
   aprs?: {
-    destination?: string;
     stateProvider?: () => AprsRuntimeState | undefined;
   };
   clock?: () => Date;
@@ -395,11 +394,24 @@ export class MeshGatewayRuntime {
       return { event: duplicate.event, decision, outboxCreated: false };
     }
 
+    const validationClock = this.clock();
+    const eligibility = validatePositionForAprs(duplicate.event, {
+      now: validationClock,
+    });
+    if (!eligibility.accepted) {
+      const decision = this.recordDecision(
+        positionObservation,
+        duplicate.event,
+        eligibility.code,
+      );
+      return { event: duplicate.event, decision, outboxCreated: false };
+    }
+
     const mapping = selectActiveMapping(
       aprsState.mappings,
       duplicate.event.meshNetworkId,
       duplicate.event.nodeNum,
-      observation.serverIngestedAt,
+      eligibility.event.eventTime!,
     );
     if (mapping.kind === "none") {
       this.publish("position.unmapped", {
@@ -428,7 +440,7 @@ export class MeshGatewayRuntime {
       target,
     );
     const validation = validatePositionForAprs(duplicate.event, {
-      now: this.clock(),
+      now: validationClock,
       ...(current?.latestEventTime
         ? { previousTrustedEventTime: current.latestEventTime }
         : {}),
@@ -443,29 +455,59 @@ export class MeshGatewayRuntime {
       return { event: duplicate.event, decision, outboxCreated: false };
     }
 
+    const aprsIdentity = aprsState.identity;
+    const activeMapping = mapping.mapping;
+    const mappingSymbolTable = Object.prototype.hasOwnProperty.call(
+      activeMapping,
+      "symbolTable",
+    )
+      ? (activeMapping.symbolTable ?? "/")
+      : aprsIdentity.symbolTable;
+    const mappingSymbolCode = Object.prototype.hasOwnProperty.call(
+      activeMapping,
+      "symbolCode",
+    )
+      ? (activeMapping.symbolCode ?? ">")
+      : aprsIdentity.symbolCode;
+    const mappingSymbolOverlay = Object.prototype.hasOwnProperty.call(
+      activeMapping,
+      "symbolOverlay",
+    )
+      ? activeMapping.symbolOverlay
+      : aprsIdentity.symbolOverlay;
+    const encoded = encodeAprsPosition(validation.event, {
+      mappingCallsign: target.callsign,
+      mappingSymbolTable,
+      mappingSymbolCode,
+      provisionIgateCallsign: aprsIdentity.callsign,
+      ...(mappingSymbolOverlay === undefined ? {} : { mappingSymbolOverlay }),
+      ...(typeof activeMapping.comment === "string"
+        ? { mappingComment: activeMapping.comment }
+        : {}),
+      ...(typeof activeMapping.altitudeMeters === "number"
+        ? { mappingAltitudeMeters: activeMapping.altitudeMeters }
+        : {}),
+    });
     const monitorTarget = {
       ...target,
       meshNetworkId: duplicate.event.meshNetworkId,
       nodeNum: duplicate.event.nodeNum,
     };
-    if (!this.remoteHighWater.canUpload(validation.event, monitorTarget)) {
+    if (
+      !this.remoteHighWater.canUploadData(
+        encoded.data,
+        monitorTarget,
+        validationClock.toISOString(),
+      )
+    ) {
       const decision = this.recordDecision(
         positionObservation,
         duplicate.event,
-        "APRS_SKIPPED_OUT_OF_ORDER",
+        "APRS_SKIPPED_RECENT_DUPLICATE",
         target,
       );
       return { event: duplicate.event, decision, outboxCreated: false };
     }
-
-    const aprsIdentity = aprsState.identity;
-    const encoded = encodeAprsPosition(validation.event, {
-      source: target.callsign,
-      destination: this.options.aprs?.destination ?? "APCM20",
-      symbolTable: aprsIdentity.effectiveSymbolTable,
-      symbolCode: aprsIdentity.symbolCode,
-      ...(aprsIdentity.comment ? { comment: aprsIdentity.comment } : {}),
-    });
     let enqueued:
       ReturnType<GatewayDatabase["aprsOutbox"]["enqueue"]> | undefined;
     const ordered = this.highWater.apply(

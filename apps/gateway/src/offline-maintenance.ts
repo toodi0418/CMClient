@@ -75,6 +75,8 @@ const DOMAIN_TABLES = Object.freeze([
   { name: "aprs_delivery_high_water", migration: 12 },
   { name: "callmesh_sync_state", migration: 14 },
   { name: "callmesh_sync_history", migration: 14 },
+  { name: "aprs_observed_packets", migration: 18 },
+  { name: "aprs_local_transmissions", migration: 18 },
 ] as const);
 
 export interface OfflineMaintenanceRequest {

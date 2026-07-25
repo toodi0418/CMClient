@@ -151,7 +151,7 @@ export class CallMeshMappingRepository implements CallMeshSnapshotStore {
   list(): CallMeshMapping[] {
     return this.database
       .prepare(
-        "SELECT version, effective_at, mesh_network_id, node_num, callsign FROM callmesh_mappings ORDER BY effective_at DESC, version ASC, mesh_network_id ASC, node_num ASC",
+        "SELECT version, effective_at, mesh_network_id, node_num, callsign, symbol_table_present, symbol_table, symbol_code_present, symbol_code, symbol_overlay_present, symbol_overlay, comment_present, comment, altitude_meters_present, altitude_meters FROM callmesh_mappings ORDER BY effective_at DESC, version ASC, mesh_network_id ASC, node_num ASC",
       )
       .all()
       .map((row) => ({
@@ -160,6 +160,7 @@ export class CallMeshMappingRepository implements CallMeshSnapshotStore {
         meshNetworkId: String(row.mesh_network_id),
         nodeNum: Number(row.node_num),
         callsign: String(row.callsign),
+        ...mappingMetadataFromRow(row),
       }));
   }
 
@@ -307,7 +308,7 @@ export class CallMeshMappingRepository implements CallMeshSnapshotStore {
   private replaceMappings(mappings: CallMeshMapping[]): void {
     this.database.exec("DELETE FROM callmesh_mappings");
     const insert = this.database.prepare(
-      "INSERT INTO callmesh_mappings (version, effective_at, mesh_network_id, node_num, callsign) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO callmesh_mappings (version, effective_at, mesh_network_id, node_num, callsign, symbol_table_present, symbol_table, symbol_code_present, symbol_code, symbol_overlay_present, symbol_overlay, comment_present, comment, altitude_meters_present, altitude_meters) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
     for (const mapping of mappings) {
       insert.run(
@@ -316,6 +317,16 @@ export class CallMeshMappingRepository implements CallMeshSnapshotStore {
         mapping.meshNetworkId,
         mapping.nodeNum,
         mapping.callsign,
+        hasOwn(mapping, "symbolTable") ? 1 : 0,
+        mapping.symbolTable ?? null,
+        hasOwn(mapping, "symbolCode") ? 1 : 0,
+        mapping.symbolCode ?? null,
+        hasOwn(mapping, "symbolOverlay") ? 1 : 0,
+        mapping.symbolOverlay ?? null,
+        hasOwn(mapping, "comment") ? 1 : 0,
+        mapping.comment ?? null,
+        hasOwn(mapping, "altitudeMeters") ? 1 : 0,
+        mapping.altitudeMeters ?? null,
       );
     }
   }
@@ -931,11 +942,14 @@ function parseMappingItem(
     "comment",
     "aprs_comment",
     "aprsComment",
+    "altitude_m",
+    "altitudeMeters",
+    "altitude",
   ]);
   if (!mappingEnabled(record)) {
     return undefined;
   }
-  validateMappingMetadata(record);
+  const metadata = parseMappingMetadata(record);
   const network = optionalText(
     record.mesh_network_id ?? record.meshNetworkId,
     128,
@@ -958,7 +972,14 @@ function parseMappingItem(
     record.effective_at !== undefined || record.effectiveAt !== undefined
       ? normalizeTimestamp(record.effective_at ?? record.effectiveAt)
       : normalizeTimestamp(batchEffectiveAt);
-  return { version, effectiveAt, meshNetworkId, nodeNum, callsign };
+  return {
+    version,
+    effectiveAt,
+    meshNetworkId,
+    nodeNum,
+    callsign,
+    ...metadata,
+  };
 }
 
 function mappingEnabled(record: Record<string, unknown>): boolean {
@@ -978,47 +999,91 @@ function mappingEnabled(record: Record<string, unknown>): boolean {
   return flags.length === 0 || flags[0] === true;
 }
 
-function validateMappingMetadata(record: Record<string, unknown>): void {
-  for (const value of [
-    record.symbol_table,
-    record.symbolTable,
-    record.aprs_symbol_table,
-    record.aprsSymbolTable,
-    record.symbol_code,
-    record.symbolCode,
-    record.aprs_symbol_code,
-    record.aprsSymbolCode,
-    record.symbol_overlay,
-    record.symbolOverlay,
-    record.aprs_symbol_overlay,
-    record.aprsSymbolOverlay,
-  ]) {
-    if (value !== undefined && value !== null) {
-      boundedText(value, 1);
+function parseMappingMetadata(
+  record: Record<string, unknown>,
+): Pick<
+  CallMeshMapping,
+  "symbolTable" | "symbolCode" | "symbolOverlay" | "comment" | "altitudeMeters"
+> {
+  const metadata: Pick<
+    CallMeshMapping,
+    | "symbolTable"
+    | "symbolCode"
+    | "symbolOverlay"
+    | "comment"
+    | "altitudeMeters"
+  > = {};
+  if (hasOwn(record, "symbol")) {
+    const symbol = optionalAprsText(record.symbol, 2);
+    metadata.symbolTable = symbol?.[0] ?? null;
+    metadata.symbolCode = symbol?.[1] ?? null;
+  } else {
+    const table = firstPresent(record, [
+      "symbol_table",
+      "symbolTable",
+      "aprs_symbol_table",
+      "aprsSymbolTable",
+    ]);
+    if (table.present) {
+      metadata.symbolTable = optionalAprsText(table.value, 1)?.[0] ?? null;
+    }
+    const code = firstPresent(record, [
+      "symbol_code",
+      "symbolCode",
+      "aprs_symbol_code",
+      "aprsSymbolCode",
+    ]);
+    if (code.present) {
+      metadata.symbolCode = optionalAprsText(code.value, 1)?.[0] ?? null;
     }
   }
-  if (record.symbol !== undefined && record.symbol !== null) {
-    boundedText(record.symbol, 2);
+  const overlay = firstPresent(record, [
+    "symbol_overlay",
+    "symbolOverlay",
+    "aprs_symbol_overlay",
+    "aprsSymbolOverlay",
+  ]);
+  if (overlay.present) {
+    metadata.symbolOverlay = optionalAprsText(overlay.value, 1)?.[0] ?? null;
   }
-  for (const value of [
-    record.comment,
-    record.aprs_comment,
-    record.aprsComment,
-  ]) {
-    if (value !== undefined && value !== null) {
-      boundedText(value, 80);
+  const comment = firstPresent(record, [
+    "aprs_comment",
+    "aprsComment",
+    "comment",
+  ]);
+  if (comment.present) {
+    metadata.comment =
+      comment.value === null ? null : boundedTextAllowEmpty(comment.value, 80);
+  }
+  const altitude = firstPresent(record, [
+    "altitude_m",
+    "altitudeMeters",
+    "altitude",
+  ]);
+  if (altitude.present) {
+    if (altitude.value === null) {
+      metadata.altitudeMeters = null;
+    } else if (
+      typeof altitude.value === "number" &&
+      Number.isFinite(altitude.value)
+    ) {
+      metadata.altitudeMeters = altitude.value;
+    } else {
+      throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
     }
   }
+  return metadata;
 }
 
 function parseMappingCallsign(record: Record<string, unknown>): string {
   const full = optionalText(
-    record.aprs_callsign_with_ssid ??
+    record.aprs_callsign ??
+      record.aprsCallsign ??
+      record.aprs_callsign_with_ssid ??
       record.aprsCallsignWithSsid ??
       record.callsign_with_ssid ??
       record.callsignWithSsid ??
-      record.aprs_callsign ??
-      record.aprsCallsign,
+      record.callsign,
     16,
   );
   if (full) {
@@ -1028,8 +1093,7 @@ function parseMappingCallsign(record: Record<string, unknown>): string {
     record.aprs_callsign_base ??
     record.aprsCallsignBase ??
     record.callsign_base ??
-    record.callsignBase ??
-    record.callsign;
+    record.callsignBase;
   const base = boundedText(baseValue, 6).toUpperCase();
   if (!/^[A-Z0-9]{1,6}$/.test(base)) {
     throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
@@ -1237,6 +1301,97 @@ function strictRecord(
     throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
   }
   return record;
+}
+
+function hasOwn(record: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function firstPresent(
+  record: Record<string, unknown>,
+  keys: readonly string[],
+): { present: boolean; value?: unknown } {
+  for (const key of keys) {
+    if (hasOwn(record, key)) {
+      return { present: true, value: record[key] };
+    }
+  }
+  return { present: false };
+}
+
+function optionalAprsText(
+  value: unknown,
+  maximumLength: number,
+): string | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (
+    typeof value !== "string" ||
+    value.length > maximumLength ||
+    !/^[ -~]+$/.test(value)
+  ) {
+    throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
+  }
+  return value;
+}
+
+function boundedTextAllowEmpty(value: unknown, maximumLength: number): string {
+  if (typeof value !== "string") {
+    throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
+  }
+  const text = value
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length > maximumLength || hasControlCharacter(text)) {
+    throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
+  }
+  return text;
+}
+
+function mappingMetadataFromRow(
+  row: Record<string, unknown>,
+): Pick<
+  CallMeshMapping,
+  "symbolTable" | "symbolCode" | "symbolOverlay" | "comment" | "altitudeMeters"
+> {
+  const metadata: Pick<
+    CallMeshMapping,
+    | "symbolTable"
+    | "symbolCode"
+    | "symbolOverlay"
+    | "comment"
+    | "altitudeMeters"
+  > = {};
+  const readOptional = (
+    presentValue: unknown,
+    value: unknown,
+    key:
+      | "symbolTable"
+      | "symbolCode"
+      | "symbolOverlay"
+      | "comment"
+      | "altitudeMeters",
+  ) => {
+    const present = Number(presentValue);
+    if (present !== 0 && present !== 1) {
+      throw new CallMeshClientError("CALLMESH_MAPPING_STORE_FAILED");
+    }
+    if (present === 1) {
+      Object.assign(metadata, { [key]: value === null ? null : value });
+    }
+  };
+  readOptional(row.symbol_table_present, row.symbol_table, "symbolTable");
+  readOptional(row.symbol_code_present, row.symbol_code, "symbolCode");
+  readOptional(row.symbol_overlay_present, row.symbol_overlay, "symbolOverlay");
+  readOptional(row.comment_present, row.comment, "comment");
+  readOptional(
+    row.altitude_meters_present,
+    row.altitude_meters === null ? null : Number(row.altitude_meters),
+    "altitudeMeters",
+  );
+  return metadata;
 }
 
 function firstOwnValue(

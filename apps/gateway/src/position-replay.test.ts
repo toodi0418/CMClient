@@ -96,7 +96,6 @@ describe("position/APRS replay matrix", () => {
 
     expect(eventA.canonicalKey).toBe(eventB.canonicalKey);
     expect(encode(eventA).data).toBe(encode(eventB).data);
-    expect(encode(eventA).eventMarker).toBe(encode(eventB).eventMarker);
     expect(first.transport).not.toBe(second.transport);
     expect(second.viaMqtt).toBe(true);
     gatewayA.close();
@@ -159,7 +158,7 @@ describe("position/APRS replay matrix", () => {
     database.close();
   });
 
-  it("uses remote deterministic markers to block a station that missed the newer event", () => {
+  it("uses exact observed Info without treating receive time as temporal high-water", () => {
     const database = new GatewayDatabase(":memory:");
     const remoteHighWater = new AprsRemoteHighWaterStore(database.connection);
     const monitor = new AprsIsMonitor([target], remoteHighWater);
@@ -172,8 +171,20 @@ describe("position/APRS replay matrix", () => {
     );
 
     expect(monitored).toMatchObject({ kind: "advanced" });
-    expect(remoteHighWater.canUpload(older, target)).toBe(false);
-    expect(remoteHighWater.canUpload(newer, target)).toBe(true);
+    expect(
+      remoteHighWater.canUploadData(
+        encode(older).data,
+        target,
+        "2030-01-02T03:06:01.000Z",
+      ),
+    ).toBe(true);
+    expect(
+      remoteHighWater.canUploadData(
+        encode(newer).data,
+        target,
+        "2030-01-02T03:06:01.000Z",
+      ),
+    ).toBe(false);
     database.close();
   });
 
@@ -196,7 +207,7 @@ describe("position/APRS replay matrix", () => {
     database.close();
   });
 
-  it("rejects reduced precision and preserves altitude zero while omitting a partial speed pair", () => {
+  it("rejects reduced precision and preserves altitude zero plus a partial speed pair", () => {
     const database = new GatewayDatabase(":memory:");
     const reducedPrecision = observe(
       database,
@@ -215,7 +226,7 @@ describe("position/APRS replay matrix", () => {
     const validation = validatePositionForAprs(partialSpeed, { now });
     expect(validation).toMatchObject({
       accepted: true,
-      speedTrackIncluded: false,
+      speedTrackIncluded: true,
     });
     if (!validation.accepted) {
       throw new Error("fixture position should be eligible");
@@ -227,7 +238,7 @@ describe("position/APRS replay matrix", () => {
     expect(
       validation.event.position.groundSpeedMetersPerSecond,
     ).toBeUndefined();
-    expect(validation.event.position.groundTrackDegrees).toBeUndefined();
+    expect(validation.event.position.groundTrackDegrees).toBe(90);
     database.close();
   });
 });
@@ -307,9 +318,9 @@ function observe(
 
 function encode(event: PositionCanonicalEvent) {
   return encodeAprsPosition(event, {
-    source: target.callsign,
-    destination: "APCM20",
-    symbolTable: "/",
-    symbolCode: ">",
+    mappingCallsign: target.callsign,
+    mappingSymbolTable: "/",
+    mappingSymbolCode: ">",
+    provisionIgateCallsign: "N1GATE-10",
   });
 }

@@ -9,6 +9,7 @@ import {
   type AprsAuthorizationProvider,
   type AprsConnectionAuthorization,
 } from "./aprs-identity.js";
+import { parseCmClientAprsLine } from "./aprs-monitor.js";
 
 export type AprsOutboxStatus = "queued" | "sending" | "sent" | "failed";
 
@@ -49,6 +50,7 @@ export interface EnqueueAprsResult {
 
 export interface AprsTransport {
   send(data: string, provisionFingerprint: string): Promise<void>;
+  close?(): Promise<void>;
 }
 
 export interface AprsRetryOptions {
@@ -273,6 +275,12 @@ export class AprsOutboxRepository {
         transactionOpen = false;
         return { authorized: false };
       }
+      if (this.isRecentExactDuplicate(entry, now)) {
+        this.database.prepare("DELETE FROM aprs_outbox WHERE id = ?").run(id);
+        this.database.exec("COMMIT");
+        transactionOpen = false;
+        return { authorized: false };
+      }
       const order = this.evaluateSendOrder(entry);
       if (order === "stale") {
         this.database.prepare("DELETE FROM aprs_outbox WHERE id = ?").run(id);
@@ -319,6 +327,15 @@ export class AprsOutboxRepository {
       ) {
         throw new AprsOutboxError();
       }
+      const packet = parseCmClientAprsLine(current.data);
+      if (!packet || packet.callsign !== current.callsign) {
+        throw new AprsOutboxError();
+      }
+      this.database
+        .prepare(
+          "INSERT INTO aprs_local_transmissions (callsign, info, transmitted_at) VALUES (?, ?, ?) ON CONFLICT(callsign, info) DO UPDATE SET transmitted_at = excluded.transmitted_at",
+        )
+        .run(packet.callsign, packet.info, now);
       this.database
         .prepare(
           "UPDATE aprs_outbox SET status = 'sent', sent_at = ?, updated_at = ?, last_error_code = NULL WHERE id = ? AND status = 'sending'",
@@ -600,11 +617,7 @@ export class AprsOutboxRepository {
     if (!validOrderSnapshot(snapshot)) {
       return "ambiguous";
     }
-    const remoteOrder = this.evaluateRemoteSendOrder(snapshot, entry.callsign);
-    if (remoteOrder === "stale") {
-      return "stale";
-    }
-    let ambiguous = remoteOrder === "ambiguous";
+    let ambiguous = false;
     const delivery = this.findDelivery(snapshot, entry.callsign);
     if (delivery) {
       if (delivery.canonicalEventId === entry.canonicalEventId) {
@@ -636,60 +649,27 @@ export class AprsOutboxRepository {
     return ambiguous ? "ambiguous" : "current";
   }
 
-  private evaluateRemoteSendOrder(
-    snapshot: OrderSnapshot,
-    callsign: string,
-  ): "current" | "stale" | "ambiguous" {
-    const event = this.database
-      .prepare("SELECT canonical_key FROM position_events WHERE id = ?")
-      .get(snapshot.canonicalEventId);
-    const canonicalKey = event?.canonical_key;
-    if (
-      typeof canonicalKey !== "string" ||
-      !/^[a-f0-9]{64}$/.test(canonicalKey)
-    ) {
-      return "ambiguous";
+  private isRecentExactDuplicate(entry: AprsOutboxEntry, now: string): boolean {
+    const packet = parseCmClientAprsLine(entry.data);
+    if (!packet || packet.callsign !== entry.callsign || !isTimestamp(now)) {
+      return true;
     }
-    const rows = this.database
-      .prepare(
-        "SELECT latest_event_time, latest_event_marker FROM aprs_remote_high_water WHERE mesh_network_id = ? AND node_num = ? AND callsign = ?",
-      )
-      .all(snapshot.meshNetworkId, snapshot.nodeNum, callsign);
-    if (rows.length === 0) {
-      return "current";
-    }
-    const eventTime = Date.parse(snapshot.eventTime!);
-    const localMinute = new Date(eventTime);
-    localMinute.setUTCSeconds(0, 0);
-    const eventMarker = `CM2/${canonicalKey.slice(0, 12)}`;
-    let ambiguous = false;
-    for (const row of rows) {
-      const remoteEventTime = row.latest_event_time;
-      const remoteEventMarker = row.latest_event_marker;
-      if (
-        typeof remoteEventTime !== "string" ||
-        !isTimestamp(remoteEventTime) ||
-        typeof remoteEventMarker !== "string" ||
-        !/^CM2\/[a-f0-9]{12}$/.test(remoteEventMarker)
-      ) {
-        ambiguous = true;
-        continue;
-      }
-      if (
-        remoteEventMarker === eventMarker &&
-        remoteEventTime === localMinute.toISOString()
-      ) {
-        continue;
-      }
-      const remoteTime = Date.parse(remoteEventTime);
-      if (eventTime < remoteTime) {
-        return "stale";
-      }
-      if (eventTime < remoteTime + 60_000) {
-        ambiguous = true;
-      }
-    }
-    return ambiguous ? "ambiguous" : "current";
+    const observerCutoff = new Date(
+      Date.parse(now) - 3 * 60 * 60 * 1_000,
+    ).toISOString();
+    const localCutoff = new Date(Date.parse(now) - 30_000).toISOString();
+    return Boolean(
+      this.database
+        .prepare(
+          "SELECT 1 FROM aprs_observed_packets WHERE callsign = ? AND info = ? AND last_observed_at >= ?",
+        )
+        .get(packet.callsign, packet.info, observerCutoff) ||
+      this.database
+        .prepare(
+          "SELECT 1 FROM aprs_local_transmissions WHERE callsign = ? AND info = ? AND transmitted_at >= ?",
+        )
+        .get(packet.callsign, packet.info, localCutoff),
+    );
   }
 
   private findDelivery(
@@ -791,6 +771,11 @@ export class AprsOutboxWorker {
     return operation;
   }
 
+  async close(): Promise<void> {
+    await this.activeFlush?.catch(() => undefined);
+    await this.transport.close?.();
+  }
+
   private async runFlush(limit?: number): Promise<AprsOutboxEntry[]> {
     const now = this.clock().toISOString();
     this.repository.resumeInterrupted(now);
@@ -865,6 +850,9 @@ export class AprsOutboxWorker {
 }
 
 export class AprsIsTcpClient implements AprsTransport {
+  private session: AprsTxSession | undefined;
+  private operationTail: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly options: {
       host: string;
@@ -886,7 +874,30 @@ export class AprsIsTcpClient implements AprsTransport {
     }
   }
 
-  async send(data: string, provisionFingerprint: string): Promise<void> {
+  send(data: string, provisionFingerprint: string): Promise<void> {
+    const operation = this.operationTail.then(() =>
+      this.sendSerialized(data, provisionFingerprint),
+    );
+    this.operationTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  close(): Promise<void> {
+    const operation = this.operationTail.then(() => this.closeCurrentSession());
+    this.operationTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  private async sendSerialized(
+    data: string,
+    provisionFingerprint: string,
+  ): Promise<void> {
     if (
       !data.trim() ||
       /[\r\n]/.test(data) ||
@@ -894,35 +905,166 @@ export class AprsIsTcpClient implements AprsTransport {
     ) {
       throw new AprsOutboxError();
     }
-    resolveAuthorization(
-      this.options.authorizationProvider,
-      provisionFingerprint,
-    );
+    let authorization: AprsConnectionAuthorization;
+    let callsign: string;
+    try {
+      authorization = resolveAuthorization(
+        this.options.authorizationProvider,
+        provisionFingerprint,
+      );
+      callsign = authorizationCallsign(authorization);
+    } catch (error) {
+      await this.closeCurrentSession();
+      throw error;
+    }
+    let session = this.session;
+    if (session && session.provisionFingerprint !== provisionFingerprint) {
+      await this.closeCurrentSession();
+      session = undefined;
+    } else if (session && !authorizationMatches(session, authorization)) {
+      await this.closeCurrentSession();
+      throw new AprsAuthorizationError();
+    }
+
+    if (!session || !isVerifiedSession(session)) {
+      if (session) {
+        await this.closeCurrentSession();
+      }
+      session = await this.openVerifiedSession(
+        authorization,
+        callsign,
+        provisionFingerprint,
+      );
+    }
+
+    let currentAuthorization: AprsConnectionAuthorization;
+    try {
+      currentAuthorization = resolveAuthorization(
+        this.options.authorizationProvider,
+        provisionFingerprint,
+      );
+    } catch (error) {
+      await this.closeCurrentSession();
+      throw error;
+    }
+    if (
+      this.session !== session ||
+      !isVerifiedSession(session) ||
+      !authorizationMatches(session, currentAuthorization)
+    ) {
+      await this.closeCurrentSession();
+      throw new AprsAuthorizationError();
+    }
+    try {
+      await write(session.socket, `${data}\r\n`);
+    } catch {
+      await this.closeCurrentSession();
+      throw new AprsOutboxError();
+    }
+  }
+
+  private async openVerifiedSession(
+    authorization: AprsConnectionAuthorization,
+    callsign: string,
+    provisionFingerprint: string,
+  ): Promise<AprsTxSession> {
     const socket = net.createConnection({
       host: this.options.host,
       port: this.options.port,
     });
+    const session: AprsTxSession = {
+      socket,
+      state: "connecting",
+      callsign,
+      loginLine: authorization.loginLine,
+      provisionFingerprint,
+    };
+    this.session = session;
+    const timeoutMs = this.options.timeoutMs ?? 10_000;
+    const verification = waitForVerifiedLogresp(
+      socket,
+      callsign,
+      timeoutMs,
+      () => this.invalidateSession(session),
+    );
+    void verification.catch(() => undefined);
     try {
-      await onceConnected(socket, this.options.timeoutMs ?? 10_000);
-      const authorization = resolveAuthorization(
+      await onceConnected(socket, timeoutMs);
+      const connectedAuthorization = resolveAuthorization(
         this.options.authorizationProvider,
         provisionFingerprint,
       );
+      if (
+        this.session !== session ||
+        !authorizationMatches(session, connectedAuthorization)
+      ) {
+        throw new AprsAuthorizationError();
+      }
+      session.state = "login-sent";
       await write(socket, `${authorization.loginLine}\r\n`);
-      resolveAuthorization(
+      await verification;
+      const verifiedAuthorization = resolveAuthorization(
         this.options.authorizationProvider,
         provisionFingerprint,
       );
-      await write(socket, `${data}\r\n`);
-      socket.end();
+      if (
+        this.session !== session ||
+        session.state !== "login-sent" ||
+        !authorizationMatches(session, verifiedAuthorization)
+      ) {
+        throw new AprsAuthorizationError();
+      }
+      session.state = "verified";
+      socket.unref();
+      return session;
     } catch (error) {
-      socket.destroy();
+      await this.closeSession(session);
       if (error instanceof AprsAuthorizationError) {
         throw error;
       }
       throw new AprsOutboxError();
     }
   }
+
+  private invalidateSession(session: AprsTxSession): void {
+    if (session.state !== "closing") {
+      session.state = "closed";
+    }
+    if (this.session === session) {
+      this.session = undefined;
+    }
+    if (!session.socket.destroyed) {
+      session.socket.destroy();
+    }
+  }
+
+  private async closeCurrentSession(): Promise<void> {
+    const session = this.session;
+    if (!session) {
+      return;
+    }
+    await this.closeSession(session);
+  }
+
+  private async closeSession(session: AprsTxSession): Promise<void> {
+    if (this.session === session) {
+      this.session = undefined;
+    }
+    session.state = "closing";
+    await destroySocket(session.socket);
+    session.state = "closed";
+  }
+}
+
+type AprsTxSessionState =
+  "connecting" | "login-sent" | "verified" | "closing" | "closed";
+
+interface AprsTxSession {
+  callsign: string;
+  loginLine: string;
+  provisionFingerprint: string;
+  socket: Socket;
+  state: AprsTxSessionState;
 }
 
 function retryDelay(
@@ -937,18 +1079,36 @@ function retryDelay(
 
 function onceConnected(socket: Socket, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: AprsOutboxError) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+      socket.off("end", onEnd);
+      socket.off("close", onClose);
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const onConnect = () => finish();
+    const onError = () => finish(new AprsOutboxError());
+    const onEnd = () => finish(new AprsOutboxError());
+    const onClose = () => finish(new AprsOutboxError());
     const timer = setTimeout(() => {
       socket.destroy();
-      reject(new AprsOutboxError());
+      finish(new AprsOutboxError());
     }, timeoutMs);
-    socket.once("connect", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-    socket.once("error", () => {
-      clearTimeout(timer);
-      reject(new AprsOutboxError());
-    });
+    timer.unref();
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+    socket.once("end", onEnd);
+    socket.once("close", onClose);
   });
 }
 
@@ -959,6 +1119,148 @@ function write(socket: Socket, value: string): Promise<void> {
 }
 
 const MAX_APRS_LOGIN_LINE_BYTES = 512;
+const APRS_CALLSIGN_PATTERN = /^[A-Z0-9]{1,6}(?:-[0-9]{1,2})?$/;
+
+function waitForVerifiedLogresp(
+  socket: Socket,
+  expectedCallsign: string,
+  timeoutMs: number,
+  invalidate: () => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let buffer = "";
+    let settled = false;
+    const finish = (error?: AprsOutboxError) => {
+      if (settled) {
+        if (error) {
+          invalidate();
+        }
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        invalidate();
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const processLine = (line: string): boolean => {
+      if (Buffer.byteLength(line, "utf8") > MAX_APRS_LOGIN_LINE_BYTES) {
+        finish(new AprsOutboxError());
+        return false;
+      }
+      const logresp = parseLogresp(line);
+      if (logresp === undefined) {
+        return true;
+      }
+      if (
+        logresp === "malformed" ||
+        logresp.callsign !== expectedCallsign ||
+        logresp.status !== "verified"
+      ) {
+        finish(new AprsOutboxError());
+        return false;
+      }
+      finish();
+      return true;
+    };
+    const onData = (chunk: Buffer) => {
+      try {
+        buffer += decoder.decode(chunk, { stream: true });
+      } catch {
+        finish(new AprsOutboxError());
+        return;
+      }
+      let lineEnd = buffer.indexOf("\n");
+      while (lineEnd >= 0) {
+        const line = buffer.slice(0, lineEnd).replace(/\r$/, "");
+        buffer = buffer.slice(lineEnd + 1);
+        if (!processLine(line)) {
+          return;
+        }
+        lineEnd = buffer.indexOf("\n");
+      }
+      if (Buffer.byteLength(buffer, "utf8") > MAX_APRS_LOGIN_LINE_BYTES) {
+        finish(new AprsOutboxError());
+      }
+    };
+    const onFailure = () => finish(new AprsOutboxError());
+    const timer = setTimeout(onFailure, timeoutMs);
+    timer.unref();
+    socket.on("data", onData);
+    socket.on("error", onFailure);
+    socket.on("end", onFailure);
+    socket.on("close", onFailure);
+  });
+}
+
+function parseLogresp(
+  line: string,
+):
+  | { callsign: string; status: "verified" | "unverified" }
+  | "malformed"
+  | undefined {
+  if (!/^#\s*logresp\b/i.test(line)) {
+    return undefined;
+  }
+  const match =
+    /^#\s*logresp\s+([^\s,]+)\s+(verified|unverified)(?:[\s,]|$)/i.exec(line);
+  if (!match || !APRS_CALLSIGN_PATTERN.test(match[1]!)) {
+    return "malformed";
+  }
+  return {
+    callsign: match[1]!,
+    status: match[2]!.toLowerCase() as "verified" | "unverified",
+  };
+}
+
+function authorizationCallsign(
+  authorization: AprsConnectionAuthorization,
+): string {
+  const match = /^user\s+([^\s]+)\s+pass\s+[^\s]+(?:\s|$)/.exec(
+    authorization.loginLine,
+  );
+  if (!match || !APRS_CALLSIGN_PATTERN.test(match[1]!)) {
+    throw new AprsAuthorizationError();
+  }
+  return match[1]!;
+}
+
+function authorizationMatches(
+  session: AprsTxSession,
+  authorization: AprsConnectionAuthorization,
+): boolean {
+  try {
+    return (
+      authorization.provisionFingerprint === session.provisionFingerprint &&
+      authorization.loginLine === session.loginLine &&
+      authorizationCallsign(authorization) === session.callsign
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isVerifiedSession(session: AprsTxSession): boolean {
+  return (
+    session.state === "verified" &&
+    !session.socket.destroyed &&
+    session.socket.writable
+  );
+}
+
+function destroySocket(socket: Socket): Promise<void> {
+  if (socket.destroyed) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    socket.once("close", resolve);
+    socket.destroy();
+  });
+}
 
 function resolveAuthorization(
   provider: AprsAuthorizationProvider,

@@ -19,6 +19,7 @@ const MONITOR_SESSION_CLOSE_TIMEOUT_MS = 10_000;
 
 export interface AprsOutboxFlusher {
   flush(limit?: number): Promise<AprsOutboxEntry[]>;
+  close?(): Promise<void>;
 }
 
 export interface AprsMonitorClient {
@@ -68,6 +69,7 @@ export class AprsGatewayRuntime {
   private monitorTimer: NodeJS.Timeout | undefined;
   private monitorSession: AprsIsRxSession | undefined;
   private monitorToken: object | undefined;
+  private monitorConfigurationKey: string | undefined;
   private flushOperation: Promise<void> | undefined;
   private monitorRefreshOperation: Promise<void> | undefined;
   private monitorRefreshQueued = false;
@@ -141,14 +143,17 @@ export class AprsGatewayRuntime {
     const session = this.monitorSession;
     this.monitorSession = undefined;
     this.monitorToken = undefined;
+    this.monitorConfigurationKey = undefined;
     this.monitorStatus = "stopped";
     this.mappedCallsigns = 0;
 
     const closeSession = session ? closeMonitorSession(session) : undefined;
+    const closeOutbox = this.options.outbox.close?.();
     const operations = [
       ...(this.flushOperation ? [this.flushOperation] : []),
       ...(this.monitorRefreshOperation ? [this.monitorRefreshOperation] : []),
       ...(closeSession ? [closeSession] : []),
+      ...(closeOutbox ? [closeOutbox] : []),
     ];
     const stopOperation = this.finishStop(operations);
     this.stopOperation = stopOperation;
@@ -262,9 +267,26 @@ export class AprsGatewayRuntime {
     this.monitorStatus = "connecting";
     this.lastErrorCode = undefined;
     try {
+      const earlyState = this.readState();
+      const earlyMappings =
+        earlyState?.mappings ?? this.options.database.callmeshMappings.list();
+      const earlyConfigurationKey = earlyState
+        ? `${earlyState.provisionFingerprint}:${earlyState.mappingsFingerprint}`
+        : JSON.stringify(earlyMappings);
+      if (
+        this.monitorSession &&
+        this.monitorToken &&
+        this.monitorConfigurationKey === earlyConfigurationKey &&
+        this.isStateCurrent(earlyState)
+      ) {
+        this.monitorStatus = "connected";
+        this.lastErrorCode = undefined;
+        return;
+      }
       const previous = this.monitorSession;
       this.monitorSession = undefined;
       this.monitorToken = undefined;
+      this.monitorConfigurationKey = undefined;
       if (previous) {
         await closeMonitorSession(previous);
       }
@@ -346,9 +368,7 @@ export class AprsGatewayRuntime {
             ...(result.reason ? { reason: result.reason } : {}),
             ...(result.remote
               ? {
-                  callsign: result.remote.callsign,
-                  eventMarker: result.remote.eventMarker,
-                  eventTime: result.remote.eventTime,
+                  packetDigest: result.remote.infoDigest,
                 }
               : {}),
           });
@@ -380,6 +400,7 @@ export class AprsGatewayRuntime {
         return;
       }
       this.monitorSession = session;
+      this.monitorConfigurationKey = earlyConfigurationKey;
       if (callbackFailed) {
         return;
       }
@@ -396,6 +417,7 @@ export class AprsGatewayRuntime {
         return;
       }
       this.monitorToken = undefined;
+      this.monitorConfigurationKey = undefined;
       if (this.options.stateProvider && !this.readState()) {
         this.setProvisionUnavailable();
         return;
@@ -473,6 +495,7 @@ export class AprsGatewayRuntime {
       return;
     }
     this.monitorToken = undefined;
+    this.monitorConfigurationKey = undefined;
     this.monitorStatus = "idle";
     this.mappedCallsigns = 0;
     this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";
@@ -493,6 +516,7 @@ export class AprsGatewayRuntime {
 
   private setProvisionUnavailable(): void {
     this.monitorToken = undefined;
+    this.monitorConfigurationKey = undefined;
     this.monitorStatus = "idle";
     this.mappedCallsigns = 0;
     this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";

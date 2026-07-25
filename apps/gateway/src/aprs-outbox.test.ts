@@ -1,12 +1,15 @@
 import { once } from "node:events";
-import net, { type Server } from "node:net";
+import net, { type Server, type Socket } from "node:net";
 
 import { describe, expect, it } from "vitest";
 
 import { createMeshObservation } from "./observations";
 import { DomainEventBus } from "./events";
 import { GatewayMaintenanceRuntime } from "./maintenance";
-import { AprsRemoteHighWaterStore } from "./aprs-monitor";
+import {
+  AprsRemoteHighWaterStore,
+  parseCmClientAprsLine,
+} from "./aprs-monitor";
 import {
   AprsIsTcpClient,
   AprsOutboxRepository,
@@ -205,7 +208,12 @@ describe("APRS outbox", () => {
         buffer += chunk.toString("utf8");
         const parts = buffer.split("\r\n");
         buffer = parts.pop() ?? "";
-        lines.push(...parts.filter(Boolean));
+        for (const line of parts.filter(Boolean)) {
+          lines.push(line);
+          if (line.startsWith("user ")) {
+            socket.write("# logresp TEST01 verified, server fixture\r\n");
+          }
+        }
       });
     });
     server.listen({ host: "127.0.0.1", port: 0 });
@@ -382,11 +390,15 @@ describe("APRS outbox", () => {
       },
     );
     let sends = 0;
-    const worker = newWorker(repository, {
-      send: async () => {
-        sends += 1;
+    const worker = newWorker(
+      repository,
+      {
+        send: async () => {
+          sends += 1;
+        },
       },
-    });
+      { clock: () => new Date("2026-07-18T00:00:02.000Z") },
+    );
     await worker.flush();
 
     expect(rotated.decision.code).not.toBe("POSITION_ACCEPTED");
@@ -573,7 +585,7 @@ describe("APRS outbox", () => {
     database.close();
   });
 
-  it("drops a pre-rotation retry when another iGate advances the remote watermark", async () => {
+  it("does not derive temporal order from a different observed Info payload", async () => {
     const database = new GatewayDatabase(":memory:");
     const repository = database.aprsOutbox;
     const event = persistedPositionEvent(
@@ -597,14 +609,14 @@ describe("APRS outbox", () => {
         },
       }),
     );
-    const remoteMinute = new Date(Date.parse(event.eventTime!) + 60_000);
-    remoteMinute.setUTCSeconds(0, 0);
+    const remote = parseCmClientAprsLine(
+      "N0CALL-7>APTMAG,MESHD*,qAR,N1GATE-10:remote-different",
+    );
+    if (!remote) {
+      throw new Error("invalid observer fixture");
+    }
     new AprsRemoteHighWaterStore(database.connection).apply(
-      {
-        callsign: "N0CALL-7",
-        eventMarker: "CM2/ffffffffffff",
-        eventTime: remoteMinute.toISOString(),
-      },
+      remote,
       {
         callsign: "N0CALL-7",
         mappingVersion: "mapping-v2",
@@ -614,19 +626,24 @@ describe("APRS outbox", () => {
       "2026-07-18T00:00:01.000Z",
     );
     let sends = 0;
-    const worker = newWorker(repository, {
-      send: async () => {
-        sends += 1;
+    const worker = newWorker(
+      repository,
+      {
+        send: async () => {
+          sends += 1;
+        },
       },
-    });
+      { clock: () => new Date("2026-07-18T00:00:02.000Z") },
+    );
 
-    await expect(worker.flush()).resolves.toEqual([]);
-    expect(sends).toBe(0);
-    expect(repository.find(entry.id)).toBeUndefined();
+    await expect(worker.flush()).resolves.toMatchObject([
+      { id: entry.id, status: "sent" },
+    ]);
+    expect(sends).toBe(1);
     database.close();
   });
 
-  it("allows a byte-identical event after observing its exact remote marker", async () => {
+  it("suppresses a byte-identical Info observed through a different q path", async () => {
     const database = new GatewayDatabase(":memory:");
     const repository = database.aprsOutbox;
     const event = persistedPositionEvent(
@@ -636,8 +653,6 @@ describe("APRS outbox", () => {
       20,
     );
     const eventTime = event.eventTime!;
-    const remoteMinute = new Date(eventTime);
-    remoteMinute.setUTCSeconds(0, 0);
     const entry = requiredOutbox(
       enqueueProvisioned(repository, {
         callsign: "N0CALL-7",
@@ -653,12 +668,14 @@ describe("APRS outbox", () => {
         },
       }),
     );
+    const remote = parseCmClientAprsLine(
+      "N0CALL-7>APTMAG,MESHD*,qAR,N1GATE-10:remote-exact",
+    );
+    if (!remote) {
+      throw new Error("invalid observer fixture");
+    }
     new AprsRemoteHighWaterStore(database.connection).apply(
-      {
-        callsign: "N0CALL-7",
-        eventMarker: `CM2/${event.canonicalKey.slice(0, 12)}`,
-        eventTime: remoteMinute.toISOString(),
-      },
+      remote,
       {
         callsign: "N0CALL-7",
         mappingVersion: "mapping-v1",
@@ -669,14 +686,18 @@ describe("APRS outbox", () => {
     );
     let sends = 0;
 
-    await newWorker(repository, {
-      send: async () => {
-        sends += 1;
+    await newWorker(
+      repository,
+      {
+        send: async () => {
+          sends += 1;
+        },
       },
-    }).flush();
+      { clock: () => new Date("2026-07-18T00:00:02.000Z") },
+    ).flush();
 
-    expect(sends).toBe(1);
-    expect(repository.find(entry.id)?.status).toBe("sent");
+    expect(sends).toBe(0);
+    expect(repository.find(entry.id)).toBeUndefined();
     database.close();
   });
 
@@ -1001,15 +1022,18 @@ describe("APRS outbox", () => {
 });
 
 describe("AprsIsTcpClient", () => {
-  it("writes login and APRS Data lines to a loopback server", async () => {
-    const lines: string[] = [];
+  it("waits for a fragmented verified logresp and reuses one provision session", async () => {
+    const sessions: string[][] = [];
     const server = net.createServer((socket) => {
-      let buffer = "";
-      socket.on("data", (chunk: Buffer) => {
-        buffer += chunk.toString("utf8");
-        const parts = buffer.split("\r\n");
-        buffer = parts.pop() ?? "";
-        lines.push(...parts.filter(Boolean));
+      const lines: string[] = [];
+      sessions.push(lines);
+      collectFixtureLines(socket, lines, (line) => {
+        if (line.startsWith("user ")) {
+          socket.write("# fixture banner\r\n# log");
+          setImmediate(() => {
+            socket.write("resp TEST01 verified, server fixture\r\n");
+          });
+        }
       });
     });
     server.listen({ host: "127.0.0.1", port: 0 });
@@ -1026,13 +1050,236 @@ describe("AprsIsTcpClient", () => {
       ),
     });
 
-    await client.send("N0CALL-7>APCM20:fixture", PROVISION_FINGERPRINT);
-    await waitFor(() => lines.length === 2);
+    await client.send("N0CALL-7>APCM20:fixture-one", PROVISION_FINGERPRINT);
+    await client.send("N0CALL-7>APCM20:fixture-two", PROVISION_FINGERPRINT);
+    await waitFor(() => sessions[0]?.length === 3);
+    expect(sessions).toEqual([
+      [
+        "user TEST01 pass 11111 vers CMClient 2.0",
+        "N0CALL-7>APCM20:fixture-one",
+        "N0CALL-7>APCM20:fixture-two",
+      ],
+    ]);
+    await client.close();
+    await close(server);
+  });
+
+  it("closes a reused session when its provision is revoked", async () => {
+    const lines: string[] = [];
+    let closedResolve: (() => void) | undefined;
+    const closed = new Promise<void>((resolve) => {
+      closedResolve = resolve;
+    });
+    const server = net.createServer((socket) => {
+      socket.once("close", () => closedResolve?.());
+      collectFixtureLines(socket, lines, (line) => {
+        if (line.startsWith("user ")) {
+          socket.write("# logresp TEST01 verified, server fixture\r\n");
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    let revoked = false;
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: () =>
+        revoked
+          ? undefined
+          : {
+              loginLine: "user TEST01 pass 11111 vers CMClient 2.0",
+              provisionFingerprint: PROVISION_FINGERPRINT,
+            },
+    });
+
+    await client.send("N0CALL-7>APCM20:fixture-one", PROVISION_FINGERPRINT);
+    revoked = true;
+    await expect(
+      client.send("N0CALL-7>APCM20:must-not-send", PROVISION_FINGERPRINT),
+    ).rejects.toMatchObject({ code: "APRS_PROVISION_UNAVAILABLE" });
+    await closed;
     expect(lines).toEqual([
       "user TEST01 pass 11111 vers CMClient 2.0",
-      "N0CALL-7>APCM20:fixture",
+      "N0CALL-7>APCM20:fixture-one",
     ]);
+    await client.close();
     await close(server);
+  });
+
+  it.each([
+    ["mismatched callsign", "# logresp OTHER1 verified, server fixture\r\n"],
+    ["unverified identity", "# logresp TEST01 unverified, server fixture\r\n"],
+  ])("fences Data after a %s logresp", async (_case, response) => {
+    const lines: string[] = [];
+    const server = net.createServer((socket) => {
+      collectFixtureLines(socket, lines, (line) => {
+        if (line.startsWith("user ")) {
+          socket.write(response);
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      timeoutMs: 100,
+    });
+
+    await expect(
+      client.send("N0CALL-7>APCM20:must-not-send", PROVISION_FINGERPRINT),
+    ).rejects.toMatchObject({ code: "APRS_OUTBOX_FAILED" });
+    expect(lines).toEqual(["user TEST01 pass 11111 vers CMClient 2.0"]);
+    await client.close();
+    await close(server);
+  });
+
+  it("fences Data when verification times out", async () => {
+    const lines: string[] = [];
+    const server = net.createServer((socket) => {
+      collectFixtureLines(socket, lines);
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      timeoutMs: 25,
+    });
+
+    await expect(
+      client.send("N0CALL-7>APCM20:must-not-send", PROVISION_FINGERPRINT),
+    ).rejects.toMatchObject({ code: "APRS_OUTBOX_FAILED" });
+    expect(lines).toEqual(["user TEST01 pass 11111 vers CMClient 2.0"]);
+    await client.close();
+    await close(server);
+  });
+
+  it("fences Data when the server reaches EOF before verification", async () => {
+    const lines: string[] = [];
+    const server = net.createServer((socket) => {
+      collectFixtureLines(socket, lines, (line) => {
+        if (line.startsWith("user ")) {
+          socket.end("# fixture banner\r\n");
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      timeoutMs: 100,
+    });
+
+    await expect(
+      client.send("N0CALL-7>APCM20:must-not-send", PROVISION_FINGERPRINT),
+    ).rejects.toMatchObject({ code: "APRS_OUTBOX_FAILED" });
+    expect(lines).toEqual(["user TEST01 pass 11111 vers CMClient 2.0"]);
+    await client.close();
+    await close(server);
+  });
+
+  it("fences a closed session and requires fresh verification", async () => {
+    const sessions: string[][] = [];
+    let firstClosedResolve: (() => void) | undefined;
+    const firstClosed = new Promise<void>((resolve) => {
+      firstClosedResolve = resolve;
+    });
+    const server = net.createServer((socket) => {
+      const sessionIndex = sessions.length;
+      const lines: string[] = [];
+      sessions.push(lines);
+      collectFixtureLines(socket, lines, (line) => {
+        if (line.startsWith("user ") && sessionIndex === 0) {
+          socket.write("# logresp TEST01 verified, server fixture\r\n");
+        } else if (line.endsWith("fixture-one") && sessionIndex === 0) {
+          socket.end();
+        }
+      });
+      if (sessionIndex === 0) {
+        socket.once("close", () => firstClosedResolve?.());
+      }
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      timeoutMs: 30,
+    });
+
+    await client.send("N0CALL-7>APCM20:fixture-one", PROVISION_FINGERPRINT);
+    await firstClosed;
+    await expect(
+      client.send("N0CALL-7>APCM20:fixture-two", PROVISION_FINGERPRINT),
+    ).rejects.toMatchObject({ code: "APRS_OUTBOX_FAILED" });
+    expect(sessions).toEqual([
+      [
+        "user TEST01 pass 11111 vers CMClient 2.0",
+        "N0CALL-7>APCM20:fixture-one",
+      ],
+      ["user TEST01 pass 11111 vers CMClient 2.0"],
+    ]);
+    await client.close();
+    await close(server);
+  });
+
+  it("fences Data on a TCP connection error", async () => {
+    const server = net.createServer();
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    await close(server);
+    const client = new AprsIsTcpClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      timeoutMs: 100,
+    });
+
+    await expect(
+      client.send("N0CALL-7>APCM20:must-not-send", PROVISION_FINGERPRINT),
+    ).rejects.toMatchObject({ code: "APRS_OUTBOX_FAILED" });
+    await client.close();
   });
 
   it.each([
@@ -1093,12 +1340,11 @@ describe("AprsIsTcpClient", () => {
     const server = net.createServer((socket) => {
       const lines: string[] = [];
       sessions.push(lines);
-      let buffer = "";
-      socket.on("data", (chunk: Buffer) => {
-        buffer += chunk.toString("utf8");
-        const parts = buffer.split("\r\n");
-        buffer = parts.pop() ?? "";
-        lines.push(...parts.filter(Boolean));
+      collectFixtureLines(socket, lines, (line) => {
+        const callsign = /^user ([^ ]+) /.exec(line)?.[1];
+        if (callsign) {
+          socket.write(`# logresp ${callsign} verified, server fixture\r\n`);
+        }
       });
     });
     server.listen({ host: "127.0.0.1", port: 0 });
@@ -1139,6 +1385,7 @@ describe("AprsIsTcpClient", () => {
       "TEST01-7>APCM20:fixture-one",
       "TEST01-7>APCM20:fixture-two",
     ]);
+    await client.close();
     await close(server);
   });
 
@@ -1268,6 +1515,23 @@ function requiredOutbox(result: EnqueueAprsResult) {
     throw new Error("fixture APRS outbox enqueue was suppressed");
   }
   return result.entry;
+}
+
+function collectFixtureLines(
+  socket: Socket,
+  lines: string[],
+  onLine: (line: string) => void = () => undefined,
+): void {
+  let buffer = "";
+  socket.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    const parts = buffer.split("\r\n");
+    buffer = parts.pop() ?? "";
+    for (const line of parts.filter(Boolean)) {
+      lines.push(line);
+      onLine(line);
+    }
+  });
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

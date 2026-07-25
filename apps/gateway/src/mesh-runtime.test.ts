@@ -96,9 +96,9 @@ describe("MeshGatewayRuntime", () => {
       database.aprsOutbox.list(10)[0]!.id,
     );
     expect(queued?.data).toMatch(
-      /^N0CALL-7>APCM20:\/180000z2502\.85N\/12131\.05E>/,
+      /^N0CALL-7>APTMAG,MESHD\*,qAO,TEST01-7:!2502\.85N\/12131\.05E>/,
     );
-    expect(queued?.data).toMatch(/ CM2\/[a-f0-9]{12}$/);
+    expect(queued?.data).not.toMatch(/CM2\/|\/\d{6}z/);
     expect(queued?.data).not.toMatch(/gateway|rssi|snr|received/i);
     expect(observedTypes).toEqual(
       expect.arrayContaining([

@@ -48,7 +48,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT version FROM schema_migrations")
         .all(),
-    ).toHaveLength(16);
+    ).toHaveLength(18);
     for (const [table, primaryKey] of [
       [
         "node_position_state",
@@ -400,7 +400,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 16 });
+    ).toEqual({ version: 18 });
     expect(
       database.connection
         .prepare("SELECT * FROM aprs_delivery_high_water")
@@ -498,7 +498,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 16 });
+    ).toEqual({ version: 18 });
     const firstFingerprint = "a".repeat(64);
     const secondFingerprint = "b".repeat(64);
     const insertState = database.connection.prepare(
@@ -671,7 +671,7 @@ describe("GatewayDatabase", () => {
       runMigrations(database.connection, [
         ...gatewayMigrations,
         createSqlMigration(
-          17,
+          19,
           "broken",
           "CREATE TABLE migration_rollback_probe (id INTEGER); SELECT * FROM definitely_missing_table;",
         ),
@@ -679,7 +679,7 @@ describe("GatewayDatabase", () => {
     ).toThrow(DatabaseMigrationError);
     expect(
       database.connection
-        .prepare("SELECT version FROM schema_migrations WHERE version = 17")
+        .prepare("SELECT version FROM schema_migrations WHERE version = 19")
         .get(),
     ).toBeUndefined();
     expect(

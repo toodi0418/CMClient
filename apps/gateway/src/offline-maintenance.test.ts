@@ -148,6 +148,8 @@ describe("Gateway offline maintenance", { timeout: 20_000 }, () => {
         aprs_delivery_high_water: 0,
         callmesh_sync_state: 0,
         callmesh_sync_history: 0,
+        aprs_observed_packets: 0,
+        aprs_local_transmissions: 0,
       },
     });
     expect(report.schemaHistory).toEqual(
@@ -174,7 +176,7 @@ describe("Gateway offline maintenance", { timeout: 20_000 }, () => {
     ).toEqual({ value: '{"enabled":true}' });
     expect(
       staged.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get(),
-    ).toEqual({ count: 16 });
+    ).toEqual({ count: 18 });
     staged.close();
 
     const untouchedSource = new DatabaseSync(sourcePath, { readOnly: true });

@@ -336,14 +336,13 @@ export function createConfiguredAprsGatewayRuntime(
 
 export function parseAprsEncodingOptions(
   environment: Record<string, string | undefined>,
-): { destination: string } {
-  const destination = environment.CMCLIENT_APRS_DESTINATION?.trim() || "APCM20";
-  if (!/^[A-Z0-9]{1,6}$/.test(destination)) {
+): Record<string, never> {
+  if (environment.CMCLIENT_APRS_DESTINATION?.trim()) {
     throw new GatewayRuntimeConfigurationError(
       "APRS_ENCODING_CONFIGURATION_INVALID",
     );
   }
-  return { destination };
+  return {};
 }
 
 export function parseAprsEndpointOptions(

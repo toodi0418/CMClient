@@ -51,7 +51,9 @@ describe("AprsGatewayRuntime", () => {
 
     await runtime.flushNow();
     await runtime.refreshMonitor();
-    onLine?.("N0CALL-7>APCM20:/180000z2502.85N/12131.05E> CM2/abcdef123456");
+    onLine?.(
+      "N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>fixture-one",
+    );
 
     expect(filter).toBe("b/N0CALL-7/N1CALL-7");
     expect(runtime.status()).toMatchObject({
@@ -72,14 +74,14 @@ describe("AprsGatewayRuntime", () => {
     );
     expect(
       database.connection
-        .prepare("SELECT callsign FROM aprs_remote_high_water")
+        .prepare("SELECT callsign FROM aprs_observed_packets")
         .all(),
     ).toEqual([{ callsign: "N0CALL-7" }]);
 
     await runtime.refreshMonitor();
-    expect(closes).toBe(1);
+    expect(closes).toBe(0);
     await runtime.stop();
-    expect(closes).toBe(2);
+    expect(closes).toBe(1);
     database.close();
   });
 
@@ -115,11 +117,13 @@ describe("AprsGatewayRuntime", () => {
     });
     await runtime.refreshMonitor();
     database.connection.exec(
-      "CREATE TRIGGER fixture_reject_remote_high_water BEFORE INSERT ON aprs_remote_high_water BEGIN SELECT RAISE(ABORT, 'fixture persistence failure'); END",
+      "CREATE TRIGGER fixture_reject_observed_packet BEFORE INSERT ON aprs_observed_packets BEGIN SELECT RAISE(ABORT, 'fixture persistence failure'); END",
     );
 
     expect(() =>
-      onLine?.("N0CALL-7>APCM20:/180000z2502.85N/12131.05E> CM2/abcdef123456"),
+      onLine?.(
+        "N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>fixture-one",
+      ),
     ).not.toThrow();
     expect(runtime.status()).toMatchObject({
       monitorStatus: "error",
@@ -128,9 +132,11 @@ describe("AprsGatewayRuntime", () => {
     });
     expect(errorCodes).toEqual(["APRS_MONITOR_PERSISTENCE_FAILED"]);
 
-    database.connection.exec("DROP TRIGGER fixture_reject_remote_high_water");
+    database.connection.exec("DROP TRIGGER fixture_reject_observed_packet");
     expect(() =>
-      onLine?.("N0CALL-7>APCM20:/180001z2502.85N/12131.05E> CM2/bcdefa123456"),
+      onLine?.(
+        "N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>fixture-two",
+      ),
     ).not.toThrow();
 
     expect(runtime.status()).toMatchObject({
@@ -140,11 +146,9 @@ describe("AprsGatewayRuntime", () => {
     expect(runtime.status()).not.toHaveProperty("lastErrorCode");
     expect(
       database.connection
-        .prepare(
-          "SELECT latest_event_marker FROM aprs_remote_high_water WHERE callsign = ?",
-        )
+        .prepare("SELECT info FROM aprs_observed_packets WHERE callsign = ?")
         .get("N0CALL-7"),
-    ).toEqual({ latest_event_marker: "CM2/bcdefa123456" });
+    ).toEqual({ info: "!2502.85N/12131.05E>fixture-two" });
     expect(
       types.filter((type) => type === "aprs.monitor.connected"),
     ).toHaveLength(2);
@@ -609,11 +613,11 @@ describe("AprsGatewayRuntime", () => {
       });
     }
 
-    expect(connections).toBe(cycles * 2);
+    expect(connections).toBe(cycles);
     expect(closes).toBe(connections);
     expect(flushes).toBe(cycles);
     await Promise.all([runtime.flushNow(), runtime.refreshMonitor()]);
-    expect(connections).toBe(cycles * 2);
+    expect(connections).toBe(cycles);
     expect(flushes).toBe(cycles);
     database.close();
   });

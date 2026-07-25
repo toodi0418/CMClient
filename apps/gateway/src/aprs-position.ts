@@ -1,16 +1,25 @@
 import type { PositionCanonicalEvent } from "@cmclient/contracts";
 
+const APRS_DESTINATION = "APTMAG";
+const APRS_TRACKER_PATH = "MESHD*,qAO";
+const MAX_APRS_LINE_BYTES = 512;
+const APRS_CALLSIGN = /^[A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?$/;
+const APRS_PRINTABLE_CHARACTER = /^[ -~]$/;
+
+/** Values resolved from the active CallMesh mapping and provision. */
 export interface AprsPositionEncodingOptions {
-  comment?: string;
-  destination: string;
-  source: string;
-  symbolCode: string;
-  symbolTable: string;
+  mappingCallsign: string;
+  mappingSymbolTable: string;
+  mappingSymbolCode: string;
+  mappingSymbolOverlay?: string | null;
+  mappingComment?: string;
+  mappingAltitudeMeters?: number;
+  provisionIgateCallsign: string;
 }
 
 export interface EncodedAprsPosition {
+  /** Complete TNC2 line without CRLF. The APRS transport adds CRLF. */
   data: string;
-  eventMarker: string;
 }
 
 export class AprsPositionEncodingError extends Error {
@@ -31,44 +40,45 @@ export function encodeAprsPosition(
     position.precisionBits !== 32 ||
     position.latitudeI === undefined ||
     position.longitudeI === undefined ||
-    !event.eventTime
+    !isTimestamp(event.eventTime)
   ) {
     throw new AprsPositionEncodingError();
   }
-  const timestamp = formatTimestamp(event.eventTime);
+
   const latitude = formatCoordinate(position.latitudeI, "latitude");
   const longitude = formatCoordinate(position.longitudeI, "longitude");
+  const symbolTable =
+    options.mappingSymbolOverlay ?? options.mappingSymbolTable;
   const courseSpeed = formatCourseSpeed(position);
-  const altitude = formatAltitude(position.altitudeMslMeters);
-  const eventMarker = `CM2/${event.canonicalKey.slice(0, 12)}`;
-  const comment = [options.comment?.trim(), eventMarker]
-    .filter(Boolean)
-    .join(" ");
-  return {
-    eventMarker,
-    data: `${options.source}>${options.destination}:/${timestamp}${latitude}${options.symbolTable}${longitude}${options.symbolCode}${courseSpeed}${altitude}${comment ? ` ${comment}` : ""}`,
-  };
+  const altitude = formatAltitude(
+    position.altitudeMslMeters ?? options.mappingAltitudeMeters,
+  );
+  const comment = sanitizeComment(options.mappingComment);
+  const info = `!${latitude}${symbolTable}${longitude}${options.mappingSymbolCode}${courseSpeed}${altitude}${comment}`;
+  const data = `${options.mappingCallsign}>${APRS_DESTINATION},${APRS_TRACKER_PATH},${options.provisionIgateCallsign}:${info}`;
+
+  if (Buffer.byteLength(data, "utf8") > MAX_APRS_LINE_BYTES) {
+    throw new AprsPositionEncodingError();
+  }
+  return { data };
 }
 
 function validateOptions(options: AprsPositionEncodingOptions): void {
   if (
-    !/^[A-Z0-9]{1,6}(?:-[0-9]{1,2})?$/.test(options.source) ||
-    !/^[A-Z0-9]{1,6}$/.test(options.destination) ||
-    !/^[ -~]$/.test(options.symbolTable) ||
-    !/^[ -~]$/.test(options.symbolCode) ||
-    (options.comment !== undefined &&
-      (options.comment.length > 80 || /[\r\n]/.test(options.comment)))
+    !APRS_CALLSIGN.test(options.mappingCallsign) ||
+    !APRS_CALLSIGN.test(options.provisionIgateCallsign) ||
+    !APRS_PRINTABLE_CHARACTER.test(options.mappingSymbolTable) ||
+    !APRS_PRINTABLE_CHARACTER.test(options.mappingSymbolCode) ||
+    (options.mappingSymbolOverlay !== undefined &&
+      options.mappingSymbolOverlay !== null &&
+      !APRS_PRINTABLE_CHARACTER.test(options.mappingSymbolOverlay)) ||
+    (options.mappingComment !== undefined &&
+      typeof options.mappingComment !== "string") ||
+    (options.mappingAltitudeMeters !== undefined &&
+      !Number.isFinite(options.mappingAltitudeMeters))
   ) {
     throw new AprsPositionEncodingError();
   }
-}
-
-function formatTimestamp(eventTime: string): string {
-  const date = new Date(eventTime);
-  if (Number.isNaN(date.getTime())) {
-    throw new AprsPositionEncodingError();
-  }
-  return `${pad(date.getUTCDate(), 2)}${pad(date.getUTCHours(), 2)}${pad(date.getUTCMinutes(), 2)}z`;
 }
 
 function formatCoordinate(
@@ -82,14 +92,20 @@ function formatCoordinate(
   const degreesWidth = kind === "latitude" ? 2 : 3;
   const hemisphere =
     kind === "latitude" ? (value < 0 ? "S" : "N") : value < 0 ? "W" : "E";
-  let degrees = Math.floor(Math.abs(value) / 10_000_000);
-  const fractionalDegrees = (Math.abs(value) % 10_000_000) / 10_000_000;
-  let hundredthsMinutes = Math.round(fractionalDegrees * 60 * 100);
-  if (hundredthsMinutes === 6_000) {
+  const absoluteDegrees = Math.abs(value / 10_000_000);
+  let degrees = Math.floor(absoluteDegrees);
+  let minutes = (absoluteDegrees - degrees) * 60;
+  if (minutes >= 59.995) {
     degrees += 1;
-    hundredthsMinutes = 0;
+    minutes = 0;
   }
-  return `${pad(degrees, degreesWidth)}${pad(Math.floor(hundredthsMinutes / 100), 2)}.${pad(hundredthsMinutes % 100, 2)}${hemisphere}`;
+  if (
+    degrees > (kind === "latitude" ? 90 : 180) ||
+    (degrees === (kind === "latitude" ? 90 : 180) && minutes !== 0)
+  ) {
+    throw new AprsPositionEncodingError();
+  }
+  return `${pad(degrees, degreesWidth)}${minutes.toFixed(2).padStart(5, "0")}${hemisphere}`;
 }
 
 function formatCourseSpeed(
@@ -97,35 +113,50 @@ function formatCourseSpeed(
 ): string {
   const speed = position.groundSpeedMetersPerSecond;
   const track = position.groundTrackDegrees;
-  if (speed === undefined || track === undefined) {
+  const hasSpeed = Number.isFinite(speed);
+  const hasTrack = Number.isFinite(track);
+  if (!hasSpeed && !hasTrack) {
     return "";
   }
-  if (
-    !Number.isFinite(speed) ||
-    !Number.isFinite(track) ||
-    speed < 0 ||
-    track < 0 ||
-    track >= 360
-  ) {
-    throw new AprsPositionEncodingError();
-  }
-  const knots = Math.round(speed * 1.943844);
-  const course = Math.round(track);
-  if (knots > 999 || course > 359) {
-    throw new AprsPositionEncodingError();
-  }
+  const course = hasTrack
+    ? Math.round((((track as number) % 360) + 360) % 360)
+    : 0;
+  const knots = hasSpeed
+    ? clamp(Math.round((speed as number) * 1.943844), 0, 999)
+    : 0;
   return `${pad(course, 3)}/${pad(knots, 3)}`;
 }
 
-function formatAltitude(altitudeMslMeters: number | undefined): string {
-  if (altitudeMslMeters === undefined) {
+function formatAltitude(altitudeMeters: number | undefined): string {
+  if (altitudeMeters === undefined) {
     return "";
   }
-  const feet = Math.round(altitudeMslMeters * 3.28084);
-  if (!Number.isFinite(feet) || feet < 0 || feet > 999_999) {
+  if (!Number.isFinite(altitudeMeters)) {
     throw new AprsPositionEncodingError();
   }
-  return `/A=${pad(feet, 6)}`;
+  const feet = Math.round(altitudeMeters * 3.28084);
+  if (!Number.isFinite(feet)) {
+    throw new AprsPositionEncodingError();
+  }
+  return `/A=${pad(clamp(feet, 0, 999_999), 6)}`;
+}
+
+function sanitizeComment(comment: string | undefined): string {
+  if (!comment) {
+    return "";
+  }
+  return comment
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isTimestamp(value: string | undefined): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function pad(value: number, width: number): string {

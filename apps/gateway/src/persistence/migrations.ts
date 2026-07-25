@@ -33,6 +33,8 @@ const EXPECTED_SHA256 = [
   "7c4eed5d8b5d6df26c5f755d36ccf80bbe7652395ac4a04c7bc4aa92daf10662",
   "f62171d84e7ac53380042fd21d1f9664d3d81ceca1fa9ad61e3a7da27ed719d8",
   "fce433ea3bd2fe3dca5118e41db6940340c3c80d9eba7769cfb794946b81e018",
+  "b3a2bbd54b00d92b12d3ee1152176748e64d642f291758eaf70b7a48d62e36e2",
+  "3195acde77470f80ce1d6cf6764676863733c6d6fdef8fac9e46654fe8b779b6",
 ] as const;
 
 function migration(
@@ -161,6 +163,24 @@ export const gatewayMigrations: readonly SqlMigration[] = Object.freeze([
     "DROP INDEX jobs_type_idempotency_key_unique",
     "CREATE UNIQUE INDEX jobs_generation_type_idempotency_key_unique ON jobs (setup_generation, type, idempotency_key) WHERE idempotency_key IS NOT NULL",
     "CREATE INDEX jobs_generation_queued_type_created_at_index ON jobs (setup_generation, type, created_at ASC, id ASC) WHERE status = 'queued'",
+  ]),
+  migration(17, "callmesh_mapping_aprs_metadata", [
+    "ALTER TABLE callmesh_mappings ADD COLUMN symbol_table_present INTEGER NOT NULL DEFAULT 0 CHECK (symbol_table_present IN (0, 1))",
+    "ALTER TABLE callmesh_mappings ADD COLUMN symbol_table TEXT",
+    "ALTER TABLE callmesh_mappings ADD COLUMN symbol_code_present INTEGER NOT NULL DEFAULT 0 CHECK (symbol_code_present IN (0, 1))",
+    "ALTER TABLE callmesh_mappings ADD COLUMN symbol_code TEXT",
+    "ALTER TABLE callmesh_mappings ADD COLUMN symbol_overlay_present INTEGER NOT NULL DEFAULT 0 CHECK (symbol_overlay_present IN (0, 1))",
+    "ALTER TABLE callmesh_mappings ADD COLUMN symbol_overlay TEXT",
+    "ALTER TABLE callmesh_mappings ADD COLUMN comment_present INTEGER NOT NULL DEFAULT 0 CHECK (comment_present IN (0, 1))",
+    "ALTER TABLE callmesh_mappings ADD COLUMN comment TEXT",
+    "ALTER TABLE callmesh_mappings ADD COLUMN altitude_meters_present INTEGER NOT NULL DEFAULT 0 CHECK (altitude_meters_present IN (0, 1))",
+    "ALTER TABLE callmesh_mappings ADD COLUMN altitude_meters REAL",
+  ]),
+  migration(18, "aprs_exact_info_caches", [
+    "CREATE TABLE aprs_observed_packets (callsign TEXT NOT NULL, info TEXT NOT NULL, first_observed_at TEXT NOT NULL, last_observed_at TEXT NOT NULL, PRIMARY KEY (callsign, info))",
+    "CREATE INDEX aprs_observed_packets_retention_index ON aprs_observed_packets (last_observed_at ASC)",
+    "CREATE TABLE aprs_local_transmissions (callsign TEXT NOT NULL, info TEXT NOT NULL, transmitted_at TEXT NOT NULL, PRIMARY KEY (callsign, info))",
+    "CREATE INDEX aprs_local_transmissions_retention_index ON aprs_local_transmissions (transmitted_at ASC)",
   ]),
 ]);
 

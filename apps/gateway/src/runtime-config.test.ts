@@ -222,11 +222,9 @@ describe("Gateway production runtime configuration", () => {
   });
 
   it("validates deterministic APRS encoder settings before ingest starts", () => {
-    expect(parseAprsEncodingOptions({})).toEqual({
-      destination: "APCM20",
-    });
+    expect(parseAprsEncodingOptions({})).toEqual({});
     expect(() =>
-      parseAprsEncodingOptions({ CMCLIENT_APRS_DESTINATION: "bad-value" }),
+      parseAprsEncodingOptions({ CMCLIENT_APRS_DESTINATION: "APTMAG" }),
     ).toThrowError(GatewayRuntimeConfigurationError);
     expect(parseAprsEndpointOptions({})).toEqual({
       host: "asia.aprs2.net",

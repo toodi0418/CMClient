@@ -39,7 +39,7 @@ describe("position APRS validation", () => {
     ).toEqual({ accepted: false, code: "POSITION_QUARANTINED" });
   });
 
-  it("keeps MSL altitude zero and omits partial speed/track without inventing values", () => {
+  it("keeps MSL altitude zero and preserves partial speed/track for Legacy formatting", () => {
     const result = validatePositionForAprs(
       event({
         altitudeMslMeters: 0,
@@ -48,7 +48,7 @@ describe("position APRS validation", () => {
       }),
       { now: NOW },
     );
-    expect(result).toMatchObject({ accepted: true, speedTrackIncluded: false });
+    expect(result).toMatchObject({ accepted: true, speedTrackIncluded: true });
     if (!result.accepted) {
       throw new Error("fixture should be valid");
     }
@@ -58,10 +58,11 @@ describe("position APRS validation", () => {
       precisionBits: 32,
       altitudeMslMeters: 0,
       altitudeHaeMeters: 42,
+      groundTrackDegrees: 90,
     });
   });
 
-  it("requires a paired plausible speed and ground track", () => {
+  it("requires every provided speed and ground track component to be plausible", () => {
     expect(
       validatePositionForAprs(
         event({ groundSpeedMetersPerSecond: 121, groundTrackDegrees: 90 }),

@@ -47,11 +47,12 @@ describe("APRS-IS monitor", () => {
     expect(monitor.filterExpression()).toBe("b/N0CALL-7");
     expect(advanced).toMatchObject({
       kind: "advanced",
-      remote: { eventMarker: `CM2/${"a".repeat(12)}` },
+      remote: { infoDigest: expect.stringMatching(/^[a-f0-9]{64}$/) },
       state: {
         meshNetworkId: target.meshNetworkId,
         nodeNum: target.nodeNum,
-        latestEventTime: "2026-07-18T00:00:00.000Z",
+        latestInfoDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        receivedAt: "2026-07-18T00:01:00.000Z",
       },
     });
     expect(repeated).toMatchObject({ kind: "not_new" });
@@ -59,39 +60,32 @@ describe("APRS-IS monitor", () => {
     database.close();
   });
 
-  it("fails closed for malformed remote lines and local events not proven newer", () => {
+  it("uses path-insensitive exact Info TTLs and fails closed for malformed data", () => {
     const database = new GatewayDatabase(":memory:");
     const highWater = new AprsRemoteHighWaterStore(database.connection);
     const monitor = new AprsIsMonitor([target], highWater);
-    expect(highWater.canUpload(event(undefined), target)).toBe(false);
-    monitor.observeLine(
-      encode(event("2026-07-18T00:00:35.000Z")),
-      "2026-07-18T00:01:00.000Z",
-    );
+    const encoded = encode(event("2026-07-18T00:00:35.000Z"));
+    const qArObserved = encoded.replace(",qAO,", ",qAR,");
+    monitor.observeLine(qArObserved, "2026-07-18T00:01:00.000Z");
 
     expect(
-      monitor.observeLine(
-        `N0CALL-7>APCM20:/180000z2500.00Q/12130.00E> CM2/${"a".repeat(12)}`,
-        "2026-07-18T00:01:00.000Z",
-      ),
+      monitor.observeLine("not-an-aprs-line", "2026-07-18T00:01:00.000Z"),
     ).toEqual({ kind: "ignored", reason: "malformed" });
+    expect(parseCmClientAprsLine(`${encoded}\r\n`)).toBeUndefined();
     expect(
-      parseCmClientAprsLine(
-        `N0CALL-7>APCM20:/010000z2500.00N/12130.00E> CM2/${"b".repeat(12)}`,
-        "2026-09-18T00:01:00.000Z",
-      ),
-    ).toBeUndefined();
-    expect(highWater.canUpload(event("2026-07-18T00:00:35.000Z"), target)).toBe(
-      true,
-    );
-    expect(
-      highWater.canUpload(event("2026-07-18T00:00:59.000Z", "b"), target),
+      highWater.canUploadData(encoded, target, "2026-07-18T00:01:30.000Z"),
     ).toBe(false);
     expect(
-      highWater.canUpload(event("2026-07-18T00:01:00.000Z", "c"), target),
+      highWater.canUploadData(
+        encoded.replace(/:!.*/, ":!2500.01N/12130.00E>"),
+        target,
+        "2026-07-18T00:01:30.000Z",
+      ),
     ).toBe(true);
-    expect(highWater.canUpload(event(undefined, "d"), target)).toBe(false);
-    expect(highWater.canUpload(event("not-a-time", "e"), target)).toBe(false);
+    expect(
+      highWater.canUploadData(encoded, target, "2026-07-18T03:01:01.000Z"),
+    ).toBe(true);
+    expect(highWater.canUploadData(encoded, target, "not-a-time")).toBe(false);
     database.close();
   });
 });
@@ -108,7 +102,10 @@ describe("AprsIsRxClient", () => {
         buffer = parts.pop() ?? "";
         loginLines.push(...parts.filter(Boolean));
         if (loginLines.length === 1) {
-          socket.write(`${encode(event("2026-07-18T00:00:35.000Z"))}\r\n`);
+          socket.write("# logresp TEST");
+          socket.write(
+            `01 verified, fixture\r\n${encode(event("2026-07-18T00:00:35.000Z"))}\r\n`,
+          );
         }
       });
     });
@@ -150,6 +147,10 @@ describe("AprsIsRxClient", () => {
         const parts = buffer.split("\r\n");
         buffer = parts.pop() ?? "";
         lines.push(...parts.filter(Boolean));
+        const callsign = /^user\s+([^\s]+)/.exec(lines[0] ?? "")?.[1];
+        if (lines.length === 1 && callsign) {
+          socket.write(`# logresp ${callsign} verified, fixture\r\n`);
+        }
       });
     });
     server.listen({ host: "127.0.0.1", port: 0 });
@@ -299,6 +300,7 @@ describe("AprsIsRxClient", () => {
         sent = true;
         socket.write(
           [
+            "# logresp TEST01 verified, fixture",
             encode(event("2026-07-18T00:00:35.000Z")),
             encode(event("2026-07-18T00:01:35.000Z", "b")),
             "",
@@ -360,7 +362,7 @@ describe("AprsIsRxClient", () => {
       socket.on("data", () => {
         if (!sent) {
           sent = true;
-          socket.write(burst);
+          socket.write(`# logresp TEST01 verified, fixture\r\n${burst}`);
         }
       });
     });
@@ -395,7 +397,9 @@ describe("AprsIsRxClient", () => {
       sockets.add(socket);
       socket.on("error", () => undefined);
       socket.once("close", () => sockets.delete(socket));
-      socket.resume();
+      socket.on("data", () => {
+        socket.write("# logresp TEST01 verified, fixture\r\n");
+      });
     });
     server.listen({ host: "127.0.0.1", port: 0 });
     await once(server, "listening");
@@ -428,10 +432,10 @@ describe("AprsIsRxClient", () => {
 
 function encode(positionEvent: PositionCanonicalEvent): string {
   return encodeAprsPosition(positionEvent, {
-    source: target.callsign,
-    destination: "APCM20",
-    symbolTable: "/",
-    symbolCode: ">",
+    mappingCallsign: target.callsign,
+    mappingSymbolTable: "/",
+    mappingSymbolCode: ">",
+    provisionIgateCallsign: "N1GATE-10",
   }).data;
 }
 

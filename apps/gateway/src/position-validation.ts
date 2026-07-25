@@ -100,15 +100,16 @@ function normalizeSpeedTrack(
 ): { included: boolean } | "invalid" {
   const speed = position.groundSpeedMetersPerSecond;
   const track = position.groundTrackDegrees;
-  if (speed === undefined || track === undefined) {
+  if (speed === undefined && track === undefined) {
     return { included: false };
   }
-  return Number.isFinite(speed) &&
-    Number.isFinite(track) &&
-    speed >= 0 &&
-    speed <= maximumGroundSpeedMetersPerSecond &&
-    track >= 0 &&
-    track < 360
-    ? { included: true }
-    : "invalid";
+  const speedValid =
+    speed === undefined ||
+    (Number.isFinite(speed) &&
+      speed >= 0 &&
+      speed <= maximumGroundSpeedMetersPerSecond);
+  const trackValid =
+    track === undefined ||
+    (Number.isFinite(track) && track >= 0 && track < 360);
+  return speedValid && trackValid ? { included: true } : "invalid";
 }

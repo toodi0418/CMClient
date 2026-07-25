@@ -440,6 +440,54 @@ describe("CallMesh client", () => {
     });
   });
 
+  it("preserves Legacy-compatible Tracker APRS metadata across restart", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const client = new CallMeshClient(
+      clientOptions(async (input) =>
+        new URL(String(input)).pathname.endsWith("/mappings")
+          ? jsonResponse({
+              hash: recordedMappings.hash,
+              items: [
+                {
+                  mesh_id: "!0000002a",
+                  aprs_callsign: "N0CALL-7",
+                  enabled: true,
+                  effective_at: "2026-07-18T00:00:00.000Z",
+                  symbol: "/8",
+                  symbol_table: "\\",
+                  symbol_code: ">",
+                  symbol_overlay: "A",
+                  aprs_comment: "  Alpha\r\n  Beta  ",
+                  altitude_m: 12.5,
+                },
+              ],
+            })
+          : jsonResponse(heartbeat()),
+      ),
+      database.callmeshMappings,
+    );
+
+    await client.synchronize();
+
+    const expected = {
+      version: recordedMappings.hash,
+      effectiveAt: "2026-07-18T00:00:00.000Z",
+      meshNetworkId: "fixture-network",
+      nodeNum: 42,
+      callsign: "N0CALL-7",
+      symbolTable: "/",
+      symbolCode: "8",
+      symbolOverlay: "A",
+      comment: "Alpha Beta",
+      altitudeMeters: 12.5,
+    };
+    expect(client.getAprsState()?.mappings).toEqual([expected]);
+    expect(database.callmeshMappings.loadSnapshot()?.mappings).toEqual([
+      expected,
+    ]);
+    database.close();
+  });
+
   it("restores the last snapshot and rejects stale or conflicting revisions without downgrade", async () => {
     const database = new GatewayDatabase(":memory:");
     const initial = new CallMeshClient(
@@ -856,6 +904,10 @@ function normalizedMapping() {
     meshNetworkId: "fixture-network",
     nodeNum: 42,
     callsign: "N0CALL-7",
+    symbolTable: "/",
+    symbolCode: ">",
+    symbolOverlay: null,
+    comment: "Sanitized Legacy mapping fixture",
   };
 }
 
