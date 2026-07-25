@@ -35,7 +35,7 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_COMMAND: &[u8] = b"CMCLIENT_SHUTDOWN\n";
 pub const GATEWAY_PRIVATE_FRAME_MAX_BYTES: usize = 16 * 1024;
 pub const GATEWAY_CALLMESH_API_KEY_MAX_BYTES: usize = 4096;
-pub const DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(5);
+pub const DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(30);
 const GATEWAY_OWNERSHIP_RESPONSE_MAX_BYTES: usize = 4096;
 const GATEWAY_OWNERSHIP_PATH: &str = "/_cmclient/bootstrap/ownership";
 const GATEWAY_OWNERSHIP_CHALLENGE_HEADER: &str = "x-cmclient-gateway-ownership-challenge";
@@ -1788,6 +1788,30 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn private_bootstrap_tolerates_bounded_windows_cold_start() {
+        let marker = unique_marker("bootstrap-delayed-success");
+        let mut supervisor = powershell_bootstrap_supervisor("bootstrap-delayed-success", &marker);
+        supervisor.set_environment(BTreeMap::from([(
+            String::from(FIXTURE_DELAY_MS),
+            String::from("5500"),
+        )]));
+        supervisor
+            .enable_private_bootstrap()
+            .expect("private bootstrap should enable");
+
+        let started_at = Instant::now();
+        let event = supervisor
+            .start()
+            .expect("bounded Windows cold start should complete bootstrap");
+        assert!(started_at.elapsed() >= Duration::from_secs(5));
+        assert!(matches!(event, SupervisorEvent::Started { .. }));
+        supervisor
+            .stop()
+            .expect("delayed verified child should stop");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn private_bootstrap_faults_terminate_and_reap_real_children() {
         let cases = [
             ("bootstrap-wrong-pid", SupervisorError::BootstrapInvalid),
@@ -2584,6 +2608,29 @@ $heldStdout = [Console]::OpenStandardOutput()
 
 switch ($mode) {
     'bootstrap-success' {
+        $listener = [Net.Sockets.TcpListener]::new(
+            [Net.IPAddress]::Loopback,
+            0
+        )
+        $listener.Start()
+        $port = [uint16]$listener.LocalEndpoint.Port
+        Write-Ready ([uint32]$PID) $nonce $port
+        Serve-Ownership-Proof $listener $port
+        $shutdown = [byte[]]::new(18)
+        $offset = 0
+        while ($offset -lt $shutdown.Length) {
+            $count = $inputStream.Read(
+                $shutdown,
+                $offset,
+                $shutdown.Length - $offset
+            )
+            if ($count -eq 0) { break }
+            $offset += $count
+        }
+        exit 0
+    }
+    'bootstrap-delayed-success' {
+        Start-Sleep -Milliseconds ([int]$env:CMCLIENT_SUPERVISOR_TEST_DELAY_MS)
         $listener = [Net.Sockets.TcpListener]::new(
             [Net.IPAddress]::Loopback,
             0
