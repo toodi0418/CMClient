@@ -54,6 +54,10 @@ export const CallMeshProvisionSchema = Type.Object(
     antennaHeightM: Type.Optional(
       Type.Number({ minimum: 0, maximum: 100_000 }),
     ),
+    altitudeMeters: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+    phg: Type.Optional(
+      Type.Union([Type.String({ pattern: "^[0-9]{3,4}$" }), Type.Null()]),
+    ),
   },
   { additionalProperties: false },
 );

@@ -186,6 +186,74 @@ describe("CallMesh client", () => {
     await close(server);
   });
 
+  it("accepts the hosted Legacy provision altitude and PHG fields", async () => {
+    const client = new CallMeshClient(
+      clientOptions(async (input) =>
+        new URL(String(input)).pathname.endsWith("/mappings")
+          ? jsonResponse(recordedMappings)
+          : jsonResponse(
+              heartbeat({
+                provision: {
+                  ...provision,
+                  altitude_m: null,
+                  phg: "1234",
+                },
+              }),
+            ),
+      ),
+    );
+
+    await client.synchronize();
+
+    expect(client.getOverview().status).toMatchObject({
+      state: "ready",
+      provisionState: "valid",
+    });
+    expect(client.getProvision()).toEqual({
+      callsignBase: "N0CALL",
+      ssid: -7,
+      symbolTable: "/",
+      symbolCode: ">",
+      symbolOverlay: null,
+      comment: "Sanitized fixture",
+      altitudeMeters: null,
+      phg: "1234",
+    });
+  });
+
+  it("normalizes Legacy mapping mesh IDs before applying the uint32 bound", async () => {
+    const client = new CallMeshClient(
+      clientOptions(async (input) =>
+        new URL(String(input)).pathname.endsWith("/mappings")
+          ? jsonResponse({
+              hash: recordedMappings.hash,
+              items: [
+                {
+                  mesh_id: "legacy-id",
+                  callsign_base: "N1FIX",
+                  ssid: -8,
+                  enabled: true,
+                },
+              ],
+            })
+          : jsonResponse(heartbeat()),
+      ),
+    );
+
+    await client.synchronize();
+
+    expect(client.getOverview().status).toMatchObject({
+      state: "ready",
+      activeMappingCount: 1,
+    });
+    expect(client.getAprsState()?.mappings).toEqual([
+      expect.objectContaining({
+        nodeNum: Number.parseInt("eacd", 16),
+        callsign: "N1FIX-8",
+      }),
+    ]);
+  });
+
   it("fails closed without a key and does not make an upstream request", async () => {
     let requests = 0;
     const client = new CallMeshClient({

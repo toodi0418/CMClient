@@ -1142,6 +1142,10 @@ function parseProvision(payload: unknown): CallMeshProvision | undefined {
     "antennaGainDbi",
     "antenna_height_m",
     "antennaHeightM",
+    "altitude_m",
+    "altitudeMeters",
+    "altitude",
+    "phg",
   ]);
   const callsignBase = boundedText(
     record.callsign_base ?? record.callsignBase ?? record.base,
@@ -1177,6 +1181,12 @@ function parseProvision(payload: unknown): CallMeshProvision | undefined {
     "aprs_symbol_overlay",
     "aprsSymbolOverlay",
   ]);
+  const altitude = firstPresent(record, [
+    "altitude_m",
+    "altitudeMeters",
+    "altitude",
+  ]);
+  const phg = firstPresent(record, ["phg"]);
   const provision: CallMeshProvision = {
     callsignBase,
     ssid: numberField(record.ssid ?? record.aprs_ssid ?? record.aprsSsid),
@@ -1215,11 +1225,30 @@ function parseProvision(payload: unknown): CallMeshProvision | undefined {
           ),
         }
       : {}),
+    ...(altitude.present
+      ? {
+          altitudeMeters:
+            altitude.value === null ? null : numberField(altitude.value),
+        }
+      : {}),
+    ...(phg.present
+      ? {
+          phg: phg.value === null ? null : parsePhg(phg.value),
+        }
+      : {}),
   };
   if (!Value.Check(CallMeshProvisionSchema, provision)) {
     throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
   }
   return provision;
+}
+
+function parsePhg(value: unknown): string {
+  const phg = boundedText(value, 4);
+  if (!/^[0-9]{3,4}$/.test(phg)) {
+    throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
+  }
+  return phg;
 }
 
 function validateSnapshot(snapshot: CallMeshSyncSnapshot): void {
@@ -1414,11 +1443,18 @@ function parseMeshId(value: unknown): number {
   if (typeof value !== "string") {
     throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
   }
-  const match = /^(?:!|0x)?(?<hex>[a-fA-F0-9]{1,8})$/.exec(value.trim());
-  if (!match?.groups?.hex) {
+  let normalized = value.trim();
+  if (normalized.startsWith("!")) {
+    normalized = normalized.slice(1);
+  } else if (normalized.toLowerCase().startsWith("0x")) {
+    normalized = normalized.slice(2);
+  }
+  const hex = normalized.replace(/[^a-fA-F0-9]/g, "");
+  if (!hex) {
     throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
   }
-  return Number.parseInt(match.groups.hex, 16);
+  const uint32Hex = hex.length > 8 ? hex.slice(-8) : hex;
+  return Number.parseInt(uint32Hex, 16) >>> 0;
 }
 
 function validateCallsign(value: string): string {
