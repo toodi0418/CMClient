@@ -28,7 +28,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Condvar, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     thread::{self, JoinHandle},
@@ -392,6 +392,7 @@ pub struct ManagementWebConfig {
     pub port: u16,
     pub profile: ManagementWebProfile,
     pub setup_generation: u64,
+    pub setup_required: bool,
     pub allow_lan: bool,
     pub allowed_cidrs: Vec<String>,
     pub allowed_hosts: BTreeSet<String>,
@@ -407,6 +408,7 @@ impl fmt::Debug for ManagementWebConfig {
             .field("port", &self.port)
             .field("profile", &self.profile)
             .field("setup_generation", &self.setup_generation)
+            .field("setup_required", &self.setup_required)
             .field("allow_lan", &self.allow_lan)
             .field("allowed_cidrs", &self.allowed_cidrs)
             .field("allowed_hosts", &self.allowed_hosts)
@@ -423,6 +425,7 @@ impl Default for ManagementWebConfig {
             port: 7080,
             profile: ManagementWebProfile::Native,
             setup_generation: 1,
+            setup_required: true,
             allow_lan: false,
             allowed_cidrs: Vec::new(),
             allowed_hosts: BTreeSet::new(),
@@ -485,6 +488,7 @@ struct WebPolicy {
     access: Option<Arc<ManagementAccessController>>,
     generation: Arc<AtomicU64>,
     setup_generation: Arc<AtomicU64>,
+    setup_required: Arc<AtomicBool>,
     response_slots: Arc<Semaphore>,
     gateway_session: GatewaySessionHandle,
     gateway_client: GatewayClient,
@@ -507,6 +511,10 @@ impl fmt::Debug for WebPolicy {
                 &self.setup_generation.load(Ordering::Acquire),
             )
             .field(
+                "setup_required",
+                &self.setup_required.load(Ordering::Acquire),
+            )
+            .field(
                 "available_response_slots",
                 &self.response_slots.available_permits(),
             )
@@ -520,9 +528,33 @@ pub struct ManagementWebService {
     advertised_url: String,
     generation: Arc<AtomicU64>,
     setup_generation: Arc<AtomicU64>,
+    setup_required: Arc<AtomicBool>,
     rate_limit_cleanup: CancellationToken,
     handles: Vec<axum_server::Handle<SocketAddr>>,
     worker: Option<JoinHandle<Result<(), ManagementWebError>>>,
+}
+
+#[derive(Clone)]
+pub struct ManagementSetupState {
+    session_generation: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    required: Arc<AtomicBool>,
+}
+
+impl ManagementSetupState {
+    pub fn snapshot(&self) -> (u64, bool) {
+        (
+            self.generation.load(Ordering::Acquire),
+            self.required.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set(&self, generation: u64, required: bool) {
+        if self.generation.swap(generation, Ordering::AcqRel) != generation {
+            self.session_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.required.store(required, Ordering::Release);
+    }
 }
 
 impl ManagementWebService {
@@ -561,6 +593,7 @@ impl ManagementWebService {
             NEXT_WEB_GENERATION.fetch_add(1, Ordering::AcqRel),
         ));
         let setup_generation = Arc::new(AtomicU64::new(config.setup_generation));
+        let setup_required = Arc::new(AtomicBool::new(config.setup_required));
         let http_lan_warning = config.allow_lan && config.tls.is_none();
         if http_lan_warning {
             if let Some(access) = &access {
@@ -579,6 +612,7 @@ impl ManagementWebService {
             access,
             generation: Arc::clone(&generation),
             setup_generation: Arc::clone(&setup_generation),
+            setup_required: Arc::clone(&setup_required),
             response_slots: Arc::new(Semaphore::new(MAX_RESPONSE_BODIES)),
             gateway_session,
             gateway_client: Client::builder(TokioExecutor::new()).build_http(),
@@ -623,6 +657,7 @@ impl ManagementWebService {
             advertised_url,
             generation,
             setup_generation,
+            setup_required,
             rate_limit_cleanup,
             handles,
             worker: Some(worker),
@@ -651,6 +686,19 @@ impl ManagementWebService {
     pub fn set_setup_generation(&self, generation: u64) {
         if self.setup_generation.swap(generation, Ordering::AcqRel) != generation {
             self.revoke_sessions();
+        }
+    }
+
+    pub fn set_setup_state(&self, generation: u64, setup_required: bool) {
+        self.set_setup_generation(generation);
+        self.setup_required.store(setup_required, Ordering::Release);
+    }
+
+    pub fn setup_state(&self) -> ManagementSetupState {
+        ManagementSetupState {
+            session_generation: Arc::clone(&self.generation),
+            generation: Arc::clone(&self.setup_generation),
+            required: Arc::clone(&self.setup_required),
         }
     }
 
@@ -1083,6 +1131,9 @@ async fn issue_session(
 }
 
 async fn proxy_gateway(Extension(policy): Extension<Arc<WebPolicy>>, request: Request) -> Response {
+    if policy.setup_required.load(Ordering::Acquire) {
+        return stable_error(StatusCode::SERVICE_UNAVAILABLE, "SETUP_REQUIRED");
+    }
     let Some(active) = policy.gateway_session.active() else {
         return stable_error(StatusCode::SERVICE_UNAVAILABLE, "GATEWAY_PROXY_UNAVAILABLE");
     };
@@ -1774,10 +1825,10 @@ mod tests {
         AUTH_CACHE_CONTROL, CSRF_HEADER_NAME, GATEWAY_CAPABILITY_HEADER,
         GATEWAY_LEASE_DRAIN_TIMEOUT, GATEWAY_RESPONSE_HEADER_ALLOWLIST, GatewayRoute,
         GatewaySessionHandle, IMMUTABLE_ASSET_CACHE_CONTROL, MANAGEMENT_CONTENT_SECURITY_POLICY,
-        MAX_REQUEST_BYTES, MAX_RESPONSE_BODIES, ManagementWebConfig, ManagementWebError,
-        ManagementWebProfile, ManagementWebService, RevocableBody, SHELL_CACHE_CONTROL, WebPolicy,
-        allowlisted_headers, canonical_static_root, complete_login_request, gateway_request,
-        local_hosts, management_router, strip_hop_headers,
+        MAX_REQUEST_BYTES, MAX_RESPONSE_BODIES, ManagementSetupState, ManagementWebConfig,
+        ManagementWebError, ManagementWebProfile, ManagementWebService, RevocableBody,
+        SHELL_CACHE_CONTROL, WebPolicy, allowlisted_headers, canonical_static_root,
+        complete_login_request, gateway_request, local_hosts, management_router, strip_hop_headers,
     };
     use crate::access::{LanAccessConfig, ManagementAccessController};
     use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
@@ -1887,6 +1938,7 @@ mod tests {
             access,
             generation: Arc::new(AtomicU64::new(1)),
             setup_generation: Arc::new(AtomicU64::new(1)),
+            setup_required: Arc::new(AtomicBool::new(false)),
             response_slots: Arc::new(Semaphore::new(MAX_RESPONSE_BODIES)),
             gateway_session: GatewaySessionHandle::new(),
             gateway_client: Client::builder(TokioExecutor::new()).build_http(),
@@ -1926,6 +1978,87 @@ mod tests {
             .and_then(|value| value.split(';').next())
             .expect("session response should set the management cookie")
             .to_owned()
+    }
+
+    #[tokio::test]
+    async fn setup_gate_blocks_the_gateway_namespace_until_ready() {
+        let policy = test_policy(
+            ManagementWebProfile::Native,
+            false,
+            Vec::new(),
+            &[],
+            None,
+            None,
+            false,
+        );
+        policy.setup_required.store(true, Ordering::Release);
+        let (router, cleanup) = test_router(Router::new(), Arc::clone(&policy));
+        let request = || {
+            test_request(
+                Method::GET,
+                "/api/v1/system/health",
+                "127.0.0.1:7080",
+                "127.0.0.1:49152".parse().unwrap(),
+                Body::empty(),
+            )
+        };
+
+        let blocked = router
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("setup-gated request should complete");
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &to_bytes(blocked.into_body(), 1_024)
+                    .await
+                    .expect("setup error should read"),
+            )
+            .expect("setup error should be JSON"),
+            serde_json::json!({"code": "SETUP_REQUIRED"}),
+        );
+
+        policy.setup_required.store(false, Ordering::Release);
+        let ready = router
+            .oneshot(request())
+            .await
+            .expect("ready request should complete");
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &to_bytes(ready.into_body(), 1_024)
+                    .await
+                    .expect("Gateway error should read"),
+            )
+            .expect("Gateway error should be JSON"),
+            serde_json::json!({"code": "GATEWAY_PROXY_UNAVAILABLE"}),
+        );
+        cleanup.cancel();
+    }
+
+    #[test]
+    fn management_setup_state_revokes_sessions_exactly_once_per_generation_change() {
+        let session_generation = Arc::new(AtomicU64::new(7));
+        let setup_generation = Arc::new(AtomicU64::new(3));
+        let setup_required = Arc::new(AtomicBool::new(false));
+        let state = ManagementSetupState {
+            session_generation: Arc::clone(&session_generation),
+            generation: Arc::clone(&setup_generation),
+            required: Arc::clone(&setup_required),
+        };
+
+        state.set(4, true);
+        assert_eq!(state.snapshot(), (4, true));
+        assert_eq!(session_generation.load(Ordering::Acquire), 8);
+
+        state.set(4, false);
+        assert_eq!(state.snapshot(), (4, false));
+        assert_eq!(
+            session_generation.load(Ordering::Acquire),
+            8,
+            "a readiness projection change in one setup generation must not revoke twice",
+        );
     }
 
     async fn response_json(response: Response) -> Value {
@@ -3185,6 +3318,28 @@ mod tests {
         assert!(!response_headers.contains_key(header::SET_COOKIE));
         assert!(!response_headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
         assert!(!response_headers.contains_key(header::WWW_AUTHENTICATE));
+    }
+
+    #[tokio::test]
+    async fn gateway_stream_body_preserves_exact_bytes_without_reframing() {
+        let route = GatewayRoute::new(SocketAddr::from(([127, 0, 0, 1], 4810)), "c".repeat(64))
+            .expect("route should construct");
+        let active = route.active().expect("route should be active");
+        let expected = Bytes::from_static(
+            b"id: domain:9\nevent: position.observed\ndata: {\"value\":\"a\\r\\nb\"}\n\n",
+        );
+        let body = Body::new(RevocableBody::new(
+            Body::from(expected.clone()),
+            active.cancellation_token(),
+            active,
+        ));
+
+        assert_eq!(
+            to_bytes(body, expected.len() + 1)
+                .await
+                .expect("proxied stream should read"),
+            expected,
+        );
     }
 
     #[test]

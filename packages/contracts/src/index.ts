@@ -7,6 +7,7 @@ export * from "./position.js";
 export * from "./proxy.js";
 export * from "./recording.js";
 export * from "./remote-dispatch.js";
+export * from "./setup.js";
 export * from "./system.js";
 export * from "./transport.js";
 export * from "./update.js";

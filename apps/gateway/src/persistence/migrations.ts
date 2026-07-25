@@ -32,6 +32,7 @@ const EXPECTED_SHA256 = [
   "7567c5aee928fb968bdc44e7be6942e76e8cb31e27c834dc53f8504591b6390c",
   "7c4eed5d8b5d6df26c5f755d36ccf80bbe7652395ac4a04c7bc4aa92daf10662",
   "f62171d84e7ac53380042fd21d1f9664d3d81ceca1fa9ad61e3a7da27ed719d8",
+  "fce433ea3bd2fe3dca5118e41db6940340c3c80d9eba7769cfb794946b81e018",
 ] as const;
 
 function migration(
@@ -154,6 +155,12 @@ export const gatewayMigrations: readonly SqlMigration[] = Object.freeze([
   ]),
   migration(15, "aprs_outbox_provision_authorization", [
     "ALTER TABLE aprs_outbox ADD COLUMN provision_fingerprint TEXT CHECK (provision_fingerprint IS NULL OR (length(provision_fingerprint) = 64 AND provision_fingerprint NOT GLOB '*[^a-f0-9]*'))",
+  ]),
+  migration(16, "jobs_setup_generation", [
+    "ALTER TABLE jobs ADD COLUMN setup_generation INTEGER NOT NULL DEFAULT 1 CHECK (setup_generation >= 1 AND setup_generation <= 9007199254740991)",
+    "DROP INDEX jobs_type_idempotency_key_unique",
+    "CREATE UNIQUE INDEX jobs_generation_type_idempotency_key_unique ON jobs (setup_generation, type, idempotency_key) WHERE idempotency_key IS NOT NULL",
+    "CREATE INDEX jobs_generation_queued_type_created_at_index ON jobs (setup_generation, type, created_at ASC, id ASC) WHERE status = 'queued'",
   ]),
 ]);
 

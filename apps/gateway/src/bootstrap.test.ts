@@ -22,10 +22,11 @@ import {
 } from "./bootstrap.js";
 
 const bootstrap = {
-  schemaVersion: 1 as const,
+  schemaVersion: 2 as const,
   type: "gateway.bootstrap" as const,
   startupNonce: "a".repeat(32),
   capability: "b".repeat(64),
+  setupGeneration: 7,
   callMeshApiKey: " fixture-private-callmesh-key ",
 };
 
@@ -44,6 +45,7 @@ describe("private Gateway bootstrap", () => {
       type: bootstrap.type,
       startupNonce: bootstrap.startupNonce,
       capability: bootstrap.capability,
+      setupGeneration: bootstrap.setupGeneration,
     };
     const inputWithoutKey = new PassThrough();
     const pendingWithoutKey = readGatewayBootstrap(inputWithoutKey);
@@ -184,7 +186,11 @@ describe("private Gateway bootstrap", () => {
     for (const frame of [
       Buffer.from([0, 0, 0, 1, 0xff]),
       Buffer.concat([encodePrivateFrame(bootstrap), Buffer.from([0])]),
+      encodePrivateFrame({ ...bootstrap, schemaVersion: 1 }),
       encodePrivateFrame({ ...bootstrap, capability: "not-a-capability" }),
+      encodePrivateFrame({ ...bootstrap, setupGeneration: 0 }),
+      encodePrivateFrame({ ...bootstrap, setupGeneration: 1.5 }),
+      encodePrivateFrame({ ...bootstrap, setupGeneration: Number.MAX_VALUE }),
       encodePrivateFrame({ ...bootstrap, unknown: true }),
     ]) {
       const input = new PassThrough();

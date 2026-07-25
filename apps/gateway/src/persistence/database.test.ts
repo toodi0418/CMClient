@@ -48,7 +48,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT version FROM schema_migrations")
         .all(),
-    ).toHaveLength(15);
+    ).toHaveLength(16);
     for (const [table, primaryKey] of [
       [
         "node_position_state",
@@ -220,6 +220,109 @@ describe("GatewayDatabase", () => {
     rmSync(path, { force: true });
   });
 
+  it("persists setup generations and atomically fences job transitions", () => {
+    const database = new GatewayDatabase(":memory:");
+    const first = database.jobs.create({
+      id: "generation-one",
+      type: "diagnostics.noop",
+      input: {},
+      setupGeneration: 1,
+      idempotencyKey: "same-operation",
+      now: "2026-07-18T00:00:00.000Z",
+    });
+    const replayed = database.jobs.create({
+      id: "generation-one-replay",
+      type: "diagnostics.noop",
+      input: {},
+      setupGeneration: 1,
+      idempotencyKey: "same-operation",
+      now: "2026-07-18T00:00:01.000Z",
+    });
+    const nextGeneration = database.jobs.create({
+      id: "generation-two",
+      type: "diagnostics.noop",
+      input: {},
+      setupGeneration: 2,
+      idempotencyKey: "same-operation",
+      now: "2026-07-18T00:00:02.000Z",
+    });
+
+    expect(first.created).toBe(true);
+    expect(replayed).toMatchObject({
+      created: false,
+      job: { id: first.job.id, setupGeneration: 1 },
+    });
+    expect(nextGeneration).toMatchObject({
+      created: true,
+      job: { setupGeneration: 2 },
+    });
+    expect(
+      database.jobs.transition(
+        first.job.id,
+        ["queued"],
+        "running",
+        "2026-07-18T00:00:03.000Z",
+        { startedAt: "2026-07-18T00:00:03.000Z" },
+        1,
+      ),
+    ).toMatchObject({ status: "running" });
+    expect(
+      database.jobs.transition(
+        first.job.id,
+        ["queued"],
+        "failed",
+        "2026-07-18T00:00:04.000Z",
+        {},
+        1,
+      ),
+    ).toBeUndefined();
+    expect(
+      database.jobs.transition(
+        first.job.id,
+        ["running"],
+        "succeeded",
+        "2026-07-18T00:00:05.000Z",
+        {},
+        2,
+      ),
+    ).toBeUndefined();
+    expect(database.jobs.find(first.job.id)).toMatchObject({
+      status: "running",
+      setupGeneration: 1,
+    });
+    database.close();
+  });
+
+  it("migrates existing jobs into setup generation one", () => {
+    const database = new GatewayDatabase(
+      ":memory:",
+      gatewayMigrations.filter((migration) => migration.version <= 15),
+    );
+    database.connection
+      .prepare(
+        "INSERT INTO jobs (id, type, status, input, idempotency_key, created_at, updated_at) VALUES ('legacy-job', 'diagnostics.noop', 'queued', '{}', 'legacy-operation', '2026-07-18T00:00:00.000Z', '2026-07-18T00:00:00.000Z')",
+      )
+      .run();
+
+    runMigrations(database.connection, gatewayMigrations);
+
+    expect(database.jobs.find("legacy-job")).toMatchObject({
+      setupGeneration: 1,
+      idempotencyKey: "legacy-operation",
+    });
+    expect(
+      database.jobs.create({
+        id: "next-generation-job",
+        type: "diagnostics.noop",
+        input: {},
+        setupGeneration: 2,
+        idempotencyKey: "legacy-operation",
+        now: "2026-07-18T00:00:01.000Z",
+      }),
+    ).toMatchObject({ created: true, job: { setupGeneration: 2 } });
+    database.close();
+  });
+
   it("rejects duplicate migration versions before applying work", () => {
     const database = new GatewayDatabase(":memory:");
     expect(() =>
@@ -297,7 +400,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 15 });
+    ).toEqual({ version: 16 });
     expect(
       database.connection
         .prepare("SELECT * FROM aprs_delivery_high_water")
@@ -395,7 +498,7 @@ describe("GatewayDatabase", () => {
       database.connection
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get(),
-    ).toEqual({ version: 15 });
+    ).toEqual({ version: 16 });
     const firstFingerprint = "a".repeat(64);
     const secondFingerprint = "b".repeat(64);
     const insertState = database.connection.prepare(
@@ -568,7 +671,7 @@ describe("GatewayDatabase", () => {
       runMigrations(database.connection, [
         ...gatewayMigrations,
         createSqlMigration(
-          16,
+          17,
           "broken",
           "CREATE TABLE migration_rollback_probe (id INTEGER); SELECT * FROM definitely_missing_table;",
         ),
@@ -576,7 +679,7 @@ describe("GatewayDatabase", () => {
     ).toThrow(DatabaseMigrationError);
     expect(
       database.connection
-        .prepare("SELECT version FROM schema_migrations WHERE version = 16")
+        .prepare("SELECT version FROM schema_migrations WHERE version = 17")
         .get(),
     ).toBeUndefined();
     expect(

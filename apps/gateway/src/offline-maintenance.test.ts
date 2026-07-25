@@ -174,7 +174,7 @@ describe("Gateway offline maintenance", { timeout: 20_000 }, () => {
     ).toEqual({ value: '{"enabled":true}' });
     expect(
       staged.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get(),
-    ).toEqual({ count: 15 });
+    ).toEqual({ count: 16 });
     staged.close();
 
     const untouchedSource = new DatabaseSync(sourcePath, { readOnly: true });

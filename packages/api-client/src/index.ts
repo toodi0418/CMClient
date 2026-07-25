@@ -12,6 +12,10 @@ import {
   MeshtasticRuntimeStatusSchema,
   PositionCanonicalEventListSchema,
   ProxyStatusSchema,
+  AgentLifecycleStatusSchema,
+  SetupAcceptTermsRequestSchema,
+  SetupResetRequestSchema,
+  SetupStatusSchema,
   SystemCapabilitiesSchema,
   SystemHealthSchema,
   SystemStatusSchema,
@@ -28,6 +32,10 @@ import {
   type MeshtasticRuntimeStatus,
   type PositionCanonicalEventList,
   type ProxyStatus,
+  type AgentLifecycleStatus,
+  type SetupAcceptTermsRequest,
+  type SetupResetRequest,
+  type SetupStatus,
   type SystemCapabilities,
   type SystemHealth,
   type SystemStatus,
@@ -168,6 +176,32 @@ export class GatewayApiClient {
       this.request<SystemStatus>("/system/status", SystemStatusSchema),
   };
 
+  readonly setup = {
+    status: () => this.request<SetupStatus>("/setup/status", SetupStatusSchema),
+    acceptTerms: (termsVersion: string) =>
+      this.requestBody<SetupStatus, SetupAcceptTermsRequest>(
+        "/setup/terms",
+        SetupStatusSchema,
+        SetupAcceptTermsRequestSchema,
+        { termsVersion },
+      ),
+    reset: (confirmation: SetupResetRequest["confirmation"]) =>
+      this.requestBody<SetupStatus, SetupResetRequest>(
+        "/setup/reset",
+        SetupStatusSchema,
+        SetupResetRequestSchema,
+        { confirmation },
+      ),
+  };
+
+  readonly lifecycle = {
+    status: () =>
+      this.request<AgentLifecycleStatus>(
+        "/lifecycle/status",
+        AgentLifecycleStatusSchema,
+      ),
+  };
+
   readonly jobs = {
     get: (jobId: string) =>
       this.requestJob<JobDetail>(jobId, "GET", JobDetailSchema),
@@ -233,6 +267,7 @@ export class GatewayApiClient {
     schema: TSchema,
     method: "GET" | "POST" = "GET",
     additionalHeaders: Record<string, string> = {},
+    body: unknown = {},
   ): Promise<T> {
     const traceId = this.traceIdFactory();
     let response: Response;
@@ -249,7 +284,7 @@ export class GatewayApiClient {
             : {}),
           ...additionalHeaders,
         },
-        ...(method === "POST" ? { body: "{}" } : {}),
+        ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
       });
     } catch (error) {
       throw createNetworkError(error);
@@ -269,6 +304,20 @@ export class GatewayApiClient {
     }
 
     return payload as T;
+  }
+
+  private requestBody<TResponse, TRequest>(
+    path: string,
+    responseSchema: TSchema,
+    requestSchema: TSchema,
+    body: TRequest,
+  ): Promise<TResponse> {
+    if (!checkSchema(requestSchema, body)) {
+      return Promise.reject(
+        new GatewayApiError({ code: "CLIENT_INPUT_INVALID" }),
+      );
+    }
+    return this.request<TResponse>(path, responseSchema, "POST", {}, body);
   }
 
   private requestJob<T>(
@@ -328,6 +377,18 @@ export type GatewaySystemApi = {
   version: () => Promise<ComponentIdentityReport>;
   capabilities: () => Promise<SystemCapabilities>;
   status: () => Promise<SystemStatus>;
+};
+
+export type AgentSetupApi = {
+  status: () => Promise<SetupStatus>;
+  acceptTerms: (termsVersion: string) => Promise<SetupStatus>;
+  reset: (
+    confirmation: SetupResetRequest["confirmation"],
+  ) => Promise<SetupStatus>;
+};
+
+export type AgentLifecycleApi = {
+  status: () => Promise<AgentLifecycleStatus>;
 };
 
 export type GatewayProxyApi = {

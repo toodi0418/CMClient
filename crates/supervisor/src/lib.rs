@@ -136,6 +136,7 @@ struct GatewayBootstrapFrame<'a> {
     frame_type: &'static str,
     startup_nonce: String,
     capability: String,
+    setup_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     callmesh_api_key: Option<&'a str>,
 }
@@ -255,6 +256,7 @@ pub struct GatewaySupervisor {
     stable_window: Duration,
     started_at: Option<Instant>,
     private_bootstrap: bool,
+    setup_generation: u64,
     callmesh_api_key: Option<Zeroizing<String>>,
     bootstrap_deadline: Duration,
     ready: Option<GatewayReady>,
@@ -301,6 +303,7 @@ impl GatewaySupervisor {
             stable_window,
             started_at: None,
             private_bootstrap: false,
+            setup_generation: 1,
             callmesh_api_key: None,
             bootstrap_deadline: DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE,
             ready: None,
@@ -330,6 +333,19 @@ impl GatewaySupervisor {
         }
         self.private_bootstrap = true;
         Ok(())
+    }
+
+    pub fn set_setup_generation(&mut self, generation: u64) -> Result<(), SupervisorError> {
+        const MAX_SAFE_JAVASCRIPT_INTEGER: u64 = 9_007_199_254_740_991;
+        if self.child.is_some() || generation == 0 || generation > MAX_SAFE_JAVASCRIPT_INTEGER {
+            return Err(SupervisorError::BootstrapInvalid);
+        }
+        self.setup_generation = generation;
+        Ok(())
+    }
+
+    pub const fn configured_setup_generation(&self) -> u64 {
+        self.setup_generation
     }
 
     pub fn set_callmesh_api_key(&mut self, api_key: &str) -> Result<(), SupervisorError> {
@@ -439,6 +455,7 @@ impl GatewaySupervisor {
             let (result, reader) = perform_private_bootstrap(
                 &mut child,
                 self.bootstrap_deadline,
+                self.setup_generation,
                 self.callmesh_api_key.as_deref().map(String::as_str),
             );
             match result {
@@ -688,6 +705,7 @@ fn is_capture_log_error_code(code: &str) -> bool {
 fn perform_private_bootstrap(
     child: &mut Box<dyn ChildWrapper>,
     deadline: Duration,
+    setup_generation: u64,
     callmesh_api_key: Option<&str>,
 ) -> (
     Result<GatewayReady, SupervisorError>,
@@ -708,10 +726,11 @@ fn perform_private_bootstrap(
             uuid::Uuid::new_v4().simple()
         );
         let bootstrap = GatewayBootstrapFrame {
-            schema_version: 1,
+            schema_version: 2,
             frame_type: "gateway.bootstrap",
             startup_nonce: startup_nonce.clone(),
             capability: capability.clone(),
+            setup_generation,
             callmesh_api_key,
         };
         let encoded = Zeroizing::new(encode_private_frame(&bootstrap)?);
@@ -1135,10 +1154,11 @@ mod tests {
         let capability = "b".repeat(64);
         let api_key = "fixture-private-callmesh-key";
         let encoded = encode_private_frame(&GatewayBootstrapFrame {
-            schema_version: 1,
+            schema_version: 2,
             frame_type: "gateway.bootstrap",
             startup_nonce: nonce.clone(),
             capability: capability.clone(),
+            setup_generation: 7,
             callmesh_api_key: Some(api_key),
         })
         .expect("bootstrap should encode");
@@ -1149,13 +1169,16 @@ mod tests {
         let body = read_private_frame(&mut encoded.as_slice()).expect("frame should decode");
         assert_eq!(body, encoded[4..]);
         let decoded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded["schemaVersion"], 2);
+        assert_eq!(decoded["setupGeneration"], 7);
         assert_eq!(decoded["callmeshApiKey"], api_key);
         let maximum_escaped_key = "\\".repeat(GATEWAY_CALLMESH_API_KEY_MAX_BYTES);
         let maximum_frame = encode_private_frame(&GatewayBootstrapFrame {
-            schema_version: 1,
+            schema_version: 2,
             frame_type: "gateway.bootstrap",
             startup_nonce: nonce.clone(),
             capability: capability.clone(),
+            setup_generation: 7,
             callmesh_api_key: Some(&maximum_escaped_key),
         })
         .expect("maximum escaped API key should fit the bounded frame");
@@ -1201,6 +1224,32 @@ mod tests {
             read_private_frame(&mut oversized.as_slice()),
             Err(SupervisorError::BootstrapInvalid)
         ));
+    }
+
+    #[test]
+    fn setup_generation_is_bounded_before_private_bootstrap() {
+        let command = GatewayCommand {
+            program: String::from("fixture"),
+            arguments: Vec::new(),
+        };
+        let mut supervisor = GatewaySupervisor::new(command, BackoffPolicy::default())
+            .expect("supervisor should initialize");
+
+        supervisor
+            .set_setup_generation(9_007_199_254_740_991)
+            .expect("maximum JavaScript-safe generation should be accepted");
+        assert_eq!(
+            supervisor.configured_setup_generation(),
+            9_007_199_254_740_991,
+        );
+        assert_eq!(
+            supervisor.set_setup_generation(0),
+            Err(SupervisorError::BootstrapInvalid)
+        );
+        assert_eq!(
+            supervisor.set_setup_generation(9_007_199_254_740_992),
+            Err(SupervisorError::BootstrapInvalid)
+        );
     }
 
     #[test]

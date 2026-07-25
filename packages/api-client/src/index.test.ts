@@ -121,6 +121,92 @@ describe("gateway API client", () => {
     setManagementCsrfToken(undefined);
   });
 
+  it("uses the Agent-owned setup status, terms, reset, and lifecycle contracts", async () => {
+    const requests: Array<{ body: unknown; method: string; url: string }> = [];
+    const client = new GatewayApiClient({
+      fetch: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+          method: init?.method ?? "GET",
+          url,
+        });
+        if (url.endsWith("/lifecycle/status")) {
+          return jsonResponse({
+            schemaVersion: 1,
+            agent: "running",
+            gateway: "stopped",
+            managementWeb: "running",
+            managementWebUrl: "http://127.0.0.1:7080",
+            uptimeSeconds: 10,
+            latestErrorCode: null,
+          });
+        }
+        return jsonResponse({
+          schemaVersion: 1,
+          phase: url.endsWith("/setup/status")
+            ? "terms_required"
+            : "credentials_required",
+          setupRequired: true,
+          termsRequired: url.endsWith("/setup/status"),
+          credentialsRequired: !url.endsWith("/setup/status"),
+          validating: false,
+          ready: false,
+          recoveryRequired: false,
+          reasonCode: url.endsWith("/setup/status")
+            ? "SETUP_TERMS_REQUIRED"
+            : "SETUP_CREDENTIALS_REQUIRED",
+        });
+      },
+    });
+
+    await expect(client.setup.status()).resolves.toMatchObject({
+      phase: "terms_required",
+    });
+    await expect(
+      client.setup.acceptTerms("cmclient-2.0-terms-v1"),
+    ).resolves.toMatchObject({ phase: "credentials_required" });
+    await expect(
+      client.setup.reset("operational_reset"),
+    ).resolves.toMatchObject({ phase: "credentials_required" });
+    await expect(client.lifecycle.status()).resolves.toMatchObject({
+      gateway: "stopped",
+    });
+
+    expect(requests).toEqual([
+      { body: undefined, method: "GET", url: "/api/v1/setup/status" },
+      {
+        body: { termsVersion: "cmclient-2.0-terms-v1" },
+        method: "POST",
+        url: "/api/v1/setup/terms",
+      },
+      {
+        body: { confirmation: "operational_reset" },
+        method: "POST",
+        url: "/api/v1/setup/reset",
+      },
+      { body: undefined, method: "GET", url: "/api/v1/lifecycle/status" },
+    ]);
+  });
+
+  it("rejects malformed setup command input before issuing a request", async () => {
+    let requests = 0;
+    const client = new GatewayApiClient({
+      fetch: async () => {
+        requests += 1;
+        return jsonResponse({});
+      },
+    });
+
+    await expect(
+      client.setup.acceptTerms("bad terms version"),
+    ).rejects.toMatchObject({ code: "CLIENT_INPUT_INVALID" });
+    await expect(
+      client.setup.reset("wrong" as "operational_reset"),
+    ).rejects.toMatchObject({ code: "CLIENT_INPUT_INVALID" });
+    expect(requests).toBe(0);
+  });
+
   it("reads the privacy-safe proxy status through the versioned API", async () => {
     let url: string | undefined;
     const client = new GatewayApiClient({

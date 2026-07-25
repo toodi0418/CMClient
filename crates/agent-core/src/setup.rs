@@ -16,6 +16,7 @@ use std::{
     sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 pub const SETUP_SCHEMA_VERSION: u8 = 1;
 pub const CURRENT_TERMS_VERSION: &str = "cmclient-2.0-terms-v1";
@@ -24,6 +25,9 @@ pub const MESHTASTIC_TCP_PORT: u16 = 4_403;
 pub const MAX_DISCOVERY_CANDIDATES: usize = 16;
 pub const MAX_MDNS_EVENTS: usize = 64;
 pub const MAX_MDNS_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_SETUP_GENERATION: u64 = 9_007_199_254_740_991;
+const RECOVERY_GENERATION_HIGH_BIT: u64 = 1 << 52;
+const RECOVERY_GENERATION_RANDOM_MASK: u64 = (1 << 51) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +37,7 @@ pub enum SetupPhase {
     CredentialsRequired,
     Validating,
     Ready,
+    RecoveryRequired,
 }
 
 impl SetupPhase {
@@ -46,6 +51,7 @@ impl SetupPhase {
             Self::CredentialsRequired => "SETUP_CREDENTIALS_REQUIRED",
             Self::Validating => "SETUP_VALIDATING",
             Self::Ready => "SETUP_READY",
+            Self::RecoveryRequired => "SETUP_RECOVERY_REQUIRED",
         }
     }
 }
@@ -70,6 +76,17 @@ impl SetupState {
         }
     }
 
+    fn recovery() -> Self {
+        let random = Uuid::new_v4().as_u128() as u64;
+        Self {
+            schema_version: SETUP_SCHEMA_VERSION,
+            setup_generation: RECOVERY_GENERATION_HIGH_BIT
+                | (random & RECOVERY_GENERATION_RANDOM_MASK),
+            phase: SetupPhase::RecoveryRequired,
+            terms_version: None,
+        }
+    }
+
     fn validate_terms_version(version: &str) -> bool {
         !version.is_empty()
             && version.len() <= 128
@@ -85,11 +102,11 @@ impl DurableDocument for SetupState {
 
     fn validate(&self) -> bool {
         self.schema_version == SETUP_SCHEMA_VERSION
-            && self.setup_generation > 0
+            && (1..=MAX_SETUP_GENERATION).contains(&self.setup_generation)
             && match self.phase {
-                SetupPhase::Uninitialized | SetupPhase::TermsRequired => {
-                    self.terms_version.is_none()
-                }
+                SetupPhase::Uninitialized
+                | SetupPhase::TermsRequired
+                | SetupPhase::RecoveryRequired => self.terms_version.is_none(),
                 SetupPhase::CredentialsRequired | SetupPhase::Validating | SetupPhase::Ready => {
                     self.terms_version
                         .as_deref()
@@ -103,11 +120,13 @@ impl DurableDocument for SetupState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SetupStatus {
     pub schema_version: u8,
+    pub phase: SetupPhase,
     pub setup_required: bool,
     pub terms_required: bool,
     pub credentials_required: bool,
     pub validating: bool,
     pub ready: bool,
+    pub recovery_required: bool,
     pub reason_code: String,
 }
 
@@ -115,6 +134,7 @@ impl From<&SetupState> for SetupStatus {
     fn from(state: &SetupState) -> Self {
         Self {
             schema_version: SETUP_SCHEMA_VERSION,
+            phase: state.phase,
             setup_required: state.phase.setup_required(),
             terms_required: matches!(
                 state.phase,
@@ -123,6 +143,7 @@ impl From<&SetupState> for SetupStatus {
             credentials_required: matches!(state.phase, SetupPhase::CredentialsRequired),
             validating: matches!(state.phase, SetupPhase::Validating),
             ready: matches!(state.phase, SetupPhase::Ready),
+            recovery_required: matches!(state.phase, SetupPhase::RecoveryRequired),
             reason_code: String::from(state.phase.reason_code()),
         }
     }
@@ -183,27 +204,32 @@ impl SetupStore {
 
     pub fn open_file(path: impl Into<std::path::PathBuf>) -> Result<Self, SetupError> {
         let document = TypedDocument::<SetupState>::new(path).map_err(map_document_error)?;
-        let mut state = match document.load_optional().map_err(map_document_error)? {
-            Some(state) => state,
-            None => {
+        let mut state = match document.load_optional() {
+            Ok(Some(state)) => state,
+            Ok(None) => {
                 let state = SetupState::initial();
                 document.store(&state).map_err(map_document_error)?;
                 state
             }
+            Err(
+                DocumentError::Malformed | DocumentError::SchemaInvalid | DocumentError::TooLarge,
+            ) => {
+                let state = SetupState::recovery();
+                document.store(&state).map_err(map_document_error)?;
+                state
+            }
+            Err(error) => return Err(map_document_error(error)),
         };
         if !state.validate() {
             return Err(SetupError::Invalid);
         }
         let terms_changed = !matches!(
             state.phase,
-            SetupPhase::TermsRequired | SetupPhase::Uninitialized
+            SetupPhase::TermsRequired | SetupPhase::Uninitialized | SetupPhase::RecoveryRequired
         ) && state.terms_version.as_deref() != Some(CURRENT_TERMS_VERSION);
         if matches!(state.phase, SetupPhase::Uninitialized) || terms_changed {
             if terms_changed {
-                state.setup_generation = state
-                    .setup_generation
-                    .checked_add(1)
-                    .ok_or(SetupError::GenerationExhausted)?;
+                state.setup_generation = next_generation(state.setup_generation)?;
             }
             state.phase = SetupPhase::TermsRequired;
             state.terms_version = None;
@@ -288,10 +314,7 @@ impl SetupStore {
 
     pub fn reset(&self) -> Result<SetupStatus, SetupError> {
         self.mutate(|state| {
-            state.setup_generation = state
-                .setup_generation
-                .checked_add(1)
-                .ok_or(SetupError::GenerationExhausted)?;
+            state.setup_generation = next_generation(state.setup_generation)?;
             state.phase = SetupPhase::TermsRequired;
             state.terms_version = None;
             Ok(())
@@ -316,6 +339,13 @@ impl SetupStore {
         *state = next;
         Ok(SetupStatus::from(&*state))
     }
+}
+
+fn next_generation(current: u64) -> Result<u64, SetupError> {
+    current
+        .checked_add(1)
+        .filter(|generation| *generation <= MAX_SETUP_GENERATION)
+        .ok_or(SetupError::GenerationExhausted)
 }
 
 fn map_document_error(error: DocumentError) -> SetupError {
@@ -562,9 +592,71 @@ mod tests {
         let status = store.status().expect("public status should load");
         assert!(status.setup_required && status.terms_required);
         let serialized = serde_json::to_string(&status).expect("status should serialize");
+        assert!(serialized.contains("\"phase\":\"terms_required\""));
+        assert!(serialized.contains("\"recoveryRequired\":false"));
         assert!(!serialized.contains("generation"));
         assert!(!serialized.contains("127.0.0.1"));
         fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn recovery_status_is_explicit_and_remains_redacted() {
+        let root = fixture_path("recovery");
+        let path = root.join("state/setup.json");
+        let document = TypedDocument::<SetupState>::new(&path).expect("document should create");
+        document
+            .store(&SetupState {
+                schema_version: SETUP_SCHEMA_VERSION,
+                setup_generation: 4,
+                phase: SetupPhase::RecoveryRequired,
+                terms_version: None,
+            })
+            .expect("fixture should persist");
+
+        let store = SetupStore::open_file(&path).expect("recovery state should reopen");
+        let status = store.status().expect("recovery status should load");
+        assert_eq!(status.phase, SetupPhase::RecoveryRequired);
+        assert!(status.setup_required && status.recovery_required);
+        assert_eq!(status.reason_code, "SETUP_RECOVERY_REQUIRED");
+        let serialized = serde_json::to_string(&status).expect("status should serialize");
+        assert!(!serialized.contains("setupGeneration"));
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn invalid_documents_are_replaced_by_a_redacted_fresh_recovery_generation() {
+        let oversized = vec![b'x'; SetupState::MAX_BYTES + 1];
+        for (label, bytes) in [
+            ("malformed", b"{credential-marker".to_vec()),
+            (
+                "unknown-field",
+                br#"{"schemaVersion":1,"setupGeneration":9,"phase":"ready","termsVersion":"cmclient-2.0-terms-v1","credentialMarker":"must-not-survive"}"#.to_vec(),
+            ),
+            (
+                "zero-generation",
+                br#"{"schemaVersion":1,"setupGeneration":0,"phase":"terms_required","termsVersion":null}"#.to_vec(),
+            ),
+            ("oversized", oversized),
+        ] {
+            let root = fixture_path(label);
+            let path = root.join("state/setup.json");
+            fs::create_dir_all(path.parent().expect("state parent should exist"))
+                .expect("state directory should create");
+            fs::write(&path, bytes).expect("invalid fixture should write");
+
+            let store = SetupStore::open_file(&path).expect("invalid state should enter recovery");
+            let state = store.snapshot().expect("recovery state should load");
+            assert_eq!(state.phase, SetupPhase::RecoveryRequired);
+            assert!((RECOVERY_GENERATION_HIGH_BIT..=MAX_SETUP_GENERATION)
+                .contains(&state.setup_generation));
+            let status = store.status().expect("recovery status should project");
+            assert!(status.setup_required && status.recovery_required);
+            let persisted = fs::read_to_string(&path).expect("replacement state should read");
+            assert!(!persisted.contains("credential"));
+            assert!(!persisted.contains("must-not-survive"));
+            assert!(persisted.len() < 512);
+            fs::remove_dir_all(root).expect("fixture should clean up");
+        }
     }
 
     #[test]

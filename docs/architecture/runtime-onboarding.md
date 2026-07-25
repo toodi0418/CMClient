@@ -21,6 +21,37 @@ nonce-correlated configuration request/response actions. The Windows physical
 source-smoke profile remains a separate campaign-only path guarded by the
 product-integrated physical write fence.
 
+## P14-T02 implementation boundary
+
+The Agent now exposes redacted setup and lifecycle status plus separate Axum
+setup, lifecycle, and update event streams. While the authoritative setup state
+is not ready, Management Web serves the setup shell and Agent-owned setup
+surface but rejects every Gateway proxy route with `SETUP_REQUIRED`. The
+setup-phase reset endpoint may rotate generation only while external Gateway
+work is already fenced; the complete ready-state operational/factory reset,
+including secret/config clearing and staged recovery, remains P14-T04.
+
+The supervised private bootstrap frame is schema version 2 and carries the
+current positive JavaScript-safe setup generation beside the memory-only
+capability. Gateway requires that capability on every HTTP, health, and SSE
+route, removes it before route handling, and passes the bootstrap generation to
+the SQLite-authoritative Job engine. `p-queue` schedules only bounded runnable
+work; Job idempotency, recovery, and terminal transitions are generation
+fenced. TypeBox schemas shared by Web/API clients and the deterministic OpenAPI
+snapshot bind the public Agent projections and Gateway routes, including exact
+per-stream Agent event IDs, Gateway `Last-Event-ID`/event-stream responses, and
+Job `Idempotency-Key` headers. Invalid handler error codes are reduced to the
+stable `JOB_EXECUTION_FAILED` code before SQLite persistence.
+
+Malformed, schema-invalid, zero/out-of-range-generation, or oversized
+`state/setup.json` content is atomically replaced by a minimal
+`recovery_required` document. Its fresh random high-range JavaScript-safe
+generation is disjoint from the ordinary incrementing range and makes a repeat
+recovery collision negligible; no bytes or values from the invalid document
+are retained or projected. Files that cannot be read
+or safely replaced still fail closed. The recovery projection contains only
+booleans, phase, schema version, and a stable reason code.
+
 ## State Root
 
 ```text

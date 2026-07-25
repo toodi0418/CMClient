@@ -24,9 +24,12 @@ generation while Agent and local Control IPC remain available.
 
 Agent-owned routes are handled before the private Gateway proxy:
 `GET /api/v1/auth/session` bootstraps a local browser session only for a
-loopback peer using an exact local Host. `GET /api/v1/updates` and
-`GET /api/v1/updates/events` expose the durable update-journal projection and
-an Axum-owned SSE namespace even while Gateway is stopped.
+loopback peer using an exact local Host. Setup status/terms/reset and setup
+events, lifecycle status/events, and update status/events remain Agent-owned;
+the three event streams use independent Axum SSE namespaces even while Gateway
+is stopped. Until setup is ready, the static setup shell and those allowed
+Agent surfaces remain reachable while every proxied Gateway route returns the
+stable `SETUP_REQUIRED` response.
 `/api/v1/control/*` is deliberately absent and returns
 `CONTROL_ROUTE_NOT_FOUND`; CLI and Desktop use the independent local framed IPC
 documented in [Local Agent Control IPC](../api/local-control.md). Gateway owns
@@ -44,6 +47,12 @@ Agent returns `GATEWAY_PROXY_UNAVAILABLE` without exposing transport details.
 The Agent checks the same private health route before reporting a running
 Gateway through local Control; a live process that fails the probe is
 `degraded`.
+
+Changing setup generation also increments the in-memory Management Web session
+generation before the setup command returns. Old local or LAN cookies therefore
+fail immediately; changing only readiness within the same setup generation does
+not perform a second revocation. Reset and generation change record distinct
+code-only audit outcomes without storing the generation value.
 
 LAN access is an explicit authenticated mode with an optional CIDR allowlist.
 `POST /api/v1/auth/login` accepts only an exact configured Origin and an

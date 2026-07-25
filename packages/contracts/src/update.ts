@@ -121,7 +121,7 @@ export const UpdateControlStatusSchema = Type.Object(
     schemaVersion: Type.Literal(1),
     job: Type.Union([UpdateControlJobSchema, Type.Null()]),
   },
-  { additionalProperties: false },
+  { $id: "UpdateControlStatus", additionalProperties: false },
 );
 
 export type UpdateReleaseIdentity = ReleaseIdentity;

@@ -62,6 +62,12 @@ proxies the remaining `/api/*` requests to loopback Gateway:
 | --- | --- |
 | `POST /api/v1/auth/login` | Management LAN login; the body must contain exactly one `password` string |
 | `GET /api/v1/auth/session` | Loopback-only local browser session bootstrap; denied to LAN and Docker peers |
+| `GET /api/v1/setup/status` | Redacted Agent-authoritative setup projection |
+| `POST /api/v1/setup/terms` | Accept the exact current terms version during setup |
+| `POST /api/v1/setup/reset` | Confirm a setup-phase reset; full ready-state operational reset is owned by the reset workflow |
+| `GET /api/v1/setup/events` | Agent-owned setup SSE with an immediate snapshot |
+| `GET /api/v1/lifecycle/status` | Redacted Agent/Gateway/Management Web lifecycle projection |
+| `GET /api/v1/lifecycle/events` | Agent-owned lifecycle SSE with an immediate snapshot |
 | `GET /api/v1/updates` | Agent-owned durable update projection |
 | `GET /api/v1/updates/events` | Agent-owned update SSE with an immediate snapshot |
 
@@ -70,6 +76,13 @@ reads require the session cookie, and writes additionally require the matching
 Origin and CSRF token. `/api/v1/control/*` is not a browser or CLI surface and
 returns the stable Agent-owned `CONTROL_ROUTE_NOT_FOUND` response. CLI and
 Desktop use only the separate local framed IPC endpoint.
+
+Before setup reaches `ready`, the Agent serves the static setup shell and the
+Agent-owned setup/reset/status routes above, but returns `503 SETUP_REQUIRED`
+for the entire proxied Gateway namespace. Malformed setup command bodies use
+the stable code-only `SETUP_REQUEST_INVALID` response and never expose an Axum
+extractor message. Setup generation is internal and is never returned by the
+public status or event contracts.
 
 ## Gateway route index
 
@@ -106,3 +119,10 @@ the Gateway and clients. Rust Control payloads are defined in
 `crates/control-api/src/lib.rs`. The API version is part of the path and schema
 version is part of each versioned envelope; permissive parsing at a route is
 not permission to add contract fields.
+
+The deterministic combined Management OpenAPI snapshot contains both the
+Agent-owned setup/lifecycle/update operations and the private Gateway
+operations. Agent operations reference the shared TypeBox request, response,
+and event components and use browser-session security; Gateway operations keep
+the private capability security requirement. The snapshot is test data for
+contract drift, not a separately served documentation UI.

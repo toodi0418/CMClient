@@ -3,14 +3,18 @@ import Fastify, {
   type FastifyReply,
   type FastifyRequest,
 } from "fastify";
+import fastifySwagger from "@fastify/swagger";
 import { fastifySSE, type SSEMessage } from "@fastify/sse";
+import type { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import { Type } from "@sinclair/typebox";
 import {
+  AGENT_CONTRACT_SCHEMAS,
   ApiErrorSchema,
   AprsOutboxEntryListSchema,
   AprsRuntimeStatusSchema,
   ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
+  DomainEventSchema,
   DomainEventListSchema,
   JobAcceptedSchema,
   JobDetailSchema,
@@ -61,6 +65,14 @@ import {
 
 const SSE_HTTP_HIGH_WATER_MARK_BYTES = DEFAULT_SSE_FRAME_MAX_BYTES + 4 * 1024;
 const SSE_PENDING_EVENT_MAX_BYTES = DEFAULT_SSE_FRAME_MAX_BYTES;
+const MANAGEMENT_OPENAPI_SCHEMAS = Object.fromEntries(
+  [...AGENT_CONTRACT_SCHEMAS, DomainEventSchema].map((schema) => {
+    if (typeof schema.$id !== "string") {
+      throw new Error("AGENT_CONTRACT_SCHEMA_ID_REQUIRED");
+    }
+    return [schema.$id, schema];
+  }),
+);
 const GATEWAY_ROUTE_METHODS = [
   "DELETE",
   "GET",
@@ -139,7 +151,7 @@ export interface GatewaySseOptions {
 }
 
 export interface GatewayAccessOptions {
-  capability?: string;
+  capability: string;
 }
 
 type GatewaySseSessionCloser = (reason: string) => void;
@@ -202,6 +214,7 @@ export class GatewayRuntime {
     }
     this.options = options;
     this.app = createGatewayApp(
+      access,
       logger,
       system,
       eventBus,
@@ -212,7 +225,6 @@ export class GatewayRuntime {
       proxy,
       meshtastic,
       aprs,
-      access,
     );
   }
 
@@ -243,6 +255,7 @@ export class GatewayRuntime {
 }
 
 export function createGatewayApp(
+  access: GatewayAccessOptions | undefined,
   logger: StructuredLogger = new ConsoleStructuredLogger(),
   system: GatewaySystemState = defaultGatewaySystemState(),
   eventBus: DomainEventBus = new DomainEventBus(),
@@ -253,23 +266,45 @@ export function createGatewayApp(
   proxy?: GatewayProxyReadApi,
   meshtastic?: GatewayMeshtasticReadApi,
   aprs?: GatewayAprsReadApi,
-  access: GatewayAccessOptions = {},
 ): FastifyInstance {
   const heartbeatIntervalMs = sseOptions.heartbeatIntervalMs ?? 15_000;
   if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
     throw new GatewayConfigurationError();
   }
-  if (
-    access.capability !== undefined &&
-    !isGatewayCapability(access.capability)
-  ) {
+  if (!isGatewayCapability(access?.capability)) {
     throw new GatewayAccessConfigurationError();
   }
   const app = Fastify({
     logger: false,
     http: { highWaterMark: SSE_HTTP_HIGH_WATER_MARK_BYTES },
-  });
+  }).withTypeProvider<TypeBoxTypeProvider>();
   const sseSessions = new Set<GatewaySseSessionCloser>();
+  app.register(fastifySwagger, {
+    openapi: {
+      openapi: "3.1.0",
+      info: {
+        title: "CMClient Gateway private API",
+        version: "2.0.0",
+      },
+      components: {
+        schemas: MANAGEMENT_OPENAPI_SCHEMAS,
+        securitySchemes: {
+          gatewayCapability: {
+            type: "apiKey",
+            in: "header",
+            name: GATEWAY_CAPABILITY_HEADER,
+          },
+          agentBrowserSession: {
+            type: "apiKey",
+            in: "cookie",
+            name: "cmclient.sid",
+          },
+        },
+      },
+      security: [{ gatewayCapability: [] }],
+    },
+    exposeHeadRoutes: false,
+  });
   app.register(fastifySSE, { heartbeatInterval: heartbeatIntervalMs });
   app.decorate("eventBus", eventBus);
   app.decorateRequest("traceId", "");
@@ -282,7 +317,6 @@ export function createGatewayApp(
     request.traceId = resolveTraceId(request.headers["x-trace-id"]);
     reply.header("x-trace-id", request.traceId);
     if (
-      access.capability !== undefined &&
       !gatewayCapabilityMatches(
         request.headers[GATEWAY_CAPABILITY_HEADER],
         access.capability,
@@ -308,7 +342,7 @@ export function createGatewayApp(
   app.setErrorHandler((error, request, reply) => {
     const statusCode = frameworkStatusCode(error);
     const code = isFrameworkValidationError(error)
-      ? "GATEWAY_REQUEST_SCHEMA_INVALID"
+      ? frameworkValidationErrorCode(error, request)
       : frameworkErrorCode(statusCode);
     return reply
       .code(statusCode)
@@ -361,330 +395,369 @@ export function createGatewayApp(
     });
     done();
   });
-  app.get(
-    "/api/v1/aprs",
-    {
-      schema: {
-        response: { 200: AprsRuntimeStatusSchema },
-      },
-    },
-    () =>
-      aprs?.status() ?? {
-        configured: false,
-        running: false,
-        monitorStatus: "stopped",
-        mappedCallsigns: 0,
-        pendingOutbox: 0,
-        failedOutbox: 0,
-      },
-  );
-  app.get(
-    "/api/v1/meshtastic",
-    {
-      schema: {
-        response: { 200: MeshtasticRuntimeStatusSchema },
-      },
-    },
-    () => meshtastic?.status() ?? { configured: false },
-  );
-  app.get(
-    "/api/v1/system/health",
-    {
-      schema: {
-        response: {
-          200: SystemHealthSchema,
+  app.register(async function gatewayRoutes(routeApp) {
+    const app = routeApp.withTypeProvider<TypeBoxTypeProvider>();
+    app.get(
+      "/api/v1/aprs",
+      {
+        schema: {
+          response: { 200: AprsRuntimeStatusSchema },
         },
       },
-    },
-    async () => ({ status: "ok" }),
-  );
-  app.get(
-    "/api/v1/system/version",
-    {
-      schema: { response: { 200: ComponentIdentityReportSchema } },
-    },
-    async () => system.identity,
-  );
-  app.get(
-    "/api/v1/system/capabilities",
-    {
-      schema: { response: { 200: SystemCapabilitiesSchema } },
-    },
-    async () => system.capabilities,
-  );
-  app.get(
-    "/api/v1/system/status",
-    {
-      schema: {
-        response: { 200: SystemStatusSchema },
+      () =>
+        aprs?.status() ?? {
+          configured: false,
+          running: false,
+          monitorStatus: "stopped" as const,
+          mappedCallsigns: 0,
+          pendingOutbox: 0,
+          failedOutbox: 0,
+        },
+    );
+    app.get(
+      "/api/v1/meshtastic",
+      {
+        schema: {
+          response: { 200: MeshtasticRuntimeStatusSchema },
+        },
       },
-    },
-    async () => ({
-      schemaVersion: 2,
-      health: "ok",
-      identity: system.identity,
-    }),
-  );
-  app.get<{ Querystring: ListQuery }>(
-    "/api/v1/nodes",
-    {
-      schema: {
-        querystring: listQuerySchema(),
-        response: { 200: MeshNodeListSchema, 503: ApiErrorSchema },
+      () => meshtastic?.status() ?? { configured: false },
+    );
+    app.get(
+      "/api/v1/system/health",
+      {
+        schema: {
+          response: {
+            200: SystemHealthSchema,
+          },
+        },
       },
-    },
-    (request, reply) =>
-      domain
-        ? { items: domain.listNodes(resolveListLimit(request.query.limit)) }
-        : sendDomainDataUnavailable(request, reply),
-  );
-  app.get(
-    "/api/v1/callmesh",
-    {
-      schema: {
-        response: { 200: CallMeshOverviewSchema, 503: ApiErrorSchema },
+      async () => ({ status: "ok" as const }),
+    );
+    app.get(
+      "/api/v1/system/version",
+      {
+        schema: { response: { 200: ComponentIdentityReportSchema } },
       },
-    },
-    (request, reply) =>
-      callmesh
-        ? callmesh.getOverview()
-        : sendCallMeshUnavailable(request, reply),
-  );
-  app.get(
-    "/api/v1/proxy",
-    {
-      schema: {
-        response: { 200: ProxyStatusSchema, 503: ApiErrorSchema },
+      async () => system.identity,
+    );
+    app.get(
+      "/api/v1/system/capabilities",
+      {
+        schema: { response: { 200: SystemCapabilitiesSchema } },
       },
-    },
-    (request, reply) =>
-      proxy ? proxy.status() : sendProxyUnavailable(request, reply),
-  );
-  app.get<{ Querystring: ListQuery }>(
-    "/api/v1/aprs/outbox",
-    {
-      schema: {
-        querystring: listQuerySchema(),
-        response: { 200: AprsOutboxEntryListSchema, 503: ApiErrorSchema },
+      async () => system.capabilities,
+    );
+    app.get(
+      "/api/v1/system/status",
+      {
+        schema: {
+          response: { 200: SystemStatusSchema },
+        },
       },
-    },
-    (request, reply) =>
-      domain
-        ? {
-            items: domain.listAprsOutbox(resolveListLimit(request.query.limit)),
+      async () => ({
+        schemaVersion: 2 as const,
+        health: "ok" as const,
+        identity: system.identity,
+      }),
+    );
+    app.get<{ Querystring: ListQuery }>(
+      "/api/v1/nodes",
+      {
+        schema: {
+          querystring: listQuerySchema(),
+          response: { 200: MeshNodeListSchema, 503: ApiErrorSchema },
+        },
+      },
+      (request, reply) =>
+        domain
+          ? { items: domain.listNodes(resolveListLimit(request.query.limit)) }
+          : sendDomainDataUnavailable(request, reply),
+    );
+    app.get(
+      "/api/v1/callmesh",
+      {
+        schema: {
+          response: { 200: CallMeshOverviewSchema, 503: ApiErrorSchema },
+        },
+      },
+      (request, reply) => {
+        if (callmesh) {
+          return callmesh.getOverview();
+        }
+        sendCallMeshUnavailable(request, reply);
+      },
+    );
+    app.get(
+      "/api/v1/proxy",
+      {
+        schema: {
+          response: { 200: ProxyStatusSchema, 503: ApiErrorSchema },
+        },
+      },
+      (request, reply) => {
+        if (proxy) {
+          return proxy.status();
+        }
+        sendProxyUnavailable(request, reply);
+      },
+    );
+    app.get<{ Querystring: ListQuery }>(
+      "/api/v1/aprs/outbox",
+      {
+        schema: {
+          querystring: listQuerySchema(),
+          response: { 200: AprsOutboxEntryListSchema, 503: ApiErrorSchema },
+        },
+      },
+      (request, reply) =>
+        domain
+          ? {
+              items: domain.listAprsOutbox(
+                resolveListLimit(request.query.limit),
+              ),
+            }
+          : sendDomainDataUnavailable(request, reply),
+    );
+    app.get<{ Querystring: ListQuery }>(
+      "/api/v1/messages",
+      {
+        schema: {
+          querystring: listQuerySchema(),
+          response: { 200: MeshMessageListSchema, 503: ApiErrorSchema },
+        },
+      },
+      (request, reply) =>
+        domain
+          ? {
+              items: domain.listMessages(resolveListLimit(request.query.limit)),
+            }
+          : sendDomainDataUnavailable(request, reply),
+    );
+    app.get<{ Querystring: TelemetryQuery }>(
+      "/api/v1/telemetry",
+      {
+        schema: {
+          querystring: telemetryQuerySchema(),
+          response: {
+            200: MeshTelemetryListSchema,
+            400: ApiErrorSchema,
+            503: ApiErrorSchema,
+          },
+        },
+      },
+      (request, reply) => {
+        if (!domain) {
+          return sendDomainDataUnavailable(request, reply);
+        }
+        const query = resolveTelemetryQuery(request.query);
+        if (!query) {
+          return sendTelemetryRangeInvalid(request, reply);
+        }
+        if (domain.queryTelemetry) {
+          return { items: domain.queryTelemetry(query) };
+        }
+        if (hasTelemetryRangeFilter(request.query)) {
+          return sendDomainDataUnavailable(request, reply);
+        }
+        return { items: domain.listTelemetry(query.limit) };
+      },
+    );
+    app.get<{ Querystring: ListQuery }>(
+      "/api/v1/positions",
+      {
+        schema: {
+          querystring: listQuerySchema(),
+          response: {
+            200: PositionCanonicalEventListSchema,
+            503: ApiErrorSchema,
+          },
+        },
+      },
+      (request, reply) =>
+        domain
+          ? {
+              items: domain.listPositions(
+                resolveListLimit(request.query.limit),
+              ),
+            }
+          : sendDomainDataUnavailable(request, reply),
+    );
+    app.get<{ Querystring: ListQuery }>(
+      "/api/v1/events/recent",
+      {
+        schema: {
+          querystring: listQuerySchema(),
+          response: { 200: DomainEventListSchema },
+        },
+      },
+      (request) => ({
+        items: eventBus.recent(resolveListLimit(request.query.limit)),
+      }),
+    );
+    app.post<{ Headers: IdempotencyHeaders }>(
+      "/api/v1/diagnostics/integrity-check",
+      {
+        schema: {
+          headers: idempotencyHeadersSchema(),
+          response: { 202: JobAcceptedSchema, 503: ApiErrorSchema },
+        },
+      },
+      (request, reply) => {
+        if (!jobs?.submitIntegrityCheck) {
+          return sendJobEngineUnavailable(request, reply);
+        }
+        const idempotencyKey = request.headers["idempotency-key"];
+        if (
+          idempotencyKey !== undefined &&
+          !/^[a-zA-Z0-9._:-]{1,128}$/.test(idempotencyKey)
+        ) {
+          return sendJobInputInvalid(request, reply);
+        }
+        let submitted: ReturnType<
+          NonNullable<GatewayJobApi["submitIntegrityCheck"]>
+        >;
+        try {
+          submitted = jobs.submitIntegrityCheck(
+            request.correlationId,
+            idempotencyKey,
+          );
+        } catch (error) {
+          if (isJobQueueFull(error)) {
+            return sendJobQueueFull(request, reply);
           }
-        : sendDomainDataUnavailable(request, reply),
-  );
-  app.get<{ Querystring: ListQuery }>(
-    "/api/v1/messages",
-    {
-      schema: {
-        querystring: listQuerySchema(),
-        response: { 200: MeshMessageListSchema, 503: ApiErrorSchema },
-      },
-    },
-    (request, reply) =>
-      domain
-        ? { items: domain.listMessages(resolveListLimit(request.query.limit)) }
-        : sendDomainDataUnavailable(request, reply),
-  );
-  app.get<{ Querystring: TelemetryQuery }>(
-    "/api/v1/telemetry",
-    {
-      schema: {
-        querystring: telemetryQuerySchema(),
-        response: {
-          200: MeshTelemetryListSchema,
-          400: ApiErrorSchema,
-          503: ApiErrorSchema,
-        },
-      },
-    },
-    (request, reply) => {
-      if (!domain) {
-        return sendDomainDataUnavailable(request, reply);
-      }
-      const query = resolveTelemetryQuery(request.query);
-      if (!query) {
-        return sendTelemetryRangeInvalid(request, reply);
-      }
-      if (domain.queryTelemetry) {
-        return { items: domain.queryTelemetry(query) };
-      }
-      if (hasTelemetryRangeFilter(request.query)) {
-        return sendDomainDataUnavailable(request, reply);
-      }
-      return { items: domain.listTelemetry(query.limit) };
-    },
-  );
-  app.get<{ Querystring: ListQuery }>(
-    "/api/v1/positions",
-    {
-      schema: {
-        querystring: listQuerySchema(),
-        response: {
-          200: PositionCanonicalEventListSchema,
-          503: ApiErrorSchema,
-        },
-      },
-    },
-    (request, reply) =>
-      domain
-        ? { items: domain.listPositions(resolveListLimit(request.query.limit)) }
-        : sendDomainDataUnavailable(request, reply),
-  );
-  app.get<{ Querystring: ListQuery }>(
-    "/api/v1/events/recent",
-    {
-      schema: {
-        querystring: listQuerySchema(),
-        response: { 200: DomainEventListSchema },
-      },
-    },
-    (request) => ({
-      items: eventBus.recent(resolveListLimit(request.query.limit)),
-    }),
-  );
-  app.post<{ Headers: IdempotencyHeaders }>(
-    "/api/v1/diagnostics/integrity-check",
-    {
-      schema: {
-        response: { 202: JobAcceptedSchema, 503: ApiErrorSchema },
-      },
-    },
-    (request, reply) => {
-      if (!jobs?.submitIntegrityCheck) {
-        return sendJobEngineUnavailable(request, reply);
-      }
-      const idempotencyKey = request.headers["idempotency-key"];
-      if (
-        idempotencyKey !== undefined &&
-        !/^[a-zA-Z0-9._:-]{1,128}$/.test(idempotencyKey)
-      ) {
-        return sendJobInputInvalid(request, reply);
-      }
-      let submitted: ReturnType<
-        NonNullable<GatewayJobApi["submitIntegrityCheck"]>
-      >;
-      try {
-        submitted = jobs.submitIntegrityCheck(
-          request.correlationId,
-          idempotencyKey,
-        );
-      } catch (error) {
-        if (isJobQueueFull(error)) {
-          return sendJobQueueFull(request, reply);
+          throw error;
         }
-        throw error;
-      }
-      const accepted: JobAccepted = {
-        jobId: submitted.job.id,
-        reused: !submitted.created,
-      };
-      return reply.code(202).send(accepted);
-    },
-  );
-  app.post<{ Headers: IdempotencyHeaders }>(
-    "/api/v1/backups",
-    {
-      schema: {
-        response: { 202: JobAcceptedSchema, 503: ApiErrorSchema },
+        const accepted: JobAccepted = {
+          jobId: submitted.job.id,
+          reused: !submitted.created,
+        };
+        return reply.code(202).send(accepted);
       },
-    },
-    (request, reply) => {
-      if (!jobs?.submitBackup) {
-        return sendJobEngineUnavailable(request, reply);
-      }
-      const idempotencyKey = request.headers["idempotency-key"];
-      if (
-        idempotencyKey !== undefined &&
-        !/^[a-zA-Z0-9._:-]{1,128}$/.test(idempotencyKey)
-      ) {
-        return sendJobInputInvalid(request, reply);
-      }
-      let submitted: ReturnType<NonNullable<GatewayJobApi["submitBackup"]>>;
-      try {
-        submitted = jobs.submitBackup(request.correlationId, idempotencyKey);
-      } catch (error) {
-        if (isJobQueueFull(error)) {
-          return sendJobQueueFull(request, reply);
+    );
+    app.post<{ Headers: IdempotencyHeaders }>(
+      "/api/v1/backups",
+      {
+        schema: {
+          headers: idempotencyHeadersSchema(),
+          response: { 202: JobAcceptedSchema, 503: ApiErrorSchema },
+        },
+      },
+      (request, reply) => {
+        if (!jobs?.submitBackup) {
+          return sendJobEngineUnavailable(request, reply);
         }
-        throw error;
-      }
-      return reply.code(202).send({
-        jobId: submitted.job.id,
-        reused: !submitted.created,
-      } satisfies JobAccepted);
-    },
-  );
-  app.get<{ Params: JobIdParams }>(
-    "/api/v1/jobs/:jobId",
-    {
-      schema: {
-        params: jobIdParamsSchema(),
-        response: {
-          200: JobDetailSchema,
-          404: ApiErrorSchema,
-          503: ApiErrorSchema,
-        },
+        const idempotencyKey = request.headers["idempotency-key"];
+        if (
+          idempotencyKey !== undefined &&
+          !/^[a-zA-Z0-9._:-]{1,128}$/.test(idempotencyKey)
+        ) {
+          return sendJobInputInvalid(request, reply);
+        }
+        let submitted: ReturnType<NonNullable<GatewayJobApi["submitBackup"]>>;
+        try {
+          submitted = jobs.submitBackup(request.correlationId, idempotencyKey);
+        } catch (error) {
+          if (isJobQueueFull(error)) {
+            return sendJobQueueFull(request, reply);
+          }
+          throw error;
+        }
+        return reply.code(202).send({
+          jobId: submitted.job.id,
+          reused: !submitted.created,
+        } satisfies JobAccepted);
       },
-    },
-    async (request, reply) => {
-      if (!jobs) {
-        return sendJobEngineUnavailable(request, reply);
-      }
-      const job = jobs.get(request.params.jobId);
-      return job ?? sendJobNotFound(request, reply);
-    },
-  );
-  app.post<{ Params: JobIdParams }>(
-    "/api/v1/jobs/:jobId/cancel",
-    {
-      schema: {
-        params: jobIdParamsSchema(),
-        response: {
-          202: JobDetailSchema,
-          404: ApiErrorSchema,
-          503: ApiErrorSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      if (!jobs) {
-        return sendJobEngineUnavailable(request, reply);
-      }
-      const job = jobs.cancel(request.params.jobId, request.correlationId);
-      if (!job) {
-        return sendJobNotFound(request, reply);
-      }
-      return reply.code(202).send(job);
-    },
-  );
-  app.register(async function gatewaySseRoutes(app) {
-    app.get("/api/v1/events", { sse: "only" }, async (request, reply) =>
-      openSseStream(request, reply, eventBus, logger, sseSessions),
     );
     app.get<{ Params: JobIdParams }>(
-      "/api/v1/jobs/:jobId/events",
-      { sse: "only", schema: { params: jobIdParamsSchema() } },
+      "/api/v1/jobs/:jobId",
+      {
+        schema: {
+          params: jobIdParamsSchema(),
+          response: {
+            200: JobDetailSchema,
+            404: ApiErrorSchema,
+            503: ApiErrorSchema,
+          },
+        },
+      },
       async (request, reply) => {
         if (!jobs) {
           return sendJobEngineUnavailable(request, reply);
         }
         const job = jobs.get(request.params.jobId);
+        return job ?? sendJobNotFound(request, reply);
+      },
+    );
+    app.post<{ Params: JobIdParams }>(
+      "/api/v1/jobs/:jobId/cancel",
+      {
+        schema: {
+          params: jobIdParamsSchema(),
+          response: {
+            202: JobDetailSchema,
+            404: ApiErrorSchema,
+            503: ApiErrorSchema,
+          },
+        },
+      },
+      async (request, reply) => {
+        if (!jobs) {
+          return sendJobEngineUnavailable(request, reply);
+        }
+        const job = jobs.cancel(request.params.jobId, request.correlationId);
         if (!job) {
           return sendJobNotFound(request, reply);
         }
-        return openSseStream(
-          request,
-          reply,
-          eventBus,
-          logger,
-          sseSessions,
-          (event) => isJobEvent(event, job.id),
-        );
+        return reply.code(202).send(job);
       },
     );
+    app.register(async function gatewaySseRoutes(app) {
+      app.get(
+        "/api/v1/events",
+        {
+          sse: "only",
+          schema: {
+            headers: sseHeadersSchema(),
+            response: { 400: ApiErrorSchema, 503: ApiErrorSchema },
+          },
+        },
+        async (request, reply) =>
+          openSseStream(request, reply, eventBus, logger, sseSessions),
+      );
+      app.get<{ Params: JobIdParams }>(
+        "/api/v1/jobs/:jobId/events",
+        {
+          sse: "only",
+          schema: {
+            headers: sseHeadersSchema(),
+            params: jobIdParamsSchema(),
+            response: {
+              400: ApiErrorSchema,
+              404: ApiErrorSchema,
+              503: ApiErrorSchema,
+            },
+          },
+        },
+        async (request, reply) => {
+          if (!jobs) {
+            return sendJobEngineUnavailable(request, reply);
+          }
+          const job = jobs.get(request.params.jobId);
+          if (!job) {
+            return sendJobNotFound(request, reply);
+          }
+          return openSseStream(
+            request,
+            reply,
+            eventBus,
+            logger,
+            sseSessions,
+            (event) => isJobEvent(event, job.id),
+          );
+        },
+      );
+    });
   });
   return app;
 }
@@ -708,6 +781,30 @@ function isFrameworkValidationError(error: unknown): boolean {
     "validation" in error &&
     Array.isArray(error.validation)
   );
+}
+
+function frameworkValidationErrorCode(
+  error: unknown,
+  request: FastifyRequest,
+): string {
+  const context =
+    error && typeof error === "object" && "validationContext" in error
+      ? error.validationContext
+      : undefined;
+  if (context !== "headers") {
+    return "GATEWAY_REQUEST_SCHEMA_INVALID";
+  }
+  const path = request.routeOptions.url;
+  if (
+    path === "/api/v1/diagnostics/integrity-check" ||
+    path === "/api/v1/backups"
+  ) {
+    return "JOB_INPUT_INVALID";
+  }
+  if (path === "/api/v1/events" || path === "/api/v1/jobs/:jobId/events") {
+    return "SSE_CURSOR_INVALID";
+  }
+  return "GATEWAY_REQUEST_SCHEMA_INVALID";
 }
 
 function frameworkErrorCode(statusCode: number): string {
@@ -790,6 +887,28 @@ function parseLastEventId(
 
 function jobIdParamsSchema() {
   return Type.Object({ jobId: Type.String({ minLength: 1, maxLength: 128 }) });
+}
+
+function idempotencyHeadersSchema() {
+  return Type.Object(
+    {
+      "idempotency-key": Type.Optional(
+        Type.String({ pattern: "^[a-zA-Z0-9._:-]{1,128}$" }),
+      ),
+    },
+    { additionalProperties: true },
+  );
+}
+
+function sseHeadersSchema() {
+  return Type.Object(
+    {
+      "last-event-id": Type.Optional(
+        Type.String({ pattern: "^[a-zA-Z0-9-]{1,128}$" }),
+      ),
+    },
+    { additionalProperties: true },
+  );
 }
 
 function listQuerySchema() {

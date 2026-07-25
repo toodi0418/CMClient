@@ -144,7 +144,7 @@ describe("immutable Gateway migration history", () => {
     expectHistoryDrift((database) => {
       database
         .prepare(
-          "INSERT INTO schema_migrations (version, name, sha256) VALUES (16, 'future', ?)",
+          "INSERT INTO schema_migrations (version, name, sha256) VALUES (17, 'future', ?)",
         )
         .run("c".repeat(64));
     });

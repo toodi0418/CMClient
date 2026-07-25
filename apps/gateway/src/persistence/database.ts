@@ -517,6 +517,7 @@ export class SettingsRepository {
 
 export interface StoredJob extends JobDetail {
   input: Record<string, unknown>;
+  setupGeneration: number;
   idempotencyKey?: string;
   result?: Record<string, unknown>;
   cancelRequested: boolean;
@@ -526,6 +527,7 @@ export interface CreateJobInput {
   id: string;
   type: string;
   input: Record<string, unknown>;
+  setupGeneration?: number;
   idempotencyKey?: string;
   now: string;
 }
@@ -542,8 +544,16 @@ export class JobRepository {
   constructor(private readonly database: DatabaseSync) {}
 
   create(input: CreateJobInput): { created: boolean; job: StoredJob } {
+    const setupGeneration = input.setupGeneration ?? 1;
+    if (!validSetupGeneration(setupGeneration)) {
+      throw new JobPersistenceError();
+    }
     if (input.idempotencyKey) {
-      const existing = this.findByIdempotency(input.type, input.idempotencyKey);
+      const existing = this.findByIdempotency(
+        input.type,
+        input.idempotencyKey,
+        setupGeneration,
+      );
       if (existing) {
         return { created: false, job: existing };
       }
@@ -551,12 +561,13 @@ export class JobRepository {
     try {
       this.database
         .prepare(
-          "INSERT INTO jobs (id, type, status, input, idempotency_key, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?)",
+          "INSERT INTO jobs (id, type, status, input, setup_generation, idempotency_key, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)",
         )
         .run(
           input.id,
           input.type,
           JSON.stringify(input.input),
+          setupGeneration,
           input.idempotencyKey ?? null,
           input.now,
           input.now,
@@ -566,6 +577,7 @@ export class JobRepository {
         const existing = this.findByIdempotency(
           input.type,
           input.idempotencyKey,
+          setupGeneration,
         );
         if (existing) {
           return { created: false, job: existing };
@@ -590,10 +602,16 @@ export class JobRepository {
   findByIdempotency(
     type: string,
     idempotencyKey: string,
+    setupGeneration = 1,
   ): StoredJob | undefined {
+    if (!validSetupGeneration(setupGeneration)) {
+      throw new JobPersistenceError();
+    }
     const row = this.database
-      .prepare("SELECT * FROM jobs WHERE type = ? AND idempotency_key = ?")
-      .get(type, idempotencyKey);
+      .prepare(
+        "SELECT * FROM jobs WHERE setup_generation = ? AND type = ? AND idempotency_key = ?",
+      )
+      .get(setupGeneration, type, idempotencyKey);
     return row ? toStoredJob(row) : undefined;
   }
 
@@ -629,7 +647,11 @@ export class JobRepository {
       .map(toStoredJob);
   }
 
-  findQueuedByTypes(types: readonly string[], limit: number): StoredJob[] {
+  findQueuedByTypes(
+    types: readonly string[],
+    limit: number,
+    setupGeneration = 1,
+  ): StoredJob[] {
     if (types.length === 0) {
       return [];
     }
@@ -638,16 +660,37 @@ export class JobRepository {
       types.some((type) => !/^[a-z][a-z0-9_.-]{0,127}$/.test(type)) ||
       !Number.isInteger(limit) ||
       limit < 1 ||
-      limit > 20_000
+      limit > 20_000 ||
+      !validSetupGeneration(setupGeneration)
     ) {
       throw new JobPersistenceError();
     }
     const placeholders = types.map(() => "?").join(", ");
     return this.database
       .prepare(
-        `SELECT * FROM jobs INDEXED BY jobs_queued_type_created_at_index WHERE status = 'queued' AND type IN (${placeholders}) ORDER BY created_at ASC, id ASC LIMIT ?`,
+        `SELECT * FROM jobs INDEXED BY jobs_generation_queued_type_created_at_index WHERE status = 'queued' AND setup_generation = ? AND type IN (${placeholders}) ORDER BY created_at ASC, id ASC LIMIT ?`,
       )
-      .all(...types, limit)
+      .all(setupGeneration, ...types, limit)
+      .map(toStoredJob);
+  }
+
+  findQueuedOutsideGeneration(
+    setupGeneration: number,
+    limit: number,
+  ): StoredJob[] {
+    if (
+      !validSetupGeneration(setupGeneration) ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 10_000
+    ) {
+      throw new JobPersistenceError();
+    }
+    return this.database
+      .prepare(
+        "SELECT * FROM jobs INDEXED BY jobs_queued_created_at_index WHERE status = 'queued' AND setup_generation <> ? ORDER BY created_at ASC, id ASC LIMIT ?",
+      )
+      .all(setupGeneration, limit)
       .map(toStoredJob);
   }
 
@@ -657,10 +700,14 @@ export class JobRepository {
     status: JobStatus,
     now: string,
     transition: JobTransition = {},
+    expectedSetupGeneration?: number,
   ): StoredJob | undefined {
-    const current = this.find(id);
-    if (!current || !expected.includes(current.status)) {
-      return current;
+    if (
+      expected.length === 0 ||
+      (expectedSetupGeneration !== undefined &&
+        !validSetupGeneration(expectedSetupGeneration))
+    ) {
+      throw new JobPersistenceError();
     }
     const assignments = ["status = ?", "updated_at = ?"];
     const values: Array<string | number> = [status, now];
@@ -687,11 +734,22 @@ export class JobRepository {
       assignments.push("cancel_requested = ?");
       values.push(transition.cancelRequested ? 1 : 0);
     }
-    values.push(id);
-    this.database
-      .prepare(`UPDATE jobs SET ${assignments.join(", ")} WHERE id = ?`)
-      .run(...values);
-    return this.find(id);
+    const expectedPlaceholders = expected.map(() => "?").join(", ");
+    const generationClause =
+      expectedSetupGeneration === undefined ? "" : " AND setup_generation = ?";
+    values.push(
+      id,
+      ...(expectedSetupGeneration === undefined
+        ? []
+        : [expectedSetupGeneration]),
+      ...expected,
+    );
+    const row = this.database
+      .prepare(
+        `UPDATE jobs SET ${assignments.join(", ")} WHERE id = ?${generationClause} AND status IN (${expectedPlaceholders}) RETURNING *`,
+      )
+      .get(...values);
+    return row ? toStoredJob(row) : undefined;
   }
 
   deleteTerminalBefore(cutoffExclusive: string, limit = 1_000): number {
@@ -1073,6 +1131,10 @@ function canonicalTimestamp(value: string | undefined): string | undefined {
 
 function toStoredJob(row: Record<string, unknown>): StoredJob {
   const errorCode = optionalString(row.error_code);
+  const setupGeneration = Number(row.setup_generation);
+  if (!validSetupGeneration(setupGeneration)) {
+    throw new JobPersistenceError();
+  }
   return {
     id: String(row.id),
     type: String(row.type),
@@ -1094,6 +1156,7 @@ function toStoredJob(row: Record<string, unknown>): StoredJob {
         }
       : {}),
     input: parseJsonRecord(row.input),
+    setupGeneration,
     ...(optionalString(row.idempotency_key)
       ? { idempotencyKey: String(row.idempotency_key) }
       : {}),
@@ -1102,6 +1165,10 @@ function toStoredJob(row: Record<string, unknown>): StoredJob {
       : {}),
     cancelRequested: Number(row.cancel_requested) === 1,
   };
+}
+
+function validSetupGeneration(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 1;
 }
 
 function optionalString(value: unknown): string | undefined {

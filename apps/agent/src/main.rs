@@ -1,21 +1,21 @@
 use axum::{
     Json, Router,
-    extract::State,
-    http::StatusCode,
+    extract::{State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use chrono::{SecondsFormat, Utc};
-use cmclient_agent_core::access::ManagementAccessController;
+use cmclient_agent_core::access::{ManagementAccessController, ManagementAuditEntry};
 use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind, SecretStoreError};
-use cmclient_agent_core::setup::{SetupPhase, SetupStore};
+use cmclient_agent_core::setup::{SetupError, SetupPhase, SetupStore};
 use cmclient_agent_core::web::{
     ActiveGatewayRoute, GATEWAY_CAPABILITY_HEADER, GatewayRoute, GatewaySessionHandle,
-    ManagementTlsConfig, ManagementWebConfig, ManagementWebError, ManagementWebProfile,
-    ManagementWebService,
+    ManagementSetupState, ManagementTlsConfig, ManagementWebConfig, ManagementWebError,
+    ManagementWebProfile, ManagementWebService,
 };
 use cmclient_agent_core::{
     AgentConfig, AgentLease, AgentRuntimeProfile, AprsConfig, MeshtasticConnectionConfig,
@@ -37,8 +37,9 @@ use cmclient_supervisor::{
     GatewaySupervisor, SupervisorEvent,
 };
 use cmclient_updater::{PersistentUpdateJob, UpdateJournalStore, recover_interrupted_update};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
     ffi::OsString,
     fs,
@@ -47,7 +48,7 @@ use std::{
     process::ExitCode,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -55,36 +56,213 @@ use std::{
 };
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-
 const EX_USAGE: u8 = 2;
 const EX_CONFIG: u8 = 5;
 const UPDATE_EVENT_BUFFER: usize = 64;
+const AGENT_EVENT_REPLAY_BUFFER: usize = 64;
+const AGENT_EVENT_SUBSCRIBER_LIMIT: usize = 32;
 const MAX_SSE_EVENT_BYTES: usize = 60 * 1024;
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const AGENT_AUDIT_CAPACITY: usize = 512;
 const GATEWAY_SSE_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const GATEWAY_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const AGENT_LOG_FILE: &str = "agent.jsonl";
 const GATEWAY_LOG_FILE: &str = "gateway.jsonl";
 const MAX_GATEWAY_IDENTITY_BYTES: u64 = 64 * 1024;
 
+#[derive(Clone)]
+struct AgentWebEvent {
+    id: String,
+    event: String,
+    data: Vec<u8>,
+}
+
+struct AgentEventJournal {
+    retained: VecDeque<AgentWebEvent>,
+}
+
+struct AgentEventHub {
+    stream: &'static str,
+    epoch: u64,
+    next_sequence: AtomicU64,
+    journal: Mutex<AgentEventJournal>,
+    live: tokio::sync::broadcast::Sender<AgentWebEvent>,
+    subscribers: Arc<AtomicUsize>,
+    runtime_log: Option<StructuredLogSink>,
+}
+
+struct AgentEventSubscription {
+    replay: Vec<AgentWebEvent>,
+    live: tokio::sync::broadcast::Receiver<AgentWebEvent>,
+    _permit: AgentEventSubscriberPermit,
+}
+
+struct AgentEventSubscriberPermit {
+    subscribers: Arc<AtomicUsize>,
+}
+
+impl Drop for AgentEventSubscriberPermit {
+    fn drop(&mut self) {
+        self.subscribers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentEventHubError {
+    SubscriberLimit,
+    Serialization,
+    State,
+}
+
+impl AgentEventHub {
+    fn new_with_log(stream: &'static str, runtime_log: Option<StructuredLogSink>) -> Self {
+        let epoch = Utc::now()
+            .timestamp_micros()
+            .unsigned_abs()
+            .saturating_add(u64::from(std::process::id()));
+        Self::new_with_epoch_and_log(stream, epoch, runtime_log)
+    }
+
+    #[cfg(test)]
+    fn new_with_epoch(stream: &'static str, epoch: u64) -> Self {
+        Self::new_with_epoch_and_log(stream, epoch, None)
+    }
+
+    fn new_with_epoch_and_log(
+        stream: &'static str,
+        epoch: u64,
+        runtime_log: Option<StructuredLogSink>,
+    ) -> Self {
+        let (live, _) = tokio::sync::broadcast::channel(AGENT_EVENT_REPLAY_BUFFER);
+        Self {
+            stream,
+            epoch,
+            next_sequence: AtomicU64::new(1),
+            journal: Mutex::new(AgentEventJournal {
+                retained: VecDeque::with_capacity(AGENT_EVENT_REPLAY_BUFFER),
+            }),
+            live,
+            subscribers: Arc::new(AtomicUsize::new(0)),
+            runtime_log,
+        }
+    }
+
+    fn publish<T: Serialize>(
+        &self,
+        event_type: &'static str,
+        payload: &T,
+    ) -> Result<AgentWebEvent, AgentEventHubError> {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::AcqRel);
+        let id = format!("agent:{}:{}-{sequence}", self.stream, self.epoch);
+        let envelope = serde_json::json!({
+            "eventId": id,
+            "schemaVersion": 1,
+            "stream": self.stream,
+            "type": event_type,
+            "occurredAt": utc_now(),
+            "source": "agent",
+            "payload": payload,
+        });
+        let data = serde_json::to_vec(&envelope).map_err(|_| AgentEventHubError::Serialization)?;
+        if data.len() > MAX_SSE_EVENT_BYTES
+            || data.iter().any(|byte| matches!(*byte, b'\r' | b'\n'))
+        {
+            return Err(AgentEventHubError::Serialization);
+        }
+        let event = AgentWebEvent {
+            id,
+            event: String::from(event_type),
+            data,
+        };
+        let mut journal = self.journal.lock().map_err(|_| AgentEventHubError::State)?;
+        if journal.retained.len() == AGENT_EVENT_REPLAY_BUFFER {
+            journal.retained.pop_front();
+        }
+        journal.retained.push_back(event.clone());
+        let _ = self.live.send(event.clone());
+        Ok(event)
+    }
+
+    fn subscribe(
+        &self,
+        last_event_id: Option<&str>,
+    ) -> Result<AgentEventSubscription, AgentEventHubError> {
+        self.acquire_subscriber()?;
+        let permit = AgentEventSubscriberPermit {
+            subscribers: Arc::clone(&self.subscribers),
+        };
+        let journal = self.journal.lock().map_err(|_| AgentEventHubError::State)?;
+        let live = self.live.subscribe();
+        let replay = match last_event_id {
+            Some(cursor) => journal
+                .retained
+                .iter()
+                .position(|event| event.id == cursor)
+                .map_or_else(
+                    || journal.retained.back().cloned().into_iter().collect(),
+                    |position| {
+                        journal
+                            .retained
+                            .iter()
+                            .skip(position + 1)
+                            .cloned()
+                            .collect()
+                    },
+                ),
+            None => journal.retained.back().cloned().into_iter().collect(),
+        };
+        Ok(AgentEventSubscription {
+            replay,
+            live,
+            _permit: permit,
+        })
+    }
+
+    fn acquire_subscriber(&self) -> Result<(), AgentEventHubError> {
+        let mut current = self.subscribers.load(Ordering::Acquire);
+        loop {
+            if current >= AGENT_EVENT_SUBSCRIBER_LIMIT {
+                return Err(AgentEventHubError::SubscriberLimit);
+            }
+            match self.subscribers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 struct AgentUpdateService {
     journal: UpdateJournalStore,
     subscribers: Mutex<Vec<SyncSender<ControlUpdateEvent>>>,
-    web_events: tokio::sync::broadcast::Sender<ControlUpdateEvent>,
+    web_events: Arc<AgentEventHub>,
     next_event_id: AtomicU64,
 }
 
 impl AgentUpdateService {
+    #[cfg(test)]
     fn new(data_dir: &Path) -> Result<Self, ControlError> {
-        let (web_events, _) = tokio::sync::broadcast::channel(UPDATE_EVENT_BUFFER);
-        Ok(Self {
+        Self::new_with_log(data_dir, None)
+    }
+
+    fn new_with_log(
+        data_dir: &Path,
+        runtime_log: Option<StructuredLogSink>,
+    ) -> Result<Self, ControlError> {
+        let service = Self {
             journal: UpdateJournalStore::new(data_dir).map_err(|_| ControlError::CommandFailed)?,
             subscribers: Mutex::new(Vec::new()),
-            web_events,
+            web_events: Arc::new(AgentEventHub::new_with_log("update", runtime_log)),
             next_event_id: AtomicU64::new(1),
-        })
+        };
+        service.publish_web_status(&service.status()?)?;
+        Ok(service)
     }
 
     fn recover(&self) -> Result<(), ControlError> {
@@ -127,27 +305,6 @@ impl AgentUpdateService {
         Ok(receiver)
     }
 
-    fn subscribe_web(
-        &self,
-    ) -> Result<
-        (
-            ControlUpdateEvent,
-            tokio::sync::broadcast::Receiver<ControlUpdateEvent>,
-        ),
-        ControlError,
-    > {
-        let _event_order = self
-            .subscribers
-            .lock()
-            .map_err(|_| ControlError::CommandFailed)?;
-        let receiver = self.web_events.subscribe();
-        Ok((self.web_snapshot()?, receiver))
-    }
-
-    fn web_snapshot(&self) -> Result<ControlUpdateEvent, ControlError> {
-        self.event_for(&self.status()?)
-    }
-
     fn publish(&self, job: &PersistentUpdateJob) -> Result<(), ControlError> {
         let status = UpdateControlStatus {
             schema_version: 1,
@@ -159,8 +316,15 @@ impl AgentUpdateService {
             .map_err(|_| ControlError::CommandFailed)?;
         let event = self.event_for(&status)?;
         subscribers.retain(|sender| sender.try_send(event.clone()).is_ok());
-        let _ = self.web_events.send(event);
+        self.publish_web_status(&status)?;
         Ok(())
+    }
+
+    fn publish_web_status(&self, status: &UpdateControlStatus) -> Result<(), ControlError> {
+        self.web_events
+            .publish("update.status", status)
+            .map(|_| ())
+            .map_err(|_| ControlError::CommandFailed)
     }
 
     fn event_for(&self, status: &UpdateControlStatus) -> Result<ControlUpdateEvent, ControlError> {
@@ -202,8 +366,205 @@ fn utc_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn agent_web_router(updates: Arc<AgentUpdateService>) -> Router {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentLifecycleStatus {
+    schema_version: u8,
+    agent: String,
+    gateway: String,
+    management_web: String,
+    management_web_url: Option<String>,
+    uptime_seconds: u64,
+    latest_error_code: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetupTermsRequest {
+    terms_version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupResetRequest {
+    confirmation: String,
+}
+
+struct AgentWebState {
+    updates: Arc<AgentUpdateService>,
+    setup: Arc<SetupStore>,
+    setup_gate_required: bool,
+    setup_events: Arc<AgentEventHub>,
+    lifecycle: Mutex<AgentLifecycleStatus>,
+    lifecycle_events: Arc<AgentEventHub>,
+    management_setup_state: Mutex<Option<ManagementSetupState>>,
+    management_access: Option<Arc<ManagementAccessController>>,
+    audit: Mutex<VecDeque<ManagementAuditEntry>>,
+    runtime_log: Option<StructuredLogSink>,
+}
+
+impl AgentWebState {
+    #[cfg(test)]
+    fn new(
+        updates: Arc<AgentUpdateService>,
+        setup: Arc<SetupStore>,
+        setup_gate_required: bool,
+        lifecycle: AgentLifecycleStatus,
+    ) -> Result<Self, ControlError> {
+        Self::new_with_log(updates, setup, setup_gate_required, lifecycle, None, None)
+    }
+
+    fn new_with_log(
+        updates: Arc<AgentUpdateService>,
+        setup: Arc<SetupStore>,
+        setup_gate_required: bool,
+        lifecycle: AgentLifecycleStatus,
+        runtime_log: Option<StructuredLogSink>,
+        management_access: Option<Arc<ManagementAccessController>>,
+    ) -> Result<Self, ControlError> {
+        let setup_events = Arc::new(AgentEventHub::new_with_log("setup", runtime_log.clone()));
+        setup_events
+            .publish(
+                "setup.status",
+                &setup.status().map_err(|_| ControlError::CommandFailed)?,
+            )
+            .map_err(|_| ControlError::CommandFailed)?;
+        let lifecycle_events = Arc::new(AgentEventHub::new_with_log(
+            "lifecycle",
+            runtime_log.clone(),
+        ));
+        lifecycle_events
+            .publish("lifecycle.status", &lifecycle)
+            .map_err(|_| ControlError::CommandFailed)?;
+        Ok(Self {
+            updates,
+            setup,
+            setup_gate_required,
+            setup_events,
+            lifecycle: Mutex::new(lifecycle),
+            lifecycle_events,
+            management_setup_state: Mutex::new(None),
+            management_access,
+            audit: Mutex::new(VecDeque::new()),
+            runtime_log,
+        })
+    }
+
+    fn attach_management_setup_state(
+        &self,
+        state: ManagementSetupState,
+    ) -> Result<(), ControlError> {
+        let status = self
+            .setup
+            .status()
+            .map_err(|_| ControlError::CommandFailed)?;
+        let generation = self
+            .setup
+            .generation()
+            .map_err(|_| ControlError::CommandFailed)?
+            .generation();
+        state.set(
+            generation,
+            self.setup_gate_required && status.setup_required,
+        );
+        *self
+            .management_setup_state
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)? = Some(state);
+        Ok(())
+    }
+
+    fn publish_setup_status(
+        &self,
+        status: &cmclient_agent_core::setup::SetupStatus,
+    ) -> Result<(), ControlError> {
+        let generation = self
+            .setup
+            .generation()
+            .map_err(|_| ControlError::CommandFailed)?
+            .generation();
+        if let Some(state) = self
+            .management_setup_state
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .as_ref()
+        {
+            state.set(
+                generation,
+                self.setup_gate_required && status.setup_required,
+            );
+        }
+        self.setup_events
+            .publish("setup.status", status)
+            .map(|_| ())
+            .map_err(|_| ControlError::CommandFailed)
+    }
+
+    fn update_lifecycle(&self, next: AgentLifecycleStatus) -> Result<(), ControlError> {
+        let mut current = self
+            .lifecycle
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?;
+        if *current == next {
+            return Ok(());
+        }
+        let publish = lifecycle_event_changed(&current, &next);
+        *current = next.clone();
+        drop(current);
+        if publish {
+            self.lifecycle_events
+                .publish("lifecycle.status", &next)
+                .map(|_| ())
+                .map_err(|_| ControlError::CommandFailed)?;
+        }
+        Ok(())
+    }
+
+    fn record_audit(&self, action: &'static str, outcome: &'static str, log_code: &'static str) {
+        let occurred_at_unix_seconds = Utc::now().timestamp().max(0) as u64;
+        if let Ok(mut audit) = self.audit.lock() {
+            audit.push_back(ManagementAuditEntry {
+                occurred_at_unix_seconds,
+                action,
+                outcome,
+            });
+            while audit.len() > AGENT_AUDIT_CAPACITY {
+                audit.pop_front();
+            }
+        }
+        if let Some(access) = &self.management_access {
+            access.audit(occurred_at_unix_seconds, action, outcome);
+        }
+        if let Some(runtime_log) = &self.runtime_log {
+            let _ = runtime_log.write_code(LogLevel::Info, log_code);
+        }
+    }
+
+    #[cfg(test)]
+    fn audit_snapshot(&self) -> Vec<ManagementAuditEntry> {
+        self.audit
+            .lock()
+            .map_or_else(|_| Vec::new(), |audit| audit.iter().cloned().collect())
+    }
+}
+
+fn lifecycle_event_changed(current: &AgentLifecycleStatus, next: &AgentLifecycleStatus) -> bool {
+    current.schema_version != next.schema_version
+        || current.agent != next.agent
+        || current.gateway != next.gateway
+        || current.management_web != next.management_web
+        || current.management_web_url != next.management_web_url
+        || current.latest_error_code != next.latest_error_code
+}
+
+fn agent_web_router(state: Arc<AgentWebState>) -> Router {
     Router::new()
+        .route("/api/v1/setup/status", get(management_setup_status))
+        .route("/api/v1/setup/terms", post(management_setup_terms))
+        .route("/api/v1/setup/reset", post(management_setup_reset))
+        .route("/api/v1/setup/events", get(management_setup_events))
+        .route("/api/v1/lifecycle/status", get(management_lifecycle_status))
+        .route("/api/v1/lifecycle/events", get(management_lifecycle_events))
         .route("/api/v1/updates", get(management_update_status))
         .route("/api/v1/updates/events", get(management_update_events))
         .route(
@@ -211,38 +572,204 @@ fn agent_web_router(updates: Arc<AgentUpdateService>) -> Router {
             any(management_control_route_not_found),
         )
         .route("/api/v1/control", any(management_control_route_not_found))
-        .with_state(updates)
+        .with_state(state)
 }
 
-async fn management_update_status(State(updates): State<Arc<AgentUpdateService>>) -> Response {
+async fn management_setup_status(State(state): State<Arc<AgentWebState>>) -> Response {
+    match tokio::task::spawn_blocking(move || state.setup.status()).await {
+        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(Err(_)) | Err(_) => management_control_failed_response(),
+    }
+}
+
+async fn management_setup_terms(
+    State(state): State<Arc<AgentWebState>>,
+    request: Result<Json<SetupTermsRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return setup_request_invalid_response(),
+    };
+    let operation = tokio::task::spawn_blocking(move || {
+        let status = state.setup.accept_terms(&request.terms_version)?;
+        state
+            .publish_setup_status(&status)
+            .map_err(|_| cmclient_agent_core::setup::SetupError::WriteFailed)?;
+        Ok::<_, cmclient_agent_core::setup::SetupError>(status)
+    })
+    .await;
+    match operation {
+        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(Err(error)) => setup_error_response(error),
+        Err(_) => management_control_failed_response(),
+    }
+}
+
+async fn management_setup_reset(
+    State(state): State<Arc<AgentWebState>>,
+    request: Result<Json<SetupResetRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return setup_request_invalid_response(),
+    };
+    if request.confirmation != "operational_reset" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"code": "SETUP_RESET_CONFIRMATION_INVALID"})),
+        )
+            .into_response();
+    }
+    let operation = tokio::task::spawn_blocking(move || {
+        if !state.setup_gate_required {
+            return Err(cmclient_agent_core::setup::SetupError::TransitionInvalid);
+        }
+        let current = state.setup.status()?;
+        if !current.setup_required {
+            return Err(cmclient_agent_core::setup::SetupError::TransitionInvalid);
+        }
+        let previous_generation = state.setup.generation()?.generation();
+        let status = state.setup.reset()?;
+        let next_generation = state.setup.generation()?.generation();
+        state.record_audit("setup_reset", "allowed", "SETUP_RESET_COMPLETED");
+        if next_generation != previous_generation {
+            state.record_audit("setup_generation", "changed", "SETUP_GENERATION_CHANGED");
+        }
+        state
+            .publish_setup_status(&status)
+            .map_err(|_| cmclient_agent_core::setup::SetupError::WriteFailed)?;
+        Ok::<_, cmclient_agent_core::setup::SetupError>(status)
+    })
+    .await;
+    match operation {
+        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(Err(error)) => setup_error_response(error),
+        Err(_) => management_control_failed_response(),
+    }
+}
+
+async fn management_lifecycle_status(State(state): State<Arc<AgentWebState>>) -> Response {
+    match state.lifecycle.lock() {
+        Ok(status) => (StatusCode::OK, Json(status.clone())).into_response(),
+        Err(_) => management_control_failed_response(),
+    }
+}
+
+async fn management_setup_events(
+    State(state): State<Arc<AgentWebState>>,
+    headers: HeaderMap,
+) -> Response {
+    management_agent_events(&state.setup_events, &headers)
+}
+
+async fn management_lifecycle_events(
+    State(state): State<Arc<AgentWebState>>,
+    headers: HeaderMap,
+) -> Response {
+    management_agent_events(&state.lifecycle_events, &headers)
+}
+
+async fn management_update_status(State(state): State<Arc<AgentWebState>>) -> Response {
+    let updates = Arc::clone(&state.updates);
     match tokio::task::spawn_blocking(move || updates.status()).await {
         Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
         Ok(Err(_)) | Err(_) => management_control_failed_response(),
     }
 }
 
-async fn management_update_events(State(updates): State<Arc<AgentUpdateService>>) -> Response {
-    let subscription = tokio::task::spawn_blocking(move || updates.subscribe_web()).await;
-    let (snapshot, receiver) = match subscription {
-        Ok(Ok(subscription)) => subscription,
-        Ok(Err(_)) | Err(_) => return management_control_failed_response(),
+async fn management_update_events(
+    State(state): State<Arc<AgentWebState>>,
+    headers: HeaderMap,
+) -> Response {
+    management_agent_events(&state.updates.web_events, &headers)
+}
+
+fn management_agent_events(hub: &AgentEventHub, headers: &HeaderMap) -> Response {
+    let last_event_id = match parse_last_event_id(headers) {
+        Ok(value) => value,
+        Err(()) => return sse_cursor_error(),
     };
-    let snapshot = match update_web_sse_event(snapshot) {
-        Ok(event) => event,
+    let subscription = match hub.subscribe(last_event_id.as_deref()) {
+        Ok(subscription) => subscription,
+        Err(AgentEventHubError::SubscriberLimit) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"code": "SSE_SUBSCRIBER_LIMIT_REACHED"})),
+            )
+                .into_response();
+        }
         Err(_) => return management_control_failed_response(),
     };
-    let events = tokio_stream::once(Ok::<_, std::io::Error>(snapshot)).chain(
-        BroadcastStream::new(receiver).map(|event| match event {
-            Ok(event) => update_web_sse_event(event),
-            Err(_) => Err(std::io::Error::other("update event subscriber lagged")),
-        }),
-    );
+    let AgentEventSubscription {
+        replay,
+        live,
+        _permit: permit,
+    } = subscription;
+    let replay = tokio_stream::iter(replay).map(agent_web_sse_event);
+    let runtime_log = hub.runtime_log.clone();
+    let live = BroadcastStream::new(live).map(move |event| {
+        let _keep_permit = &permit;
+        match event {
+            Ok(event) => agent_web_sse_event(event),
+            Err(_) => {
+                if let Some(runtime_log) = &runtime_log {
+                    let _ = runtime_log.write_code(LogLevel::Warn, "AGENT_SSE_SLOW_CONSUMER");
+                }
+                Err(std::io::Error::other("AGENT_SSE_SLOW_CONSUMER"))
+            }
+        }
+    });
+    let events = replay.chain(live);
     Sse::new(events)
         .keep_alive(
             KeepAlive::new()
                 .interval(Duration::from_secs(15))
                 .text("heartbeat"),
         )
+        .into_response()
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<String>, ()> {
+    let mut values = headers.get_all("last-event-id").iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(());
+    }
+    let Some(value) = first else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| ())?;
+    if !is_safe_sse_token(value) {
+        return Err(());
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn sse_cursor_error() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"code": "SSE_CURSOR_INVALID"})),
+    )
+        .into_response()
+}
+
+fn setup_error_response(error: SetupError) -> Response {
+    let status = match error {
+        SetupError::TransitionInvalid | SetupError::StaleGeneration => StatusCode::CONFLICT,
+        SetupError::PathInvalid
+        | SetupError::ReadFailed
+        | SetupError::Invalid
+        | SetupError::WriteFailed
+        | SetupError::GenerationExhausted => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(serde_json::json!({"code": error.code()}))).into_response()
+}
+
+fn setup_request_invalid_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"code": "SETUP_REQUEST_INVALID"})),
+    )
         .into_response()
 }
 
@@ -262,7 +789,7 @@ fn management_control_failed_response() -> Response {
         .into_response()
 }
 
-fn update_web_sse_event(event: ControlUpdateEvent) -> Result<Event, std::io::Error> {
+fn agent_web_sse_event(event: AgentWebEvent) -> Result<Event, std::io::Error> {
     if !is_safe_sse_token(&event.id)
         || !is_safe_sse_token(&event.event)
         || event.data.len() > MAX_SSE_EVENT_BYTES
@@ -270,13 +797,13 @@ fn update_web_sse_event(event: ControlUpdateEvent) -> Result<Event, std::io::Err
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "update event is not valid SSE data",
+            "Agent event is not valid SSE data",
         ));
     }
     let data = String::from_utf8(event.data).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "update event data is not UTF-8",
+            "Agent event data is not UTF-8",
         )
     })?;
     Ok(Event::default().id(event.id).event(event.event).data(data))
@@ -287,7 +814,30 @@ fn is_safe_sse_token(value: &str) -> bool {
         && value.len() <= 128
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
+}
+
+fn agent_lifecycle_status(status: &ControlStatus) -> AgentLifecycleStatus {
+    let gateway = match status.gateway {
+        GatewayControlStatus::Stopped => "stopped",
+        GatewayControlStatus::Starting => "starting",
+        GatewayControlStatus::Running => "running",
+        GatewayControlStatus::Backoff => "backoff",
+        GatewayControlStatus::Degraded => "degraded",
+    };
+    let management_web = match status.management_web {
+        ManagementWebControlStatus::Disabled => "disabled",
+        ManagementWebControlStatus::Running => "running",
+    };
+    AgentLifecycleStatus {
+        schema_version: 1,
+        agent: String::from("running"),
+        gateway: String::from(gateway),
+        management_web: String::from(management_web),
+        management_web_url: status.management_web_url.clone(),
+        uptime_seconds: status.uptime_seconds,
+        latest_error_code: status.latest_error_code.clone(),
+    }
 }
 
 struct AgentController {
@@ -308,6 +858,7 @@ struct AgentController {
     setup: Arc<SetupStore>,
     setup_gate_required: bool,
     updates: Arc<AgentUpdateService>,
+    web_state: Arc<AgentWebState>,
     shutdown_requested: AtomicBool,
     started_at: Instant,
     latest_error_code: Mutex<Option<String>>,
@@ -339,8 +890,14 @@ impl SupervisorWorker {
         let worker = thread::Builder::new()
             .name(String::from("cmclient-gateway-supervisor"))
             .spawn(move || {
+                let mut next_lifecycle_refresh = Instant::now();
                 while !worker_shutdown.load(Ordering::Acquire) {
-                    let _ = controller.tick_supervisor();
+                    let lifecycle_changed = controller.tick_supervisor().unwrap_or(true);
+                    let now = Instant::now();
+                    if lifecycle_changed || now >= next_lifecycle_refresh {
+                        let _ = controller.publish_lifecycle_snapshot();
+                        next_lifecycle_refresh = now + LIFECYCLE_REFRESH_INTERVAL;
+                    }
                     thread::sleep(SUPERVISOR_POLL_INTERVAL);
                 }
             })
@@ -441,17 +998,11 @@ fn setup_gate_required(config: &AgentConfig) -> bool {
 }
 
 fn setup_gate_required_with_profile(config: &AgentConfig, physical_profile: bool) -> bool {
-    let has_external_configuration = config.callmesh.is_some()
-        || config.meshtastic.is_some()
-        || config.aprs.is_some()
-        || config.proxy.is_some();
-    if !has_external_configuration {
-        return false;
-    }
     // The physical source-smoke profile is a campaign-only observation path.
     // It is valid only when CallMesh/APRS/Proxy are absent; P18's product
     // guard then owns the one Meshtastic socket and its allowlisted write.
     if physical_profile
+        && config.meshtastic.is_some()
         && config.callmesh.is_none()
         && config.aprs.is_none()
         && config.proxy.is_none()
@@ -679,6 +1230,9 @@ impl AgentController {
                 supervisor.set_environment(environment);
                 if private_bootstrap {
                     supervisor
+                        .set_setup_generation(setup_generation)
+                        .map_err(|_| ControlError::CommandFailed)?;
+                    supervisor
                         .enable_private_bootstrap()
                         .map_err(|_| ControlError::CommandFailed)?;
                     if let Some(api_key) = secrets
@@ -734,6 +1288,11 @@ impl AgentController {
             port: config.management_lan.as_ref().map_or(7080, |lan| lan.port),
             profile: management_web_profile(config.runtime_profile),
             setup_generation,
+            setup_required: setup_gate_required
+                && setup
+                    .status()
+                    .map_err(|_| ControlError::CommandFailed)?
+                    .setup_required,
             allow_lan: management_access.is_some(),
             allowed_cidrs: config
                 .management_lan
@@ -747,13 +1306,39 @@ impl AgentController {
             static_web_root: Some(resolve_static_web_root()),
         };
         let gateway_session = GatewaySessionHandle::new();
-        let updates = Arc::new(AgentUpdateService::new(config.paths.root_dir())?);
+        let updates = Arc::new(AgentUpdateService::new_with_log(
+            config.paths.root_dir(),
+            runtime_log.clone(),
+        )?);
         updates.recover()?;
+        let started_at = Instant::now();
+        let web_state = Arc::new(AgentWebState::new_with_log(
+            Arc::clone(&updates),
+            Arc::clone(&setup),
+            setup_gate_required,
+            AgentLifecycleStatus {
+                schema_version: 1,
+                agent: String::from("running"),
+                gateway: String::from("stopped"),
+                management_web: if config.management_web_enabled {
+                    String::from("running")
+                } else {
+                    String::from("disabled")
+                },
+                management_web_url: None,
+                uptime_seconds: 0,
+                latest_error_code: management_web_config
+                    .setup_required
+                    .then(|| String::from("SETUP_REQUIRED")),
+            },
+            runtime_log.clone(),
+            management_access.clone(),
+        )?);
         let management_web = if config.management_web_enabled {
             Some(
                 ManagementWebService::start(
                     &management_web_config,
-                    agent_web_router(Arc::clone(&updates)),
+                    agent_web_router(Arc::clone(&web_state)),
                     management_access.clone(),
                     gateway_session.clone(),
                 )
@@ -762,6 +1347,20 @@ impl AgentController {
         } else {
             None
         };
+        if let Some(service) = management_web.as_ref() {
+            web_state.attach_management_setup_state(service.setup_state())?;
+            web_state.update_lifecycle(AgentLifecycleStatus {
+                schema_version: 1,
+                agent: String::from("running"),
+                gateway: String::from("stopped"),
+                management_web: String::from("running"),
+                management_web_url: Some(service.advertised_url().trim_end_matches('/').to_owned()),
+                uptime_seconds: 0,
+                latest_error_code: management_web_config
+                    .setup_required
+                    .then(|| String::from("SETUP_REQUIRED")),
+            })?;
+        }
         let controller = Self {
             identity,
             supervisor: Mutex::new(supervisor),
@@ -783,8 +1382,9 @@ impl AgentController {
             setup,
             setup_gate_required,
             updates,
+            web_state,
             shutdown_requested: AtomicBool::new(false),
-            started_at: Instant::now(),
+            started_at,
             latest_error_code: Mutex::new(initial_log_error_code),
         };
         controller.log_agent_code(LogLevel::Info, "AGENT_RUNTIME_READY");
@@ -792,7 +1392,20 @@ impl AgentController {
     }
 
     fn status(&self) -> Result<ControlStatus, ControlError> {
-        self.tick_supervisor()?;
+        let _ = self.tick_supervisor()?;
+        let status = self.control_status_snapshot()?;
+        self.web_state
+            .update_lifecycle(agent_lifecycle_status(&status))?;
+        Ok(status)
+    }
+
+    fn publish_lifecycle_snapshot(&self) -> Result<(), ControlError> {
+        let status = self.control_status_snapshot()?;
+        self.web_state
+            .update_lifecycle(agent_lifecycle_status(&status))
+    }
+
+    fn control_status_snapshot(&self) -> Result<ControlStatus, ControlError> {
         let setup_blocked = self.setup_blocked()?;
         let mut supervisor = self
             .supervisor
@@ -886,15 +1499,16 @@ impl AgentController {
             .map_err(|_| ControlError::CommandFailed)?;
         self.ensure_resource_start_allowed()?;
         if management_web.is_none() {
-            *management_web = Some(
-                ManagementWebService::start(
-                    &self.management_web_config,
-                    agent_web_router(Arc::clone(&self.updates)),
-                    self.management_access.clone(),
-                    self.gateway_session.clone(),
-                )
-                .map_err(|_| ControlError::CommandFailed)?,
-            );
+            let service = ManagementWebService::start(
+                &self.management_web_config,
+                agent_web_router(Arc::clone(&self.web_state)),
+                self.management_access.clone(),
+                self.gateway_session.clone(),
+            )
+            .map_err(|_| ControlError::CommandFailed)?;
+            self.web_state
+                .attach_management_setup_state(service.setup_state())?;
+            *management_web = Some(service);
         }
         drop(management_web);
         self.status()
@@ -1189,6 +1803,7 @@ impl AgentController {
             let Some(supervisor) = supervisor.as_mut() else {
                 return Ok(false);
             };
+            self.synchronize_supervisor_setup_generation(supervisor)?;
             let result = supervisor.start();
             let ready = supervisor.gateway_ready().cloned();
             let log_health = supervisor.take_log_health_update();
@@ -1213,17 +1828,18 @@ impl AgentController {
         Ok(true)
     }
 
-    fn tick_supervisor(&self) -> Result<(), ControlError> {
+    fn tick_supervisor(&self) -> Result<bool, ControlError> {
         if self.setup_blocked()? {
+            let changed = self.gateway_session.snapshot().is_some();
             self.gateway_session.clear();
-            return Ok(());
+            return Ok(changed);
         }
         let _transition = self
             .gateway_transition
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
         if self.is_shutdown_requested() {
-            return Ok(());
+            return Ok(false);
         }
         let (result, ready, log_health) = {
             let mut supervisor = self
@@ -1231,10 +1847,11 @@ impl AgentController {
                 .lock()
                 .map_err(|_| ControlError::CommandFailed)?;
             if self.is_shutdown_requested() {
-                return Ok(());
+                return Ok(false);
             }
             match supervisor.as_mut() {
                 Some(supervisor) => {
+                    self.synchronize_supervisor_setup_generation(supervisor)?;
                     let result = supervisor.tick().map(Some);
                     let ready = supervisor.gateway_ready().cloned();
                     let log_health = supervisor.take_log_health_update();
@@ -1258,10 +1875,12 @@ impl AgentController {
                     }
                 }
                 self.log_agent_code(LogLevel::Info, "GATEWAY_SUPERVISOR_STARTED");
-                Ok(())
+                Ok(true)
             }
             Ok(Some(SupervisorEvent::Heartbeat { .. })) => {
-                if self.private_gateway_bootstrap && self.gateway_session.snapshot().is_none() {
+                let route_was_missing =
+                    self.private_gateway_bootstrap && self.gateway_session.snapshot().is_none();
+                if route_was_missing {
                     self.publish_verified_gateway(ready)?;
                 }
                 if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
@@ -1272,16 +1891,21 @@ impl AgentController {
                         *latest_error_code = None;
                     }
                 }
-                Ok(())
+                Ok(route_was_missing)
             }
             Ok(Some(SupervisorEvent::Exited { .. })) => {
                 self.gateway_session.clear();
                 self.log_agent_code(LogLevel::Warn, "GATEWAY_SUPERVISOR_EXITED");
-                Ok(())
+                Ok(true)
             }
-            Ok(Some(SupervisorEvent::Backoff { .. } | SupervisorEvent::Stopped)) | Ok(None) => {
+            Ok(Some(SupervisorEvent::Backoff { .. } | SupervisorEvent::Stopped)) => {
                 self.gateway_session.clear();
-                Ok(())
+                Ok(true)
+            }
+            Ok(None) => {
+                let changed = self.gateway_session.snapshot().is_some();
+                self.gateway_session.clear();
+                Ok(changed)
             }
             Err(error) => {
                 self.gateway_session.clear();
@@ -1289,6 +1913,25 @@ impl AgentController {
                 Err(ControlError::CommandFailed)
             }
         }
+    }
+
+    fn synchronize_supervisor_setup_generation(
+        &self,
+        supervisor: &mut GatewaySupervisor,
+    ) -> Result<(), ControlError> {
+        if !self.private_gateway_bootstrap
+            || matches!(supervisor.status(), GatewayStatus::Running { .. })
+        {
+            return Ok(());
+        }
+        let generation = self
+            .setup
+            .generation()
+            .map_err(|_| ControlError::CommandFailed)?
+            .generation();
+        supervisor
+            .set_setup_generation(generation)
+            .map_err(|_| ControlError::CommandFailed)
     }
 
     fn publish_verified_gateway(&self, ready: Option<GatewayReady>) -> Result<(), ControlError> {
@@ -2380,23 +3023,28 @@ fn bundled_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, AgentController, AgentRuntimeProfile, AgentSecretStore, AgentUpdateService,
-        ControlHandler, GatewayLogHealthUpdate, GatewaySessionHandle, InternalComponent, LogLevel,
-        ManagementWebConfig, ManagementWebError, ManagementWebService, SecretKind,
-        agent_web_router, apply_aprs_environment, apply_physical_qualification_environment,
-        bridge_gateway_event_stream, compiled_component_identity, gateway_json_projection,
-        legacy_state_candidates, load_agent_config_after_migration_with, management_web_profile,
+        AGENT_EVENT_REPLAY_BUFFER, AGENT_EVENT_SUBSCRIBER_LIMIT, AgentConfig, AgentController,
+        AgentEventHub, AgentEventHubError, AgentEventSubscription, AgentLifecycleStatus,
+        AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState, ControlCommand,
+        ControlHandler, GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle,
+        InternalComponent, LogLevel, LogPolicy, ManagementWebConfig, ManagementWebError,
+        ManagementWebService, SecretKind, SetupError, SetupStore, StructuredLogSink,
+        SupervisorWorker, agent_web_router, apply_aprs_environment,
+        apply_physical_qualification_environment, bridge_gateway_event_stream,
+        compiled_component_identity, gateway_json_projection, legacy_state_candidates,
+        load_agent_config_after_migration_with, management_agent_events, management_web_profile,
         normalize_runtime_process_path, push_legacy_source_candidate,
-        resolve_gateway_maintenance_program, setup_gate_required_with_profile,
-        verified_gateway_route,
+        resolve_gateway_maintenance_program, setup_error_response,
+        setup_gate_required_with_profile, verified_gateway_route,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
-        ControlCommand, GatewayControlStatus, ManagementWebControlStatus, SupervisorWorker,
-        active_gateway_event_bridge_count, bridge_gateway_events_with_read_poll, gateway_heartbeat,
-        read_bounded_gateway_sse_line, shutdown_agent_runtime, try_forward_gateway_event,
+        GatewayControlStatus, ManagementWebControlStatus, active_gateway_event_bridge_count,
+        bridge_gateway_events_with_read_poll, gateway_heartbeat, read_bounded_gateway_sse_line,
+        shutdown_agent_runtime, try_forward_gateway_event,
     };
     use axum::{
+        Router,
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
@@ -2425,6 +3073,7 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::{
         collections::BTreeMap,
+        io::{Read, Write},
         path::Path,
         sync::Arc,
         thread,
@@ -2432,7 +3081,7 @@ mod tests {
     };
     #[cfg(not(target_os = "windows"))]
     use std::{
-        io::{Cursor, Read, Write},
+        io::Cursor,
         net::{TcpListener, TcpStream},
         path::PathBuf,
         sync::{
@@ -2441,6 +3090,12 @@ mod tests {
             mpsc,
         },
     };
+
+    #[test]
+    #[ignore = "child-process fixture"]
+    fn long_running_gateway_fixture() {
+        thread::sleep(Duration::from_secs(10));
+    }
 
     #[cfg(not(target_os = "windows"))]
     fn wait_for_fixture_marker(marker: &Path, expected: &str, timeout: Duration) -> String {
@@ -2465,6 +3120,35 @@ mod tests {
             assert!(Instant::now() < deadline, "gateway fixture did not report");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn test_agent_web_state(directory: &Path) -> Arc<AgentWebState> {
+        let paths = RuntimePaths {
+            data_dir: directory.to_path_buf(),
+            config_dir: directory.join("config"),
+            cache_dir: directory.join("cache"),
+            log_dir: directory.join("logs"),
+        };
+        let setup = Arc::new(SetupStore::open(&paths).expect("setup store should initialize"));
+        let updates =
+            Arc::new(AgentUpdateService::new(directory).expect("update service should initialize"));
+        Arc::new(
+            AgentWebState::new(
+                updates,
+                setup,
+                true,
+                AgentLifecycleStatus {
+                    schema_version: 1,
+                    agent: String::from("running"),
+                    gateway: String::from("stopped"),
+                    management_web: String::from("running"),
+                    management_web_url: Some(String::from("http://127.0.0.1:7080")),
+                    uptime_seconds: 1,
+                    latest_error_code: Some(String::from("SETUP_REQUIRED")),
+                },
+            )
+            .expect("Agent Web state should initialize"),
+        )
     }
 
     struct NoDatabaseMaintenance;
@@ -2942,9 +3626,18 @@ mod tests {
             management_lan: None,
         };
         std::fs::create_dir_all(&root).expect("test root should create");
-        let controller =
-            AgentController::from_config_with_secrets(&config, AgentSecretStore::memory())
-                .expect("controller should initialize");
+        let setup = SetupStore::open(&config.paths).expect("setup state should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let fence = setup.begin_validation().expect("validation should begin");
+        setup.mark_ready(fence).expect("setup should become ready");
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-callmesh-api-key")
+            .expect("fixture secret should store");
+        let controller = AgentController::from_config_with_secrets(&config, secrets)
+            .expect("controller should initialize");
         controller.apply_gateway_log_health(GatewayLogHealthUpdate {
             capture_error_code: Some("RUNTIME_LOG_CAPTURE_READ_FAILED"),
             write_error_code: Some("RUNTIME_LOG_FILE_UNAVAILABLE"),
@@ -3425,9 +4118,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let router = agent_web_router(Arc::new(
-            AgentUpdateService::new(&directory).expect("update service should initialize"),
-        ));
+        let router = agent_web_router(test_agent_web_state(&directory));
         let response = router
             .clone()
             .oneshot(
@@ -3475,9 +4166,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("temporary directory should exist");
-        let router = agent_web_router(Arc::new(
-            AgentUpdateService::new(&directory).expect("update service should initialize"),
-        ));
+        let router = agent_web_router(test_agent_web_state(&directory));
 
         let status = router
             .clone()
@@ -3537,12 +4226,766 @@ mod tests {
         .expect("initial SSE snapshot should not block");
         let first_event =
             String::from_utf8(first_event).expect("initial SSE snapshot should be UTF-8");
-        assert!(first_event.contains("id: update-"));
-        assert!(first_event.contains("event: update.status_changed"));
+        assert!(first_event.contains("id: agent:update:"));
+        assert!(first_event.contains("event: update.status"));
         assert!(!first_event.contains("gateway-999"));
         drop(body);
 
         std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn management_setup_and_lifecycle_routes_use_the_shared_redacted_contract() {
+        let directory =
+            std::env::temp_dir().join(format!("cmclient-agent-axum-setup-{}", std::process::id(),));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let state = test_agent_web_state(&directory);
+        let initial_generation = state
+            .setup
+            .generation()
+            .expect("generation should load")
+            .generation();
+        let mut management = ManagementWebService::start(
+            &ManagementWebConfig {
+                port: 0,
+                setup_generation: initial_generation,
+                setup_required: true,
+                ..ManagementWebConfig::default()
+            },
+            Router::new(),
+            None,
+            GatewaySessionHandle::new(),
+        )
+        .expect("management policy should start");
+        let management_setup = management.setup_state();
+        state
+            .attach_management_setup_state(management_setup.clone())
+            .expect("management setup state should attach");
+        let router = agent_web_router(Arc::clone(&state));
+
+        let status = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/setup/status")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("setup status should respond");
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = to_bytes(status.into_body(), 4_096)
+            .await
+            .expect("setup status should read");
+        let status: serde_json::Value =
+            serde_json::from_slice(&status).expect("setup status should be JSON");
+        assert_eq!(status["phase"], "terms_required");
+        assert_eq!(status["recoveryRequired"], false);
+        assert!(status.get("setupGeneration").is_none());
+
+        let terms = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/setup/terms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"termsVersion":"cmclient-2.0-terms-v1"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("terms route should respond");
+        assert_eq!(terms.status(), StatusCode::OK);
+        let terms: serde_json::Value = serde_json::from_slice(
+            &to_bytes(terms.into_body(), 4_096)
+                .await
+                .expect("terms response should read"),
+        )
+        .expect("terms response should be JSON");
+        assert_eq!(terms["phase"], "credentials_required");
+
+        for invalid_body in [
+            r#"{"termsVersion":"cmclient-2.0-terms-v1","extra":true}"#,
+            r#"{"termsVersion":42}"#,
+            r#"{"termsVersion":"unterminated""#,
+        ] {
+            let invalid = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/setup/terms")
+                        .header("content-type", "application/json")
+                        .body(Body::from(invalid_body))
+                        .expect("invalid request should build"),
+                )
+                .await
+                .expect("invalid setup request should respond");
+            assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &to_bytes(invalid.into_body(), 4_096)
+                        .await
+                        .expect("invalid setup response should read"),
+                )
+                .expect("invalid setup response should be JSON"),
+                serde_json::json!({"code": "SETUP_REQUEST_INVALID"}),
+            );
+        }
+
+        let lifecycle = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lifecycle/status")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("lifecycle status should respond");
+        assert_eq!(lifecycle.status(), StatusCode::OK);
+        let lifecycle: serde_json::Value = serde_json::from_slice(
+            &to_bytes(lifecycle.into_body(), 4_096)
+                .await
+                .expect("lifecycle response should read"),
+        )
+        .expect("lifecycle response should be JSON");
+        assert_eq!(lifecycle["gateway"], "stopped");
+        assert!(lifecycle.get("identity").is_none());
+
+        let reset = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/setup/reset")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirmation":"operational_reset"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("setup reset should respond");
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .setup
+                .generation()
+                .expect("generation should load")
+                .generation(),
+            initial_generation + 1,
+        );
+        assert_eq!(
+            management_setup.snapshot(),
+            (initial_generation + 1, true),
+            "setup reset must update the live Management Web generation fence before returning",
+        );
+        let reset_audit = state.audit_snapshot();
+        assert_eq!(
+            reset_audit,
+            vec![
+                cmclient_agent_core::access::ManagementAuditEntry {
+                    occurred_at_unix_seconds: reset_audit[0].occurred_at_unix_seconds,
+                    action: "setup_reset",
+                    outcome: "allowed",
+                },
+                cmclient_agent_core::access::ManagementAuditEntry {
+                    occurred_at_unix_seconds: reset_audit[1].occurred_at_unix_seconds,
+                    action: "setup_generation",
+                    outcome: "changed",
+                },
+            ],
+            "reset audit must contain only stable code-like fields",
+        );
+
+        let events = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/setup/events")
+                    .header("last-event-id", "agent:lifecycle:foreign-1")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("setup events should respond");
+        assert_eq!(events.status(), StatusCode::OK);
+        let mut body = events.into_body();
+        let first_event = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut encoded = Vec::new();
+            loop {
+                let frame = body
+                    .frame()
+                    .await
+                    .expect("setup SSE should yield a snapshot")
+                    .expect("setup SSE frame should encode");
+                if let Ok(data) = frame.into_data() {
+                    encoded.extend_from_slice(&data);
+                    if encoded.windows(2).any(|window| window == b"\n\n") {
+                        return encoded;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("setup snapshot should not block");
+        let first_event = String::from_utf8(first_event).expect("setup SSE should be UTF-8");
+        assert!(first_event.contains("id: agent:setup:"));
+        assert!(first_event.contains("event: setup.status"));
+        assert!(!first_event.contains("setupGeneration"));
+
+        management.stop().expect("management policy should stop");
+        std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn agent_event_namespaces_bound_replay_subscribers_and_slow_consumers() {
+        for (stream, event_type, epoch, foreign_cursor) in [
+            ("setup", "setup.status", 11, "agent:lifecycle:12-1"),
+            ("lifecycle", "lifecycle.status", 12, "agent:update:13-1"),
+            ("update", "update.status", 13, "agent:setup:11-1"),
+        ] {
+            let hub = AgentEventHub::new_with_epoch(stream, epoch);
+            let first = hub
+                .publish(event_type, &serde_json::json!({"sequence": 1}))
+                .expect("first event should publish");
+            let second = hub
+                .publish(event_type, &serde_json::json!({"sequence": 2}))
+                .expect("second event should publish");
+
+            let replay = hub
+                .subscribe(Some(&first.id))
+                .expect("known cursor should subscribe");
+            assert_eq!(
+                replay
+                    .replay
+                    .iter()
+                    .map(|event| event.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![second.id.as_str()],
+            );
+            drop(replay);
+            let foreign = hub
+                .subscribe(Some(foreign_cursor))
+                .expect("foreign cursor should recover with a snapshot");
+            assert_eq!(foreign.replay.len(), 1);
+            assert_eq!(foreign.replay[0].id, second.id);
+            drop(foreign);
+
+            let slow = hub.subscribe(None).expect("slow subscriber should open");
+            for sequence in 0..=AGENT_EVENT_REPLAY_BUFFER {
+                hub.publish(event_type, &serde_json::json!({"sequence": sequence + 10}))
+                    .expect("event should publish");
+            }
+            let latest = hub
+                .journal
+                .lock()
+                .expect("journal should lock")
+                .retained
+                .back()
+                .expect("latest event should exist")
+                .id
+                .clone();
+            let expired = hub
+                .subscribe(Some(&first.id))
+                .expect("expired cursor should recover with a snapshot");
+            assert_eq!(expired.replay.len(), 1);
+            assert_eq!(expired.replay[0].id, latest);
+            drop(expired);
+            let AgentEventSubscription {
+                mut live,
+                _permit: permit,
+                ..
+            } = slow;
+            assert!(matches!(
+                live.recv().await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+            ));
+            drop(live);
+            drop(permit);
+
+            let mut subscribers = Vec::new();
+            for _ in 0..AGENT_EVENT_SUBSCRIBER_LIMIT {
+                subscribers.push(hub.subscribe(None).expect("subscriber should fit"));
+            }
+            assert!(matches!(
+                hub.subscribe(None),
+                Err(AgentEventHubError::SubscriberLimit)
+            ));
+            subscribers.pop();
+            subscribers.push(
+                hub.subscribe(None)
+                    .expect("released subscriber slot should be reusable"),
+            );
+            drop(subscribers);
+
+            let restarted = AgentEventHub::new_with_epoch(stream, epoch + 100);
+            let restarted_event = restarted
+                .publish(event_type, &serde_json::json!({"sequence": 1}))
+                .expect("restart snapshot should publish");
+            let recovery = restarted
+                .subscribe(Some(&first.id))
+                .expect("old process cursor should recover");
+            assert_eq!(recovery.replay[0].id, restarted_event.id);
+            assert_ne!(first.id, restarted_event.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_sse_slow_consumer_closes_with_a_stable_observable_reason() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-sse-slow-consumer-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("log directory should exist");
+        let sink =
+            StructuredLogSink::open(&directory, "agent.jsonl", "agent", LogPolicy::default())
+                .expect("runtime log should open");
+        let hub = AgentEventHub::new_with_epoch_and_log("setup", 77, Some(sink));
+        hub.publish("setup.status", &serde_json::json!({"sequence": 0}))
+            .expect("snapshot should publish");
+        let response = management_agent_events(&hub, &axum::http::HeaderMap::new());
+        let mut body = response.into_body();
+
+        for sequence in 1..=AGENT_EVENT_REPLAY_BUFFER + 1 {
+            hub.publish("setup.status", &serde_json::json!({"sequence": sequence}))
+                .expect("live event should publish");
+        }
+        body.frame()
+            .await
+            .expect("snapshot frame should exist")
+            .expect("snapshot frame should encode");
+        let error = body
+            .frame()
+            .await
+            .expect("lagged stream should yield a terminal error")
+            .expect_err("lagged stream must close instead of continuing silently");
+        assert!(error.to_string().contains("AGENT_SSE_SLOW_CONSUMER"));
+        drop(body);
+        assert_eq!(
+            hub.subscribers.load(std::sync::atomic::Ordering::Acquire),
+            0,
+        );
+
+        let logs = std::fs::read_dir(&directory)
+            .expect("log directory should read")
+            .map(|entry| {
+                std::fs::read_to_string(entry.expect("log entry should read").path())
+                    .expect("log file should read")
+            })
+            .collect::<String>();
+        assert!(logs.contains("AGENT_SSE_SLOW_CONSUMER"));
+        std::fs::remove_dir_all(directory).expect("log directory should remove");
+    }
+
+    #[tokio::test]
+    async fn every_agent_sse_route_enforces_and_releases_its_subscriber_cap() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-sse-route-cap-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let router = agent_web_router(test_agent_web_state(&directory));
+
+        for path in [
+            "/api/v1/setup/events",
+            "/api/v1/lifecycle/events",
+            "/api/v1/updates/events",
+        ] {
+            let mut subscribers = Vec::new();
+            for _ in 0..AGENT_EVENT_SUBSCRIBER_LIMIT {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .body(Body::empty())
+                            .expect("subscriber request should build"),
+                    )
+                    .await
+                    .expect("subscriber request should respond");
+                assert_eq!(response.status(), StatusCode::OK);
+                subscribers.push(response);
+            }
+            let rejected = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("overflow request should build"),
+                )
+                .await
+                .expect("overflow request should respond");
+            assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &to_bytes(rejected.into_body(), 1_024)
+                        .await
+                        .expect("overflow response should read"),
+                )
+                .expect("overflow response should be JSON"),
+                serde_json::json!({"code": "SSE_SUBSCRIBER_LIMIT_REACHED"}),
+            );
+
+            drop(subscribers);
+            let recovered = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("recovery request should build"),
+                )
+                .await
+                .expect("recovery request should respond");
+            assert_eq!(recovered.status(), StatusCode::OK);
+            drop(recovered);
+        }
+
+        std::fs::remove_dir_all(directory).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn setup_storage_failures_are_not_reported_as_client_conflicts() {
+        for error in [
+            SetupError::PathInvalid,
+            SetupError::ReadFailed,
+            SetupError::Invalid,
+            SetupError::WriteFailed,
+            SetupError::GenerationExhausted,
+        ] {
+            assert_eq!(
+                setup_error_response(error).status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
+        for error in [SetupError::TransitionInvalid, SetupError::StaleGeneration] {
+            assert_eq!(setup_error_response(error).status(), StatusCode::CONFLICT);
+        }
+    }
+
+    #[test]
+    fn reset_generation_reaches_the_next_private_gateway_bootstrap() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-generation-bootstrap-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let paths = RuntimePaths {
+            data_dir: directory.clone(),
+            config_dir: directory.clone(),
+            cache_dir: directory.join("cache"),
+            log_dir: directory.join("logs"),
+        };
+        let setup = SetupStore::open(&paths).expect("setup state should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let fence = setup.begin_validation().expect("validation should begin");
+        setup.mark_ready(fence).expect("setup should become ready");
+        drop(setup);
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-callmesh-api-key")
+            .expect("fixture secret should store");
+        let missing_gateway = directory.join("missing-private-gateway");
+        let config = AgentConfig {
+            paths,
+            config_file: directory.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
+            gateway_command: Some(vec![missing_gateway.to_string_lossy().into_owned()]),
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = AgentController::from_config_with_secrets(&config, secrets)
+            .expect("controller should initialize");
+        controller.setup.reset().expect("setup should reset");
+        controller
+            .setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be reaccepted");
+        let fence = controller
+            .setup
+            .begin_validation()
+            .expect("validation should restart");
+        controller
+            .setup
+            .mark_ready(fence)
+            .expect("setup should become ready again");
+        let expected_generation = controller
+            .setup
+            .generation()
+            .expect("generation should load")
+            .generation();
+        assert_eq!(
+            controller.start_supervisor(),
+            Err(ControlError::CommandFailed),
+        );
+        assert_eq!(
+            controller
+                .supervisor
+                .lock()
+                .expect("supervisor should lock")
+                .as_ref()
+                .expect("supervisor should exist")
+                .configured_setup_generation(),
+            expected_generation,
+            "the live supervisor must refresh its private bootstrap fence before spawning",
+        );
+        let _ = controller.stop_supervisor();
+        std::fs::remove_dir_all(directory).expect("temporary directory should remove");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_worker_refreshes_uptime_and_detects_failed_gateway_health() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-lifecycle-health-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let paths = RuntimePaths {
+            data_dir: directory.clone(),
+            config_dir: directory.clone(),
+            cache_dir: directory.join("cache"),
+            log_dir: directory.join("logs"),
+        };
+        let setup = SetupStore::open(&paths).expect("setup state should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let fence = setup.begin_validation().expect("validation should begin");
+        setup.mark_ready(fence).expect("setup should become ready");
+        drop(setup);
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-callmesh-api-key")
+            .expect("fixture secret should store");
+        let executable = std::env::current_exe().expect("test executable should resolve");
+        let config = AgentConfig {
+            paths,
+            config_file: directory.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
+            gateway_command: Some(vec![
+                executable.to_string_lossy().into_owned(),
+                String::from("--ignored"),
+                String::from("--exact"),
+                String::from("tests::long_running_gateway_fixture"),
+            ]),
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = Arc::new(
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize"),
+        );
+        controller
+            .handle(ControlCommand::Start)
+            .expect("Gateway fixture should start");
+
+        let gateway = TcpListener::bind("127.0.0.1:0").expect("health fixture should bind");
+        let gateway_address = gateway.local_addr().expect("health address should load");
+        let gateway_thread = thread::spawn(move || {
+            let (mut stream, _) = gateway.accept().expect("health request should accept");
+            let mut request = [0_u8; 4096];
+            let _ = stream
+                .read(&mut request)
+                .expect("health request should read");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 15\r\nconnection: close\r\n\r\n{\"status\":\"ok\"}",
+                )
+                .expect("health response should write");
+        });
+        controller.gateway_session.set(
+            GatewayRoute::new(gateway_address, "c".repeat(64))
+                .expect("health route should be valid"),
+        );
+        let initial_controller = Arc::clone(&controller);
+        tokio::task::spawn_blocking(move || initial_controller.publish_lifecycle_snapshot())
+            .await
+            .expect("health snapshot task should join")
+            .expect("healthy lifecycle should publish");
+        gateway_thread.join().expect("health fixture should join");
+
+        let router = agent_web_router(Arc::clone(&controller.web_state));
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lifecycle/events")
+                    .body(Body::empty())
+                    .expect("lifecycle request should build"),
+            )
+            .await
+            .expect("lifecycle request should respond");
+        let mut body = response.into_body();
+        let mut worker =
+            SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
+
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut encoded = String::new();
+            loop {
+                let frame = body
+                    .frame()
+                    .await
+                    .expect("lifecycle stream should remain open")
+                    .expect("lifecycle frame should encode");
+                if let Ok(data) = frame.into_data() {
+                    encoded.push_str(
+                        std::str::from_utf8(&data).expect("lifecycle frame should be UTF-8"),
+                    );
+                    if encoded.contains("\"gateway\":\"degraded\"") {
+                        break encoded;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("failed health should publish degraded lifecycle");
+        assert!(observed.contains("GATEWAY_HEALTH_DEGRADED"));
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let status = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lifecycle/status")
+                    .body(Body::empty())
+                    .expect("status request should build"),
+            )
+            .await
+            .expect("status request should respond");
+        let status: serde_json::Value = serde_json::from_slice(
+            &to_bytes(status.into_body(), 4_096)
+                .await
+                .expect("status body should read"),
+        )
+        .expect("status body should be JSON");
+        assert!(
+            status["uptimeSeconds"]
+                .as_u64()
+                .is_some_and(|value| value >= 1)
+        );
+
+        drop(body);
+        worker.stop();
+        controller.gateway_session.clear();
+        controller
+            .handle(ControlCommand::Stop)
+            .expect("Gateway fixture should stop");
+        drop(controller);
+        std::fs::remove_dir_all(directory).expect("temporary directory should remove");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn background_supervisor_publishes_crash_lifecycle_without_a_status_request() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-lifecycle-worker-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let paths = RuntimePaths {
+            data_dir: directory.clone(),
+            config_dir: directory.clone(),
+            cache_dir: directory.join("cache"),
+            log_dir: directory.join("logs"),
+        };
+        let setup = SetupStore::open(&paths).expect("setup state should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let fence = setup.begin_validation().expect("validation should begin");
+        setup.mark_ready(fence).expect("setup should become ready");
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-callmesh-api-key")
+            .expect("fixture secret should store");
+        let powershell = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows SystemRoot should exist"),
+        )
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let config = AgentConfig {
+            paths,
+            config_file: directory.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
+            gateway_command: Some(vec![
+                powershell.to_string_lossy().into_owned(),
+                String::from("-NoLogo"),
+                String::from("-NoProfile"),
+                String::from("-NonInteractive"),
+                String::from("-Command"),
+                String::from("Start-Sleep -Milliseconds 750; exit 7"),
+            ]),
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = Arc::new(
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize"),
+        );
+        let response = agent_web_router(Arc::clone(&controller.web_state))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/lifecycle/events")
+                    .body(Body::empty())
+                    .expect("lifecycle request should build"),
+            )
+            .await
+            .expect("lifecycle request should respond");
+        let mut body = response.into_body();
+        let mut worker =
+            SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
+        controller
+            .handle(ControlCommand::Start)
+            .expect("Gateway fixture should start");
+
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut encoded = String::new();
+            loop {
+                let frame = body
+                    .frame()
+                    .await
+                    .expect("lifecycle stream should remain open")
+                    .expect("lifecycle frame should encode");
+                if let Ok(data) = frame.into_data() {
+                    encoded.push_str(
+                        std::str::from_utf8(&data).expect("lifecycle frame should be UTF-8"),
+                    );
+                    if encoded.contains("\"gateway\":\"backoff\"") {
+                        break encoded;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("background crash should publish lifecycle promptly");
+        assert!(observed.contains("event: lifecycle.status"));
+        assert!(observed.contains("GATEWAY_RESTART_BACKOFF"));
+
+        drop(body);
+        worker.stop();
+        controller
+            .handle(ControlCommand::Stop)
+            .expect("supervisor should stop");
+        drop(controller);
+        std::fs::remove_dir_all(directory).expect("temporary directory should remove");
     }
 
     #[cfg(not(target_os = "windows"))]

@@ -1,12 +1,17 @@
 import { request, type IncomingMessage } from "node:http";
 
+import type {
+  FastifyInstance,
+  InjectOptions,
+  LightMyRequestCallback,
+} from "fastify";
 import { describe, expect, it } from "vitest";
 
 import {
   GatewayAccessConfigurationError,
   GatewayConfigurationError,
   GatewayRuntime,
-  createGatewayApp,
+  createGatewayApp as createCapabilityProtectedGatewayApp,
 } from "./app";
 import { MemoryLogger, redact } from "./observability";
 import {
@@ -173,18 +178,9 @@ describe("GatewayRuntime", () => {
 
   it("rejects direct and spoofed access on health, HTTP, SSE, and unmatched routes", async () => {
     const capability = "c".repeat(64);
-    const app = createGatewayApp(
-      new MemoryLogger(),
-      undefined,
-      undefined,
-      {},
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+    const app = createCapabilityProtectedGatewayApp(
       { capability },
+      new MemoryLogger(),
     );
     for (const url of [
       "/api/v1/system/health",
@@ -228,20 +224,11 @@ describe("GatewayRuntime", () => {
   });
 
   it("rejects malformed private capability configuration instead of disabling the gate", () => {
-    for (const capability of ["", "g".repeat(64), "c".repeat(63)]) {
+    for (const capability of [undefined, "", "g".repeat(64), "c".repeat(63)]) {
       expect(() =>
-        createGatewayApp(
+        createCapabilityProtectedGatewayApp(
+          capability === undefined ? undefined : { capability },
           new MemoryLogger(),
-          undefined,
-          undefined,
-          {},
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          { capability },
         ),
       ).toThrow(GatewayAccessConfigurationError);
     }
@@ -500,7 +487,12 @@ describe("GatewayRuntime", () => {
       throw new Error("Gateway did not bind a TCP address");
     }
 
-    const stream = await openSse(address.port, "/api/v1/events", first.eventId);
+    const stream = await openSse(
+      address.port,
+      "/api/v1/events",
+      first.eventId,
+      TEST_GATEWAY_CAPABILITY,
+    );
     try {
       const body = await readUntil(stream.response, ": heartbeat\n\n");
       expect(body).toContain(": heartbeat\n\n");
@@ -512,6 +504,27 @@ describe("GatewayRuntime", () => {
       stream.response.destroy();
       await app.close();
     }
+  });
+
+  it("rejects an invalid Last-Event-ID before committing SSE headers", async () => {
+    const app = createGatewayApp(new MemoryLogger());
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/events",
+      headers: {
+        accept: "text/event-stream",
+        "last-event-id": "invalid cursor",
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.headers["content-type"]).toContain("application/json");
+    expect(response.json()).toMatchObject({
+      code: "SSE_CURSOR_INVALID",
+      params: {},
+      traceId: expect.any(String),
+    });
+    await app.close();
   });
 
   it("replays the maximum accepted payload within the SSE frame cap", async () => {
@@ -540,7 +553,12 @@ describe("GatewayRuntime", () => {
 
     let stream: Awaited<ReturnType<typeof openSse>> | undefined;
     try {
-      stream = await openSse(address.port, "/api/v1/events", "missing");
+      stream = await openSse(
+        address.port,
+        "/api/v1/events",
+        "missing",
+        TEST_GATEWAY_CAPABILITY,
+      );
       const body = await readUntil(stream.response, ": heartbeat\n\n");
       const frame = body.slice(0, body.indexOf(": heartbeat\n\n"));
 
@@ -609,6 +627,7 @@ describe("GatewayRuntime", () => {
         address.port,
         "/api/v1/events",
         checkpoint.eventId,
+        TEST_GATEWAY_CAPABILITY,
       );
       const live = events.publish({
         type: "gateway.live",
@@ -667,6 +686,7 @@ describe("GatewayRuntime", () => {
         address.port,
         "/api/v1/events",
         checkpoint.eventId,
+        TEST_GATEWAY_CAPABILITY,
       );
       const responseClosed = new Promise<void>((resolve) => {
         stream?.response.once("error", () => resolve());
@@ -774,6 +794,7 @@ describe("GatewayRuntime", () => {
       address.port,
       `/api/v1/jobs/${accepted.job.id}/events`,
       checkpoint.eventId,
+      TEST_GATEWAY_CAPABILITY,
     );
     try {
       const body = await readUntil(
@@ -868,6 +889,54 @@ describe("GatewayRuntime", () => {
     }
   });
 });
+
+const TEST_GATEWAY_CAPABILITY = "f".repeat(64);
+type GatewayTestDependencies =
+  Parameters<typeof createCapabilityProtectedGatewayApp> extends [
+    unknown,
+    ...infer Dependencies,
+  ]
+    ? Dependencies
+    : never;
+
+function createGatewayApp(
+  ...dependencies: GatewayTestDependencies
+): FastifyInstance {
+  const app = createCapabilityProtectedGatewayApp(
+    { capability: TEST_GATEWAY_CAPABILITY },
+    ...dependencies,
+  );
+  const inject = app.inject.bind(app);
+  app.inject = ((
+    options?: InjectOptions | string,
+    callback?: LightMyRequestCallback,
+  ) => {
+    if (options === undefined) {
+      return inject();
+    }
+    const securedOptions: InjectOptions =
+      typeof options === "string"
+        ? {
+            method: "GET",
+            url: options,
+            headers: {
+              [GATEWAY_CAPABILITY_HEADER]: TEST_GATEWAY_CAPABILITY,
+            },
+          }
+        : {
+            ...options,
+            headers: {
+              ...options.headers,
+              [GATEWAY_CAPABILITY_HEADER]: TEST_GATEWAY_CAPABILITY,
+            },
+          };
+    if (callback) {
+      return inject(securedOptions, callback);
+    }
+    return inject(securedOptions);
+  }) as typeof app.inject;
+  return app;
+}
 
 function openSse(
   port: number,

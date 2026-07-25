@@ -2,6 +2,7 @@ import { Type, type Static } from "@sinclair/typebox";
 
 const UTC_ISO_TIMESTAMP =
   "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z$";
+const STABLE_ERROR_CODE = "^[A-Z][A-Z0-9_]{0,127}$";
 
 export const JOB_STATUSES = [
   "queued",
@@ -21,7 +22,7 @@ export const JobStatusSchema = Type.Union(
 
 export const JobErrorSchema = Type.Object(
   {
-    code: Type.String({ minLength: 1, maxLength: 128 }),
+    code: Type.String({ pattern: STABLE_ERROR_CODE }),
     params: Type.Record(
       Type.String(),
       Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Null()]),

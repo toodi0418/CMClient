@@ -3341,28 +3341,34 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn create_directory_link(target: &Path, link: &Path) -> bool {
-        std::os::unix::fs::symlink(target, link).unwrap();
-        true
+    fn create_directory_link(target: &Path, link: &Path) -> Result<(), String> {
+        std::os::unix::fs::symlink(target, link)
+            .map_err(|error| format!("directory symlink creation failed: {error}"))
     }
 
     #[cfg(windows)]
-    fn create_directory_link(target: &Path, link: &Path) -> bool {
-        Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "New-Item -ItemType Junction -Path $env:CMCLIENT_TEST_LINK -Target $env:CMCLIENT_TEST_TARGET | Out-Null",
-            ])
-            .env("CMCLIENT_TEST_LINK", link)
-            .env("CMCLIENT_TEST_TARGET", target)
+    fn create_directory_link(target: &Path, link: &Path) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+
+        let link = link.as_os_str().to_string_lossy().replace('/', "\\");
+        let target = target.as_os_str().to_string_lossy().replace('/', "\\");
+        let output = Command::new("cmd.exe")
+            .args(["/d", "/v:off", "/c"])
+            .raw_arg("\"mklink /J \"%CMCLIENT_TEST_LINK%\" \"%CMCLIENT_TEST_TARGET%\"\"")
+            .env("CMCLIENT_TEST_LINK", &link)
+            .env("CMCLIENT_TEST_TARGET", &target)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+            .output()
+            .map_err(|error| format!("junction command failed to start: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(format!(
+            "junction command exited with {}; stdout={:?}; stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 
     #[cfg(unix)]
@@ -3580,7 +3586,7 @@ mod tests {
 
     #[test]
     fn nested_directory_link_cannot_redirect_atomic_temp_cleanup() {
-        let (directory, request) = fixture("atomic-temp-directory-link");
+        let (directory, request) = fixture("atomic-temp-directory-link & shell");
         let nested_source = request.source_root.join("backups/nested");
         fs::create_dir(&nested_source).unwrap();
         fs::write(nested_source.join("two.sqlite"), b"nested-backup").unwrap();
@@ -3591,10 +3597,9 @@ mod tests {
         let external_temp = external.join(".two.sqlite.A1b2C3");
         fs::write(&external_temp, b"must-not-delete").unwrap();
         let nested_target = request.target_root.join("backups/nested");
-        assert!(
-            create_directory_link(&external, &nested_target),
-            "junction fixture must be created without elevation"
-        );
+        create_directory_link(&external, &nested_target).unwrap_or_else(|error| {
+            panic!("junction fixture must be created without elevation: {error}")
+        });
 
         assert_eq!(
             run_or_resume_product_migration(&request, &CopyMaintenance::working()),

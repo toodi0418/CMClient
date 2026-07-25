@@ -5,6 +5,8 @@ import { TypeCompiler } from "@sinclair/typebox/compiler";
 
 import {
   DomainEventSchema,
+  AgentEventSchema,
+  AgentLifecycleStatusSchema,
   ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
   JobDetailSchema,
@@ -18,6 +20,9 @@ import {
   PositionCanonicalEventSchema,
   PositionDecisionSchema,
   PositionObservationSchema,
+  SetupAcceptTermsRequestSchema,
+  SetupResetRequestSchema,
+  SetupStatusSchema,
   ProductIdentitySchema,
   ProductTargetSchema,
   ProxyStatusSchema,
@@ -406,6 +411,93 @@ describe("domain event contract", () => {
   });
 });
 
+describe("Agent setup and lifecycle contracts", () => {
+  it("makes recovery_required a canonical redacted setup phase", () => {
+    const check = TypeCompiler.Compile(SetupStatusSchema);
+    const recovery = {
+      schemaVersion: 1,
+      phase: "recovery_required",
+      setupRequired: true,
+      termsRequired: false,
+      credentialsRequired: false,
+      validating: false,
+      ready: false,
+      recoveryRequired: true,
+      reasonCode: "SETUP_RECOVERY_REQUIRED",
+    };
+
+    expect(check.Check(recovery)).toBe(true);
+    expect(check.Check({ ...recovery, setupGeneration: 42 })).toBe(false);
+    expect(check.Check({ ...recovery, apiKey: "must-not-leak" })).toBe(false);
+    expect(check.Check({ ...recovery, phase: "degraded" })).toBe(false);
+  });
+
+  it("binds setup commands without accepting credentials or hidden state", () => {
+    const terms = TypeCompiler.Compile(SetupAcceptTermsRequestSchema);
+    const reset = TypeCompiler.Compile(SetupResetRequestSchema);
+
+    expect(terms.Check({ termsVersion: "cmclient-2.0-terms-v1" })).toBe(true);
+    expect(
+      terms.Check({
+        termsVersion: "cmclient-2.0-terms-v1",
+        apiKey: "must-not-cross-this-contract",
+      }),
+    ).toBe(false);
+    expect(reset.Check({ confirmation: "operational_reset" })).toBe(true);
+    expect(reset.Check({ confirmation: true })).toBe(false);
+  });
+
+  it("keeps Agent setup, lifecycle, and update events in an Agent namespace", () => {
+    const lifecycle = {
+      schemaVersion: 1,
+      agent: "running",
+      gateway: "backoff",
+      managementWeb: "running",
+      managementWebUrl: "http://127.0.0.1:7080",
+      uptimeSeconds: 12,
+      latestErrorCode: "GATEWAY_START_FAILED",
+    };
+    expect(
+      TypeCompiler.Compile(AgentLifecycleStatusSchema).Check(lifecycle),
+    ).toBe(true);
+
+    const check = TypeCompiler.Compile(AgentEventSchema);
+    expect(
+      check.Check({
+        eventId: "agent:lifecycle:17",
+        schemaVersion: 1,
+        stream: "lifecycle",
+        type: "lifecycle.status",
+        occurredAt: "2026-07-25T00:00:00.000Z",
+        source: "agent",
+        payload: lifecycle,
+      }),
+    ).toBe(true);
+    expect(
+      check.Check({
+        eventId: "gateway-17",
+        schemaVersion: 1,
+        stream: "lifecycle",
+        type: "lifecycle.status",
+        occurredAt: "2026-07-25T00:00:00.000Z",
+        source: "agent",
+        payload: lifecycle,
+      }),
+    ).toBe(false);
+    expect(
+      check.Check({
+        eventId: "agent:setup:17",
+        schemaVersion: 1,
+        stream: "lifecycle",
+        type: "lifecycle.status",
+        occurredAt: "2026-07-25T00:00:00.000Z",
+        source: "agent",
+        payload: lifecycle,
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("job contract", () => {
   it("keeps API job state free of execution input", () => {
     const check = TypeCompiler.Compile(JobDetailSchema);
@@ -427,6 +519,16 @@ describe("job contract", () => {
         createdAt: "2026-07-18T00:00:00.000Z",
         updatedAt: "2026-07-18T00:00:01.000Z",
         input: { secret: "must-not-leak" },
+      }),
+    ).toBe(false);
+    expect(
+      check.Check({
+        id: "job-1",
+        type: "diagnostics.integrity_check",
+        status: "failed",
+        createdAt: "2026-07-18T00:00:00.000Z",
+        updatedAt: "2026-07-18T00:00:01.000Z",
+        error: { code: "INVALID CODE", params: {} },
       }),
     ).toBe(false);
   });

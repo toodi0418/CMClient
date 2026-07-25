@@ -122,6 +122,7 @@ export async function runGateway(): Promise<void> {
     const activeEvents = new DomainEventBus();
     events = activeEvents;
     const activeJobs = new JobEngine(activeDatabase.jobs, activeEvents, {
+      setupGeneration: bootstrap.setupGeneration,
       handlers: [
         {
           type: "diagnostics.integrity_check",

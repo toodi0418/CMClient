@@ -16,10 +16,11 @@ const GATEWAY_OWNERSHIP_PROTOCOL = "cmclient-bootstrap-ownership-v1";
 const GATEWAY_OWNERSHIP_DOMAIN = "cmclient.gateway.bootstrap-ownership.v1";
 
 export interface GatewayBootstrapFrame {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly type: "gateway.bootstrap";
   readonly startupNonce: string;
   readonly capability: string;
+  readonly setupGeneration: number;
   readonly callMeshApiKey?: string;
 }
 
@@ -54,7 +55,13 @@ export async function readGatewayBootstrap(
   deadlineMs = GATEWAY_BOOTSTRAP_DEADLINE_MS,
 ): Promise<GatewayBootstrapFrame> {
   const value = await readPrivateFrame(input, deadlineMs);
-  const exactKeys = ["capability", "schemaVersion", "startupNonce", "type"];
+  const exactKeys = [
+    "capability",
+    "schemaVersion",
+    "setupGeneration",
+    "startupNonce",
+    "type",
+  ];
   if (
     value !== null &&
     typeof value === "object" &&
@@ -67,10 +74,12 @@ export async function readGatewayBootstrap(
     throw new GatewayBootstrapError("GATEWAY_BOOTSTRAP_FRAME_INVALID");
   }
   if (
-    value.schemaVersion !== 1 ||
+    value.schemaVersion !== 2 ||
     value.type !== "gateway.bootstrap" ||
     !isLowerHex(value.startupNonce, 32) ||
     !isLowerHex(value.capability, 64) ||
+    !Number.isSafeInteger(value.setupGeneration) ||
+    (value.setupGeneration as number) < 1 ||
     (value.callMeshApiKey !== undefined &&
       !isCallMeshApiKey(value.callMeshApiKey))
   ) {

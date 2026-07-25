@@ -167,6 +167,9 @@ must be Argon2id version 19 with bounded memory, iteration, and lane parameters.
 The bounded in-memory audit projection records only timestamp, stable action,
 and stable outcome code, never addresses, credentials, cookies, tokens,
 payloads, identities, or locations.
+Setup reset and setup-generation rotation always add dedicated entries to this
+code-only Agent audit and structured log, including loopback-only deployments
+without a LAN authentication controller.
 
 Docker uses the same listener implementation but has no Native local-session
 bypass: starting its Web listener without the authenticated access controller
@@ -175,9 +178,13 @@ CIDR, exact Host, Origin, CSRF, rate, and TLS policies are otherwise identical.
 Stopping Web or changing its setup/session generation revokes sessions without
 disabling the separate local Control IPC.
 
-The Agent delivers a bounded memory-only bootstrap frame through the supervised
-Gateway's inherited private pipe; the frame carries the startup nonce,
-capability, and optional CallMesh key. The key is never placed in a
+The Agent delivers a bounded memory-only schema-version-2 bootstrap frame
+through the supervised Gateway's inherited private pipe; the frame carries the
+startup nonce, capability, current setup generation, and optional CallMesh key.
+The generation is positive and JavaScript-safe before the child can start. A
+stopped or backoff Supervisor reloads the current durable generation immediately
+before every start or restart, so a reset cannot reuse the generation captured
+when the Agent process was first constructed. The key is never placed in a
 secret-bearing environment value or returned in the ready frame.
 Gateway validates that frame, atomically binds `127.0.0.1:0`, and returns the
 OS-assigned port, child PID, and nonce through the same private channel.

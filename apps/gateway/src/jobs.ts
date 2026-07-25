@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { JobDetail, JobError, JobStatus } from "@cmclient/contracts";
+import PQueue from "p-queue";
 
 import { DomainEventBus } from "./events.js";
 import { type JobRepository, type StoredJob } from "./persistence/database.js";
@@ -48,6 +49,7 @@ export interface JobEngineOptions {
   idFactory?: () => string;
   maximumConcurrency?: number;
   maximumQueuedJobs?: number;
+  setupGeneration?: number | (() => number);
   shutdownTimeoutMs?: number;
 }
 
@@ -60,6 +62,9 @@ export interface JobEngineScheduleSnapshot {
 
 interface ScheduledJob {
   completion: Promise<void>;
+  dispatchController: AbortController;
+  executionController: AbortController;
+  started: boolean;
   correlationId?: string;
   resolve: () => void;
 }
@@ -70,12 +75,10 @@ export class JobEngine {
   private readonly idFactory: () => string;
   private readonly maximumConcurrency: number;
   private readonly maximumQueuedJobs: number;
+  private readonly setupGeneration: () => number;
   private readonly shutdownTimeoutMs: number;
-  private readonly controllers = new Map<string, AbortController>();
+  private readonly dispatch: PQueue;
   private readonly scheduled = new Map<string, ScheduledJob>();
-  private readonly activePromises = new Set<Promise<void>>();
-  private readonly queue: string[] = [];
-  private activeExecutions = 0;
   private stopping = false;
   private stopPromise: Promise<void> | undefined;
 
@@ -88,6 +91,11 @@ export class JobEngine {
     this.idFactory = options.idFactory ?? randomUUID;
     this.maximumConcurrency = options.maximumConcurrency ?? 2;
     this.maximumQueuedJobs = options.maximumQueuedJobs ?? 1_024;
+    const configuredSetupGeneration = options.setupGeneration;
+    this.setupGeneration =
+      typeof configuredSetupGeneration === "function"
+        ? configuredSetupGeneration
+        : () => configuredSetupGeneration ?? 1;
     this.shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     if (
@@ -103,6 +111,8 @@ export class JobEngine {
     ) {
       throw new JobConfigurationError();
     }
+    this.currentSetupGeneration();
+    this.dispatch = new PQueue({ concurrency: this.maximumConcurrency });
     for (const definition of options.handlers ?? []) {
       if (
         !JOB_TYPE.test(definition.type) ||
@@ -130,10 +140,12 @@ export class JobEngine {
     ) {
       throw new JobInputError();
     }
+    const setupGeneration = this.currentSetupGeneration();
     if (submission.idempotencyKey) {
       const existing = this.repository.findByIdempotency(
         submission.type,
         submission.idempotencyKey,
+        setupGeneration,
       );
       if (existing) {
         if (
@@ -157,6 +169,7 @@ export class JobEngine {
       id: jobId,
       type: submission.type,
       input: cloneRecord(submission.input),
+      setupGeneration,
       ...(submission.idempotencyKey
         ? { idempotencyKey: submission.idempotencyKey }
         : {}),
@@ -183,6 +196,10 @@ export class JobEngine {
     if (!current || TERMINAL_STATUSES.has(current.status)) {
       return current ? toJobDetail(current) : undefined;
     }
+    if (current.status === "cancelling") {
+      this.scheduled.get(jobId)?.executionController.abort();
+      return toJobDetail(current);
+    }
     const nextStatus: JobStatus =
       current.status === "queued" ? "cancelled" : "cancelling";
     const updated = this.repository.transition(
@@ -194,15 +211,20 @@ export class JobEngine {
         cancelRequested: true,
         ...(nextStatus === "cancelled" ? { completedAt: this.now() } : {}),
       },
+      current.setupGeneration,
     );
     if (!updated) {
-      return undefined;
+      const latest = this.repository.find(jobId);
+      return latest ? toJobDetail(latest) : undefined;
     }
-    if (updated.status !== current.status) {
+    const scheduled = this.scheduled.get(jobId);
+    try {
       this.publish("job.status_changed", updated, correlationId);
-      this.controllers.get(jobId)?.abort();
+    } finally {
       if (updated.status === "cancelled") {
-        this.removeQueued(jobId);
+        scheduled?.dispatchController.abort();
+      } else {
+        scheduled?.executionController.abort();
       }
     }
     return toJobDetail(updated);
@@ -211,6 +233,19 @@ export class JobEngine {
   recover(): void {
     if (this.stopping) {
       throw new JobEngineStoppedError();
+    }
+    const setupGeneration = this.currentSetupGeneration();
+    while (true) {
+      const staleQueued = this.repository.findQueuedOutsideGeneration(
+        setupGeneration,
+        1_000,
+      );
+      if (staleQueued.length === 0) {
+        break;
+      }
+      for (const job of staleQueued) {
+        this.stale(job);
+      }
     }
     const interruptedStatuses = [
       "running",
@@ -227,18 +262,13 @@ export class JobEngine {
         break;
       }
       for (const job of interrupted) {
-        const failed = this.repository.transition(
-          job.id,
-          [job.status],
-          "failed",
-          this.now(),
-          {
-            completedAt: this.now(),
-            error: { code: "JOB_INTERRUPTED_BY_RESTART", params: {} },
-          },
-        );
-        if (failed) {
-          this.publish("job.status_changed", failed);
+        if (job.setupGeneration !== setupGeneration) {
+          this.stale(job);
+        } else {
+          this.fail(job, {
+            code: "JOB_INTERRUPTED_BY_RESTART",
+            params: {},
+          });
         }
       }
     }
@@ -251,13 +281,10 @@ export class JobEngine {
   }
 
   async drain(): Promise<void> {
-    while (this.activePromises.size > 0 || this.scheduled.size > 0) {
-      const pending = [
-        ...this.activePromises,
-        ...[...this.scheduled.values()].map((scheduled) =>
-          scheduled.completion.then(() => undefined),
-        ),
-      ];
+    while (this.scheduled.size > 0) {
+      const pending = [...this.scheduled.values()].map((scheduled) =>
+        scheduled.completion.then(() => undefined),
+      );
       if (pending.length === 0) {
         return;
       }
@@ -270,35 +297,36 @@ export class JobEngine {
       return this.stopPromise;
     }
     this.stopping = true;
+    this.dispatch.pause();
     this.stopPromise = Promise.resolve().then(() => this.stopAndDrain());
     return this.stopPromise;
   }
 
   private async stopAndDrain(): Promise<void> {
-    const queued = this.queue.splice(0);
-    for (const jobId of queued) {
-      const scheduled = this.scheduled.get(jobId);
-      this.scheduled.delete(jobId);
-      scheduled?.resolve();
-    }
-    for (const [jobId, controller] of [...this.controllers]) {
-      try {
-        this.cancel(jobId);
-      } catch {
-        // Shutdown still aborts and drains when cancellation persistence fails.
-      } finally {
-        controller.abort();
+    for (const [jobId, scheduled] of [...this.scheduled]) {
+      if (!scheduled.started) {
+        scheduled.dispatchController.abort();
+        continue;
       }
+      const job = this.repository.find(jobId);
+      if (job && !TERMINAL_STATUSES.has(job.status)) {
+        try {
+          this.cancel(jobId);
+        } catch {
+          // Shutdown still aborts and drains when cancellation persistence fails.
+        }
+      }
+      scheduled.executionController.abort();
     }
     await withDeadline(this.drain(), this.shutdownTimeoutMs);
   }
 
   get scheduleSnapshot(): JobEngineScheduleSnapshot {
     return {
-      active: this.activeExecutions,
+      active: this.dispatch.pending,
       maximumConcurrency: this.maximumConcurrency,
       maximumQueuedJobs: this.maximumQueuedJobs,
-      queued: this.queue.length,
+      queued: this.dispatch.size,
     };
   }
 
@@ -310,38 +338,28 @@ export class JobEngine {
     const completion = new Promise<void>((complete) => {
       resolve = complete;
     });
-    this.scheduled.set(jobId, {
+    const dispatchController = new AbortController();
+    const executionController = new AbortController();
+    const scheduled: ScheduledJob = {
       completion,
+      dispatchController,
+      executionController,
+      started: false,
       ...(correlationId ? { correlationId } : {}),
       resolve,
-    });
-    this.queue.push(jobId);
-    this.drainQueue();
-  }
-
-  private drainQueue(): void {
-    while (
-      !this.stopping &&
-      this.activeExecutions < this.maximumConcurrency &&
-      this.queue.length > 0
-    ) {
-      const jobId = this.queue.shift();
-      if (!jobId) {
-        continue;
-      }
-      const scheduled = this.scheduled.get(jobId);
-      if (!scheduled) {
-        continue;
-      }
-      this.activeExecutions += 1;
-      const execution = this.runScheduled(jobId, scheduled).catch(
-        () => undefined,
-      );
-      this.activePromises.add(execution);
-      void execution.then(() => {
-        this.activePromises.delete(execution);
-      });
-    }
+    };
+    this.scheduled.set(jobId, scheduled);
+    const execution = this.dispatch.add(
+      () => {
+        scheduled.started = true;
+        return this.runScheduled(jobId, scheduled);
+      },
+      { id: jobId, signal: dispatchController.signal },
+    );
+    void execution.then(
+      () => this.completeScheduled(jobId, scheduled),
+      () => this.completeScheduled(jobId, scheduled),
+    );
   }
 
   private async runScheduled(
@@ -349,38 +367,33 @@ export class JobEngine {
     scheduled: ScheduledJob,
   ): Promise<void> {
     try {
-      await this.execute(jobId, scheduled.correlationId);
+      await this.execute(
+        jobId,
+        scheduled.executionController.signal,
+        scheduled.correlationId,
+      );
     } catch (error) {
       this.handleUnexpectedExecutionFailure(
         jobId,
         error,
         scheduled.correlationId,
       );
-    } finally {
-      this.activeExecutions -= 1;
-      this.scheduled.delete(jobId);
-      scheduled.resolve();
-      if (!this.stopping) {
-        this.drainQueue();
-        try {
-          this.refillQueue();
-        } catch {
-          // A later submission or recovery pass can refill after persistence recovers.
-        }
-      }
     }
   }
 
-  private removeQueued(jobId: string): void {
-    const index = this.queue.indexOf(jobId);
-    if (index === -1) {
+  private completeScheduled(jobId: string, scheduled: ScheduledJob): void {
+    if (this.scheduled.get(jobId) !== scheduled) {
       return;
     }
-    this.queue.splice(index, 1);
-    const scheduled = this.scheduled.get(jobId);
     this.scheduled.delete(jobId);
-    scheduled?.resolve();
-    this.refillQueue();
+    scheduled.resolve();
+    if (!this.stopping) {
+      try {
+        this.refillQueue();
+      } catch {
+        // A later submission or recovery pass can refill after persistence recovers.
+      }
+    }
   }
 
   private refillQueue(): void {
@@ -394,7 +407,8 @@ export class JobEngine {
     }
     const candidates = this.repository.findQueuedByTypes(
       [...this.handlers.keys()],
-      Math.min(20_000, this.queue.length + available),
+      Math.min(20_000, this.dispatch.size + available),
+      this.currentSetupGeneration(),
     );
     for (const candidate of candidates) {
       if (!this.hasScheduleCapacity()) {
@@ -422,6 +436,10 @@ export class JobEngine {
       if (!current || TERMINAL_STATUSES.has(current.status)) {
         return;
       }
+      if (!this.isCurrentSetupGeneration(current)) {
+        this.stale(current, correlationId);
+        return;
+      }
       if (current.cancelRequested) {
         this.cancelled(current, correlationId);
         return;
@@ -432,9 +450,20 @@ export class JobEngine {
     }
   }
 
-  private async execute(jobId: string, correlationId?: string): Promise<void> {
+  private async execute(
+    jobId: string,
+    signal: AbortSignal,
+    correlationId?: string,
+  ): Promise<void> {
     const queued = this.repository.find(jobId);
     if (!queued || queued.status !== "queued") {
+      return;
+    }
+    if (this.stopping) {
+      return;
+    }
+    if (!this.isCurrentSetupGeneration(queued)) {
+      this.stale(queued, correlationId);
       return;
     }
     const handler = this.handlers.get(queued.type);
@@ -452,21 +481,31 @@ export class JobEngine {
       "running",
       this.now(),
       { startedAt: this.now() },
+      queued.setupGeneration,
     );
     if (!running || running.status !== "running") {
       return;
     }
     this.publish("job.status_changed", running, correlationId);
-    const controller = new AbortController();
-    this.controllers.set(running.id, controller);
     try {
       const result = await handler({
         job: running,
-        signal: controller.signal,
-        isCancellationRequested: () =>
-          this.repository.find(running.id)?.cancelRequested ?? true,
+        signal,
+        isCancellationRequested: () => {
+          const current = this.repository.find(running.id);
+          return (
+            !current ||
+            this.stopping ||
+            current.cancelRequested ||
+            !this.isCurrentSetupGeneration(current)
+          );
+        },
         throwIfCancellationRequested: () => {
-          if (this.repository.find(running.id)?.cancelRequested) {
+          const current = this.repository.find(running.id);
+          if (!current || !this.isCurrentSetupGeneration(current)) {
+            throw new JobGenerationStaleError();
+          }
+          if (this.stopping || current.cancelRequested) {
             throw new JobCancelledError();
           }
         },
@@ -475,7 +514,11 @@ export class JobEngine {
       if (!current) {
         return;
       }
-      if (current.cancelRequested) {
+      if (!this.isCurrentSetupGeneration(current)) {
+        this.stale(current, correlationId);
+        return;
+      }
+      if (this.stopping || current.cancelRequested) {
         this.cancelled(current, correlationId);
         return;
       }
@@ -488,6 +531,7 @@ export class JobEngine {
           completedAt: this.now(),
           ...(result ? { result: cloneRecord(result) } : {}),
         },
+        running.setupGeneration,
       );
       if (succeeded) {
         this.publish("job.status_changed", succeeded, correlationId);
@@ -497,13 +541,22 @@ export class JobEngine {
       if (!current) {
         return;
       }
-      if (current.cancelRequested || error instanceof JobCancelledError) {
+      if (
+        error instanceof JobGenerationStaleError ||
+        !this.isCurrentSetupGeneration(current)
+      ) {
+        this.stale(current, correlationId);
+        return;
+      }
+      if (
+        this.stopping ||
+        current.cancelRequested ||
+        error instanceof JobCancelledError
+      ) {
         this.cancelled(current, correlationId);
         return;
       }
       this.fail(current, toJobError(error), correlationId);
-    } finally {
-      this.controllers.delete(running.id);
     }
   }
 
@@ -514,6 +567,7 @@ export class JobEngine {
       "cancelled",
       this.now(),
       { completedAt: this.now(), cancelRequested: true },
+      job.setupGeneration,
     );
     if (cancelled) {
       this.publish("job.status_changed", cancelled, correlationId);
@@ -527,10 +581,19 @@ export class JobEngine {
       "failed",
       this.now(),
       { completedAt: this.now(), error },
+      job.setupGeneration,
     );
     if (failed) {
       this.publish("job.status_changed", failed, correlationId);
     }
+  }
+
+  private stale(job: StoredJob, correlationId?: string): void {
+    this.fail(
+      job,
+      { code: "JOB_SETUP_GENERATION_STALE", params: {} },
+      correlationId,
+    );
   }
 
   private publish(
@@ -548,6 +611,18 @@ export class JobEngine {
 
   private now(): string {
     return this.clock().toISOString();
+  }
+
+  private currentSetupGeneration(): number {
+    const setupGeneration = this.setupGeneration();
+    if (!Number.isSafeInteger(setupGeneration) || setupGeneration < 1) {
+      throw new JobConfigurationError();
+    }
+    return setupGeneration;
+  }
+
+  private isCurrentSetupGeneration(job: StoredJob): boolean {
+    return job.setupGeneration === this.currentSetupGeneration();
   }
 }
 
@@ -609,6 +684,10 @@ export class JobCancelledError extends Error {
   readonly code = "JOB_CANCELLED";
 }
 
+export class JobGenerationStaleError extends Error {
+  readonly code = "JOB_SETUP_GENERATION_STALE";
+}
+
 function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
   if (!value || Array.isArray(value)) {
     throw new JobInputError();
@@ -628,9 +707,12 @@ function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
 }
 
 function toJobError(error: unknown): JobError {
-  return error instanceof Error && "code" in error
-    ? { code: String(error.code), params: {} }
-    : { code: "JOB_EXECUTION_FAILED", params: {} };
+  const code =
+    error instanceof Error && "code" in error ? String(error.code) : "";
+  return {
+    code: /^[A-Z][A-Z0-9_]{0,127}$/.test(code) ? code : "JOB_EXECUTION_FAILED",
+    params: {},
+  };
 }
 
 export function toJobDetail(job: StoredJob): JobDetail {

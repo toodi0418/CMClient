@@ -21,7 +21,7 @@ export const DomainEventSchema = Type.Object(
     correlationId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
     payload: Type.Record(Type.String(), Type.Unknown()),
   },
-  { additionalProperties: false },
+  { $id: "DomainEvent", additionalProperties: false },
 );
 
 export const DomainEventListSchema = Type.Object(

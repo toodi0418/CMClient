@@ -59,6 +59,29 @@ Gateway domain/Job SSE and Agent-owned setup, lifecycle, and update SSE use
 separate route namespaces, event-ID spaces, and replay stores. A
 `Last-Event-ID` value is meaningful only within the namespace that issued it.
 
+The three Agent streams are `/api/v1/setup/events`,
+`/api/v1/lifecycle/events`, and `/api/v1/updates/events`. Axum owns their SSE
+framing and 15-second heartbeat. Their IDs are respectively
+`agent:setup:*`, `agent:lifecycle:*`, and `agent:update:*`; each namespace has
+an exact route-specific TypeBox/OpenAPI event schema, independent 64-event
+process-local journal, and 32-subscriber cap. Cross-namespace event IDs are
+invalid even when the rest of an envelope is well formed. A new
+subscriber receives the latest projection immediately. A known cursor replays
+the retained events after it; an unknown, expired, restarted-process, or
+foreign-namespace cursor receives the latest projection so the client can
+resynchronize. A lagged broadcast receiver is closed and must reconnect. Agent
+events and public status omit setup generation, secrets, configuration,
+credentials, and identity.
+
+Agent records `AGENT_SSE_SLOW_CONSUMER` without an event ID or payload before a
+lagged stream closes. Subscriber permits are released when the HTTP body is
+dropped, including error closure. Gateway process crash, backoff, restart, and
+route publication update lifecycle status/SSE directly from the background
+supervisor; they do not wait for an unrelated CLI or Control status request.
+The worker also refreshes the lifecycle snapshot once per second so Web uptime
+advances and a running process whose private health route fails becomes
+`degraded` without requiring another command.
+
 Each bounded retention cycle emits `telemetry.retention.completed`. Its payload
 reports `deleted` telemetry rows, `observationsDeleted` orphan observations,
 `messagesDeleted`, `terminalJobsDeleted`, `sentAprsOutboxDeleted`,
