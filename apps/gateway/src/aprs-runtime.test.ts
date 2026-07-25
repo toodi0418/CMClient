@@ -160,6 +160,95 @@ describe("AprsGatewayRuntime", () => {
     database.close();
   });
 
+  it("drops a terminated monitor session and reconnects with the same filter", async () => {
+    const database = new GatewayDatabase(":memory:");
+    database.callmeshMappings.replace([
+      mapping("fixture-network-a", 42, "N0CALL-7"),
+    ]);
+    const terminations = [deferred<void>(), deferred<void>()];
+    const filters: string[] = [];
+    let connections = 0;
+    let closes = 0;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: new DomainEventBus({ eventIdFactory: sequentialFactory() }),
+      outbox: { flush: async () => [] },
+      monitorRefreshIntervalMs: 100,
+      monitorClientFactory: (filter) => ({
+        connect: async () => {
+          const index = connections;
+          connections += 1;
+          filters.push(filter);
+          return {
+            close: async () => {
+              closes += 1;
+            },
+            terminated: terminations[index]!.promise,
+          } as AprsIsRxSession;
+        },
+      }),
+    });
+
+    await runtime.refreshMonitor();
+    expect(connections).toBe(1);
+    terminations[0]!.resolve();
+    await Promise.resolve();
+    expect(connections).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    await waitFor(() => connections === 2);
+
+    expect(filters).toEqual(["b/N0CALL-7", "b/N0CALL-7"]);
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "connected",
+      mappedCallsigns: 1,
+    });
+
+    await runtime.stop();
+    expect(closes).toBe(1);
+    database.close();
+  });
+
+  it("bounds repeated monitor termination retries and cancels them on stop", async () => {
+    vi.useFakeTimers();
+    const database = new GatewayDatabase(":memory:");
+    try {
+      database.callmeshMappings.replace([
+        mapping("fixture-network-a", 42, "N0CALL-7"),
+      ]);
+      let connections = 0;
+      const runtime = new AprsGatewayRuntime({
+        database,
+        eventBus: new DomainEventBus({ eventIdFactory: sequentialFactory() }),
+        outbox: { flush: async () => [] },
+        monitorRefreshIntervalMs: 1_000,
+        monitorClientFactory: () => ({
+          connect: async () => {
+            connections += 1;
+            return {
+              close: async () => undefined,
+              terminated: Promise.resolve(),
+            };
+          },
+        }),
+      });
+
+      await runtime.refreshMonitor();
+      await Promise.resolve();
+      expect(connections).toBe(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(connections).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(connections).toBe(2);
+
+      await runtime.stop();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(connections).toBe(2);
+    } finally {
+      database.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("fails closed when one callsign maps to more than one node", async () => {
     const database = new GatewayDatabase(":memory:");
     database.callmeshMappings.replace([

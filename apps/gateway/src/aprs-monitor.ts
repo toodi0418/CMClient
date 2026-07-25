@@ -14,6 +14,7 @@ const APRS_LOCAL_TX_TTL_MS = 30_000;
 const MAX_APRS_LINE_BYTES = 512;
 const MAX_APRS_BUFFER_BYTES = 1_024;
 const APRS_CALLSIGN_PATTERN = /^[A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?$/;
+const APRS_LOGIN_CALLSIGN_PATTERN = /^[A-Z0-9]{1,6}(?:-[A-Z0-9]{1,2})?$/;
 
 export interface AprsMonitorTarget {
   callsign: string;
@@ -42,6 +43,7 @@ export interface AprsMonitorResult {
 
 export interface AprsIsRxSession {
   close(): Promise<void>;
+  terminated?: Promise<void>;
 }
 
 export class AprsMonitorError extends Error {
@@ -303,6 +305,7 @@ export class AprsIsRxClient {
       }
       socket.unref();
       return {
+        terminated: reader.terminated,
         close: async () => {
           reader.beginClose();
           await closeSocket(
@@ -440,7 +443,7 @@ function authorizationCallsign(
   const match = /^user\s+([^\s]+)\s+pass\s+[^\s]+(?:\s|$)/.exec(
     authorization.loginLine,
   );
-  if (!match || !APRS_CALLSIGN_PATTERN.test(match[1]!)) {
+  if (!match || !APRS_LOGIN_CALLSIGN_PATTERN.test(match[1]!)) {
     throw new AprsMonitorAuthorizationError();
   }
   return match[1]!;
@@ -467,7 +470,7 @@ function parseLogresp(
   }
   const match =
     /^#\s*logresp\s+([^\s,]+)\s+(verified|unverified)(?:[\s,]|$)/i.exec(line);
-  if (!match || !APRS_CALLSIGN_PATTERN.test(match[1]!)) {
+  if (!match || !APRS_LOGIN_CALLSIGN_PATTERN.test(match[1]!)) {
     return "malformed";
   }
   return {
@@ -482,7 +485,11 @@ function attachVerifiedLineReader(
   timeoutMs: number,
   onLine: (line: string) => void,
   onLineError: (error: unknown) => void,
-): { verified: Promise<void>; beginClose: () => void } {
+): {
+  verified: Promise<void>;
+  terminated: Promise<void>;
+  beginClose: () => void;
+} {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
   let state: "awaiting" | "verified" | "failed" | "closing" = "awaiting";
@@ -492,6 +499,17 @@ function attachVerifiedLineReader(
     resolveVerified = resolve;
     rejectVerified = reject;
   });
+  let resolveTerminated!: () => void;
+  const terminated = new Promise<void>((resolve) => {
+    resolveTerminated = resolve;
+  });
+  let terminationSettled = false;
+  const markTerminated = () => {
+    if (!terminationSettled) {
+      terminationSettled = true;
+      resolveTerminated();
+    }
+  };
   void verified.catch(() => undefined);
   const fail = (error = new AprsMonitorError()) => {
     if (state === "failed" || state === "closing") {
@@ -509,6 +527,7 @@ function attachVerifiedLineReader(
         // Consumer reporting must not escape a socket callback.
       }
     }
+    markTerminated();
     socket.destroy();
   };
   const processLine = (line: string) => {
@@ -578,12 +597,14 @@ function attachVerifiedLineReader(
   socket.on("close", () => fail());
   return {
     verified,
+    terminated,
     beginClose: () => {
       if (state === "awaiting") {
         rejectVerified(new AprsMonitorError());
       }
       state = "closing";
       clearTimeout(timer);
+      markTerminated();
     },
   };
 }

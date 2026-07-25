@@ -48,8 +48,11 @@ proof survives outbox retention and blocks re-enqueue after a mapping-version
 rotation. Active entries are never age-retention candidates; only queued or
 failed entries with durable supersession proof are removed.
 
-The client writes exactly two CRLF-terminated lines per connection: the
-configured APRS-IS login followed by the deterministic APRS Data line. Both
-inputs reject CR/LF injection. Gateway-specific path information and every
-local observation attribute stay outside the stored Data and never alter the
-canonical APRS payload.
+The client keeps one provision-scoped persistent TX connection. It writes one
+CRLF-terminated canonical iGate login, waits for the exact matching verified
+`logresp`, and may then write deterministic APRS Data lines until the socket or
+provision generation changes. Both login and Data reject CR/LF injection.
+Gateway-specific path information and every local observation attribute stay
+outside the stored Data and never alter the canonical APRS payload. The
+separate buddy-filter monitor uses the deterministic `<callsignBase>-CM` login;
+it is never a packet source or path component.

@@ -7,6 +7,7 @@ import { AprsGatewayRuntime } from "./aprs-runtime.js";
 import {
   connectionAuthorization,
   deriveAprsRuntimeState,
+  observerConnectionAuthorization,
   type AprsRuntimeState,
 } from "./aprs-identity.js";
 import type { CallMeshAprsState } from "./callmesh.js";
@@ -289,6 +290,8 @@ export function createConfiguredAprsGatewayRuntime(
   }
   const stateProvider = createAprsRuntimeStateProvider(aprsStateProvider);
   const authorizationProvider = connectionAuthorization(stateProvider);
+  const monitorAuthorizationProvider =
+    observerConnectionAuthorization(stateProvider);
   const { host, port, timeoutMs } = parseAprsEndpointOptions(environment);
   const worker = new AprsOutboxWorker(
     database.aprsOutbox,
@@ -315,7 +318,7 @@ export function createConfiguredAprsGatewayRuntime(
         new AprsIsRxClient({
           host,
           port,
-          authorizationProvider,
+          authorizationProvider: monitorAuthorizationProvider,
           provisionFingerprint: provisionFingerprint ?? "",
           filterExpression,
           timeoutMs,

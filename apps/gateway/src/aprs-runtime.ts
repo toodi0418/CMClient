@@ -67,6 +67,7 @@ export class AprsGatewayRuntime {
   private readonly monitorRefreshIntervalMs: number;
   private flushTimer: NodeJS.Timeout | undefined;
   private monitorTimer: NodeJS.Timeout | undefined;
+  private monitorReconnectTimer: NodeJS.Timeout | undefined;
   private monitorSession: AprsIsRxSession | undefined;
   private monitorToken: object | undefined;
   private monitorConfigurationKey: string | undefined;
@@ -140,6 +141,7 @@ export class AprsGatewayRuntime {
       clearInterval(this.monitorTimer);
       this.monitorTimer = undefined;
     }
+    this.clearMonitorReconnectTimer();
     const session = this.monitorSession;
     this.monitorSession = undefined;
     this.monitorToken = undefined;
@@ -401,6 +403,8 @@ export class AprsGatewayRuntime {
       }
       this.monitorSession = session;
       this.monitorConfigurationKey = earlyConfigurationKey;
+      this.clearMonitorReconnectTimer();
+      this.watchMonitorTermination(session, generation, token);
       if (callbackFailed) {
         return;
       }
@@ -512,6 +516,68 @@ export class AprsGatewayRuntime {
     } catch {
       // Keep authorization invalidation contained to the socket callback.
     }
+  }
+
+  private watchMonitorTermination(
+    session: AprsIsRxSession,
+    generation: number,
+    token: object,
+  ): void {
+    if (!session.terminated) {
+      return;
+    }
+    void session.terminated.then(
+      () => this.handleMonitorTermination(session, generation, token),
+      () => this.handleMonitorTermination(session, generation, token),
+    );
+  }
+
+  private handleMonitorTermination(
+    session: AprsIsRxSession,
+    generation: number,
+    token: object,
+  ): void {
+    if (
+      !this.isGenerationActive(generation) ||
+      this.monitorToken !== token ||
+      this.monitorSession !== session
+    ) {
+      return;
+    }
+    this.monitorSession = undefined;
+    this.monitorToken = undefined;
+    this.monitorConfigurationKey = undefined;
+    this.monitorStatus = "error";
+    this.lastErrorCode = "APRS_MONITOR_CONNECTION_LOST";
+    try {
+      this.publish("aprs.monitor.error", { code: this.lastErrorCode });
+    } catch {
+      // This callback runs from a socket lifecycle promise.
+    }
+    this.scheduleMonitorReconnect();
+  }
+
+  private scheduleMonitorReconnect(): void {
+    if (this.lifecycleStopped || this.monitorReconnectTimer) {
+      return;
+    }
+    this.monitorReconnectTimer = setTimeout(() => {
+      this.monitorReconnectTimer = undefined;
+      try {
+        void this.refreshMonitor().catch(() => undefined);
+      } catch {
+        // Keep reconnect scheduling contained to the timer callback.
+      }
+    }, this.monitorRefreshIntervalMs);
+    this.monitorReconnectTimer.unref();
+  }
+
+  private clearMonitorReconnectTimer(): void {
+    if (!this.monitorReconnectTimer) {
+      return;
+    }
+    clearTimeout(this.monitorReconnectTimer);
+    this.monitorReconnectTimer = undefined;
   }
 
   private setProvisionUnavailable(): void {

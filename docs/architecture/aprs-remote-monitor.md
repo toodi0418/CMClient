@@ -1,18 +1,17 @@
 # APRS-IS Remote High-Water Monitoring
 
 Each iGate independently subscribes with an APRS-IS buddy filter made only from
-its mapped APRS callsigns. Incoming data is accepted for collaboration only
-when it has a mapped source callsign, a valid uncompressed timestamped position,
-and a trailing `CM2/<12 lowercase hex>` deterministic marker. The monitor does
-not trust receive time as source event time and ignores malformed, unmapped, or
-stale data.
+its mapped APRS callsigns. TX uses the provision's canonical iGate callsign.
+The separate receive-only monitor derives the provision-scoped login
+`<callsignBase>-CM`, using the same base-callsign passcode. This distinct
+APRS-IS client identity never enters APRS Data, the iGate path, mapping state,
+or public status.
 
-APRS `DDHHMMz` timestamps have no year, month, or seconds. The monitor resolves
-them against the receiving time's adjacent months and rejects candidates more
-than 36 hours away. Stored remote time is therefore minute-precise. A local
-event can proceed after a remote marker only when it is the same deterministic
-marker in that minute, or its trusted event time is at least the following
-minute. Any event without a trustworthy time remains blocked.
+Incoming data is accepted for collaboration only when it has a mapped source
+callsign and a valid Legacy-compatible untimestamped `!` position. The monitor
+persists exact source-plus-information observations for three hours and exact
+local transmissions for 30 seconds. Receive time is observation metadata only;
+it never establishes source-event order. Malformed or unmapped data is ignored.
 
 The outbox repeats this comparison inside its final synchronous authorization
 transaction immediately before transport I/O. This closes the interval between
@@ -26,6 +25,9 @@ runtime moves to `error` with `APRS_MONITOR_PERSISTENCE_FAILED` or the generic
 `APRS_MONITOR_CALLBACK_FAILED` while retaining the session. A later valid
 observation that completes successfully restores `connected`, so one bad
 callback neither crashes Gateway nor permanently disables remote ordering.
+Socket error, EOF, or close instead terminates the session, clears its connected
+state, and starts a fresh verified login and filter restore. A dead session is
+never relabelled `connected` by the periodic refresh loop.
 
 Remote records live in `aprs_remote_high_water`, keyed by Mesh network, node,
 callsign, and mapping version. They intentionally do not write a synthetic

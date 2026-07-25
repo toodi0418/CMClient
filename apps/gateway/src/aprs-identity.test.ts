@@ -4,6 +4,8 @@ import {
   AprsRuntimeIdentityError,
   deriveAprsPasscode,
   deriveAprsRuntimeIdentity,
+  deriveAprsRuntimeState,
+  observerConnectionAuthorization,
 } from "./aprs-identity";
 
 const baseProvision = {
@@ -43,6 +45,20 @@ describe("CallMesh provision APRS identity", () => {
       callsign: "TEST01",
       ssid: 0,
       passcode: 17_602,
+    });
+  });
+
+  it("derives a provision-scoped observer login distinct from the TX identity", () => {
+    const state = deriveAprsRuntimeState({
+      provision: baseProvision,
+      provisionFingerprint: "a".repeat(64),
+      mappings: [],
+      mappingsFingerprint: "b".repeat(64),
+    });
+
+    expect(observerConnectionAuthorization(() => state)()).toEqual({
+      loginLine: "user TEST01-CM pass 17602 vers CMClient 2.0",
+      provisionFingerprint: "a".repeat(64),
     });
   });
 

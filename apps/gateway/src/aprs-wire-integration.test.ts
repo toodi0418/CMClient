@@ -21,12 +21,21 @@ describe("APRS verified wire integration", () => {
   it("sends legacy qAO Data only after logresp and observes the same source plus Info", async () => {
     const sockets = new Set<Socket>();
     const verified = new WeakSet<Socket>();
+    const activeLogins = new Set<string>();
+    const loginBySocket = new WeakMap<Socket, string>();
+    const loginLines: string[] = [];
     let observerSocket: Socket | undefined;
     let transmittedLine: string | undefined;
     let dataBeforeVerification = false;
     const server = net.createServer((socket) => {
       sockets.add(socket);
-      socket.on("close", () => sockets.delete(socket));
+      socket.on("close", () => {
+        sockets.delete(socket);
+        const login = loginBySocket.get(socket);
+        if (login) {
+          activeLogins.delete(login);
+        }
+      });
       let buffer = "";
       socket.on("data", (chunk: Buffer) => {
         buffer += chunk.toString("utf8");
@@ -34,12 +43,20 @@ describe("APRS verified wire integration", () => {
         buffer = lines.pop() ?? "";
         for (const line of lines.filter(Boolean)) {
           if (line.startsWith("user ")) {
+            const callsign = /^user\s+([^\s]+)/.exec(line)?.[1];
+            if (!callsign || activeLogins.has(callsign)) {
+              socket.end();
+              continue;
+            }
+            activeLogins.add(callsign);
+            loginBySocket.set(socket, callsign);
+            loginLines.push(line);
             if (line.includes(" filter ")) {
               observerSocket = socket;
             }
             setTimeout(() => {
               verified.add(socket);
-              socket.write("# logresp TEST01 verified, integration\r\n");
+              socket.write(`# logresp ${callsign} verified, integration\r\n`);
             }, 20);
             continue;
           }
@@ -49,9 +66,11 @@ describe("APRS verified wire integration", () => {
           transmittedLine = line;
           const separator = line.indexOf(":");
           const source = line.slice(0, line.indexOf(">"));
-          observerSocket?.write(
-            `${source}>APTMAG,TCPIP*,qAC,TEST01:${line.slice(separator + 1)}\r\n`,
-          );
+          if (observerSocket && observerSocket !== socket) {
+            observerSocket.write(
+              `${source}>APTMAG,MESHD*,qAO,TEST01:${line.slice(separator + 1)}\r\n`,
+            );
+          }
         }
       });
     });
@@ -71,14 +90,18 @@ describe("APRS verified wire integration", () => {
     };
     const highWater = new AprsRemoteHighWaterStore(database.connection);
     const monitor = new AprsIsMonitor([target], highWater);
-    const authorizationProvider = () => ({
+    const transmitterAuthorizationProvider = () => ({
       loginLine: "user TEST01 pass 11111 vers CMClient 2.0",
+      provisionFingerprint: PROVISION_FINGERPRINT,
+    });
+    const observerAuthorizationProvider = () => ({
+      loginLine: "user TEST01-CM pass 11111 vers CMClient 2.0",
       provisionFingerprint: PROVISION_FINGERPRINT,
     });
     const receiver = new AprsIsRxClient({
       host: "127.0.0.1",
       port: address.port,
-      authorizationProvider,
+      authorizationProvider: observerAuthorizationProvider,
       provisionFingerprint: PROVISION_FINGERPRINT,
       filterExpression: monitor.filterExpression(),
       timeoutMs: 2_000,
@@ -86,7 +109,7 @@ describe("APRS verified wire integration", () => {
     const transmitter = new AprsIsTcpClient({
       host: "127.0.0.1",
       port: address.port,
-      authorizationProvider,
+      authorizationProvider: transmitterAuthorizationProvider,
       timeoutMs: 2_000,
     });
     let observed: AprsMonitorResult | undefined;
@@ -107,6 +130,10 @@ describe("APRS verified wire integration", () => {
       await waitFor(() => observed !== undefined);
 
       expect(dataBeforeVerification).toBe(false);
+      expect(loginLines.map((line) => line.split(" ")[1])).toEqual([
+        "TEST01-CM",
+        "TEST01",
+      ]);
       expect(transmittedLine).toBe(encoded.data);
       expect(transmittedLine).toMatch(/^TRACK1-7>APTMAG,MESHD\*,qAO,TEST01:!/);
       expect(observed).toMatchObject({ kind: "advanced" });

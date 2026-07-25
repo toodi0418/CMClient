@@ -114,6 +114,21 @@ export function connectionAuthorization(
   };
 }
 
+export function observerConnectionAuthorization(
+  stateProvider: () => AprsRuntimeState | undefined,
+): AprsAuthorizationProvider {
+  return () => {
+    const state = stateProvider();
+    if (!state) {
+      return undefined;
+    }
+    return {
+      loginLine: `user ${state.identity.callsignBase}-CM pass ${state.identity.passcode} vers CMClient 2.0`,
+      provisionFingerprint: state.provisionFingerprint,
+    };
+  };
+}
+
 export function deriveAprsPasscode(callsignBase: string): number {
   const base = normalizeCallsignBase(callsignBase);
   let hash = 0x73e2;
