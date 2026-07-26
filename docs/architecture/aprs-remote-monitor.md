@@ -1,25 +1,57 @@
 # APRS-IS Remote High-Water Monitoring
 
-Each iGate independently subscribes with an APRS-IS buddy filter made from its
-mapped APRS callsigns plus the provision's canonical iGate callsign. TX uses
-that canonical iGate callsign. The separate receive-only monitor derives the
-provision-scoped login `<callsignBase>-CM`, authenticates it with the same
-base-callsign passcode as TX, and accepts only that exact callsign's `verified`
-logresp. CMClient never writes APRS Data on this application-level receive-only
-socket, and its distinct identity never enters APRS Data, the iGate path,
-mapping state, or public status.
+Each iGate independently opens a separate receive-only APRS-IS session. TX uses
+the provision's canonical iGate callsign. The observer login is derived as
+`<callsignBase>-C<uppercase hex abs(SSID)>`: SSID `0` produces `-C0`, `7`
+produces `-C7`, and `15` produces `-CF`. It authenticates with the same
+base-callsign passcode as TX and accepts only that exact observer callsign's
+`verified` logresp. CMClient never writes APRS Data on this application-level
+receive-only socket, and its distinct identity never enters APRS Data, the
+iGate path, mapping state, or public status.
 
-Incoming packets participate in delivery confirmation only when their source is
-in the current receive filter and the APRS line is parseable. Only a valid
-Legacy-compatible untimestamped `!` position participates in cross-iGate
-ordering. New monitor observations and local transmissions are keyed by the
-exact source, destination, and information tuple for three hours and 30
-seconds respectively. Destinationless records upgraded from an older schema
-remain conservative source-plus-information wildcards for duplicate
-suppression only; they are excluded from delivery reconciliation. Destination
-must match when an observation confirms a submitted outbox entry.
-Receive time is observation metadata only; it never establishes source-event
-order. Malformed or unwatched data is ignored.
+Before opening the socket, CMClient enforces the APRS-IS
+[login limits](https://www.aprs-is.net/connecting.aspx): an alphanumeric base
+of three through six characters, one one-or-two-character suffix, and no more
+than nine callsign characters in total. It rejects an observer that collides
+with the canonical TX identity or any provisioned mapping. The complete login,
+fixed filter, and terminating CRLF must also fit the inclusive 512-byte APRS-IS
+line limit.
+
+Every observer session uses the fixed server filter
+`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX t/p`. APRS-IS positive filter clauses are
+additive and use OR semantics: the prefix clause admits all packet types from
+those source-call prefixes, while `t/p` additionally admits position packets
+worldwide. The user-defined port `14580` may also deliver its default message
+traffic, as documented by the APRS-IS
+[server-side filter commands](https://www.aprs-is.net/javAPRSFilter.aspx). This
+server filter is therefore only a coarse wire subscription, not CMClient's
+delivery-confirmation boundary.
+
+Mappings never enter the server filter or RX connection identity. A mapping
+refresh atomically hot-swaps the monitor's local exact target matcher, including
+the canonical station target, without fencing transmitters or reconnecting the
+active RX socket. A provision fingerprint, derived observer identity, or fixed
+filter change instead fences TX, invalidates the old observer token, closes the
+old session, and restores TX only after the replacement login and filter are
+verified. Socket termination follows the same fail-closed reconnect path. A
+valid provision with no active Tracker mappings retains the station target and
+observer session.
+
+Incoming packets participate in persistence, ordering, events, or delivery
+confirmation only when the APRS line is parseable and its source matches the
+current local mapping or station target. Confirmation then requires an exact
+source, destination, and information tuple matching one eligible outbox or
+station submission under the current provision and observation window. Packets
+admitted by the broad server feed but unrelated to those local targets are not
+persisted or published. Only a valid Legacy-compatible untimestamped `!`
+position participates in cross-iGate ordering. New monitor observations and
+local transmissions are keyed by the exact source, destination, and information
+tuple for three hours and 30 seconds respectively. Destinationless records
+upgraded from an older schema remain conservative source-plus-information
+wildcards for duplicate suppression only; they are excluded from delivery
+reconciliation. Destination must match when an observation confirms a submitted
+outbox entry. Receive time is observation metadata only; it never establishes
+source-event order. Malformed or unrelated data is ignored.
 
 The outbox repeats this comparison inside its final synchronous authorization
 transaction immediately before transport I/O. This closes the interval between

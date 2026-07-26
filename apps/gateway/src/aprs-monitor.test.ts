@@ -7,6 +7,7 @@ import type { PositionCanonicalEvent } from "@cmclient/contracts";
 
 import { encodeAprsPosition } from "./aprs-position";
 import {
+  APRS_RX_FILTER_EXPRESSION,
   AprsIsMonitor,
   AprsIsRxClient,
   AprsRemoteHighWaterStore,
@@ -30,6 +31,16 @@ function authorization(
   return () => ({ loginLine, provisionFingerprint });
 }
 
+function boundaryLoginLine(totalBytes: number): string {
+  const prefix = "user TEST01-C7 pass 17602 vers ";
+  const suffix = ` filter ${APRS_RX_FILTER_EXPRESSION}\r\n`;
+  const padding = totalBytes - Buffer.byteLength(`${prefix}${suffix}`, "ascii");
+  if (padding < 1) {
+    throw new Error("fixture login boundary is too short");
+  }
+  return `${prefix}${"x".repeat(padding)}`;
+}
+
 describe("APRS-IS monitor", () => {
   it("filters mapped callsigns and advances an isolated remote high-water", () => {
     const database = new GatewayDatabase(":memory:");
@@ -44,7 +55,7 @@ describe("APRS-IS monitor", () => {
       "2026-07-18T00:01:02.000Z",
     );
 
-    expect(monitor.filterExpression()).toBe("b/N0CALL-7");
+    expect(monitor.filterExpression()).toBe(APRS_RX_FILTER_EXPRESSION);
     expect(advanced).toMatchObject({
       kind: "advanced",
       remote: { infoDigest: expect.stringMatching(/^[a-f0-9]{64}$/) },
@@ -57,6 +68,57 @@ describe("APRS-IS monitor", () => {
     });
     expect(repeated).toMatchObject({ kind: "not_new" });
     expect(unknown).toEqual({ kind: "ignored", reason: "unmapped_callsign" });
+    database.close();
+  });
+
+  it("replaces exact local targets without changing the fixed server filter", () => {
+    const database = new GatewayDatabase(":memory:");
+    const monitor = new AprsIsMonitor(
+      [target],
+      new AprsRemoteHighWaterStore(database.connection),
+    );
+    const replacement = {
+      callsign: "N1CALL-7",
+      mappingVersion: "mapping-v2",
+      meshNetworkId: "fixture-network-b",
+      nodeNum: 7,
+    };
+
+    monitor.replaceTargets([replacement]);
+
+    expect(monitor.filterExpression()).toBe(APRS_RX_FILTER_EXPRESSION);
+    expect(
+      monitor.observeLine(
+        "N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>old",
+        "2026-07-18T00:00:10.000Z",
+      ),
+    ).toEqual({ kind: "ignored", reason: "unmapped_callsign" });
+    expect(
+      monitor.observeLine(
+        "N1CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>new",
+        "2026-07-18T00:00:11.000Z",
+      ),
+    ).toMatchObject({ kind: "advanced", state: replacement });
+    database.close();
+  });
+
+  it("keeps a 200-mapping login line below the APRS-IS limit", () => {
+    const database = new GatewayDatabase(":memory:");
+    const targets = Array.from({ length: 200 }, (_, index) => ({
+      callsign: `B${index.toString(36).toUpperCase().padStart(4, "0")}`,
+      mappingVersion: "mapping-v1",
+      meshNetworkId: `fixture-network-${index}`,
+      nodeNum: index,
+    }));
+    const monitor = new AprsIsMonitor(
+      targets,
+      new AprsRemoteHighWaterStore(database.connection),
+    );
+    const loginLine = `user TEST01-CF pass 12345 vers CMClient 2.0 filter ${monitor.filterExpression()}\r\n`;
+
+    expect(Buffer.byteLength(loginLine, "ascii")).toBeLessThanOrEqual(512);
+    expect(monitor.filterExpression()).not.toContain(targets[0]!.callsign);
+    expect(monitor.filterExpression()).not.toContain(targets.at(-1)!.callsign);
     database.close();
   });
 
@@ -182,14 +244,14 @@ describe("AprsIsRxClient", () => {
         "user TEST01-CM pass 17602 vers CMClient 2.0",
       ),
       provisionFingerprint: PROVISION_FINGERPRINT,
-      filterExpression: "b/TEST01-7",
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
     });
 
     const session = await client.connect((line) => received.push(line));
     await waitFor(() => loginLines.length === 1 && received.length === 1);
 
     expect(loginLines).toEqual([
-      "user TEST01-CM pass 17602 vers CMClient 2.0 filter b/TEST01-7",
+      `user TEST01-CM pass 17602 vers CMClient 2.0 filter ${APRS_RX_FILTER_EXPRESSION}`,
     ]);
     expect(received).toEqual([encode(event("2026-07-18T00:00:35.000Z"))]);
     await session.close();
@@ -221,7 +283,7 @@ describe("AprsIsRxClient", () => {
           "user TEST01-CM pass 17602 vers CMClient 2.0",
         ),
         provisionFingerprint: PROVISION_FINGERPRINT,
-        filterExpression: "b/TEST01-7",
+        filterExpression: APRS_RX_FILTER_EXPRESSION,
       });
 
       const session = await client.connect(
@@ -279,7 +341,7 @@ describe("AprsIsRxClient", () => {
         port: address.port,
         authorizationProvider: authorization(loginLine),
         provisionFingerprint: PROVISION_FINGERPRINT,
-        filterExpression: "b/TEST01-7",
+        filterExpression: APRS_RX_FILTER_EXPRESSION,
       });
 
       await expect(client.connect(() => undefined)).rejects.toMatchObject({
@@ -313,7 +375,7 @@ describe("AprsIsRxClient", () => {
         port: address.port,
         authorizationProvider: authorization(loginLine, provisionFingerprint),
         provisionFingerprint,
-        filterExpression: "b/TEST01-7",
+        filterExpression: APRS_RX_FILTER_EXPRESSION,
       });
     const first = await createClient(
       "user TEST01-CM pass 17602 vers CMClient 2.0",
@@ -375,10 +437,10 @@ describe("AprsIsRxClient", () => {
       host: "127.0.0.1",
       port: address.port,
       authorizationProvider: authorization(
-        "user A-CM pass 13026 vers CMClient 2.0",
+        "user ABC-CM pass 13026 vers CMClient 2.0",
       ),
       provisionFingerprint: PROVISION_FINGERPRINT,
-      filterExpression: "b/TEST01-7",
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
     });
 
     const first = await firstClient.connect(() => undefined);
@@ -388,19 +450,19 @@ describe("AprsIsRxClient", () => {
       host: "127.0.0.1",
       port: address.port,
       authorizationProvider: authorization(
-        "user AB-CM pass 12960 vers CMClient 2.0",
+        "user ABCD-CM pass 12960 vers CMClient 2.0",
         ROTATED_PROVISION_FINGERPRINT,
       ),
       provisionFingerprint: ROTATED_PROVISION_FINGERPRINT,
-      filterExpression: "b/TEST01-7",
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
     });
     const second = await secondClient.connect(() => undefined);
     await waitFor(() => sessions.length === 2 && sessions[1]!.length === 1);
     await second.close();
 
     expect(sessions.map((lines) => lines[0])).toEqual([
-      "user A-CM pass 13026 vers CMClient 2.0 filter b/TEST01-7",
-      "user AB-CM pass 12960 vers CMClient 2.0 filter b/TEST01-7",
+      `user ABC-CM pass 13026 vers CMClient 2.0 filter ${APRS_RX_FILTER_EXPRESSION}`,
+      `user ABCD-CM pass 12960 vers CMClient 2.0 filter ${APRS_RX_FILTER_EXPRESSION}`,
     ]);
     await close(server);
   });
@@ -445,7 +507,7 @@ describe("AprsIsRxClient", () => {
             : changedAuthorization;
         },
         provisionFingerprint: PROVISION_FINGERPRINT,
-        filterExpression: "b/TEST01-7",
+        filterExpression: APRS_RX_FILTER_EXPRESSION,
       });
 
       await expect(client.connect(() => undefined)).rejects.toMatchObject({
@@ -478,7 +540,8 @@ describe("AprsIsRxClient", () => {
       },
       authorization("user TEST01 pass 11111\r\nuser injected"),
       authorization("x".repeat(513)),
-      authorization("user AB-CM pass -1 vers CMClient 2.0"),
+      authorization(boundaryLoginLine(513)),
+      authorization("user ABC-CM pass -1 vers CMClient 2.0"),
       authorization("user TEST01-CM pass -1 vers CMClient 2.0"),
       authorization("user TEST01-CM pass invalid vers CMClient 2.0"),
       authorization("user TEST01-CM pass 32768 vers CMClient 2.0"),
@@ -494,7 +557,7 @@ describe("AprsIsRxClient", () => {
         port: address.port,
         authorizationProvider,
         provisionFingerprint: PROVISION_FINGERPRINT,
-        filterExpression: "b/TEST01-7",
+        filterExpression: APRS_RX_FILTER_EXPRESSION,
       });
       await expect(client.connect(() => undefined)).rejects.toMatchObject({
         code: "APRS_PROVISION_UNAVAILABLE",
@@ -503,6 +566,41 @@ describe("AprsIsRxClient", () => {
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(connections).toBe(0);
+    await close(server);
+  });
+
+  it("accepts a login line that is exactly 512 bytes including CRLF", async () => {
+    const loginLines: string[] = [];
+    const server = net.createServer((socket) => {
+      let buffer = "";
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8");
+        const lineEnd = buffer.indexOf("\r\n");
+        if (lineEnd >= 0 && loginLines.length === 0) {
+          loginLines.push(buffer.slice(0, lineEnd + 2));
+          socket.write("# logresp TEST01-C7 verified, fixture\r\n");
+        }
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsRxClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(boundaryLoginLine(512)),
+      provisionFingerprint: PROVISION_FINGERPRINT,
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
+    });
+
+    const session = await client.connect(() => undefined);
+
+    expect(loginLines).toHaveLength(1);
+    expect(Buffer.byteLength(loginLines[0]!, "ascii")).toBe(512);
+    await session.close();
     await close(server);
   });
 
@@ -537,7 +635,7 @@ describe("AprsIsRxClient", () => {
         "user TEST01 pass 11111 vers CMClient 2.0",
       ),
       provisionFingerprint: PROVISION_FINGERPRINT,
-      filterExpression: "b/N0CALL-7",
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
     });
     const processed: string[] = [];
     const callbackErrors: unknown[] = [];
@@ -595,7 +693,7 @@ describe("AprsIsRxClient", () => {
         "user TEST01 pass 11111 vers CMClient 2.0",
       ),
       provisionFingerprint: PROVISION_FINGERPRINT,
-      filterExpression: "b/N0CALL-7",
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
     });
 
     const session = await client.connect((value) => received.push(value));
@@ -630,7 +728,7 @@ describe("AprsIsRxClient", () => {
         "user TEST01 pass 11111 vers CMClient 2.0",
       ),
       provisionFingerprint: PROVISION_FINGERPRINT,
-      filterExpression: "b/N0CALL-7",
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
       closeTimeoutMs: 25,
     });
 

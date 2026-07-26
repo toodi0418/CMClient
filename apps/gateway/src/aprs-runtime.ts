@@ -5,6 +5,7 @@ import type {
 } from "@cmclient/contracts";
 
 import {
+  APRS_RX_FILTER_EXPRESSION,
   AprsIsMonitor,
   AprsRemoteHighWaterStore,
   type AprsMonitorTarget,
@@ -22,7 +23,10 @@ import {
   type AprsTransport,
   type AprsVerifiedTransportSession,
 } from "./aprs-outbox.js";
-import type { AprsRuntimeState } from "./aprs-identity.js";
+import {
+  deriveAprsObserverCallsign,
+  type AprsRuntimeState,
+} from "./aprs-identity.js";
 import { DomainEventBus } from "./events.js";
 import { selectActiveMapping } from "./mesh-runtime.js";
 import { GatewayDatabase } from "./persistence/database.js";
@@ -84,6 +88,24 @@ class AprsMonitorSessionCloseError extends Error {
   }
 }
 
+class AprsMappingConflictError extends Error {
+  readonly code = "CALLMESH_MAPPING_CONFLICT";
+
+  constructor(readonly mappedCallsigns: number) {
+    super("CALLMESH_MAPPING_CONFLICT");
+    this.name = "AprsMappingConflictError";
+  }
+}
+
+interface AprsMonitorPlan {
+  readonly connectionKey: string;
+  readonly mappedCallsigns: number;
+  readonly mappingsFingerprint: string;
+  readonly nextMappingEffectiveAt: number | undefined;
+  readonly state: AprsRuntimeState | undefined;
+  readonly targets: readonly AprsMonitorTarget[];
+}
+
 export class AprsGatewayRuntime {
   private readonly clock: () => Date;
   private readonly flushIntervalMs: number;
@@ -96,9 +118,12 @@ export class AprsGatewayRuntime {
   private igateTimer: NodeJS.Timeout | undefined;
   private monitorTimer: NodeJS.Timeout | undefined;
   private monitorReconnectTimer: NodeJS.Timeout | undefined;
+  private monitor: AprsIsMonitor | undefined;
   private monitorSession: AprsIsRxSession | undefined;
   private monitorToken: object | undefined;
   private monitorConfigurationKey: string | undefined;
+  private monitorMappingsFingerprint: string | undefined;
+  private monitorNextMappingEffectiveAt: number | undefined;
   private flushOperation: Promise<void> | undefined;
   private igateOperation: Promise<void> | undefined;
   private monitorRefreshOperation: Promise<void> | undefined;
@@ -206,9 +231,12 @@ export class AprsGatewayRuntime {
     }
     this.clearMonitorReconnectTimer();
     const session = this.monitorSession;
+    this.monitor = undefined;
     this.monitorSession = undefined;
     this.monitorToken = undefined;
     this.monitorConfigurationKey = undefined;
+    this.monitorMappingsFingerprint = undefined;
+    this.monitorNextMappingEffectiveAt = undefined;
     this.monitorStatus = "stopped";
     this.mappedCallsigns = 0;
 
@@ -530,75 +558,63 @@ export class AprsGatewayRuntime {
   }
 
   private async runMonitorRefresh(generation: number): Promise<void> {
-    this.lastErrorCode = undefined;
+    let pendingSession: AprsIsRxSession | undefined;
     try {
-      const earlyState = this.readState();
-      const earlyMappings =
-        earlyState?.mappings ?? this.options.database.callmeshMappings.list();
-      const earlyConfigurationKey = earlyState
-        ? `${earlyState.provisionFingerprint}:${earlyState.mappingsFingerprint}`
-        : JSON.stringify(earlyMappings);
+      const earlyPlan = this.createMonitorPlan();
       if (
+        earlyPlan &&
+        earlyPlan.targets.length > 0 &&
         this.monitorSession &&
         this.monitorToken &&
-        this.monitorStatus === "connected" &&
-        this.monitorConfigurationKey === earlyConfigurationKey &&
-        this.isStateCurrent(earlyState)
+        this.monitor &&
+        this.monitorConfigurationKey === earlyPlan.connectionKey
       ) {
-        this.monitorStatus = "connected";
-        this.lastErrorCode = undefined;
-        this.activateTransmitters(generation, this.monitorToken);
+        this.applyMonitorPlan(this.monitor, earlyPlan);
+        if (this.monitorStatus === "connected") {
+          this.lastErrorCode = undefined;
+          this.activateTransmitters(generation, this.monitorToken);
+        }
         return;
       }
       this.fenceTransmitters(true);
       this.monitorStatus = "connecting";
       const previous = this.monitorSession;
+      this.monitor = undefined;
       this.monitorSession = undefined;
       this.monitorToken = undefined;
       this.monitorConfigurationKey = undefined;
+      this.monitorMappingsFingerprint = undefined;
+      this.monitorNextMappingEffectiveAt = undefined;
       if (previous) {
         await closeMonitorSession(previous);
       }
       if (!this.isGenerationActive(generation)) {
         return;
       }
-      const state = this.readState();
-      if (this.options.stateProvider && !state) {
+      const plan = this.createMonitorPlan();
+      if (!plan) {
         this.setProvisionUnavailable();
         return;
       }
-      const mappingTargets = activeTargets(
-        state?.mappings ?? this.options.database.callmeshMappings.list(),
-        this.clock(),
-      );
-      this.mappedCallsigns = mappingTargets.length;
-      if (
-        new Set(mappingTargets.map((target) => target.callsign)).size !==
-        mappingTargets.length
-      ) {
-        this.monitorStatus = "error";
-        this.lastErrorCode = "CALLMESH_MAPPING_CONFLICT";
-        this.publish("aprs.monitor.error", {
-          code: this.lastErrorCode,
-        });
-        return;
-      }
-      const targets = appendStationTarget(mappingTargets, state);
-      if (targets.length === 0) {
+      this.mappedCallsigns = plan.mappedCallsigns;
+      if (plan.targets.length === 0) {
         this.monitorStatus = "idle";
+        this.lastErrorCode = undefined;
         this.publish("aprs.monitor.idle", { mappedCallsigns: 0 });
         return;
       }
       const monitor = new AprsIsMonitor(
-        targets,
+        plan.targets,
         new AprsRemoteHighWaterStore(this.options.database.connection),
       );
       const client = this.options.monitorClientFactory(
         monitor.filterExpression(),
-        state?.provisionFingerprint,
+        plan.state?.provisionFingerprint,
       );
       const token = {};
       this.monitorToken = token;
+      this.monitorMappingsFingerprint = plan.mappingsFingerprint;
+      this.monitorNextMappingEffectiveAt = plan.nextMappingEffectiveAt;
       let callbackFailed = false;
       const onLineError = (error: unknown): void => {
         if (
@@ -627,42 +643,71 @@ export class AprsGatewayRuntime {
         ) {
           return;
         }
-        if (!this.isStateCurrent(state)) {
+        let observationState = this.readState();
+        if (
+          this.options.stateProvider &&
+          (!observationState ||
+            observationState.provisionFingerprint !==
+              plan.state?.provisionFingerprint)
+        ) {
           this.invalidateMonitorState(generation, token);
           return;
         }
         try {
-          const receivedAt = this.clock().toISOString();
+          const receivedAtDate = this.clock();
+          if (
+            (observationState &&
+              observationState.mappingsFingerprint !==
+                this.monitorMappingsFingerprint) ||
+            (this.monitorNextMappingEffectiveAt !== undefined &&
+              receivedAtDate.getTime() >= this.monitorNextMappingEffectiveAt)
+          ) {
+            const currentPlan = this.createMonitorPlan(
+              observationState,
+              receivedAtDate,
+            );
+            if (
+              !currentPlan ||
+              currentPlan.connectionKey !== plan.connectionKey
+            ) {
+              this.invalidateMonitorState(generation, token);
+              return;
+            }
+            this.applyMonitorPlan(monitor, currentPlan);
+            observationState = currentPlan.state;
+          }
+          const receivedAt = receivedAtDate.toISOString();
           const result = monitor.observeLine(line, receivedAt);
           const confirmed =
-            result.remote && state
+            result.remote && observationState
               ? this.options.database.aprsOutbox.confirmObserved(
                   result.remote.callsign,
                   result.remote.destination,
                   result.remote.info,
                   receivedAt,
-                  state.provisionFingerprint,
+                  observationState.provisionFingerprint,
                 )
               : [];
           const stationConfirmed =
-            result.remote && state
+            result.remote && observationState
               ? this.igateRepository.confirmObserved(
-                  state.provisionFingerprint,
+                  observationState.provisionFingerprint,
                   result.remote.callsign,
                   result.remote.destination,
                   result.remote.info,
                   receivedAt,
                 )
               : [];
-          this.publish("aprs.monitor.observed", {
-            kind: result.kind,
-            ...(result.reason ? { reason: result.reason } : {}),
-            ...(result.remote
-              ? {
-                  packetDigest: result.remote.infoDigest,
-                }
-              : {}),
-          });
+          if (result.kind !== "ignored") {
+            this.publish("aprs.monitor.observed", {
+              kind: result.kind,
+              ...(result.remote
+                ? {
+                    packetDigest: result.remote.infoDigest,
+                  }
+                : {}),
+            });
+          }
           for (const entry of confirmed) {
             this.publish("aprs.outbox.observer_confirmed", {
               outboxId: entry.id,
@@ -680,7 +725,9 @@ export class AprsGatewayRuntime {
           if (
             callbackFailed &&
             result.kind !== "ignored" &&
-            this.isStateCurrent(state)
+            (!this.options.stateProvider ||
+              observationState?.provisionFingerprint ===
+                plan.state?.provisionFingerprint)
           ) {
             callbackFailed = false;
             this.monitorStatus = "connected";
@@ -694,38 +741,56 @@ export class AprsGatewayRuntime {
           onLineError(error);
         }
       }, onLineError);
+      pendingSession = session;
       if (!this.isGenerationActive(generation) || this.monitorToken !== token) {
         await closeMonitorSession(session);
+        pendingSession = undefined;
         return;
       }
-      if (!this.isStateCurrent(state)) {
+      const currentPlan = this.createMonitorPlan();
+      if (
+        !currentPlan ||
+        currentPlan.connectionKey !== plan.connectionKey ||
+        currentPlan.targets.length === 0
+      ) {
+        this.monitorToken = undefined;
+        this.monitorMappingsFingerprint = undefined;
+        this.monitorNextMappingEffectiveAt = undefined;
         await closeMonitorSession(session);
+        pendingSession = undefined;
         if (this.isGenerationActive(generation)) {
-          this.setProvisionUnavailable();
+          if (!currentPlan) {
+            this.setProvisionUnavailable();
+          } else if (currentPlan.targets.length === 0) {
+            this.monitorStatus = "idle";
+            this.mappedCallsigns = 0;
+            this.lastErrorCode = undefined;
+            this.publish("aprs.monitor.idle", { mappedCallsigns: 0 });
+          } else {
+            this.monitorRefreshQueued = true;
+          }
         }
         return;
       }
+      this.applyMonitorPlan(monitor, currentPlan);
       let reconciledOutbox: AprsOutboxEntry[] = [];
       let reconciledIgate: ReturnType<
         AprsIgateRepository["reconcileObserved"]
       > = [];
-      if (state) {
-        try {
-          reconciledOutbox =
-            this.options.database.aprsOutbox.reconcileObservedCache(
-              state.provisionFingerprint,
-            );
-          reconciledIgate = this.igateRepository.reconcileObserved(
-            state.provisionFingerprint,
-            this.clock().toISOString(),
+      if (currentPlan.state) {
+        reconciledOutbox =
+          this.options.database.aprsOutbox.reconcileObservedCache(
+            currentPlan.state.provisionFingerprint,
           );
-        } catch (error) {
-          await closeMonitorSession(session);
-          throw error;
-        }
+        reconciledIgate = this.igateRepository.reconcileObserved(
+          currentPlan.state.provisionFingerprint,
+          this.clock().toISOString(),
+        );
       }
+      this.monitor = monitor;
       this.monitorSession = session;
-      this.monitorConfigurationKey = earlyConfigurationKey;
+      pendingSession = undefined;
+      this.monitorConfigurationKey = currentPlan.connectionKey;
       this.clearMonitorReconnectTimer();
       this.watchMonitorTermination(session, generation, token);
       if (callbackFailed) {
@@ -759,21 +824,78 @@ export class AprsGatewayRuntime {
         return;
       }
       this.fenceTransmitters(true);
+      const activeSession = this.monitorSession ?? pendingSession;
+      this.monitor = undefined;
+      this.monitorSession = undefined;
       this.monitorToken = undefined;
       this.monitorConfigurationKey = undefined;
+      this.monitorMappingsFingerprint = undefined;
+      this.monitorNextMappingEffectiveAt = undefined;
+      let failure = error;
+      if (activeSession) {
+        try {
+          await closeMonitorSession(activeSession);
+        } catch (closeError) {
+          failure = closeError;
+        }
+      }
       if (this.options.stateProvider && !this.readState()) {
         this.setProvisionUnavailable();
         return;
       }
       this.monitorStatus = "error";
+      if (failure instanceof AprsMappingConflictError) {
+        this.mappedCallsigns = failure.mappedCallsigns;
+      }
       this.lastErrorCode = stableErrorCode(
-        error,
+        failure,
         "APRS_MONITOR_CONNECT_FAILED",
       );
       this.publish("aprs.monitor.error", {
         code: this.lastErrorCode,
       });
     }
+  }
+
+  private createMonitorPlan(
+    state = this.readState(),
+    now = this.clock(),
+  ): AprsMonitorPlan | undefined {
+    if (this.options.stateProvider && !state) {
+      return undefined;
+    }
+    const mappings =
+      state?.mappings ?? this.options.database.callmeshMappings.list();
+    const mappingTargets = activeTargets(mappings, now);
+    if (
+      new Set(mappingTargets.map((target) => target.callsign)).size !==
+      mappingTargets.length
+    ) {
+      throw new AprsMappingConflictError(mappingTargets.length);
+    }
+    const targets = appendStationTarget(mappingTargets, state);
+    const observerIdentity = state
+      ? deriveAprsObserverCallsign(state)
+      : "unscoped";
+    return {
+      connectionKey: `${state?.provisionFingerprint ?? "unscoped"}:${observerIdentity}:${APRS_RX_FILTER_EXPRESSION}`,
+      mappedCallsigns: mappingTargets.length,
+      mappingsFingerprint:
+        state?.mappingsFingerprint ?? JSON.stringify(mappingTargets),
+      nextMappingEffectiveAt: nextMappingEffectiveAt(mappings, now),
+      state,
+      targets,
+    };
+  }
+
+  private applyMonitorPlan(
+    monitor: AprsIsMonitor,
+    plan: AprsMonitorPlan,
+  ): void {
+    monitor.replaceTargets(plan.targets);
+    this.mappedCallsigns = plan.mappedCallsigns;
+    this.monitorMappingsFingerprint = plan.mappingsFingerprint;
+    this.monitorNextMappingEffectiveAt = plan.nextMappingEffectiveAt;
   }
 
   private async finishStop(operations: Promise<void>[]): Promise<void> {
@@ -868,26 +990,16 @@ export class AprsGatewayRuntime {
     return { family: this.igateFamily, state };
   }
 
-  private isStateCurrent(state: AprsRuntimeState | undefined): boolean {
-    if (!this.options.stateProvider) {
-      return true;
-    }
-    const current = this.readState();
-    return Boolean(
-      state &&
-      current &&
-      current.provisionFingerprint === state.provisionFingerprint &&
-      current.mappingsFingerprint === state.mappingsFingerprint,
-    );
-  }
-
   private invalidateMonitorState(generation: number, token: object): void {
     if (!this.isGenerationActive(generation) || this.monitorToken !== token) {
       return;
     }
     this.fenceTransmitters(true);
+    this.monitor = undefined;
     this.monitorToken = undefined;
     this.monitorConfigurationKey = undefined;
+    this.monitorMappingsFingerprint = undefined;
+    this.monitorNextMappingEffectiveAt = undefined;
     this.monitorStatus = "idle";
     this.mappedCallsigns = 0;
     this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";
@@ -933,9 +1045,12 @@ export class AprsGatewayRuntime {
       return;
     }
     this.fenceTransmitters(true);
+    this.monitor = undefined;
     this.monitorSession = undefined;
     this.monitorToken = undefined;
     this.monitorConfigurationKey = undefined;
+    this.monitorMappingsFingerprint = undefined;
+    this.monitorNextMappingEffectiveAt = undefined;
     this.monitorStatus = "error";
     this.lastErrorCode = "APRS_MONITOR_CONNECTION_LOST";
     try {
@@ -971,8 +1086,12 @@ export class AprsGatewayRuntime {
 
   private setProvisionUnavailable(): void {
     this.fenceTransmitters(true);
+    this.monitor = undefined;
+    this.monitorSession = undefined;
     this.monitorToken = undefined;
     this.monitorConfigurationKey = undefined;
+    this.monitorMappingsFingerprint = undefined;
+    this.monitorNextMappingEffectiveAt = undefined;
     this.monitorStatus = "idle";
     this.mappedCallsigns = 0;
     this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";
@@ -1107,6 +1226,21 @@ function activeTargets(mappings: readonly CallMeshMapping[], now: Date) {
     })
     .filter((target) => target !== undefined)
     .sort((left, right) => left.callsign.localeCompare(right.callsign));
+}
+
+function nextMappingEffectiveAt(
+  mappings: readonly CallMeshMapping[],
+  now: Date,
+): number | undefined {
+  const nowMs = now.getTime();
+  let next: number | undefined;
+  for (const mapping of mappings) {
+    const effectiveAt = Date.parse(mapping.effectiveAt);
+    if (effectiveAt > nowMs && (next === undefined || effectiveAt < next)) {
+      next = effectiveAt;
+    }
+  }
+  return next;
 }
 
 function appendStationTarget(

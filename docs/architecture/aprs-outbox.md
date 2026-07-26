@@ -33,7 +33,11 @@ The runtime also supplies a per-entry observer-readiness gate to the worker and
 the concrete TCP writer. If the verified RX session terminates during a claimed
 batch, the writer performs no later Data write and the worker releases every
 unwritten claim back to `queued` without incrementing attempts. A fenced write
-does not tear down a still-valid provision-scoped TX session.
+does not tear down a still-valid provision-scoped TX session. Mapping refreshes
+only hot-swap the receive monitor's local exact matcher and do not interrupt this
+readiness gate. A provision, derived observer identity, or fixed-filter change
+fences the gate and reconnects RX; outbound work resumes only after the new
+observer session is verified.
 
 Enqueue and local position-state advancement share one SQLite transaction. A
 strictly newer event removes older queued or failed rows for its identity, so
@@ -87,5 +91,13 @@ CRLF-terminated canonical iGate login, waits for the exact matching verified
 provision generation changes. Both login and Data reject CR/LF injection.
 Gateway-specific path information and every local observation attribute stay
 outside the stored Data and never alter the canonical APRS payload. The
-separate buddy-filter monitor uses the deterministic `<callsignBase>-CM` login;
-it is never a packet source or path component.
+separate receive-only monitor uses the deterministic
+`<callsignBase>-C<uppercase hex abs(SSID)>` login and the fixed
+`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX t/p` server filter; it is never a packet source or
+path component. APRS-IS combines positive filter clauses additively with OR
+semantics, so this subscription includes worldwide position packets as well as
+all packet types from the listed prefixes, plus any default message traffic on
+port `14580`. None of that broad wire traffic is delivery proof by itself. Only
+a parseable packet selected by the current local mapping or station matcher and
+matching one eligible outbox or station source/destination/information tuple is
+persisted, published, or allowed to confirm delivery.

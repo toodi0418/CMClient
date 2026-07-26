@@ -61,7 +61,7 @@ describe("CallMesh provision APRS identity", () => {
     const observer = observerConnectionAuthorization(() => state)();
 
     expect(observer).toEqual({
-      loginLine: "user TEST01-CM pass 17602 vers CMClient 2.0",
+      loginLine: "user TEST01-C7 pass 17602 vers CMClient 2.0",
       provisionFingerprint: "a".repeat(64),
     });
     expect(observer?.loginLine).not.toBe(transmitter?.loginLine);
@@ -70,16 +70,52 @@ describe("CallMesh provision APRS identity", () => {
     );
   });
 
+  it.each([
+    [0, "C0"],
+    [1, "C1"],
+    [-1, "C1"],
+    [10, "CA"],
+    [-10, "CA"],
+    [15, "CF"],
+    [-15, "CF"],
+  ])(
+    "encodes observer SSID %i as uppercase hexadecimal suffix %s",
+    (ssid, suffix) => {
+      const state = deriveAprsRuntimeState({
+        provision: { ...baseProvision, ssid },
+        provisionFingerprint: "a".repeat(64),
+        mappings: [],
+        mappingsFingerprint: "b".repeat(64),
+      });
+
+      expect(observerConnectionAuthorization(() => state)()).toEqual({
+        loginLine: `user TEST01-${suffix} pass 17602 vers CMClient 2.0`,
+        provisionFingerprint: "a".repeat(64),
+      });
+    },
+  );
+
+  it("keeps observer logins unique across iGate SSIDs on one base", () => {
+    const logins = [1, 6, 10, 15].map((ssid) => {
+      const state = deriveAprsRuntimeState({
+        provision: { ...baseProvision, ssid },
+        provisionFingerprint: "a".repeat(64),
+        mappings: [],
+        mappingsFingerprint: "b".repeat(64),
+      });
+      return observerConnectionAuthorization(() => state)()?.loginLine;
+    });
+
+    expect(new Set(logins).size).toBe(logins.length);
+  });
+
   it("returns no observer authorization while provision state is unavailable", () => {
     expect(observerConnectionAuthorization(() => undefined)()).toBeUndefined();
   });
 
-  it.each([
-    ["A", 13_026],
-    ["AB", 12_960],
-  ])(
-    "supports a %s short base callsign for the verified observer login",
-    (callsignBase, passcode) => {
+  it.each(["A", "AB"])(
+    "rejects a %s base below the APRS-IS login minimum",
+    (callsignBase) => {
       const state = deriveAprsRuntimeState({
         provision: { ...baseProvision, callsignBase },
         provisionFingerprint: "a".repeat(64),
@@ -87,10 +123,9 @@ describe("CallMesh provision APRS identity", () => {
         mappingsFingerprint: "b".repeat(64),
       });
 
-      expect(observerConnectionAuthorization(() => state)()).toEqual({
-        loginLine: `user ${callsignBase}-CM pass ${passcode} vers CMClient 2.0`,
-        provisionFingerprint: "a".repeat(64),
-      });
+      expect(() => observerConnectionAuthorization(() => state)()).toThrow(
+        AprsRuntimeIdentityError,
+      );
     },
   );
 
@@ -112,7 +147,7 @@ describe("CallMesh provision APRS identity", () => {
       },
       {
         ...state,
-        identity: { ...state.identity, callsign: "TEST01-CM" },
+        identity: { ...state.identity, callsign: "TEST01-C7" },
       },
       {
         ...state,
@@ -122,7 +157,7 @@ describe("CallMesh provision APRS identity", () => {
             effectiveAt: "2026-07-25T00:00:00.000Z",
             meshNetworkId: "fixture-network",
             nodeNum: 42,
-            callsign: "TEST01-CM",
+            callsign: "TEST01-C7",
           },
         ],
       },

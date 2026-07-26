@@ -4,6 +4,7 @@ import net from "node:net";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  APRS_RX_FILTER_EXPRESSION,
   AprsIsRxClient,
   parseCmClientAprsLine,
   type AprsIsRxSession,
@@ -79,7 +80,7 @@ describe("AprsGatewayRuntime", () => {
         .all(),
     ).toEqual([{ delivery_status: "submitted", count: 6 }]);
 
-    expect(filter).toBe("b/N0CALL-7/TEST01-7");
+    expect(filter).toBe(APRS_RX_FILTER_EXPRESSION);
     for (const line of transmitted) {
       onLine?.(line.replace("TCPIP*:", "TCPIP*,qAC,T2TEST:"));
     }
@@ -323,7 +324,7 @@ describe("AprsGatewayRuntime", () => {
     expect(flushes).toBe(0);
     expect(sends).toBe(0);
     expect(logins).toEqual([
-      `user TEST01-CM pass ${state.identity.passcode} vers CMClient 2.0 filter b/N0CALL-7/TEST01-7`,
+      `user TEST01-C7 pass ${state.identity.passcode} vers CMClient 2.0 filter ${APRS_RX_FILTER_EXPRESSION}`,
     ]);
     await runtime.stop();
     await closeServer(server);
@@ -576,7 +577,7 @@ describe("AprsGatewayRuntime", () => {
       "N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>fixture-one",
     );
 
-    expect(filter).toBe("b/N0CALL-7/N1CALL-7");
+    expect(filter).toBe(APRS_RX_FILTER_EXPRESSION);
     expect(runtime.status()).toMatchObject({
       configured: true,
       running: false,
@@ -606,6 +607,336 @@ describe("AprsGatewayRuntime", () => {
     database.close();
   });
 
+  it("hot-swaps mapping targets without reconnecting the RX socket", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let state = aprsState("a", "N0CALL-7", 42);
+    let onLine: ((line: string) => void) | undefined;
+    let connections = 0;
+    let closes = 0;
+    let transmissionGate: (() => boolean) | undefined;
+    const pendingFlush = deferred<AprsOutboxEntry[]>();
+    const filters: string[] = [];
+    const eventTypes: string[] = [];
+    const events = new DomainEventBus({ eventIdFactory: sequentialFactory() });
+    events.subscribe((event) => eventTypes.push(event.type));
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: events,
+      stateProvider: () => state,
+      clock: () => new Date("2026-07-18T00:02:00.000Z"),
+      outbox: {
+        flush: async (_limit, shouldContinue) => {
+          transmissionGate = shouldContinue;
+          return pendingFlush.promise;
+        },
+      },
+      monitorClientFactory: (filter) => {
+        filters.push(filter);
+        return {
+          connect: async (listener) => {
+            connections += 1;
+            onLine = listener;
+            return {
+              close: async () => {
+                closes += 1;
+              },
+            };
+          },
+        };
+      },
+    });
+
+    await runtime.refreshMonitor();
+    const inFlightFlush = runtime.flushNow();
+    await waitFor(() => transmissionGate !== undefined);
+    state = {
+      ...state,
+      mappings: [
+        mapping("fixture-network-a", 42, "N0CALL-7"),
+        mapping("fixture-network-b", 7, "N1CALL-7"),
+      ],
+      mappingsFingerprint: "b".repeat(64),
+    };
+    onLine?.("N1CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>added");
+    expect(transmissionGate?.()).toBe(true);
+    await runtime.refreshMonitor();
+    expect(transmissionGate?.()).toBe(true);
+
+    state = {
+      ...state,
+      mappings: [mapping("fixture-network-b", 7, "N1CALL-7")],
+      mappingsFingerprint: "c".repeat(64),
+    };
+    await runtime.refreshMonitor();
+    expect(transmissionGate?.()).toBe(true);
+    const observedBeforeRemovedLine = eventTypes.filter(
+      (type) => type === "aprs.monitor.observed",
+    ).length;
+    onLine?.("N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>removed");
+    onLine?.(
+      "BM2XYZ-7>APTMAG,TCPIP*,qAC,T2FIXTURE:!2502.85N/12131.05E>unrelated",
+    );
+
+    state = {
+      ...state,
+      mappings: [
+        {
+          ...mapping("fixture-network-c", 9, "N2CALL-7"),
+          version: "mapping-v2",
+        },
+      ],
+      mappingsFingerprint: "d".repeat(64),
+    };
+    await runtime.refreshMonitor();
+    expect(transmissionGate?.()).toBe(true);
+    onLine?.("N2CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>changed");
+
+    expect(connections).toBe(1);
+    expect(closes).toBe(0);
+    expect(filters).toEqual([APRS_RX_FILTER_EXPRESSION]);
+    expect(
+      eventTypes.filter((type) => type === "aprs.monitor.observed"),
+    ).toHaveLength(observedBeforeRemovedLine + 1);
+    expect(
+      database.connection
+        .prepare(
+          "SELECT callsign FROM aprs_observed_packets ORDER BY callsign ASC",
+        )
+        .all(),
+    ).toEqual([{ callsign: "N1CALL-7" }, { callsign: "N2CALL-7" }]);
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "connected",
+      mappedCallsigns: 1,
+    });
+
+    pendingFlush.resolve([]);
+    await inFlightFlush;
+    await runtime.stop();
+    expect(closes).toBe(1);
+    database.close();
+  });
+
+  it("switches an effective mapping at its time boundary without reconnecting", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let now = new Date("2026-07-18T00:02:00.000Z");
+    const initial = aprsState("a", "N0CALL-7", 42);
+    const state: AprsRuntimeState = {
+      ...initial,
+      mappings: [
+        mapping("fixture-network-a", 42, "N0CALL-7"),
+        {
+          ...mapping("fixture-network-a", 42, "N1CALL-7"),
+          version: "mapping-v2",
+          effectiveAt: "2026-07-18T00:05:00.000Z",
+        },
+      ],
+      mappingsFingerprint: "b".repeat(64),
+    };
+    let onLine: ((line: string) => void) | undefined;
+    let connections = 0;
+    let closes = 0;
+    const eventTypes: string[] = [];
+    const events = new DomainEventBus({ eventIdFactory: sequentialFactory() });
+    events.subscribe((event) => eventTypes.push(event.type));
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: events,
+      stateProvider: () => state,
+      clock: () => now,
+      outbox: { flush: async () => [] },
+      monitorClientFactory: () => ({
+        connect: async (listener) => {
+          connections += 1;
+          onLine = listener;
+          return {
+            close: async () => {
+              closes += 1;
+            },
+          };
+        },
+      }),
+    });
+
+    await runtime.refreshMonitor();
+    onLine?.("N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>initial");
+    now = new Date("2026-07-18T00:05:00.000Z");
+    onLine?.(
+      "N1CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>effective",
+    );
+    const observedAtBoundary = eventTypes.filter(
+      (type) => type === "aprs.monitor.observed",
+    ).length;
+    onLine?.("N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>stale");
+
+    expect(connections).toBe(1);
+    expect(closes).toBe(0);
+    expect(
+      eventTypes.filter((type) => type === "aprs.monitor.observed"),
+    ).toHaveLength(observedAtBoundary);
+    expect(
+      database.connection
+        .prepare(
+          "SELECT callsign FROM aprs_observed_packets ORDER BY callsign ASC",
+        )
+        .all(),
+    ).toEqual([{ callsign: "N0CALL-7" }, { callsign: "N1CALL-7" }]);
+
+    await runtime.stop();
+    expect(closes).toBe(1);
+    database.close();
+  });
+
+  it("adopts the latest mapping while the fixed-filter connection is pending", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let state = aprsState("a", "N0CALL-7", 42);
+    const pendingSession = deferred<AprsIsRxSession>();
+    const connectStarted = deferred<void>();
+    let onLine: ((line: string) => void) | undefined;
+    let connections = 0;
+    let closes = 0;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: new DomainEventBus({ eventIdFactory: sequentialFactory() }),
+      stateProvider: () => state,
+      clock: () => new Date("2026-07-18T00:02:00.000Z"),
+      outbox: { flush: async () => [] },
+      monitorClientFactory: (filter) => {
+        expect(filter).toBe(APRS_RX_FILTER_EXPRESSION);
+        return {
+          connect: (listener) => {
+            connections += 1;
+            onLine = listener;
+            connectStarted.resolve();
+            return pendingSession.promise;
+          },
+        };
+      },
+    });
+
+    const firstRefresh = runtime.refreshMonitor();
+    await connectStarted.promise;
+    state = {
+      ...state,
+      mappings: [mapping("fixture-network-b", 7, "N1CALL-7")],
+      mappingsFingerprint: "b".repeat(64),
+    };
+    const queuedRefresh = runtime.refreshMonitor();
+    pendingSession.resolve({
+      close: async () => {
+        closes += 1;
+      },
+    });
+    await Promise.all([firstRefresh, queuedRefresh]);
+    onLine?.("N1CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>latest");
+
+    expect(connections).toBe(1);
+    expect(closes).toBe(0);
+    expect(
+      database.connection
+        .prepare("SELECT callsign FROM aprs_observed_packets")
+        .all(),
+    ).toEqual([{ callsign: "N1CALL-7" }]);
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "connected",
+      mappedCallsigns: 1,
+    });
+
+    await runtime.stop();
+    expect(closes).toBe(1);
+    database.close();
+  });
+
+  it("closes a verified pending session when the latest mapping plan conflicts", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let state = aprsState("a", "N0CALL-7", 42);
+    const pendingSession = deferred<AprsIsRxSession>();
+    const connectStarted = deferred<void>();
+    let connections = 0;
+    let closes = 0;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: new DomainEventBus({ eventIdFactory: sequentialFactory() }),
+      stateProvider: () => state,
+      outbox: { flush: async () => [] },
+      monitorClientFactory: () => ({
+        connect: () => {
+          connections += 1;
+          connectStarted.resolve();
+          return pendingSession.promise;
+        },
+      }),
+    });
+
+    const refresh = runtime.refreshMonitor();
+    await connectStarted.promise;
+    state = {
+      ...state,
+      mappings: [
+        mapping("fixture-network-a", 42, "N0CALL-7"),
+        mapping("fixture-network-b", 7, "N0CALL-7"),
+      ],
+      mappingsFingerprint: "b".repeat(64),
+    };
+    pendingSession.resolve({
+      close: async () => {
+        closes += 1;
+      },
+    });
+    await refresh;
+
+    expect(connections).toBe(1);
+    expect(closes).toBe(1);
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "error",
+      mappedCallsigns: 2,
+      lastErrorCode: "CALLMESH_MAPPING_CONFLICT",
+    });
+
+    await runtime.stop();
+    expect(closes).toBe(1);
+    database.close();
+  });
+
+  it("keeps the station observer connected when provision has no mappings", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const populated = aprsState("a", "N0CALL-7", 42);
+    const state: AprsRuntimeState = {
+      ...populated,
+      mappings: [],
+      mappingsFingerprint: "b".repeat(64),
+    };
+    let connections = 0;
+    let closes = 0;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: new DomainEventBus({ eventIdFactory: sequentialFactory() }),
+      stateProvider: () => state,
+      outbox: { flush: async () => [] },
+      monitorClientFactory: (filter) => ({
+        connect: async () => {
+          connections += 1;
+          expect(filter).toBe(APRS_RX_FILTER_EXPRESSION);
+          return {
+            close: async () => {
+              closes += 1;
+            },
+          };
+        },
+      }),
+    });
+
+    await runtime.refreshMonitor();
+
+    expect(connections).toBe(1);
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "connected",
+      mappedCallsigns: 0,
+    });
+    await runtime.stop();
+    expect(closes).toBe(1);
+    database.close();
+  });
+
   it("contains a high-water callback failure and recovers on the next valid line", async () => {
     const database = new GatewayDatabase(":memory:");
     database.callmeshMappings.replace([
@@ -624,6 +955,7 @@ describe("AprsGatewayRuntime", () => {
       }
     });
     let onLine: ((line: string) => void) | undefined;
+    let closes = 0;
     const runtime = new AprsGatewayRuntime({
       database,
       eventBus: events,
@@ -632,7 +964,11 @@ describe("AprsGatewayRuntime", () => {
       monitorClientFactory: () => ({
         connect: async (listener) => {
           onLine = listener;
-          return { close: async () => undefined };
+          return {
+            close: async () => {
+              closes += 1;
+            },
+          };
         },
       }),
     });
@@ -653,10 +989,21 @@ describe("AprsGatewayRuntime", () => {
     });
     expect(errorCodes).toEqual(["APRS_MONITOR_PERSISTENCE_FAILED"]);
 
+    database.callmeshMappings.replace([
+      mapping("fixture-network-b", 7, "N1CALL-7"),
+    ]);
+    await runtime.refreshMonitor();
+    expect(closes).toBe(0);
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "error",
+      lastErrorCode: "APRS_MONITOR_PERSISTENCE_FAILED",
+      mappedCallsigns: 1,
+    });
+
     database.connection.exec("DROP TRIGGER fixture_reject_observed_packet");
     expect(() =>
       onLine?.(
-        "N0CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>fixture-two",
+        "N1CALL-7>APTMAG,MESHD*,qAO,TEST01-7:!2502.85N/12131.05E>fixture-two",
       ),
     ).not.toThrow();
 
@@ -668,7 +1015,7 @@ describe("AprsGatewayRuntime", () => {
     expect(
       database.connection
         .prepare("SELECT info FROM aprs_observed_packets WHERE callsign = ?")
-        .get("N0CALL-7"),
+        .get("N1CALL-7"),
     ).toEqual({ info: "!2502.85N/12131.05E>fixture-two" });
     expect(
       types.filter((type) => type === "aprs.monitor.connected"),
@@ -678,6 +1025,7 @@ describe("AprsGatewayRuntime", () => {
     ).toHaveLength(1);
 
     await runtime.stop();
+    expect(closes).toBe(1);
     database.close();
   });
 
@@ -718,7 +1066,10 @@ describe("AprsGatewayRuntime", () => {
     await new Promise((resolve) => setTimeout(resolve, 110));
     await waitFor(() => connections === 2);
 
-    expect(filters).toEqual(["b/N0CALL-7", "b/N0CALL-7"]);
+    expect(filters).toEqual([
+      APRS_RX_FILTER_EXPRESSION,
+      APRS_RX_FILTER_EXPRESSION,
+    ]);
     expect(runtime.status()).toMatchObject({
       monitorStatus: "connected",
       mappedCallsigns: 1,
@@ -906,7 +1257,10 @@ describe("AprsGatewayRuntime", () => {
     await firstRefresh;
     expect(connections).toBe(2);
     expect(closes).toBe(1);
-    expect(filters).toEqual(["b/N0CALL-7/TEST01-7", "b/AB12CD-7/N1CALL-7"]);
+    expect(filters).toEqual([
+      APRS_RX_FILTER_EXPRESSION,
+      APRS_RX_FILTER_EXPRESSION,
+    ]);
     expect(fingerprints).toEqual(["a".repeat(64), "b".repeat(64)]);
     expect(runtime.status()).toMatchObject({
       monitorStatus: "connected",
@@ -1024,8 +1378,8 @@ describe("AprsGatewayRuntime", () => {
       expect(eventTypes).not.toContain("aprs.monitor.observed");
       expect(filters).toEqual(
         change === "rotated"
-          ? ["b/N0CALL-7/TEST01-7", "b/AB12CD-7/N1CALL-7"]
-          : ["b/N0CALL-7/TEST01-7"],
+          ? [APRS_RX_FILTER_EXPRESSION, APRS_RX_FILTER_EXPRESSION]
+          : [APRS_RX_FILTER_EXPRESSION],
       );
       expect(runtime.status()).toMatchObject(
         change === "rotated"

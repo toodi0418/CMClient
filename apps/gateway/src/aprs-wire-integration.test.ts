@@ -95,7 +95,7 @@ describe("APRS verified wire integration", () => {
       provisionFingerprint: PROVISION_FINGERPRINT,
     });
     const observerAuthorizationProvider = () => ({
-      loginLine: "user TEST01-CM pass 11111 vers CMClient 2.0",
+      loginLine: "user TEST01-C0 pass 11111 vers CMClient 2.0",
       provisionFingerprint: PROVISION_FINGERPRINT,
     });
     const receiver = new AprsIsRxClient({
@@ -131,7 +131,7 @@ describe("APRS verified wire integration", () => {
 
       expect(dataBeforeVerification).toBe(false);
       expect(loginLines.map((line) => line.split(" ")[1])).toEqual([
-        "TEST01-CM",
+        "TEST01-C0",
         "TEST01",
       ]);
       expect(transmittedLine).toBe(encoded.data);

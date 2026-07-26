@@ -92,9 +92,26 @@ valid CallMesh provision. A missing, revoked, expired, stale, or conflicting
 provision stops APRS authorization and fails closed; static identity/passcode
 environment values are rejected. The runtime performs an immediate outbox
 flush and APRS-monitor refresh, then repeats both on bounded configured
-intervals. The monitor filter is rebuilt from active mappings. Duplicate
-callsign targets are treated as `CALLMESH_MAPPING_CONFLICT` and fail closed
-without opening a monitor session.
+intervals. The receive-only observer derives its login as
+`<callsignBase>-C<uppercase hex abs(SSID)>` and uses the fixed
+`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX t/p` server filter. APRS-IS positive filters are
+additive OR clauses, so that subscription admits all packet types from the
+listed source-call prefixes, worldwide position packets, and the default
+message traffic that port `14580` may supply. The server feed is deliberately
+broader than CMClient's local confirmation boundary.
+
+Active mappings and the canonical station identity form a local exact target
+matcher. Mapping additions, removals, version changes, and effective-time
+changes atomically hot-swap that matcher without changing the server filter,
+fencing TX, or reconnecting an active observer socket. A provision fingerprint,
+derived observer identity, or filter change does fence both APRS producers and
+reconnect RX; TX resumes only after the replacement observer login is verified.
+Socket loss also fences TX and enters bounded reconnect. Packets that do not
+match a current local target are ignored without persistence or an
+`aprs.monitor.observed` event. A matched packet still confirms nothing unless
+its exact source, destination, and information tuple identifies one eligible
+current-provision outbox or station submission. Duplicate local callsign targets
+remain a fail-closed `CALLMESH_MAPPING_CONFLICT`.
 
 `GET /api/v1/aprs` returns the schema-backed runtime projection:
 

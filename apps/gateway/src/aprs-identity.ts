@@ -8,9 +8,8 @@ import {
 import type { CallMeshAprsState } from "./callmesh.js";
 
 const APRS_CALLSIGN_BASE = /^[A-Z0-9]{1,6}$/;
-const APRS_LOGIN_CALLSIGN_BASE = /^[A-Z0-9]{1,6}$/;
-const APRS_LOGIN_CALLSIGN = /^[A-Z0-9]{1,6}(?:-[A-Z0-9]{1,2})?$/;
-const APRS_OBSERVER_SUFFIX = "CM";
+const APRS_LOGIN_CALLSIGN_BASE = /^[A-Z0-9]{3,6}$/;
+const APRS_LOGIN_CALLSIGN = /^[A-Z0-9]{3,6}(?:-[A-Z0-9]{1,2})?$/;
 const MAX_APRS_LOGIN_CALLSIGN_BYTES = 9;
 const APRS_PRINTABLE_CHARACTER = /^[ -~]$/;
 const MAX_APRS_COMMENT_LENGTH = 80;
@@ -128,7 +127,7 @@ export function observerConnectionAuthorization(
     if (!state) {
       return undefined;
     }
-    const callsign = observerCallsign(state);
+    const callsign = deriveAprsObserverCallsign(state);
     return {
       loginLine: `user ${callsign} pass ${state.identity.passcode} vers CMClient 2.0`,
       provisionFingerprint: state.provisionFingerprint,
@@ -160,7 +159,7 @@ function normalizeCallsignBase(value: unknown): string {
   return normalized;
 }
 
-function observerCallsign(state: AprsRuntimeState): string {
+export function deriveAprsObserverCallsign(state: AprsRuntimeState): string {
   const { callsignBase, callsign, ssid } = state.identity;
   if (
     !APRS_LOGIN_CALLSIGN_BASE.test(callsignBase) ||
@@ -172,7 +171,8 @@ function observerCallsign(state: AprsRuntimeState): string {
   }
   const expectedTransmitterCallsign =
     ssid === 0 ? callsignBase : `${callsignBase}-${Math.abs(ssid)}`;
-  const observerCallsign = `${callsignBase}-${APRS_OBSERVER_SUFFIX}`;
+  const observerSuffix = `C${Math.abs(ssid).toString(16).toUpperCase()}`;
+  const observerCallsign = `${callsignBase}-${observerSuffix}`;
   if (
     callsign !== expectedTransmitterCallsign ||
     observerCallsign === callsign ||

@@ -14,7 +14,8 @@ const APRS_LOCAL_TX_TTL_MS = 30_000;
 const MAX_APRS_LINE_BYTES = 512;
 const MAX_APRS_BUFFER_BYTES = 1_024;
 const APRS_CALLSIGN_PATTERN = /^[A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?$/;
-const APRS_LOGIN_CALLSIGN_PATTERN = /^[A-Z0-9]{1,6}(?:-[A-Z0-9]{1,2})?$/;
+const APRS_LOGIN_CALLSIGN_PATTERN = /^[A-Z0-9]{3,6}(?:-[A-Z0-9]{1,2})?$/;
+export const APRS_RX_FILTER_EXPRESSION = "p/BM/BN/BO/BP/BQ/BU/BV/BW/BX t/p";
 
 export interface AprsMonitorTarget {
   callsign: string;
@@ -197,28 +198,24 @@ export class AprsRemoteHighWaterStore {
 }
 
 export class AprsIsMonitor {
-  private readonly targetsByCallsign: ReadonlyMap<string, AprsMonitorTarget>;
+  private targetsByCallsign: ReadonlyMap<string, AprsMonitorTarget>;
 
   constructor(
     targets: readonly AprsMonitorTarget[],
     private readonly highWater: AprsRemoteHighWaterStore,
   ) {
-    const targetsByCallsign = new Map<string, AprsMonitorTarget>();
-    for (const target of targets) {
-      validateTarget(target);
-      if (targetsByCallsign.has(target.callsign)) {
-        throw new AprsMonitorError();
-      }
-      targetsByCallsign.set(target.callsign, { ...target });
-    }
-    this.targetsByCallsign = targetsByCallsign;
+    this.targetsByCallsign = targetMap(targets);
   }
 
   filterExpression(): string {
     if (this.targetsByCallsign.size === 0) {
       throw new AprsMonitorError();
     }
-    return `b/${[...this.targetsByCallsign.keys()].join("/")}`;
+    return APRS_RX_FILTER_EXPRESSION;
+  }
+
+  replaceTargets(targets: readonly AprsMonitorTarget[]): void {
+    this.targetsByCallsign = targetMap(targets);
   }
 
   observeLine(line: string, receivedAt: string): AprsMonitorResult {
@@ -278,6 +275,10 @@ export class AprsIsRxClient {
       this.options.provisionFingerprint,
     );
     const login = authorizationLogin(authorization);
+    const loginLine = `${authorization.loginLine} filter ${this.options.filterExpression}\r\n`;
+    if (Buffer.byteLength(loginLine, "utf8") > MAX_APRS_LINE_BYTES) {
+      throw new AprsMonitorAuthorizationError();
+    }
     const socket = net.createConnection({
       host: this.options.host,
       port: this.options.port,
@@ -299,10 +300,7 @@ export class AprsIsRxClient {
       if (!authorizationMatches(authorization, connectedAuthorization)) {
         throw new AprsMonitorAuthorizationError();
       }
-      await write(
-        socket,
-        `${authorization.loginLine} filter ${this.options.filterExpression}\r\n`,
-      );
+      await write(socket, loginLine);
       await reader.verified;
       const verifiedAuthorization = resolveAuthorization(
         this.options.authorizationProvider,
@@ -384,10 +382,22 @@ function validateTarget(target: AprsMonitorTarget): void {
   }
 }
 
+function targetMap(
+  targets: readonly AprsMonitorTarget[],
+): ReadonlyMap<string, AprsMonitorTarget> {
+  const targetsByCallsign = new Map<string, AprsMonitorTarget>();
+  for (const target of targets) {
+    validateTarget(target);
+    if (targetsByCallsign.has(target.callsign)) {
+      throw new AprsMonitorError();
+    }
+    targetsByCallsign.set(target.callsign, { ...target });
+  }
+  return targetsByCallsign;
+}
+
 function isFilterExpression(value: string): boolean {
-  return /^b\/[A-Z0-9]{1,6}(?:-[0-9]{1,2})?(?:\/[A-Z0-9]{1,6}(?:-[0-9]{1,2})?)*$/.test(
-    value,
-  );
+  return value === APRS_RX_FILTER_EXPRESSION;
 }
 
 function isTimestamp(value: string): boolean {
