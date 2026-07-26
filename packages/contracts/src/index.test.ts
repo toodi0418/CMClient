@@ -799,6 +799,25 @@ describe("position domain contracts", () => {
     expect(outboxEntry.Check({ ...entry, deliveryStatus: "sent" })).toBe(false);
   });
 
+  it.each(["APRS_MAPPING_UNAVAILABLE", "APRS_MAPPING_CONFLICT"] as const)(
+    "accepts the %s durable position decision",
+    (code) => {
+      const decision = TypeCompiler.Compile(PositionDecisionSchema);
+
+      expect(
+        decision.Check({
+          schemaVersion: 1,
+          id: `position-decision-${code.toLowerCase()}`,
+          observationId: "position-observation-1",
+          canonicalEventId: "position-event-1",
+          code,
+          decidedAt: "2026-07-18T00:00:01.006Z",
+          parameters: {},
+        }),
+      ).toBe(true);
+    },
+  );
+
   it("keeps local observations, canonical events, decisions, and high-water state separate", () => {
     const observation = TypeCompiler.Compile(PositionObservationSchema);
     const event = TypeCompiler.Compile(PositionCanonicalEventSchema);

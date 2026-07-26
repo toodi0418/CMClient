@@ -11,7 +11,9 @@ Position processing persists four distinct records before any APRS operation:
   `position_timestamp`, `position_time`, or `sequence`; device `rx_time` is
   never an event time source.
 - `PositionDecision` records a stable accept, duplicate, historical, clock,
-  precision, sequence, or quarantine code with typed parameters.
+  precision, sequence, quarantine, unavailable mapping, or conflicting mapping
+  code with typed parameters. A mapping miss includes the absence of a revision
+  effective at or before the trusted source event time.
 - `NodePositionState` is the high-water record. Its composite identity is
   `(mesh_network_id, node_num, callsign, mapping_version)`, so mapping changes
   and separate Mesh networks cannot overwrite one another's live marker.

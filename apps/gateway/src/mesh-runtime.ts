@@ -425,20 +425,30 @@ export class MeshGatewayRuntime {
       eligibility.event.eventTime!,
     );
     if (mapping.kind === "none") {
+      const decision = this.recordDecision(
+        positionObservation,
+        duplicate.event,
+        "APRS_MAPPING_UNAVAILABLE",
+      );
       this.publish("position.unmapped", {
         canonicalEventId: duplicate.event.id,
         meshNetworkId: duplicate.event.meshNetworkId,
         nodeNum: duplicate.event.nodeNum,
       });
-      return { event: duplicate.event, outboxCreated: false };
+      return { event: duplicate.event, decision, outboxCreated: false };
     }
     if (mapping.kind === "conflict") {
+      const decision = this.recordDecision(
+        positionObservation,
+        duplicate.event,
+        "APRS_MAPPING_CONFLICT",
+      );
       this.publish("callmesh.mapping.conflict", {
         canonicalEventId: duplicate.event.id,
         meshNetworkId: duplicate.event.meshNetworkId,
         nodeNum: duplicate.event.nodeNum,
       });
-      return { event: duplicate.event, outboxCreated: false };
+      return { event: duplicate.event, decision, outboxCreated: false };
     }
 
     const target: PositionMappingTarget = {

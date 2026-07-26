@@ -63,7 +63,9 @@ Telemetry, or Position domain records. Position records continue through
 canonical duplicate detection, active CallMesh mapping selection, validation,
 local and APRS-monitor high-water checks, deterministic APRS encoding, and the
 durable outbox. Mapping conflicts, inadequate precision, untrusted ordering,
-and unmapped nodes do not enqueue an upload.
+and unmapped nodes do not enqueue an upload. Mapping conflicts and missing or
+not-yet-effective mappings persist a stable position decision before retaining
+the existing conflict or unmapped SSE event.
 
 ## CallMesh runtime
 

@@ -368,6 +368,180 @@ describe("MeshGatewayRuntime", () => {
     database.close();
   });
 
+  it.each([
+    ["an empty mapping set", undefined],
+    [
+      "a future-only mapping set",
+      {
+        version: "mapping-future",
+        effectiveAt: "2026-07-18T00:00:04.251Z",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        callsign: "N0CALL-7",
+      },
+    ],
+  ] as const)(
+    "records a durable unavailable decision for %s without enqueueing or advancing",
+    async (_fixture, mapping) => {
+      const database = new GatewayDatabase(":memory:");
+      database.callmeshMappings.replace(mapping ? [mapping] : []);
+      const schema = await loadMeshtasticSchema();
+      const events = new DomainEventBus({
+        eventIdFactory: sequentialFactory("mapping-unavailable-event"),
+      });
+      const observedTypes: string[] = [];
+      events.subscribe((event) => observedTypes.push(event.type));
+      const runtime = createRuntime(
+        database,
+        schema,
+        new FixtureTransport(),
+        events,
+      );
+
+      const result = runtime.ingestFrame({
+        kind: "frame",
+        frame: positionFrame(schema, 32),
+        receivedAt: "2026-07-18T00:00:05.000Z",
+        sessionConnectedAt: "2026-07-18T00:00:01.000Z",
+      });
+
+      expect(result.position).toMatchObject({
+        decision: { code: "APRS_MAPPING_UNAVAILABLE", parameters: {} },
+        outboxCreated: false,
+      });
+      expect(database.aprsOutbox.list(10)).toEqual([]);
+      expect(
+        database.connection.prepare("SELECT * FROM node_position_state").all(),
+      ).toEqual([]);
+      expect(
+        database.connection
+          .prepare("SELECT code, parameters FROM position_decisions")
+          .all(),
+      ).toEqual([{ code: "APRS_MAPPING_UNAVAILABLE", parameters: "{}" }]);
+      expect(observedTypes).toEqual(
+        expect.arrayContaining(["position.unmapped", "position.decision"]),
+      );
+      database.close();
+    },
+  );
+
+  it("records a durable mapping-conflict rejection while preserving its SSE event", async () => {
+    const database = new GatewayDatabase(":memory:");
+    database.callmeshMappings.replace([
+      {
+        version: "mapping-conflict-a",
+        effectiveAt: "2026-07-18T00:00:00.000Z",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        callsign: "N0CALL-7",
+      },
+      {
+        version: "mapping-conflict-b",
+        effectiveAt: "2026-07-18T00:00:00.000Z",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        callsign: "N1CALL-7",
+      },
+    ]);
+    const schema = await loadMeshtasticSchema();
+    const events = new DomainEventBus({
+      eventIdFactory: sequentialFactory("mapping-conflict-event"),
+    });
+    const observedTypes: string[] = [];
+    events.subscribe((event) => observedTypes.push(event.type));
+    const runtime = createRuntime(
+      database,
+      schema,
+      new FixtureTransport(),
+      events,
+    );
+
+    const result = runtime.ingestFrame({
+      kind: "frame",
+      frame: positionFrame(schema, 32),
+      receivedAt: "2026-07-18T00:00:05.000Z",
+      sessionConnectedAt: "2026-07-18T00:00:01.000Z",
+    });
+
+    expect(result.position).toMatchObject({
+      decision: { code: "APRS_MAPPING_CONFLICT", parameters: {} },
+      outboxCreated: false,
+    });
+    expect(database.aprsOutbox.list(10)).toEqual([]);
+    expect(
+      database.connection.prepare("SELECT * FROM node_position_state").all(),
+    ).toEqual([]);
+    expect(
+      database.connection
+        .prepare("SELECT code, parameters FROM position_decisions")
+        .all(),
+    ).toEqual([{ code: "APRS_MAPPING_CONFLICT", parameters: "{}" }]);
+    expect(observedTypes).toEqual(
+      expect.arrayContaining([
+        "callmesh.mapping.conflict",
+        "position.decision",
+      ]),
+    );
+    database.close();
+  });
+
+  it("accepts and enqueues a mapping effective exactly at the trusted event time", async () => {
+    const database = new GatewayDatabase(":memory:");
+    database.callmeshMappings.replace([
+      {
+        version: "mapping-boundary",
+        effectiveAt: "2026-07-18T00:00:04.250Z",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        callsign: "N0CALL-7",
+      },
+    ]);
+    const schema = await loadMeshtasticSchema();
+    const events = new DomainEventBus({
+      eventIdFactory: sequentialFactory("mapping-boundary-event"),
+    });
+    const observedTypes: string[] = [];
+    events.subscribe((event) => observedTypes.push(event.type));
+    const runtime = createRuntime(
+      database,
+      schema,
+      new FixtureTransport(),
+      events,
+    );
+
+    const result = runtime.ingestFrame({
+      kind: "frame",
+      frame: positionFrame(schema, 32),
+      receivedAt: "2026-07-18T00:00:05.000Z",
+      sessionConnectedAt: "2026-07-18T00:00:01.000Z",
+    });
+
+    expect(result.position).toMatchObject({
+      decision: { code: "POSITION_ACCEPTED" },
+      outboxCreated: true,
+    });
+    expect(database.aprsOutbox.list(10)).toEqual([
+      expect.objectContaining({
+        callsign: "N0CALL-7",
+        status: "queued",
+      }),
+    ]);
+    expect(
+      database.connection
+        .prepare("SELECT mapping_version FROM aprs_outbox")
+        .get(),
+    ).toEqual({ mapping_version: "mapping-boundary" });
+    expect(
+      database.connection
+        .prepare("SELECT callsign, mapping_version FROM node_position_state")
+        .get(),
+    ).toEqual({ callsign: "N0CALL-7", mapping_version: "mapping-boundary" });
+    expect(observedTypes).toEqual(
+      expect.arrayContaining(["position.decision", "aprs.outbox.queued"]),
+    );
+    database.close();
+  });
+
   it("retries an orphan canonical event after an atomic outbox failure", async () => {
     const database = new GatewayDatabase(":memory:");
     database.callmeshMappings.replace([
