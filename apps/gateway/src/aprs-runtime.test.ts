@@ -676,6 +676,16 @@ describe("AprsGatewayRuntime", () => {
     onLine?.(
       "BM2XYZ-7>APTMAG,TCPIP*,qAC,T2FIXTURE:!2502.85N/12131.05E>unrelated",
     );
+    expect(
+      eventTypes.filter((type) => type === "aprs.monitor.observed"),
+    ).toHaveLength(observedBeforeRemovedLine);
+    expect(
+      database.connection
+        .prepare(
+          "SELECT callsign FROM aprs_observed_packets ORDER BY callsign ASC",
+        )
+        .all(),
+    ).toEqual([{ callsign: "N1CALL-7" }]);
 
     state = {
       ...state,

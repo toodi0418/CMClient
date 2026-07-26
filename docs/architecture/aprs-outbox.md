@@ -93,11 +93,12 @@ Gateway-specific path information and every local observation attribute stay
 outside the stored Data and never alter the canonical APRS payload. The
 separate receive-only monitor uses the deterministic
 `<callsignBase>-C<uppercase hex abs(SSID)>` login and the fixed
-`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX t/p` server filter; it is never a packet source or
+`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX` server filter; it is never a packet source or
 path component. APRS-IS combines positive filter clauses additively with OR
-semantics, so this subscription includes worldwide position packets as well as
-all packet types from the listed prefixes, plus any default message traffic on
-port `14580`. None of that broad wire traffic is delivery proof by itself. Only
-a parseable packet selected by the current local mapping or station matcher and
-matching one eligible outbox or station source/destination/information tuple is
-persisted, published, or allowed to confirm delivery.
+semantics, so this subscription includes all packet types from the listed
+Taiwan prefixes, plus any default message traffic on port `14580`; it does not
+request the global `t/p` position feed. None of that wire traffic is delivery
+proof by itself. Only a parseable packet selected by the current local mapping
+or station matcher and matching one eligible outbox or station
+source/destination/information tuple is persisted, published, or allowed to
+confirm delivery.

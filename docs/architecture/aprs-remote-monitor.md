@@ -18,13 +18,13 @@ fixed filter, and terminating CRLF must also fit the inclusive 512-byte APRS-IS
 line limit.
 
 Every observer session uses the fixed server filter
-`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX t/p`. APRS-IS positive filter clauses are
-additive and use OR semantics: the prefix clause admits all packet types from
-those source-call prefixes, while `t/p` additionally admits position packets
-worldwide. The user-defined port `14580` may also deliver its default message
-traffic, as documented by the APRS-IS
+`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX`. APRS-IS positive filter clauses are additive
+and use OR semantics: this prefix clause admits all packet types from the
+listed Taiwan source-call prefixes. CMClient deliberately does not request the
+global `t/p` position feed. The user-defined port `14580` may still deliver its
+default message traffic, as documented by the APRS-IS
 [server-side filter commands](https://www.aprs-is.net/javAPRSFilter.aspx). This
-server filter is therefore only a coarse wire subscription, not CMClient's
+prefix-only filter is a bounded coarse wire subscription, not CMClient's
 delivery-confirmation boundary.
 
 Mappings never enter the server filter or RX connection identity. A mapping

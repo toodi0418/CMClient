@@ -16,7 +16,7 @@ const MAX_APRS_LINE_BYTES = 512;
 const MAX_APRS_BUFFER_BYTES = 1_024;
 const APRS_CALLSIGN_PATTERN = /^[A-Z0-9]{1,6}(?:-(?:[1-9]|1[0-5]))?$/;
 const APRS_LOGIN_CALLSIGN_PATTERN = /^[A-Z0-9]{3,6}(?:-[A-Z0-9]{1,2})?$/;
-export const APRS_RX_FILTER_EXPRESSION = "p/BM/BN/BO/BP/BQ/BU/BV/BW/BX t/p";
+export const APRS_RX_FILTER_EXPRESSION = "p/BM/BN/BO/BP/BQ/BU/BV/BW/BX";
 
 export interface AprsMonitorTarget {
   callsign: string;

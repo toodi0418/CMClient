@@ -51,11 +51,13 @@ describe("APRS-IS monitor", () => {
     const advanced = monitor.observeLine(encoded, "2026-07-18T00:01:00.000Z");
     const repeated = monitor.observeLine(encoded, "2026-07-18T00:01:01.000Z");
     const unknown = monitor.observeLine(
-      encoded.replace("N0CALL-7", "N1CALL-7"),
+      encoded.replace("N0CALL-7", "BM2XYZ-7"),
       "2026-07-18T00:01:02.000Z",
     );
 
     expect(monitor.filterExpression()).toBe(APRS_RX_FILTER_EXPRESSION);
+    expect(APRS_RX_FILTER_EXPRESSION).toBe("p/BM/BN/BO/BP/BQ/BU/BV/BW/BX");
+    expect(APRS_RX_FILTER_EXPRESSION).not.toContain("t/p");
     expect(advanced).toMatchObject({
       kind: "advanced",
       remote: { infoDigest: expect.stringMatching(/^[a-f0-9]{64}$/) },
@@ -68,6 +70,11 @@ describe("APRS-IS monitor", () => {
     });
     expect(repeated).toMatchObject({ kind: "not_new" });
     expect(unknown).toEqual({ kind: "ignored", reason: "unmapped_callsign" });
+    expect(
+      database.connection
+        .prepare("SELECT COUNT(*) AS count FROM aprs_observed_packets")
+        .get(),
+    ).toEqual({ count: 1 });
     database.close();
   });
 
@@ -253,6 +260,7 @@ describe("AprsIsRxClient", () => {
     expect(loginLines).toEqual([
       `user TEST01-CM pass 17602 vers CMClient 2.0 filter ${APRS_RX_FILTER_EXPRESSION}`,
     ]);
+    expect(loginLines[0]).not.toContain("t/p");
     expect(received).toEqual([encode(event("2026-07-18T00:00:35.000Z"))]);
     await session.close();
     await close(server);

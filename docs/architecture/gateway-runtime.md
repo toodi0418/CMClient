@@ -96,11 +96,12 @@ environment values are rejected. The runtime performs an immediate outbox
 flush and APRS-monitor refresh, then repeats both on bounded configured
 intervals. The receive-only observer derives its login as
 `<callsignBase>-C<uppercase hex abs(SSID)>` and uses the fixed
-`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX t/p` server filter. APRS-IS positive filters are
+`p/BM/BN/BO/BP/BQ/BU/BV/BW/BX` server filter. APRS-IS positive filters are
 additive OR clauses, so that subscription admits all packet types from the
-listed source-call prefixes, worldwide position packets, and the default
-message traffic that port `14580` may supply. The server feed is deliberately
-broader than CMClient's local confirmation boundary.
+listed Taiwan source-call prefixes and the default message traffic that port
+`14580` may supply. CMClient deliberately does not request the global `t/p`
+position feed. The server feed is still broader than CMClient's local
+confirmation boundary.
 
 Active mappings and the canonical station identity form a local exact target
 matcher. Mapping additions, removals, version changes, and effective-time
