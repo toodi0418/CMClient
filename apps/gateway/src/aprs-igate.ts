@@ -96,6 +96,7 @@ export interface AprsIgateSubmission {
   attemptedAt: string;
   updatedAt: string;
   submittedAt?: string;
+  localWriteCompletedAt?: string;
   observerConfirmedAt?: string;
   observationExpiresAt: string;
 }
@@ -267,6 +268,26 @@ export class AprsIgateRepository {
         transactionOpen = false;
         return { created: false, submission };
       }
+      const observerProven = this.database
+        .prepare(
+          "SELECT * FROM aprs_igate_submissions WHERE provision_fingerprint = ? AND callsign = ? AND destination = ? AND info = ? AND delivery_status = 'observer_confirmed' AND local_write_completed_at IS NULL AND observer_confirmed_at >= ? AND observer_confirmed_at <= ? ORDER BY observer_confirmed_at DESC, updated_at DESC, id ASC LIMIT 1",
+        )
+        .get(
+          provisionFingerprint,
+          parsed.callsign,
+          parsed.destination,
+          parsed.info,
+          localCutoff,
+          attemptedAt,
+        );
+      if (observerProven) {
+        const submission = toSubmission(
+          observerProven as Record<string, unknown>,
+        );
+        this.database.exec("COMMIT");
+        transactionOpen = false;
+        return { created: false, submission };
+      }
       const id = `aprs-igate-${randomUUID()}`;
       this.database
         .prepare(
@@ -363,23 +384,49 @@ export class AprsIgateRepository {
       transactionOpen = true;
       const current = this.requiredSubmission(id);
       if (
-        !["sending", "transmission_uncertain", "observer_confirmed"].includes(
-          current.deliveryStatus,
-        ) ||
+        current.deliveryStatus !== "sending" ||
         Date.parse(submittedAt) < Date.parse(current.attemptedAt) ||
         Date.parse(submittedAt) > Date.parse(current.observationExpiresAt)
       ) {
         throw new AprsIgatePersistenceError();
       }
-      const nextStatus =
-        current.deliveryStatus === "observer_confirmed"
-          ? "observer_confirmed"
-          : "submitted";
+      const evidence = this.database
+        .prepare(
+          "SELECT first_observed_at, last_observed_at FROM aprs_observed_packets WHERE callsign = ? AND destination = ? AND info = ?",
+        )
+        .get(current.callsign, current.destination, current.info) as
+        Record<string, unknown> | undefined;
+      const observerConfirmedAt = evidence
+        ? [
+            String(evidence.first_observed_at),
+            String(evidence.last_observed_at),
+          ]
+            .filter(
+              (observedAt, index, values) =>
+                values.indexOf(observedAt) === index &&
+                isTimestamp(observedAt) &&
+                Date.parse(observedAt) >= Date.parse(submittedAt) &&
+                Date.parse(observedAt) <=
+                  Date.parse(current.observationExpiresAt),
+            )
+            .sort()[0]
+        : undefined;
+      const nextStatus = observerConfirmedAt
+        ? "observer_confirmed"
+        : "submitted";
       this.database
         .prepare(
-          "UPDATE aprs_igate_submissions SET delivery_status = ?, submitted_at = ?, updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END WHERE id = ? AND delivery_status IN ('sending', 'transmission_uncertain', 'observer_confirmed')",
+          "UPDATE aprs_igate_submissions SET delivery_status = ?, submitted_at = ?, local_write_completed_at = ?, observer_confirmed_at = ?, updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END WHERE id = ? AND delivery_status = 'sending'",
         )
-        .run(nextStatus, submittedAt, submittedAt, submittedAt, id);
+        .run(
+          nextStatus,
+          submittedAt,
+          submittedAt,
+          observerConfirmedAt ?? null,
+          observerConfirmedAt ?? submittedAt,
+          observerConfirmedAt ?? submittedAt,
+          id,
+        );
       this.database
         .prepare(
           "INSERT INTO aprs_local_transmissions (callsign, destination, info, transmitted_at) VALUES (?, ?, ?, ?) ON CONFLICT(callsign, destination, info) DO UPDATE SET transmitted_at = excluded.transmitted_at",
@@ -443,13 +490,14 @@ export class AprsIgateRepository {
       transactionOpen = true;
       const ids = this.database
         .prepare(
-          "SELECT id FROM aprs_igate_submissions WHERE provision_fingerprint = ? AND callsign = ? AND destination = ? AND info = ? AND delivery_status IN ('sending', 'transmission_uncertain', 'submitted') AND attempted_at <= ? AND observation_expires_at >= ? ORDER BY attempted_at ASC, id ASC",
+          "SELECT id FROM aprs_igate_submissions WHERE provision_fingerprint = ? AND callsign = ? AND destination = ? AND info = ? AND ((delivery_status = 'submitted' AND submitted_at IS NOT NULL AND submitted_at <= ?) OR (delivery_status = 'transmission_uncertain' AND attempted_at <= ?)) AND observation_expires_at >= ? ORDER BY attempted_at ASC, id ASC",
         )
         .all(
           provisionFingerprint,
           callsign,
           destination,
           info,
+          observedAt,
           observedAt,
           observedAt,
         )
@@ -490,7 +538,7 @@ export class AprsIgateRepository {
       this.expireActiveInsideTransaction(reconciledAt, provisionFingerprint);
       const rows = this.database
         .prepare(
-          "SELECT submission.id AS id, observed.last_observed_at AS observed_at FROM aprs_igate_submissions AS submission JOIN aprs_observed_packets AS observed ON observed.callsign = submission.callsign AND observed.destination = submission.destination AND observed.info = submission.info WHERE submission.provision_fingerprint = ? AND submission.delivery_status IN ('sending', 'transmission_uncertain', 'submitted') AND observed.last_observed_at >= submission.attempted_at AND observed.last_observed_at <= submission.observation_expires_at AND observed.last_observed_at <= ? ORDER BY submission.attempted_at ASC, submission.id ASC",
+          "SELECT submission.id AS id, observed.last_observed_at AS observed_at FROM aprs_igate_submissions AS submission JOIN aprs_observed_packets AS observed ON observed.callsign = submission.callsign AND observed.destination = submission.destination AND observed.info = submission.info WHERE submission.provision_fingerprint = ? AND ((submission.delivery_status = 'submitted' AND submission.submitted_at IS NOT NULL AND observed.last_observed_at >= submission.submitted_at) OR (submission.delivery_status = 'transmission_uncertain' AND observed.last_observed_at >= submission.attempted_at)) AND observed.last_observed_at <= submission.observation_expires_at AND observed.last_observed_at <= ? ORDER BY submission.attempted_at ASC, submission.id ASC",
         )
         .all(provisionFingerprint, reconciledAt) as Array<{
         id: unknown;
@@ -650,21 +698,19 @@ export class AprsIgateRepository {
     observedAt: string,
   ): AprsIgateSubmission {
     const current = this.requiredSubmission(id);
-    this.database
+    const result = this.database
       .prepare(
-        "UPDATE aprs_igate_submissions SET delivery_status = 'observer_confirmed', submitted_at = COALESCE(submitted_at, ?), observer_confirmed_at = ?, updated_at = ? WHERE id = ? AND delivery_status IN ('sending', 'transmission_uncertain', 'submitted')",
+        "UPDATE aprs_igate_submissions SET delivery_status = 'observer_confirmed', observer_confirmed_at = ?, updated_at = ? WHERE id = ? AND delivery_status IN ('transmission_uncertain', 'submitted')",
       )
-      .run(observedAt, observedAt, observedAt, id);
-    if (current.submittedAt === undefined) {
-      this.database
-        .prepare(
-          "INSERT INTO aprs_local_transmissions (callsign, destination, info, transmitted_at) VALUES (?, ?, ?, ?) ON CONFLICT(callsign, destination, info) DO NOTHING",
-        )
-        .run(current.callsign, current.destination, current.info, observedAt);
+      .run(observedAt, observedAt, id);
+    if (Number(result.changes) !== 1) {
+      throw new AprsIgatePersistenceError();
     }
-    const sequence = telemetrySequence(current);
-    if (sequence !== undefined) {
-      this.persistSequenceInsideTransaction(current, sequence, observedAt);
+    if (current.deliveryStatus === "transmission_uncertain") {
+      const sequence = telemetrySequence(current);
+      if (sequence !== undefined) {
+        this.persistSequenceInsideTransaction(current, sequence, observedAt);
+      }
     }
     return this.requiredSubmission(id);
   }
@@ -1298,6 +1344,7 @@ function toSubmission(row: Record<string, unknown>): AprsIgateSubmission {
   const deliveryStatus = row.delivery_status;
   const attemptedAt = row.attempted_at;
   const submittedAt = row.submitted_at;
+  const localWriteCompletedAt = row.local_write_completed_at;
   const observerConfirmedAt = row.observer_confirmed_at;
   const observationExpiresAt = row.observation_expires_at;
   const updatedAt = row.updated_at;
@@ -1329,18 +1376,24 @@ function toSubmission(row: Record<string, unknown>): AprsIgateSubmission {
 
   const hasConfirmation = observerConfirmedAt !== null;
   const hasSubmission = submittedAt !== null;
+  const hasLocalWrite = localWriteCompletedAt !== null;
   if (
     (deliveryStatus === "observer_confirmed") !== hasConfirmation ||
-    (deliveryStatus === "observer_confirmed" && !hasSubmission) ||
     (hasSubmission &&
       (!isTimestamp(submittedAt) ||
         Date.parse(submittedAt) < Date.parse(attemptedAt) ||
         Date.parse(submittedAt) > Date.parse(observationExpiresAt))) ||
-    (deliveryStatus === "submitted" && !hasSubmission) ||
+    (deliveryStatus === "submitted" && (!hasSubmission || !hasLocalWrite)) ||
+    (hasLocalWrite &&
+      (!hasSubmission ||
+        !isTimestamp(localWriteCompletedAt) ||
+        Date.parse(localWriteCompletedAt) !== Date.parse(submittedAt))) ||
     (hasConfirmation &&
       (!isTimestamp(observerConfirmedAt) ||
         Date.parse(observerConfirmedAt) < Date.parse(attemptedAt) ||
-        Date.parse(observerConfirmedAt) > Date.parse(observationExpiresAt)))
+        Date.parse(observerConfirmedAt) > Date.parse(observationExpiresAt) ||
+        (hasSubmission &&
+          Date.parse(observerConfirmedAt) < Date.parse(submittedAt))))
   ) {
     throw new AprsIgatePersistenceError();
   }
@@ -1357,6 +1410,9 @@ function toSubmission(row: Record<string, unknown>): AprsIgateSubmission {
     updatedAt,
     observationExpiresAt,
     ...(typeof submittedAt === "string" ? { submittedAt } : {}),
+    ...(typeof localWriteCompletedAt === "string"
+      ? { localWriteCompletedAt }
+      : {}),
     ...(typeof observerConfirmedAt === "string" ? { observerConfirmedAt } : {}),
   };
 }
@@ -1386,6 +1442,9 @@ function publicSubmission(
     updatedAt: submission.updatedAt,
     observationExpiresAt: submission.observationExpiresAt,
     ...(submission.submittedAt ? { submittedAt: submission.submittedAt } : {}),
+    ...(submission.localWriteCompletedAt
+      ? { localWriteCompletedAt: submission.localWriteCompletedAt }
+      : {}),
     ...(submission.observerConfirmedAt
       ? { observerConfirmedAt: submission.observerConfirmedAt }
       : {}),

@@ -498,6 +498,7 @@ describe("Legacy-compatible APRS iGate packet family", () => {
         deliveryStatus: "observer_confirmed",
         attemptedAt,
         submittedAt,
+        localWriteCompletedAt: submittedAt,
         observerConfirmedAt: observedAt,
         updatedAt: observedAt,
         observationExpiresAt: submitted.observationExpiresAt,
@@ -529,6 +530,7 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     expect(repository.markSubmitted(intent.id, submittedAt)).toMatchObject({
       deliveryStatus: "submitted",
       submittedAt,
+      localWriteCompletedAt: submittedAt,
     });
     expect(repository.loadLastSuccessfulSequence("N1GATE-10")).toBe(42);
     expect(
@@ -541,7 +543,7 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     database.close();
   });
 
-  it("preserves an observer confirmation that races local socket completion", () => {
+  it("does not attribute an observer packet before local socket completion", () => {
     const database = new GatewayDatabase(":memory:");
     const repository = new AprsIgateRepository(database.connection);
     const attemptedAt = new Date(START).toISOString();
@@ -569,21 +571,25 @@ describe("Legacy-compatible APRS iGate packet family", () => {
         parsed.info,
         observedAt,
       ),
-    ).toEqual([
+    ).toEqual([]);
+    const pending = repository.list();
+    expect(pending).toEqual([
       expect.objectContaining({
         id: intent.id,
-        deliveryStatus: "observer_confirmed",
-        observerConfirmedAt: observedAt,
+        deliveryStatus: "sending",
       }),
     ]);
-    expect(repository.loadLastSuccessfulSequence("N1GATE-10")).toBe(43);
+    expect(pending[0]).not.toHaveProperty("submittedAt");
+    expect(pending[0]).not.toHaveProperty("localWriteCompletedAt");
+    expect(pending[0]).not.toHaveProperty("observerConfirmedAt");
+    expect(repository.loadLastSuccessfulSequence("N1GATE-10")).toBe(0);
     expect(
       database.connection
         .prepare(
           "SELECT transmitted_at FROM aprs_local_transmissions WHERE callsign = ? AND destination = ? AND info = ?",
         )
         .get(parsed.callsign, parsed.destination, parsed.info),
-    ).toEqual({ transmitted_at: observedAt });
+    ).toBeUndefined();
     expect(
       new AprsIgateRepository(database.connection).beginTransmission(
         packet,
@@ -592,12 +598,11 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       ),
     ).toMatchObject({
       created: false,
-      submission: { id: intent.id, deliveryStatus: "observer_confirmed" },
+      submission: { id: intent.id, deliveryStatus: "sending" },
     });
     expect(repository.markSubmitted(intent.id, submittedAt)).toMatchObject({
-      deliveryStatus: "observer_confirmed",
+      deliveryStatus: "submitted",
       submittedAt,
-      observerConfirmedAt: observedAt,
       updatedAt: submittedAt,
     });
     expect(repository.loadLastSuccessfulSequence("N1GATE-10")).toBe(43);
@@ -608,15 +613,44 @@ describe("Legacy-compatible APRS iGate packet family", () => {
         )
         .get(parsed.callsign, parsed.destination, parsed.info),
     ).toEqual({ transmitted_at: submittedAt });
+    const confirmedAt = new Date(START + 3).toISOString();
+    expect(
+      repository.confirmObserved(
+        PROVISION_FINGERPRINT,
+        parsed.callsign,
+        parsed.destination,
+        parsed.info,
+        confirmedAt,
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        id: intent.id,
+        deliveryStatus: "observer_confirmed",
+        submittedAt,
+        observerConfirmedAt: confirmedAt,
+      }),
+    ]);
     database.close();
   });
 
-  it("recovers an interrupted write without blind resend and reconciles its cache", () => {
+  it("recovers observer-proven uncertain telemetry without claiming a local write", async () => {
     const database = new GatewayDatabase(":memory:");
     const repository = new AprsIgateRepository(database.connection);
     const attemptedAt = new Date(START).toISOString();
     const observedAt = new Date(START + MINUTE_MS).toISOString();
-    const packet = encodeAprsIgateBeacon(provision);
+    const packet = encodeAprsIgateTelemetryData(provision, 43, {
+      all: 1,
+      forwardedAprs: 2,
+      position: 3,
+      message: 4,
+      control: 5,
+    });
+    repository.persistLastSuccessfulSequence(
+      "N1GATE-10",
+      PROVISION_FINGERPRINT,
+      42,
+      new Date(START - 1).toISOString(),
+    );
     const intent = repository.beginTransmission(
       packet,
       PROVISION_FINGERPRINT,
@@ -646,14 +680,57 @@ describe("Legacy-compatible APRS iGate packet family", () => {
         observedAt,
         observedAt,
       );
-    expect(
-      repository.reconcileObserved(PROVISION_FINGERPRINT, observedAt),
-    ).toEqual([
+    const reconciled = repository.reconcileObserved(
+      PROVISION_FINGERPRINT,
+      observedAt,
+    );
+    expect(reconciled).toEqual([
       expect.objectContaining({
         id: intent.id,
         deliveryStatus: "observer_confirmed",
       }),
     ]);
+    expect(reconciled[0]).not.toHaveProperty("submittedAt");
+    expect(reconciled[0]).not.toHaveProperty("localWriteCompletedAt");
+    expect(
+      database.connection
+        .prepare(
+          "SELECT transmitted_at FROM aprs_local_transmissions WHERE callsign = ? AND destination = ? AND info = ?",
+        )
+        .get(parsed.callsign, parsed.destination, parsed.info),
+    ).toBeUndefined();
+    const restartedRepository = new AprsIgateRepository(database.connection);
+    expect(restartedRepository.loadLastSuccessfulSequence("N1GATE-10")).toBe(
+      43,
+    );
+    expect(
+      restartedRepository.beginTransmission(
+        packet,
+        PROVISION_FINGERPRINT,
+        new Date(Date.parse(observedAt) + 1).toISOString(),
+      ),
+    ).toMatchObject({
+      created: false,
+      submission: {
+        id: intent.id,
+        deliveryStatus: "observer_confirmed",
+        observerConfirmedAt: observedAt,
+      },
+    });
+    const restartedFamily = new AprsIgateFamily({
+      provision,
+      version: "2.0.0",
+      lastSuccessfulTelemetrySequence:
+        restartedRepository.loadLastSuccessfulSequence("N1GATE-10"),
+    });
+    const restartWrites = await restartedFamily.onVerifiedLogin(
+      Date.parse(observedAt) + 2,
+      () => true,
+    );
+    expect(
+      restartWrites.find(({ packet: value }) => value.kind === "telemetry-data")
+        ?.packet.data,
+    ).toContain(":T#044,");
     expect(repository.deliveryCounts(PROVISION_FINGERPRINT)).toEqual({
       pending: 0,
       failed: 0,
@@ -661,13 +738,26 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     database.close();
   });
 
-  it("does not reconcile an exact observation older than the transmission intent", () => {
+  it("rejects an uncertain exact observation older than the transmission intent", () => {
     const database = new GatewayDatabase(":memory:");
     const repository = new AprsIgateRepository(database.connection);
     const observedAt = new Date(START).toISOString();
     const attemptedAt = new Date(START + MINUTE_MS).toISOString();
-    const packet = encodeAprsIgateBeacon(provision);
+    const uncertainAt = new Date(START + MINUTE_MS + 1).toISOString();
+    const packet = encodeAprsIgateTelemetryData(provision, 43, {
+      all: 1,
+      forwardedAprs: 2,
+      position: 3,
+      message: 4,
+      control: 5,
+    });
     const parsed = parseCmClientAprsLine(packet.data)!;
+    repository.persistLastSuccessfulSequence(
+      "N1GATE-10",
+      PROVISION_FINGERPRINT,
+      42,
+      new Date(START - 1).toISOString(),
+    );
     database.connection
       .prepare(
         "INSERT INTO aprs_observed_packets (callsign, destination, info, first_observed_at, last_observed_at) VALUES (?, ?, ?, ?, ?)",
@@ -684,14 +774,25 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       PROVISION_FINGERPRINT,
       attemptedAt,
     ).submission;
+    repository.markTransmissionUncertain(intent.id, uncertainAt);
 
     expect(
-      repository.reconcileObserved(PROVISION_FINGERPRINT, attemptedAt),
+      repository.confirmObserved(
+        PROVISION_FINGERPRINT,
+        parsed.callsign,
+        parsed.destination,
+        parsed.info,
+        observedAt,
+      ),
+    ).toEqual([]);
+    expect(
+      repository.reconcileObserved(PROVISION_FINGERPRINT, uncertainAt),
     ).toEqual([]);
     expect(repository.list()[0]).toMatchObject({
       id: intent.id,
-      deliveryStatus: "sending",
+      deliveryStatus: "transmission_uncertain",
     });
+    expect(repository.loadLastSuccessfulSequence("N1GATE-10")).toBe(42);
     database.close();
   });
 
@@ -746,6 +847,7 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     const confirmedPacket = parseCmClientAprsLine(
       encodeAprsIgateStatus(provision, "2.0.0").data,
     )!;
+    repository.markSubmitted(confirmed.id, firstAttemptedAt);
     repository.confirmObserved(
       PROVISION_FINGERPRINT,
       confirmedPacket.callsign,

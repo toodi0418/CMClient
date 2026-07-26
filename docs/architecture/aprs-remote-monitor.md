@@ -49,3 +49,16 @@ only when one pending submission matches the observation window. Socket write
 completion alone never advances it. This
 preserves mapping state isolation and avoids a central server or an elected
 primary iGate.
+
+Station transmission intent and local write completion are separate durable
+facts. An observation received while an intent is still `sending` remains only
+in the exact observer cache; it cannot synthesize `submittedAt`,
+`localWriteCompletedAt`, or a local-transmission cache row. Only the successful
+return from the station transport write records those local timestamps. A
+`transmission_uncertain` intent may still become `observer_confirmed` after an
+exact network observation, but without `localWriteCompletedAt` it is not proof
+that the current process completed that write. That exact observation still
+suppresses a repeat for the bounded local window and advances an observed
+telemetry sequence, without creating a local-transmission cache row.
+Qualification requires the attempt, local write completion, and observer
+confirmation to be ordered inside the same bounded run.

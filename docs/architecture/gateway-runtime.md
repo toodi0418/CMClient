@@ -117,7 +117,9 @@ failed projection does not erase the last valid state from the other.
 `GET /api/v1/aprs/station-submissions` exposes only station packet kind,
 delivery state, and lifecycle timestamps. A `sending` row exists before I/O;
 an interrupted write becomes `transmission_uncertain` and waits for exact
-observer-cache reconciliation. The projection never returns station identity,
+observer-cache reconciliation. `localWriteCompletedAt` is emitted only for a
+completed local transport write and is never inferred from an observer packet.
+The projection never returns station identity,
 APRS Data, coordinates, comment, or provision fingerprint.
 
 ## Telemetry and maintenance

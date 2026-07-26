@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
+import { AprsIgateRepository } from "../aprs-igate";
 import {
   createSqlMigration,
   DatabaseMigrationError,
@@ -13,6 +14,76 @@ import {
 } from "./database";
 
 describe("immutable Gateway migration history", () => {
+  it("upgrades real v20 iGate rows without inventing historical local writes", () => {
+    const database = legacyDatabase(20);
+    const insert = database.prepare(
+      "INSERT INTO aprs_igate_submissions (id, callsign, destination, info, packet_kind, provision_fingerprint, delivery_status, attempted_at, submitted_at, observer_confirmed_at, observation_expires_at, updated_at) VALUES (?, ?, 'APTMAG', ?, 'status', ?, ?, ?, ?, ?, ?, ?)",
+    );
+    const attemptedAt = "2026-07-20T00:00:00.000Z";
+    const submittedAt = "2026-07-20T00:00:01.000Z";
+    const observedAt = "2026-07-20T00:00:02.000Z";
+    const expiresAt = "2026-07-20T03:00:00.000Z";
+    const fingerprint = "a".repeat(64);
+    const submittedId = "aprs-igate-00000000-0000-4000-8000-000000000001";
+    const observerId = "aprs-igate-00000000-0000-4000-8000-000000000002";
+    insert.run(
+      submittedId,
+      "N1GATE-10",
+      ">TMAG Client v2.0.0",
+      fingerprint,
+      "submitted",
+      attemptedAt,
+      submittedAt,
+      null,
+      expiresAt,
+      submittedAt,
+    );
+    insert.run(
+      observerId,
+      "N1GATE-10",
+      ">TMAG Client v2.0.0-legacy",
+      fingerprint,
+      "observer_confirmed",
+      attemptedAt,
+      submittedAt,
+      observedAt,
+      expiresAt,
+      observedAt,
+    );
+
+    runMigrations(database, gatewayMigrations, true);
+
+    expect(
+      database
+        .prepare(
+          "SELECT id, local_write_completed_at FROM aprs_igate_submissions ORDER BY id",
+        )
+        .all(),
+    ).toEqual([
+      { id: submittedId, local_write_completed_at: submittedAt },
+      { id: observerId, local_write_completed_at: null },
+    ]);
+    const submissions = new AprsIgateRepository(database).list();
+    expect(submissions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: submittedId,
+          localWriteCompletedAt: submittedAt,
+        }),
+        expect.objectContaining({
+          id: observerId,
+          deliveryStatus: "observer_confirmed",
+          submittedAt,
+          observerConfirmedAt: observedAt,
+        }),
+      ]),
+    );
+    expect(submissions.find(({ id }) => id === observerId)).not.toHaveProperty(
+      "localWriteCompletedAt",
+    );
+    database.close();
+  });
+
   it("upgrades a legacy name-only v7 journal and retains its data", () => {
     const database = legacyDatabase(7);
     database
@@ -142,11 +213,12 @@ describe("immutable Gateway migration history", () => {
 
   it("rejects a future migration version", () => {
     expectHistoryDrift((database) => {
+      const futureVersion = gatewayMigrations.length + 1;
       database
         .prepare(
-          "INSERT INTO schema_migrations (version, name, sha256) VALUES (21, 'future', ?)",
+          "INSERT INTO schema_migrations (version, name, sha256) VALUES (?, 'future', ?)",
         )
-        .run("c".repeat(64));
+        .run(futureVersion, "c".repeat(64));
     });
   });
 

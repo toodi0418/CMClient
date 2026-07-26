@@ -181,6 +181,9 @@ export const AprsIgateSubmissionSchema = Type.Object(
     attemptedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
     updatedAt: Type.String({ pattern: UTC_ISO_TIMESTAMP }),
     submittedAt: Type.Optional(Type.String({ pattern: UTC_ISO_TIMESTAMP })),
+    localWriteCompletedAt: Type.Optional(
+      Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    ),
     observerConfirmedAt: Type.Optional(
       Type.String({ pattern: UTC_ISO_TIMESTAMP }),
     ),

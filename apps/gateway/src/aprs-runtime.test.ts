@@ -117,6 +117,54 @@ describe("AprsGatewayRuntime", () => {
     database.close();
   });
 
+  it("attributes a cached observer race only after the local write completes", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const state = aprsState("a", "N0CALL-7", 42);
+    const eventTypes: string[] = [];
+    const events = new DomainEventBus({ eventIdFactory: sequentialFactory() });
+    events.subscribe((event) => eventTypes.push(event.type));
+    let onLine: ((line: string) => void) | undefined;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: events,
+      stateProvider: () => state,
+      clock: () => new Date("2026-07-18T00:00:10.000Z"),
+      version: "2.0.0-test",
+      outbox: { flush: async () => [] },
+      stationTransport: {
+        send: async (data) => {
+          onLine?.(data.replace("TCPIP*:", "TCPIP*,qAC,T2TEST:"));
+        },
+      },
+      monitorClientFactory: () => ({
+        connect: async (listener) => {
+          onLine = listener;
+          return { close: async () => undefined };
+        },
+      }),
+    });
+
+    await runtime.refreshMonitor();
+    await runtime.igateNow();
+
+    expect(
+      database.connection
+        .prepare(
+          "SELECT delivery_status, COUNT(*) AS count FROM aprs_igate_submissions WHERE local_write_completed_at IS NOT NULL AND observer_confirmed_at >= local_write_completed_at GROUP BY delivery_status",
+        )
+        .all(),
+    ).toEqual([{ delivery_status: "observer_confirmed", count: 6 }]);
+    expect(
+      eventTypes.filter((type) => type === "aprs.igate.submitted"),
+    ).toHaveLength(6);
+    expect(
+      eventTypes.filter((type) => type === "aprs.igate.observer_confirmed"),
+    ).toHaveLength(6);
+
+    await runtime.stop();
+    database.close();
+  });
+
   it("reanchors station cadence after the verified TX session changes", async () => {
     const database = new GatewayDatabase(":memory:");
     const state = aprsState("a", "N0CALL-7", 42);

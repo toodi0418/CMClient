@@ -81,6 +81,12 @@ describe("GatewayDatabase", () => {
     }
     expect(
       database.connection
+        .prepare("PRAGMA table_info(aprs_igate_submissions)")
+        .all()
+        .map((row) => String(row.name)),
+    ).toContain("local_write_completed_at");
+    expect(
+      database.connection
         .prepare(
           "EXPLAIN QUERY PLAN DELETE FROM telemetry WHERE id IN (SELECT id FROM telemetry WHERE observed_at < ? ORDER BY observed_at ASC, id ASC LIMIT ?)",
         )
@@ -729,11 +735,12 @@ describe("GatewayDatabase", () => {
 
   it("rolls back a failed migration without advancing the journal", () => {
     const database = new GatewayDatabase(":memory:");
+    const futureVersion = gatewayMigrations.length + 1;
     expect(() =>
       runMigrations(database.connection, [
         ...gatewayMigrations,
         createSqlMigration(
-          21,
+          futureVersion,
           "broken",
           "CREATE TABLE migration_rollback_probe (id INTEGER); SELECT * FROM definitely_missing_table;",
         ),
@@ -741,8 +748,8 @@ describe("GatewayDatabase", () => {
     ).toThrow(DatabaseMigrationError);
     expect(
       database.connection
-        .prepare("SELECT version FROM schema_migrations WHERE version = 21")
-        .get(),
+        .prepare("SELECT version FROM schema_migrations WHERE version = ?")
+        .get(futureVersion),
     ).toBeUndefined();
     expect(
       database.connection

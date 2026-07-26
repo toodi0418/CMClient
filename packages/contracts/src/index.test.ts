@@ -746,7 +746,10 @@ describe("position domain contracts", () => {
         observationExpiresAt: "2026-07-18T03:00:00.000Z",
         ...(deliveryStatus === "submitted" ||
         deliveryStatus === "observer_confirmed"
-          ? { submittedAt: "2026-07-18T00:00:01.000Z" }
+          ? {
+              submittedAt: "2026-07-18T00:00:01.000Z",
+              localWriteCompletedAt: "2026-07-18T00:00:01.000Z",
+            }
           : {}),
         ...(deliveryStatus === "observer_confirmed"
           ? { observerConfirmedAt: "2026-07-18T00:00:02.000Z" }

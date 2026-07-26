@@ -37,6 +37,7 @@ const EXPECTED_SHA256 = [
   "3195acde77470f80ce1d6cf6764676863733c6d6fdef8fac9e46654fe8b779b6",
   "a0e68a9f124b7aa1ea84e00486574dcc445c5d09ac8e922d55d6df4d85424475",
   "b5da29496eafe700ec3b42c8ecdeaebd9b72fb58afaf8d5a0138f56d6f9255e1",
+  "fd513da2362821593ff6a3e83b042b8624c317ea73783920be5f1581165d331c",
 ] as const;
 
 function migration(
@@ -215,6 +216,10 @@ export const gatewayMigrations: readonly SqlMigration[] = Object.freeze([
     "CREATE INDEX aprs_igate_submissions_confirmation_index ON aprs_igate_submissions (provision_fingerprint, callsign, destination, info, attempted_at ASC, id ASC) WHERE delivery_status IN ('sending', 'transmission_uncertain', 'submitted')",
     "CREATE INDEX aprs_igate_submissions_expiry_index ON aprs_igate_submissions (observation_expires_at ASC, id ASC) WHERE delivery_status IN ('sending', 'transmission_uncertain', 'submitted')",
     "CREATE INDEX aprs_igate_submissions_retention_index ON aprs_igate_submissions (updated_at ASC, id ASC) WHERE delivery_status IN ('observer_confirmed', 'observation_expired')",
+  ]),
+  migration(21, "aprs_igate_local_write_completion", [
+    "ALTER TABLE aprs_igate_submissions ADD COLUMN local_write_completed_at TEXT",
+    "UPDATE aprs_igate_submissions SET local_write_completed_at = submitted_at WHERE delivery_status = 'submitted' AND submitted_at IS NOT NULL",
   ]),
 ]);
 

@@ -72,7 +72,9 @@ kind, durable delivery state, and bounded lifecycle timestamps. Its state is
 `sending|transmission_uncertain|submitted|observer_confirmed|observation_expired`.
 `sending` is a durable pre-I/O intent. `transmission_uncertain` means the local
 write outcome could not be proven and is held for exact observer
-reconciliation instead of being resent blindly. The projection excludes
+reconciliation instead of being resent blindly. `localWriteCompletedAt` is
+present only after the current process's transport write completes; an
+observer-only confirmation never creates it. The projection excludes
 callsign, destination, information field, provision fingerprint, coordinates,
 and comment.
 

@@ -14,6 +14,7 @@ import {
   AprsIgateFamily,
   AprsIgateRepository,
   type AprsIgatePacket,
+  type AprsIgateSubmission,
 } from "./aprs-igate.js";
 import {
   AprsTransmissionFencedError,
@@ -416,6 +417,7 @@ export class AprsGatewayRuntime {
             return false;
           }
           let submissionId: string | undefined;
+          let completedSubmission: AprsIgateSubmission | undefined;
           try {
             const attemptedAt = this.clock().toISOString();
             const intent = this.igateRepository.beginTransmission(
@@ -433,7 +435,7 @@ export class AprsGatewayRuntime {
               transportSession,
               () => this.canTransmit(generation),
             );
-            this.igateRepository.markSubmitted(
+            completedSubmission = this.igateRepository.markSubmitted(
               submissionId,
               this.clock().toISOString(),
             );
@@ -467,6 +469,12 @@ export class AprsGatewayRuntime {
           }
           if (this.isGenerationActive(generation)) {
             this.publish("aprs.igate.submitted", { kind: packet.kind });
+            if (completedSubmission?.deliveryStatus === "observer_confirmed") {
+              this.publish("aprs.igate.observer_confirmed", {
+                submissionId: completedSubmission.id,
+                kind: completedSubmission.packetKind,
+              });
+            }
           }
           return true;
         },
