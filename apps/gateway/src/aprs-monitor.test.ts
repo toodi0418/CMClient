@@ -662,6 +662,61 @@ describe("AprsIsRxClient", () => {
     await close(server);
   });
 
+  it("isolates a non-UTF-8 feed line after login and continues the session", async () => {
+    let peer: Socket | undefined;
+    const server = net.createServer((socket) => {
+      peer = socket;
+      socket.on("error", () => undefined);
+      socket.once("data", () => {
+        socket.write("# logresp TEST01 verified, fixture\r\n");
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsRxClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01 pass 11111 vers CMClient 2.0",
+      ),
+      provisionFingerprint: PROVISION_FINGERPRINT,
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
+    });
+    const received: string[] = [];
+    const errors: unknown[] = [];
+    const session = await client.connect(
+      (line) => received.push(line),
+      (error) => errors.push(error),
+    );
+    if (!peer || !session.terminated) {
+      throw new Error("fixture monitor session was not established");
+    }
+    let terminated = false;
+    void session.terminated.then(() => {
+      terminated = true;
+    });
+    const validLine = encode(event("2026-07-18T00:00:35.000Z"));
+
+    peer.write(
+      Buffer.concat([
+        Buffer.from("B0GUS>APTMAG:!invalid-", "ascii"),
+        Buffer.from([0xff]),
+        Buffer.from(`\r\n${validLine}\r\n`, "utf8"),
+      ]),
+    );
+    await waitFor(() => received.length === 1 || terminated);
+
+    expect(received).toEqual([validLine]);
+    expect(errors).toHaveLength(0);
+    expect(terminated).toBe(false);
+    await session.close();
+    await close(server);
+  });
+
   it("drains a coalesced burst before bounding the unterminated remainder", async () => {
     const received: string[] = [];
     let peerClosed = false;

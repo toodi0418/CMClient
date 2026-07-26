@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import { createHash } from "node:crypto";
 import net, { type Socket } from "node:net";
 import { DatabaseSync } from "node:sqlite";
@@ -526,8 +527,7 @@ function attachVerifiedLineReader(
   terminated: Promise<void>;
   beginClose: () => void;
 } {
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let buffer = "";
+  let buffer = Buffer.alloc(0);
   let state: "awaiting" | "verified" | "failed" | "closing" = "awaiting";
   let resolveVerified!: () => void;
   let rejectVerified!: (error: AprsMonitorError) => void;
@@ -605,23 +605,35 @@ function attachVerifiedLineReader(
     if (state === "failed" || state === "closing") {
       return;
     }
-    try {
-      buffer += decoder.decode(chunk, { stream: true });
-    } catch {
-      fail();
-      return;
-    }
-    let lineEnd = buffer.indexOf("\n");
+    buffer =
+      buffer.length === 0 ? Buffer.from(chunk) : Buffer.concat([buffer, chunk]);
+    let lineEnd = buffer.indexOf(0x0a);
     while (lineEnd >= 0) {
-      const line = buffer.slice(0, lineEnd).replace(/\r$/, "");
-      buffer = buffer.slice(lineEnd + 1);
+      let lineBytes = buffer.subarray(0, lineEnd);
+      buffer = buffer.subarray(lineEnd + 1);
+      if (lineBytes.at(-1) === 0x0d) {
+        lineBytes = lineBytes.subarray(0, lineBytes.length - 1);
+      }
+      if (lineBytes.length > MAX_APRS_LINE_BYTES) {
+        fail();
+        return;
+      }
+      if (!isUtf8(lineBytes)) {
+        if (state === "awaiting") {
+          fail();
+          return;
+        }
+        lineEnd = buffer.indexOf(0x0a);
+        continue;
+      }
+      const line = lineBytes.toString("utf8");
       processLine(line);
       if (socket.destroyed) {
         return;
       }
-      lineEnd = buffer.indexOf("\n");
+      lineEnd = buffer.indexOf(0x0a);
     }
-    if (Buffer.byteLength(buffer, "utf8") > MAX_APRS_BUFFER_BYTES) {
+    if (buffer.length > MAX_APRS_BUFFER_BYTES) {
       fail();
     }
   };
