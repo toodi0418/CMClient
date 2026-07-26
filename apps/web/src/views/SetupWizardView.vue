@@ -5,6 +5,7 @@ import {
   Check,
   CircleAlert,
   KeyRound,
+  Languages,
   LoaderCircle,
   RefreshCw,
   RotateCcw,
@@ -12,11 +13,16 @@ import {
   Wifi,
 } from "@lucide/vue";
 import Button from "primevue/button";
+import { useI18n } from "vue-i18n";
 
 import type { SetupConfigureRequest } from "@cmclient/contracts";
+import { isSupportedLocale, type SupportedLocale } from "@/preferences";
+import { usePreferencesStore } from "@/stores/preferences";
 import { useSetupStore } from "@/stores/setup";
 
 const setup = useSetupStore();
+const preferences = usePreferencesStore();
+const { t } = useI18n();
 const termsAccepted = ref(false);
 const meshtasticHost = ref("127.0.0.1");
 const meshtasticPort = 4403;
@@ -24,9 +30,20 @@ const meshNetworkId = ref("default");
 const gatewayId = ref("cmclient-gateway");
 const callmeshApiKey = ref("");
 const selectedCandidate = ref("");
-const localError = ref("");
+const localErrorKey = ref("");
+
+const localeOptions: Array<{
+  value: SupportedLocale;
+  labelKey: "preferences.zhTW" | "preferences.enUS";
+}> = [
+  { value: "zh-TW", labelKey: "preferences.zhTW" },
+  { value: "en-US", labelKey: "preferences.enUS" },
+];
 
 const phase = computed(() => setup.phase);
+const localError = computed(() =>
+  localErrorKey.value ? t(localErrorKey.value) : "",
+);
 const isTerms = computed(
   () => phase.value === "uninitialized" || phase.value === "terms_required",
 );
@@ -43,7 +60,7 @@ onMounted(async () => {
       await setup.discover();
     }
   } catch {
-    localError.value = "Agent setup service is not available.";
+    localErrorKey.value = "setup.serviceUnavailable";
   }
 });
 
@@ -67,24 +84,31 @@ function chooseCandidate(event: Event) {
   }
 }
 
+function setLocale(event: Event) {
+  const locale = (event.target as HTMLSelectElement).value;
+  if (isSupportedLocale(locale)) {
+    preferences.setLocale(locale);
+  }
+}
+
 async function acceptTerms() {
-  localError.value = "";
+  localErrorKey.value = "";
   if (!termsAccepted.value) {
-    localError.value = "Accept the terms to continue.";
+    localErrorKey.value = "setup.acceptTermsError";
     return;
   }
   try {
     await setup.acceptTerms();
     await setup.discover();
   } catch {
-    localError.value = setup.errorCode ?? "Unable to accept terms.";
+    localErrorKey.value = "setup.errorUnableToAcceptTerms";
   }
 }
 
 async function configure() {
-  localError.value = "";
+  localErrorKey.value = "";
   if (!meshtasticHost.value.trim() || !callmeshApiKey.value) {
-    localError.value = "Meshtastic host and CallMesh API key are required.";
+    localErrorKey.value = "setup.requiredFields";
     return;
   }
   const key = callmeshApiKey.value;
@@ -100,7 +124,7 @@ async function configure() {
     };
     await setup.configure(request);
   } catch {
-    localError.value = setup.errorCode ?? "Setup validation failed.";
+    localErrorKey.value = "setup.validationFailed";
   } finally {
     // Never retain the credential in reactive state after the request.
     callmeshApiKey.value = "";
@@ -108,22 +132,22 @@ async function configure() {
 }
 
 async function reset() {
-  localError.value = "";
+  localErrorKey.value = "";
   try {
     await setup.reset();
     termsAccepted.value = false;
     callmeshApiKey.value = "";
   } catch {
-    localError.value = setup.errorCode ?? "Unable to reset setup.";
+    localErrorKey.value = "setup.errorUnableToReset";
   }
 }
 
 async function rediscover() {
-  localError.value = "";
+  localErrorKey.value = "";
   try {
     await setup.discover();
   } catch {
-    localError.value = setup.errorCode ?? "Discovery failed.";
+    localErrorKey.value = "setup.discoveryFailed";
   }
 }
 </script>
@@ -135,14 +159,31 @@ async function rediscover() {
         <div class="setup-brand__mark" aria-hidden="true">CM</div>
         <div>
           <p class="setup-eyebrow">CMCLIENT 2.0</p>
-          <h1 id="setup-title">Initial setup</h1>
+          <h1 id="setup-title">{{ t("setup.title") }}</h1>
         </div>
+        <label class="setup-language-selector">
+          <Languages :size="16" aria-hidden="true" />
+          <span class="visually-hidden">{{ t("preferences.language") }}</span>
+          <select
+            :value="preferences.locale"
+            :aria-label="t('preferences.language')"
+            @change="setLocale"
+          >
+            <option
+              v-for="option in localeOptions"
+              :key="option.value"
+              :value="option.value"
+            >
+              {{ t(option.labelKey) }}
+            </option>
+          </select>
+        </label>
       </div>
 
-      <ol class="setup-steps" aria-label="Setup progress">
+      <ol class="setup-steps" :aria-label="t('setup.progress')">
         <li :class="{ active: isTerms, complete: !isTerms && !isRecovery }">
           <span>1</span>
-          <small>Terms</small>
+          <small>{{ t("setup.terms") }}</small>
         </li>
         <li
           :class="{
@@ -151,11 +192,11 @@ async function rediscover() {
           }"
         >
           <span>2</span>
-          <small>Connection</small>
+          <small>{{ t("setup.connection") }}</small>
         </li>
         <li :class="{ active: isValidating || isReady, complete: isReady }">
           <span>3</span>
-          <small>Finish</small>
+          <small>{{ t("setup.finish") }}</small>
         </li>
       </ol>
 
@@ -163,19 +204,12 @@ async function rediscover() {
         <div class="setup-icon" aria-hidden="true">
           <ShieldCheck :size="24" />
         </div>
-        <p class="setup-kicker">Before you begin</p>
-        <h2>Connect your CMClient to CallMesh</h2>
-        <p class="setup-copy">
-          CMClient uses the official CallMesh service and your Meshtastic node
-          connection to provide the complete Web management experience. Nothing
-          is transmitted until setup is complete.
-        </p>
+        <p class="setup-kicker">{{ t("setup.beforeBegin") }}</p>
+        <h2>{{ t("setup.connectTitle") }}</h2>
+        <p class="setup-copy">{{ t("setup.connectDescription") }}</p>
         <label class="setup-consent">
           <input v-model="termsAccepted" type="checkbox" />
-          <span
-            >I agree to the CMClient terms of use and understand that the
-            supplied API key is stored locally for this installation.</span
-          >
+          <span>{{ t("setup.termsConsent") }}</span>
         </label>
         <p v-if="localError" class="setup-error" role="alert">
           <CircleAlert :size="16" aria-hidden="true" /> {{ localError }}
@@ -184,7 +218,7 @@ async function rediscover() {
           class="setup-primary"
           type="button"
           :disabled="busy"
-          label="Continue"
+          :label="t('setup.continue')"
           @click="acceptTerms"
         >
           <template #icon
@@ -195,22 +229,19 @@ async function rediscover() {
 
       <div v-else-if="isCredentials" class="setup-content">
         <div class="setup-icon" aria-hidden="true"><Wifi :size="24" /></div>
-        <p class="setup-kicker">Connection details</p>
-        <h2>Choose your Meshtastic node</h2>
-        <p class="setup-copy">
-          The Agent performs a passive TCP reachability check on port 4403.
-          Radio settings are never changed by setup.
-        </p>
+        <p class="setup-kicker">{{ t("setup.connectionDetails") }}</p>
+        <h2>{{ t("setup.chooseNode") }}</h2>
+        <p class="setup-copy">{{ t("setup.passiveCheck") }}</p>
 
         <div v-if="setup.candidates.length" class="setup-discovery">
-          <label for="discovered-node">Discovered nodes</label>
+          <label for="discovered-node">{{ t("setup.discoveredNodes") }}</label>
           <div class="setup-inline-control">
             <select
               id="discovered-node"
               :value="selectedCandidate"
               @change="chooseCandidate"
             >
-              <option value="">Select a discovered node</option>
+              <option value="">{{ t("setup.selectDiscoveredNode") }}</option>
               <option
                 v-for="candidate in setup.candidates"
                 :key="`${candidate.host}:${candidate.port}`"
@@ -226,8 +257,8 @@ async function rediscover() {
               text
               type="button"
               :loading="setup.discovering"
-              aria-label="Refresh discovered nodes"
-              title="Refresh discovered nodes"
+              :aria-label="t('setup.refreshDiscoveredNodes')"
+              :title="t('setup.refreshDiscoveredNodes')"
               @click="rediscover"
             >
               <RefreshCw :size="17" aria-hidden="true" />
@@ -237,7 +268,7 @@ async function rediscover() {
 
         <div class="setup-form-grid">
           <label>
-            Meshtastic host
+            {{ t("setup.host") }}
             <input
               v-model="meshtasticHost"
               autocomplete="off"
@@ -245,30 +276,35 @@ async function rediscover() {
             />
           </label>
           <label>
-            Port
+            {{ t("setup.port") }}
             <input :value="meshtasticPort" readonly />
           </label>
           <label>
-            Mesh network ID <span>(optional)</span>
+            {{ t("setup.meshNetworkId") }}
+            <span>({{ t("setup.optional") }})</span>
             <input v-model="meshNetworkId" autocomplete="off" />
           </label>
           <label>
-            Gateway ID <span>(optional)</span>
+            {{ t("setup.gatewayId") }}
+            <span>({{ t("setup.optional") }})</span>
             <input v-model="gatewayId" autocomplete="off" />
           </label>
         </div>
 
         <label class="setup-field setup-key-field">
-          <span
-            ><KeyRound :size="16" aria-hidden="true" /> CallMesh API key</span
-          >
+          <span>
+            <KeyRound :size="16" aria-hidden="true" />
+            {{ t("setup.callmeshApiKey") }}
+          </span>
           <input
             v-model="callmeshApiKey"
             type="password"
             autocomplete="new-password"
             spellcheck="false"
           />
-          <small>Official endpoint: {{ setup.callmeshUrl }}</small>
+          <small>{{
+            t("setup.officialEndpoint", { url: setup.callmeshUrl })
+          }}</small>
         </label>
 
         <p v-if="localError" class="setup-error" role="alert">
@@ -280,7 +316,7 @@ async function rediscover() {
             type="button"
             :loading="setup.loading"
             :disabled="busy || !callmeshApiKey"
-            label="Validate and start"
+            :label="t('setup.validateAndStart')"
             @click="configure"
           >
             <template #icon
@@ -295,44 +331,35 @@ async function rediscover() {
         class="setup-content setup-content--centered"
       >
         <LoaderCircle class="setup-spinner" :size="42" aria-hidden="true" />
-        <p class="setup-kicker">Agent validation</p>
-        <h2>Starting your local services</h2>
-        <p class="setup-copy">
-          CMClient is applying the configuration and starting the Gateway. Keep
-          this page open; it will continue automatically.
-        </p>
+        <p class="setup-kicker">{{ t("setup.agentValidation") }}</p>
+        <h2>{{ t("setup.startingServices") }}</h2>
+        <p class="setup-copy">{{ t("setup.applyingConfiguration") }}</p>
         <Button
           text
           type="button"
-          label="Refresh status"
+          :label="t('setup.refreshStatus')"
           @click="setup.refresh"
         />
       </div>
 
       <div v-else-if="isReady" class="setup-content setup-content--centered">
         <div class="setup-success" aria-hidden="true"><Check :size="26" /></div>
-        <p class="setup-kicker">Ready</p>
-        <h2>CMClient is ready</h2>
-        <p class="setup-copy">
-          The full management console is now available. Gateway and APRS status
-          will appear in the dashboard as services come online.
-        </p>
+        <p class="setup-kicker">{{ t("setup.ready") }}</p>
+        <h2>{{ t("setup.readyTitle") }}</h2>
+        <p class="setup-copy">{{ t("setup.readyDescription") }}</p>
       </div>
 
       <div v-else class="setup-content setup-content--centered">
         <div class="setup-icon setup-icon--warning" aria-hidden="true">
           <CircleAlert :size="24" />
         </div>
-        <p class="setup-kicker">Recovery required</p>
-        <h2>Setup needs to be run again</h2>
-        <p class="setup-copy">
-          The Agent could not complete the last setup transaction. Reset the
-          local setup state and start again.
-        </p>
+        <p class="setup-kicker">{{ t("setup.recoveryRequired") }}</p>
+        <h2>{{ t("setup.recoveryTitle") }}</h2>
+        <p class="setup-copy">{{ t("setup.recoveryDescription") }}</p>
         <p v-if="localError" class="setup-error" role="alert">
           <CircleAlert :size="16" aria-hidden="true" /> {{ localError }}
         </p>
-        <Button type="button" label="Reset setup" @click="reset">
+        <Button type="button" :label="t('setup.resetSetup')" @click="reset">
           <template #icon><RotateCcw :size="17" aria-hidden="true" /></template>
         </Button>
       </div>
@@ -393,6 +420,35 @@ async function rediscover() {
   margin: 0.2rem 0 0;
   font-size: 1.35rem;
   line-height: 1.2;
+}
+
+.setup-language-selector {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+  padding: 0 0.55rem;
+  border: 1px solid #b9c9ce;
+  border-radius: 5px;
+  color: #1e6b72;
+  background: #fff;
+}
+
+.setup-language-selector:focus-within {
+  outline: 2px solid rgb(30 107 114 / 28%);
+  outline-offset: 2px;
+  border-color: #1e6b72;
+}
+
+.setup-language-selector select {
+  max-width: 9rem;
+  border: 0;
+  outline: 0;
+  color: #30464e;
+  background: transparent;
+  font: inherit;
+  font-size: 0.8rem;
 }
 
 .setup-steps {

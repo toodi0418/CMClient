@@ -12,5 +12,12 @@ describe("management web i18n", () => {
 
     expect(i18n.global.t("navigation.overview")).toBe("Overview");
     expect(i18n.global.t("preferences.system")).toBe("System");
+    expect(i18n.global.t("setup.title")).toBe("Initial setup");
+    expect(i18n.global.t("setup.validateAndStart")).toBe("Validate and start");
+  });
+
+  it("translates the setup wizard in Traditional Chinese", () => {
+    expect(i18n.global.t("setup.title")).toBe("初始設定");
+    expect(i18n.global.t("setup.validateAndStart")).toBe("驗證並啟動");
   });
 });
