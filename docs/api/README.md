@@ -63,7 +63,9 @@ proxies the remaining `/api/*` requests to loopback Gateway:
 | `POST /api/v1/auth/login` | Management LAN login; the body must contain exactly one `password` string |
 | `GET /api/v1/auth/session` | Loopback-only local browser session bootstrap; denied to LAN and Docker peers |
 | `GET /api/v1/setup/status` | Redacted Agent-authoritative setup projection |
+| `GET /api/v1/setup/discovery` | Bounded passive Meshtastic discovery candidates and fixed CallMesh endpoint |
 | `POST /api/v1/setup/terms` | Accept the exact current terms version during setup |
+| `POST /api/v1/setup/configure` | Validate and atomically apply the first-run Meshtastic/CallMesh configuration |
 | `POST /api/v1/setup/reset` | Confirm a setup-phase reset; full ready-state operational reset is owned by the reset workflow |
 | `GET /api/v1/setup/events` | Agent-owned setup SSE with an immediate snapshot |
 | `GET /api/v1/lifecycle/status` | Redacted Agent/Gateway/Management Web lifecycle projection |

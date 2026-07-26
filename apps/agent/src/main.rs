@@ -1,3 +1,4 @@
+use atomic_write_file::AtomicWriteFile;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -11,7 +12,10 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::access::{ManagementAccessController, ManagementAuditEntry};
 use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind, SecretStoreError};
-use cmclient_agent_core::setup::{SetupError, SetupPhase, SetupStore};
+use cmclient_agent_core::setup::{
+    MeshtasticCandidate, SetupError, SetupPhase, SetupStatus, SetupStore, discover_mdns,
+    ordered_candidates,
+};
 use cmclient_agent_core::web::{
     ActiveGatewayRoute, GATEWAY_CAPABILITY_HEADER, GatewayRoute, GatewaySessionHandle,
     ManagementSetupState, ManagementTlsConfig, ManagementWebConfig, ManagementWebError,
@@ -43,7 +47,8 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
@@ -55,6 +60,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use zeroize::Zeroize;
 
 const EX_USAGE: u8 = 2;
 const EX_CONFIG: u8 = 5;
@@ -390,6 +396,52 @@ struct SetupResetRequest {
     confirmation: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetupConfigureRequest {
+    meshtastic_host: String,
+    meshtastic_port: u16,
+    mesh_network_id: Option<String>,
+    gateway_id: Option<String>,
+    callmesh_api_key: String,
+}
+
+impl Drop for SetupConfigureRequest {
+    fn drop(&mut self) {
+        self.callmesh_api_key.zeroize();
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupDiscoveryResponse {
+    schema_version: u8,
+    candidates: Vec<MeshtasticCandidate>,
+    callmesh_url: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupApplyError {
+    Setup(SetupError),
+    InvalidInput,
+    EndpointUnreachable,
+    SupervisorUnavailable,
+    ConfigWriteFailed,
+}
+
+impl From<SetupError> for SetupApplyError {
+    fn from(error: SetupError) -> Self {
+        Self::Setup(error)
+    }
+}
+
+type SetupApplyHandler =
+    Arc<dyn Fn(SetupConfigureRequest) -> Result<SetupStatus, SetupApplyError> + Send + Sync>;
+
+const CALLMESH_PRODUCTION_URL: &str = "https://callmesh.tmmarc.org";
+const DEFAULT_APRS_HOST: &str = "asia.aprs2.net";
+const DEFAULT_APRS_PORT: u16 = 14_580;
+
 struct AgentWebState {
     updates: Arc<AgentUpdateService>,
     setup: Arc<SetupStore>,
@@ -399,6 +451,7 @@ struct AgentWebState {
     lifecycle_events: Arc<AgentEventHub>,
     management_setup_state: Mutex<Option<ManagementSetupState>>,
     management_access: Option<Arc<ManagementAccessController>>,
+    setup_apply: Mutex<Option<SetupApplyHandler>>,
     audit: Mutex<VecDeque<ManagementAuditEntry>>,
     runtime_log: Option<StructuredLogSink>,
 }
@@ -445,9 +498,18 @@ impl AgentWebState {
             lifecycle_events,
             management_setup_state: Mutex::new(None),
             management_access,
+            setup_apply: Mutex::new(None),
             audit: Mutex::new(VecDeque::new()),
             runtime_log,
         })
+    }
+
+    fn install_setup_apply(&self, handler: SetupApplyHandler) -> Result<(), ControlError> {
+        *self
+            .setup_apply
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)? = Some(handler);
+        Ok(())
     }
 
     fn attach_management_setup_state(
@@ -560,6 +622,8 @@ fn lifecycle_event_changed(current: &AgentLifecycleStatus, next: &AgentLifecycle
 fn agent_web_router(state: Arc<AgentWebState>) -> Router {
     Router::new()
         .route("/api/v1/setup/status", get(management_setup_status))
+        .route("/api/v1/setup/discovery", get(management_setup_discovery))
+        .route("/api/v1/setup/configure", post(management_setup_configure))
         .route("/api/v1/setup/terms", post(management_setup_terms))
         .route("/api/v1/setup/reset", post(management_setup_reset))
         .route("/api/v1/setup/events", get(management_setup_events))
@@ -573,6 +637,117 @@ fn agent_web_router(state: Arc<AgentWebState>) -> Router {
         )
         .route("/api/v1/control", any(management_control_route_not_found))
         .with_state(state)
+}
+
+async fn management_setup_discovery() -> Response {
+    let mdns = tokio::task::spawn_blocking(|| {
+        discover_mdns(Duration::from_secs(2), 16).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    let candidates = ordered_candidates(None, mdns, None);
+    (
+        StatusCode::OK,
+        Json(SetupDiscoveryResponse {
+            schema_version: 1,
+            candidates,
+            callmesh_url: CALLMESH_PRODUCTION_URL,
+        }),
+    )
+        .into_response()
+}
+
+async fn management_setup_configure(
+    State(state): State<Arc<AgentWebState>>,
+    request: Result<Json<SetupConfigureRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return setup_request_invalid_response(),
+    };
+    let handler = match state.setup_apply.lock() {
+        Ok(handler) => handler.clone(),
+        Err(_) => return management_control_failed_response(),
+    };
+    let Some(handler) = handler else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"code": "SETUP_TRANSACTION_UNAVAILABLE"})),
+        )
+            .into_response();
+    };
+    match tokio::task::spawn_blocking(move || handler(request)).await {
+        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(Err(error)) => setup_apply_error_response(error),
+        Err(_) => management_control_failed_response(),
+    }
+}
+
+fn validate_setup_request(request: &SetupConfigureRequest) -> Result<(), SetupApplyError> {
+    let host = request.meshtastic_host.trim();
+    if host.is_empty()
+        || request.meshtastic_host != host
+        || host.len() > 255
+        || host.contains(char::is_whitespace)
+        || host.contains('/')
+        || host.contains(['"', '\\', '\r', '\n'])
+        || request.meshtastic_port != 4_403
+        || request.callmesh_api_key.is_empty()
+        || request.callmesh_api_key.len() > 4_096
+        || request
+            .callmesh_api_key
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+    {
+        return Err(SetupApplyError::InvalidInput);
+    }
+    for value in [
+        request.mesh_network_id.as_deref(),
+        request.gateway_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let value = value.trim();
+        if value.is_empty()
+            || value.len() > 128
+            || value.chars().any(char::is_control)
+            || value.contains(['"', '\\'])
+        {
+            return Err(SetupApplyError::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
+fn probe_meshtastic_endpoint(host: &str, port: u16) -> bool {
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .take(4)
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok())
+}
+
+fn write_setup_configuration(
+    path: &Path,
+    host: &str,
+    port: u16,
+    mesh_network_id: &str,
+    gateway_id: &str,
+) -> Result<(), SetupApplyError> {
+    let parent = path.parent().ok_or(SetupApplyError::ConfigWriteFailed)?;
+    fs::create_dir_all(parent).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    let contents = format!(
+        "[agent]\nmanagement_web_enabled = true\n\n[callmesh]\nurl = \"{CALLMESH_PRODUCTION_URL}\"\n\n[meshtastic]\ntransport = \"tcp\"\nmesh_network_id = \"{mesh_network_id}\"\ngateway_id = \"{gateway_id}\"\ntcp_host = \"{host}\"\ntcp_port = {port}\n\n[aprs]\nhost = \"{DEFAULT_APRS_HOST}\"\nport = {DEFAULT_APRS_PORT}\n"
+    );
+    let mut output = AtomicWriteFile::open(path).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    output
+        .write_all(contents.as_bytes())
+        .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    output
+        .commit()
+        .map_err(|_| SetupApplyError::ConfigWriteFailed)
 }
 
 async fn management_setup_status(State(state): State<Arc<AgentWebState>>) -> Response {
@@ -765,6 +940,32 @@ fn setup_error_response(error: SetupError) -> Response {
     (status, Json(serde_json::json!({"code": error.code()}))).into_response()
 }
 
+fn setup_apply_error_response(error: SetupApplyError) -> Response {
+    match error {
+        SetupApplyError::Setup(error) => setup_error_response(error),
+        SetupApplyError::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"code": "SETUP_CONFIGURATION_INVALID"})),
+        )
+            .into_response(),
+        SetupApplyError::EndpointUnreachable => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"code": "SETUP_MESHTASTIC_UNREACHABLE"})),
+        )
+            .into_response(),
+        SetupApplyError::SupervisorUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"code": "SETUP_SUPERVISOR_UNAVAILABLE"})),
+        )
+            .into_response(),
+        SetupApplyError::ConfigWriteFailed => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"code": "SETUP_CONFIGURATION_WRITE_FAILED"})),
+        )
+            .into_response(),
+    }
+}
+
 fn setup_request_invalid_response() -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -854,6 +1055,7 @@ struct AgentController {
     management_web_config: ManagementWebConfig,
     management_access: Option<Arc<ManagementAccessController>>,
     control_endpoint: ControlEndpoint,
+    config_file: PathBuf,
     secrets: AgentSecretStore,
     setup: Arc<SetupStore>,
     setup_gate_required: bool,
@@ -1020,6 +1222,171 @@ const fn management_web_profile(profile: AgentRuntimeProfile) -> ManagementWebPr
 }
 
 impl AgentController {
+    fn install_setup_apply(self: &Arc<Self>) -> Result<(), ControlError> {
+        let weak = Arc::downgrade(self);
+        self.web_state.install_setup_apply(Arc::new(move |request| {
+            let controller = weak
+                .upgrade()
+                .ok_or(SetupApplyError::SupervisorUnavailable)?;
+            controller.apply_setup(request)
+        }))
+    }
+
+    fn apply_setup(&self, request: SetupConfigureRequest) -> Result<SetupStatus, SetupApplyError> {
+        validate_setup_request(&request)?;
+        let current = self.setup.status()?;
+        if !self.setup_gate_required || !matches!(current.phase, SetupPhase::CredentialsRequired) {
+            return Err(SetupApplyError::Setup(SetupError::TransitionInvalid));
+        }
+
+        if !probe_meshtastic_endpoint(&request.meshtastic_host, request.meshtastic_port) {
+            return Err(SetupApplyError::EndpointUnreachable);
+        }
+
+        let mesh_network_id = request
+            .mesh_network_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("default");
+        let gateway_id = request
+            .gateway_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("cmclient-gateway");
+        let fence = match self.setup.begin_validation() {
+            Ok(fence) => fence,
+            Err(error) => return Err(error.into()),
+        };
+        if self
+            .secrets
+            .store(SecretKind::CallMeshApiKey, &request.callmesh_api_key)
+            .is_err()
+        {
+            let _ = self.setup.require_credentials();
+            if let Ok(status) = self.setup.status() {
+                let _ = self.web_state.publish_setup_status(&status);
+            }
+            return Err(SetupApplyError::ConfigWriteFailed);
+        }
+        if let Err(error) = write_setup_configuration(
+            &self.config_file,
+            request.meshtastic_host.trim(),
+            request.meshtastic_port,
+            mesh_network_id,
+            gateway_id,
+        ) {
+            let _ = self.secrets.remove(SecretKind::CallMeshApiKey);
+            let _ = self.setup.require_credentials();
+            if let Ok(status) = self.setup.status() {
+                let _ = self.web_state.publish_setup_status(&status);
+            }
+            return Err(error);
+        };
+        if let Err(error) = self.configure_supervisor_for_setup(
+            fence.generation(),
+            &request,
+            mesh_network_id,
+            gateway_id,
+        ) {
+            let _ = self.secrets.remove(SecretKind::CallMeshApiKey);
+            let _ = self.setup.require_credentials();
+            if let Ok(status) = self.setup.status() {
+                let _ = self.web_state.publish_setup_status(&status);
+            }
+            return Err(error);
+        }
+
+        match self.start_supervisor_for_setup() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                let _ = self.secrets.remove(SecretKind::CallMeshApiKey);
+                let _ = self.stop_supervisor();
+                let _ = self.setup.require_credentials();
+                if let Ok(status) = self.setup.status() {
+                    let _ = self.web_state.publish_setup_status(&status);
+                }
+                return Err(SetupApplyError::SupervisorUnavailable);
+            }
+        }
+        let status = match self.setup.mark_ready(fence) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = self.secrets.remove(SecretKind::CallMeshApiKey);
+                let _ = self.stop_supervisor();
+                let _ = self.setup.require_credentials();
+                return Err(error.into());
+            }
+        };
+        self.web_state
+            .publish_setup_status(&status)
+            .map_err(|_| SetupApplyError::Setup(SetupError::WriteFailed))?;
+        self.clear_error();
+        Ok(status)
+    }
+
+    fn configure_supervisor_for_setup(
+        &self,
+        generation: u64,
+        request: &SetupConfigureRequest,
+        mesh_network_id: &str,
+        gateway_id: &str,
+    ) -> Result<(), SetupApplyError> {
+        let _transition = self
+            .gateway_transition
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        let mut supervisor = self
+            .supervisor
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        let Some(supervisor) = supervisor.as_mut() else {
+            return Err(SetupApplyError::SupervisorUnavailable);
+        };
+        if !matches!(supervisor.status(), GatewayStatus::Stopped) {
+            supervisor
+                .stop()
+                .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        }
+        let mut environment = BTreeMap::new();
+        environment.insert(
+            String::from("CMCLIENT_CALLMESH_URL"),
+            String::from(CALLMESH_PRODUCTION_URL),
+        );
+        environment.insert(
+            String::from("CMCLIENT_MESHTASTIC_TRANSPORT"),
+            String::from("tcp"),
+        );
+        environment.insert(
+            String::from("CMCLIENT_MESHTASTIC_TCP_HOST"),
+            request.meshtastic_host.trim().to_owned(),
+        );
+        environment.insert(
+            String::from("CMCLIENT_MESHTASTIC_TCP_PORT"),
+            request.meshtastic_port.to_string(),
+        );
+        environment.insert(
+            String::from("CMCLIENT_MESH_NETWORK_ID"),
+            mesh_network_id.into(),
+        );
+        environment.insert(String::from("CMCLIENT_GATEWAY_ID"), gateway_id.into());
+        environment.insert(String::from("CMCLIENT_APRS_ENABLED"), String::from("true"));
+        environment.insert(
+            String::from("CMCLIENT_APRS_HOST"),
+            String::from(DEFAULT_APRS_HOST),
+        );
+        environment.insert(
+            String::from("CMCLIENT_APRS_PORT"),
+            DEFAULT_APRS_PORT.to_string(),
+        );
+        supervisor.set_environment(environment);
+        supervisor
+            .set_setup_generation(generation)
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        supervisor
+            .set_callmesh_api_key(&request.callmesh_api_key)
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)
+    }
+
     fn from_config(config: &AgentConfig) -> Result<Self, ControlError> {
         let secrets =
             AgentSecretStore::runtime(config.paths.root_dir()).map_err(control_secret_error)?;
@@ -1378,6 +1745,7 @@ impl AgentController {
             management_web_config,
             management_access,
             control_endpoint,
+            config_file: config.config_file.clone(),
             secrets,
             setup,
             setup_gate_required,
@@ -1785,7 +2153,24 @@ impl AgentController {
     }
 
     fn start_supervisor(&self) -> Result<bool, ControlError> {
-        if self.setup_blocked()? {
+        self.start_supervisor_inner(false)
+    }
+
+    fn start_supervisor_for_setup(&self) -> Result<bool, ControlError> {
+        self.start_supervisor_inner(true)
+    }
+
+    fn start_supervisor_inner(&self, allow_validating: bool) -> Result<bool, ControlError> {
+        if self.setup_blocked()?
+            && !(allow_validating
+                && matches!(
+                    self.setup
+                        .status()
+                        .map_err(|_| ControlError::CommandFailed)?
+                        .phase,
+                    SetupPhase::Validating
+                ))
+        {
             self.remember_error_code("SETUP_REQUIRED");
             return Err(ControlError::CommandFailed);
         }
@@ -2927,6 +3312,11 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
+    if let Err(error) = controller.install_setup_apply() {
+        controller.remember_error(&error);
+        eprintln!("{}", error.code());
+        return ExitCode::from(EX_CONFIG);
+    }
     let endpoint = match default_local_endpoint(config.paths.root_dir()) {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -3028,14 +3418,15 @@ mod tests {
         AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState, ControlCommand,
         ControlHandler, GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle,
         InternalComponent, LogLevel, LogPolicy, ManagementWebConfig, ManagementWebError,
-        ManagementWebService, SecretKind, SetupError, SetupStore, StructuredLogSink,
-        SupervisorWorker, agent_web_router, apply_aprs_environment,
+        ManagementWebService, SecretKind, SetupApplyError, SetupConfigureRequest, SetupError,
+        SetupStore, StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
         apply_physical_qualification_environment, bridge_gateway_event_stream,
         compiled_component_identity, gateway_json_projection, legacy_state_candidates,
         load_agent_config_after_migration_with, management_agent_events, management_web_profile,
         normalize_runtime_process_path, push_legacy_source_candidate,
         resolve_gateway_maintenance_program, setup_error_response,
-        setup_gate_required_with_profile, verified_gateway_route,
+        setup_gate_required_with_profile, validate_setup_request, verified_gateway_route,
+        write_setup_configuration,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -3120,6 +3511,50 @@ mod tests {
             assert!(Instant::now() < deadline, "gateway fixture did not report");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn setup_configuration_validation_rejects_injection_and_non_meshtastic_ports() {
+        let request = |host: &str, port: u16, key: &str| SetupConfigureRequest {
+            meshtastic_host: String::from(host),
+            meshtastic_port: port,
+            mesh_network_id: Some(String::from("default")),
+            gateway_id: Some(String::from("cmclient-gateway")),
+            callmesh_api_key: String::from(key),
+        };
+        let valid = request("172.16.8.88", 4_403, "fixture-key");
+        assert!(validate_setup_request(&valid).is_ok());
+
+        for invalid in [
+            request("172.16.8.88\n", 4_403, "fixture-key"),
+            request("172.16.8.88\"", 4_403, "fixture-key"),
+            request("172.16.8.88", 80, "fixture-key"),
+            request("172.16.8.88", 4_403, "fixture\nkey"),
+        ] {
+            assert_eq!(
+                validate_setup_request(&invalid),
+                Err(SetupApplyError::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
+    fn setup_configuration_file_is_atomic_and_contains_no_secret_or_destination_override() {
+        let root = std::env::temp_dir().join(format!(
+            "cmclient-agent-setup-config-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("config/agent.toml");
+        write_setup_configuration(&path, "172.16.8.88", 4_403, "default", "cmclient-gateway")
+            .expect("setup config should commit");
+        let contents = std::fs::read_to_string(&path).expect("setup config should read");
+        assert!(contents.contains("tcp_host = \"172.16.8.88\""));
+        assert!(contents.contains("url = \"https://callmesh.tmmarc.org\""));
+        assert!(!contents.contains("CMCLIENT_CALLMESH_API_KEY"));
+        assert!(!contents.contains("CMCLIENT_APRS_DESTINATION"));
+        assert!(!contents.contains("APCM20"));
+        std::fs::remove_dir_all(root).expect("setup config fixture should clean up");
     }
 
     fn test_agent_web_state(directory: &Path) -> Arc<AgentWebState> {

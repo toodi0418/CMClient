@@ -52,6 +52,29 @@ are retained or projected. Files that cannot be read
 or safely replaced still fail closed. The recovery projection contains only
 booleans, phase, schema version, and a stable reason code.
 
+## P14-T03 setup transaction
+
+The first Web screen is an Agent-owned wizard. It uses `GET
+/api/v1/setup/discovery` for the bounded loopback/mDNS candidate list and
+`POST /api/v1/setup/configure` for the one setup transaction. The CallMesh
+endpoint is fixed to `https://callmesh.tmmarc.org`; it is not a user-editable
+mapping authority. The request accepts only TCP port `4403`, a bounded host,
+the optional local mesh/gateway identifiers, and the CallMesh API key.
+
+The Agent performs a passive TCP reachability check before applying the
+configuration. It writes the non-secret TOML configuration with an atomic
+document replacement and stores the key only through the plaintext
+`secrets.json` backend. The key is passed to the Gateway only through its
+private bootstrap channel and is zeroized when the setup request is dropped;
+it is never placed in TOML, argv, URLs, browser state, or logs. Setup does not
+send radio configuration or RF traffic.
+
+After the private Gateway bootstrap succeeds, setup reaches `ready` and the
+normal Web shell becomes available. Gateway CallMesh heartbeat, provision, and
+mapping authentication then remain the authoritative runtime status; a
+temporary upstream failure is surfaced as a degraded CallMesh/Gateway state
+and does not expose or silently replace the stored credential.
+
 ## State Root
 
 ```text
@@ -90,9 +113,11 @@ uninitialized -> terms_required -> credentials_required -> validating -> ready
 Missing, removed, authoritatively rejected, or revoked credentials enter the
 mandatory Web wizard. Transient network failure is degraded/retryable, not
 credential revocation. The wizard selects language, accepts versioned terms,
-discovers bounded loopback/mDNS Meshtastic TCP 4403 candidates, validates the
-CallMesh key, applies provision-derived APRS identity, reviews defaults, and
-commits setup atomically. There is no Agent/Gateway/Desktop/CLI product choice.
+discovers bounded loopback/mDNS Meshtastic TCP 4403 candidates, checks the
+selected endpoint, passes the CallMesh key through the private Gateway
+bootstrap, applies provision-derived APRS identity, reviews defaults, and
+commits each durable document atomically. There is no Agent/Gateway/Desktop/CLI
+product choice.
 
 Operational reset increments `setupGeneration`, cancels and fences old Jobs,
 stops external activity, removes relevant secrets/config/terms, preserves the

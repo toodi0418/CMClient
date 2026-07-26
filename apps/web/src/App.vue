@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch } from "vue";
+import { computed, onMounted, watch } from "vue";
 import {
   Gauge,
   Cloud,
@@ -42,6 +42,8 @@ import { usePreferencesStore } from "@/stores/preferences";
 import { useProxyStore } from "@/stores/proxy";
 import { useShellStore } from "@/stores/shell";
 import ManagementLoginView from "@/views/ManagementLoginView.vue";
+import SetupWizardView from "@/views/SetupWizardView.vue";
+import { useSetupStore } from "@/stores/setup";
 
 const shell = useShellStore();
 const gateway = useGatewayStore();
@@ -51,6 +53,7 @@ const callmesh = useCallMeshStore();
 const proxy = useProxyStore();
 const auth = useManagementAuthStore();
 const preferences = usePreferencesStore();
+const setup = useSetupStore();
 const route = useRoute();
 const { t } = useI18n();
 
@@ -112,6 +115,8 @@ const requiresLogin = computed(
   () => auth.required || isManagementSessionError(gateway.errorCode),
 );
 
+const setupRequired = computed(() => setup.required);
+
 const railToggleIcon = computed(() =>
   shell.desktopRailCollapsed ? PanelLeftOpen : PanelLeftClose,
 );
@@ -166,11 +171,16 @@ function setLocale(event: Event) {
 async function refreshAfterLogin() {
   await gateway.refresh();
 }
+
+onMounted(() => {
+  void setup.refresh().catch(() => undefined);
+});
 </script>
 
 <template>
+  <SetupWizardView v-if="setupRequired" />
   <ManagementLoginView
-    v-if="requiresLogin"
+    v-else-if="requiresLogin"
     @authenticated="refreshAfterLogin"
   />
   <div

@@ -15,6 +15,8 @@ import {
   ProxyStatusSchema,
   AgentLifecycleStatusSchema,
   SetupAcceptTermsRequestSchema,
+  SetupConfigureRequestSchema,
+  SetupDiscoveryResponseSchema,
   SetupResetRequestSchema,
   SetupStatusSchema,
   SystemCapabilitiesSchema,
@@ -36,6 +38,8 @@ import {
   type ProxyStatus,
   type AgentLifecycleStatus,
   type SetupAcceptTermsRequest,
+  type SetupConfigureRequest,
+  type SetupDiscoveryResponse,
   type SetupResetRequest,
   type SetupStatus,
   type SystemCapabilities,
@@ -180,6 +184,18 @@ export class GatewayApiClient {
 
   readonly setup = {
     status: () => this.request<SetupStatus>("/setup/status", SetupStatusSchema),
+    discovery: () =>
+      this.request<SetupDiscoveryResponse>(
+        "/setup/discovery",
+        SetupDiscoveryResponseSchema,
+      ),
+    configure: (request: SetupConfigureRequest) =>
+      this.requestBody<SetupStatus, SetupConfigureRequest>(
+        "/setup/configure",
+        SetupStatusSchema,
+        SetupConfigureRequestSchema,
+        request,
+      ),
     acceptTerms: (termsVersion: string) =>
       this.requestBody<SetupStatus, SetupAcceptTermsRequest>(
         "/setup/terms",
@@ -388,6 +404,8 @@ export type GatewaySystemApi = {
 
 export type AgentSetupApi = {
   status: () => Promise<SetupStatus>;
+  discovery: () => Promise<SetupDiscoveryResponse>;
+  configure: (request: SetupConfigureRequest) => Promise<SetupStatus>;
   acceptTerms: (termsVersion: string) => Promise<SetupStatus>;
   reset: (
     confirmation: SetupResetRequest["confirmation"],

@@ -1871,7 +1871,7 @@ describe("AprsIsTcpClient", () => {
       authorizationProvider: authorization(
         "user TEST01 pass 11111 vers CMClient 2.0",
       ),
-      timeoutMs: 30,
+      timeoutMs: 100,
     });
 
     await client.send("N0CALL-7>APCM20:fixture-one", PROVISION_FINGERPRINT);

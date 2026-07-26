@@ -81,6 +81,35 @@ const AGENT_MANAGEMENT_PATHS: Record<string, JsonValue> = {
       },
     },
   },
+  "/api/v1/setup/discovery": {
+    get: {
+      security: AGENT_SESSION_SECURITY,
+      responses: {
+        "200": agentJsonResponse("SetupDiscoveryResponse"),
+        "503": AGENT_ERROR_RESPONSE,
+      },
+    },
+  },
+  "/api/v1/setup/configure": {
+    post: {
+      security: AGENT_SESSION_SECURITY,
+      parameters: [CSRF_PARAMETER],
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/SetupConfigureRequest" },
+          },
+        },
+      },
+      responses: {
+        "200": agentJsonResponse("SetupStatus"),
+        "400": AGENT_ERROR_RESPONSE,
+        "409": AGENT_ERROR_RESPONSE,
+        "503": AGENT_ERROR_RESPONSE,
+      },
+    },
+  },
   "/api/v1/setup/terms": {
     post: {
       security: AGENT_SESSION_SECURITY,

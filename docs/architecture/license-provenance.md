@@ -45,7 +45,7 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `8aa7d1ab6e6d00d37a8fc4819d84e4b2015a108ee08ffb933275b7d9760aa841`.
+  `d235cda65d75e3f784322e3769ffa3b93700fdf92ea73e72c638b8328dbc568b`.
 - Cargo license inventory: 619 registry packages, 13 workspace packages, zero
   Git sources, zero unknown source classifications, and zero unknown licenses;
   inventory SHA-256

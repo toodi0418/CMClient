@@ -126,6 +126,51 @@ export const SetupResetRequestSchema = Type.Object(
   { $id: "SetupResetRequest", additionalProperties: false },
 );
 
+const MeshtasticDiscoverySourceSchema = Type.Union([
+  Type.Literal("migrated"),
+  Type.Literal("loopback"),
+  Type.Literal("mdns"),
+  Type.Literal("manual"),
+]);
+
+export const SetupDiscoveryResponseSchema = Type.Object(
+  {
+    schemaVersion: Type.Literal(1),
+    candidates: Type.Array(
+      Type.Object(
+        {
+          host: Type.String({ minLength: 1, maxLength: 255 }),
+          port: Type.Literal(4403),
+          source: MeshtasticDiscoverySourceSchema,
+        },
+        { additionalProperties: false },
+      ),
+      { maxItems: 16 },
+    ),
+    callmeshUrl: Type.Literal("https://callmesh.tmmarc.org"),
+  },
+  { $id: "SetupDiscoveryResponse", additionalProperties: false },
+);
+
+export const SetupConfigureRequestSchema = Type.Object(
+  {
+    meshtasticHost: Type.String({
+      minLength: 1,
+      maxLength: 255,
+      pattern: '^[^\\s/"\\\\]+$',
+    }),
+    meshtasticPort: Type.Literal(4403),
+    meshNetworkId: Type.Optional(
+      Type.String({ minLength: 1, maxLength: 128, pattern: '^[^"\\\\]+$' }),
+    ),
+    gatewayId: Type.Optional(
+      Type.String({ minLength: 1, maxLength: 128, pattern: '^[^"\\\\]+$' }),
+    ),
+    callmeshApiKey: Type.String({ minLength: 1, maxLength: 4096 }),
+  },
+  { $id: "SetupConfigureRequest", additionalProperties: false },
+);
+
 export const AgentGatewayLifecycleStateSchema = Type.Union(
   AGENT_GATEWAY_LIFECYCLE_STATES.map((state) => Type.Literal(state)),
   { $id: "AgentGatewayLifecycleState" },
@@ -213,6 +258,8 @@ export const AGENT_CONTRACT_SCHEMAS: readonly TSchema[] = [
   SetupStatusSchema,
   SetupAcceptTermsRequestSchema,
   SetupResetRequestSchema,
+  SetupDiscoveryResponseSchema,
+  SetupConfigureRequestSchema,
   AgentGatewayLifecycleStateSchema,
   AgentLifecycleStatusSchema,
   UpdateControlStatusSchema,
@@ -228,6 +275,10 @@ export type SetupAcceptTermsRequest = Static<
   typeof SetupAcceptTermsRequestSchema
 >;
 export type SetupResetRequest = Static<typeof SetupResetRequestSchema>;
+export type SetupDiscoveryResponse = Static<
+  typeof SetupDiscoveryResponseSchema
+>;
+export type SetupConfigureRequest = Static<typeof SetupConfigureRequestSchema>;
 export type AgentGatewayLifecycleState =
   (typeof AGENT_GATEWAY_LIFECYCLE_STATES)[number];
 export type AgentLifecycleStatus = Static<typeof AgentLifecycleStatusSchema>;

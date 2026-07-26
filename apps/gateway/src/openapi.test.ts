@@ -36,6 +36,8 @@ describe("Gateway OpenAPI contract", () => {
       "/api/v1/nodes",
       "/api/v1/positions",
       "/api/v1/proxy",
+      "/api/v1/setup/configure",
+      "/api/v1/setup/discovery",
       "/api/v1/setup/events",
       "/api/v1/setup/reset",
       "/api/v1/setup/status",
@@ -57,6 +59,8 @@ describe("Gateway OpenAPI contract", () => {
       "AgentUpdateEvent",
       "DomainEvent",
       "SetupAcceptTermsRequest",
+      "SetupConfigureRequest",
+      "SetupDiscoveryResponse",
       "SetupPhase",
       "SetupResetRequest",
       "SetupStatus",
@@ -118,7 +122,7 @@ describe("Gateway OpenAPI contract", () => {
     );
     expect(JSON.stringify(document)).not.toContain(capability);
     expect(gatewayOpenApiDocumentDigest(document)).toBe(
-      "add85936e836f6732c895dd601758e5c303ede5e173a9220f2a5d1f6b855fffc",
+      "6d3316e8db80b7d51c60ec08907ff43c8c68de41e0bd0628d9a686324b8c9058",
     );
 
     await app.close();
