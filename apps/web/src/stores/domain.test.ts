@@ -18,10 +18,13 @@ describe("domain store", () => {
     expect(domain.messages).toHaveLength(1);
     expect(domain.telemetry).toHaveLength(1);
     expect(domain.positions).toHaveLength(1);
-    expect(domain.errorCode).toBeUndefined();
+    expect(domain.nodesErrorCode).toBeUndefined();
+    expect(domain.messagesErrorCode).toBeUndefined();
+    expect(domain.telemetryErrorCode).toBeUndefined();
+    expect(domain.positionsErrorCode).toBeUndefined();
   });
 
-  it("retains a stable error code when a projection request fails", async () => {
+  it("keeps unrelated projections available when one request fails", async () => {
     const useDomain = createDomainStore({
       domain: {
         nodes: async () => {
@@ -38,7 +41,37 @@ describe("domain store", () => {
 
     await domain.refresh();
 
-    expect(domain.errorCode).toBe("GATEWAY_DOMAIN_DATA_UNAVAILABLE");
+    expect(domain.nodesErrorCode).toBe("GATEWAY_DOMAIN_DATA_UNAVAILABLE");
+    expect(domain.messagesErrorCode).toBeUndefined();
+    expect(domain.messages).toEqual([]);
+    expect(domain.telemetryErrorCode).toBeUndefined();
+    expect(domain.positionsErrorCode).toBeUndefined();
+  });
+
+  it("keeps the last successful projection when a later refresh fails", async () => {
+    let failNodes = false;
+    const source = fakeClient();
+    const useDomain = createDomainStore({
+      domain: {
+        ...source.domain,
+        nodes: async () => {
+          if (failNodes) {
+            throw new GatewayApiError({
+              code: "GATEWAY_DOMAIN_DATA_UNAVAILABLE",
+            });
+          }
+          return source.domain.nodes();
+        },
+      },
+    });
+    const domain = useDomain();
+
+    await domain.refreshNodes();
+    failNodes = true;
+    await domain.refreshNodes();
+
+    expect(domain.nodes).toHaveLength(1);
+    expect(domain.nodesErrorCode).toBe("GATEWAY_DOMAIN_DATA_UNAVAILABLE");
   });
 });
 

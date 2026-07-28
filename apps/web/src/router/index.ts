@@ -7,9 +7,10 @@ import {
   type RouterHistory,
 } from "vue-router";
 
+import type { SetupAdmission } from "@/stores/setup";
+
 export interface SetupRouteGate {
-  initialized: boolean;
-  required: boolean;
+  admission: SetupAdmission;
   refresh: () => Promise<unknown>;
   $subscribe: (listener: () => void) => () => void;
 }
@@ -134,18 +135,18 @@ export function installSetupRouteGate(
   let intendedPath = "/";
 
   targetRouter.beforeEach(async (to) => {
-    if (!setup.initialized) {
+    if (setup.admission === "checking") {
       try {
         await setup.refresh();
       } catch {
-        // An unavailable setup projection fails closed onto the setup route.
+        // Do not misrepresent a temporary API failure as an incomplete setup.
       }
     }
-    if (setup.required && to.name !== "setup") {
+    if (setup.admission === "required" && to.name !== "setup") {
       intendedPath = to.fullPath;
       return { name: "setup" };
     }
-    if (!setup.required && to.name === "setup") {
+    if (setup.admission === "ready" && to.name === "setup") {
       const destination = intendedPath === "/setup" ? "/" : intendedPath;
       intendedPath = "/";
       return destination;
@@ -158,10 +159,10 @@ export function installSetupRouteGate(
     if (current.matched.length === 0) {
       return;
     }
-    if (setup.required && current.name !== "setup") {
+    if (setup.admission === "required" && current.name !== "setup") {
       intendedPath = current.fullPath;
       void targetRouter.replace({ name: "setup" });
-    } else if (!setup.required && current.name === "setup") {
+    } else if (setup.admission === "ready" && current.name === "setup") {
       const destination = intendedPath === "/setup" ? "/" : intendedPath;
       intendedPath = "/";
       void targetRouter.replace(destination);

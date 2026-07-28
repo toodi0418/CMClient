@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useI18n } from "vue-i18n";
 
+import { eventActivityKey } from "@/problems";
 import { useGatewayStore } from "@/stores/gateway";
 
 const gateway = useGatewayStore();
@@ -26,14 +27,16 @@ const { t } = useI18n();
           class="record-row"
         >
           <div>
-            <strong>{{ event.type }}</strong>
-            <span>{{ event.source }}</span>
+            <strong>{{ t(eventActivityKey(event.type)) }}</strong>
+            <span>{{ event.occurredAt }}</span>
           </div>
           <div>
-            <span>{{ t("logs.eventId") }}</span>
-            <code>{{ event.eventId }}</code>
+            <details class="event-details">
+              <summary>{{ t("logs.technicalDetails") }}</summary>
+              <span>{{ t("logs.eventId") }}</span>
+              <code>{{ event.eventId }}</code>
+            </details>
           </div>
-          <time>{{ event.occurredAt }}</time>
         </article>
       </div>
     </div>

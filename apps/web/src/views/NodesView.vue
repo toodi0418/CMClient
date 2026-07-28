@@ -4,12 +4,13 @@ import { RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useDomainStore } from "@/stores/domain";
 
 const domain = useDomainStore();
 const { t } = useI18n();
 
-onMounted(() => void domain.refresh());
+onMounted(() => void domain.refreshNodes());
 </script>
 
 <template>
@@ -28,19 +29,24 @@ onMounted(() => void domain.refresh());
           type="button"
           :aria-label="t('common.refresh')"
           :title="t('common.refresh')"
-          :disabled="domain.loading"
-          @click="domain.refresh"
+          :disabled="domain.nodesLoading"
+          @click="domain.refreshNodes"
         >
           <RefreshCw :size="17" aria-hidden="true" />
         </Button>
       </div>
-      <p v-if="domain.loading" class="status-message">
+      <p
+        v-if="domain.nodesLoading && !domain.nodes.length"
+        class="status-message"
+      >
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="domain.errorCode" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ domain.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-else-if="domain.nodesErrorCode && !domain.nodes.length"
+        :code="domain.nodesErrorCode"
+        show-retry
+        @retry="domain.refreshNodes"
+      />
       <p v-else-if="!domain.nodes.length" class="status-message">
         {{ t("domain.empty") }}
       </p>
@@ -66,6 +72,13 @@ onMounted(() => void domain.refresh());
           </div>
         </article>
       </div>
+      <ProblemNotice
+        v-if="domain.nodesErrorCode && domain.nodes.length"
+        :code="domain.nodesErrorCode"
+        compact
+        show-retry
+        @retry="domain.refreshNodes"
+      />
     </div>
   </section>
 </template>

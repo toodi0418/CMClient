@@ -1,6 +1,8 @@
 import { setManagementCsrfToken } from "@cmclient/api-client";
 import { defineStore } from "pinia";
 
+import { managementRequestQueue } from "../management-api";
+
 const LOGIN_URL = "/api/v1/auth/login";
 const LOCAL_SESSION_URL = "/api/v1/auth/session";
 const LOCAL_SESSION_DENIED = "MANAGEMENT_LOCAL_SESSION_DENIED";
@@ -26,8 +28,7 @@ export interface ManagementAuthClient {
 
 export class BrowserManagementAuthClient implements ManagementAuthClient {
   constructor(
-    private readonly fetchImplementation: typeof fetch = (input, init) =>
-      globalThis.fetch(input, init),
+    private readonly fetchImplementation: typeof fetch = managementRequestQueue.fetch,
   ) {}
 
   async localSession(): Promise<{ csrfToken: string; expiresAt: number }> {
@@ -105,9 +106,9 @@ export function createManagementAuthStore(
               : "MANAGEMENT_AUTH_UNAVAILABLE";
           this.errorCode = code;
           this.required = code === LOCAL_SESSION_DENIED;
+          this.initialized = this.required;
           setManagementCsrfToken(undefined);
         } finally {
-          this.initialized = true;
           this.loading = false;
         }
       },
@@ -137,6 +138,7 @@ export function createManagementAuthStore(
       applySession(session: { csrfToken: string; expiresAt: number }) {
         this.csrfToken = session.csrfToken;
         this.expiresAt = session.expiresAt;
+        this.initialized = true;
         this.required = false;
         this.errorCode = undefined;
         setManagementCsrfToken(session.csrfToken);

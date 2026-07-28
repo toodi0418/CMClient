@@ -1,14 +1,14 @@
-import { GatewayApiClient, isGatewayApiError } from "@cmclient/api-client";
+import { isGatewayApiError, type GatewayApiClient } from "@cmclient/api-client";
 import type { CallMeshMapping, CallMeshStatus } from "@cmclient/contracts";
 import { defineStore } from "pinia";
+
+import { managementApi } from "../management-api";
 
 export interface CallMeshApiClient {
   callmesh: Pick<GatewayApiClient["callmesh"], "overview">;
 }
 
-export function createCallMeshStore(
-  client: CallMeshApiClient = new GatewayApiClient(),
-) {
+export function createCallMeshStore(client: CallMeshApiClient = managementApi) {
   return defineStore("callmesh", {
     state: () => ({
       loading: false,

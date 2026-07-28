@@ -4,6 +4,8 @@ import { RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import CapabilityStatus from "@/components/CapabilityStatus.vue";
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useGatewayStore } from "@/stores/gateway";
 
 const gateway = useGatewayStore();
@@ -11,7 +13,12 @@ const { t } = useI18n();
 
 const capabilityRows = computed(() =>
   Object.entries(gateway.capabilities?.capabilities ?? {}).map(
-    ([key, capability]) => ({ key, capability }),
+    ([key, capability]) => ({
+      key,
+      capability,
+      reasonCode:
+        "reasonCode" in capability ? capability.reasonCode : undefined,
+    }),
   ),
 );
 </script>
@@ -39,10 +46,12 @@ const capabilityRows = computed(() =>
       <p v-if="gateway.loading" class="status-message">
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="gateway.errorCode" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ gateway.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-else-if="gateway.errorCode && !gateway.status"
+        :code="gateway.errorCode"
+        show-retry
+        @retry="gateway.refresh"
+      />
       <dl v-else-if="gateway.status" class="facts-grid">
         <div>
           <dt>{{ t("system.platform") }}</dt>
@@ -68,6 +77,13 @@ const capabilityRows = computed(() =>
           </dd>
         </div>
       </dl>
+      <ProblemNotice
+        v-if="gateway.errorCode && gateway.status"
+        :code="gateway.errorCode"
+        compact
+        show-retry
+        @retry="gateway.refresh"
+      />
     </div>
 
     <div class="status-panel">
@@ -84,19 +100,10 @@ const capabilityRows = computed(() =>
           class="capability-row"
         >
           <span>{{ t(`capability.${row.key}`) }}</span>
-          <span
-            class="status-badge"
-            :data-state="row.capability.available ? 'available' : 'unavailable'"
-          >
-            {{
-              row.capability.available
-                ? t("common.available")
-                : t("common.notConfigured")
-            }}
-          </span>
-          <code v-if="!row.capability.available">{{
-            row.capability.reasonCode
-          }}</code>
+          <CapabilityStatus
+            :available="row.capability.available"
+            :reason-code="row.reasonCode"
+          />
         </div>
       </div>
       <p v-else class="status-message">{{ t("common.unavailable") }}</p>

@@ -1,12 +1,14 @@
-import { GatewayApiClient, isGatewayApiError } from "@cmclient/api-client";
+import { isGatewayApiError, type GatewayApiClient } from "@cmclient/api-client";
 import type { ProxyStatus } from "@cmclient/contracts";
 import { defineStore } from "pinia";
+
+import { managementApi } from "../management-api";
 
 export interface ProxyClient {
   proxy: Pick<GatewayApiClient["proxy"], "status">;
 }
 
-export function createProxyStore(client: ProxyClient = new GatewayApiClient()) {
+export function createProxyStore(client: ProxyClient = managementApi) {
   return defineStore("proxy", {
     state: () => ({
       errorCode: undefined as string | undefined,

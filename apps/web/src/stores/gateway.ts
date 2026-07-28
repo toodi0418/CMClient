@@ -1,8 +1,4 @@
-import {
-  GatewayApiClient,
-  isGatewayApiError,
-  type GatewaySystemApi,
-} from "@cmclient/api-client";
+import { isGatewayApiError, type GatewaySystemApi } from "@cmclient/api-client";
 import {
   GatewayEventClient,
   type SseConnectionState,
@@ -13,6 +9,8 @@ import type {
   SystemStatus,
 } from "@cmclient/contracts";
 import { defineStore } from "pinia";
+
+import { managementApi } from "../management-api";
 
 export type GatewayAvailability = "checking" | "available" | "unavailable";
 
@@ -29,7 +27,7 @@ export interface GatewayClients {
 
 function defaultClients(): GatewayClients {
   return {
-    api: new GatewayApiClient(),
+    api: managementApi,
     events: new GatewayEventClient(),
   };
 }
@@ -73,12 +71,6 @@ export function createGatewayStore(clients: GatewayClients = defaultClients()) {
                   (current) => current.eventId !== event.eventId,
                 ),
               ].slice(0, 50);
-              if (
-                event.type.startsWith("gateway.") ||
-                event.type.startsWith("system.")
-              ) {
-                void this.refresh();
-              }
             }),
           ];
           clients.events.start();

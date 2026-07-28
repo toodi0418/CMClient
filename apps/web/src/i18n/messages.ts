@@ -136,6 +136,40 @@ export const messages = {
       notConfigured: "尚未設定",
       available: "可用",
     },
+    connection: {
+      checkingTitle: "正在確認本機服務",
+      checkingMessage: "CMClient 正在確認這台電腦上的 Agent 與設定狀態。",
+      unavailableTitle: "暫時無法更新管理頁面",
+      unavailableMessage:
+        "CMClient 會保留目前網址與既有設定，並自動嘗試重新連線。",
+    },
+    problems: {
+      retry: "立即重試",
+      technicalDetails: "支援詳細資訊",
+      genericTitle: "這項資料暫時無法更新",
+      genericMessage: "請稍後再試。已顯示的資料會保留，不會遺失設定。",
+      rateLimitedTitle: "CMClient 正在處理較多要求",
+      rateLimitedMessage: "請稍候再選擇立即重試。你的設定與 API Key 不會遺失。",
+      sessionTitle: "需要重新確認管理工作階段",
+      sessionMessage: "請在這個瀏覽器重新登入後再繼續。",
+      localServiceTitle: "本機服務暫時沒有回應",
+      localServiceMessage:
+        "CMClient 會繼續嘗試連線。請確認 Agent 與 Gateway 正在執行。",
+      callmeshStaleTitle: "已忽略較舊的 CallMesh 回覆",
+      callmeshStaleMessage:
+        "為避免套用舊映射資料，CMClient 已安全暫停依賴此資料的工作，並會自動重新同步。",
+      aprsProvisionTitle: "APRS 傳送暫停",
+      aprsProvisionMessage:
+        "目前沒有可驗證的 APRS 授權資料。CMClient 會在取得有效資料後自動恢復。",
+      proxyConfigurationTitle: "TCP Proxy 尚未設定",
+      proxyConfigurationMessage:
+        "這個選用功能尚未為此安裝啟用；Meshtastic 的主要連線不受影響。",
+      notConfiguredTitle: "此功能尚未設定",
+      notConfiguredMessage: "完成相應設定後，CMClient 會在這裡顯示狀態。",
+      notEnabledTitle: "此版本未提供這項功能",
+      notEnabledMessage:
+        "目前沒有可執行的操作，因此 CMClient 不會顯示無效控制項。",
+    },
     auth: {
       title: "管理登入",
       password: "密碼",
@@ -195,6 +229,14 @@ export const messages = {
       dockerPullRecreateUpdate: "Docker 拉取與重建更新",
       localControl: "本機控制",
       remoteDispatch: "遠端派送",
+    },
+    capabilityReason: {
+      ownedByAgent: "由 Agent 管理",
+      ownedByGraphicalMode: "由桌面程式管理",
+      notConfigured: "尚未設定",
+      unavailableInNative: "原生安裝不提供",
+      notEnabled: "此版本未啟用",
+      unavailable: "目前不可用",
     },
     remoteDispatch: {
       module: "Remote Dispatch",
@@ -340,7 +382,18 @@ export const messages = {
     logs: {
       events: "即時事件",
       eventId: "Event ID",
+      technicalDetails: "事件詳細資訊",
       empty: "目前工作階段尚未收到事件。",
+      activity: {
+        node: "節點狀態已更新",
+        message: "收到 Mesh 訊息",
+        telemetry: "收到遙測資料",
+        position: "位置資料已更新",
+        aprs: "APRS 傳送狀態已更新",
+        callmesh: "CallMesh 同步狀態已更新",
+        proxy: "TCP Proxy 狀態已更新",
+        generic: "已收到系統活動",
+      },
     },
     settings: {
       display: "顯示偏好",
@@ -372,6 +425,13 @@ export const messages = {
       speed: "速度",
       log: "最近事件",
       idle: "目前沒有進行中的更新。",
+      activity: {
+        downloadStarted: "已開始下載更新",
+        signatureVerified: "已驗證更新簽章",
+        staged: "更新已準備完成",
+        completed: "更新已完成",
+        recorded: "已記錄更新活動",
+      },
       phase: {
         idle: "閒置",
         checking: "檢查中",
@@ -543,6 +603,44 @@ export const messages = {
       notConfigured: "Not configured",
       available: "Available",
     },
+    connection: {
+      checkingTitle: "Checking local services",
+      checkingMessage:
+        "CMClient is confirming the Agent and setup state on this computer.",
+      unavailableTitle: "The management page cannot be updated yet",
+      unavailableMessage:
+        "CMClient keeps this address and your existing setup, then reconnects automatically.",
+    },
+    problems: {
+      retry: "Retry now",
+      technicalDetails: "Support details",
+      genericTitle: "This information cannot be updated yet",
+      genericMessage:
+        "Try again shortly. Existing information stays visible and your setup is not lost.",
+      rateLimitedTitle: "CMClient is handling several requests",
+      rateLimitedMessage:
+        "Wait a moment, then choose Retry now. Your setup and API key are not lost.",
+      sessionTitle: "The management session needs confirmation",
+      sessionMessage: "Sign in again in this browser before continuing.",
+      localServiceTitle: "A local service is not responding yet",
+      localServiceMessage:
+        "CMClient will keep reconnecting. Check that Agent and Gateway are running.",
+      callmeshStaleTitle: "An older CallMesh response was ignored",
+      callmeshStaleMessage:
+        "To avoid using an older mapping, CMClient safely pauses work that depends on it and synchronizes again automatically.",
+      aprsProvisionTitle: "APRS sending is paused",
+      aprsProvisionMessage:
+        "No verified APRS authorization is currently available. CMClient resumes automatically after valid data is received.",
+      proxyConfigurationTitle: "TCP Proxy is not configured",
+      proxyConfigurationMessage:
+        "This optional feature is not enabled for this installation. The primary Meshtastic connection is unaffected.",
+      notConfiguredTitle: "This feature is not configured",
+      notConfiguredMessage:
+        "CMClient shows its status here after the required configuration is completed.",
+      notEnabledTitle: "This feature is not available in this release",
+      notEnabledMessage:
+        "There is no action to take, so CMClient does not show inactive controls.",
+    },
     auth: {
       title: "Management sign in",
       password: "Password",
@@ -603,6 +701,14 @@ export const messages = {
       dockerPullRecreateUpdate: "Docker pull/recreate update",
       localControl: "Local Control",
       remoteDispatch: "Remote Dispatch",
+    },
+    capabilityReason: {
+      ownedByAgent: "Managed by Agent",
+      ownedByGraphicalMode: "Managed by the desktop app",
+      notConfigured: "Not configured",
+      unavailableInNative: "Not available in native installs",
+      notEnabled: "Not enabled in this release",
+      unavailable: "Currently unavailable",
     },
     remoteDispatch: {
       module: "Remote Dispatch",
@@ -749,7 +855,18 @@ export const messages = {
     logs: {
       events: "Live events",
       eventId: "Event ID",
+      technicalDetails: "Event details",
       empty: "No events have been received in this session.",
+      activity: {
+        node: "Node status updated",
+        message: "Mesh message received",
+        telemetry: "Telemetry received",
+        position: "Position data updated",
+        aprs: "APRS delivery status updated",
+        callmesh: "CallMesh synchronization updated",
+        proxy: "TCP Proxy status updated",
+        generic: "System activity received",
+      },
     },
     settings: {
       display: "Display preferences",
@@ -781,6 +898,13 @@ export const messages = {
       speed: "Speed",
       log: "Recent events",
       idle: "No update is currently active.",
+      activity: {
+        downloadStarted: "Update download started",
+        signatureVerified: "Update signature verified",
+        staged: "Update is ready to install",
+        completed: "Update completed",
+        recorded: "Update activity recorded",
+      },
       phase: {
         idle: "Idle",
         checking: "Checking",

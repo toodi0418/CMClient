@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from "vue";
+import { computed, onMounted } from "vue";
 import { RadioTower, RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import CapabilityStatus from "@/components/CapabilityStatus.vue";
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useGatewayStore } from "@/stores/gateway";
 import { useMeshtasticStore } from "@/stores/meshtastic";
 
@@ -14,15 +16,12 @@ const { t } = useI18n();
 const serialCapability = computed(
   () => gateway.capabilities?.capabilities.serial,
 );
-
-watch(
-  () => gateway.lastEventType,
-  (eventType) => {
-    if (eventType?.startsWith("mesh.")) {
-      void meshtastic.refresh();
-    }
-  },
-);
+const serialReasonCode = computed(() => {
+  const capability = serialCapability.value;
+  return capability && "reasonCode" in capability
+    ? capability.reasonCode
+    : undefined;
+});
 
 async function refreshRuntime() {
   await Promise.all([gateway.refresh(), meshtastic.refresh()]);
@@ -56,13 +55,12 @@ onMounted(() => void meshtastic.refresh());
       <p v-if="meshtastic.loading && !meshtastic.status" class="status-message">
         {{ t("common.loading") }}
       </p>
-      <p
+      <ProblemNotice
         v-else-if="meshtastic.errorCode && !meshtastic.status"
-        class="status-message"
-      >
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ meshtastic.errorCode }}</code>
-      </p>
+        :code="meshtastic.errorCode"
+        show-retry
+        @retry="refreshRuntime"
+      />
       <template v-else-if="meshtastic.status">
         <dl class="facts-grid">
           <div>
@@ -127,14 +125,16 @@ onMounted(() => void meshtastic.refresh());
             <dd>{{ meshtastic.status.metrics?.reconnects ?? 0 }}</dd>
           </div>
         </dl>
-        <code
+        <ProblemNotice
           v-if="meshtastic.status.connection?.reasonCode"
-          class="stable-code"
-          >{{ meshtastic.status.connection.reasonCode }}</code
-        >
-        <code v-if="meshtastic.errorCode" class="stable-code">{{
-          meshtastic.errorCode
-        }}</code>
+          :code="meshtastic.status.connection.reasonCode"
+          compact
+        />
+        <ProblemNotice
+          v-if="meshtastic.errorCode"
+          :code="meshtastic.errorCode"
+          compact
+        />
       </template>
     </div>
 
@@ -160,21 +160,10 @@ onMounted(() => void meshtastic.refresh());
           }}
         </p>
         <div class="connection-summary">
-          <span
-            class="status-badge"
-            :data-state="
-              serialCapability.available ? 'available' : 'unavailable'
-            "
-          >
-            {{
-              serialCapability.available
-                ? t("common.available")
-                : t("common.notConfigured")
-            }}
-          </span>
-          <code v-if="!serialCapability.available">{{
-            serialCapability.reasonCode
-          }}</code>
+          <CapabilityStatus
+            :available="serialCapability.available"
+            :reason-code="serialReasonCode"
+          />
         </div>
       </template>
       <p v-else class="status-message">{{ t("common.unavailable") }}</p>
@@ -199,9 +188,12 @@ onMounted(() => void meshtastic.refresh());
         >
           {{ t(`eventState.${gateway.eventConnection}`) }}
         </span>
-        <code v-if="gateway.lastEventType">{{ gateway.lastEventType }}</code>
-        <code v-else-if="gateway.errorCode">{{ gateway.errorCode }}</code>
       </div>
+      <ProblemNotice
+        v-if="gateway.errorCode"
+        :code="gateway.errorCode"
+        compact
+      />
     </div>
   </section>
 </template>

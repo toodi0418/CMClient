@@ -4,6 +4,8 @@ import { Languages, Monitor, Moon, Sun } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import CapabilityStatus from "@/components/CapabilityStatus.vue";
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { isSupportedLocale, type ThemePreference } from "@/preferences";
 import { useGatewayStore } from "@/stores/gateway";
 import { usePreferencesStore } from "@/stores/preferences";
@@ -46,7 +48,12 @@ const runtimeCapabilities = computed(() =>
         key: "managementWeb" | "nativeUpdate";
         capability: NonNullable<typeof row.capability>;
       } => Boolean(row.capability),
-    ),
+    )
+    .map((row) => ({
+      ...row,
+      reasonCode:
+        "reasonCode" in row.capability ? row.capability.reasonCode : undefined,
+    })),
 );
 
 onMounted(() => void gateway.refresh());
@@ -115,10 +122,12 @@ function setLocale(event: Event) {
           <h2>{{ t("settings.capabilities") }}</h2>
         </div>
       </div>
-      <p v-if="gateway.errorCode" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ gateway.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-if="gateway.errorCode"
+        :code="gateway.errorCode"
+        show-retry
+        @retry="gateway.refresh"
+      />
       <div v-else class="capability-list">
         <div
           v-for="row in runtimeCapabilities"
@@ -126,19 +135,10 @@ function setLocale(event: Event) {
           class="capability-row"
         >
           <span>{{ t(`capability.${row.key}`) }}</span>
-          <span
-            class="status-badge"
-            :data-state="row.capability.available ? 'available' : 'unavailable'"
-          >
-            {{
-              row.capability.available
-                ? t("common.available")
-                : t("common.notConfigured")
-            }}
-          </span>
-          <code v-if="!row.capability.available">{{
-            row.capability.reasonCode
-          }}</code>
+          <CapabilityStatus
+            :available="row.capability.available"
+            :reason-code="row.reasonCode"
+          />
         </div>
       </div>
     </div>

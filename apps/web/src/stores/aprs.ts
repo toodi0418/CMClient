@@ -1,10 +1,12 @@
-import { GatewayApiClient, isGatewayApiError } from "@cmclient/api-client";
+import { isGatewayApiError, type GatewayApiClient } from "@cmclient/api-client";
 import type {
   AprsIgateSubmission,
   AprsOutboxEntry,
   AprsRuntimeStatus,
 } from "@cmclient/contracts";
 import { defineStore } from "pinia";
+
+import { managementApi } from "../management-api";
 
 export interface AprsClient {
   aprs: Pick<
@@ -13,7 +15,7 @@ export interface AprsClient {
   >;
 }
 
-export function createAprsStore(client: AprsClient = new GatewayApiClient()) {
+export function createAprsStore(client: AprsClient = managementApi) {
   return defineStore("aprs", {
     state: () => ({
       loading: false,

@@ -2,6 +2,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createMemoryHistory } from "vue-router";
 
+import { GatewayApiError } from "@cmclient/api-client";
 import { CURRENT_TERMS_VERSION, type SetupStatus } from "@cmclient/contracts";
 import { createSetupStore, type SetupClient } from "../stores/setup";
 import { createManagementRouter, installSetupRouteGate, router } from "./index";
@@ -84,6 +85,43 @@ describe("management web router", () => {
     await eventually();
 
     expect(guardedRouter.currentRoute.value.fullPath).toBe("/setup");
+  });
+
+  it("keeps a deep link when setup status is temporarily rate limited", async () => {
+    const setup = createSetupStore({
+      setup: {
+        status: async () => {
+          throw new GatewayApiError({
+            code: "MANAGEMENT_REQUEST_RATE_LIMITED",
+            status: 429,
+            retryable: true,
+          });
+        },
+        discovery: async () => ({
+          schemaVersion: 1,
+          candidates: [],
+          callmeshUrl: "https://callmesh.tmmarc.org",
+        }),
+        acceptTerms: async () => termsStatus,
+        configure: async () => termsStatus,
+        reset: async () => termsStatus,
+      },
+    })();
+    const guardedRouter = createManagementRouter(createMemoryHistory(), {
+      template: "<div />",
+    });
+    guardedRouter.addRoute({
+      path: "/fixture-management",
+      component: { template: "<div />" },
+    });
+    installSetupRouteGate(guardedRouter, setup);
+
+    await guardedRouter.push("/fixture-management");
+
+    expect(setup.admission).toBe("unavailable");
+    expect(guardedRouter.currentRoute.value.fullPath).toBe(
+      "/fixture-management",
+    );
   });
 });
 

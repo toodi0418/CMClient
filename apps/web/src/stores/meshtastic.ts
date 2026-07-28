@@ -1,13 +1,15 @@
-import { GatewayApiClient, isGatewayApiError } from "@cmclient/api-client";
+import { isGatewayApiError, type GatewayApiClient } from "@cmclient/api-client";
 import type { MeshtasticRuntimeStatus } from "@cmclient/contracts";
 import { defineStore } from "pinia";
+
+import { managementApi } from "../management-api";
 
 export interface MeshtasticClient {
   meshtastic: Pick<GatewayApiClient["meshtastic"], "status">;
 }
 
 export function createMeshtasticStore(
-  client: MeshtasticClient = new GatewayApiClient(),
+  client: MeshtasticClient = managementApi,
 ) {
   return defineStore("meshtastic", {
     state: () => ({

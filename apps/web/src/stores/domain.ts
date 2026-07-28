@@ -1,4 +1,4 @@
-import { GatewayApiClient, isGatewayApiError } from "@cmclient/api-client";
+import { isGatewayApiError, type GatewayApiClient } from "@cmclient/api-client";
 import type {
   MeshMessage,
   MeshNode,
@@ -7,6 +7,8 @@ import type {
 } from "@cmclient/contracts";
 import { defineStore } from "pinia";
 
+import { managementApi } from "../management-api";
+
 export interface DomainClient {
   domain: Pick<
     GatewayApiClient["domain"],
@@ -14,14 +16,17 @@ export interface DomainClient {
   >;
 }
 
-export function createDomainStore(
-  client: DomainClient = new GatewayApiClient(),
-) {
+export function createDomainStore(client: DomainClient = managementApi) {
   return defineStore("domain", {
     state: () => ({
-      loading: false,
-      refreshPending: false,
-      errorCode: undefined as string | undefined,
+      nodesLoading: false,
+      messagesLoading: false,
+      telemetryLoading: false,
+      positionsLoading: false,
+      nodesErrorCode: undefined as string | undefined,
+      messagesErrorCode: undefined as string | undefined,
+      telemetryErrorCode: undefined as string | undefined,
+      positionsErrorCode: undefined as string | undefined,
       nodes: [] as MeshNode[],
       messages: [] as MeshMessage[],
       telemetry: [] as MeshTelemetry[],
@@ -29,33 +34,79 @@ export function createDomainStore(
     }),
     actions: {
       async refresh() {
-        if (this.loading) {
-          this.refreshPending = true;
+        await Promise.all([
+          this.refreshNodes(),
+          this.refreshMessages(),
+          this.refreshTelemetry(),
+          this.refreshPositions(),
+        ]);
+      },
+      async refreshNodes() {
+        if (this.nodesLoading) {
           return;
         }
-        this.loading = true;
+        this.nodesLoading = true;
         try {
-          const [nodes, messages, telemetry, positions] = await Promise.all([
-            client.domain.nodes(),
-            client.domain.messages(),
-            client.domain.telemetry(),
-            client.domain.positions(),
-          ]);
+          const nodes = await client.domain.nodes();
           this.nodes = nodes.items;
-          this.messages = messages.items;
-          this.telemetry = telemetry.items;
-          this.positions = positions.items;
-          this.errorCode = undefined;
+          this.nodesErrorCode = undefined;
         } catch (error) {
-          this.errorCode = isGatewayApiError(error)
+          this.nodesErrorCode = isGatewayApiError(error)
             ? error.code
             : "GATEWAY_NETWORK_UNAVAILABLE";
         } finally {
-          this.loading = false;
-          if (this.refreshPending) {
-            this.refreshPending = false;
-            void this.refresh();
-          }
+          this.nodesLoading = false;
+        }
+      },
+      async refreshMessages() {
+        if (this.messagesLoading) {
+          return;
+        }
+        this.messagesLoading = true;
+        try {
+          const messages = await client.domain.messages();
+          this.messages = messages.items;
+          this.messagesErrorCode = undefined;
+        } catch (error) {
+          this.messagesErrorCode = isGatewayApiError(error)
+            ? error.code
+            : "GATEWAY_NETWORK_UNAVAILABLE";
+        } finally {
+          this.messagesLoading = false;
+        }
+      },
+      async refreshTelemetry() {
+        if (this.telemetryLoading) {
+          return;
+        }
+        this.telemetryLoading = true;
+        try {
+          const telemetry = await client.domain.telemetry();
+          this.telemetry = telemetry.items;
+          this.telemetryErrorCode = undefined;
+        } catch (error) {
+          this.telemetryErrorCode = isGatewayApiError(error)
+            ? error.code
+            : "GATEWAY_NETWORK_UNAVAILABLE";
+        } finally {
+          this.telemetryLoading = false;
+        }
+      },
+      async refreshPositions() {
+        if (this.positionsLoading) {
+          return;
+        }
+        this.positionsLoading = true;
+        try {
+          const positions = await client.domain.positions();
+          this.positions = positions.items;
+          this.positionsErrorCode = undefined;
+        } catch (error) {
+          this.positionsErrorCode = isGatewayApiError(error)
+            ? error.code
+            : "GATEWAY_NETWORK_UNAVAILABLE";
+        } finally {
+          this.positionsLoading = false;
         }
       },
     },

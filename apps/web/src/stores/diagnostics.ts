@@ -1,6 +1,8 @@
-import { GatewayApiClient, isGatewayApiError } from "@cmclient/api-client";
+import { isGatewayApiError, type GatewayApiClient } from "@cmclient/api-client";
 import type { JobDetail } from "@cmclient/contracts";
 import { defineStore } from "pinia";
+
+import { managementApi } from "../management-api";
 
 export interface DiagnosticsClient {
   diagnostics: Pick<GatewayApiClient["diagnostics"], "integrityCheck">;
@@ -8,7 +10,7 @@ export interface DiagnosticsClient {
 }
 
 export function createDiagnosticsStore(
-  client: DiagnosticsClient = new GatewayApiClient(),
+  client: DiagnosticsClient = managementApi,
 ) {
   return defineStore("diagnostics", {
     state: () => ({

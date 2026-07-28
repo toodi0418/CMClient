@@ -4,12 +4,13 @@ import { RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useDomainStore } from "@/stores/domain";
 
 const domain = useDomainStore();
 const { t } = useI18n();
 
-onMounted(() => void domain.refresh());
+onMounted(() => void domain.refreshMessages());
 </script>
 
 <template>
@@ -28,18 +29,23 @@ onMounted(() => void domain.refresh());
           type="button"
           :aria-label="t('common.refresh')"
           :title="t('common.refresh')"
-          :disabled="domain.loading"
-          @click="domain.refresh"
+          :disabled="domain.messagesLoading"
+          @click="domain.refreshMessages"
           ><RefreshCw :size="17" aria-hidden="true"
         /></Button>
       </div>
-      <p v-if="domain.loading" class="status-message">
+      <p
+        v-if="domain.messagesLoading && !domain.messages.length"
+        class="status-message"
+      >
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="domain.errorCode" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ domain.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-else-if="domain.messagesErrorCode && !domain.messages.length"
+        :code="domain.messagesErrorCode"
+        show-retry
+        @retry="domain.refreshMessages"
+      />
       <p v-else-if="!domain.messages.length" class="status-message">
         {{ t("domain.empty") }}
       </p>
@@ -57,6 +63,13 @@ onMounted(() => void domain.refresh());
           <time>{{ message.observedAt }}</time>
         </article>
       </div>
+      <ProblemNotice
+        v-if="domain.messagesErrorCode && domain.messages.length"
+        :code="domain.messagesErrorCode"
+        compact
+        show-retry
+        @retry="domain.refreshMessages"
+      />
     </div>
   </section>
 </template>

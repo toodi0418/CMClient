@@ -106,6 +106,31 @@ describe("management auth store", () => {
     expect(auth.csrfToken).toBeUndefined();
     expect(auth.errorCode).toBe("MANAGEMENT_LOCAL_SESSION_DENIED");
   });
+
+  it("keeps a temporary local-session failure retryable", async () => {
+    let attempts = 0;
+    const auth = createManagementAuthStore({
+      async localSession() {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new ManagementAuthError("MANAGEMENT_REQUEST_RATE_LIMITED");
+        }
+        return { csrfToken: "c".repeat(32), expiresAt: 1_784_344_000 };
+      },
+      async login() {
+        throw new ManagementAuthError("MANAGEMENT_CREDENTIALS_INVALID");
+      },
+    })();
+
+    await auth.initialize();
+    expect(auth.initialized).toBe(false);
+    expect(auth.required).toBe(false);
+    expect(auth.errorCode).toBe("MANAGEMENT_REQUEST_RATE_LIMITED");
+
+    await auth.initialize();
+    expect(auth.initialized).toBe(true);
+    expect(auth.csrfToken).toBe("c".repeat(32));
+  });
 });
 
 function jsonResponse(payload: unknown): Response {

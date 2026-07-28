@@ -5,6 +5,8 @@ import {
 import { Value } from "@sinclair/typebox/value";
 import { defineStore } from "pinia";
 
+import { managementRequestQueue } from "../management-api";
+
 export const DEFAULT_UPDATE_STATUS_URL = "/api/v1/updates";
 export const DEFAULT_UPDATE_EVENTS_URL = "/api/v1/updates/events";
 
@@ -45,8 +47,7 @@ export class AgentUpdateClient implements UpdatesClient {
   private readonly eventsUrl: string;
 
   constructor(options: AgentUpdateClientOptions = {}) {
-    this.fetchImplementation =
-      options.fetch ?? ((input, init) => globalThis.fetch(input, init));
+    this.fetchImplementation = options.fetch ?? managementRequestQueue.fetch;
     this.eventSource = options.eventSource ?? globalThis.EventSource;
     this.statusUrl = validateUpdateUrl(
       options.statusUrl ?? DEFAULT_UPDATE_STATUS_URL,

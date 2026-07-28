@@ -4,6 +4,7 @@ import { Activity, RefreshCw, ShieldCheck, X } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useDiagnosticsStore } from "@/stores/diagnostics";
 
 const diagnostics = useDiagnosticsStore();
@@ -66,10 +67,12 @@ const active = computed(() =>
           <span>{{ t("diagnostics.run") }}</span>
         </Button>
       </div>
-      <p v-if="diagnostics.errorCode" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ diagnostics.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-if="diagnostics.errorCode"
+        :code="diagnostics.errorCode"
+        show-retry
+        @retry="diagnostics.refresh"
+      />
       <p v-else-if="!diagnostics.job" class="status-message">
         {{ t("diagnostics.ready") }}
       </p>
@@ -101,9 +104,11 @@ const active = computed(() =>
           </dd>
         </div>
       </dl>
-      <code v-if="diagnostics.job?.error" class="stable-code">{{
-        diagnostics.job.error.code
-      }}</code>
+      <ProblemNotice
+        v-if="diagnostics.job?.error"
+        :code="diagnostics.job.error.code"
+        compact
+      />
     </div>
   </section>
 </template>

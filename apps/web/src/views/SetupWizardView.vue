@@ -77,12 +77,9 @@ const connectionInitialValues = computed<SetupFormValues>(() => ({
   gatewayId: reviewedConfiguration.value?.gatewayId ?? "cmclient-gateway",
   callmeshApiKey: "",
 }));
-const localError = computed(() => {
-  const key =
-    localErrorKey.value ||
-    (!setup.initialized && setup.errorCode ? "setup.serviceUnavailable" : "");
-  return key ? t(key) : "";
-});
+const localError = computed(() =>
+  localErrorKey.value ? t(localErrorKey.value) : "",
+);
 const isSynchronizing = computed(() => flow.value.matches("synchronizing"));
 const isTerms = computed(() => flow.value.matches("terms"));
 const isConnection = computed(() =>
@@ -125,7 +122,7 @@ onMounted(async () => {
     try {
       await setup.start();
     } catch {
-      localErrorKey.value = "setup.serviceUnavailable";
+      // App renders the recoverable management connection state instead.
     }
   }
 });
@@ -301,7 +298,7 @@ async function retryStatus() {
   try {
     await setup.refresh();
   } catch {
-    localErrorKey.value = "setup.serviceUnavailable";
+    // The connection state stays visible until a verified setup status arrives.
   }
 }
 

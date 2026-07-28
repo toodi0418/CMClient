@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useGatewayStore } from "@/stores/gateway";
 
 const { t } = useI18n();
@@ -37,9 +38,11 @@ const gatewayMessage = computed(() => {
       <div class="signal-board__body">
         <strong>{{ t(`gateway.${gateway.availability}`) }}</strong>
         <p>{{ gatewayMessage }}</p>
-        <code v-if="gateway.errorCode" class="stable-code">{{
-          gateway.errorCode
-        }}</code>
+        <ProblemNotice
+          v-if="gateway.errorCode"
+          :code="gateway.errorCode"
+          compact
+        />
       </div>
     </div>
     <div class="overview-strip" :aria-label="t('shell.operations')">

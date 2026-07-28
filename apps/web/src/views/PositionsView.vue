@@ -13,6 +13,7 @@ import "leaflet/dist/leaflet.css";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useDomainStore } from "@/stores/domain";
 
 const domain = useDomainStore();
@@ -42,7 +43,7 @@ function longitude(event: (typeof domain.positions)[number]) {
 }
 
 async function refreshPositions() {
-  await domain.refresh();
+  await domain.refreshPositions();
   await nextTick();
   await initializeMap();
   renderMarkers();
@@ -205,29 +206,41 @@ onBeforeUnmount(() => {
             type="button"
             :aria-label="t('common.refresh')"
             :title="t('common.refresh')"
-            :disabled="domain.loading"
+            :disabled="domain.positionsLoading"
             @click="refreshPositions"
           >
             <RefreshCw :size="17" aria-hidden="true" />
           </Button>
         </div>
       </div>
-      <p v-if="domain.loading" class="status-message">
+      <p
+        v-if="domain.positionsLoading && !plottedPositions.length"
+        class="status-message"
+      >
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="domain.errorCode" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ domain.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-else-if="domain.positionsErrorCode && !plottedPositions.length"
+        :code="domain.positionsErrorCode"
+        show-retry
+        @retry="refreshPositions"
+      />
       <p v-else-if="!plottedPositions.length" class="status-message">
         {{ t("domain.empty") }}
       </p>
       <div
-        v-show="!domain.loading && !domain.errorCode && plottedPositions.length"
+        v-show="!domain.positionsLoading && plottedPositions.length"
         ref="mapElement"
         class="position-map"
         role="application"
         :aria-label="t('domain.coordinates')"
+      />
+      <ProblemNotice
+        v-if="domain.positionsErrorCode && plottedPositions.length"
+        :code="domain.positionsErrorCode"
+        compact
+        show-retry
+        @retry="refreshPositions"
       />
     </div>
     <div v-if="plottedPositions.length" class="status-panel record-list">

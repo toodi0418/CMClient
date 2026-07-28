@@ -4,6 +4,9 @@ import { RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import CapabilityStatus from "@/components/CapabilityStatus.vue";
+import ProblemNotice from "@/components/ProblemNotice.vue";
+import { updateActivityKey } from "@/problems";
 import { useGatewayStore } from "@/stores/gateway";
 import { useUpdatesStore } from "@/stores/updates";
 
@@ -13,6 +16,12 @@ const { locale, t } = useI18n();
 const updateCapability = computed(
   () => gateway.capabilities?.capabilities.nativeUpdate,
 );
+const updateCapabilityReasonCode = computed(() => {
+  const capability = updateCapability.value;
+  return capability && "reasonCode" in capability
+    ? capability.reasonCode
+    : undefined;
+});
 const job = computed(() => updates.status?.job);
 const phase = computed(() => job.value?.phase ?? "idle");
 const phaseLabel = computed(() => t("updates.phase." + phase.value));
@@ -118,29 +127,30 @@ onUnmounted(() => updates.stop());
         <div v-if="job" class="update-job-meta">
           <span>{{ t("updates.job") }}</span>
           <code>{{ job.id }}</code>
-          <code v-if="job.errorCode" class="stable-code">{{
-            job.errorCode
-          }}</code>
+          <ProblemNotice v-if="job.errorCode" :code="job.errorCode" compact />
         </div>
         <p v-else class="status-message">{{ t("updates.idle") }}</p>
         <div v-if="job?.recentLogCodes.length" class="update-log">
           <p>{{ t("updates.log") }}</p>
           <ul>
             <li v-for="code in job.recentLogCodes" :key="code">
-              <code>{{ code }}</code>
+              {{ t(updateActivityKey(code)) }}
             </li>
           </ul>
         </div>
-        <code v-if="updates.errorCode" class="stable-code">{{
-          updates.errorCode
-        }}</code>
+        <ProblemNotice
+          v-if="updates.errorCode"
+          :code="updates.errorCode"
+          compact
+        />
       </template>
-      <p v-else class="status-message">
-        {{ t("common.unavailable") }}
-        <code v-if="updates.errorCode" class="stable-code">{{
-          updates.errorCode
-        }}</code>
-      </p>
+      <ProblemNotice
+        v-else-if="updates.errorCode"
+        :code="updates.errorCode"
+        show-retry
+        @retry="refresh"
+      />
+      <p v-else class="status-message">{{ t("common.loading") }}</p>
     </div>
 
     <div class="status-panel">
@@ -163,25 +173,15 @@ onUnmounted(() => updates.stop());
         </div>
         <div>
           <dt>{{ t("updates.owner") }}</dt>
-          <dd>
-            <span
-              class="status-badge"
-              :data-state="
-                updateCapability?.available ? 'available' : 'unavailable'
-              "
-            >
-              {{ t("updates.agent") }}
-            </span>
-          </dd>
+          <dd>{{ t("updates.agent") }}</dd>
         </div>
         <div>
           <dt>{{ t("updates.capability") }}</dt>
           <dd>
-            <code>{{
-              updateCapability && !updateCapability.available
-                ? updateCapability.reasonCode
-                : "--"
-            }}</code>
+            <CapabilityStatus
+              :available="updateCapability?.available ?? false"
+              :reason-code="updateCapabilityReasonCode"
+            />
           </dd>
         </div>
       </dl>

@@ -4,6 +4,7 @@ import { RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useCallMeshStore } from "@/stores/callmesh";
 
 const callmesh = useCallMeshStore();
@@ -36,10 +37,12 @@ onMounted(() => void callmesh.refresh());
       <p v-if="callmesh.loading" class="status-message">
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="callmesh.errorCode" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ callmesh.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-else-if="callmesh.errorCode && !callmesh.status"
+        :code="callmesh.errorCode"
+        show-retry
+        @retry="callmesh.refresh"
+      />
       <dl v-else-if="callmesh.status" class="facts-grid">
         <div>
           <dt>{{ t("callmesh.state") }}</dt>
@@ -64,11 +67,18 @@ onMounted(() => void callmesh.refresh());
           </dd>
         </div>
       </dl>
-      <code
+      <ProblemNotice
         v-if="callmesh.status?.reasonCode && !callmesh.errorCode"
-        class="stable-code"
-        >{{ callmesh.status.reasonCode }}</code
-      >
+        :code="callmesh.status.reasonCode"
+        compact
+      />
+      <ProblemNotice
+        v-if="callmesh.errorCode && callmesh.status"
+        :code="callmesh.errorCode"
+        compact
+        show-retry
+        @retry="callmesh.refresh"
+      />
     </div>
 
     <div class="status-panel">

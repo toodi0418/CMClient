@@ -5,6 +5,7 @@ import type { ECharts } from "echarts/core";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useDomainStore } from "@/stores/domain";
 import { buildTelemetryChartModel } from "@/telemetry-chart";
 
@@ -20,7 +21,7 @@ let resizeFrame: number | undefined;
 let themeObserver: MutationObserver | undefined;
 
 async function refreshTelemetry() {
-  await domain.refresh();
+  await domain.refreshTelemetry();
   await nextTick();
   await renderChart();
 }
@@ -119,19 +120,24 @@ onBeforeUnmount(() => {
           type="button"
           :aria-label="t('common.refresh')"
           :title="t('common.refresh')"
-          :disabled="domain.loading"
+          :disabled="domain.telemetryLoading"
           @click="refreshTelemetry"
         >
           <RefreshCw :size="17" aria-hidden="true" />
         </Button>
       </div>
-      <p v-if="domain.loading" class="status-message">
+      <p
+        v-if="domain.telemetryLoading && !domain.telemetry.length"
+        class="status-message"
+      >
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="domain.errorCode" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ domain.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-else-if="domain.telemetryErrorCode && !domain.telemetry.length"
+        :code="domain.telemetryErrorCode"
+        show-retry
+        @retry="refreshTelemetry"
+      />
       <p v-else-if="!domain.telemetry.length" class="status-message">
         {{ t("domain.empty") }}
       </p>
@@ -144,6 +150,13 @@ onBeforeUnmount(() => {
         class="telemetry-chart"
         role="img"
         :aria-label="t('domain.telemetryChart')"
+      />
+      <ProblemNotice
+        v-if="domain.telemetryErrorCode && domain.telemetry.length"
+        :code="domain.telemetryErrorCode"
+        compact
+        show-retry
+        @retry="refreshTelemetry"
       />
     </div>
     <div v-if="domain.telemetry.length" class="status-panel record-list">

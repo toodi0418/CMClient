@@ -1,6 +1,5 @@
 import {
   GatewayApiError,
-  GatewayApiClient,
   isGatewayApiError,
   type AgentSetupApi,
 } from "@cmclient/api-client";
@@ -17,6 +16,8 @@ import {
 import { Value } from "@sinclair/typebox/value";
 import { defineStore } from "pinia";
 
+import { managementApi } from "../management-api";
+
 export interface SetupEventListener {
   onStatus(status: SetupStatus): void;
   onError(code: string): void;
@@ -27,11 +28,12 @@ export interface SetupClient {
   subscribe?: (listener: SetupEventListener) => () => void;
 }
 
+export type SetupAdmission = "checking" | "ready" | "required" | "unavailable";
+
 function defaultClient(): SetupClient {
-  const api = new GatewayApiClient();
   const events = new BrowserSetupEventClient();
   return {
-    setup: api.setup,
+    setup: managementApi.setup,
     subscribe: (listener) => events.subscribe(listener),
   };
 }
@@ -95,6 +97,8 @@ export class BrowserSetupEventClient {
  * out of Pinia state and browser persistence.
  */
 export function createSetupStore(client: SetupClient = defaultClient()) {
+  let activeRefresh: Promise<SetupStatus | undefined> | undefined;
+
   return defineStore("setup", {
     state: () => ({
       status: undefined as SetupStatus | undefined,
@@ -104,19 +108,21 @@ export function createSetupStore(client: SetupClient = defaultClient()) {
       discovering: false,
       errorCode: undefined as string | undefined,
       initialized: false,
+      admission: "checking" as SetupAdmission,
       connection: "idle" as
         "idle" | "connecting" | "open" | "reconnecting" | "stopped",
       started: false,
       unsubscribe: undefined as (() => void) | undefined,
     }),
     getters: {
-      required: (state) => state.status?.setupRequired ?? true,
+      required: (state) => state.admission === "required",
       phase: (state) => state.status?.phase ?? "uninitialized",
     },
     actions: {
       applyStatus(status: SetupStatus) {
         this.status = status;
         this.initialized = true;
+        this.admission = status.setupRequired ? "required" : "ready";
       },
       async start() {
         if (this.started) {
@@ -135,8 +141,16 @@ export function createSetupStore(client: SetupClient = defaultClient()) {
                 this.connection = "open";
               },
               onError: (code) => {
-                this.errorCode = code;
+                // Keep a recent REST admission failure visible while the SSE
+                // transport reconnects, so an unrelated stream error does not
+                // replace the actionable reason shown to the operator.
+                if (!this.errorCode) {
+                  this.errorCode = code;
+                }
                 this.connection = "reconnecting";
+                if (!this.status) {
+                  this.admission = "unavailable";
+                }
               },
             });
           }
@@ -149,22 +163,31 @@ export function createSetupStore(client: SetupClient = defaultClient()) {
         this.connection = "stopped";
       },
       async refresh() {
-        if (this.loading) {
-          return this.status;
+        if (activeRefresh) {
+          return activeRefresh;
         }
         this.loading = true;
-        try {
-          this.applyStatus(await client.setup.status());
-          this.errorCode = undefined;
-          return this.status;
-        } catch (error) {
-          this.errorCode = isGatewayApiError(error)
-            ? error.code
-            : "AGENT_SETUP_UNAVAILABLE";
-          throw error;
-        } finally {
-          this.loading = false;
-        }
+        activeRefresh = client.setup
+          .status()
+          .then((status) => {
+            this.applyStatus(status);
+            this.errorCode = undefined;
+            return this.status;
+          })
+          .catch((error) => {
+            this.errorCode = isGatewayApiError(error)
+              ? error.code
+              : "AGENT_SETUP_UNAVAILABLE";
+            if (!this.status) {
+              this.admission = "unavailable";
+            }
+            throw error;
+          })
+          .finally(() => {
+            this.loading = false;
+            activeRefresh = undefined;
+          });
+        return activeRefresh;
       },
       async discover() {
         if (this.discovering) {

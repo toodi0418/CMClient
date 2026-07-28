@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch } from "vue";
+import { computed, onBeforeUnmount, watch } from "vue";
 import {
   Gauge,
   Cloud,
@@ -29,11 +29,16 @@ import { RouterLink, RouterView, useRoute } from "vue-router";
 import { useI18n } from "vue-i18n";
 
 import { isSupportedLocale, type ThemePreference } from "@/preferences";
-import { projectionForEvent } from "@/realtime-refresh";
+import {
+  createRefreshScheduler,
+  projectionForEvent,
+  type RealtimeProjection,
+} from "@/realtime-refresh";
 import { useAprsStore } from "@/stores/aprs";
 import { useCallMeshStore } from "@/stores/callmesh";
 import { useDomainStore } from "@/stores/domain";
 import { useGatewayStore } from "@/stores/gateway";
+import { useMeshtasticStore } from "@/stores/meshtastic";
 import {
   isManagementSessionError,
   useManagementAuthStore,
@@ -42,6 +47,7 @@ import { usePreferencesStore } from "@/stores/preferences";
 import { useProxyStore } from "@/stores/proxy";
 import { useShellStore } from "@/stores/shell";
 import ManagementLoginView from "@/views/ManagementLoginView.vue";
+import ManagementConnectionView from "@/views/ManagementConnectionView.vue";
 import { useSetupStore } from "@/stores/setup";
 
 const shell = useShellStore();
@@ -50,6 +56,7 @@ const domain = useDomainStore();
 const aprs = useAprsStore();
 const callmesh = useCallMeshStore();
 const proxy = useProxyStore();
+const meshtastic = useMeshtasticStore();
 const auth = useManagementAuthStore();
 const preferences = usePreferencesStore();
 const setup = useSetupStore();
@@ -73,6 +80,14 @@ const primaryNavigation = [
   { labelKey: "navigation.aprs", to: "/aprs", icon: Satellite },
   { labelKey: "navigation.callmesh", to: "/callmesh", icon: Cloud },
 ];
+
+const visiblePrimaryNavigation = computed(() =>
+  primaryNavigation.filter(
+    (item) =>
+      item.to !== "/remote-dispatch" ||
+      gateway.capabilities?.capabilities.remoteDispatch?.available === true,
+  ),
+);
 
 const supportNavigation = [
   { labelKey: "navigation.logs", to: "/logs", icon: ScrollText },
@@ -116,6 +131,15 @@ const requiresLogin = computed(
 
 const setupRequired = computed(() => setup.required);
 const isSetupRoute = computed(() => route.name === "setup");
+const setupAdmissionPending = computed(
+  () => setup.admission === "checking" || setup.admission === "unavailable",
+);
+const authAdmissionPending = computed(
+  () =>
+    (setup.admission === "ready" || setup.admission === "required") &&
+    !auth.initialized,
+);
+const refreshScheduler = createRefreshScheduler();
 
 const railToggleIcon = computed(() =>
   shell.desktopRailCollapsed ? PanelLeftOpen : PanelLeftClose,
@@ -137,28 +161,42 @@ watch(
   { immediate: true },
 );
 
+function refreshProjection(projection: RealtimeProjection) {
+  switch (projection) {
+    case "gateway":
+      return gateway.refresh();
+    case "nodes":
+      return domain.refreshNodes();
+    case "messages":
+      return domain.refreshMessages();
+    case "telemetry":
+      return domain.refreshTelemetry();
+    case "positions":
+      return domain.refreshPositions();
+    case "meshtastic":
+      return meshtastic.refresh();
+    case "aprs":
+      return aprs.refresh();
+    case "callmesh":
+      return callmesh.refresh();
+    case "proxy":
+      return proxy.refresh();
+  }
+}
+
 watch(
   () => gateway.recentEvents[0],
   (event) => {
-    if (!event) {
-      return;
-    }
-    switch (projectionForEvent(event.type)) {
-      case "domain":
-        void domain.refresh();
-        break;
-      case "aprs":
-        void aprs.refresh();
-        break;
-      case "callmesh":
-        void callmesh.refresh();
-        break;
-      case "proxy":
-        void proxy.refresh();
-        break;
+    const projection = event && projectionForEvent(event.type);
+    if (projection) {
+      refreshScheduler.schedule(projection, () =>
+        refreshProjection(projection),
+      );
     }
   },
 );
+
+onBeforeUnmount(() => refreshScheduler.dispose());
 
 function setLocale(event: Event) {
   const locale = (event.target as HTMLSelectElement).value;
@@ -173,21 +211,34 @@ async function refreshAfterLogin() {
 }
 
 watch(
-  () => setup.required,
-  (required) => {
-    if (required) {
+  () => setup.admission,
+  (admission) => {
+    if (admission === "checking" || admission === "unavailable") {
       gateway.dispose();
       return;
     }
     void auth.initialize();
-    void gateway.initialize();
+    if (admission === "ready") {
+      void gateway.initialize();
+    } else {
+      gateway.dispose();
+    }
   },
   { immediate: true },
 );
 </script>
 
 <template>
-  <RouterView v-if="isSetupRoute" />
+  <ManagementConnectionView v-if="setupAdmissionPending" />
+  <ManagementConnectionView
+    v-else-if="authAdmissionPending"
+    :checking="!auth.errorCode"
+    :unavailable="Boolean(auth.errorCode)"
+    :error-code="auth.errorCode"
+    :loading="auth.loading"
+    :retry-action="() => auth.initialize()"
+  />
+  <RouterView v-else-if="isSetupRoute" />
   <div v-else-if="setupRequired" class="min-h-screen" aria-hidden="true" />
   <ManagementLoginView
     v-else-if="requiresLogin"
@@ -236,7 +287,7 @@ watch(
     <aside class="side-rail" :aria-label="t('shell.primaryNavigation')">
       <nav class="navigation-list" :aria-label="t('shell.primaryNavigation')">
         <RouterLink
-          v-for="item in primaryNavigation"
+          v-for="item in visiblePrimaryNavigation"
           :key="item.to"
           :to="item.to"
           class="navigation-link"

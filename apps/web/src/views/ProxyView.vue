@@ -1,27 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from "vue";
+import { computed, onMounted } from "vue";
 import { RefreshCw } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
-import { useGatewayStore } from "@/stores/gateway";
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useProxyStore } from "@/stores/proxy";
 
-const gateway = useGatewayStore();
 const proxy = useProxyStore();
 const { t } = useI18n();
 
 const auditEntries = computed(
   () => proxy.status?.recentAudit.slice().reverse() ?? [],
-);
-
-watch(
-  () => gateway.lastEventType,
-  (eventType) => {
-    if (eventType?.startsWith("proxy.")) {
-      void proxy.refresh();
-    }
-  },
 );
 
 onMounted(() => void proxy.refresh());
@@ -52,10 +42,12 @@ onMounted(() => void proxy.refresh());
       <p v-if="proxy.loading && !proxy.status" class="status-message">
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="proxy.errorCode && !proxy.status" class="status-message">
-        {{ t("common.unavailable") }}
-        <code class="stable-code">{{ proxy.errorCode }}</code>
-      </p>
+      <ProblemNotice
+        v-else-if="proxy.errorCode && !proxy.status"
+        :code="proxy.errorCode"
+        show-retry
+        @retry="proxy.refresh"
+      />
       <template v-else-if="proxy.status">
         <div class="record-list">
           <article class="record-row">
@@ -104,11 +96,11 @@ onMounted(() => void proxy.refresh());
                 >{{ t("proxy.configFrames") }}:
                 {{ proxy.status.upstream.configFrameCount }}</span
               >
-              <code
+              <ProblemNotice
                 v-if="proxy.status.upstream.lastErrorCode"
-                class="stable-code"
-                >{{ proxy.status.upstream.lastErrorCode }}</code
-              >
+                :code="proxy.status.upstream.lastErrorCode"
+                compact
+              />
             </div>
           </article>
           <article class="record-row">
@@ -137,9 +129,11 @@ onMounted(() => void proxy.refresh());
                   proxy.status.queue.directDropped
                 }}</span
               >
-              <code v-if="proxy.status.lastErrorCode" class="stable-code">{{
-                proxy.status.lastErrorCode
-              }}</code>
+              <ProblemNotice
+                v-if="proxy.status.lastErrorCode"
+                :code="proxy.status.lastErrorCode"
+                compact
+              />
             </div>
           </article>
         </div>
@@ -159,9 +153,7 @@ onMounted(() => void proxy.refresh());
               <span>{{ entry.variant ?? "-" }}</span>
             </div>
             <div>
-              <code v-if="entry.code" class="stable-code">{{
-                entry.code
-              }}</code>
+              <ProblemNotice v-if="entry.code" :code="entry.code" compact />
             </div>
           </article>
         </div>

@@ -4,6 +4,7 @@ import { KeyRound } from "@lucide/vue";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
+import ProblemNotice from "@/components/ProblemNotice.vue";
 import { useManagementAuthStore } from "@/stores/management-auth";
 
 const emit = defineEmits<{ authenticated: [] }>();
@@ -42,10 +43,7 @@ async function submit() {
           required
         />
       </label>
-      <p v-if="auth.errorCode" class="management-login__error" role="alert">
-        <span>{{ t("auth.rejected") }}</span>
-        <code>{{ auth.errorCode }}</code>
-      </p>
+      <ProblemNotice v-if="auth.errorCode" :code="auth.errorCode" compact />
       <Button
         unstyled
         class="command-action management-login__submit"

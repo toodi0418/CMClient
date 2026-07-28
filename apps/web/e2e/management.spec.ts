@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 
 const identity = {
   schemaVersion: 1,
@@ -17,6 +17,18 @@ const identity = {
       packageProfile: "workspace",
     },
   },
+};
+const setupReady = {
+  schemaVersion: 1,
+  currentTermsVersion: "cmclient-2.0-terms-v1",
+  phase: "ready",
+  setupRequired: false,
+  termsRequired: false,
+  credentialsRequired: false,
+  validating: false,
+  ready: true,
+  recoveryRequired: false,
+  reasonCode: "SETUP_READY",
 };
 const updateStatus = {
   schemaVersion: 1,
@@ -77,8 +89,8 @@ test("settings and update status remain usable on desktop", async ({
   ).toBeVisible();
   await expect(workspace.getByText("下載中", { exact: true })).toBeVisible();
   await expect(workspace.getByText("512 KiB / 1 MiB")).toBeVisible();
-  await expect(workspace.getByText("UPDATE_SIGNATURE_VERIFIED")).toBeVisible();
-  await expect(workspace.getByText("owned_by_agent")).toBeVisible();
+  await expect(workspace.getByText("已驗證更新簽章")).toBeVisible();
+  await expect(workspace.getByText("由 Agent 管理")).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });
 
@@ -257,10 +269,144 @@ test("remote dispatch stays visibly fail-closed behind its capability", async ({
   page,
 }) => {
   await page.goto("/remote-dispatch");
+  await expect(page.getByRole("link", { name: "Remote Dispatch" })).toHaveCount(
+    0,
+  );
   await expect(
     page.getByRole("heading", { name: "Dispatch service status" }),
   ).toBeVisible();
-  await expect(page.getByText("not_enabled")).toBeVisible();
+  await expect(
+    page.getByText("This feature is not available in this release"),
+  ).toBeVisible();
+});
+
+test("a temporary setup rate limit preserves a deep link and recovers", async ({
+  page,
+}) => {
+  let setupRequests = 0;
+  await page.unroute("**/api/v1/setup/status");
+  await page.route("**/api/v1/setup/status", (route) => {
+    setupRequests += 1;
+    return route.fulfill(
+      setupRequests === 1
+        ? {
+            status: 429,
+            contentType: "application/json",
+            body: JSON.stringify({ code: "MANAGEMENT_REQUEST_RATE_LIMITED" }),
+          }
+        : {
+            contentType: "application/json",
+            body: JSON.stringify(setupReady),
+          },
+    );
+  });
+
+  await page.goto("/aprs");
+  await expect(page).toHaveURL(/\/aprs$/);
+  await expect(
+    page.getByRole("heading", {
+      name: "The management page cannot be updated yet",
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("CMClient is handling several requests"),
+  ).toBeVisible();
+  await expect(
+    page.getByText("MANAGEMENT_REQUEST_RATE_LIMITED"),
+  ).not.toBeVisible();
+  // The preceding 429 is intentional and has been verified through the
+  // human-facing recovery state. Keep the rest of this test strict about
+  // unexpected browser-console errors.
+  consoleErrors.set(page, []);
+  await expect(
+    page.getByRole("heading", { name: "APRS-IS runtime" }),
+  ).toBeVisible();
+  await expect(page).toHaveURL(/\/aprs$/);
+});
+
+test("a pending setup request still renders the connection recovery state", async ({
+  page,
+}) => {
+  await page.unroute("**/api/v1/setup/status");
+  await page.route(
+    "**/api/v1/setup/status",
+    () => new Promise<never>(() => undefined),
+  );
+
+  await page.goto("/aprs");
+  await expect(
+    page.getByRole("heading", {
+      name: "Checking local services",
+    }),
+  ).toBeVisible();
+});
+
+test("a temporary local-session rate limit recovers without showing login", async ({
+  page,
+}) => {
+  let sessions = 0;
+  await page.unroute("**/api/v1/auth/session");
+  await page.route("**/api/v1/auth/session", (route) => {
+    sessions += 1;
+    return route.fulfill(
+      sessions === 1
+        ? {
+            status: 429,
+            contentType: "application/json",
+            body: JSON.stringify({ code: "MANAGEMENT_REQUEST_RATE_LIMITED" }),
+          }
+        : {
+            contentType: "application/json",
+            body: JSON.stringify({
+              schemaVersion: 1,
+              csrfToken: "a".repeat(32),
+              expiresAt: 1_784_344_000,
+            }),
+          },
+    );
+  });
+
+  await page.goto("/diagnostics");
+  await expect(
+    page.getByRole("heading", {
+      name: "The management page cannot be updated yet",
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("CMClient is handling several requests"),
+  ).toBeVisible();
+  await expect(
+    page.getByText("MANAGEMENT_REQUEST_RATE_LIMITED"),
+  ).not.toBeVisible();
+  consoleErrors.set(page, []);
+  await expect(
+    page.getByRole("heading", { name: "Diagnostics" }),
+  ).toBeVisible();
+});
+
+test("APRS combines a shared temporary failure into one clear recovery state", async ({
+  page,
+}) => {
+  const rateLimited = (route: Route) =>
+    route.fulfill({
+      status: 429,
+      contentType: "application/json",
+      body: JSON.stringify({ code: "MANAGEMENT_REQUEST_RATE_LIMITED" }),
+    });
+
+  await page.unroute("**/api/v1/aprs");
+  await page.unroute("**/api/v1/aprs/outbox");
+  await page.unroute("**/api/v1/aprs/station-submissions");
+  await page.route("**/api/v1/aprs", rateLimited);
+  await page.route("**/api/v1/aprs/outbox", rateLimited);
+  await page.route("**/api/v1/aprs/station-submissions", rateLimited);
+
+  await page.goto("/aprs");
+  const notice = page.locator(".page-problem-notice");
+  await expect(notice).toHaveCount(1);
+  await expect(notice).toContainText("CMClient is handling several requests");
+  await expect(notice.locator("code")).not.toBeVisible();
+  consoleErrors.set(page, []);
 });
 
 test("LAN management login unlocks protected commands with the CSRF token", async ({
@@ -338,6 +484,22 @@ test("LAN management login unlocks protected commands with the CSRF token", asyn
 });
 
 async function mockGateway(page: Page): Promise<void> {
+  await page.route("**/api/v1/auth/session", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        schemaVersion: 1,
+        csrfToken: "a".repeat(32),
+        expiresAt: 1_784_344_000,
+      }),
+    }),
+  );
+  await page.route("**/api/v1/setup/status", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(setupReady),
+    }),
+  );
   await page.route("**/api/v1/updates", (route) =>
     route.fulfill({
       contentType: "application/json",
@@ -383,6 +545,12 @@ async function mockGateway(page: Page): Promise<void> {
           remoteDispatch: { available: false, reasonCode: "not_enabled" },
         },
       }),
+    }),
+  );
+  await page.route("**/api/v1/setup/events", (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body: ": heartbeat\n\n",
     }),
   );
   await page.route("**/api/v1/events", (route) =>
@@ -494,6 +662,8 @@ async function mockGateway(page: Page): Promise<void> {
         mappedCallsigns: 1,
         pendingOutbox: 1,
         failedOutbox: 0,
+        pendingStationSubmissions: 0,
+        failedStationSubmissions: 0,
       }),
     }),
   );
@@ -507,6 +677,7 @@ async function mockGateway(page: Page): Promise<void> {
             callsign: "N0CALL-7",
             canonicalEventId: "position-e2e",
             status: "queued",
+            deliveryStatus: "queued",
             attempts: 0,
             nextAttemptAt: "2026-07-18T00:00:00.000Z",
             createdAt: "2026-07-18T00:00:00.000Z",
@@ -515,6 +686,9 @@ async function mockGateway(page: Page): Promise<void> {
         ],
       }),
     }),
+  );
+  await page.route("**/api/v1/aprs/station-submissions", (route) =>
+    route.fulfill({ contentType: "application/json", body: '{"items":[]}' }),
   );
 }
 

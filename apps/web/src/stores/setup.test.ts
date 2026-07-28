@@ -57,6 +57,7 @@ describe("setup store", () => {
     expect(setup.phase).toBe("terms_required");
     expect(setup.candidates[0]?.host).toBe("192.0.2.10");
     expect(setup.callmeshUrl).toBe("https://callmesh.tmmarc.org");
+    expect(setup.admission).toBe("required");
   });
 
   it("resumes from REST and keeps the Agent projection current from setup SSE", async () => {
@@ -196,6 +197,50 @@ describe("setup store", () => {
     expect(receivedKey).toBe("campaign-test-key");
     expect(JSON.stringify(setup.$state)).not.toContain("campaign-test-key");
     expect(setup.required).toBe(false);
+    expect(setup.admission).toBe("ready");
+  });
+
+  it("treats a temporary setup status failure as unavailable, not required", async () => {
+    let listener:
+      | {
+          onStatus(status: SetupStatus): void;
+          onError(code: string): void;
+        }
+      | undefined;
+    const client: SetupClient = {
+      setup: {
+        status: async () => {
+          throw new GatewayApiError({
+            code: "MANAGEMENT_REQUEST_RATE_LIMITED",
+            status: 429,
+            retryable: true,
+          });
+        },
+        discovery: async () => ({
+          schemaVersion: 1,
+          candidates: [],
+          callmeshUrl: "https://callmesh.tmmarc.org",
+        }),
+        acceptTerms: async () => termsStatus,
+        configure: async () => termsStatus,
+        reset: async () => termsStatus,
+      },
+      subscribe: (registered) => {
+        listener = registered;
+        return () => {};
+      },
+    };
+    const setup = createSetupStore(client)();
+
+    await expect(setup.start()).rejects.toMatchObject({ status: 429 });
+
+    expect(setup.admission).toBe("unavailable");
+    expect(setup.required).toBe(false);
+    expect(setup.initialized).toBe(false);
+    expect(setup.errorCode).toBe("MANAGEMENT_REQUEST_RATE_LIMITED");
+
+    listener?.onError("AGENT_SETUP_EVENT_STREAM_UNAVAILABLE");
+    expect(setup.errorCode).toBe("MANAGEMENT_REQUEST_RATE_LIMITED");
   });
 
   it.each([
@@ -220,6 +265,7 @@ describe("setup store", () => {
         },
       };
       const setup = createSetupStore(client)();
+      setup.applyStatus(credentialsStatus);
       const apiKey = "fixture-private-setup-key";
 
       await expect(
