@@ -1,6 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { useMachine } from "@xstate/vue";
 import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
+import {
+  ArrowLeft,
   ArrowRight,
   Check,
   CircleAlert,
@@ -12,25 +21,47 @@ import {
   ShieldCheck,
   Wifi,
 } from "@lucide/vue";
+import Form from "@primevue/forms/form";
+import FormField from "@primevue/forms/formfield";
+import type {
+  FormInstance,
+  FormResolverOptions,
+  FormSubmitEvent,
+} from "@primevue/forms/form";
 import Button from "primevue/button";
 import { useI18n } from "vue-i18n";
 
 import type { SetupConfigureRequest } from "@cmclient/contracts";
 import { isSupportedLocale, type SupportedLocale } from "@/preferences";
+import { setupFlowMachine } from "@/setup-flow";
 import { usePreferencesStore } from "@/stores/preferences";
 import { useSetupStore } from "@/stores/setup";
+
+interface SetupFormValues {
+  meshtasticHost: string;
+  meshNetworkId: string;
+  gatewayId: string;
+  callmeshApiKey: string;
+}
+
+interface ReviewedConfiguration {
+  meshtasticHost: string;
+  meshtasticPort: 4403;
+  meshNetworkId?: string;
+  gatewayId?: string;
+}
 
 const setup = useSetupStore();
 const preferences = usePreferencesStore();
 const { t } = useI18n();
+const { snapshot: flow, send } = useMachine(setupFlowMachine);
 const termsAccepted = ref(false);
-const meshtasticHost = ref("127.0.0.1");
-const meshtasticPort = 4403;
-const meshNetworkId = ref("default");
-const gatewayId = ref("cmclient-gateway");
-const callmeshApiKey = ref("");
 const selectedCandidate = ref("");
 const localErrorKey = ref("");
+const reviewedConfiguration = ref<ReviewedConfiguration>();
+const connectionForm = ref<FormInstance>();
+const activeHeading = ref<HTMLElement>();
+let pendingCredential = "";
 
 const localeOptions: Array<{
   value: SupportedLocale;
@@ -40,47 +71,75 @@ const localeOptions: Array<{
   { value: "en-US", labelKey: "preferences.enUS" },
 ];
 
-const phase = computed(() => setup.phase);
-const localError = computed(() =>
-  localErrorKey.value ? t(localErrorKey.value) : "",
-);
-const isTerms = computed(
-  () => phase.value === "uninitialized" || phase.value === "terms_required",
-);
-const isCredentials = computed(() => phase.value === "credentials_required");
-const isValidating = computed(() => phase.value === "validating");
-const isRecovery = computed(() => phase.value === "recovery_required");
-const isReady = computed(() => phase.value === "ready");
-const busy = computed(() => setup.loading || setup.discovering);
-
-onMounted(async () => {
-  try {
-    await setup.refresh();
-    if (setup.phase !== "terms_required" && setup.phase !== "uninitialized") {
-      await setup.discover();
-    }
-  } catch {
-    localErrorKey.value = "setup.serviceUnavailable";
-  }
+const connectionInitialValues = computed<SetupFormValues>(() => ({
+  meshtasticHost: reviewedConfiguration.value?.meshtasticHost ?? "",
+  meshNetworkId: reviewedConfiguration.value?.meshNetworkId ?? "default",
+  gatewayId: reviewedConfiguration.value?.gatewayId ?? "cmclient-gateway",
+  callmeshApiKey: "",
+}));
+const localError = computed(() => {
+  const key =
+    localErrorKey.value ||
+    (!setup.initialized && setup.errorCode ? "setup.serviceUnavailable" : "");
+  return key ? t(key) : "";
 });
+const isSynchronizing = computed(() => flow.value.matches("synchronizing"));
+const isTerms = computed(() => flow.value.matches("terms"));
+const isConnection = computed(() =>
+  flow.value.matches({ credentials: "connection" }),
+);
+const isReview = computed(() => flow.value.matches({ credentials: "review" }));
+const isValidating = computed(() => flow.value.matches("validating"));
+const isRecovery = computed(() => flow.value.matches("recovery"));
+const isReady = computed(() => flow.value.matches("finish"));
+const busy = computed(() => setup.loading || setup.discovering);
 
 watch(
   () => setup.phase,
-  (nextPhase) => {
+  (phase) => send({ type: "AGENT_PHASE_CHANGED", phase }),
+  { immediate: true },
+);
+
+watch(
+  () => setup.phase,
+  (phase) => {
     if (
-      (nextPhase === "credentials_required" || nextPhase === "validating") &&
+      (phase === "credentials_required" || phase === "validating") &&
       setup.candidates.length === 0
     ) {
       void setup.discover().catch(() => undefined);
     }
   },
+  { immediate: true },
 );
+
+watch(
+  () => JSON.stringify(flow.value.value),
+  () => {
+    void nextTick(() => activeHeading.value?.focus());
+  },
+);
+
+onMounted(async () => {
+  if (!setup.started) {
+    try {
+      await setup.start();
+    } catch {
+      localErrorKey.value = "setup.serviceUnavailable";
+    }
+  }
+});
+
+onBeforeUnmount(() => {
+  pendingCredential = "";
+  connectionForm.value?.setFieldValue("callmeshApiKey", "");
+});
 
 function chooseCandidate(event: Event) {
   const host = (event.target as HTMLSelectElement).value;
   selectedCandidate.value = host;
   if (host) {
-    meshtasticHost.value = host;
+    connectionForm.value?.setFieldValue("meshtasticHost", host);
   }
 }
 
@@ -99,44 +158,130 @@ async function acceptTerms() {
   }
   try {
     await setup.acceptTerms();
-    await setup.discover();
   } catch {
     localErrorKey.value = "setup.errorUnableToAcceptTerms";
+    return;
   }
+  try {
+    await setup.discover();
+  } catch {
+    localErrorKey.value = "setup.discoveryFailed";
+  }
+}
+
+function resolveConnectionForm({ values }: FormResolverOptions) {
+  const errors: Record<string, Array<{ message: string }>> = {};
+  const host = stringValue(values.meshtasticHost).trim();
+  const meshNetworkId = stringValue(values.meshNetworkId).trim();
+  const gatewayId = stringValue(values.gatewayId).trim();
+  const apiKey = stringValue(values.callmeshApiKey);
+
+  if (!host || host.length > 255 || /[\s/"\\]/.test(host)) {
+    errors.meshtasticHost = [{ message: t("setup.invalidHost") }];
+  }
+  if (
+    (meshNetworkId && meshNetworkId.length > 128) ||
+    /["\\]/.test(meshNetworkId)
+  ) {
+    errors.meshNetworkId = [{ message: t("setup.invalidOptionalId") }];
+  }
+  if ((gatewayId && gatewayId.length > 128) || /["\\]/.test(gatewayId)) {
+    errors.gatewayId = [{ message: t("setup.invalidOptionalId") }];
+  }
+  if (!apiKey || apiKey.length > 4096) {
+    errors.callmeshApiKey = [{ message: t("setup.apiKeyRequired") }];
+  }
+  return {
+    values: {
+      meshtasticHost: host,
+      meshNetworkId,
+      gatewayId,
+      callmeshApiKey: apiKey,
+    } satisfies SetupFormValues,
+    errors,
+  };
+}
+
+function reviewConfiguration(event: FormSubmitEvent) {
+  localErrorKey.value = "";
+  if (!event.valid) {
+    return;
+  }
+  const host = stringValue(event.values.meshtasticHost).trim();
+  const meshNetworkId = stringValue(event.values.meshNetworkId).trim();
+  const gatewayId = stringValue(event.values.gatewayId).trim();
+  pendingCredential = stringValue(event.values.callmeshApiKey);
+  reviewedConfiguration.value = {
+    meshtasticHost: host,
+    meshtasticPort: 4403,
+    ...(meshNetworkId ? { meshNetworkId } : {}),
+    ...(gatewayId ? { gatewayId } : {}),
+  };
+
+  // PrimeVue Forms must not retain the credential after leaving this step.
+  event.reset();
+  send({ type: "REVIEW" });
+}
+
+function editConfiguration() {
+  localErrorKey.value = "";
+  send({ type: "EDIT" });
+  void nextTick(() => {
+    const review = reviewedConfiguration.value;
+    if (review) {
+      connectionForm.value?.setValues({
+        meshtasticHost: review.meshtasticHost,
+        meshNetworkId: review.meshNetworkId ?? "",
+        gatewayId: review.gatewayId ?? "",
+        callmeshApiKey: pendingCredential,
+      });
+    }
+  });
 }
 
 async function configure() {
   localErrorKey.value = "";
-  if (!meshtasticHost.value.trim() || !callmeshApiKey.value) {
+  const review = reviewedConfiguration.value;
+  if (!review || !pendingCredential) {
     localErrorKey.value = "setup.requiredFields";
+    send({ type: "EDIT" });
     return;
   }
-  const key = callmeshApiKey.value;
+
+  const request: SetupConfigureRequest = {
+    ...review,
+    callmeshApiKey: pendingCredential,
+  };
+  pendingCredential = "";
+  let operation: ReturnType<typeof setup.configure>;
   try {
-    const request: SetupConfigureRequest = {
-      meshtasticHost: meshtasticHost.value.trim(),
-      meshtasticPort,
-      callmeshApiKey: key,
-      ...(meshNetworkId.value.trim()
-        ? { meshNetworkId: meshNetworkId.value.trim() }
-        : {}),
-      ...(gatewayId.value.trim() ? { gatewayId: gatewayId.value.trim() } : {}),
-    };
-    await setup.configure(request);
-  } catch {
-    localErrorKey.value = "setup.validationFailed";
+    // GatewayApiClient serializes the body synchronously. Clear the only
+    // remaining Web-owned copy immediately after handing off that body.
+    operation = setup.configure(request);
   } finally {
-    // Never retain the credential in reactive state after the request.
-    callmeshApiKey.value = "";
+    request.callmeshApiKey = "";
+  }
+
+  try {
+    await operation;
+  } catch {
+    localErrorKey.value =
+      setup.errorCode === "CALLMESH_CREDENTIAL_REJECTED"
+        ? "setup.callmeshCredentialRejected"
+        : setup.errorCode === "CALLMESH_UNAVAILABLE"
+          ? "setup.callmeshUnavailable"
+          : "setup.validationFailed";
+    send({ type: "EDIT" });
   }
 }
 
 async function reset() {
   localErrorKey.value = "";
+  pendingCredential = "";
+  reviewedConfiguration.value = undefined;
   try {
     await setup.reset();
     termsAccepted.value = false;
-    callmeshApiKey.value = "";
   } catch {
     localErrorKey.value = "setup.errorUnableToReset";
   }
@@ -149,6 +294,19 @@ async function rediscover() {
   } catch {
     localErrorKey.value = "setup.discoveryFailed";
   }
+}
+
+async function retryStatus() {
+  localErrorKey.value = "";
+  try {
+    await setup.refresh();
+  } catch {
+    localErrorKey.value = "setup.serviceUnavailable";
+  }
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 </script>
 
@@ -182,30 +340,32 @@ async function rediscover() {
 
       <ol class="setup-steps" :aria-label="t('setup.progress')">
         <li :class="{ active: isTerms, complete: !isTerms && !isRecovery }">
-          <span>1</span>
-          <small>{{ t("setup.terms") }}</small>
+          <span>1</span><small>{{ t("setup.terms") }}</small>
         </li>
         <li
           :class="{
-            active: isCredentials || isValidating,
-            complete: isReady,
+            active: isConnection || isReview,
+            complete: isValidating || isReady,
           }"
         >
-          <span>2</span>
-          <small>{{ t("setup.connection") }}</small>
+          <span>2</span><small>{{ t("setup.connection") }}</small>
         </li>
-        <li :class="{ active: isValidating || isReady, complete: isReady }">
-          <span>3</span>
-          <small>{{ t("setup.finish") }}</small>
+        <li :class="{ active: isValidating, complete: isReady }">
+          <span>3</span><small>{{ t("setup.finish") }}</small>
         </li>
       </ol>
 
-      <div v-if="isTerms" class="setup-content">
+      <div v-if="isSynchronizing" class="setup-content setup-content--centered">
+        <LoaderCircle class="setup-spinner" :size="42" aria-hidden="true" />
+        <h2 ref="activeHeading" tabindex="-1">{{ t("setup.syncing") }}</h2>
+      </div>
+
+      <div v-else-if="isTerms" class="setup-content">
         <div class="setup-icon" aria-hidden="true">
           <ShieldCheck :size="24" />
         </div>
         <p class="setup-kicker">{{ t("setup.beforeBegin") }}</p>
-        <h2>{{ t("setup.connectTitle") }}</h2>
+        <h2 ref="activeHeading" tabindex="-1">{{ t("setup.connectTitle") }}</h2>
         <p class="setup-copy">{{ t("setup.connectDescription") }}</p>
         <label class="setup-consent">
           <input v-model="termsAccepted" type="checkbox" />
@@ -214,26 +374,45 @@ async function rediscover() {
         <p v-if="localError" class="setup-error" role="alert">
           <CircleAlert :size="16" aria-hidden="true" /> {{ localError }}
         </p>
-        <Button
-          class="setup-primary"
-          type="button"
-          :disabled="busy"
-          :label="t('setup.continue')"
-          @click="acceptTerms"
-        >
-          <template #icon
-            ><ArrowRight :size="17" aria-hidden="true"
-          /></template>
-        </Button>
+        <div class="setup-actions setup-actions--split">
+          <Button
+            v-if="!setup.initialized"
+            text
+            type="button"
+            :label="t('setup.refreshStatus')"
+            @click="retryStatus"
+          />
+          <Button
+            class="setup-primary"
+            type="button"
+            :disabled="busy || !setup.initialized"
+            :label="t('setup.continue')"
+            @click="acceptTerms"
+          >
+            <template #icon
+              ><ArrowRight :size="17" aria-hidden="true"
+            /></template>
+          </Button>
+        </div>
       </div>
 
-      <div v-else-if="isCredentials" class="setup-content">
+      <Form
+        v-else-if="isConnection"
+        ref="connectionForm"
+        class="setup-content"
+        autocomplete="off"
+        :initial-values="connectionInitialValues"
+        :resolver="resolveConnectionForm"
+        :validate-on-value-update="false"
+        :validate-on-blur="true"
+        @submit="reviewConfiguration"
+      >
         <div class="setup-icon" aria-hidden="true"><Wifi :size="24" /></div>
         <p class="setup-kicker">{{ t("setup.connectionDetails") }}</p>
-        <h2>{{ t("setup.chooseNode") }}</h2>
+        <h2 ref="activeHeading" tabindex="-1">{{ t("setup.chooseNode") }}</h2>
         <p class="setup-copy">{{ t("setup.passiveCheck") }}</p>
 
-        <div v-if="setup.candidates.length" class="setup-discovery">
+        <div class="setup-discovery">
           <label for="discovered-node">{{ t("setup.discoveredNodes") }}</label>
           <div class="setup-inline-control">
             <select
@@ -267,45 +446,96 @@ async function rediscover() {
         </div>
 
         <div class="setup-form-grid">
-          <label>
-            {{ t("setup.host") }}
+          <FormField v-slot="$field" name="meshtasticHost" as="label">
+            <span>{{ t("setup.host") }}</span>
             <input
-              v-model="meshtasticHost"
+              id="meshtastic-host"
+              v-bind="$field.props"
               autocomplete="off"
               spellcheck="false"
+              :aria-invalid="$field.invalid"
+              :aria-describedby="
+                $field.invalid ? 'meshtastic-host-error' : undefined
+              "
             />
-          </label>
+            <small
+              v-if="$field.invalid"
+              id="meshtastic-host-error"
+              class="setup-field-error"
+              role="alert"
+            >
+              {{ $field.error?.message }}
+            </small>
+          </FormField>
           <label>
-            {{ t("setup.port") }}
-            <input :value="meshtasticPort" readonly />
+            <span>{{ t("setup.port") }}</span>
+            <input value="4403" readonly />
           </label>
-          <label>
-            {{ t("setup.meshNetworkId") }}
-            <span>({{ t("setup.optional") }})</span>
-            <input v-model="meshNetworkId" autocomplete="off" />
-          </label>
-          <label>
-            {{ t("setup.gatewayId") }}
-            <span>({{ t("setup.optional") }})</span>
-            <input v-model="gatewayId" autocomplete="off" />
-          </label>
+          <FormField v-slot="$field" name="meshNetworkId" as="label">
+            <span
+              >{{ t("setup.meshNetworkId") }} ({{ t("setup.optional") }})</span
+            >
+            <input
+              v-bind="$field.props"
+              autocomplete="off"
+              spellcheck="false"
+              :aria-invalid="$field.invalid"
+            />
+            <small
+              v-if="$field.invalid"
+              class="setup-field-error"
+              role="alert"
+              >{{ $field.error?.message }}</small
+            >
+          </FormField>
+          <FormField v-slot="$field" name="gatewayId" as="label">
+            <span>{{ t("setup.gatewayId") }} ({{ t("setup.optional") }})</span>
+            <input
+              v-bind="$field.props"
+              autocomplete="off"
+              spellcheck="false"
+              :aria-invalid="$field.invalid"
+            />
+            <small
+              v-if="$field.invalid"
+              class="setup-field-error"
+              role="alert"
+              >{{ $field.error?.message }}</small
+            >
+          </FormField>
         </div>
 
-        <label class="setup-field setup-key-field">
-          <span>
-            <KeyRound :size="16" aria-hidden="true" />
-            {{ t("setup.callmeshApiKey") }}
-          </span>
+        <FormField
+          v-slot="$field"
+          name="callmeshApiKey"
+          as="label"
+          class="setup-field setup-key-field"
+        >
+          <span
+            ><KeyRound :size="16" aria-hidden="true" />
+            {{ t("setup.callmeshApiKey") }}</span
+          >
           <input
-            v-model="callmeshApiKey"
+            v-bind="$field.props"
             type="password"
-            autocomplete="new-password"
+            autocomplete="off"
             spellcheck="false"
+            :aria-invalid="$field.invalid"
+            :aria-describedby="
+              $field.invalid ? 'callmesh-key-error' : 'callmesh-endpoint'
+            "
           />
-          <small>{{
+          <small
+            v-if="$field.invalid"
+            id="callmesh-key-error"
+            class="setup-field-error"
+            role="alert"
+            >{{ $field.error?.message }}</small
+          >
+          <small id="callmesh-endpoint">{{
             t("setup.officialEndpoint", { url: setup.callmeshUrl })
           }}</small>
-        </label>
+        </FormField>
 
         <p v-if="localError" class="setup-error" role="alert">
           <CircleAlert :size="16" aria-hidden="true" /> {{ localError }}
@@ -313,9 +543,71 @@ async function rediscover() {
         <div class="setup-actions">
           <Button
             class="setup-primary"
+            type="submit"
+            :loading="setup.loading"
+            :disabled="busy"
+            :label="t('setup.reviewConfiguration')"
+          >
+            <template #icon
+              ><ArrowRight :size="17" aria-hidden="true"
+            /></template>
+          </Button>
+        </div>
+      </Form>
+
+      <div v-else-if="isReview" class="setup-content">
+        <div class="setup-icon" aria-hidden="true">
+          <ShieldCheck :size="24" />
+        </div>
+        <p class="setup-kicker">{{ t("setup.review") }}</p>
+        <h2 ref="activeHeading" tabindex="-1">{{ t("setup.reviewTitle") }}</h2>
+        <p class="setup-copy">{{ t("setup.reviewDescription") }}</p>
+        <dl v-if="reviewedConfiguration" class="setup-review">
+          <div>
+            <dt>{{ t("setup.host") }}</dt>
+            <dd>{{ reviewedConfiguration.meshtasticHost }}:4403</dd>
+          </div>
+          <div>
+            <dt>{{ t("setup.meshNetworkId") }}</dt>
+            <dd>
+              {{
+                reviewedConfiguration.meshNetworkId ?? t("setup.defaultValue")
+              }}
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("setup.gatewayId") }}</dt>
+            <dd>
+              {{ reviewedConfiguration.gatewayId ?? t("setup.defaultValue") }}
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("setup.callmeshApiKey") }}</dt>
+            <dd>
+              <KeyRound :size="15" aria-hidden="true" />
+              {{ t("setup.credentialProvided") }}
+            </dd>
+          </div>
+        </dl>
+        <p v-if="localError" class="setup-error" role="alert">
+          <CircleAlert :size="16" aria-hidden="true" /> {{ localError }}
+        </p>
+        <div class="setup-actions setup-actions--split">
+          <Button
+            type="button"
+            severity="secondary"
+            :label="t('setup.editConfiguration')"
+            @click="editConfiguration"
+          >
+            <template #icon
+              ><ArrowLeft :size="17" aria-hidden="true"
+            /></template>
+          </Button>
+          <Button
+            class="setup-primary"
             type="button"
             :loading="setup.loading"
-            :disabled="busy || !callmeshApiKey"
+            :disabled="busy"
             :label="t('setup.validateAndStart')"
             @click="configure"
           >
@@ -329,10 +621,13 @@ async function rediscover() {
       <div
         v-else-if="isValidating"
         class="setup-content setup-content--centered"
+        aria-live="polite"
       >
         <LoaderCircle class="setup-spinner" :size="42" aria-hidden="true" />
         <p class="setup-kicker">{{ t("setup.agentValidation") }}</p>
-        <h2>{{ t("setup.startingServices") }}</h2>
+        <h2 ref="activeHeading" tabindex="-1">
+          {{ t("setup.startingServices") }}
+        </h2>
         <p class="setup-copy">{{ t("setup.applyingConfiguration") }}</p>
         <Button
           text
@@ -342,10 +637,14 @@ async function rediscover() {
         />
       </div>
 
-      <div v-else-if="isReady" class="setup-content setup-content--centered">
+      <div
+        v-else-if="isReady"
+        class="setup-content setup-content--centered"
+        aria-live="polite"
+      >
         <div class="setup-success" aria-hidden="true"><Check :size="26" /></div>
         <p class="setup-kicker">{{ t("setup.ready") }}</p>
-        <h2>{{ t("setup.readyTitle") }}</h2>
+        <h2 ref="activeHeading" tabindex="-1">{{ t("setup.readyTitle") }}</h2>
         <p class="setup-copy">{{ t("setup.readyDescription") }}</p>
       </div>
 
@@ -354,7 +653,9 @@ async function rediscover() {
           <CircleAlert :size="24" />
         </div>
         <p class="setup-kicker">{{ t("setup.recoveryRequired") }}</p>
-        <h2>{{ t("setup.recoveryTitle") }}</h2>
+        <h2 ref="activeHeading" tabindex="-1">
+          {{ t("setup.recoveryTitle") }}
+        </h2>
         <p class="setup-copy">{{ t("setup.recoveryDescription") }}</p>
         <p v-if="localError" class="setup-error" role="alert">
           <CircleAlert :size="16" aria-hidden="true" /> {{ localError }}
@@ -379,7 +680,7 @@ async function rediscover() {
 
 .setup-panel {
   width: min(100%, 720px);
-  background: #ffffff;
+  background: #fff;
   border: 1px solid #d8e1e4;
   border-radius: 8px;
   box-shadow: 0 18px 48px rgb(20 37 45 / 12%);
@@ -398,12 +699,12 @@ async function rediscover() {
   display: grid;
   width: 42px;
   height: 42px;
+  flex: 0 0 42px;
   place-items: center;
   border-radius: 8px;
   background: #1e6b72;
-  color: #ffffff;
+  color: #fff;
   font-weight: 750;
-  letter-spacing: 0;
 }
 
 .setup-eyebrow,
@@ -412,7 +713,7 @@ async function rediscover() {
   color: #59717a;
   font-size: 0.72rem;
   font-weight: 750;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 
@@ -435,7 +736,9 @@ async function rediscover() {
   background: #fff;
 }
 
-.setup-language-selector:focus-within {
+.setup-language-selector:focus-within,
+input:focus,
+select:focus {
   outline: 2px solid rgb(30 107 114 / 28%);
   outline-offset: 2px;
   border-color: #1e6b72;
@@ -473,7 +776,7 @@ async function rediscover() {
   width: 24px;
   height: 24px;
   place-items: center;
-  border: 1px solid currentColor;
+  border: 1px solid currentcolor;
   border-radius: 50%;
   font-size: 0.72rem;
   font-weight: 700;
@@ -532,11 +835,20 @@ async function rediscover() {
   line-height: 1.25;
 }
 
+.setup-content h2:focus {
+  outline: none;
+}
+
 .setup-copy {
   max-width: 58ch;
   margin: 0 0 1.35rem;
   color: #526970;
   line-height: 1.6;
+}
+
+.setup-content--centered .setup-copy {
+  margin-right: auto;
+  margin-left: auto;
 }
 
 .setup-consent {
@@ -559,7 +871,7 @@ async function rediscover() {
   margin-bottom: 1rem;
 }
 
-.setup-discovery label,
+.setup-discovery > label,
 .setup-form-grid label,
 .setup-key-field {
   display: flex;
@@ -583,13 +895,6 @@ async function rediscover() {
   font: inherit;
 }
 
-.setup-discovery select:focus,
-.setup-form-grid input:focus,
-.setup-key-field input:focus {
-  outline: 2px solid rgb(30 107 114 / 28%);
-  border-color: #1e6b72;
-}
-
 .setup-inline-control {
   display: flex;
   gap: 0.5rem;
@@ -607,16 +912,12 @@ async function rediscover() {
   margin-bottom: 1rem;
 }
 
-.setup-form-grid label span {
-  color: #71838a;
-  font-weight: 450;
-}
-
 .setup-key-field {
   margin-bottom: 1.1rem;
 }
 
-.setup-key-field span {
+.setup-key-field > span,
+.setup-review dd {
   display: inline-flex;
   gap: 0.4rem;
   align-items: center;
@@ -628,6 +929,12 @@ async function rediscover() {
   overflow-wrap: anywhere;
 }
 
+.setup-field-error,
+.setup-key-field .setup-field-error {
+  color: #a33131;
+  font-weight: 550;
+}
+
 .setup-error {
   display: flex;
   gap: 0.45rem;
@@ -637,9 +944,40 @@ async function rediscover() {
   font-size: 0.86rem;
 }
 
+.setup-review {
+  margin: 1.25rem 0 1.5rem;
+  border-top: 1px solid #e8edef;
+}
+
+.setup-review div {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.8fr) minmax(0, 1.2fr);
+  gap: 1rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid #e8edef;
+}
+
+.setup-review dt {
+  color: #59717a;
+  font-size: 0.82rem;
+}
+
+.setup-review dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #14252d;
+  font-weight: 650;
+}
+
 .setup-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.setup-actions--split {
+  justify-content: space-between;
 }
 
 .setup-primary {
@@ -669,8 +1007,43 @@ async function rediscover() {
     border-radius: 0;
   }
 
-  .setup-form-grid {
+  .setup-brand,
+  .setup-content,
+  .setup-steps {
+    padding-right: 1rem;
+    padding-left: 1rem;
+  }
+
+  .setup-brand {
+    flex-wrap: wrap;
+  }
+
+  .setup-language-selector {
+    max-width: 100%;
+  }
+
+  .setup-steps {
+    justify-content: space-between;
+    gap: 0.4rem;
+  }
+
+  .setup-steps li {
+    gap: 0.25rem;
+  }
+
+  .setup-form-grid,
+  .setup-review div {
     grid-template-columns: 1fr;
+    gap: 0.3rem;
+  }
+
+  .setup-actions,
+  .setup-actions--split {
+    flex-direction: column-reverse;
+  }
+
+  .setup-actions :deep(button) {
+    width: 100%;
   }
 }
 </style>

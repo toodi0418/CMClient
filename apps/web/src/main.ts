@@ -5,10 +5,9 @@ import PrimeVue from "primevue/config";
 
 import App from "./App.vue";
 import { i18n } from "./i18n";
-import { router } from "./router";
-import { useGatewayStore } from "./stores/gateway";
-import { useManagementAuthStore } from "./stores/management-auth";
+import { installSetupRouteGate, router } from "./router";
 import { usePreferencesStore } from "./stores/preferences";
+import { useSetupStore } from "./stores/setup";
 import "./styles.css";
 
 const app = createApp(App);
@@ -17,7 +16,6 @@ const pinia = createPinia();
 app.use(pinia);
 app.use(i18n);
 usePreferencesStore(pinia).initialize();
-app.use(router);
 app.use(PrimeVue, {
   theme: {
     preset: Aura,
@@ -28,8 +26,15 @@ app.use(PrimeVue, {
 });
 
 async function mountApplication() {
-  await useManagementAuthStore(pinia).initialize();
-  void useGatewayStore(pinia).initialize();
+  const setup = useSetupStore(pinia);
+  installSetupRouteGate(router, setup);
+  try {
+    await setup.start();
+  } catch {
+    // Router admission treats an unavailable setup projection as required.
+  }
+  app.use(router);
+  await router.isReady();
   app.mount("#app");
 }
 

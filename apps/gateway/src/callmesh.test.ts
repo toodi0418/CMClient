@@ -340,6 +340,35 @@ describe("CallMesh client", () => {
     },
   );
 
+  it.each([
+    { status: 401, expected: "CALLMESH_CREDENTIAL_REJECTED" },
+    { status: 403, expected: "CALLMESH_CREDENTIAL_REJECTED" },
+    { status: 503, expected: "CALLMESH_UNAVAILABLE" },
+  ])(
+    "maps setup credential validation status $status",
+    async ({ status, expected }) => {
+      const client = new CallMeshClient({
+        ...clientOptions(async () => new Response(null, { status })),
+        maximumRetries: 0,
+      });
+      await expect(client.validateCredentials()).rejects.toMatchObject({
+        code: expected,
+      });
+    },
+  );
+
+  it("rejects an authenticated setup heartbeat after provision revocation", async () => {
+    const client = new CallMeshClient({
+      ...clientOptions(async () =>
+        jsonResponse(heartbeat({ provision: null })),
+      ),
+      maximumRetries: 0,
+    });
+    await expect(client.validateCredentials()).rejects.toMatchObject({
+      code: "CALLMESH_CREDENTIAL_REJECTED",
+    });
+  });
+
   it("bounds response bytes, rejects credential controls, and refuses redirects", async () => {
     expect(
       () =>

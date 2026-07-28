@@ -17,14 +17,166 @@ use std::{
     env,
     fmt::{Display, Formatter},
     fs::{self, File, Metadata, OpenOptions},
-    io::Read,
+    io::{self, Read},
     net::IpAddr,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "windows")]
+use std::{os::windows::process::CommandExt, process::Command};
+
 /// Stable workspace identity for the Agent core boundary.
 pub const COMPONENT: &str = "agent-core";
+
+/// Versioned identity written by the Desktop for Agent-owned focus and quit.
+pub const DESKTOP_PROCESS_IDENTITY_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DesktopProcessIdentity {
+    pub schema_version: u8,
+    pub pid: u32,
+    pub creation_time: u64,
+    pub session_id: u32,
+}
+
+impl DesktopProcessIdentity {
+    pub const fn new(pid: u32, creation_time: u64, session_id: u32) -> Self {
+        Self {
+            schema_version: DESKTOP_PROCESS_IDENTITY_SCHEMA_VERSION,
+            pid,
+            creation_time,
+            session_id,
+        }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        self.schema_version == DESKTOP_PROCESS_IDENTITY_SCHEMA_VERSION
+            && self.pid > 0
+            && self.creation_time > 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_PROCESS_IDENTITY_SCRIPT: &str = r#"& {
+    param([int]$processId)
+    $ErrorActionPreference = 'Stop'
+    $target = [System.Diagnostics.Process]::GetProcessById($processId)
+    [Console]::Out.Write($target.Id.ToString() + ',' + $target.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() + ',' + $target.SessionId.ToString())
+}"#;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_TERMINATE_PROCESS_SCRIPT: &str = r#"& {
+    param([int]$processId, [UInt64]$creationTime, [int]$sessionId)
+    $ErrorActionPreference = 'Stop'
+    $target = [System.Diagnostics.Process]::GetProcessById($processId)
+    if ($target.SessionId -ne $sessionId) {
+        exit 10
+    }
+    if (([UInt64]$target.StartTime.ToUniversalTime().ToFileTimeUtc()) -ne $creationTime) {
+        exit 10
+    }
+    $target.Kill()
+    if (-not $target.WaitForExit(5000)) {
+        exit 11
+    }
+    exit 0
+}"#;
+
+/// Reads the versioned identity for a Windows process through the platform
+/// `Process` abstraction. The Desktop and Agent use this exact identity to
+/// reject reused PIDs before a tray action targets a process.
+#[cfg(target_os = "windows")]
+pub fn windows_process_identity(pid: u32) -> io::Result<DesktopProcessIdentity> {
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "desktop process PID is invalid",
+        ));
+    }
+    let output = windows_process_command(WINDOWS_PROCESS_IDENTITY_SCRIPT)?
+        .arg(pid.to_string())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("desktop process identity is unavailable"));
+    }
+    let output = std::str::from_utf8(&output.stdout)
+        .map_err(|_| io::Error::other("desktop process identity is malformed"))?
+        .trim();
+    let mut fields = output.split(',');
+    let identity = DesktopProcessIdentity::new(
+        fields
+            .next()
+            .ok_or_else(|| io::Error::other("desktop process identity is malformed"))?
+            .parse()
+            .map_err(|_| io::Error::other("desktop process identity is malformed"))?,
+        fields
+            .next()
+            .ok_or_else(|| io::Error::other("desktop process identity is malformed"))?
+            .parse()
+            .map_err(|_| io::Error::other("desktop process identity is malformed"))?,
+        fields
+            .next()
+            .ok_or_else(|| io::Error::other("desktop process identity is malformed"))?
+            .parse()
+            .map_err(|_| io::Error::other("desktop process identity is malformed"))?,
+    );
+    if fields.next().is_some() || identity.pid != pid || !identity.is_valid() {
+        return Err(io::Error::other("desktop process identity is malformed"));
+    }
+    Ok(identity)
+}
+
+/// Ends a Windows process only after the platform `Process` object has checked
+/// the registered PID, creation time, and session. `Kill` and `WaitForExit`
+/// operate on that same object, so a reused PID is rejected rather than killed.
+#[cfg(target_os = "windows")]
+pub fn terminate_windows_process(identity: DesktopProcessIdentity) -> io::Result<bool> {
+    if !identity.is_valid() {
+        return Ok(false);
+    }
+    let output = windows_process_command(WINDOWS_TERMINATE_PROCESS_SCRIPT)?
+        .args([
+            identity.pid.to_string(),
+            identity.creation_time.to_string(),
+            identity.session_id.to_string(),
+        ])
+        .output()?;
+    Ok(output.status.success())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_command(script: &str) -> io::Result<Command> {
+    let powershell = env::var_os("SystemRoot")
+        .or_else(|| env::var_os("WINDIR"))
+        .filter(|root| Path::new(root).is_absolute())
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .ok_or_else(|| io::Error::other("Windows PowerShell is unavailable"))?;
+    if !powershell.is_file() {
+        return Err(io::Error::other("Windows PowerShell is unavailable"));
+    }
+    let mut command = Command::new(powershell);
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .creation_flags(WINDOWS_CREATE_NO_WINDOW);
+    Ok(command)
+}
 
 const MAX_MIGRATED_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -68,6 +220,10 @@ impl RuntimePaths {
 
     pub fn agent_lock_file(&self) -> PathBuf {
         self.run_dir().join("agent.lock")
+    }
+
+    pub fn desktop_process_file(&self) -> PathBuf {
+        self.run_dir().join("desktop.pid")
     }
 
     pub fn secrets_file(&self) -> PathBuf {
@@ -953,6 +1109,40 @@ mod tests {
         path::{Path, PathBuf},
     };
     use uuid::Uuid;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_process_identity_rejects_a_reused_pid_before_termination() {
+        let current = super::windows_process_identity(std::process::id())
+            .expect("current process identity should resolve");
+        assert_eq!(current.pid, std::process::id());
+        assert!(current.is_valid());
+
+        let mut child = super::windows_process_command("Start-Sleep -Seconds 30")
+            .expect("Windows PowerShell command should resolve")
+            .spawn()
+            .expect("fixture process should start");
+        let identity = super::windows_process_identity(child.id())
+            .expect("fixture process identity should resolve");
+        let mut stale = identity;
+        stale.creation_time = stale.creation_time.saturating_add(1);
+        let stale_termination = super::terminate_windows_process(stale)
+            .expect("stale process termination should be checked");
+        let still_running = child
+            .try_wait()
+            .expect("fixture process status should read")
+            .is_none();
+        let terminated = super::terminate_windows_process(identity)
+            .expect("verified process termination should run");
+        if !terminated {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+
+        assert!(!stale_termination);
+        assert!(still_running);
+        assert!(terminated);
+    }
 
     fn fixture_home() -> PathBuf {
         #[cfg(windows)]

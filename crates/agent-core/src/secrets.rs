@@ -67,6 +67,13 @@ pub enum SecretStoreError {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallMeshSetupSecretState {
+    None,
+    Staged,
+    Promoted,
+}
+
 impl SecretStoreError {
     pub const fn code(self) -> &'static str {
         match self {
@@ -80,6 +87,11 @@ trait SecretBackend: Send + Sync {
     fn set(&self, kind: SecretKind, value: &str) -> Result<(), SecretStoreError>;
     fn get(&self, kind: SecretKind) -> Result<Option<SecretValue>, SecretStoreError>;
     fn delete(&self, kind: SecretKind) -> Result<bool, SecretStoreError>;
+    fn stage_callmesh_setup(&self, candidate: &str) -> Result<(), SecretStoreError>;
+    fn promote_callmesh_setup(&self) -> Result<(), SecretStoreError>;
+    fn rollback_callmesh_setup(&self) -> Result<bool, SecretStoreError>;
+    fn finalize_callmesh_setup(&self) -> Result<bool, SecretStoreError>;
+    fn callmesh_setup_state(&self) -> Result<CallMeshSetupSecretState, SecretStoreError>;
 
     #[cfg(test)]
     fn kind(&self) -> SecretBackendKind;
@@ -102,6 +114,23 @@ struct PlaintextSecretBackend {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CallMeshSetupSecretTransaction {
+    candidate: String,
+    previous: Option<String>,
+    promoted: bool,
+}
+
+impl Drop for CallMeshSetupSecretTransaction {
+    fn drop(&mut self) {
+        self.candidate.zeroize();
+        if let Some(previous) = self.previous.as_mut() {
+            previous.zeroize();
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PlaintextSecretDocument {
     version: u8,
     #[serde(
@@ -116,6 +145,12 @@ struct PlaintextSecretDocument {
         skip_serializing_if = "Option::is_none"
     )]
     aprs_passcode: Option<String>,
+    #[serde(
+        rename = "setup-callmesh-transaction",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    setup_callmesh_transaction: Option<CallMeshSetupSecretTransaction>,
 }
 
 impl PlaintextSecretDocument {
@@ -124,6 +159,7 @@ impl PlaintextSecretDocument {
             version: PLAINTEXT_DOCUMENT_VERSION,
             callmesh_api_key: None,
             aprs_passcode: None,
+            setup_callmesh_transaction: None,
         }
     }
 
@@ -156,11 +192,27 @@ impl PlaintextSecretDocument {
         for value in [
             self.callmesh_api_key.as_deref(),
             self.aprs_passcode.as_deref(),
+            self.setup_callmesh_transaction
+                .as_ref()
+                .map(|transaction| transaction.candidate.as_str()),
+            self.setup_callmesh_transaction
+                .as_ref()
+                .and_then(|transaction| transaction.previous.as_deref()),
         ]
         .into_iter()
         .flatten()
         {
             validate_secret(value).map_err(|_| SecretStoreError::Unavailable)?;
+        }
+        if self
+            .setup_callmesh_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                transaction.promoted
+                    && self.callmesh_api_key.as_deref() != Some(transaction.candidate.as_str())
+            })
+        {
+            return Err(SecretStoreError::Unavailable);
         }
         Ok(())
     }
@@ -272,6 +324,7 @@ impl PlaintextSecretBackend {
 
     fn save(&self, document: &PlaintextSecretDocument) -> Result<(), SecretStoreError> {
         self.validate_parent()?;
+        document.validate()?;
         #[cfg(unix)]
         validate_optional_private_file(&self.path, self.owner)?;
         #[cfg(not(unix))]
@@ -302,6 +355,9 @@ impl SecretBackend for PlaintextSecretBackend {
             .lock()
             .map_err(|_| SecretStoreError::Unavailable)?;
         let mut document = self.load()?;
+        if kind == SecretKind::CallMeshApiKey && document.setup_callmesh_transaction.is_some() {
+            return Err(SecretStoreError::Unavailable);
+        }
         if !document.replace(kind, value.to_owned()) {
             return Err(SecretStoreError::Unavailable);
         }
@@ -323,12 +379,106 @@ impl SecretBackend for PlaintextSecretBackend {
             .lock()
             .map_err(|_| SecretStoreError::Unavailable)?;
         let mut document = self.load()?;
+        if kind == SecretKind::CallMeshApiKey && document.setup_callmesh_transaction.is_some() {
+            return Err(SecretStoreError::Unavailable);
+        }
         let Some(mut removed) = document.take(kind) else {
             return Ok(false);
         };
         removed.zeroize();
         self.save(&document)?;
         Ok(true)
+    }
+
+    fn stage_callmesh_setup(&self, candidate: &str) -> Result<(), SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        if document.setup_callmesh_transaction.is_some() {
+            return Err(SecretStoreError::Unavailable);
+        }
+        document.setup_callmesh_transaction = Some(CallMeshSetupSecretTransaction {
+            candidate: candidate.to_owned(),
+            previous: document.callmesh_api_key.clone(),
+            promoted: false,
+        });
+        self.save(&document)
+    }
+
+    fn promote_callmesh_setup(&self) -> Result<(), SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        let candidate = document
+            .setup_callmesh_transaction
+            .as_ref()
+            .filter(|transaction| !transaction.promoted)
+            .map(|transaction| transaction.candidate.clone())
+            .ok_or(SecretStoreError::Unavailable)?;
+        document.replace(SecretKind::CallMeshApiKey, candidate);
+        document
+            .setup_callmesh_transaction
+            .as_mut()
+            .ok_or(SecretStoreError::Unavailable)?
+            .promoted = true;
+        self.save(&document)
+    }
+
+    fn rollback_callmesh_setup(&self) -> Result<bool, SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        let Some(mut transaction) = document.setup_callmesh_transaction.take() else {
+            return Ok(false);
+        };
+        match transaction.previous.take() {
+            Some(previous) => {
+                document.replace(SecretKind::CallMeshApiKey, previous);
+            }
+            None => {
+                if let Some(mut active) = document.callmesh_api_key.take() {
+                    active.zeroize();
+                }
+            }
+        }
+        self.save(&document)?;
+        Ok(true)
+    }
+
+    fn finalize_callmesh_setup(&self) -> Result<bool, SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        let Some(transaction) = document.setup_callmesh_transaction.as_ref() else {
+            return Ok(false);
+        };
+        if !transaction.promoted {
+            return Err(SecretStoreError::Unavailable);
+        }
+        document.setup_callmesh_transaction = None;
+        self.save(&document)?;
+        Ok(true)
+    }
+
+    fn callmesh_setup_state(&self) -> Result<CallMeshSetupSecretState, SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let document = self.load()?;
+        Ok(match document.setup_callmesh_transaction.as_ref() {
+            None => CallMeshSetupSecretState::None,
+            Some(transaction) if transaction.promoted => CallMeshSetupSecretState::Promoted,
+            Some(_) => CallMeshSetupSecretState::Staged,
+        })
     }
 
     #[cfg(test)]
@@ -339,15 +489,24 @@ impl SecretBackend for PlaintextSecretBackend {
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
-struct MemorySecretBackend(Mutex<std::collections::BTreeMap<SecretKind, String>>);
+struct MemorySecretState {
+    values: std::collections::BTreeMap<SecretKind, String>,
+    setup_callmesh_transaction: Option<CallMeshSetupSecretTransaction>,
+    fail_next_setup_finalize: bool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+struct MemorySecretBackend(Mutex<MemorySecretState>);
 
 #[cfg(any(test, feature = "test-support"))]
 impl SecretBackend for MemorySecretBackend {
     fn set(&self, kind: SecretKind, value: &str) -> Result<(), SecretStoreError> {
-        self.0
-            .lock()
-            .map_err(|_| SecretStoreError::Unavailable)?
-            .insert(kind, value.to_owned());
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        if kind == SecretKind::CallMeshApiKey && state.setup_callmesh_transaction.is_some() {
+            return Err(SecretStoreError::Unavailable);
+        }
+        state.values.insert(kind, value.to_owned());
         Ok(())
     }
 
@@ -356,18 +515,96 @@ impl SecretBackend for MemorySecretBackend {
             .0
             .lock()
             .map_err(|_| SecretStoreError::Unavailable)?
+            .values
             .get(&kind)
             .cloned()
             .map(SecretValue::new))
     }
 
     fn delete(&self, kind: SecretKind) -> Result<bool, SecretStoreError> {
-        Ok(self
-            .0
-            .lock()
-            .map_err(|_| SecretStoreError::Unavailable)?
-            .remove(&kind)
-            .is_some())
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        if kind == SecretKind::CallMeshApiKey && state.setup_callmesh_transaction.is_some() {
+            return Err(SecretStoreError::Unavailable);
+        }
+        Ok(state.values.remove(&kind).is_some())
+    }
+
+    fn stage_callmesh_setup(&self, candidate: &str) -> Result<(), SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        if state.setup_callmesh_transaction.is_some() {
+            return Err(SecretStoreError::Unavailable);
+        }
+        state.setup_callmesh_transaction = Some(CallMeshSetupSecretTransaction {
+            candidate: candidate.to_owned(),
+            previous: state.values.get(&SecretKind::CallMeshApiKey).cloned(),
+            promoted: false,
+        });
+        Ok(())
+    }
+
+    fn promote_callmesh_setup(&self) -> Result<(), SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        let candidate = state
+            .setup_callmesh_transaction
+            .as_ref()
+            .filter(|transaction| !transaction.promoted)
+            .map(|transaction| transaction.candidate.clone())
+            .ok_or(SecretStoreError::Unavailable)?;
+        if let Some(mut previous) = state.values.insert(SecretKind::CallMeshApiKey, candidate) {
+            previous.zeroize();
+        }
+        state
+            .setup_callmesh_transaction
+            .as_mut()
+            .ok_or(SecretStoreError::Unavailable)?
+            .promoted = true;
+        Ok(())
+    }
+
+    fn rollback_callmesh_setup(&self) -> Result<bool, SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        let Some(mut transaction) = state.setup_callmesh_transaction.take() else {
+            return Ok(false);
+        };
+        match transaction.previous.take() {
+            Some(previous) => {
+                if let Some(mut current) = state.values.insert(SecretKind::CallMeshApiKey, previous)
+                {
+                    current.zeroize();
+                }
+            }
+            None => {
+                if let Some(mut current) = state.values.remove(&SecretKind::CallMeshApiKey) {
+                    current.zeroize();
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn finalize_callmesh_setup(&self) -> Result<bool, SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        if state.fail_next_setup_finalize {
+            state.fail_next_setup_finalize = false;
+            return Err(SecretStoreError::Unavailable);
+        }
+        let Some(transaction) = state.setup_callmesh_transaction.as_ref() else {
+            return Ok(false);
+        };
+        if !transaction.promoted {
+            return Err(SecretStoreError::Unavailable);
+        }
+        state.setup_callmesh_transaction = None;
+        Ok(true)
+    }
+
+    fn callmesh_setup_state(&self) -> Result<CallMeshSetupSecretState, SecretStoreError> {
+        let state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        Ok(match state.setup_callmesh_transaction.as_ref() {
+            None => CallMeshSetupSecretState::None,
+            Some(transaction) if transaction.promoted => CallMeshSetupSecretState::Promoted,
+            Some(_) => CallMeshSetupSecretState::Staged,
+        })
     }
 
     #[cfg(test)]
@@ -408,6 +645,27 @@ impl AgentSecretStore {
         self.backend.delete(kind)
     }
 
+    pub fn stage_callmesh_setup(&self, candidate: &str) -> Result<(), SecretStoreError> {
+        validate_secret(candidate)?;
+        self.backend.stage_callmesh_setup(candidate)
+    }
+
+    pub fn promote_callmesh_setup(&self) -> Result<(), SecretStoreError> {
+        self.backend.promote_callmesh_setup()
+    }
+
+    pub fn rollback_callmesh_setup(&self) -> Result<bool, SecretStoreError> {
+        self.backend.rollback_callmesh_setup()
+    }
+
+    pub fn finalize_callmesh_setup(&self) -> Result<bool, SecretStoreError> {
+        self.backend.finalize_callmesh_setup()
+    }
+
+    pub fn callmesh_setup_state(&self) -> Result<CallMeshSetupSecretState, SecretStoreError> {
+        self.backend.callmesh_setup_state()
+    }
+
     #[cfg(test)]
     fn backend_kind(&self) -> SecretBackendKind {
         self.backend.kind()
@@ -421,6 +679,16 @@ impl AgentSecretStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn memory() -> Self {
         Self::with_backend(Arc::new(MemorySecretBackend::default()))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn memory_with_finalize_failure_once() -> Self {
+        Self::with_backend(Arc::new(MemorySecretBackend(Mutex::new(
+            MemorySecretState {
+                fail_next_setup_finalize: true,
+                ..MemorySecretState::default()
+            },
+        ))))
     }
 
     /// Legacy test fixture alias. This is never compiled into a runtime build.
@@ -710,6 +978,124 @@ mod tests {
                 .read(SecretKind::AprsPasscode)
                 .expect("missing secret should be valid")
                 .is_none()
+        );
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn callmesh_setup_transaction_reopens_and_rolls_back_within_secrets_json() {
+        let root = fixture("setup-transaction-rollback");
+        let store = AgentSecretStore::runtime(&root).expect("runtime store should initialize");
+        store
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous key should store");
+        store
+            .stage_callmesh_setup("fixture-candidate-key")
+            .expect("candidate should stage");
+        assert_eq!(
+            store
+                .read(SecretKind::CallMeshApiKey)
+                .expect("active key should read")
+                .expect("active key should remain present")
+                .expose_secret(),
+            "fixture-previous-key",
+        );
+        assert_eq!(
+            store
+                .callmesh_setup_state()
+                .expect("transaction state should read"),
+            super::CallMeshSetupSecretState::Staged,
+        );
+        assert_eq!(
+            store.store(SecretKind::CallMeshApiKey, "fixture-concurrent-key"),
+            Err(SecretStoreError::Unavailable),
+        );
+        assert_eq!(
+            store.remove(SecretKind::CallMeshApiKey),
+            Err(SecretStoreError::Unavailable),
+        );
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("runtime root should read")
+                .count(),
+            1,
+            "candidate and rollback key must stay in the sole secrets.json backend",
+        );
+
+        let reopened = AgentSecretStore::runtime(&root).expect("secret store should reopen");
+        reopened
+            .promote_callmesh_setup()
+            .expect("candidate should promote atomically");
+        assert_eq!(
+            reopened
+                .callmesh_setup_state()
+                .expect("promoted state should read"),
+            super::CallMeshSetupSecretState::Promoted,
+        );
+        assert_eq!(
+            reopened.store(SecretKind::CallMeshApiKey, "fixture-concurrent-key"),
+            Err(SecretStoreError::Unavailable),
+        );
+        assert_eq!(
+            reopened.remove(SecretKind::CallMeshApiKey),
+            Err(SecretStoreError::Unavailable),
+        );
+        drop(reopened);
+
+        let recovered = AgentSecretStore::runtime(&root).expect("secret store should reopen again");
+        assert!(
+            recovered
+                .rollback_callmesh_setup()
+                .expect("promoted transaction should rollback")
+        );
+        assert_eq!(
+            recovered
+                .read(SecretKind::CallMeshApiKey)
+                .expect("restored key should read")
+                .expect("restored key should be present")
+                .expose_secret(),
+            "fixture-previous-key",
+        );
+        assert_eq!(
+            recovered
+                .callmesh_setup_state()
+                .expect("cleared state should read"),
+            super::CallMeshSetupSecretState::None,
+        );
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn promoted_callmesh_setup_transaction_can_finalize_after_reopen() {
+        let root = fixture("setup-transaction-finalize");
+        let store = AgentSecretStore::runtime(&root).expect("runtime store should initialize");
+        store
+            .stage_callmesh_setup("fixture-candidate-key")
+            .expect("candidate should stage");
+        store
+            .promote_callmesh_setup()
+            .expect("candidate should promote");
+        drop(store);
+
+        let reopened = AgentSecretStore::runtime(&root).expect("secret store should reopen");
+        assert!(
+            reopened
+                .finalize_callmesh_setup()
+                .expect("promoted transaction should finalize")
+        );
+        assert_eq!(
+            reopened
+                .read(SecretKind::CallMeshApiKey)
+                .expect("committed key should read")
+                .expect("committed key should remain present")
+                .expose_secret(),
+            "fixture-candidate-key",
+        );
+        assert_eq!(
+            reopened
+                .callmesh_setup_state()
+                .expect("final state should read"),
+            super::CallMeshSetupSecretState::None,
         );
         fs::remove_dir_all(root).expect("fixture should clean up");
     }

@@ -22,8 +22,15 @@ fails closed until its unified Agent entrypoint is delivered.
 Gateway opens root-level `~/.cmclient/cmclient.db`, recovers persistent Jobs, and
 constructs CallMesh, Proxy, maintenance, APRS, and Meshtastic runtimes. Under
 Agent supervision it first binds the capability-protected Fastify control plane
-to `127.0.0.1:0`, writes the ready frame, and then starts external runtimes. This
-keeps the private bootstrap deadline independent of external service latency;
+to `127.0.0.1:0`, then validates CallMesh and starts configured external
+runtimes before writing the ready frame. Setup uses a separate validation-only
+launch: before authenticating the in-memory CallMesh key, it reserves the
+physical safety lease and performs exactly one Meshtastic configuration
+handshake against the selected TCP endpoint. It does not start Mesh ingestion,
+APRS, Proxy, maintenance, or mapping synchronization. Agent stops that launch,
+commits setup, records the recoverable ready marker, and starts a normal Gateway;
+the Web receives ready only after normal startup succeeds. Any failure rolls the
+marker, config, and secret back to the credentials phase.
 Agent still withholds the session and the capability from ordinary HTTP until
 listener ownership is proven. Gateway accepts only the exact HTTP/1.1 Upgrade
 request on `/_cmclient/bootstrap/ownership`, with a fresh 64-character

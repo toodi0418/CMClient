@@ -88,6 +88,7 @@ export function tauriReleaseConfig({
   const iconRoot = resolve(icons);
   const signing = windowsSigningConfig(target, windowsSigning);
   return {
+    mainBinaryName: "cmclient-desktop",
     version: tauriPackageVersion(target, version),
     bundle: {
       active: true,

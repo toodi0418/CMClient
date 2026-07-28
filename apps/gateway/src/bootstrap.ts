@@ -33,6 +33,17 @@ export interface GatewayReadyFrame {
   port: number;
 }
 
+export interface GatewayBootstrapFailureFrame {
+  readonly schemaVersion: 1;
+  readonly type: "gateway.bootstrap.failed";
+  readonly startupNonce: string;
+  readonly code:
+    | "CALLMESH_CREDENTIAL_REJECTED"
+    | "CALLMESH_UNAVAILABLE"
+    | "SETUP_MESHTASTIC_UNREACHABLE"
+    | "GATEWAY_EXTERNAL_START_FAILED";
+}
+
 export class GatewayBootstrapError extends Error {
   constructor(readonly code: string) {
     super(code);
@@ -115,6 +126,22 @@ export async function writeGatewayReady(
   await endPrivateOutput(output, encodePrivateFrame(frame));
 }
 
+export async function writeGatewayBootstrapFailure(
+  output: Writable,
+  bootstrap: GatewayBootstrapFrame,
+  code: GatewayBootstrapFailureFrame["code"],
+): Promise<void> {
+  await endPrivateOutput(
+    output,
+    encodePrivateFrame({
+      schemaVersion: 1,
+      type: "gateway.bootstrap.failed",
+      startupNonce: bootstrap.startupNonce,
+      code,
+    } satisfies GatewayBootstrapFailureFrame),
+  );
+}
+
 export async function startSupervisedGateway(
   output: Writable,
   bootstrap: GatewayBootstrapFrame,
@@ -122,8 +149,20 @@ export async function startSupervisedGateway(
   startExternalRuntimes: () => Promise<void>,
 ): Promise<void> {
   const address = await bindControlPlane();
+  try {
+    await startExternalRuntimes();
+  } catch (error) {
+    const code =
+      error instanceof GatewayBootstrapError &&
+      (error.code === "CALLMESH_CREDENTIAL_REJECTED" ||
+        error.code === "CALLMESH_UNAVAILABLE" ||
+        error.code === "SETUP_MESHTASTIC_UNREACHABLE")
+        ? error.code
+        : "GATEWAY_EXTERNAL_START_FAILED";
+    await writeGatewayBootstrapFailure(output, bootstrap, code);
+    throw error;
+  }
   await writeGatewayReady(output, bootstrap, address);
-  await startExternalRuntimes();
 }
 
 export function registerGatewayOwnershipProofEndpoint(

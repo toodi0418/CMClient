@@ -45,11 +45,11 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `d235cda65d75e3f784322e3769ffa3b93700fdf92ea73e72c638b8328dbc568b`.
-- Cargo license inventory: 619 registry packages, 13 workspace packages, zero
+  `d6c325b5ec6909c44214c797be933050cc0f28a8c3b2221c936009ea2410de68`.
+- Cargo license inventory: 622 registry packages, 13 workspace packages, zero
   Git sources, zero unknown source classifications, and zero unknown licenses;
   inventory SHA-256
-  `3fa1a393b6662655aa8707d81dee4b1d8598f3623eafac60fe68b539a24b8853`.
+  `c10fdd67646c652354e7fe910359596b4ea4553b85f464c34be9a4c63437da8c`.
   Its `canonical-json-v2` input is a UTF-8 JSON array with object keys in the
   exact order `name`, `version`, `source`, `checksum`, and `license`.
   Workspace sources are the literal `workspace`; absent checksums and licenses
@@ -69,17 +69,24 @@ The promotion baseline is CMClient commit
   canonical inventory digest remained unchanged.
   P13-T10 then adopted exact Axum/Tower Web ingress dependencies. P14-T01
   added the Agent-owned `mdns-sd` discovery dependency and its bounded
-  transitive graph. The current
-  inventory includes those direct rows and all packages in Cargo's resolved
-  graph; the canonical input was regenerated from structured `cargo metadata`
-  and `Cargo.lock` data after the package set stabilized.
+  transitive graph. The Windows Agent tray lifecycle later added `sysinfo` for
+  bounded executable-image verification, plus `tao` and `tray-icon` for the
+  Windows-only native event loop and icon/menu boundary. Exact PID, creation
+  time, and session validation remains in the system process object rather than
+  in a package-provided PID-only kill helper. The current inventory includes
+  those direct rows and all packages in Cargo's resolved graph; the canonical
+  input was regenerated from structured `cargo metadata` and `Cargo.lock` data
+  after the package set stabilized.
   The superseded P13-T10 snapshot retained lock digest
   `d6bfadfa028ad4d128249dc6446f29102039dce5af6fb79e96761de2f2d8706f`
   and inventory digest
   `e34a3450f05198d6b7309207587b3f753a089499965e79e751ce0ec785f9de0e` for
   historical comparison only.
 - `pnpm-lock.yaml` SHA-256:
-  `561ce24da4300bc8c4716874931e944d02eab86bea94fc35c558c892e6a2c7e6`.
+  `025136bc8446e910de0c56fdeab46a367556ae64d82d4ccdcf9e7d4a9f1a73bc`.
+  The pre-Setup-wizard dependency snapshot used
+  `561ce24da4300bc8c4716874931e944d02eab86bea94fc35c558c892e6a2c7e6`;
+  it is retained for historical comparison only.
 - The P13-T04 Windows production-install evidence contains 183 package versions;
   inventory SHA-256
   `632b3ae7d319aede117c8113b1961e23a331d66972f6b59ff2b548b5fc10ca5f`.
@@ -120,10 +127,13 @@ notices remain part of the target-specific packaging inventory.
 | `libc` | `0.2.186` | `https://github.com/rust-lang/libc` | MIT OR Apache-2.0 | `68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66` | 1.65 |
 | `mdns-sd` | `0.20.2` | `https://github.com/keepsimple1/mdns-sd` | Apache-2.0 OR MIT | `f18d8ec9d1869796fb2910d95f4d957072df0b6a22e247a1d760d8b4c805e17a` | 1.70 |
 | `same-file` | `1.0.6` | `https://github.com/BurntSushi/same-file` | Unlicense/MIT | `93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502` | Not declared |
+| `sysinfo` | `0.35.2` | `https://github.com/GuillaumeGomez/sysinfo` | MIT | `3c3ffa3e4ff2b324a57f7aeb3c349656c7b127c3c189520251a648102a92496e` | 1.75 |
+| `tao` | `0.35.3` | `https://github.com/tauri-apps/tao` | Apache-2.0 | `d1c93047acf68669466a34690ac58cca7010bd1b201e1ec86f1fd0a75d3dd4a9` | 1.74 |
 | `time` | `0.3.45` | `https://github.com/time-rs/time` | MIT OR Apache-2.0 | `f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd` | 1.83.0 |
 | `tower-http` | `0.7.0` | `https://github.com/tower-rs/tower-http` | MIT | `b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233` | 1.65 |
 | `tower-sessions` | `0.15.0` | `https://github.com/maxcountryman/tower-sessions` | MIT | `518dca34b74a17cadfcee06e616a09d2bd0c3984eff1769e1e76d58df978fc78` | Not declared |
 | `tower_governor` | `0.8.0` | `https://github.com/benwis/tower-governor` | MIT OR Apache-2.0 | `44de9b94d849d3c46e06a883d72d408c2de6403367b39df2b1c9d9e7b6736fe6` | Not declared |
+| `tray-icon` | `0.24.1` | `https://github.com/tauri-apps/tray-icon` | MIT OR Apache-2.0 | `65ba1e5f6b9ef9fd87e21b9c6f351554dbd717960089168fcfdef854686961dc` | 1.73 |
 | `tracing` | `0.1.44` | `https://github.com/tokio-rs/tracing` | MIT | `63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100` | 1.65.0 |
 | `tracing-appender` | `0.2.5` | `https://github.com/tokio-rs/tracing` | MIT | `050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c` | 1.63.0 |
 | `winapi-util` | `0.1.11` | `https://github.com/BurntSushi/winapi-util` | Unlicense OR MIT | `c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22` | not declared |

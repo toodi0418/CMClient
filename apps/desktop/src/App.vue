@@ -65,7 +65,7 @@ let statusRefreshTimer: ReturnType<typeof setInterval> | undefined;
 const appWindow = isTauri() ? getCurrentWindow() : undefined;
 const windowControlTarget = appWindow
   ? {
-      exit: () => invoke<void>("exit_desktop"),
+      close: () => appWindow.hide(),
       minimize: () => appWindow.minimize(),
       hide: () => appWindow.hide(),
     }
@@ -314,10 +314,10 @@ onUnmounted(() => {
         <button
           class="window-control window-control--exit"
           type="button"
-          aria-label="Exit CMClient"
-          title="Exit CMClient"
+          aria-label="Close CMClient Desktop"
+          title="Close CMClient Desktop"
           data-tauri-drag-region="false"
-          @click="controlWindow('exit')"
+          @click="controlWindow('close')"
         >
           <X class="window-control__icon" :size="8" :stroke-width="3" />
         </button>

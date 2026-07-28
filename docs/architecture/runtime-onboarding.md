@@ -12,11 +12,13 @@ so a reset or terms-version change makes an older callback stale before it can
 publish readiness. Public setup status contains only booleans and stable reason
 codes.
 
-Meshtastic setup discovery is also Agent-owned. Candidate order is migrated
-non-secret endpoint, loopback `4403`, bounded `_meshtastic._tcp.local.` mDNS
-results, then explicit manual input. The mDNS browse has a fixed event/count
-budget and is stopped before returning; no subnet scan or radio mutation is
-possible through this boundary. Setup wire validation accepts only the
+Meshtastic setup discovery is also Agent-owned. Candidate order is a migrated
+non-secret endpoint, IPv4/IPv6 loopback port `4403`, bounded
+`_meshtastic._tcp.local.` mDNS results from the LAN, then explicit manual input.
+Loopback mDNS advertisements are rejected because the canonical loopback
+candidates already precede mDNS. The mDNS browse has a fixed event/count budget
+and is stopped before returning; it does not probe every subnet address or
+mutate radio state. Setup wire validation accepts only the
 nonce-correlated configuration request/response actions. The Windows physical
 source-smoke profile remains a separate campaign-only path guarded by the
 product-integrated physical write fence.
@@ -55,25 +57,28 @@ booleans, phase, schema version, and a stable reason code.
 ## P14-T03 setup transaction
 
 The first Web screen is an Agent-owned wizard. It uses `GET
-/api/v1/setup/discovery` for the bounded loopback/mDNS candidate list and
+/api/v1/setup/discovery` for the bounded migrated/loopback/mDNS candidate list and
 `POST /api/v1/setup/configure` for the one setup transaction. The CallMesh
 endpoint is fixed to `https://callmesh.tmmarc.org`; it is not a user-editable
 mapping authority. The request accepts only TCP port `4403`, a bounded host,
 the optional local mesh/gateway identifiers, and the CallMesh API key.
 
-The Agent performs a passive TCP reachability check before applying the
-configuration. It writes the non-secret TOML configuration with an atomic
-document replacement and stores the key only through the plaintext
-`secrets.json` backend. The key is passed to the Gateway only through its
-private bootstrap channel and is zeroized when the setup request is dropped;
-it is never placed in TOML, argv, URLs, browser state, or logs. Setup does not
-send radio configuration or RF traffic.
-
-After the private Gateway bootstrap succeeds, setup reaches `ready` and the
-normal Web shell becomes available. Gateway CallMesh heartbeat, provision, and
-mapping authentication then remain the authoritative runtime status; a
-temporary upstream failure is surfaced as a degraded CallMesh/Gateway state
-and does not expose or silently replace the stored credential.
+The Agent starts a validation-only Gateway that reserves the product-integrated
+physical lease and proves the selected endpoint with one nonce-correlated
+Meshtastic configuration handshake. That process cannot start Mesh, Proxy,
+APRS, or maintenance runtimes. It then authenticates the transient key against
+the protected CallMesh heartbeat endpoint. Credential rejection and temporary
+upstream failure return distinct
+stable errors before any key or configuration is committed. Only successful
+authentication may atomically replace the non-secret TOML configuration,
+persist the key through the plaintext `secrets.json` backend, start the normal
+Gateway, and reach `ready`. A later write, bootstrap, or runtime-start failure
+restores the previous config and secret. The key is zeroized when the request
+is dropped and never appears in TOML, argv, URLs, browser state, or logs. A
+client disconnect after the transaction begins is treated as cancellation: the
+Agent rolls back staged/promoted credentials, configuration, and ready state;
+the durable transaction journal recovers the same invariant after a process
+interruption. Setup does not send radio configuration or RF traffic.
 
 ## State Root
 
@@ -113,7 +118,8 @@ uninitialized -> terms_required -> credentials_required -> validating -> ready
 Missing, removed, authoritatively rejected, or revoked credentials enter the
 mandatory Web wizard. Transient network failure is degraded/retryable, not
 credential revocation. The wizard selects language, accepts versioned terms,
-discovers bounded loopback/mDNS Meshtastic TCP 4403 candidates, checks the
+discovers bounded migrated, loopback, and LAN mDNS Meshtastic TCP 4403
+candidates, checks the
 selected endpoint, passes the CallMesh key through the private Gateway
 bootstrap, applies provision-derived APRS identity, reviews defaults, and
 commits each durable document atomically. There is no Agent/Gateway/Desktop/CLI

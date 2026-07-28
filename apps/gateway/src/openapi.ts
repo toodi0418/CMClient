@@ -93,6 +93,9 @@ const AGENT_MANAGEMENT_PATHS: Record<string, JsonValue> = {
   "/api/v1/setup/configure": {
     post: {
       security: AGENT_SESSION_SECURITY,
+      "x-cmclient-error-schema": {
+        $ref: "#/components/schemas/SetupErrorCode",
+      },
       parameters: [CSRF_PARAMETER],
       requestBody: {
         required: true,
@@ -105,6 +108,8 @@ const AGENT_MANAGEMENT_PATHS: Record<string, JsonValue> = {
       responses: {
         "200": agentJsonResponse("SetupStatus"),
         "400": AGENT_ERROR_RESPONSE,
+        "401": AGENT_ERROR_RESPONSE,
+        "408": AGENT_ERROR_RESPONSE,
         "409": AGENT_ERROR_RESPONSE,
         "503": AGENT_ERROR_RESPONSE,
       },

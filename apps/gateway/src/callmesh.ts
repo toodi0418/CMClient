@@ -517,6 +517,42 @@ export class CallMeshClient {
     return this.getOverview();
   }
 
+  /**
+   * Performs a real authenticated heartbeat without mutating the runtime
+   * mapping snapshot. Normal startup performs the full mapping sync only after
+   * Agent has committed the setup transaction.
+   */
+  async validateCredentials(): Promise<void> {
+    try {
+      const heartbeat = parseHeartbeat(
+        await this.request(HEARTBEAT_PATH, {
+          local_hash: this.mappingHash ?? null,
+          agent: this.agent,
+        }),
+      );
+      if (!parseProvision(heartbeat.provision)) {
+        throw new CallMeshClientError("CALLMESH_CREDENTIAL_REJECTED");
+      }
+    } catch (error) {
+      const classified = classifyError(error);
+      if (
+        classified.code === "CALLMESH_AUTH_INVALID" ||
+        classified.code === "CALLMESH_CREDENTIAL_REJECTED"
+      ) {
+        throw new CallMeshClientError("CALLMESH_CREDENTIAL_REJECTED");
+      }
+      if (
+        classified.code === "CALLMESH_NETWORK_UNAVAILABLE" ||
+        classified.code === "CALLMESH_HTTP_408" ||
+        classified.code === "CALLMESH_HTTP_429" ||
+        /^CALLMESH_HTTP_5\d\d$/.test(classified.code)
+      ) {
+        throw new CallMeshClientError("CALLMESH_UNAVAILABLE", true);
+      }
+      throw new CallMeshClientError("CALLMESH_SETUP_VALIDATION_FAILED");
+    }
+  }
+
   private async synchronizeInner(): Promise<void> {
     this.status = this.makeStatus("checking");
     try {

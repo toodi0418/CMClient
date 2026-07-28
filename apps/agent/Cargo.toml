@@ -28,5 +28,10 @@ cmclient-agent-core = { path = "../../crates/agent-core", features = ["test-supp
 http-body-util.workspace = true
 tower.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+sysinfo = { version = "=0.35.2", default-features = false, features = ["system"] }
+tao = { version = "=0.35.3", default-features = false }
+tray-icon = { version = "=0.24.1", default-features = false }
+
 [lints]
 workspace = true

@@ -138,12 +138,18 @@ importers:
       '@primeuix/themes':
         specifier: ^1.2.5
         version: 1.2.5
+      '@primevue/forms':
+        specifier: ^4.5.5
+        version: 4.5.5(vue@3.5.40(typescript@5.9.3))
       '@sinclair/typebox':
         specifier: ^0.34.52
         version: 0.34.52
       '@tailwindcss/vite':
         specifier: ^4.3.3
         version: 4.3.3(vite@8.1.5(@types/node@22.20.1)(jiti@2.7.0)(yaml@2.9.0))
+      '@xstate/vue':
+        specifier: ^5.0.1
+        version: 5.0.1(vue@3.5.40(typescript@5.9.3))(xstate@5.32.5)
       echarts:
         specifier: ^6.1.0
         version: 6.1.0
@@ -168,6 +174,9 @@ importers:
       vue-router:
         specifier: ^5.2.0
         version: 5.2.0(@vue/compiler-sfc@3.5.40)(pinia@4.0.2(@vue/devtools-api@8.1.5)(typescript@5.9.3)(vue@3.5.40(typescript@5.9.3)))(rolldown@1.1.5)(vite@8.1.5(@types/node@22.20.1)(jiti@2.7.0)(yaml@2.9.0))(vue@3.5.40(typescript@5.9.3))
+      xstate:
+        specifier: ^5.32.5
+        version: 5.32.5
     devDependencies:
       '@types/leaflet':
         specifier: ^1.9.21
@@ -420,6 +429,10 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
+  '@primeuix/forms@0.1.0':
+    resolution: {integrity: sha512-LctcQidb+B5PuvAFWH24YH/SIzmHlOabLHpaTeGY/k51iBv1WyCp+5w9JMYuMB/BplSvV0ZGySxQVkN5Azr/aQ==}
+    engines: {node: '>=12.11.0'}
+
   '@primeuix/styled@0.7.4':
     resolution: {integrity: sha512-QSO/NpOQg8e9BONWRBx9y8VGMCMYz0J/uKfNJEya/RGEu7ARx0oYW0ugI1N3/KB1AAvyGxzKBzGImbwg0KUiOQ==}
     engines: {node: '>=12.11.0'}
@@ -439,6 +452,10 @@ packages:
     engines: {node: '>=12.11.0'}
     peerDependencies:
       vue: ^3.5.0
+
+  '@primevue/forms@4.5.5':
+    resolution: {integrity: sha512-LUeIt6oItwCZyBreQ7ycErE8aEjPmBWOTq1VPLhyaATcnzMBOZRIiwclaYk8s/tf5VYMqN9N4B80XnXoO7OdvQ==}
+    engines: {node: '>=12.11.0'}
 
   '@primevue/icons@4.5.5':
     resolution: {integrity: sha512-eteOhTdAOXEYE9qW1AOrBBgDxQ2szHJxSkEK1XVdV2TKxGM5FQf03Ovms0VDyZTc16XBIgvwYjXJQS0BPbhPaA==}
@@ -970,6 +987,15 @@ packages:
   '@vue/shared@3.5.40':
     resolution: {integrity: sha512-WxnBtruIqOoV3rA4jeKDWzrYI5h7Cp4+pjwDi8kWGHz+IslhiN+wguLVVhtv2l8VoU02rzDCVfDjgCl1lNpZVg==}
 
+  '@xstate/vue@5.0.1':
+    resolution: {integrity: sha512-SsiIgj+9lnArECyeqcJ+y4JsxcdT/dA8mLaN+lA8sk7TfZM5ASEMk+/2VLho2r/PtRBCg7KZqRstb5MBF7yEWg==}
+    peerDependencies:
+      vue: ^3.0.0
+      xstate: ^5.32.5
+    peerDependenciesMeta:
+      xstate:
+        optional: true
+
   abstract-logging@2.0.1:
     resolution: {integrity: sha512-2BjRTZxTPvheOvGbBslFSYOUkr+SjPtOnrLP33f+VIWLzezQpZcqVg7ja3L4dBXmzzgwT+a029jRx5PCi3JuiA==}
 
@@ -1472,6 +1498,7 @@ packages:
 
   nostics@1.1.4:
     resolution: {integrity: sha512-U4FApICSLCQ0dYiN59pxUCEZC053palQXi57yLaNdMaL6TBY4C4q3qZrJKUGcor2dGv8EhEwt8y5KvU2bo2kFg==}
+    hasBin: true
 
   nth-check@2.1.1:
     resolution: {integrity: sha512-lqjrjmaOoAnWfMmBPL+XNnynZh2+swxiX3WUE0s4yEHI6m+AwrK2UZOimIRl3X/4QctVqS8AiZjFqyOGrMXb/w==}
@@ -1955,6 +1982,9 @@ packages:
     resolution: {integrity: sha512-ICP2e+jsHvAj2E2lIHxa5tjXRlKDJo4IdvPvCXbXQGdzSfmSpNVyIKMvoZHjDY9DP0zV17iI85o90vRFXNccRw==}
     engines: {node: '>=12'}
 
+  xstate@5.32.5:
+    resolution: {integrity: sha512-ULazi1oe6wGrXl0Frb6otSlkm5HLifbbVTkMk5kkSKqz4TkxJaVpnl6jOJwKeid3ORPxYyZQgNLUSYX9q65SIA==}
+
   yaml@2.9.0:
     resolution: {integrity: sha512-2AvhNX3mb8zd6Zy7INTtSpl1F15HW6Wnqj0srWlkKLcpYl/gMIMJiyuGq2KeI2YFxUPjdlB+3Lc10seMLtL4cA==}
     engines: {node: '>= 14.6'}
@@ -2174,6 +2204,10 @@ snapshots:
     dependencies:
       playwright: 1.61.1
 
+  '@primeuix/forms@0.1.0':
+    dependencies:
+      '@primeuix/utils': 0.6.4
+
   '@primeuix/styled@0.7.4':
     dependencies:
       '@primeuix/utils': 0.6.4
@@ -2193,6 +2227,14 @@ snapshots:
       '@primeuix/styled': 0.7.4
       '@primeuix/utils': 0.6.4
       vue: 3.5.40(typescript@5.9.3)
+
+  '@primevue/forms@4.5.5(vue@3.5.40(typescript@5.9.3))':
+    dependencies:
+      '@primeuix/forms': 0.1.0
+      '@primeuix/utils': 0.6.4
+      '@primevue/core': 4.5.5(vue@3.5.40(typescript@5.9.3))
+    transitivePeerDependencies:
+      - vue
 
   '@primevue/icons@4.5.5(vue@3.5.40(typescript@5.9.3))':
     dependencies:
@@ -2695,6 +2737,12 @@ snapshots:
       '@vue/shared': 3.5.40
 
   '@vue/shared@3.5.40': {}
+
+  '@xstate/vue@5.0.1(vue@3.5.40(typescript@5.9.3))(xstate@5.32.5)':
+    dependencies:
+      vue: 3.5.40(typescript@5.9.3)
+    optionalDependencies:
+      xstate: 5.32.5
 
   abstract-logging@2.0.1: {}
 
@@ -3570,6 +3618,8 @@ snapshots:
   word-wrap@1.2.5: {}
 
   xml-name-validator@4.0.0: {}
+
+  xstate@5.32.5: {}
 
   yaml@2.9.0: {}
 

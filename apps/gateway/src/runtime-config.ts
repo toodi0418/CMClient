@@ -41,6 +41,8 @@ export class GatewayRuntimeConfigurationError extends Error {
 
 export type AprsStateProvider = () => AprsRuntimeState | undefined;
 
+const SETUP_MESHTASTIC_VALIDATION_TIMEOUT_MS = 8_000;
+
 export function createConfiguredGatewayMaintenanceRuntime(
   environment: Record<string, string | undefined>,
   database: GatewayDatabase,
@@ -224,6 +226,82 @@ export async function createConfiguredMeshGatewayRuntime(
         : {}),
     },
   });
+}
+
+/**
+ * Proves that a setup TCP candidate is Meshtastic, not merely an open port.
+ * The physical guard reserves the process-wide lease and authorizes only the
+ * nonce-correlated configuration request before any socket write.
+ */
+export async function validateConfiguredMeshtasticEndpoint(
+  environment: Record<string, string | undefined>,
+): Promise<void> {
+  const kind =
+    environment.CMCLIENT_MESHTASTIC_TRANSPORT?.trim().toLowerCase() ||
+    "disabled";
+  if (kind !== "tcp") {
+    throw new GatewayRuntimeConfigurationError(
+      "MESHTASTIC_TCP_CONFIGURATION_INVALID",
+    );
+  }
+  const schema = await loadMeshtasticSchema();
+  const physicalGuard = createPhysicalWriteGuard(environment, kind);
+  if (!physicalGuard?.physicalProfile) {
+    throw new GatewayRuntimeConfigurationError(
+      "PHYSICAL_PROFILE_CONFIGURATION_INVALID",
+    );
+  }
+  const transport = new TcpMeshtasticTransport({
+    configSession: new MeshtasticProtobufCodec(schema),
+    host: boundedText(
+      environment.CMCLIENT_MESHTASTIC_TCP_HOST?.trim() || "127.0.0.1",
+      255,
+      "MESHTASTIC_TCP_CONFIGURATION_INVALID",
+    ),
+    port: parsePort(
+      environment.CMCLIENT_MESHTASTIC_TCP_PORT,
+      4403,
+      "MESHTASTIC_TCP_CONFIGURATION_INVALID",
+    ),
+    configTimeoutMs: 5_000,
+    connectTimeoutMs: 3_000,
+    physicalGuard,
+  });
+  const connection = transport.connect();
+  let timer: NodeJS.Timeout | undefined;
+  let failure: unknown;
+  try {
+    await Promise.race([
+      connection,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new GatewayRuntimeConfigurationError(
+                "MESHTASTIC_SETUP_VALIDATION_TIMEOUT",
+              ),
+            ),
+          SETUP_MESHTASTIC_VALIDATION_TIMEOUT_MS,
+        );
+        timer.unref();
+      }),
+    ]);
+  } catch (error) {
+    failure = error;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+  try {
+    await transport.disconnect();
+  } catch (error) {
+    failure ??= error;
+  }
+  await connection.catch(() => undefined);
+  if (failure) {
+    throw failure;
+  }
 }
 
 function createPhysicalWriteGuard(

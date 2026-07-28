@@ -11,8 +11,11 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::access::{ManagementAccessController, ManagementAuditEntry};
-use cmclient_agent_core::secrets::{AgentSecretStore, SecretKind, SecretStoreError};
+use cmclient_agent_core::secrets::{
+    AgentSecretStore, CallMeshSetupSecretState, SecretKind, SecretStoreError,
+};
 use cmclient_agent_core::setup::{
+    DiscoveryError, DiscoverySource, MAX_DISCOVERY_CANDIDATES, MAX_MDNS_TIMEOUT,
     MeshtasticCandidate, SetupError, SetupPhase, SetupStatus, SetupStore, discover_mdns,
     ordered_candidates,
 };
@@ -48,7 +51,6 @@ use std::{
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
@@ -61,6 +63,8 @@ use std::{
 };
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use zeroize::Zeroize;
+
+mod tray;
 
 const EX_USAGE: u8 = 2;
 const EX_CONFIG: u8 = 5;
@@ -76,6 +80,12 @@ const GATEWAY_SSE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const AGENT_LOG_FILE: &str = "agent.jsonl";
 const GATEWAY_LOG_FILE: &str = "gateway.jsonl";
 const MAX_GATEWAY_IDENTITY_BYTES: u64 = 64 * 1024;
+const SETUP_VALIDATION_ONLY_ENVIRONMENT_NAME: &str = "CMCLIENT_SETUP_VALIDATION_ONLY";
+const SETUP_COMMIT_START_ENVIRONMENT_NAME: &str = "CMCLIENT_SETUP_COMMIT_START";
+const PROXY_ENABLED_ENVIRONMENT_NAME: &str = "CMCLIENT_PROXY_ENABLED";
+const SETUP_TRANSACTION_FILE_NAME: &str = "setup-transaction.json";
+const SETUP_TRANSACTION_VERSION: u8 = 1;
+const MAX_SETUP_CONFIGURATION_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct AgentWebEvent {
@@ -406,6 +416,14 @@ struct SetupConfigureRequest {
     callmesh_api_key: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupTransactionJournal {
+    version: u8,
+    generation: u64,
+    previous_configuration: Option<Vec<u8>>,
+}
+
 impl Drop for SetupConfigureRequest {
     fn drop(&mut self) {
         self.callmesh_api_key.zeroize();
@@ -424,7 +442,10 @@ struct SetupDiscoveryResponse {
 enum SetupApplyError {
     Setup(SetupError),
     InvalidInput,
+    Cancelled,
     EndpointUnreachable,
+    CallMeshCredentialRejected,
+    CallMeshUnavailable,
     SupervisorUnavailable,
     ConfigWriteFailed,
 }
@@ -435,8 +456,110 @@ impl From<SetupError> for SetupApplyError {
     }
 }
 
-type SetupApplyHandler =
-    Arc<dyn Fn(SetupConfigureRequest) -> Result<SetupStatus, SetupApplyError> + Send + Sync>;
+#[derive(Clone, Default)]
+struct SetupCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SetupCancellationToken {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+struct SetupRequestCancellationGuard {
+    cancellation: SetupCancellationToken,
+    armed: bool,
+}
+
+impl SetupRequestCancellationGuard {
+    fn new(cancellation: SetupCancellationToken) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SetupRequestCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SetupRollbackState {
+    None,
+    JournalOnly,
+    Validating,
+    Persistent,
+}
+
+struct SetupPendingCommit {
+    controller: Arc<AgentController>,
+    status: SetupStatus,
+    previous_configuration: Option<Vec<u8>>,
+    committed: bool,
+}
+
+impl SetupPendingCommit {
+    fn commit(self) -> Result<SetupStatus, SetupApplyError> {
+        self.commit_with(|controller, status| controller.finish_setup_commit(status))
+    }
+
+    fn commit_with(
+        mut self,
+        finish: impl FnOnce(&AgentController, &SetupStatus) -> Result<(), SetupApplyError>,
+    ) -> Result<SetupStatus, SetupApplyError> {
+        if let Err(error) = finish(&self.controller, &self.status) {
+            let error = self.controller.rollback_setup_error(
+                self.previous_configuration.as_deref(),
+                true,
+                error,
+            );
+            self.committed = true;
+            return Err(error);
+        }
+        self.committed = true;
+        Ok(self.status.clone())
+    }
+}
+
+impl Drop for SetupPendingCommit {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.controller.rollback_setup_error(
+            self.previous_configuration.as_deref(),
+            true,
+            SetupApplyError::Cancelled,
+        ) != SetupApplyError::Cancelled
+        {
+            self.controller
+                .remember_error_code("SETUP_TRANSACTION_ROLLBACK_FAILED");
+        }
+    }
+}
+
+type SetupApplyHandler = Arc<
+    dyn Fn(
+            SetupConfigureRequest,
+            SetupCancellationToken,
+        ) -> Result<SetupPendingCommit, SetupApplyError>
+        + Send
+        + Sync,
+>;
 
 const CALLMESH_PRODUCTION_URL: &str = "https://callmesh.tmmarc.org";
 const DEFAULT_APRS_HOST: &str = "asia.aprs2.net";
@@ -452,6 +575,8 @@ struct AgentWebState {
     management_setup_state: Mutex<Option<ManagementSetupState>>,
     management_access: Option<Arc<ManagementAccessController>>,
     setup_apply: Mutex<Option<SetupApplyHandler>>,
+    migrated_meshtastic: Option<MeshtasticCandidate>,
+    discovery_gate: Mutex<()>,
     audit: Mutex<VecDeque<ManagementAuditEntry>>,
     runtime_log: Option<StructuredLogSink>,
 }
@@ -464,7 +589,15 @@ impl AgentWebState {
         setup_gate_required: bool,
         lifecycle: AgentLifecycleStatus,
     ) -> Result<Self, ControlError> {
-        Self::new_with_log(updates, setup, setup_gate_required, lifecycle, None, None)
+        Self::new_with_log(
+            updates,
+            setup,
+            setup_gate_required,
+            lifecycle,
+            None,
+            None,
+            None,
+        )
     }
 
     fn new_with_log(
@@ -474,6 +607,7 @@ impl AgentWebState {
         lifecycle: AgentLifecycleStatus,
         runtime_log: Option<StructuredLogSink>,
         management_access: Option<Arc<ManagementAccessController>>,
+        migrated_meshtastic: Option<MeshtasticCandidate>,
     ) -> Result<Self, ControlError> {
         let setup_events = Arc::new(AgentEventHub::new_with_log("setup", runtime_log.clone()));
         setup_events
@@ -499,6 +633,8 @@ impl AgentWebState {
             management_setup_state: Mutex::new(None),
             management_access,
             setup_apply: Mutex::new(None),
+            migrated_meshtastic,
+            discovery_gate: Mutex::new(()),
             audit: Mutex::new(VecDeque::new()),
             runtime_log,
         })
@@ -639,22 +775,37 @@ fn agent_web_router(state: Arc<AgentWebState>) -> Router {
         .with_state(state)
 }
 
-async fn management_setup_discovery() -> Response {
-    let mdns = tokio::task::spawn_blocking(|| {
-        discover_mdns(Duration::from_secs(2), 16).unwrap_or_default()
+async fn management_setup_discovery(State(state): State<Arc<AgentWebState>>) -> Response {
+    let status = match state.setup.status() {
+        Ok(status) => status,
+        Err(error) => return setup_error_response(error),
+    };
+    if !state.setup_gate_required || !matches!(status.phase, SetupPhase::CredentialsRequired) {
+        return setup_error_response(SetupError::TransitionInvalid);
+    }
+    let migrated = state.migrated_meshtastic.clone();
+    let operation = tokio::task::spawn_blocking(move || {
+        let _guard = state
+            .discovery_gate
+            .try_lock()
+            .map_err(|_| DiscoveryError::Busy)?;
+        let mdns = discover_mdns(MAX_MDNS_TIMEOUT, MAX_DISCOVERY_CANDIDATES)?;
+        Ok::<_, DiscoveryError>(ordered_candidates(migrated, mdns, None))
     })
-    .await
-    .unwrap_or_default();
-    let candidates = ordered_candidates(None, mdns, None);
-    (
-        StatusCode::OK,
-        Json(SetupDiscoveryResponse {
-            schema_version: 1,
-            candidates,
-            callmesh_url: CALLMESH_PRODUCTION_URL,
-        }),
-    )
-        .into_response()
+    .await;
+    match operation {
+        Ok(Ok(candidates)) => (
+            StatusCode::OK,
+            Json(SetupDiscoveryResponse {
+                schema_version: 1,
+                candidates,
+                callmesh_url: CALLMESH_PRODUCTION_URL,
+            }),
+        )
+            .into_response(),
+        Ok(Err(error)) => setup_discovery_error_response(error),
+        Err(_) => setup_discovery_error_response(DiscoveryError::MdnsFailed),
+    }
 }
 
 async fn management_setup_configure(
@@ -676,8 +827,17 @@ async fn management_setup_configure(
         )
             .into_response();
     };
-    match tokio::task::spawn_blocking(move || handler(request)).await {
-        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+    let cancellation = SetupCancellationToken::default();
+    let mut cancellation_guard = SetupRequestCancellationGuard::new(cancellation.clone());
+    let operation = tokio::task::spawn_blocking(move || handler(request, cancellation)).await;
+    match operation {
+        Ok(Ok(pending)) => match pending.commit() {
+            Ok(status) => {
+                cancellation_guard.disarm();
+                (StatusCode::OK, Json(status)).into_response()
+            }
+            Err(error) => setup_apply_error_response(error),
+        },
         Ok(Err(error)) => setup_apply_error_response(error),
         Err(_) => management_control_failed_response(),
     }
@@ -720,15 +880,6 @@ fn validate_setup_request(request: &SetupConfigureRequest) -> Result<(), SetupAp
     Ok(())
 }
 
-fn probe_meshtastic_endpoint(host: &str, port: u16) -> bool {
-    let Ok(addresses) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    addresses
-        .take(4)
-        .any(|address| TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok())
-}
-
 fn write_setup_configuration(
     path: &Path,
     host: &str,
@@ -736,18 +887,160 @@ fn write_setup_configuration(
     mesh_network_id: &str,
     gateway_id: &str,
 ) -> Result<(), SetupApplyError> {
-    let parent = path.parent().ok_or(SetupApplyError::ConfigWriteFailed)?;
-    fs::create_dir_all(parent).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
     let contents = format!(
         "[agent]\nmanagement_web_enabled = true\n\n[callmesh]\nurl = \"{CALLMESH_PRODUCTION_URL}\"\n\n[meshtastic]\ntransport = \"tcp\"\nmesh_network_id = \"{mesh_network_id}\"\ngateway_id = \"{gateway_id}\"\ntcp_host = \"{host}\"\ntcp_port = {port}\n\n[aprs]\nhost = \"{DEFAULT_APRS_HOST}\"\nport = {DEFAULT_APRS_PORT}\n"
     );
+    write_atomic_configuration(path, contents.as_bytes())
+}
+
+fn write_atomic_configuration(path: &Path, contents: &[u8]) -> Result<(), SetupApplyError> {
+    let parent = path.parent().ok_or(SetupApplyError::ConfigWriteFailed)?;
+    fs::create_dir_all(parent).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
     let mut output = AtomicWriteFile::open(path).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
     output
-        .write_all(contents.as_bytes())
+        .write_all(contents)
         .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
     output
         .commit()
         .map_err(|_| SetupApplyError::ConfigWriteFailed)
+}
+
+fn capture_setup_configuration(path: &Path) -> Result<Option<Vec<u8>>, SetupApplyError> {
+    match fs::read(path) {
+        Ok(contents) if contents.len() <= MAX_SETUP_CONFIGURATION_BYTES => Ok(Some(contents)),
+        Ok(_) => Err(SetupApplyError::ConfigWriteFailed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(SetupApplyError::ConfigWriteFailed),
+    }
+}
+
+fn restore_setup_configuration(
+    path: &Path,
+    previous: Option<&[u8]>,
+) -> Result<(), SetupApplyError> {
+    match previous {
+        Some(contents) => write_atomic_configuration(path, contents),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(SetupApplyError::ConfigWriteFailed),
+        },
+    }
+}
+
+fn setup_transaction_file(paths: &RuntimePaths) -> PathBuf {
+    paths.state_dir().join(SETUP_TRANSACTION_FILE_NAME)
+}
+
+fn write_setup_transaction(
+    path: &Path,
+    generation: u64,
+    previous_configuration: Option<&[u8]>,
+) -> Result<(), SetupApplyError> {
+    if generation == 0
+        || previous_configuration
+            .is_some_and(|contents| contents.len() > MAX_SETUP_CONFIGURATION_BYTES)
+    {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let document = SetupTransactionJournal {
+        version: SETUP_TRANSACTION_VERSION,
+        generation,
+        previous_configuration: previous_configuration.map(<[u8]>::to_vec),
+    };
+    let bytes = serde_json::to_vec(&document).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    write_atomic_configuration(path, &bytes)
+}
+
+fn read_setup_transaction(path: &Path) -> Result<Option<SetupTransactionJournal>, SetupApplyError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(SetupApplyError::ConfigWriteFailed),
+    };
+    if bytes.len() > MAX_SETUP_CONFIGURATION_BYTES.saturating_mul(4) {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let document: SetupTransactionJournal =
+        serde_json::from_slice(&bytes).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    if document.version != SETUP_TRANSACTION_VERSION
+        || document.generation == 0
+        || document
+            .previous_configuration
+            .as_ref()
+            .is_some_and(|contents| contents.len() > MAX_SETUP_CONFIGURATION_BYTES)
+    {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    Ok(Some(document))
+}
+
+fn remove_setup_transaction(path: &Path) -> Result<(), SetupApplyError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SetupApplyError::ConfigWriteFailed),
+    }
+}
+
+fn recover_interrupted_setup(
+    paths: &RuntimePaths,
+    config_file: &Path,
+    secrets: &AgentSecretStore,
+) -> Result<(), SetupApplyError> {
+    let transaction_file = setup_transaction_file(paths);
+    let Some(transaction) = read_setup_transaction(&transaction_file)? else {
+        return match secrets
+            .callmesh_setup_state()
+            .map_err(|_| SetupApplyError::ConfigWriteFailed)?
+        {
+            CallMeshSetupSecretState::None => Ok(()),
+            CallMeshSetupSecretState::Promoted => secrets
+                .finalize_callmesh_setup()
+                .map(|_| ())
+                .map_err(|_| SetupApplyError::ConfigWriteFailed),
+            CallMeshSetupSecretState::Staged => Err(SetupApplyError::ConfigWriteFailed),
+        };
+    };
+    let setup = SetupStore::open(paths).map_err(SetupApplyError::Setup)?;
+    if setup
+        .generation()
+        .map_err(SetupApplyError::Setup)?
+        .generation()
+        != transaction.generation
+    {
+        restore_setup_configuration(config_file, transaction.previous_configuration.as_deref())?;
+        secrets
+            .rollback_callmesh_setup()
+            .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        return remove_setup_transaction(&transaction_file);
+    }
+    let secret_state = secrets
+        .callmesh_setup_state()
+        .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    let setup_status = setup.status().map_err(SetupApplyError::Setup)?;
+    if matches!(setup_status.phase, SetupPhase::Ready) {
+        if secret_state == CallMeshSetupSecretState::Staged {
+            secrets
+                .promote_callmesh_setup()
+                .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        }
+        if secret_state != CallMeshSetupSecretState::None {
+            secrets
+                .finalize_callmesh_setup()
+                .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        }
+        return remove_setup_transaction(&transaction_file);
+    }
+
+    restore_setup_configuration(config_file, transaction.previous_configuration.as_deref())?;
+    secrets
+        .rollback_callmesh_setup()
+        .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    setup
+        .require_credentials()
+        .map_err(SetupApplyError::Setup)?;
+    remove_setup_transaction(&transaction_file)
 }
 
 async fn management_setup_status(State(state): State<Arc<AgentWebState>>) -> Response {
@@ -800,7 +1093,7 @@ async fn management_setup_reset(
             return Err(cmclient_agent_core::setup::SetupError::TransitionInvalid);
         }
         let current = state.setup.status()?;
-        if !current.setup_required {
+        if !current.setup_required || matches!(current.phase, SetupPhase::Validating) {
             return Err(cmclient_agent_core::setup::SetupError::TransitionInvalid);
         }
         let previous_generation = state.setup.generation()?.generation();
@@ -940,6 +1233,17 @@ fn setup_error_response(error: SetupError) -> Response {
     (status, Json(serde_json::json!({"code": error.code()}))).into_response()
 }
 
+fn setup_discovery_error_response(error: DiscoveryError) -> Response {
+    let status = match error {
+        DiscoveryError::Busy => StatusCode::TOO_MANY_REQUESTS,
+        DiscoveryError::ConfigurationInvalid => StatusCode::BAD_REQUEST,
+        DiscoveryError::MdnsUnavailable | DiscoveryError::MdnsFailed => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    (status, Json(serde_json::json!({"code": error.code()}))).into_response()
+}
+
 fn setup_apply_error_response(error: SetupApplyError) -> Response {
     match error {
         SetupApplyError::Setup(error) => setup_error_response(error),
@@ -948,9 +1252,24 @@ fn setup_apply_error_response(error: SetupApplyError) -> Response {
             Json(serde_json::json!({"code": "SETUP_CONFIGURATION_INVALID"})),
         )
             .into_response(),
+        SetupApplyError::Cancelled => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(serde_json::json!({"code": "SETUP_TRANSACTION_CANCELLED"})),
+        )
+            .into_response(),
         SetupApplyError::EndpointUnreachable => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"code": "SETUP_MESHTASTIC_UNREACHABLE"})),
+        )
+            .into_response(),
+        SetupApplyError::CallMeshCredentialRejected => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"code": "CALLMESH_CREDENTIAL_REJECTED"})),
+        )
+            .into_response(),
+        SetupApplyError::CallMeshUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"code": "CALLMESH_UNAVAILABLE"})),
         )
             .into_response(),
         SetupApplyError::SupervisorUnavailable => (
@@ -1045,6 +1364,7 @@ struct AgentController {
     identity: cmclient_control_api::ComponentIdentityReport,
     supervisor: Mutex<Option<GatewaySupervisor>>,
     gateway_transition: Mutex<()>,
+    setup_transaction: Mutex<()>,
     private_gateway_bootstrap: bool,
     runtime_log: Option<StructuredLogSink>,
     agent_log_error_code: Mutex<Option<String>>,
@@ -1056,6 +1376,7 @@ struct AgentController {
     management_access: Option<Arc<ManagementAccessController>>,
     control_endpoint: ControlEndpoint,
     config_file: PathBuf,
+    setup_transaction_file: PathBuf,
     secrets: AgentSecretStore,
     setup: Arc<SetupStore>,
     setup_gate_required: bool,
@@ -1143,6 +1464,13 @@ fn apply_aprs_environment(environment: &mut BTreeMap<String, String>, aprs: Opti
     }
 }
 
+fn disable_proxy_for_setup(environment: &mut BTreeMap<String, String>) {
+    environment.insert(
+        String::from(PROXY_ENABLED_ENVIRONMENT_NAME),
+        String::from("false"),
+    );
+}
+
 fn apply_physical_qualification_environment(
     environment: &mut BTreeMap<String, String>,
     configured: Option<&str>,
@@ -1224,25 +1552,33 @@ const fn management_web_profile(profile: AgentRuntimeProfile) -> ManagementWebPr
 impl AgentController {
     fn install_setup_apply(self: &Arc<Self>) -> Result<(), ControlError> {
         let weak = Arc::downgrade(self);
-        self.web_state.install_setup_apply(Arc::new(move |request| {
-            let controller = weak
-                .upgrade()
-                .ok_or(SetupApplyError::SupervisorUnavailable)?;
-            controller.apply_setup(request)
-        }))
+        self.web_state
+            .install_setup_apply(Arc::new(move |request, cancellation| {
+                let controller = weak
+                    .upgrade()
+                    .ok_or(SetupApplyError::SupervisorUnavailable)?;
+                controller.apply_setup(request, cancellation)
+            }))
     }
 
-    fn apply_setup(&self, request: SetupConfigureRequest) -> Result<SetupStatus, SetupApplyError> {
+    fn apply_setup(
+        self: &Arc<Self>,
+        request: SetupConfigureRequest,
+        cancellation: SetupCancellationToken,
+    ) -> Result<SetupPendingCommit, SetupApplyError> {
+        let _transaction = self
+            .setup_transaction
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
         validate_setup_request(&request)?;
         let current = self.setup.status()?;
         if !self.setup_gate_required || !matches!(current.phase, SetupPhase::CredentialsRequired) {
             return Err(SetupApplyError::Setup(SetupError::TransitionInvalid));
         }
+        self.check_setup_cancellation(&cancellation, None, SetupRollbackState::None)?;
 
-        if !probe_meshtastic_endpoint(&request.meshtastic_host, request.meshtastic_port) {
-            return Err(SetupApplyError::EndpointUnreachable);
-        }
-
+        let previous_configuration = capture_setup_configuration(&self.config_file)?;
+        let generation = self.setup.generation()?.generation();
         let mesh_network_id = request
             .mesh_network_id
             .as_deref()
@@ -1253,21 +1589,93 @@ impl AgentController {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("cmclient-gateway");
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::None,
+        )?;
+        write_setup_transaction(
+            &self.setup_transaction_file,
+            generation,
+            previous_configuration.as_deref(),
+        )?;
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::JournalOnly,
+        )?;
         let fence = match self.setup.begin_validation() {
             Ok(fence) => fence,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                let _ = remove_setup_transaction(&self.setup_transaction_file);
+                return Err(error.into());
+            }
         };
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::Validating,
+        )?;
+        if let Err(error) = self.configure_supervisor_for_setup(
+            fence.generation(),
+            &request,
+            mesh_network_id,
+            gateway_id,
+        ) {
+            return Err(self.rollback_setup_error(previous_configuration.as_deref(), false, error));
+        }
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::Validating,
+        )?;
+
+        match self.start_supervisor_for_setup() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                let error = self.setup_supervisor_failure();
+                return Err(self.rollback_setup_error(
+                    previous_configuration.as_deref(),
+                    false,
+                    error,
+                ));
+            }
+        }
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::Validating,
+        )?;
+        if self.prepare_supervisor_for_committed_setup().is_err() {
+            return Err(self.rollback_setup_error(
+                previous_configuration.as_deref(),
+                false,
+                SetupApplyError::SupervisorUnavailable,
+            ));
+        }
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::Validating,
+        )?;
+
         if self
             .secrets
-            .store(SecretKind::CallMeshApiKey, &request.callmesh_api_key)
+            .stage_callmesh_setup(&request.callmesh_api_key)
             .is_err()
         {
-            let _ = self.setup.require_credentials();
-            if let Ok(status) = self.setup.status() {
-                let _ = self.web_state.publish_setup_status(&status);
-            }
-            return Err(SetupApplyError::ConfigWriteFailed);
+            return Err(self.rollback_setup_error(
+                previous_configuration.as_deref(),
+                false,
+                SetupApplyError::ConfigWriteFailed,
+            ));
         }
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::Validating,
+        )?;
+
         if let Err(error) = write_setup_configuration(
             &self.config_file,
             request.meshtastic_host.trim(),
@@ -1275,53 +1683,230 @@ impl AgentController {
             mesh_network_id,
             gateway_id,
         ) {
-            let _ = self.secrets.remove(SecretKind::CallMeshApiKey);
-            let _ = self.setup.require_credentials();
-            if let Ok(status) = self.setup.status() {
-                let _ = self.web_state.publish_setup_status(&status);
-            }
-            return Err(error);
-        };
-        if let Err(error) = self.configure_supervisor_for_setup(
-            fence.generation(),
-            &request,
-            mesh_network_id,
-            gateway_id,
-        ) {
-            let _ = self.secrets.remove(SecretKind::CallMeshApiKey);
-            let _ = self.setup.require_credentials();
-            if let Ok(status) = self.setup.status() {
-                let _ = self.web_state.publish_setup_status(&status);
-            }
-            return Err(error);
+            return Err(self.rollback_setup_error(previous_configuration.as_deref(), true, error));
         }
-
-        match self.start_supervisor_for_setup() {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
-                let _ = self.secrets.remove(SecretKind::CallMeshApiKey);
-                let _ = self.stop_supervisor();
-                let _ = self.setup.require_credentials();
-                if let Ok(status) = self.setup.status() {
-                    let _ = self.web_state.publish_setup_status(&status);
-                }
-                return Err(SetupApplyError::SupervisorUnavailable);
-            }
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::Persistent,
+        )?;
+        if self.secrets.promote_callmesh_setup().is_err() {
+            return Err(self.rollback_setup_error(
+                previous_configuration.as_deref(),
+                true,
+                SetupApplyError::ConfigWriteFailed,
+            ));
         }
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::Persistent,
+        )?;
         let status = match self.setup.mark_ready(fence) {
             Ok(status) => status,
             Err(error) => {
-                let _ = self.secrets.remove(SecretKind::CallMeshApiKey);
-                let _ = self.stop_supervisor();
-                let _ = self.setup.require_credentials();
-                return Err(error.into());
+                return Err(self.rollback_setup_error(
+                    previous_configuration.as_deref(),
+                    true,
+                    error.into(),
+                ));
             }
         };
-        self.web_state
-            .publish_setup_status(&status)
-            .map_err(|_| SetupApplyError::Setup(SetupError::WriteFailed))?;
-        self.clear_error();
-        Ok(status)
+        match self.start_supervisor() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                let error = self.setup_supervisor_failure();
+                return Err(self.rollback_setup_error(
+                    previous_configuration.as_deref(),
+                    true,
+                    error,
+                ));
+            }
+        }
+        if self.complete_supervisor_setup_commit_start().is_err() {
+            return Err(self.rollback_setup_error(
+                previous_configuration.as_deref(),
+                true,
+                SetupApplyError::SupervisorUnavailable,
+            ));
+        }
+        self.check_setup_cancellation(
+            &cancellation,
+            previous_configuration.as_deref(),
+            SetupRollbackState::Persistent,
+        )?;
+        Ok(SetupPendingCommit {
+            controller: Arc::clone(self),
+            status,
+            previous_configuration,
+            committed: false,
+        })
+    }
+
+    fn check_setup_cancellation(
+        &self,
+        cancellation: &SetupCancellationToken,
+        previous_configuration: Option<&[u8]>,
+        state: SetupRollbackState,
+    ) -> Result<(), SetupApplyError> {
+        if !cancellation.is_cancelled() {
+            return Ok(());
+        }
+        match state {
+            SetupRollbackState::None => Err(SetupApplyError::Cancelled),
+            SetupRollbackState::JournalOnly => {
+                remove_setup_transaction(&self.setup_transaction_file)?;
+                Err(SetupApplyError::Cancelled)
+            }
+            SetupRollbackState::Validating => Err(self.rollback_setup_error(
+                previous_configuration,
+                false,
+                SetupApplyError::Cancelled,
+            )),
+            SetupRollbackState::Persistent => Err(self.rollback_setup_error(
+                previous_configuration,
+                true,
+                SetupApplyError::Cancelled,
+            )),
+        }
+    }
+
+    fn finish_setup_commit(&self, status: &SetupStatus) -> Result<(), SetupApplyError> {
+        // Keep the promoted secret transaction rollback-capable until every
+        // other fallible commit action has completed. A crash after removing
+        // the journal is still recoverable: Ready plus a promoted secret is
+        // finalized by startup recovery.
+        remove_setup_transaction(&self.setup_transaction_file)?;
+        self.secrets
+            .finalize_callmesh_setup()
+            .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        if self.web_state.publish_setup_status(status).is_err() {
+            self.remember_error_code("SETUP_STATUS_PUBLISH_FAILED");
+        } else {
+            self.clear_error();
+        }
+        Ok(())
+    }
+
+    fn setup_supervisor_failure(&self) -> SetupApplyError {
+        let code = self
+            .latest_error_code
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
+        match code.as_deref() {
+            Some("CALLMESH_CREDENTIAL_REJECTED") => SetupApplyError::CallMeshCredentialRejected,
+            Some("CALLMESH_UNAVAILABLE") => SetupApplyError::CallMeshUnavailable,
+            Some("SETUP_MESHTASTIC_UNREACHABLE") => SetupApplyError::EndpointUnreachable,
+            _ => SetupApplyError::SupervisorUnavailable,
+        }
+    }
+
+    fn prepare_supervisor_for_committed_setup(&self) -> Result<(), SetupApplyError> {
+        if !self
+            .stop_supervisor()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?
+        {
+            return Err(SetupApplyError::SupervisorUnavailable);
+        }
+        let _transition = self
+            .gateway_transition
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        let mut supervisor = self
+            .supervisor
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        let supervisor = supervisor
+            .as_mut()
+            .ok_or(SetupApplyError::SupervisorUnavailable)?;
+        if !matches!(supervisor.status(), GatewayStatus::Stopped) {
+            return Err(SetupApplyError::SupervisorUnavailable);
+        }
+        supervisor.set_environment(BTreeMap::from([
+            (
+                String::from(SETUP_VALIDATION_ONLY_ENVIRONMENT_NAME),
+                String::from("false"),
+            ),
+            (
+                String::from(SETUP_COMMIT_START_ENVIRONMENT_NAME),
+                String::from("true"),
+            ),
+            (
+                String::from("CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE"),
+                String::from("false"),
+            ),
+            (
+                String::from(PROXY_ENABLED_ENVIRONMENT_NAME),
+                String::from("false"),
+            ),
+        ]));
+        Ok(())
+    }
+
+    fn complete_supervisor_setup_commit_start(&self) -> Result<(), SetupApplyError> {
+        let mut supervisor = self
+            .supervisor
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        let supervisor = supervisor
+            .as_mut()
+            .ok_or(SetupApplyError::SupervisorUnavailable)?;
+        supervisor.set_environment(BTreeMap::from([(
+            String::from(SETUP_COMMIT_START_ENVIRONMENT_NAME),
+            String::from("false"),
+        )]));
+        Ok(())
+    }
+
+    fn rollback_setup_error(
+        &self,
+        previous_configuration: Option<&[u8]>,
+        restore_persistent_state: bool,
+        original: SetupApplyError,
+    ) -> SetupApplyError {
+        self.rollback_setup_attempt(previous_configuration, restore_persistent_state)
+            .err()
+            .unwrap_or(original)
+    }
+
+    fn rollback_setup_attempt(
+        &self,
+        previous_configuration: Option<&[u8]>,
+        restore_persistent_state: bool,
+    ) -> Result<(), SetupApplyError> {
+        let mut rollback_failed = self.stop_supervisor().is_err();
+        if let Ok(mut supervisor) = self.supervisor.lock() {
+            if let Some(supervisor) = supervisor.as_mut() {
+                supervisor.clear_callmesh_api_key();
+            }
+        } else {
+            rollback_failed = true;
+        }
+        if self.secrets.rollback_callmesh_setup().is_err() {
+            rollback_failed = true;
+        }
+        if restore_persistent_state
+            && restore_setup_configuration(&self.config_file, previous_configuration).is_err()
+        {
+            rollback_failed = true;
+        }
+        match self.setup.require_credentials() {
+            Ok(status) => {
+                if self.web_state.publish_setup_status(&status).is_err() {
+                    rollback_failed = true;
+                }
+            }
+            Err(_) => rollback_failed = true,
+        }
+        if !rollback_failed && remove_setup_transaction(&self.setup_transaction_file).is_err() {
+            rollback_failed = true;
+        }
+        if rollback_failed {
+            Err(SetupApplyError::ConfigWriteFailed)
+        } else {
+            Ok(())
+        }
     }
 
     fn configure_supervisor_for_setup(
@@ -1377,6 +1962,23 @@ impl AgentController {
         environment.insert(
             String::from("CMCLIENT_APRS_PORT"),
             DEFAULT_APRS_PORT.to_string(),
+        );
+        environment.insert(
+            String::from(SETUP_VALIDATION_ONLY_ENVIRONMENT_NAME),
+            String::from("true"),
+        );
+        environment.insert(
+            String::from(SETUP_COMMIT_START_ENVIRONMENT_NAME),
+            String::from("false"),
+        );
+        environment.insert(
+            String::from("CMCLIENT_MESHTASTIC_PHYSICAL_PROFILE"),
+            String::from("true"),
+        );
+        disable_proxy_for_setup(&mut environment);
+        environment.insert(
+            String::from("CMCLIENT_QUALIFICATION_STAGE"),
+            format!("setup-generation-{generation}"),
         );
         supervisor.set_environment(environment);
         supervisor
@@ -1569,9 +2171,15 @@ impl AgentController {
                     }
                 }
                 apply_aprs_environment(&mut environment, config.aprs.as_ref());
+                environment.insert(
+                    String::from(PROXY_ENABLED_ENVIRONMENT_NAME),
+                    String::from("false"),
+                );
                 if let Some(proxy) = &config.proxy {
-                    environment
-                        .insert(String::from("CMCLIENT_PROXY_ENABLED"), String::from("true"));
+                    environment.insert(
+                        String::from(PROXY_ENABLED_ENVIRONMENT_NAME),
+                        String::from("true"),
+                    );
                     environment.insert(String::from("CMCLIENT_PROXY_HOST"), proxy.host.clone());
                     environment.insert(String::from("CMCLIENT_PROXY_PORT"), proxy.port.to_string());
                     environment.insert(
@@ -1679,6 +2287,16 @@ impl AgentController {
         )?);
         updates.recover()?;
         let started_at = Instant::now();
+        let migrated_meshtastic =
+            config
+                .meshtastic
+                .as_ref()
+                .and_then(|meshtastic| match &meshtastic.connection {
+                    MeshtasticConnectionConfig::Tcp { host, port } => {
+                        MeshtasticCandidate::new(host.clone(), *port, DiscoverySource::Migrated)
+                    }
+                    MeshtasticConnectionConfig::Serial { .. } => None,
+                });
         let web_state = Arc::new(AgentWebState::new_with_log(
             Arc::clone(&updates),
             Arc::clone(&setup),
@@ -1700,6 +2318,7 @@ impl AgentController {
             },
             runtime_log.clone(),
             management_access.clone(),
+            migrated_meshtastic,
         )?);
         let management_web = if config.management_web_enabled {
             Some(
@@ -1732,6 +2351,7 @@ impl AgentController {
             identity,
             supervisor: Mutex::new(supervisor),
             gateway_transition: Mutex::new(()),
+            setup_transaction: Mutex::new(()),
             private_gateway_bootstrap: private_bootstrap,
             runtime_log,
             agent_log_error_code: Mutex::new(initial_agent_log_error_code),
@@ -1746,6 +2366,7 @@ impl AgentController {
             management_access,
             control_endpoint,
             config_file: config.config_file.clone(),
+            setup_transaction_file: setup_transaction_file(&config.paths),
             secrets,
             setup,
             setup_gate_required,
@@ -2125,6 +2746,33 @@ impl AgentController {
             .is_ok_and(|latest_error_code| latest_error_code.as_deref() == Some("SETUP_REQUIRED"))
     }
 
+    fn invalidate_persisted_callmesh_credential(&self) {
+        let Ok(_transaction) = self.setup_transaction.try_lock() else {
+            return;
+        };
+        self.gateway_session.clear();
+        let mut failed = self.secrets.remove(SecretKind::CallMeshApiKey).is_err();
+        match self.supervisor.lock() {
+            Ok(mut supervisor) => {
+                if let Some(supervisor) = supervisor.as_mut() {
+                    supervisor.clear_callmesh_api_key();
+                }
+            }
+            Err(_) => failed = true,
+        }
+        match self.setup.require_credentials() {
+            Ok(status) => {
+                if self.web_state.publish_setup_status(&status).is_err() {
+                    failed = true;
+                }
+            }
+            Err(_) => failed = true,
+        }
+        if failed {
+            self.remember_error_code("SETUP_CREDENTIAL_INVALIDATION_FAILED");
+        }
+    }
+
     fn stop_supervisor(&self) -> Result<bool, ControlError> {
         let _transition = self
             .gateway_transition
@@ -2197,7 +2845,25 @@ impl AgentController {
         self.apply_gateway_log_health(log_health);
         let event = result.map_err(|error| {
             self.gateway_session.clear();
-            self.remember_error_code(error.code());
+            let code = error.code();
+            self.remember_error_code(code);
+            if !allow_validating && code == "CALLMESH_CREDENTIAL_REJECTED" {
+                self.invalidate_persisted_callmesh_credential();
+            }
+            if allow_validating
+                && matches!(
+                    code,
+                    "CALLMESH_CREDENTIAL_REJECTED"
+                        | "CALLMESH_UNAVAILABLE"
+                        | "SETUP_MESHTASTIC_UNREACHABLE"
+                )
+            {
+                // Setup classification must not be masked by a secondary log
+                // sink failure while the private bootstrap is unwinding.
+                if let Ok(mut latest_error_code) = self.latest_error_code.lock() {
+                    *latest_error_code = Some(String::from(code));
+                }
+            }
             ControlError::CommandFailed
         })?;
         if self.private_gateway_bootstrap
@@ -2480,12 +3146,20 @@ impl ControlHandler for AgentController {
         ) {
             return Err(ControlError::SecretKindDeprecated);
         }
+        let _setup_transaction = (kind == ControlSecretKind::CallMeshApiKey)
+            .then(|| self.setup_transaction.try_lock())
+            .transpose()
+            .map_err(|_| ControlError::ResourceExhausted)?;
         self.secrets
             .store(secret_kind(kind), value)
             .map_err(control_secret_error)
     }
 
     fn remove_secret(&self, kind: ControlSecretKind) -> Result<bool, ControlError> {
+        let _setup_transaction = (kind == ControlSecretKind::CallMeshApiKey)
+            .then(|| self.setup_transaction.try_lock())
+            .transpose()
+            .map_err(|_| ControlError::ResourceExhausted)?;
         self.secrets
             .remove(secret_kind(kind))
             .map_err(control_secret_error)
@@ -3007,15 +3681,9 @@ const fn control_secret_error(error: SecretStoreError) -> ControlError {
     }
 }
 
-fn load_agent_config_after_migration() -> Result<AgentConfig, String> {
+fn load_agent_config_read_only() -> Result<AgentConfig, String> {
     let environment = env::vars().collect::<BTreeMap<_, _>>();
-    let paths =
-        RuntimePaths::from_environment(&environment).map_err(|error| String::from(error.code()))?;
-    let candidates = legacy_state_candidates(&environment);
-    let (program, gateway_entrypoint) = resolve_gateway_maintenance_program(&environment)?;
-    let maintenance = ChildGatewayMaintenanceRunner::new(program, gateway_entrypoint)
-        .map_err(|error| String::from(error.code()))?;
-    load_agent_config_after_migration_with(&environment, &paths, &candidates, &maintenance)
+    AgentConfig::from_environment(&environment).map_err(|error| String::from(error.code()))
 }
 
 fn load_agent_config_after_migration_with(
@@ -3026,6 +3694,10 @@ fn load_agent_config_after_migration_with(
 ) -> Result<AgentConfig, String> {
     migrate_detected_product_source_sets(paths.root_dir(), candidates, maintenance)
         .map_err(|error| String::from(error.code()))?;
+    let secrets =
+        AgentSecretStore::runtime(paths.root_dir()).map_err(|error| String::from(error.code()))?;
+    recover_interrupted_setup(paths, &paths.config_file(), &secrets)
+        .map_err(|_| String::from("SETUP_CONFIGURATION_WRITE_FAILED"))?;
     AgentConfig::from_environment(environment).map_err(|error| String::from(error.code()))
 }
 
@@ -3242,7 +3914,7 @@ fn main() -> ExitCode {
     match arguments.next().as_deref() {
         Some("--serve") => serve(),
         None | Some("--check-config") | Some("--check-instance") => {
-            match load_agent_config_after_migration() {
+            match load_agent_config_read_only() {
                 Ok(config) => {
                     if let Err(error) = ensure_runtime_directories(&config.paths) {
                         eprintln!("{}", error.code());
@@ -3287,21 +3959,49 @@ fn install_shutdown_signal_handler(controller: Arc<AgentController>) -> Result<(
 }
 
 fn serve() -> ExitCode {
-    let config = match load_agent_config_after_migration() {
-        Ok(config) => config,
+    let environment = env::vars().collect::<BTreeMap<_, _>>();
+    let paths = match RuntimePaths::from_environment(&environment) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("{}", error.code());
+            return ExitCode::from(EX_CONFIG);
+        }
+    };
+    if let Err(error) = ensure_runtime_directories(&paths) {
+        eprintln!("{}", error.code());
+        return ExitCode::from(EX_CONFIG);
+    }
+    let _lease = match AgentLease::acquire(&paths) {
+        Ok((lease, _)) => lease,
+        Err(error) => {
+            eprintln!("{}", error.code());
+            return ExitCode::from(EX_CONFIG);
+        }
+    };
+    let candidates = legacy_state_candidates(&environment);
+    let (program, gateway_entrypoint) = match resolve_gateway_maintenance_program(&environment) {
+        Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::from(EX_CONFIG);
         }
     };
-    if let Err(error) = ensure_runtime_directories(&config.paths) {
-        eprintln!("{}", error.code());
-        return ExitCode::from(EX_CONFIG);
-    }
-    let _lease = match AgentLease::acquire(&config.paths) {
-        Ok((lease, _)) => lease,
+    let maintenance = match ChildGatewayMaintenanceRunner::new(program, gateway_entrypoint) {
+        Ok(maintenance) => maintenance,
         Err(error) => {
             eprintln!("{}", error.code());
+            return ExitCode::from(EX_CONFIG);
+        }
+    };
+    let config = match load_agent_config_after_migration_with(
+        &environment,
+        &paths,
+        &candidates,
+        &maintenance,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}");
             return ExitCode::from(EX_CONFIG);
         }
     };
@@ -3326,7 +4026,7 @@ fn serve() -> ExitCode {
         }
     };
     let control_handler: Arc<dyn ControlHandler> = controller.clone();
-    let server = match ControlServer::bind(endpoint, control_handler) {
+    let server = match ControlServer::bind(endpoint.clone(), control_handler) {
         Ok(server) => server,
         Err(error) => {
             controller.remember_error(&error);
@@ -3347,6 +4047,7 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
+    let mut agent_tray = tray::AgentTray::start(endpoint, config.paths.desktop_process_file());
     let serve_error = loop {
         if controller.is_shutdown_requested() {
             break None;
@@ -3358,6 +4059,7 @@ fn serve() -> ExitCode {
         }
     };
     drop(server);
+    agent_tray.stop();
     let shutdown_error = shutdown_agent_runtime(&controller, &mut supervisor_worker).err();
     if let Some(error) = &serve_error {
         controller.remember_error(error);
@@ -3418,15 +4120,17 @@ mod tests {
         AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState, ControlCommand,
         ControlHandler, GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle,
         InternalComponent, LogLevel, LogPolicy, ManagementWebConfig, ManagementWebError,
-        ManagementWebService, SecretKind, SetupApplyError, SetupConfigureRequest, SetupError,
-        SetupStore, StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
+        ManagementWebService, SecretKind, SetupApplyError, SetupCancellationToken,
+        SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState, SetupStore,
+        StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
         apply_physical_qualification_environment, bridge_gateway_event_stream,
-        compiled_component_identity, gateway_json_projection, legacy_state_candidates,
-        load_agent_config_after_migration_with, management_agent_events, management_web_profile,
-        normalize_runtime_process_path, push_legacy_source_candidate,
-        resolve_gateway_maintenance_program, setup_error_response,
-        setup_gate_required_with_profile, validate_setup_request, verified_gateway_route,
-        write_setup_configuration,
+        compiled_component_identity, disable_proxy_for_setup, gateway_json_projection,
+        legacy_state_candidates, load_agent_config_after_migration_with, management_agent_events,
+        management_web_profile, normalize_runtime_process_path, push_legacy_source_candidate,
+        recover_interrupted_setup, remove_setup_transaction, resolve_gateway_maintenance_program,
+        setup_apply_error_response, setup_error_response, setup_gate_required_with_profile,
+        setup_transaction_file, validate_setup_request, verified_gateway_route,
+        write_setup_configuration, write_setup_transaction,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -3466,7 +4170,10 @@ mod tests {
         collections::BTreeMap,
         io::{Read, Write},
         path::Path,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -3475,17 +4182,23 @@ mod tests {
         io::Cursor,
         net::{TcpListener, TcpStream},
         path::PathBuf,
-        sync::{
-            Mutex,
-            atomic::{AtomicUsize, Ordering},
-            mpsc,
-        },
+        sync::{Mutex, atomic::AtomicUsize, mpsc},
     };
 
     #[test]
     #[ignore = "child-process fixture"]
     fn long_running_gateway_fixture() {
         thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn setup_callmesh_failure_responses_use_stable_retry_semantics() {
+        let rejected = setup_apply_error_response(SetupApplyError::CallMeshCredentialRejected);
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        let unavailable = setup_apply_error_response(SetupApplyError::CallMeshUnavailable);
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let cancelled = setup_apply_error_response(SetupApplyError::Cancelled);
+        assert_eq!(cancelled.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -3557,6 +4270,771 @@ mod tests {
         std::fs::remove_dir_all(root).expect("setup config fixture should clean up");
     }
 
+    fn setup_rollback_fixture(
+        name: &str,
+        secrets: AgentSecretStore,
+    ) -> (std::path::PathBuf, AgentController) {
+        let sequence = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should follow epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cmclient-agent-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("setup rollback root should create");
+        std::fs::create_dir_all(root.join("config"))
+            .expect("setup rollback config directory should create");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: root.clone(),
+                config_dir: root.join("config"),
+                cache_dir: root.join("cache"),
+                log_dir: root.join("logs"),
+            },
+            config_file: root.join("config/agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
+            gateway_command: None,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let setup = SetupStore::open(&config.paths).expect("setup store should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        drop(setup);
+        let controller =
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize");
+        (root, controller)
+    }
+
+    #[test]
+    fn setup_cancellation_before_first_durable_write_leaves_no_transaction_state() {
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous secret should store");
+        let (root, controller) =
+            setup_rollback_fixture("setup-cancel-pre-durable", secrets.clone());
+        let config_file = root.join("config/agent.toml");
+        let previous_configuration = b"[agent]\nmanagement_web_enabled = false\n";
+        std::fs::write(&config_file, previous_configuration).expect("previous config should store");
+        let cancellation = SetupCancellationToken::default();
+        cancellation.cancel();
+
+        assert_eq!(
+            controller.check_setup_cancellation(
+                &cancellation,
+                Some(previous_configuration),
+                SetupRollbackState::None,
+            ),
+            Err(SetupApplyError::Cancelled),
+        );
+        assert_eq!(
+            std::fs::read(&config_file).expect("previous config should remain readable"),
+            previous_configuration,
+        );
+        assert_eq!(
+            secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("previous secret should remain readable")
+                .expect("previous secret should remain present")
+                .expose_secret(),
+            "fixture-previous-key",
+        );
+        assert_eq!(
+            controller
+                .setup
+                .status()
+                .expect("setup status should read")
+                .phase,
+            SetupPhase::CredentialsRequired,
+        );
+        assert!(!controller.setup_transaction_file.exists());
+
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("setup cancellation fixture should clean up");
+    }
+
+    #[test]
+    fn setup_cancellation_after_persistent_mutation_rolls_back_config_secret_and_ready() {
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous secret should store");
+        let (root, controller) = setup_rollback_fixture("setup-cancel-persistent", secrets.clone());
+        let config_file = root.join("config/agent.toml");
+        let previous_configuration = b"[agent]\nmanagement_web_enabled = false\n";
+        std::fs::write(&config_file, previous_configuration).expect("previous config should store");
+        let generation = controller
+            .setup
+            .generation()
+            .expect("setup generation should read")
+            .generation();
+        write_setup_transaction(
+            &controller.setup_transaction_file,
+            generation,
+            Some(previous_configuration),
+        )
+        .expect("setup transaction should store");
+        let fence = controller
+            .setup
+            .begin_validation()
+            .expect("validation should begin");
+        secrets
+            .stage_callmesh_setup("fixture-replacement-key")
+            .expect("replacement secret should stage");
+        write_setup_configuration(
+            &config_file,
+            "172.16.8.88",
+            4_403,
+            "replacement-network",
+            "replacement-gateway",
+        )
+        .expect("replacement config should store");
+        secrets
+            .promote_callmesh_setup()
+            .expect("replacement secret should promote");
+        controller
+            .setup
+            .mark_ready(fence)
+            .expect("ready marker should store");
+        let cancellation = SetupCancellationToken::default();
+        cancellation.cancel();
+
+        assert_eq!(
+            controller.check_setup_cancellation(
+                &cancellation,
+                Some(previous_configuration),
+                SetupRollbackState::Persistent,
+            ),
+            Err(SetupApplyError::Cancelled),
+        );
+        assert_eq!(
+            std::fs::read(&config_file).expect("restored config should read"),
+            previous_configuration,
+        );
+        assert_eq!(
+            secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("restored secret should read")
+                .expect("restored secret should be present")
+                .expose_secret(),
+            "fixture-previous-key",
+        );
+        let status = controller.setup.status().expect("setup status should read");
+        assert_eq!(status.phase, SetupPhase::CredentialsRequired);
+        assert!(status.setup_required);
+        assert!(!controller.setup_transaction_file.exists());
+
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("setup cancellation fixture should clean up");
+    }
+
+    fn prepare_pending_setup_commit(
+        name: &str,
+        secrets: AgentSecretStore,
+    ) -> (
+        std::path::PathBuf,
+        Arc<AgentController>,
+        super::SetupPendingCommit,
+        Vec<u8>,
+    ) {
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous secret should store");
+        let (root, controller) = setup_rollback_fixture(name, secrets.clone());
+        let controller = Arc::new(controller);
+        let previous_configuration = b"[agent]\nmanagement_web_enabled = false\n".to_vec();
+        std::fs::write(&controller.config_file, &previous_configuration)
+            .expect("previous config should store");
+        let generation = controller
+            .setup
+            .generation()
+            .expect("setup generation should read")
+            .generation();
+        write_setup_transaction(
+            &controller.setup_transaction_file,
+            generation,
+            Some(&previous_configuration),
+        )
+        .expect("setup transaction should store");
+        let fence = controller
+            .setup
+            .begin_validation()
+            .expect("validation should begin");
+        secrets
+            .stage_callmesh_setup("fixture-replacement-key")
+            .expect("replacement secret should stage");
+        write_setup_configuration(
+            &controller.config_file,
+            "172.16.8.88",
+            4_403,
+            "replacement-network",
+            "replacement-gateway",
+        )
+        .expect("replacement config should store");
+        secrets
+            .promote_callmesh_setup()
+            .expect("replacement secret should promote");
+        let status = controller
+            .setup
+            .mark_ready(fence)
+            .expect("ready marker should store");
+        let pending = super::SetupPendingCommit {
+            controller: Arc::clone(&controller),
+            status,
+            previous_configuration: Some(previous_configuration.clone()),
+            committed: false,
+        };
+        (root, controller, pending, previous_configuration)
+    }
+
+    fn assert_pending_setup_rolled_back(
+        controller: &AgentController,
+        secrets: &AgentSecretStore,
+        previous_configuration: &[u8],
+    ) {
+        assert_eq!(
+            std::fs::read(&controller.config_file).expect("restored config should read"),
+            previous_configuration,
+        );
+        assert_eq!(
+            secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("restored secret should read")
+                .expect("restored secret should exist")
+                .expose_secret(),
+            "fixture-previous-key",
+        );
+        let status = controller.setup.status().expect("setup status should read");
+        assert_eq!(status.phase, SetupPhase::CredentialsRequired);
+        assert!(status.setup_required);
+    }
+
+    #[test]
+    fn setup_finalize_failure_rolls_back_before_ready_response() {
+        let secrets = AgentSecretStore::memory_with_finalize_failure_once();
+        let (root, controller, pending, previous_configuration) =
+            prepare_pending_setup_commit("setup-finalize-failure", secrets.clone());
+
+        assert_eq!(pending.commit(), Err(SetupApplyError::ConfigWriteFailed),);
+        assert_pending_setup_rolled_back(&controller, &secrets, &previous_configuration);
+        assert!(!controller.setup_transaction_file.exists());
+
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("finalize failure fixture should clean up");
+    }
+
+    #[test]
+    fn setup_journal_cleanup_failure_rolls_back_before_ready_response() {
+        let secrets = AgentSecretStore::memory();
+        let (root, controller, pending, previous_configuration) =
+            prepare_pending_setup_commit("setup-journal-cleanup-failure", secrets.clone());
+        std::fs::remove_file(&controller.setup_transaction_file)
+            .expect("journal fixture file should remove");
+        std::fs::create_dir(&controller.setup_transaction_file)
+            .expect("journal fixture directory should create");
+
+        assert_eq!(pending.commit(), Err(SetupApplyError::ConfigWriteFailed),);
+        assert_pending_setup_rolled_back(&controller, &secrets, &previous_configuration);
+
+        std::fs::remove_dir(&controller.setup_transaction_file)
+            .expect("failed journal fixture should remove");
+        let generation = controller
+            .setup
+            .generation()
+            .expect("retry generation should read")
+            .generation();
+        write_setup_transaction(
+            &controller.setup_transaction_file,
+            generation,
+            Some(&previous_configuration),
+        )
+        .expect("setup should be retryable after storage recovers");
+        remove_setup_transaction(&controller.setup_transaction_file)
+            .expect("retry journal should clean up");
+
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("journal failure fixture should clean up");
+    }
+
+    #[test]
+    fn setup_auth_failures_do_not_mutate_persistent_state_or_reach_ready() {
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous secret should store");
+        let (root, controller) = setup_rollback_fixture("setup-auth-rollback", secrets.clone());
+        let config_file = root.join("config/agent.toml");
+        let previous_configuration = b"[agent]\nmanagement_web_enabled = false\n";
+        std::fs::write(&config_file, previous_configuration).expect("previous config should store");
+        for failure in [
+            SetupApplyError::CallMeshCredentialRejected,
+            SetupApplyError::CallMeshUnavailable,
+        ] {
+            controller
+                .setup
+                .begin_validation()
+                .expect("validation should begin");
+            assert_eq!(
+                controller.rollback_setup_error(Some(previous_configuration), false, failure,),
+                failure,
+                "successful pre-commit rollback must preserve the authentication classification",
+            );
+            assert_eq!(
+                std::fs::read(&config_file).expect("previous config should remain readable"),
+                previous_configuration,
+            );
+            assert_eq!(
+                secrets
+                    .read(SecretKind::CallMeshApiKey)
+                    .expect("previous secret should remain readable")
+                    .expect("previous secret should remain present")
+                    .expose_secret(),
+                "fixture-previous-key",
+            );
+            let status = controller.setup.status().expect("setup status should read");
+            assert_eq!(status.phase, SetupPhase::CredentialsRequired);
+            assert!(status.setup_required);
+        }
+
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("setup rollback fixture should clean up");
+    }
+
+    #[test]
+    fn setup_post_validation_failure_restores_config_and_secret_before_retry() {
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous secret should store");
+        let (root, controller) =
+            setup_rollback_fixture("setup-post-validation-rollback", secrets.clone());
+        let config_file = root.join("config/agent.toml");
+        let previous_configuration = b"[agent]\nmanagement_web_enabled = false\n";
+        std::fs::write(&config_file, previous_configuration).expect("previous config should store");
+        controller
+            .setup
+            .begin_validation()
+            .expect("validation should begin");
+
+        write_setup_configuration(
+            &config_file,
+            "172.16.8.88",
+            4_403,
+            "replacement-network",
+            "replacement-gateway",
+        )
+        .expect("replacement config should store");
+        secrets
+            .stage_callmesh_setup("fixture-replacement-key")
+            .expect("replacement secret should stage");
+        secrets
+            .promote_callmesh_setup()
+            .expect("replacement secret should promote");
+
+        assert_eq!(
+            controller.rollback_setup_error(
+                Some(previous_configuration),
+                true,
+                SetupApplyError::SupervisorUnavailable,
+            ),
+            SetupApplyError::SupervisorUnavailable,
+        );
+        assert_eq!(
+            std::fs::read(&config_file).expect("restored config should read"),
+            previous_configuration,
+        );
+        assert_eq!(
+            secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("restored secret should read")
+                .expect("restored secret should be present")
+                .expose_secret(),
+            "fixture-previous-key",
+        );
+        let status = controller.setup.status().expect("setup status should read");
+        assert_eq!(status.phase, SetupPhase::CredentialsRequired);
+        assert!(status.setup_required);
+
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("setup rollback fixture should clean up");
+    }
+
+    #[test]
+    fn setup_post_validation_failure_removes_new_config_and_secret() {
+        let secrets = AgentSecretStore::memory();
+        let (root, controller) =
+            setup_rollback_fixture("setup-post-validation-cleanup", secrets.clone());
+        let config_file = root.join("config/agent.toml");
+        controller
+            .setup
+            .begin_validation()
+            .expect("validation should begin");
+        write_setup_configuration(
+            &config_file,
+            "172.16.8.88",
+            4_403,
+            "default",
+            "cmclient-gateway",
+        )
+        .expect("new config should store");
+        secrets
+            .stage_callmesh_setup("fixture-new-key")
+            .expect("new secret should stage");
+        secrets
+            .promote_callmesh_setup()
+            .expect("new secret should promote");
+
+        assert_eq!(
+            controller.rollback_setup_error(None, true, SetupApplyError::SupervisorUnavailable,),
+            SetupApplyError::SupervisorUnavailable,
+        );
+        assert!(
+            !config_file.exists(),
+            "new config must be removed on rollback"
+        );
+        assert!(
+            secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("secret backend should remain readable")
+                .is_none(),
+            "new secret must be removed on rollback",
+        );
+        let status = controller.setup.status().expect("setup status should read");
+        assert_eq!(status.phase, SetupPhase::CredentialsRequired);
+        assert!(status.setup_required);
+
+        drop(controller);
+        std::fs::remove_dir_all(root).expect("setup rollback fixture should clean up");
+    }
+
+    fn setup_crash_fixture(name: &str) -> (std::path::PathBuf, RuntimePaths) {
+        let sequence = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should follow epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cmclient-agent-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        let paths = RuntimePaths {
+            data_dir: root.clone(),
+            config_dir: root.clone(),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+        };
+        (root, paths)
+    }
+
+    #[test]
+    fn setup_crash_during_validating_reopens_and_restores_prior_state() {
+        let (root, paths) = setup_crash_fixture("setup-validating-crash");
+        let config_file = paths.config_file();
+        let previous_configuration = b"[agent]\nmanagement_web_enabled = false\n";
+        std::fs::create_dir_all(&root).expect("crash fixture root should create");
+        std::fs::write(&config_file, previous_configuration).expect("previous config should store");
+        let setup = SetupStore::open(&paths).expect("setup store should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let generation = setup
+            .generation()
+            .expect("setup generation should read")
+            .generation();
+        let transaction_file = setup_transaction_file(&paths);
+        write_setup_transaction(&transaction_file, generation, Some(previous_configuration))
+            .expect("setup transaction should store");
+        setup.begin_validation().expect("validation should begin");
+        let secrets = AgentSecretStore::runtime(&root).expect("secret store should initialize");
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous key should store");
+        secrets
+            .stage_callmesh_setup("fixture-candidate-key")
+            .expect("candidate key should stage");
+        secrets
+            .promote_callmesh_setup()
+            .expect("candidate key should promote before crash");
+        write_setup_configuration(
+            &config_file,
+            "172.16.8.88",
+            4_403,
+            "replacement-network",
+            "replacement-gateway",
+        )
+        .expect("replacement config should store");
+        let journal = std::fs::read_to_string(&transaction_file)
+            .expect("non-secret setup journal should read");
+        assert!(!journal.contains("fixture-previous-key"));
+        assert!(!journal.contains("fixture-candidate-key"));
+        drop(setup);
+        drop(secrets);
+
+        let reopened_secrets =
+            AgentSecretStore::runtime(&root).expect("secret store should reopen");
+        recover_interrupted_setup(&paths, &config_file, &reopened_secrets)
+            .expect("interrupted validation should recover");
+
+        assert_eq!(
+            std::fs::read(&config_file).expect("restored config should read"),
+            previous_configuration,
+        );
+        assert_eq!(
+            reopened_secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("restored key should read")
+                .expect("restored key should exist")
+                .expose_secret(),
+            "fixture-previous-key",
+        );
+        let reopened_setup = SetupStore::open(&paths).expect("setup store should reopen");
+        let status = reopened_setup.status().expect("setup status should read");
+        assert_eq!(status.phase, SetupPhase::CredentialsRequired);
+        assert!(status.setup_required);
+        assert!(!transaction_file.exists());
+        std::fs::remove_dir_all(root).expect("crash fixture should clean up");
+    }
+
+    #[test]
+    fn setup_crash_before_secret_stage_reopens_as_credentials_required() {
+        let (root, paths) = setup_crash_fixture("setup-pre-secret-crash");
+        let config_file = paths.config_file();
+        let setup = SetupStore::open(&paths).expect("setup store should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let generation = setup
+            .generation()
+            .expect("setup generation should read")
+            .generation();
+        let transaction_file = setup_transaction_file(&paths);
+        write_setup_transaction(&transaction_file, generation, None)
+            .expect("setup transaction should store");
+        setup.begin_validation().expect("validation should begin");
+        drop(setup);
+
+        let reopened_secrets =
+            AgentSecretStore::runtime(&root).expect("secret store should reopen");
+        recover_interrupted_setup(&paths, &config_file, &reopened_secrets)
+            .expect("pre-secret crash should recover");
+        let reopened_setup = SetupStore::open(&paths).expect("setup store should reopen");
+        assert_eq!(
+            reopened_setup
+                .status()
+                .expect("setup status should read")
+                .phase,
+            SetupPhase::CredentialsRequired,
+        );
+        assert!(!config_file.exists());
+        assert!(!transaction_file.exists());
+        std::fs::remove_dir_all(root).expect("crash fixture should clean up");
+    }
+
+    #[test]
+    fn setup_ready_commit_marker_finishes_staged_secret_after_restart() {
+        let (root, paths) = setup_crash_fixture("setup-ready-staged-crash");
+        let config_file = paths.config_file();
+        let setup = SetupStore::open(&paths).expect("setup store should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let generation = setup
+            .generation()
+            .expect("setup generation should read")
+            .generation();
+        let transaction_file = setup_transaction_file(&paths);
+        write_setup_transaction(&transaction_file, generation, None)
+            .expect("setup transaction should store");
+        let fence = setup.begin_validation().expect("validation should begin");
+        let secrets = AgentSecretStore::runtime(&root).expect("secret store should initialize");
+        secrets
+            .stage_callmesh_setup("fixture-committed-key")
+            .expect("candidate key should stage");
+        write_setup_configuration(
+            &config_file,
+            "172.16.8.88",
+            4_403,
+            "committed-network",
+            "committed-gateway",
+        )
+        .expect("committed config should store");
+        setup.mark_ready(fence).expect("ready marker should commit");
+        drop(setup);
+        drop(secrets);
+
+        let reopened_secrets =
+            AgentSecretStore::runtime(&root).expect("secret store should reopen");
+        recover_interrupted_setup(&paths, &config_file, &reopened_secrets)
+            .expect("ready setup should finish committing");
+        assert_eq!(
+            reopened_secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("committed key should read")
+                .expect("committed key should exist")
+                .expose_secret(),
+            "fixture-committed-key",
+        );
+        assert_eq!(
+            SetupStore::open(&paths)
+                .expect("setup store should reopen")
+                .status()
+                .expect("setup status should read")
+                .phase,
+            SetupPhase::Ready,
+        );
+        assert!(!transaction_file.exists());
+        std::fs::remove_dir_all(root).expect("crash fixture should clean up");
+    }
+
+    #[test]
+    fn newer_reset_generation_wins_while_old_transaction_rolls_back() {
+        let (root, paths) = setup_crash_fixture("setup-reset-generation-crash");
+        let config_file = paths.config_file();
+        let previous_configuration = b"[agent]\nmanagement_web_enabled = false\n";
+        std::fs::create_dir_all(&root).expect("crash fixture root should create");
+        std::fs::write(&config_file, previous_configuration).expect("previous config should store");
+        let setup = SetupStore::open(&paths).expect("setup store should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let generation = setup
+            .generation()
+            .expect("setup generation should read")
+            .generation();
+        let transaction_file = setup_transaction_file(&paths);
+        write_setup_transaction(&transaction_file, generation, Some(previous_configuration))
+            .expect("setup transaction should store");
+        setup.begin_validation().expect("validation should begin");
+        let secrets = AgentSecretStore::runtime(&root).expect("secret store should initialize");
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous key should store");
+        secrets
+            .stage_callmesh_setup("fixture-candidate-key")
+            .expect("candidate key should stage");
+        write_setup_configuration(
+            &config_file,
+            "172.16.8.88",
+            4_403,
+            "replacement-network",
+            "replacement-gateway",
+        )
+        .expect("replacement config should store");
+        setup
+            .reset()
+            .expect("newer reset should advance generation");
+        drop(setup);
+        drop(secrets);
+
+        let reopened_secrets =
+            AgentSecretStore::runtime(&root).expect("secret store should reopen");
+        recover_interrupted_setup(&paths, &config_file, &reopened_secrets)
+            .expect("older transaction should rollback without undoing reset");
+        assert_eq!(
+            std::fs::read(&config_file).expect("restored config should read"),
+            previous_configuration,
+        );
+        assert_eq!(
+            reopened_secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("restored key should read")
+                .expect("restored key should exist")
+                .expose_secret(),
+            "fixture-previous-key",
+        );
+        assert_eq!(
+            SetupStore::open(&paths)
+                .expect("setup store should reopen")
+                .status()
+                .expect("setup status should read")
+                .phase,
+            SetupPhase::TermsRequired,
+        );
+        assert!(!transaction_file.exists());
+        std::fs::remove_dir_all(root).expect("crash fixture should clean up");
+    }
+
+    #[test]
+    fn setup_crash_after_secret_finalize_reopens_as_committed_ready() {
+        let (root, paths) = setup_crash_fixture("setup-committed-crash");
+        let config_file = paths.config_file();
+        let previous_configuration = b"[agent]\nmanagement_web_enabled = false\n";
+        std::fs::create_dir_all(&root).expect("crash fixture root should create");
+        std::fs::write(&config_file, previous_configuration).expect("previous config should store");
+        let setup = SetupStore::open(&paths).expect("setup store should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let generation = setup
+            .generation()
+            .expect("setup generation should read")
+            .generation();
+        let transaction_file = setup_transaction_file(&paths);
+        write_setup_transaction(&transaction_file, generation, Some(previous_configuration))
+            .expect("setup transaction should store");
+        let fence = setup.begin_validation().expect("validation should begin");
+        let secrets = AgentSecretStore::runtime(&root).expect("secret store should initialize");
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous key should store");
+        secrets
+            .stage_callmesh_setup("fixture-committed-key")
+            .expect("candidate key should stage");
+        write_setup_configuration(
+            &config_file,
+            "172.16.8.88",
+            4_403,
+            "committed-network",
+            "committed-gateway",
+        )
+        .expect("committed config should store");
+        secrets
+            .promote_callmesh_setup()
+            .expect("candidate key should promote");
+        setup.mark_ready(fence).expect("setup should become ready");
+        secrets
+            .finalize_callmesh_setup()
+            .expect("candidate key should finalize");
+        let committed_configuration =
+            std::fs::read(&config_file).expect("committed config should read");
+        drop(setup);
+        drop(secrets);
+
+        let reopened_secrets =
+            AgentSecretStore::runtime(&root).expect("secret store should reopen");
+        recover_interrupted_setup(&paths, &config_file, &reopened_secrets)
+            .expect("committed setup cleanup should recover");
+        assert_eq!(
+            std::fs::read(&config_file).expect("committed config should remain readable"),
+            committed_configuration,
+        );
+        assert_eq!(
+            reopened_secrets
+                .read(SecretKind::CallMeshApiKey)
+                .expect("committed key should read")
+                .expect("committed key should exist")
+                .expose_secret(),
+            "fixture-committed-key",
+        );
+        assert_eq!(
+            SetupStore::open(&paths)
+                .expect("setup store should reopen")
+                .status()
+                .expect("setup status should read")
+                .phase,
+            SetupPhase::Ready,
+        );
+        assert!(!transaction_file.exists());
+        std::fs::remove_dir_all(root).expect("crash fixture should clean up");
+    }
+
     fn test_agent_web_state(directory: &Path) -> Arc<AgentWebState> {
         let paths = RuntimePaths {
             data_dir: directory.to_path_buf(),
@@ -3584,6 +5062,75 @@ mod tests {
             )
             .expect("Agent Web state should initialize"),
         )
+    }
+
+    #[tokio::test]
+    async fn aborted_setup_http_request_cancels_spawn_blocking_transaction() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-setup-http-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let state = test_agent_web_state(&directory);
+        let started = Arc::new(AtomicBool::new(false));
+        let cancellation_observed = Arc::new(AtomicBool::new(false));
+        let handler_started = Arc::clone(&started);
+        let handler_observed = Arc::clone(&cancellation_observed);
+        state
+            .install_setup_apply(Arc::new(move |_request, cancellation| {
+                handler_started.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancellation.is_cancelled() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                handler_observed.store(cancellation.is_cancelled(), Ordering::Release);
+                Err(SetupApplyError::Cancelled)
+            }))
+            .expect("setup apply handler should install");
+        let router = agent_web_router(Arc::clone(&state));
+        let request = tokio::spawn(async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/setup/configure")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"meshtasticHost":"127.0.0.1","meshtasticPort":4403,"meshNetworkId":"default","gatewayId":"cmclient-gateway","callmeshApiKey":"fixture-key"}"#,
+                        ))
+                        .expect("setup request should build"),
+                )
+                .await
+        });
+        let start_deadline = Instant::now() + Duration::from_secs(2);
+        while !started.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < start_deadline,
+                "spawn-blocking setup handler should start",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        request.abort();
+        let _ = request.await;
+
+        let cancellation_deadline = Instant::now() + Duration::from_secs(2);
+        while !cancellation_observed.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < cancellation_deadline,
+                "aborted HTTP handler should cancel its blocking setup transaction",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            state
+                .setup
+                .status()
+                .expect("setup status should read")
+                .phase,
+            SetupPhase::TermsRequired,
+        );
+        drop(state);
+        std::fs::remove_dir_all(directory).expect("setup HTTP fixture should clean up");
     }
 
     struct NoDatabaseMaintenance;
@@ -4458,6 +6005,21 @@ mod tests {
     }
 
     #[test]
+    fn setup_environment_disables_a_stale_proxy_flag() {
+        let mut environment =
+            BTreeMap::from([(String::from("CMCLIENT_PROXY_ENABLED"), String::from("true"))]);
+
+        disable_proxy_for_setup(&mut environment);
+
+        assert_eq!(
+            environment
+                .get("CMCLIENT_PROXY_ENABLED")
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
     fn physical_qualification_environment_is_explicit_and_bounded() {
         let mut environment = BTreeMap::new();
         apply_physical_qualification_environment(
@@ -4540,6 +6102,70 @@ mod tests {
                 .expect("secret backend should remain readable")
                 .is_none()
         );
+
+        drop(controller);
+        std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn setup_transaction_fences_concurrent_callmesh_secret_mutation() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-setup-secret-fence-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "original-fixture-key")
+            .expect("fixture key should store");
+        let config = AgentConfig {
+            paths: RuntimePaths {
+                data_dir: directory.clone(),
+                config_dir: directory.clone(),
+                cache_dir: directory.join("cache"),
+                log_dir: directory.join("logs"),
+            },
+            config_file: directory.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
+            gateway_command: None,
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = AgentController::from_config_with_secrets(&config, secrets.clone())
+            .expect("controller should initialize");
+
+        let setup_guard = controller
+            .setup_transaction
+            .lock()
+            .expect("setup transaction should lock");
+        assert_eq!(
+            controller.store_secret(ControlSecretKind::CallMeshApiKey, "racing-key"),
+            Err(ControlError::ResourceExhausted),
+        );
+        assert_eq!(
+            controller.remove_secret(ControlSecretKind::CallMeshApiKey),
+            Err(ControlError::ResourceExhausted),
+        );
+        let original = secrets
+            .read(SecretKind::CallMeshApiKey)
+            .expect("fixture key should remain readable")
+            .expect("fixture key should remain present");
+        assert_eq!(original.expose_secret(), "original-fixture-key");
+        drop(setup_guard);
+
+        controller
+            .store_secret(ControlSecretKind::CallMeshApiKey, "replacement-fixture-key")
+            .expect("secret mutation should resume after setup transaction");
+        let replacement = secrets
+            .read(SecretKind::CallMeshApiKey)
+            .expect("replacement key should remain readable")
+            .expect("replacement key should remain present");
+        assert_eq!(replacement.expose_secret(), "replacement-fixture-key");
 
         drop(controller);
         std::fs::remove_dir_all(directory).expect("temporary directory should be removed");

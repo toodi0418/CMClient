@@ -8,6 +8,8 @@ const STABLE_ERROR_CODE = "^[A-Z][A-Z0-9_]{0,127}$";
 const SETUP_REASON_CODE = "^SETUP_[A-Z0-9_]{1,121}$";
 const TERMS_VERSION = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
 
+export const CURRENT_TERMS_VERSION = "cmclient-2.0-terms-v1" as const;
+
 export const SETUP_PHASES = [
   "uninitialized",
   "terms_required",
@@ -16,6 +18,35 @@ export const SETUP_PHASES = [
   "ready",
   "recovery_required",
 ] as const;
+
+export const SETUP_ERROR_CODES = [
+  "CALLMESH_CREDENTIAL_REJECTED",
+  "CALLMESH_UNAVAILABLE",
+  "SETUP_CONFIGURATION_INVALID",
+  "SETUP_CONFIGURATION_WRITE_FAILED",
+  "SETUP_DISCOVERY_BUSY",
+  "SETUP_DISCOVERY_CONFIGURATION_INVALID",
+  "SETUP_GENERATION_EXHAUSTED",
+  "SETUP_GENERATION_STALE",
+  "SETUP_MDNS_FAILED",
+  "SETUP_MDNS_UNAVAILABLE",
+  "SETUP_MESHTASTIC_UNREACHABLE",
+  "SETUP_REQUEST_INVALID",
+  "SETUP_RESET_CONFIRMATION_INVALID",
+  "SETUP_STATE_INVALID",
+  "SETUP_STATE_PATH_INVALID",
+  "SETUP_STATE_READ_FAILED",
+  "SETUP_STATE_TRANSITION_INVALID",
+  "SETUP_STATE_WRITE_FAILED",
+  "SETUP_SUPERVISOR_UNAVAILABLE",
+  "SETUP_TRANSACTION_CANCELLED",
+  "SETUP_TRANSACTION_UNAVAILABLE",
+] as const;
+
+export const SetupErrorCodeSchema = Type.Union(
+  SETUP_ERROR_CODES.map((code) => Type.Literal(code)),
+  { $id: "SetupErrorCode" },
+);
 
 export const AGENT_GATEWAY_LIFECYCLE_STATES = [
   "stopped",
@@ -51,6 +82,7 @@ function setupStatusVariant(
   return Type.Object(
     {
       schemaVersion: Type.Literal(1),
+      currentTermsVersion: Type.Literal(CURRENT_TERMS_VERSION),
       phase: Type.Literal(phase),
       setupRequired: Type.Literal(!flags.ready),
       termsRequired: Type.Literal(flags.termsRequired),
@@ -255,6 +287,7 @@ export const AgentEventSchema = Type.Union(
 
 export const AGENT_CONTRACT_SCHEMAS: readonly TSchema[] = [
   SetupPhaseSchema,
+  SetupErrorCodeSchema,
   SetupStatusSchema,
   SetupAcceptTermsRequestSchema,
   SetupResetRequestSchema,

@@ -61,6 +61,7 @@ describe("Gateway OpenAPI contract", () => {
       "SetupAcceptTermsRequest",
       "SetupConfigureRequest",
       "SetupDiscoveryResponse",
+      "SetupErrorCode",
       "SetupPhase",
       "SetupResetRequest",
       "SetupStatus",
@@ -80,6 +81,28 @@ describe("Gateway OpenAPI contract", () => {
         },
       },
     });
+    expect(document.paths["/api/v1/setup/configure"]).toMatchObject({
+      post: {
+        "x-cmclient-error-schema": {
+          $ref: "#/components/schemas/SetupErrorCode",
+        },
+        responses: {
+          "401": {
+            content: {
+              "application/json": {},
+            },
+          },
+          "408": {
+            content: {
+              "application/json": {},
+            },
+          },
+        },
+      },
+    });
+    expect(
+      JSON.stringify(document.components?.schemas?.SetupDiscoveryResponse),
+    ).toContain('"loopback"');
     expect(document.paths["/api/v1/lifecycle/events"]).toMatchObject({
       get: {
         parameters: [{ name: "Last-Event-ID" }],
@@ -122,7 +145,7 @@ describe("Gateway OpenAPI contract", () => {
     );
     expect(JSON.stringify(document)).not.toContain(capability);
     expect(gatewayOpenApiDocumentDigest(document)).toBe(
-      "6d3316e8db80b7d51c60ec08907ff43c8c68de41e0bd0628d9a686324b8c9058",
+      "116a9b5a3c95cbf37582fa234c97e17eb5fb687d3653f69ea38857b26578469f",
     );
 
     await app.close();

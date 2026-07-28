@@ -238,6 +238,7 @@ test("Tauri release config embeds the complete portable Desktop composition", ()
     portable: "release-build/desktop/windows-x86_64",
     icons: "apps/desktop/src-tauri/icons/release",
   });
+  assert.equal(config.mainBinaryName, "cmclient-desktop");
   assert.equal(config.version, "2.0.0-1");
   assert.deepEqual(config.bundle.targets, ["msi", "nsis"]);
   assert.equal(config.bundle.active, true);
@@ -1003,6 +1004,9 @@ test("release workflow builds and inspects native Desktop packages from portable
   assert.match(windowsSmoke, /Assert-NativeAppLaunch/);
 
   const config = JSON.parse(tauriConfig);
+  assert.equal(config.build.frontendDist, "../dist");
+  assert.equal("devUrl" in config.build, false);
+  assert.equal("beforeDevCommand" in config.build, false);
   assert.equal(config.bundle.active, false);
   assert.deepEqual(config.bundle.icon, ["icons/icon.png", "icons/icon.ico"]);
 });

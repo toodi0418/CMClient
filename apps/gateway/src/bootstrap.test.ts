@@ -75,7 +75,7 @@ describe("private Gateway bootstrap", () => {
     expect(ready.includes(Buffer.from(bootstrap.callMeshApiKey))).toBe(false);
   });
 
-  it("finishes the private ready channel before slow external startup", async () => {
+  it("does not publish ready until external startup succeeds", async () => {
     const output = new PassThrough();
     const chunks: Buffer[] = [];
     output.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -103,11 +103,14 @@ describe("private Gateway bootstrap", () => {
       startupSettled = true;
     });
 
-    await new Promise<void>((resolve) => output.once("finish", resolve));
     await externalStartedSignal;
-    expect(output.writableEnded).toBe(true);
+    expect(output.writableEnded).toBe(false);
     expect(externalStarted).toBe(true);
     expect(startupSettled).toBe(false);
+
+    releaseExternal();
+    await expect(startup).resolves.toBeUndefined();
+    expect(output.writableEnded).toBe(true);
     const ready = Buffer.concat(chunks);
     expect(JSON.parse(ready.subarray(4).toString("utf8"))).toMatchObject({
       type: "gateway.ready",
@@ -115,9 +118,54 @@ describe("private Gateway bootstrap", () => {
       host: "127.0.0.1",
       port: 49153,
     });
+  });
 
-    releaseExternal();
-    await expect(startup).resolves.toBeUndefined();
+  it("reports stable CallMesh setup failures without exposing the key", async () => {
+    const output = new PassThrough();
+    const chunks: Buffer[] = [];
+    output.on("data", (chunk: Buffer) => chunks.push(chunk));
+    await expect(
+      startSupervisedGateway(
+        output,
+        bootstrap,
+        async () => ({ host: "127.0.0.1", port: 49154 }),
+        async () => {
+          throw new GatewayBootstrapError("CALLMESH_CREDENTIAL_REJECTED");
+        },
+      ),
+    ).rejects.toThrow("CALLMESH_CREDENTIAL_REJECTED");
+    const failure = Buffer.concat(chunks);
+    expect(JSON.parse(failure.subarray(4).toString("utf8"))).toEqual({
+      schemaVersion: 1,
+      type: "gateway.bootstrap.failed",
+      startupNonce: bootstrap.startupNonce,
+      code: "CALLMESH_CREDENTIAL_REJECTED",
+    });
+    expect(failure.includes(Buffer.from(bootstrap.callMeshApiKey))).toBe(false);
+  });
+
+  it("reports Meshtastic protocol validation failure before readiness", async () => {
+    const output = new PassThrough();
+    const chunks: Buffer[] = [];
+    output.on("data", (chunk: Buffer) => chunks.push(chunk));
+    await expect(
+      startSupervisedGateway(
+        output,
+        bootstrap,
+        async () => ({ host: "127.0.0.1", port: 49155 }),
+        async () => {
+          throw new GatewayBootstrapError("SETUP_MESHTASTIC_UNREACHABLE");
+        },
+      ),
+    ).rejects.toThrow("SETUP_MESHTASTIC_UNREACHABLE");
+    expect(
+      JSON.parse(Buffer.concat(chunks).subarray(4).toString("utf8")),
+    ).toEqual({
+      schemaVersion: 1,
+      type: "gateway.bootstrap.failed",
+      startupNonce: bootstrap.startupNonce,
+      code: "SETUP_MESHTASTIC_UNREACHABLE",
+    });
   });
 
   it("proves ownership without disclosing the bootstrap capability", async () => {

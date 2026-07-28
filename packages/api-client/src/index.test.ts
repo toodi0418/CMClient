@@ -144,6 +144,7 @@ describe("gateway API client", () => {
         }
         return jsonResponse({
           schemaVersion: 1,
+          currentTermsVersion: "cmclient-2.0-terms-v1",
           phase: url.endsWith("/setup/status")
             ? "terms_required"
             : "credentials_required",
@@ -206,6 +207,36 @@ describe("gateway API client", () => {
     ).rejects.toMatchObject({ code: "CLIENT_INPUT_INVALID" });
     expect(requests).toBe(0);
   });
+
+  it.each([
+    [401, "CALLMESH_CREDENTIAL_REJECTED", false],
+    [503, "CALLMESH_UNAVAILABLE", true],
+  ])(
+    "preserves setup authentication error %s without putting the key in URL or errors",
+    async (status, code, retryable) => {
+      const apiKey = "fixture-private-setup-key";
+      let requestUrl = "";
+      const client = new GatewayApiClient({
+        fetch: async (input) => {
+          requestUrl = String(input);
+          return jsonResponse({ code }, status);
+        },
+      });
+
+      const error = await client.setup
+        .configure({
+          meshtasticHost: "172.16.8.88",
+          meshtasticPort: 4403,
+          callmeshApiKey: apiKey,
+        })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ code, status, retryable });
+      expect(requestUrl).toBe("/api/v1/setup/configure");
+      expect(requestUrl).not.toContain(apiKey);
+      expect(String(error)).not.toContain(apiKey);
+    },
+  );
 
   it("reads the privacy-safe proxy status through the versioned API", async () => {
     let url: string | undefined;

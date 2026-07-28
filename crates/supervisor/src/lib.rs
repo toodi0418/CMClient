@@ -137,7 +137,7 @@ struct GatewayBootstrapFrame<'a> {
     startup_nonce: String,
     capability: String,
     setup_generation: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "callMeshApiKey", skip_serializing_if = "Option::is_none")]
     callmesh_api_key: Option<&'a str>,
 }
 
@@ -151,6 +151,16 @@ struct GatewayReadyFrame {
     startup_nonce: String,
     host: String,
     port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GatewayBootstrapFailureFrame {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    frame_type: String,
+    startup_nonce: String,
+    code: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +225,10 @@ pub enum SupervisorError {
     BootstrapTimeout,
     BootstrapIoFailed,
     BootstrapProbeFailed,
+    CallMeshCredentialRejected,
+    CallMeshUnavailable,
+    MeshtasticUnreachable,
+    GatewayExternalStartFailed,
 }
 
 impl SupervisorError {
@@ -229,6 +243,10 @@ impl SupervisorError {
             Self::BootstrapTimeout => "GATEWAY_SUPERVISOR_BOOTSTRAP_TIMEOUT",
             Self::BootstrapIoFailed => "GATEWAY_SUPERVISOR_BOOTSTRAP_IO_FAILED",
             Self::BootstrapProbeFailed => "GATEWAY_SUPERVISOR_BOOTSTRAP_PROBE_FAILED",
+            Self::CallMeshCredentialRejected => "CALLMESH_CREDENTIAL_REJECTED",
+            Self::CallMeshUnavailable => "CALLMESH_UNAVAILABLE",
+            Self::MeshtasticUnreachable => "SETUP_MESHTASTIC_UNREACHABLE",
+            Self::GatewayExternalStartFailed => "GATEWAY_EXTERNAL_START_FAILED",
         }
     }
 }
@@ -359,6 +377,10 @@ impl GatewaySupervisor {
         }
         self.callmesh_api_key = Some(Zeroizing::new(api_key.to_owned()));
         Ok(())
+    }
+
+    pub fn clear_callmesh_api_key(&mut self) {
+        self.callmesh_api_key = None;
     }
 
     pub fn gateway_ready(&self) -> Option<&GatewayReady> {
@@ -766,7 +788,8 @@ fn perform_private_bootstrap(
                 mpsc::RecvTimeoutError::Timeout => SupervisorError::BootstrapTimeout,
                 mpsc::RecvTimeoutError::Disconnected => SupervisorError::BootstrapIoFailed,
             })??;
-        let ready = validate_gateway_ready(&bytes, child.id(), startup_nonce, capability)?;
+        let ready =
+            validate_gateway_ready_or_failure(&bytes, child.id(), startup_nonce, capability)?;
         probe_gateway_ownership(&ready, remaining_until(bootstrap_deadline)?)?;
         Ok(ready)
     })();
@@ -796,6 +819,34 @@ fn validate_gateway_ready(
         startup_nonce,
         capability,
     })
+}
+
+fn validate_gateway_ready_or_failure(
+    bytes: &[u8],
+    child_pid: u32,
+    startup_nonce: String,
+    capability: String,
+) -> Result<GatewayReady, SupervisorError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| SupervisorError::BootstrapInvalid)?;
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("gateway.bootstrap.failed") {
+        let failure: GatewayBootstrapFailureFrame =
+            serde_json::from_value(value).map_err(|_| SupervisorError::BootstrapInvalid)?;
+        if failure.schema_version != 1
+            || failure.frame_type != "gateway.bootstrap.failed"
+            || failure.startup_nonce != startup_nonce
+        {
+            return Err(SupervisorError::BootstrapInvalid);
+        }
+        return match failure.code.as_str() {
+            "CALLMESH_CREDENTIAL_REJECTED" => Err(SupervisorError::CallMeshCredentialRejected),
+            "CALLMESH_UNAVAILABLE" => Err(SupervisorError::CallMeshUnavailable),
+            "SETUP_MESHTASTIC_UNREACHABLE" => Err(SupervisorError::MeshtasticUnreachable),
+            "GATEWAY_EXTERNAL_START_FAILED" => Err(SupervisorError::GatewayExternalStartFailed),
+            _ => Err(SupervisorError::BootstrapInvalid),
+        };
+    }
+    validate_gateway_ready(bytes, child_pid, startup_nonce, capability)
 }
 
 fn probe_gateway_ownership(ready: &GatewayReady, timeout: Duration) -> Result<(), SupervisorError> {
@@ -1121,6 +1172,7 @@ mod tests {
         GatewayBootstrapFrame, GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor,
         SupervisorError, SupervisorEvent, encode_private_frame, inherited_runtime_environment_from,
         probe_gateway_ownership, read_private_frame, validate_gateway_ready,
+        validate_gateway_ready_or_failure,
     };
     #[cfg(windows)]
     use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper, JobObject};
@@ -1171,7 +1223,8 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(decoded["schemaVersion"], 2);
         assert_eq!(decoded["setupGeneration"], 7);
-        assert_eq!(decoded["callmeshApiKey"], api_key);
+        assert_eq!(decoded["callMeshApiKey"], api_key);
+        assert!(decoded.get("callmeshApiKey").is_none());
         let maximum_escaped_key = "\\".repeat(GATEWAY_CALLMESH_API_KEY_MAX_BYTES);
         let maximum_frame = encode_private_frame(&GatewayBootstrapFrame {
             schema_version: 2,
@@ -1320,6 +1373,73 @@ mod tests {
                 ),
                 Err(SupervisorError::BootstrapInvalid)
             ));
+        }
+    }
+
+    #[test]
+    fn private_bootstrap_failure_frames_map_to_stable_non_secret_errors() {
+        let nonce = "a".repeat(32);
+        let capability = "b".repeat(64);
+        for (code, expected) in [
+            (
+                "CALLMESH_CREDENTIAL_REJECTED",
+                SupervisorError::CallMeshCredentialRejected,
+            ),
+            ("CALLMESH_UNAVAILABLE", SupervisorError::CallMeshUnavailable),
+            (
+                "SETUP_MESHTASTIC_UNREACHABLE",
+                SupervisorError::MeshtasticUnreachable,
+            ),
+            (
+                "GATEWAY_EXTERNAL_START_FAILED",
+                SupervisorError::GatewayExternalStartFailed,
+            ),
+        ] {
+            let body = serde_json::json!({
+                "schemaVersion": 1,
+                "type": "gateway.bootstrap.failed",
+                "startupNonce": nonce,
+                "code": code,
+            });
+            let error = validate_gateway_ready_or_failure(
+                &serde_json::to_vec(&body).expect("failure frame should serialize"),
+                42,
+                nonce.clone(),
+                capability.clone(),
+            )
+            .expect_err("failure frame must not become ready");
+            assert_eq!(error, expected);
+            assert_eq!(error.code(), code);
+            assert!(!format!("{error:?}").contains("fixture-private"));
+        }
+    }
+
+    #[test]
+    fn private_bootstrap_failure_frames_reject_nonce_code_and_field_drift() {
+        let base = serde_json::json!({
+            "schemaVersion": 1,
+            "type": "gateway.bootstrap.failed",
+            "startupNonce": "a".repeat(32),
+            "code": "CALLMESH_UNAVAILABLE",
+        });
+        for mutation in ["schema", "nonce", "code", "unknown"] {
+            let mut value = base.clone();
+            match mutation {
+                "schema" => value["schemaVersion"] = serde_json::json!(2),
+                "nonce" => value["startupNonce"] = serde_json::json!("c".repeat(32)),
+                "code" => value["code"] = serde_json::json!("CALLMESH_OTHER"),
+                "unknown" => value["detail"] = serde_json::json!("secret-looking detail"),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_gateway_ready_or_failure(
+                    &serde_json::to_vec(&value).unwrap(),
+                    42,
+                    "a".repeat(32),
+                    "b".repeat(64),
+                ),
+                Err(SupervisorError::BootstrapInvalid)
+            );
         }
     }
 
@@ -1863,25 +1983,50 @@ mod tests {
     #[test]
     fn private_bootstrap_faults_terminate_and_reap_real_children() {
         let cases = [
-            ("bootstrap-wrong-pid", SupervisorError::BootstrapInvalid),
-            ("bootstrap-wrong-nonce", SupervisorError::BootstrapInvalid),
+            (
+                "bootstrap-wrong-pid",
+                SupervisorError::BootstrapInvalid,
+                Duration::from_secs(10),
+            ),
+            (
+                "bootstrap-wrong-nonce",
+                SupervisorError::BootstrapInvalid,
+                Duration::from_secs(10),
+            ),
             (
                 "bootstrap-wrong-capability",
                 SupervisorError::BootstrapProbeFailed,
+                Duration::from_secs(10),
             ),
-            ("bootstrap-timeout", SupervisorError::BootstrapTimeout),
-            ("bootstrap-early-exit", SupervisorError::BootstrapIoFailed),
-            ("bootstrap-oversize", SupervisorError::BootstrapInvalid),
+            (
+                "bootstrap-timeout",
+                SupervisorError::BootstrapTimeout,
+                Duration::from_secs(5),
+            ),
+            (
+                "bootstrap-early-exit",
+                SupervisorError::BootstrapIoFailed,
+                Duration::from_secs(10),
+            ),
+            (
+                "bootstrap-oversize",
+                SupervisorError::BootstrapInvalid,
+                Duration::from_secs(10),
+            ),
         ];
         let mut markers = Vec::new();
 
-        for (mode, expected) in cases {
+        for (mode, expected, deadline) in cases {
             let marker = unique_marker(mode);
             let mut supervisor = powershell_bootstrap_supervisor(mode, &marker);
             supervisor
                 .enable_private_bootstrap()
                 .expect("private bootstrap should enable");
-            supervisor.bootstrap_deadline = Duration::from_secs(5);
+            // PowerShell cold starts can exceed five seconds when unit tests
+            // spawn several fixtures concurrently. The production default is
+            // thirty seconds; keep this fixture below that bound while the
+            // actual timeout mode continues to exercise the five-second path.
+            supervisor.bootstrap_deadline = deadline;
 
             assert_eq!(
                 supervisor

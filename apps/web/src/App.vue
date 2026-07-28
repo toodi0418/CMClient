@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from "vue";
+import { computed, watch } from "vue";
 import {
   Gauge,
   Cloud,
@@ -42,7 +42,6 @@ import { usePreferencesStore } from "@/stores/preferences";
 import { useProxyStore } from "@/stores/proxy";
 import { useShellStore } from "@/stores/shell";
 import ManagementLoginView from "@/views/ManagementLoginView.vue";
-import SetupWizardView from "@/views/SetupWizardView.vue";
 import { useSetupStore } from "@/stores/setup";
 
 const shell = useShellStore();
@@ -116,6 +115,7 @@ const requiresLogin = computed(
 );
 
 const setupRequired = computed(() => setup.required);
+const isSetupRoute = computed(() => route.name === "setup");
 
 const railToggleIcon = computed(() =>
   shell.desktopRailCollapsed ? PanelLeftOpen : PanelLeftClose,
@@ -172,13 +172,23 @@ async function refreshAfterLogin() {
   await gateway.refresh();
 }
 
-onMounted(() => {
-  void setup.refresh().catch(() => undefined);
-});
+watch(
+  () => setup.required,
+  (required) => {
+    if (required) {
+      gateway.dispose();
+      return;
+    }
+    void auth.initialize();
+    void gateway.initialize();
+  },
+  { immediate: true },
+);
 </script>
 
 <template>
-  <SetupWizardView v-if="setupRequired" />
+  <RouterView v-if="isSetupRoute" />
+  <div v-else-if="setupRequired" class="min-h-screen" aria-hidden="true" />
   <ManagementLoginView
     v-else-if="requiresLogin"
     @authenticated="refreshAfterLogin"

@@ -14,9 +14,11 @@
     "@cmclient/contracts": "workspace:*",
     "@cmclient/event-client": "workspace:*",
     "@lucide/vue": "^1.25.0",
+    "@primevue/forms": "^4.5.5",
     "@primeuix/themes": "^1.2.5",
     "@sinclair/typebox": "^0.34.52",
     "@tailwindcss/vite": "^4.3.3",
+    "@xstate/vue": "^5.0.1",
     "echarts": "^6.1.0",
     "leaflet": "^1.9.4",
     "pinia": "^4.0.2",
@@ -24,7 +26,8 @@
     "tailwindcss": "^4.3.3",
     "vue": "^3.5.40",
     "vue-i18n": "^11.4.6",
-    "vue-router": "^5.2.0"
+    "vue-router": "^5.2.0",
+    "xstate": "^5.32.5"
   },
   "devDependencies": {
     "@types/leaflet": "^1.9.21",

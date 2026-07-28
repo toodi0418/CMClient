@@ -104,7 +104,16 @@ Agent clears inherited application configuration and `PATH` before it passes
 validated non-secret configuration and exact absolute runtime paths to Gateway.
 Only required Windows runtime variables remain in the launcher allowlist; the
 private Node executable is always addressed absolutely. The required CallMesh
-key uses the private bootstrap pipe, never argv or environment. Gateway then owns transport,
+key uses the private bootstrap pipe, never argv or environment. During setup,
+Agent first launches a validation-only Gateway that proves the selected
+Meshtastic endpoint through the physical write fence and calls the official
+authenticated heartbeat endpoint. It cannot start Mesh ingestion, APRS, Proxy,
+maintenance, or mapping synchronization. Agent stops the validation process
+after successful authentication, atomically commits config and `secrets.json`,
+records a recoverable ready marker, then starts the normal Gateway. The Web
+receives ready only after normal startup succeeds; any commit or runtime startup
+failure restores the prior marker/config/secret and returns setup to the
+credentials step. Gateway then owns transport,
 protobuf/domain persistence, Position and APRS processing, CallMesh, Proxy,
 retention, Jobs, and domain SSE. See
 [Gateway Production Runtime](./gateway-runtime.md).
@@ -223,6 +232,16 @@ bounded exponential backoff; consecutive crashes retain their attempt count
 until the child survives a 30-second stable window. Stop and Agent teardown
 terminate and reap the child. Real subprocess tests prove crash/restart,
 deadline, stable-reset, stop, and drop behavior.
+
+On interactive Windows, Agent owns the single native tray and treats Desktop as
+an optional child. Desktop publishes a bounded JSON identity at
+`run/desktop.pid` with PID, process creation time, and session ID. Before a
+tray open or Quit action relies on it, Agent validates the pinned Desktop image
+path and all three identity fields against the system process object. Quit
+terminates and waits through that same verified object, so PID reuse fails
+closed. Session 0 and non-Windows/headless builds emit `AGENT_TRAY_UNAVAILABLE`
+and retain Web/CLI control; native graphical tray support for macOS and Linux
+is not claimed by the Windows implementation.
 
 ## Service Logging
 

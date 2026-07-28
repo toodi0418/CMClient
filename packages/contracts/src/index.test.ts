@@ -418,6 +418,7 @@ describe("Agent setup and lifecycle contracts", () => {
     const check = TypeCompiler.Compile(SetupStatusSchema);
     const recovery = {
       schemaVersion: 1,
+      currentTermsVersion: "cmclient-2.0-terms-v1",
       phase: "recovery_required",
       setupRequired: true,
       termsRequired: false,

@@ -27,11 +27,21 @@ disabled (`not_enabled`) and has no send action in this RC.
 ## Desktop supervisor
 
 Desktop is a small Tauri client of the local Control API. Its red, yellow, and
-green window controls exit, minimize, and hide the Desktop application; they do
-not stop the resident Agent or duplicate the Web application. A tray entry can
-reopen the Management Web URL returned by Agent. Each native package embeds the
-same Agent, Gateway, Web, CLI, and private pinned Node runtime. Login startup is
-a current-user setting and does not require a privileged Agent service.
+green window controls hide, minimize, and hide the Desktop application; they do
+not stop the resident Agent or duplicate the Web application. On an interactive
+Windows session, the Agent owns the single native tray icon; its safe tooltip
+distinguishes setup required, ready, Gateway offline, and CallMesh degraded.
+Left-click/Open starts or focuses Desktop. `Exit CMClient Desktop` closes only
+the Desktop UI and keeps Agent resident. The separate `Shut Down CMClient`
+command explicitly closes Desktop before requesting Agent-owned graceful
+shutdown. Session 0 services, headless/unsupported-tray deployments, Docker,
+macOS, and Linux continue
+through Web and CLI without a tray; graphical macOS/Linux tray support is not
+yet provided. On first use, Desktop opens the Agent-advertised local Management
+Web URL directly into the Setup Wizard; it does not invent a localhost fallback.
+Each native package embeds the same private pinned Node runtime together with
+Agent, Gateway, Web, and CLI. Login startup is a current-user setting and does
+not require a privileged Agent service.
 
 ## CLI essentials
 

@@ -8,7 +8,7 @@
 
 use crate::RuntimePaths;
 use cmclient_runtime_primitives::{DocumentError, DocumentFormat, DurableDocument, TypedDocument};
-use mdns_sd::{ServiceDaemon, ServiceEvent};
+use mdns_sd::{DaemonStatus, ServiceDaemon, ServiceEvent};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -120,6 +120,7 @@ impl DurableDocument for SetupState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SetupStatus {
     pub schema_version: u8,
+    pub current_terms_version: String,
     pub phase: SetupPhase,
     pub setup_required: bool,
     pub terms_required: bool,
@@ -134,6 +135,7 @@ impl From<&SetupState> for SetupStatus {
     fn from(state: &SetupState) -> Self {
         Self {
             schema_version: SETUP_SCHEMA_VERSION,
+            current_terms_version: String::from(CURRENT_TERMS_VERSION),
             phase: state.phase,
             setup_required: state.phase.setup_required(),
             terms_required: matches!(
@@ -392,6 +394,7 @@ impl MeshtasticCandidate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryError {
+    Busy,
     ConfigurationInvalid,
     MdnsUnavailable,
     MdnsFailed,
@@ -400,6 +403,7 @@ pub enum DiscoveryError {
 impl DiscoveryError {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::Busy => "SETUP_DISCOVERY_BUSY",
             Self::ConfigurationInvalid => "SETUP_DISCOVERY_CONFIGURATION_INVALID",
             Self::MdnsUnavailable => "SETUP_MDNS_UNAVAILABLE",
             Self::MdnsFailed => "SETUP_MDNS_FAILED",
@@ -407,7 +411,7 @@ impl DiscoveryError {
     }
 }
 
-/// Return candidates in the user-visible, bounded order.  The first matching
+/// Return candidates in the user-visible, bounded order. The first matching
 /// endpoint wins; later discovery sources cannot reorder or duplicate it.
 pub fn ordered_candidates(
     migrated: Option<MeshtasticCandidate>,
@@ -439,7 +443,12 @@ pub fn ordered_candidates(
         }
     }
     for candidate in mdns {
-        if candidate.source == DiscoverySource::Mdns {
+        if candidate.source == DiscoverySource::Mdns
+            && candidate
+                .host
+                .parse::<IpAddr>()
+                .is_ok_and(valid_discovered_address)
+        {
             push(candidate);
         }
     }
@@ -488,32 +497,38 @@ pub fn discover_mdns(
         let mut addresses = service
             .get_addresses()
             .iter()
-            .map(|address| address.to_ip_addr())
+            .filter(|address| valid_discovered_address(address.to_ip_addr()))
+            .map(ToString::to_string)
             .collect::<Vec<_>>();
         addresses.sort();
-        for address in addresses {
-            if !valid_discovered_address(address) || candidates.len() >= maximum {
+        for host in addresses {
+            if candidates.len() >= maximum {
                 continue;
             }
-            let key = format!("{address}:{}", service.get_port());
+            let key = format!("{host}:{}", service.get_port());
             if seen.insert(key) {
-                if let Some(candidate) = MeshtasticCandidate::new(
-                    address.to_string(),
-                    service.get_port(),
-                    DiscoverySource::Mdns,
-                ) {
+                if let Some(candidate) =
+                    MeshtasticCandidate::new(host, service.get_port(), DiscoverySource::Mdns)
+                {
                     candidates.push(candidate);
                 }
             }
         }
     }
-    let _ = daemon.stop_browse(MESHTASTIC_SERVICE_TYPE);
-    let _ = daemon.shutdown();
+    let browse_stopped = daemon.stop_browse(MESHTASTIC_SERVICE_TYPE).is_ok();
+    let daemon_stopped = daemon
+        .shutdown()
+        .ok()
+        .and_then(|status| status.recv_timeout(Duration::from_secs(1)).ok())
+        .is_some_and(|status| status == DaemonStatus::Shutdown);
+    if !browse_stopped || !daemon_stopped {
+        return Err(DiscoveryError::MdnsFailed);
+    }
     Ok(candidates)
 }
 
 fn valid_discovered_address(address: IpAddr) -> bool {
-    !address.is_unspecified() && !address.is_multicast()
+    !address.is_unspecified() && !address.is_multicast() && !address.is_loopback()
 }
 
 fn valid_endpoint_host(host: &str) -> bool {
@@ -776,6 +791,7 @@ mod tests {
         let candidates = ordered_candidates(migrated, mdns, manual);
         assert_eq!(candidates[0].source, DiscoverySource::Migrated);
         assert_eq!(candidates[1].host, "127.0.0.1");
+        assert_eq!(candidates[1].source, DiscoverySource::Loopback);
         assert_eq!(candidates[2].host, "::1");
         assert_eq!(candidates[3].host, "192.0.2.11");
         assert_eq!(candidates[4].source, DiscoverySource::Manual);
@@ -837,5 +853,39 @@ mod tests {
             discover_mdns(Duration::from_secs(1), 0),
             Err(DiscoveryError::ConfigurationInvalid)
         );
+    }
+
+    #[test]
+    fn mdns_results_reject_loopback_and_non_unicast_addresses() {
+        assert!(!valid_discovered_address(IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST
+        )));
+        assert!(!valid_discovered_address(IpAddr::V6(
+            std::net::Ipv6Addr::LOCALHOST
+        )));
+        assert!(!valid_discovered_address(IpAddr::V4(
+            std::net::Ipv4Addr::UNSPECIFIED
+        )));
+        assert!(valid_discovered_address(IpAddr::V4(
+            std::net::Ipv4Addr::new(192, 0, 2, 10)
+        )));
+
+        let candidates = ordered_candidates(
+            None,
+            [
+                MeshtasticCandidate::new("127.0.0.1", MESHTASTIC_TCP_PORT, DiscoverySource::Mdns)
+                    .expect("synthetic candidate should parse"),
+                MeshtasticCandidate::new("192.0.2.10", MESHTASTIC_TCP_PORT, DiscoverySource::Mdns)
+                    .expect("LAN candidate should parse"),
+            ],
+            None,
+        );
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates.iter().any(|candidate| {
+            candidate.source == DiscoverySource::Mdns && candidate.host == "192.0.2.10"
+        }));
+        assert!(!candidates.iter().any(|candidate| {
+            candidate.source == DiscoverySource::Mdns && candidate.host == "127.0.0.1"
+        }));
     }
 }

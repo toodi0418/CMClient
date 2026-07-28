@@ -1,9 +1,15 @@
+import type { CallMeshOverview } from "@cmclient/contracts";
+
 import { GatewayRuntime } from "./app.js";
 import { createVerifiedGatewayBackup } from "./backup.js";
 import { DomainEventBus } from "./events.js";
 import { JobEngine } from "./jobs.js";
 import { GatewayDatabase } from "./persistence/database.js";
-import { callMeshOptionsFromRuntime, CallMeshClient } from "./callmesh.js";
+import {
+  callMeshOptionsFromRuntime,
+  CallMeshClient,
+  CallMeshClientError,
+} from "./callmesh.js";
 import type { AprsGatewayRuntime } from "./aprs-runtime.js";
 import type { MeshGatewayRuntime } from "./mesh-runtime.js";
 import type { GatewayMaintenanceRuntime } from "./maintenance.js";
@@ -16,6 +22,7 @@ import {
   createConfiguredAprsGatewayRuntime,
   createConfiguredGatewayMaintenanceRuntime,
   createConfiguredMeshGatewayRuntime,
+  validateConfiguredMeshtasticEndpoint,
 } from "./runtime-config.js";
 import {
   createGatewaySupervisorShutdownInput,
@@ -34,10 +41,56 @@ import {
 import { ConsoleStructuredLogger } from "./observability.js";
 import { gatewayRuntimePaths } from "./runtime-paths.js";
 
+export interface GatewayExternalStartupCallbacks {
+  readonly validateMeshtastic: () => Promise<void>;
+  readonly validateCallMesh: () => Promise<void>;
+  readonly synchronizeCallMesh: () => Promise<void>;
+  readonly startProxy: () => Promise<void>;
+  readonly startMaintenance: () => void;
+  readonly startAprs: () => void;
+  readonly startMesh: () => void;
+  readonly throwIfShutdownRequested: () => void;
+}
+
+/**
+ * Setup validation intentionally authenticates without starting any transport
+ * that can ingest Meshtastic or transmit APRS. The Agent commits config and
+ * secrets before starting a second, normal Gateway process.
+ */
+export async function startGatewayExternalRuntimes(
+  validationOnly: boolean,
+  callbacks: GatewayExternalStartupCallbacks,
+): Promise<void> {
+  if (validationOnly) {
+    await callbacks.validateMeshtastic();
+    callbacks.throwIfShutdownRequested();
+    await callbacks.validateCallMesh();
+    return;
+  }
+  await callbacks.synchronizeCallMesh();
+  callbacks.throwIfShutdownRequested();
+  await callbacks.startProxy();
+  callbacks.throwIfShutdownRequested();
+  callbacks.startMaintenance();
+  callbacks.throwIfShutdownRequested();
+  callbacks.startAprs();
+  callbacks.throwIfShutdownRequested();
+  callbacks.startMesh();
+  callbacks.throwIfShutdownRequested();
+}
+
 export async function runGateway(): Promise<void> {
   if (process.env.CMCLIENT_SUPERVISED !== "1") {
     throw new GatewayBootstrapError("GATEWAY_SUPERVISION_REQUIRED");
   }
+  const setupValidationOnly = parseOptionalBoolean(
+    process.env.CMCLIENT_SETUP_VALIDATION_ONLY,
+    false,
+  );
+  const setupCommitStart = parseOptionalBoolean(
+    process.env.CMCLIENT_SETUP_COMMIT_START,
+    false,
+  );
   const bootstrap = await readGatewayBootstrap(process.stdin);
   let database: GatewayDatabase | undefined;
   let events: DomainEventBus | undefined;
@@ -157,34 +210,36 @@ export async function runGateway(): Promise<void> {
         compiledGatewayBuildVersion(),
         bootstrap.callMeshApiKey,
       ),
-      activeDatabase.callmeshMappings,
+      setupValidationOnly ? undefined : activeDatabase.callmeshMappings,
     );
     context.throwIfShutdownRequested();
     const verifiedAprsState = () => callmesh.getAprsState();
 
-    proxy = await createConfiguredProxyRuntime(process.env, activeEvents);
-    context.throwIfShutdownRequested();
-    maintenance = createConfiguredGatewayMaintenanceRuntime(
-      process.env,
-      activeDatabase,
-      activeEvents,
-    );
-    context.throwIfShutdownRequested();
-    aprs = createConfiguredAprsGatewayRuntime(
-      process.env,
-      activeDatabase,
-      activeEvents,
-      verifiedAprsState,
-    );
-    context.throwIfShutdownRequested();
-    mesh = await createConfiguredMeshGatewayRuntime(
-      process.env,
-      activeDatabase,
-      activeEvents,
-      verifiedAprsState,
-      aprs,
-    );
-    context.throwIfShutdownRequested();
+    if (!setupValidationOnly) {
+      proxy = await createConfiguredProxyRuntime(process.env, activeEvents);
+      context.throwIfShutdownRequested();
+      maintenance = createConfiguredGatewayMaintenanceRuntime(
+        process.env,
+        activeDatabase,
+        activeEvents,
+      );
+      context.throwIfShutdownRequested();
+      aprs = createConfiguredAprsGatewayRuntime(
+        process.env,
+        activeDatabase,
+        activeEvents,
+        verifiedAprsState,
+      );
+      context.throwIfShutdownRequested();
+      mesh = await createConfiguredMeshGatewayRuntime(
+        process.env,
+        activeDatabase,
+        activeEvents,
+        verifiedAprsState,
+        aprs,
+      );
+      context.throwIfShutdownRequested();
+    }
 
     const activeRuntime = new GatewayRuntime(
       { host: "127.0.0.1", port: 0 },
@@ -244,20 +299,49 @@ export async function runGateway(): Promise<void> {
     runtime = activeRuntime;
     context.throwIfShutdownRequested();
 
-    const startExternalRuntimes = async (): Promise<void> => {
-      await callmeshRefresh.run(() =>
-        synchronizeCallMesh(callmesh, activeEvents),
-      );
-      context.throwIfShutdownRequested();
-      await proxy?.start();
-      context.throwIfShutdownRequested();
-      maintenance?.start();
-      context.throwIfShutdownRequested();
-      aprs?.start();
-      context.throwIfShutdownRequested();
-      mesh?.start();
-      context.throwIfShutdownRequested();
-    };
+    const startExternalRuntimes = async (): Promise<void> =>
+      startGatewayExternalRuntimes(setupValidationOnly, {
+        validateMeshtastic: async () => {
+          try {
+            await validateConfiguredMeshtasticEndpoint(process.env);
+          } catch {
+            throw new GatewayBootstrapError("SETUP_MESHTASTIC_UNREACHABLE");
+          }
+        },
+        validateCallMesh: async () => {
+          try {
+            // The key exists only in the private bootstrap and this in-memory
+            // client until the Agent commits the setup transaction.
+            await callmesh.validateCredentials();
+          } catch (error) {
+            if (error instanceof CallMeshClientError) {
+              if (error.code === "CALLMESH_CREDENTIAL_REJECTED") {
+                throw new GatewayBootstrapError("CALLMESH_CREDENTIAL_REJECTED");
+              }
+              if (error.code === "CALLMESH_UNAVAILABLE") {
+                throw new GatewayBootstrapError("CALLMESH_UNAVAILABLE");
+              }
+            }
+            throw new GatewayBootstrapError("GATEWAY_EXTERNAL_START_FAILED");
+          }
+        },
+        synchronizeCallMesh: async () => {
+          const overview = await synchronizeCallMesh(callmesh, activeEvents);
+          if (callMeshCredentialRejected(overview)) {
+            throw new GatewayBootstrapError("CALLMESH_CREDENTIAL_REJECTED");
+          }
+          if (setupCommitStart && !callMeshReadyForSetupCommit(overview)) {
+            throw new GatewayBootstrapError("CALLMESH_UNAVAILABLE");
+          }
+        },
+        startProxy: async () => {
+          await proxy?.start();
+        },
+        startMaintenance: () => maintenance?.start(),
+        startAprs: () => aprs?.start(),
+        startMesh: () => mesh?.start(),
+        throwIfShutdownRequested: () => context.throwIfShutdownRequested(),
+      });
 
     await startSupervisedGateway(
       process.stdout,
@@ -275,13 +359,19 @@ export async function runGateway(): Promise<void> {
       startExternalRuntimes,
     );
 
-    callmeshTimer = setInterval(() => {
-      void callmeshRefresh.run(async () => {
-        await synchronizeCallMesh(callmesh, activeEvents);
-        await aprs?.refreshMonitor();
-      });
-    }, 60_000);
-    callmeshTimer.unref();
+    if (!setupValidationOnly) {
+      callmeshTimer = setInterval(() => {
+        void callmeshRefresh.run(async () => {
+          const overview = await synchronizeCallMesh(callmesh, activeEvents);
+          if (callMeshCredentialRejected(overview)) {
+            terminateAfterShutdown();
+            return;
+          }
+          await aprs?.refreshMonitor();
+        });
+      }, 60_000);
+      callmeshTimer.unref();
+    }
   });
 
   if (!startup.ok) {
@@ -306,7 +396,7 @@ export async function runGateway(): Promise<void> {
 async function synchronizeCallMesh(
   client: CallMeshClient,
   eventBus: DomainEventBus,
-): Promise<void> {
+): Promise<CallMeshOverview> {
   try {
     const overview = await client.synchronize();
     eventBus.publish({
@@ -314,20 +404,36 @@ async function synchronizeCallMesh(
       source: "gateway",
       payload: overview.status,
     });
+    return overview;
   } catch (error) {
     eventBus.publish({
       type: "callmesh.error",
       source: "gateway",
       payload: { code: runtimeErrorCode(error, "CALLMESH_SYNC_FAILED") },
     });
+    throw error;
   }
+}
+
+function callMeshCredentialRejected(overview: CallMeshOverview): boolean {
+  return (
+    overview.status.reasonCode === "CALLMESH_AUTH_INVALID" ||
+    overview.status.provisionState === "revoked"
+  );
+}
+
+function callMeshReadyForSetupCommit(overview: CallMeshOverview): boolean {
+  return (
+    overview.status.state === "ready" &&
+    overview.status.provisionState === "valid"
+  );
 }
 
 async function createConfiguredProxyRuntime(
   environment: Record<string, string | undefined>,
   eventBus: DomainEventBus,
 ): Promise<ProxyRuntime | undefined> {
-  if (!parseOptionalBoolean(environment.CMCLIENT_PROXY_ENABLED, false)) {
+  if (!validateProxyUpstreamConfiguration(environment)) {
     return undefined;
   }
   if (
@@ -382,6 +488,25 @@ async function createConfiguredProxyRuntime(
     schema,
     upstream: new ProxyUpstreamManager(transport, new ProxyConfigCache(schema)),
   });
+}
+
+/**
+ * Proxy has a dedicated transport until P14-T10 replaces it with the shared
+ * ingest upstream. Fail before either runtime can open a second device session.
+ */
+export function validateProxyUpstreamConfiguration(
+  environment: Record<string, string | undefined>,
+): boolean {
+  if (!parseOptionalBoolean(environment.CMCLIENT_PROXY_ENABLED, false)) {
+    return false;
+  }
+  const meshTransport =
+    environment.CMCLIENT_MESHTASTIC_TRANSPORT?.trim().toLowerCase() ||
+    "disabled";
+  if (meshTransport !== "disabled") {
+    throw new ProxyRuntimeError("PROXY_SECOND_UPSTREAM_FORBIDDEN");
+  }
+  return true;
 }
 
 function parseOptionalBoolean(
