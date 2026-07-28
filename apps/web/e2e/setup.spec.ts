@@ -40,7 +40,7 @@ test("setup is route-gated, keyboard operable, responsive, and credential-safe",
       JSON.stringify({ theme: "light", locale: "en-US" }),
     );
   });
-  await mockSetup(
+  const setupMock = await mockSetup(
     page,
     () => status,
     (next) => {
@@ -63,6 +63,9 @@ test("setup is route-gated, keyboard operable, responsive, and credential-safe",
   await expect(
     page.getByRole("heading", { name: "Choose your Meshtastic node" }),
   ).toBeVisible();
+  expect(setupMock.authSessionRequests).toBe(1);
+  expect(setupMock.termsRequests).toBe(1);
+  expect(setupMock.termsAcceptedWithSession).toBe(true);
 
   await page.getByRole("button", { name: "Review configuration" }).click();
   await expect(
@@ -102,12 +105,24 @@ test("setup is route-gated, keyboard operable, responsive, and credential-safe",
   ).not.toContain("fixture-private-setup-key");
 });
 
+interface SetupMockObservation {
+  authSessionRequests: number;
+  termsRequests: number;
+  termsAcceptedWithSession: boolean;
+}
+
 async function mockSetup(
   page: Page,
   getStatus: () => typeof termsStatus,
   setStatus: (status: typeof termsStatus) => void,
   captureConfigureBody: (body: string) => void,
-) {
+): Promise<SetupMockObservation> {
+  const csrfToken = "a".repeat(32);
+  const observation: SetupMockObservation = {
+    authSessionRequests: 0,
+    termsRequests: 0,
+    termsAcceptedWithSession: false,
+  };
   await page.route("**/api/v1/**", (route) =>
     route.fulfill({
       status: 503,
@@ -128,6 +143,17 @@ async function mockSetup(
     }),
   );
   await page.route("**/api/v1/setup/terms", async (route) => {
+    observation.termsRequests += 1;
+    const csrfMatches = route.request().headers()["x-csrf-token"] === csrfToken;
+    if (observation.authSessionRequests === 0 || !csrfMatches) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: '{"code":"MANAGEMENT_CSRF_INVALID"}',
+      });
+      return;
+    }
+    observation.termsAcceptedWithSession = true;
     setStatus(credentialsStatus);
     await route.fulfill({
       contentType: "application/json",
@@ -152,14 +178,16 @@ async function mockSetup(
       body: JSON.stringify(readyStatus),
     });
   });
-  await page.route("**/api/v1/auth/session", (route) =>
-    route.fulfill({
+  await page.route("**/api/v1/auth/session", (route) => {
+    observation.authSessionRequests += 1;
+    return route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({
         schemaVersion: 1,
-        csrfToken: "a".repeat(32),
+        csrfToken,
         expiresAt: 1_800_000_000,
       }),
-    }),
-  );
+    });
+  });
+  return observation;
 }
