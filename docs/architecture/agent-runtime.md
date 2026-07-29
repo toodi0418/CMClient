@@ -256,12 +256,15 @@ custom rename rotation; a new file is selected on the next UTC date.
 
 The logging drain accepts a stdout record only when it is a bounded JSON object,
 recursively redacts sensitive field names, and writes the sanitized object.
-Child stderr is treated only as a stable uppercase error-code channel. Unknown,
-malformed, or oversized records become a generic stable code rather than raw
-text. Sink initialization and write failures also become stable supervisor
-error codes while both pipes continue to drain, so a broken log destination
-cannot deadlock process shutdown. Stop, restart, and drop join the drain workers
-and flush accepted records before returning.
+Child stderr is treated only as a stable uppercase error-code channel except
+for the supervised Gateway's explicit private-bootstrap capture mode: because
+its stdout is reserved for the ready frame, that one mode accepts the same
+bounded structured schema on stderr. Unknown, malformed, or oversized records
+become a generic stable code rather than raw text. Sink initialization and
+write failures also become stable supervisor error codes while both pipes
+continue to drain, so a broken log destination cannot deadlock process
+shutdown. Stop, restart, and drop join the drain workers and flush accepted
+records before returning.
 
 Platform service managers tail only the newest dated file in each application
 log family with a bounded line count and retain a fixed-name legacy fallback.

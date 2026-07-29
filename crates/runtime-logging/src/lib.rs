@@ -330,7 +330,29 @@ impl StructuredLogSink {
         Stderr: Read + Send + 'static,
         Secrets: IntoIterator<Item = String>,
     {
-        self.capture_inner(stdout, stderr, secrets, None)
+        self.capture_inner(stdout, stderr, secrets, None, CaptureStream::Stderr)
+    }
+
+    /// Captures Gateway stderr after stdout has been consumed by private bootstrap.
+    ///
+    /// This mode accepts the same structured records as Gateway stdout in addition
+    /// to stable error codes. Ordinary stderr capture remains stable-code-only.
+    pub fn capture_private_bootstrap_gateway<Stderr, Secrets>(
+        &self,
+        stderr: Stderr,
+        secrets: Secrets,
+    ) -> Result<ChildOutputCapture, RuntimeLogError>
+    where
+        Stderr: Read + Send + 'static,
+        Secrets: IntoIterator<Item = String>,
+    {
+        self.capture_inner(
+            io::empty(),
+            stderr,
+            secrets,
+            None,
+            CaptureStream::PrivateBootstrapGatewayStderr,
+        )
     }
 
     fn capture_inner<Stdout, Stderr, Secrets>(
@@ -339,6 +361,7 @@ impl StructuredLogSink {
         stderr: Stderr,
         secrets: Secrets,
         writer_gate: Option<Receiver<()>>,
+        stderr_stream: CaptureStream,
     ) -> Result<ChildOutputCapture, RuntimeLogError>
     where
         Stdout: Read + Send + 'static,
@@ -389,7 +412,7 @@ impl StructuredLogSink {
         if let Err(error) = spawn_reader(
             "cmclient-log-stderr",
             stderr,
-            CaptureStream::Stderr,
+            stderr_stream,
             record_sender,
             self.clone(),
             secrets,
@@ -740,6 +763,7 @@ impl SinkState {
 enum CaptureStream {
     Stdout,
     Stderr,
+    PrivateBootstrapGatewayStderr,
 }
 
 struct CaptureRecord(Vec<u8>);
@@ -922,18 +946,30 @@ fn prepare_capture_record(
                     "RUNTIME_LOG_STDOUT_INVALID",
                 )
             }),
-        CaptureStream::Stderr if oversized => base_record(
-            &sink.shared.component,
-            "stderr",
-            LogLevel::Error,
-            "RUNTIME_LOG_STDERR_OVERSIZED",
-        ),
+        CaptureStream::Stderr | CaptureStream::PrivateBootstrapGatewayStderr if oversized => {
+            base_record(
+                &sink.shared.component,
+                "stderr",
+                LogLevel::Error,
+                "RUNTIME_LOG_STDERR_OVERSIZED",
+            )
+        }
         CaptureStream::Stderr => {
             let code = std::str::from_utf8(line)
                 .ok()
                 .filter(|code| is_stable_code(code))
                 .unwrap_or("RUNTIME_LOG_STDERR_INVALID");
             base_record(&sink.shared.component, "stderr", LogLevel::Error, code)
+        }
+        CaptureStream::PrivateBootstrapGatewayStderr => {
+            sanitize_structured_record(line, &sink.shared.component, "stderr", secrets)
+                .unwrap_or_else(|| {
+                    let code = std::str::from_utf8(line)
+                        .ok()
+                        .filter(|code| is_stable_code(code))
+                        .unwrap_or("RUNTIME_LOG_STDERR_INVALID");
+                    base_record(&sink.shared.component, "stderr", LogLevel::Error, code)
+                })
         }
     };
     let serialized =
@@ -945,7 +981,7 @@ fn prepare_capture_record(
             &sink.shared.component,
             match stream {
                 CaptureStream::Stdout => "stdout",
-                CaptureStream::Stderr => "stderr",
+                CaptureStream::Stderr | CaptureStream::PrivateBootstrapGatewayStderr => "stderr",
             },
             LogLevel::Warn,
             "RUNTIME_LOG_RECORD_OVERSIZED",
@@ -957,6 +993,15 @@ fn prepare_capture_record(
 fn sanitize_stdout_record(
     line: &[u8],
     component: &str,
+    secrets: &[Zeroizing<String>],
+) -> Option<Map<String, Value>> {
+    sanitize_structured_record(line, component, "stdout", secrets)
+}
+
+fn sanitize_structured_record(
+    line: &[u8],
+    component: &str,
+    stream: &'static str,
     secrets: &[Zeroizing<String>],
 ) -> Option<Map<String, Value>> {
     let Value::Object(mut input) = serde_json::from_slice::<Value>(line).ok()? else {
@@ -992,7 +1037,7 @@ fn sanitize_stdout_record(
         None => None,
     };
 
-    let mut record = base_record_with_level(component, "stdout", &level, &message, secrets);
+    let mut record = base_record_with_level(component, stream, &level, &message, secrets);
     record.insert(
         String::from("traceId"),
         Value::String(redact_needles(&trace_id, secrets)),
@@ -1471,7 +1516,11 @@ mod tests {
             "{\"level\":\"info\",\"message\":\"bad extra\",\"traceId\":\"trace-2\",\"extra\":\"must-not-leak\"}\n",
             "plain secret-value output\n"
         );
-        let stderr = "GATEWAY_START_FAILED\nsecret-value stack trace\n";
+        let stderr = concat!(
+            "GATEWAY_START_FAILED\n",
+            "{\"level\":\"info\",\"message\":\"ordinary-json-must-not-pass\",\"traceId\":\"trace-ordinary\"}\n",
+            "secret-value stack trace\n"
+        );
         let capture = sink
             .capture(
                 Cursor::new(stdout.as_bytes().to_vec()),
@@ -1490,9 +1539,48 @@ mod tests {
         assert!(!contents.contains("secret-value"));
         assert!(!contents.contains("must-not-leak"));
         assert!(!contents.contains("stack trace"));
+        assert!(!contents.contains("ordinary-json-must-not-pass"));
         for line in contents.lines() {
             let _: Value = serde_json::from_str(line).expect("each line should be JSON");
         }
+        remove_directory(directory);
+    }
+
+    #[test]
+    fn private_bootstrap_gateway_stderr_accepts_structured_records_and_stable_codes() {
+        let directory = temporary_directory("private-bootstrap-capture");
+        let sink = test_sink(&directory, "gateway.jsonl", MIN_LOG_MAX_BYTES, 1024);
+        let stderr = concat!(
+            "{\"level\":\"info\",\"message\":\"post-bootstrap secret-value\",\"traceId\":\"trace-private\",\"fields\":{\"password\":\"raw-password\",\"nested\":{\"value\":\"secret-value\"}}}\n",
+            "GATEWAY_PRIVATE_BOOTSTRAP_FAILED\n",
+            "{\"level\":\"info\",\"message\":\"malformed\"\n",
+            "secret-value private stack trace\n"
+        );
+        let capture = sink
+            .capture_private_bootstrap_gateway(
+                Cursor::new(stderr.as_bytes().to_vec()),
+                vec![String::from("secret-value")],
+            )
+            .expect("private bootstrap capture should start");
+        capture
+            .finish()
+            .expect("private bootstrap capture should finish");
+
+        let contents = read_log_family(&directory, "gateway.jsonl");
+        assert!(contents.contains("post-bootstrap [REDACTED]"));
+        assert!(contents.contains("GATEWAY_PRIVATE_BOOTSTRAP_FAILED"));
+        assert!(contents.contains("RUNTIME_LOG_STDERR_INVALID"));
+        assert!(!contents.contains("secret-value"));
+        assert!(!contents.contains("raw-password"));
+        assert!(!contents.contains("private stack trace"));
+        let structured = contents
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("each line should be JSON"))
+            .find(|record| record["message"] == "post-bootstrap [REDACTED]")
+            .expect("structured private bootstrap record should persist");
+        assert_eq!(structured["stream"], "stderr");
+        assert_eq!(structured["fields"]["password"], "[REDACTED]");
+        assert_eq!(structured["fields"]["nested"]["value"], "[REDACTED]");
         remove_directory(directory);
     }
 
@@ -1539,6 +1627,7 @@ mod tests {
                 Cursor::new(Vec::<u8>::new()),
                 Vec::new(),
                 Some(writer_gate),
+                CaptureStream::Stderr,
             )
             .expect("capture should start");
         let deadline = Instant::now() + Duration::from_secs(5);

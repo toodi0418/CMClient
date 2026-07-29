@@ -383,19 +383,21 @@ export function createGatewayApp(
     );
   });
   app.addHook("onResponse", (request, reply, done) => {
-    logger.log({
-      level: "info",
-      message: "gateway.request.complete",
-      traceId: request.traceId || createTraceId(),
-      ...(request.correlationId
-        ? { correlationId: request.correlationId }
-        : {}),
-      fields: {
-        method: request.method,
-        path: request.routeOptions.url ?? "unmatched",
-        statusCode: reply.statusCode,
-      },
-    });
+    if (shouldPersistRequestLog(request.method, reply.statusCode)) {
+      logger.log({
+        level: reply.statusCode >= 500 ? "error" : "info",
+        message: "gateway.request.complete",
+        traceId: request.traceId || createTraceId(),
+        ...(request.correlationId
+          ? { correlationId: request.correlationId }
+          : {}),
+        fields: {
+          method: request.method,
+          path: request.routeOptions.url ?? "unmatched",
+          statusCode: reply.statusCode,
+        },
+      });
+    }
     done();
   });
   app.register(async function gatewayRoutes(routeApp) {
@@ -785,6 +787,10 @@ export function createGatewayApp(
     });
   });
   return app;
+}
+
+function shouldPersistRequestLog(method: string, statusCode: number): boolean {
+  return statusCode >= 400 || (method !== "GET" && method !== "HEAD");
 }
 
 function frameworkStatusCode(error: unknown): number {

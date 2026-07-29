@@ -98,6 +98,39 @@ describe("GatewayRuntime", () => {
     await app.close();
   });
 
+  it("omits successful read polling but retains failures and mutations", async () => {
+    const logger = new MemoryLogger();
+    const app = createGatewayApp(logger);
+
+    const health = await app.inject("/api/v1/system/health");
+    expect(health.statusCode).toBe(200);
+    expect(logger.entries).toEqual([]);
+
+    const missing = await app.inject("/missing");
+    expect(missing.statusCode).toBe(404);
+    expect(logger.entries).toHaveLength(1);
+    expect(logger.entries[0]).toMatchObject({
+      level: "info",
+      message: "gateway.request.complete",
+      fields: { method: "GET", path: "unmatched", statusCode: 404 },
+    });
+
+    const invalidMutation = await app.inject({
+      method: "POST",
+      url: "/api/v1/system/health",
+    });
+    expect(invalidMutation.statusCode).toBe(405);
+    expect(logger.entries).toHaveLength(2);
+    expect(logger.entries[1]).toMatchObject({
+      fields: {
+        method: "POST",
+        path: "unmatched",
+        statusCode: 405,
+      },
+    });
+    await app.close();
+  });
+
   it("serves schema-backed system endpoints", async () => {
     const app = createGatewayApp(new MemoryLogger());
     const [health, version, capabilities, status, aprs] = await Promise.all([

@@ -600,7 +600,7 @@ impl GatewaySupervisor {
         })?;
         let secrets = self.child_output_redaction_secrets(ready);
         let capture = if stdout_reserved {
-            sink.capture(std::io::empty(), stderr, secrets)
+            sink.capture_private_bootstrap_gateway(stderr, secrets)
         } else {
             let stdout = child.stdout().take().ok_or_else(|| {
                 let code = RuntimeLogError::CaptureReadFailed.code();
@@ -1957,6 +1957,62 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn private_bootstrap_captures_post_ready_gateway_stderr_without_logging_ready_frame() {
+        let marker = unique_marker("bootstrap-logging-success");
+        let log_dir = unique_marker("bootstrap-logging");
+        let secret = "exact-private-bootstrap-secret";
+        let mut supervisor = powershell_bootstrap_supervisor("bootstrap-logging-success", &marker);
+        supervisor.set_environment(BTreeMap::from([(
+            String::from("CMCLIENT_FIXTURE_SECRET"),
+            String::from(secret),
+        )]));
+        fs::create_dir_all(&log_dir).expect("fixture log directory should create");
+        let sink = StructuredLogSink::open(
+            &log_dir,
+            "gateway.jsonl",
+            "gateway",
+            LogPolicy {
+                max_bytes: MIN_LOG_MAX_BYTES,
+                retained_files: 2,
+                max_line_bytes: 1024,
+            },
+        )
+        .expect("fixture log sink should open");
+        supervisor
+            .set_log_sink(sink)
+            .expect("fixture log sink should attach");
+        supervisor
+            .enable_private_bootstrap()
+            .expect("private bootstrap should enable");
+
+        supervisor
+            .start()
+            .expect("private bootstrap logging child should start");
+        supervisor
+            .stop()
+            .expect("private bootstrap logging child should stop");
+
+        let (_, contents) = read_gateway_logs(&log_dir);
+        assert!(contents.contains("post-bootstrap [REDACTED]"));
+        assert!(contents.contains("GATEWAY_PRIVATE_BOOTSTRAP_FAILED"));
+        assert!(contents.contains("RUNTIME_LOG_STDERR_INVALID"));
+        assert!(!contents.contains(secret));
+        assert!(!contents.contains("raw-private-password"));
+        assert!(!contents.contains("malformed private bootstrap stderr"));
+        assert!(!contents.contains("gateway.ready"));
+        let structured = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["message"] == "post-bootstrap [REDACTED]")
+            .expect("post-bootstrap structured record should persist");
+        assert_eq!(structured["stream"], "stderr");
+        assert_eq!(structured["fields"]["password"], "[REDACTED]");
+        assert_eq!(structured["fields"]["nested"]["value"], "[REDACTED]");
+        fs::remove_dir_all(log_dir).expect("fixture log directory should remove");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn private_bootstrap_tolerates_bounded_windows_cold_start() {
         let marker = unique_marker("bootstrap-delayed-success");
         let mut supervisor = powershell_bootstrap_supervisor("bootstrap-delayed-success", &marker);
@@ -2801,6 +2857,42 @@ $heldStdout = [Console]::OpenStandardOutput()
 }
 
 switch ($mode) {
+    'bootstrap-logging-success' {
+        $listener = [Net.Sockets.TcpListener]::new(
+            [Net.IPAddress]::Loopback,
+            0
+        )
+        $listener.Start()
+        $port = [uint16]$listener.LocalEndpoint.Port
+        Write-Ready ([uint32]$PID) $nonce $port
+        Serve-Ownership-Proof $listener $port
+        $record = [ordered]@{
+            level = 'info'
+            message = "post-bootstrap $($env:CMCLIENT_FIXTURE_SECRET)"
+            traceId = 'private-bootstrap-trace'
+            fields = [ordered]@{
+                password = 'raw-private-password'
+                nested = [ordered]@{
+                    value = [string]$env:CMCLIENT_FIXTURE_SECRET
+                }
+            }
+        }
+        [Console]::Error.WriteLine(($record | ConvertTo-Json -Compress -Depth 5))
+        [Console]::Error.WriteLine('GATEWAY_PRIVATE_BOOTSTRAP_FAILED')
+        [Console]::Error.WriteLine('malformed private bootstrap stderr')
+        $shutdown = [byte[]]::new(18)
+        $offset = 0
+        while ($offset -lt $shutdown.Length) {
+            $count = $inputStream.Read(
+                $shutdown,
+                $offset,
+                $shutdown.Length - $offset
+            )
+            if ($count -eq 0) { break }
+            $offset += $count
+        }
+        exit 0
+    }
     'bootstrap-success' {
         $listener = [Net.Sockets.TcpListener]::new(
             [Net.IPAddress]::Loopback,

@@ -43,15 +43,19 @@ Agent writes the `agent.jsonl.YYYY-MM-DD` daily family; Supervisor drains
 Gateway stdout/stderr into `gateway.jsonl.YYYY-MM-DD`; the Windows SCM wrapper
 additionally writes `service-host.jsonl.YYYY-MM-DD`. Each JSONL record has
 `schemaVersion: 1`. Structured
-stdout is allowlisted and recursively redacted, while child stderr accepts only
-a stable uppercase code; malformed, raw, or oversized output becomes a generic
-`RUNTIME_LOG_*` record. Unix log files are mode `0600`, and symlink, reparse
-point, or non-file destinations fail closed. Platform manager `logs` commands
-accept only `1..10000` lines. launchd, systemd, and Windows select the newest
-UTC-dated file in each family and retain fixed-name legacy fallback. systemd
-falls back, only when both application families are absent,
-to the bounded journal tail filtered to stable uppercase codes. No manager
-exposes unbounded raw child output.
+stdout is allowlisted and recursively redacted. Child stderr normally accepts
+only a stable uppercase code; the supervised Gateway's stdout is reserved for
+its private ready frame, so its dedicated capture mode also accepts the same
+allowlisted structured JSON on stderr. Malformed, raw, or oversized output
+becomes a generic `RUNTIME_LOG_*` record. Successful read-only Gateway polling
+is omitted from durable completion logs; mutations and unsuccessful responses
+remain recorded. Unix log files are mode `0600`, and symlink, reparse point, or
+non-file destinations fail closed. Platform manager `logs` commands accept
+only `1..10000` lines. launchd, systemd, and Windows select the newest UTC-dated
+file in each family and retain fixed-name legacy fallback. systemd falls back,
+only when both application families are absent, to the bounded journal tail
+filtered to stable uppercase codes. No manager exposes unbounded raw child
+output.
 
 The active daily file and its retained daily generations are bounded by strict
 decimal environment settings supplied to Agent or Service Host:
