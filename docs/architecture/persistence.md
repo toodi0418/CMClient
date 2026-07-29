@@ -27,9 +27,16 @@ Migration 14 adds the singleton CallMesh synchronization snapshot and a durable
 mapping-hash history. The active mapping rows, accepted server time, mapping
 fingerprint, heartbeat receive time, and optional provision lease are replaced
 in the same transaction. Each hash keeps its immutable first server time and a
-monotonic last server time. The provision is normalized and stored without an
-APRS passcode; the history prevents a previously superseded mapping hash from
-becoming active after restart.
+monotonic last server time and is permanently bound to one normalized mapping
+fingerprint. The provision is normalized and stored without an APRS passcode.
+The immutable `first_server_time` is also the normalization fallback for hosted
+mapping items that omit `effective_at`, keeping the same hash and content stable
+when it is fetched again after a restart or server-time regression.
+An exact current mapping/provision snapshot can renew its local receive-time
+lease without lowering the accepted server high-water, and a newer revision can
+reactivate a historical hash only when its fetched mapping fingerprint matches
+the immutable history. Reused hashes with changed content fail closed across
+restart.
 Migration 19 separates APRS transport state from observer delivery state,
 stores submission/confirmation/expiry timestamps, rebuilds observer and local
 caches with `(callsign, destination, info)` primary keys, and clears delivery

@@ -85,20 +85,32 @@ never placed in URLs, request diagnostics, events, or projections. Redirects
 are rejected and response bodies are incrementally limited to 512 KiB.
 
 Heartbeat, normalized mappings, server time, payload fingerprints, and the
-normalized provision are committed in one SQLite transaction. Mapping hashes
-are remembered as a durable no-downgrade high-water across restarts. A
-provision has a three-minute lease measured from the successful local receive
-time; revocation, expiry, clock rollback, schema conflict, or an untrusted
-revision makes it unavailable to APRS. Public status exposes only provision
-state, never callsign identity, symbols, comment, or a derived passcode.
+normalized provision are committed in one SQLite transaction. The accepted
+server time remains a durable no-downgrade high-water across restarts, while
+each mapping hash is permanently bound to its normalized mapping fingerprint.
+When a hosted mapping item omits its own effective time, normalization reuses
+that hash's durable first accepted server time rather than the current
+heartbeat time, so refetching unchanged content remains byte-stable across
+timestamp repeats, rollbacks, and restarts.
+An otherwise identical heartbeat may refresh the successful local receive time
+and three-minute provision lease when the server repeats or rolls back its
+timestamp; the stored server high-water never moves backward. A newer server
+revision may reuse a historical hash only after the fetched mapping fingerprint
+matches that hash's immutable history. An older response with different content
+is rejected and cannot renew the lease, but it cannot revoke the previously
+trusted provision before that lease's original expiry. Equal-time content
+conflicts, revocation, expiry, local clock rollback, or schema conflict make the
+provision unavailable to APRS. Public status exposes only provision state,
+never callsign identity, symbols, comment, or a derived passcode.
 
 ## APRS runtime
 
 Agent supplies only APRS enablement plus optional endpoint and destination
 overrides. Gateway owns the default `asia.aprs2.net:14580` endpoint and obtains
 callsign/SSID, symbol, comment, and a derived runtime passcode from the current
-valid CallMesh provision. A missing, revoked, expired, stale, or conflicting
-provision stops APRS authorization and fails closed; static identity/passcode
+valid CallMesh provision. A missing, revoked, expired, locally time-invalid, or
+conflicting provision stops APRS authorization and fails closed; a rejected
+stale reply never extends the current lease. Static identity/passcode
 environment values are rejected. The runtime performs an immediate outbox
 flush and APRS-monitor refresh, then repeats both on bounded configured
 intervals. The receive-only observer derives its login as

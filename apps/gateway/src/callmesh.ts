@@ -46,9 +46,15 @@ export interface CallMeshAprsState {
 
 export interface CallMeshHistoryHighWater {
   mappingHash: string;
+  firstServerTime: string;
   lastServerTime: string;
   mappingsFingerprint: string;
 }
+
+export type CallMeshHistoricalMapping = Pick<
+  CallMeshHistoryHighWater,
+  "firstServerTime" | "mappingsFingerprint"
+>;
 
 export interface CallMeshSnapshotStore {
   list(): CallMeshMapping[];
@@ -56,7 +62,7 @@ export interface CallMeshSnapshotStore {
   applySnapshot(snapshot: CallMeshSyncSnapshot): void;
   deactivateSnapshot(updatedAt: string): void;
   loadHistoryHighWater(): CallMeshHistoryHighWater | undefined;
-  hasHistoricalHash(hash: string): boolean;
+  loadHistoricalMapping(hash: string): CallMeshHistoricalMapping | undefined;
 }
 
 export interface CallMeshClientOptions {
@@ -271,7 +277,7 @@ export class CallMeshMappingRepository implements CallMeshSnapshotStore {
     try {
       const row = this.database
         .prepare(
-          "SELECT mapping_hash, last_server_time, mappings_fingerprint FROM callmesh_sync_history ORDER BY last_server_time DESC, mapping_hash ASC LIMIT 1",
+          "SELECT mapping_hash, first_server_time, last_server_time, mappings_fingerprint FROM callmesh_sync_history ORDER BY last_server_time DESC, mapping_hash ASC LIMIT 1",
         )
         .get();
       if (!row) {
@@ -279,10 +285,15 @@ export class CallMeshMappingRepository implements CallMeshSnapshotStore {
       }
       const highWater: CallMeshHistoryHighWater = {
         mappingHash: parseHash(row.mapping_hash),
+        firstServerTime: normalizeTimestamp(row.first_server_time),
         lastServerTime: normalizeTimestamp(row.last_server_time),
         mappingsFingerprint: String(row.mappings_fingerprint),
       };
-      if (!FINGERPRINT_PATTERN.test(highWater.mappingsFingerprint)) {
+      if (
+        Date.parse(highWater.firstServerTime) >
+          Date.parse(highWater.lastServerTime) ||
+        !FINGERPRINT_PATTERN.test(highWater.mappingsFingerprint)
+      ) {
         throw new CallMeshClientError("CALLMESH_MAPPING_STORE_FAILED");
       }
       return highWater;
@@ -291,15 +302,29 @@ export class CallMeshMappingRepository implements CallMeshSnapshotStore {
     }
   }
 
-  hasHistoricalHash(hash: string): boolean {
+  loadHistoricalMapping(hash: string): CallMeshHistoricalMapping | undefined {
     try {
-      return Boolean(
-        this.database
-          .prepare(
-            "SELECT 1 AS present FROM callmesh_sync_history WHERE mapping_hash = ?",
-          )
-          .get(hash),
-      );
+      const row = this.database
+        .prepare(
+          "SELECT first_server_time, last_server_time, mappings_fingerprint FROM callmesh_sync_history WHERE mapping_hash = ?",
+        )
+        .get(parseHash(hash));
+      if (!row) {
+        return undefined;
+      }
+      const historicalMapping: CallMeshHistoricalMapping = {
+        firstServerTime: normalizeTimestamp(row.first_server_time),
+        mappingsFingerprint: String(row.mappings_fingerprint),
+      };
+      const lastServerTime = normalizeTimestamp(row.last_server_time);
+      if (
+        Date.parse(historicalMapping.firstServerTime) >
+          Date.parse(lastServerTime) ||
+        !FINGERPRINT_PATTERN.test(historicalMapping.mappingsFingerprint)
+      ) {
+        throw new CallMeshClientError("CALLMESH_MAPPING_STORE_FAILED");
+      }
+      return historicalMapping;
     } catch {
       throw new CallMeshClientError("CALLMESH_MAPPING_STORE_FAILED");
     }
@@ -344,7 +369,10 @@ export class CallMeshClient {
   private readonly baseUrl: URL;
   private readonly agent: string;
   private readonly meshNetworkId: string;
-  private readonly historicalHashes = new Set<string>();
+  private readonly historicalMappings = new Map<
+    string,
+    CallMeshHistoricalMapping
+  >();
   private status: CallMeshStatus;
   private mappings: CallMeshMapping[] = [];
   private mappingHash: string | undefined;
@@ -400,6 +428,12 @@ export class CallMeshClient {
     }
     try {
       this.historyHighWater = snapshotStore?.loadHistoryHighWater();
+      if (this.historyHighWater) {
+        this.historicalMappings.set(this.historyHighWater.mappingHash, {
+          firstServerTime: this.historyHighWater.firstServerTime,
+          mappingsFingerprint: this.historyHighWater.mappingsFingerprint,
+        });
+      }
     } catch {
       restoreFailed = true;
       this.historyTrusted = false;
@@ -418,7 +452,10 @@ export class CallMeshClient {
           this.mappingsFingerprint = recoveryFingerprint;
           this.mappingSyncedAt = this.historyHighWater.lastServerTime;
           this.mappings = recoveryMappings.map((mapping) => ({ ...mapping }));
-          this.historicalHashes.add(this.historyHighWater.mappingHash);
+          this.historicalMappings.set(this.historyHighWater.mappingHash, {
+            firstServerTime: this.historyHighWater.firstServerTime,
+            mappingsFingerprint: recoveryFingerprint,
+          });
         }
       } catch {
         restoreFailed = true;
@@ -569,15 +606,11 @@ export class CallMeshClient {
       const provisionFingerprint = provision
         ? fingerprint(provision)
         : undefined;
-      this.validateMonotonicHeartbeat(heartbeat, provisionFingerprint);
-
-      if (heartbeat.serverTime === this.acceptedServerTime) {
-        if (!this.activeStateEligible) {
-          throw new CallMeshClientError("CALLMESH_STALE_RESPONSE");
-        }
-        this.status = this.makeStatus("ready");
-        return;
-      }
+      const preserveServerHighWater = this.validateMonotonicHeartbeat(
+        heartbeat,
+        provisionFingerprint,
+      );
+      const historicalMapping = this.loadHistoricalMapping(heartbeat.hash);
 
       if (
         this.mappingHash &&
@@ -591,6 +624,12 @@ export class CallMeshClient {
       let mappingsFingerprint = this.mappingsFingerprint;
       let mappingSyncedAt = this.mappingSyncedAt;
       const acceptedAt = this.clock().toISOString();
+      if (
+        this.lastHeartbeatAt &&
+        Date.parse(acceptedAt) < Date.parse(this.lastHeartbeatAt)
+      ) {
+        throw new CallMeshClientError("CALLMESH_STALE_RESPONSE");
+      }
       const requiresMappings = heartbeat.needsUpdate || !this.mappingHash;
       if (requiresMappings) {
         const response = parseMappingsResponse(
@@ -605,7 +644,7 @@ export class CallMeshClient {
           response.items,
           response.hash,
           this.meshNetworkId,
-          heartbeat.serverTime,
+          historicalMapping?.firstServerTime ?? heartbeat.serverTime,
         );
         mappingsFingerprint = fingerprint(mappings);
         if (
@@ -622,9 +661,33 @@ export class CallMeshClient {
         ) {
           throw new CallMeshClientError("CALLMESH_RESPONSE_CONFLICT");
         }
-        mappingSyncedAt = acceptedAt;
+        this.validateHistoricalMappingFingerprint(
+          historicalMapping,
+          mappingsFingerprint,
+        );
+        mappingSyncedAt = preserveServerHighWater
+          ? this.mappingSyncedAt
+          : acceptedAt;
       }
       if (!mappingsFingerprint || !mappingSyncedAt) {
+        throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
+      }
+      if (
+        preserveServerHighWater &&
+        (heartbeat.hash !== this.mappingHash ||
+          mappingsFingerprint !== this.mappingsFingerprint ||
+          provisionFingerprint !== this.provisionFingerprint)
+      ) {
+        throw new CallMeshClientError("CALLMESH_RESPONSE_CONFLICT");
+      }
+      this.validateHistoricalMappingFingerprint(
+        historicalMapping,
+        mappingsFingerprint,
+      );
+      const acceptedServerTime = preserveServerHighWater
+        ? this.acceptedServerTime
+        : heartbeat.serverTime;
+      if (!acceptedServerTime) {
         throw new CallMeshClientError("CALLMESH_SCHEMA_INVALID");
       }
 
@@ -634,7 +697,7 @@ export class CallMeshClient {
       const snapshot: CallMeshSyncSnapshot = {
         active: true,
         mappingHash: heartbeat.hash,
-        acceptedServerTime: heartbeat.serverTime,
+        acceptedServerTime,
         mappingsFingerprint,
         lastHeartbeatAt: acceptedAt,
         mappingSyncedAt,
@@ -644,7 +707,13 @@ export class CallMeshClient {
         mappings,
       };
       this.snapshotStore?.applySnapshot(snapshot);
-      this.historicalHashes.add(snapshot.mappingHash);
+      this.historicalMappings.set(
+        snapshot.mappingHash,
+        historicalMapping ?? {
+          firstServerTime: heartbeat.serverTime,
+          mappingsFingerprint: snapshot.mappingsFingerprint,
+        },
+      );
       this.restoreSnapshot(snapshot);
       this.status = this.makeStatus("ready");
     } catch (error) {
@@ -674,7 +743,7 @@ export class CallMeshClient {
   private validateMonotonicHeartbeat(
     heartbeat: ParsedHeartbeat,
     provisionFingerprint: string | undefined,
-  ): void {
+  ): boolean {
     if (!this.acceptedServerTime) {
       if (this.historyHighWater) {
         const ordering =
@@ -683,34 +752,66 @@ export class CallMeshClient {
         if (ordering <= 0) {
           throw new CallMeshClientError("CALLMESH_STALE_RESPONSE");
         }
-        if (
-          heartbeat.hash !== this.historyHighWater.mappingHash &&
-          (this.historicalHashes.has(heartbeat.hash) ||
-            this.snapshotStore?.hasHistoricalHash(heartbeat.hash))
-        ) {
-          throw new CallMeshClientError("CALLMESH_STALE_RESPONSE");
-        }
       }
-      return;
+      return false;
     }
     const ordering =
       Date.parse(heartbeat.serverTime) - Date.parse(this.acceptedServerTime);
     if (ordering < 0) {
-      throw new CallMeshClientError("CALLMESH_STALE_RESPONSE");
+      if (!this.matchesCurrentHeartbeat(heartbeat, provisionFingerprint)) {
+        throw new CallMeshClientError("CALLMESH_STALE_RESPONSE");
+      }
+      return true;
     }
+    if (ordering === 0) {
+      if (!this.activeStateEligible) {
+        throw new CallMeshClientError("CALLMESH_STALE_RESPONSE");
+      }
+      if (!this.matchesCurrentHeartbeat(heartbeat, provisionFingerprint)) {
+        throw new CallMeshClientError("CALLMESH_RESPONSE_CONFLICT");
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private matchesCurrentHeartbeat(
+    heartbeat: ParsedHeartbeat,
+    provisionFingerprint: string | undefined,
+  ): boolean {
+    return Boolean(
+      this.activeStateEligible &&
+      this.mappingHash &&
+      this.mappingsFingerprint &&
+      this.mappingSyncedAt &&
+      heartbeat.hash === this.mappingHash &&
+      provisionFingerprint === this.provisionFingerprint,
+    );
+  }
+
+  private loadHistoricalMapping(
+    mappingHash: string,
+  ): CallMeshHistoricalMapping | undefined {
+    const cached = this.historicalMappings.get(mappingHash);
+    if (cached) {
+      return cached;
+    }
+    const stored = this.snapshotStore?.loadHistoricalMapping(mappingHash);
+    if (stored) {
+      this.historicalMappings.set(mappingHash, stored);
+    }
+    return stored;
+  }
+
+  private validateHistoricalMappingFingerprint(
+    historicalMapping: CallMeshHistoricalMapping | undefined,
+    mappingsFingerprint: string,
+  ): void {
     if (
-      ordering === 0 &&
-      (heartbeat.hash !== this.mappingHash ||
-        provisionFingerprint !== this.provisionFingerprint)
+      historicalMapping &&
+      historicalMapping.mappingsFingerprint !== mappingsFingerprint
     ) {
       throw new CallMeshClientError("CALLMESH_RESPONSE_CONFLICT");
-    }
-    if (
-      heartbeat.hash !== this.mappingHash &&
-      (this.historicalHashes.has(heartbeat.hash) ||
-        this.snapshotStore?.hasHistoricalHash(heartbeat.hash))
-    ) {
-      throw new CallMeshClientError("CALLMESH_STALE_RESPONSE");
     }
   }
 
@@ -792,9 +893,16 @@ export class CallMeshClient {
     this.provisionExpiresAt = snapshot.provisionExpiresAt;
     this.provisionFingerprint = snapshot.provisionFingerprint;
     this.mappings = snapshot.mappings.map((mapping) => ({ ...mapping }));
-    this.historicalHashes.add(snapshot.mappingHash);
+    const historicalMapping = this.historicalMappings.get(
+      snapshot.mappingHash,
+    ) ?? {
+      firstServerTime: snapshot.acceptedServerTime,
+      mappingsFingerprint: snapshot.mappingsFingerprint,
+    };
+    this.historicalMappings.set(snapshot.mappingHash, historicalMapping);
     this.historyHighWater = {
       mappingHash: snapshot.mappingHash,
+      firstServerTime: historicalMapping.firstServerTime,
       lastServerTime: snapshot.acceptedServerTime,
       mappingsFingerprint: snapshot.mappingsFingerprint,
     };

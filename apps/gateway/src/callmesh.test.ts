@@ -147,8 +147,8 @@ describe("CallMesh client", () => {
       active: true,
       mappingHash: recordedMappings.hash,
       acceptedServerTime: "2026-07-18T00:00:00.000Z",
-      lastHeartbeatAt: "2026-07-18T00:00:30.000Z",
-      provisionExpiresAt: "2026-07-18T00:03:30.000Z",
+      lastHeartbeatAt: "2026-07-18T00:02:30.000Z",
+      provisionExpiresAt: "2026-07-18T00:05:30.000Z",
       mappings: [normalizedMapping()],
     });
     const withoutKey = new CallMeshClient(
@@ -184,6 +184,207 @@ describe("CallMesh client", () => {
     ]);
     database.close();
     await close(server);
+  });
+
+  it("renews unchanged provision after server-time rollback without lowering the high-water", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let now = "2026-07-18T00:00:30.000Z";
+    const initial = new CallMeshClient(
+      {
+        ...clientOptions(async (input) =>
+          new URL(String(input)).pathname.endsWith("/mappings")
+            ? jsonResponse(recordedMappings)
+            : jsonResponse(heartbeat()),
+        ),
+        clock: () => new Date(now),
+      },
+      database.callmeshMappings,
+    );
+    await initial.synchronize();
+
+    now = "2026-07-18T00:03:31.000Z";
+    let requests = 0;
+    let heartbeatRequests = 0;
+    const restarted = new CallMeshClient(
+      {
+        ...clientOptions(async (input) => {
+          requests += 1;
+          if (new URL(String(input)).pathname.endsWith("/mappings")) {
+            return jsonResponse(recordedMappings);
+          }
+          heartbeatRequests += 1;
+          return jsonResponse(
+            heartbeat({
+              needs_update: heartbeatRequests === 2,
+              server_time: "2026-07-17T23:59:59.000Z",
+            }),
+          );
+        }),
+        clock: () => new Date(now),
+      },
+      database.callmeshMappings,
+    );
+    expect(restarted.getOverview().status.provisionState).toBe("expired");
+
+    await restarted.synchronize();
+
+    expect(requests).toBe(1);
+    expect(restarted.getOverview()).toMatchObject({
+      status: {
+        state: "ready",
+        lastServerTime: "2026-07-18T00:00:00.000Z",
+        activeMappingCount: 1,
+        provisionState: "valid",
+      },
+      mappings: [normalizedMapping()],
+    });
+    expect(restarted.getAprsState()).toBeDefined();
+    expect(database.callmeshMappings.loadSnapshot()).toMatchObject({
+      acceptedServerTime: "2026-07-18T00:00:00.000Z",
+      lastHeartbeatAt: "2026-07-18T00:03:31.000Z",
+      provisionExpiresAt: "2026-07-18T00:06:31.000Z",
+      mappings: [normalizedMapping()],
+    });
+
+    now = "2026-07-18T00:04:31.000Z";
+    await restarted.synchronize();
+
+    expect(requests).toBe(3);
+    expect(restarted.getOverview().status).toMatchObject({
+      state: "ready",
+      lastServerTime: "2026-07-18T00:00:00.000Z",
+      provisionState: "valid",
+    });
+    expect(database.callmeshMappings.loadSnapshot()).toMatchObject({
+      acceptedServerTime: "2026-07-18T00:00:00.000Z",
+      lastHeartbeatAt: "2026-07-18T00:04:31.000Z",
+      mappingSyncedAt: "2026-07-18T00:00:30.000Z",
+      provisionExpiresAt: "2026-07-18T00:07:31.000Z",
+      mappings: [normalizedMapping()],
+    });
+    database.close();
+  });
+
+  it("rejects a rolled-back heartbeat when its provision differs", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const initial = new CallMeshClient(
+      clientOptions(async (input) =>
+        new URL(String(input)).pathname.endsWith("/mappings")
+          ? jsonResponse(recordedMappings)
+          : jsonResponse(heartbeat()),
+      ),
+      database.callmeshMappings,
+    );
+    await initial.synchronize();
+
+    const stale = new CallMeshClient(
+      clientOptions(async () =>
+        jsonResponse(
+          heartbeat({
+            needs_update: false,
+            provision: { ...provision, comment: "Changed fixture" },
+            server_time: "2026-07-17T23:59:59.000Z",
+          }),
+        ),
+      ),
+      database.callmeshMappings,
+    );
+    await stale.synchronize();
+
+    expect(stale.getOverview().status).toMatchObject({
+      state: "degraded",
+      reasonCode: "CALLMESH_STALE_RESPONSE",
+    });
+    expect(database.callmeshMappings.loadSnapshot()).toMatchObject({
+      active: true,
+      lastHeartbeatAt: "2026-07-18T00:00:30.000Z",
+      provisionExpiresAt: "2026-07-18T00:03:30.000Z",
+    });
+    database.close();
+  });
+
+  it("does not renew or expose APRS when the local receive clock moves backward", async () => {
+    const database = new GatewayDatabase(":memory:");
+    let now = "2026-07-18T00:00:30.000Z";
+    const initial = new CallMeshClient(
+      {
+        ...clientOptions(async (input) =>
+          new URL(String(input)).pathname.endsWith("/mappings")
+            ? jsonResponse(recordedMappings)
+            : jsonResponse(heartbeat()),
+        ),
+        clock: () => new Date(now),
+      },
+      database.callmeshMappings,
+    );
+    await initial.synchronize();
+
+    now = "2026-07-18T00:00:29.000Z";
+    const rolledBack = new CallMeshClient(
+      {
+        ...clientOptions(async () =>
+          jsonResponse(heartbeat({ needs_update: false })),
+        ),
+        clock: () => new Date(now),
+      },
+      database.callmeshMappings,
+    );
+    expect(rolledBack.getAprsState()).toBeUndefined();
+
+    await rolledBack.synchronize();
+
+    expect(rolledBack.getOverview().status).toMatchObject({
+      state: "degraded",
+      reasonCode: "CALLMESH_STALE_RESPONSE",
+      provisionState: "expired",
+    });
+    expect(rolledBack.getAprsState()).toBeUndefined();
+    expect(database.callmeshMappings.loadSnapshot()).toMatchObject({
+      active: true,
+      lastHeartbeatAt: "2026-07-18T00:00:30.000Z",
+      provisionExpiresAt: "2026-07-18T00:03:30.000Z",
+    });
+    database.close();
+  });
+
+  it("deactivates an equal-time heartbeat whose provision content changed", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const initial = new CallMeshClient(
+      clientOptions(async (input) =>
+        new URL(String(input)).pathname.endsWith("/mappings")
+          ? jsonResponse(recordedMappings)
+          : jsonResponse(heartbeat()),
+      ),
+      database.callmeshMappings,
+    );
+    await initial.synchronize();
+
+    const conflict = new CallMeshClient(
+      clientOptions(async () =>
+        jsonResponse(
+          heartbeat({
+            needs_update: false,
+            provision: { ...provision, comment: "Changed fixture" },
+          }),
+        ),
+      ),
+      database.callmeshMappings,
+    );
+    await conflict.synchronize();
+
+    expect(conflict.getOverview().status).toMatchObject({
+      state: "degraded",
+      reasonCode: "CALLMESH_RESPONSE_CONFLICT",
+      activeMappingCount: 0,
+      provisionState: "invalid",
+    });
+    expect(conflict.getAprsState()).toBeUndefined();
+    expect(database.callmeshMappings.loadSnapshot()).toMatchObject({
+      active: false,
+      mappingHash: recordedMappings.hash,
+    });
+    expect(database.callmeshMappings.loadSnapshot()?.provision).toBeUndefined();
+    database.close();
   });
 
   it("accepts the hosted Legacy provision altitude and PHG fields", async () => {
@@ -585,6 +786,132 @@ describe("CallMesh client", () => {
     database.close();
   });
 
+  it("reactivates a newer historical hash only when its mapping content is unchanged", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const revisions = [
+      {
+        hash: "mapping-a",
+        serverTime: "2026-07-18T00:00:00.000Z",
+        items: [wireMapping("N0AAA")],
+      },
+      {
+        hash: "mapping-b",
+        serverTime: "2026-07-18T00:01:00.000Z",
+        items: [wireMapping("N0BBB")],
+      },
+      {
+        hash: "mapping-a",
+        serverTime: "2026-07-18T00:02:00.000Z",
+        items: [wireMapping("N0AAA")],
+      },
+    ];
+    let heartbeatIndex = -1;
+    const upstream = async (input: RequestInfo | URL) => {
+      if (new URL(String(input)).pathname.endsWith("/heartbeat")) {
+        heartbeatIndex += 1;
+        const revision = revisions[heartbeatIndex]!;
+        return jsonResponse(
+          heartbeat({
+            hash: revision.hash,
+            needs_update: true,
+            server_time: revision.serverTime,
+          }),
+        );
+      }
+      const revision = revisions[heartbeatIndex]!;
+      return jsonResponse({ hash: revision.hash, items: revision.items });
+    };
+    const client = new CallMeshClient(
+      clientOptions(upstream),
+      database.callmeshMappings,
+    );
+
+    await client.synchronize();
+    await client.synchronize();
+    const restarted = new CallMeshClient(
+      clientOptions(upstream),
+      database.callmeshMappings,
+    );
+    await restarted.synchronize();
+
+    expect(restarted.getOverview()).toMatchObject({
+      status: {
+        state: "ready",
+        activeMappingHash: "mapping-a",
+        lastServerTime: "2026-07-18T00:02:00.000Z",
+      },
+      mappings: [{ callsign: "N0AAA-7" }],
+    });
+    expect(
+      database.connection
+        .prepare("SELECT COUNT(*) AS count FROM callmesh_sync_history")
+        .get(),
+    ).toEqual({ count: 2 });
+    database.close();
+  });
+
+  it("rejects changed mapping content hidden behind a historical hash", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const revisions = [
+      {
+        hash: "mapping-a",
+        serverTime: "2026-07-18T00:00:00.000Z",
+        items: [wireMapping("N0AAA")],
+      },
+      {
+        hash: "mapping-b",
+        serverTime: "2026-07-18T00:01:00.000Z",
+        items: [wireMapping("N0BBB")],
+      },
+      {
+        hash: "mapping-a",
+        serverTime: "2026-07-18T00:02:00.000Z",
+        items: [wireMapping("N0BAD")],
+      },
+    ];
+    let heartbeatIndex = -1;
+    const upstream = async (input: RequestInfo | URL) => {
+      if (new URL(String(input)).pathname.endsWith("/heartbeat")) {
+        heartbeatIndex += 1;
+        const revision = revisions[heartbeatIndex]!;
+        return jsonResponse(
+          heartbeat({
+            hash: revision.hash,
+            needs_update: true,
+            server_time: revision.serverTime,
+          }),
+        );
+      }
+      const revision = revisions[heartbeatIndex]!;
+      return jsonResponse({ hash: revision.hash, items: revision.items });
+    };
+    const client = new CallMeshClient(
+      clientOptions(upstream),
+      database.callmeshMappings,
+    );
+
+    await client.synchronize();
+    await client.synchronize();
+    const restarted = new CallMeshClient(
+      clientOptions(upstream),
+      database.callmeshMappings,
+    );
+    await restarted.synchronize();
+
+    expect(restarted.getOverview().status).toMatchObject({
+      state: "degraded",
+      reasonCode: "CALLMESH_RESPONSE_CONFLICT",
+      activeMappingCount: 0,
+      provisionState: "invalid",
+    });
+    expect(database.callmeshMappings.loadSnapshot()).toMatchObject({
+      active: false,
+      mappingHash: "mapping-b",
+      mappings: [{ callsign: "N0BBB-7" }],
+    });
+    database.close();
+  });
+
   it("restores the last snapshot and rejects stale or conflicting revisions without downgrade", async () => {
     const database = new GatewayDatabase(":memory:");
     const initial = new CallMeshClient(
@@ -877,6 +1204,51 @@ describe("CallMesh client", () => {
     database.close();
   });
 
+  it("rejects a durable mapping history whose first server time exceeds its last", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const initial = new CallMeshClient(
+      clientOptions(async (input) =>
+        new URL(String(input)).pathname.endsWith("/mappings")
+          ? jsonResponse(recordedMappings)
+          : jsonResponse(heartbeat()),
+      ),
+      database.callmeshMappings,
+    );
+    await initial.synchronize();
+    database.connection
+      .prepare(
+        "UPDATE callmesh_sync_history SET first_server_time = ? WHERE mapping_hash = ?",
+      )
+      .run("2026-07-18T00:00:01.000Z", recordedMappings.hash);
+    expect(() =>
+      database.callmeshMappings.loadHistoricalMapping(recordedMappings.hash),
+    ).toThrow("CALLMESH_MAPPING_STORE_FAILED");
+    let requests = 0;
+    const isolated = new CallMeshClient(
+      clientOptions(async () => {
+        requests += 1;
+        return jsonResponse(
+          heartbeat({ server_time: "2026-07-18T00:02:00.000Z" }),
+        );
+      }),
+      database.callmeshMappings,
+    );
+
+    await isolated.synchronize();
+
+    expect(requests).toBe(0);
+    expect(isolated.getOverview()).toMatchObject({
+      status: {
+        state: "degraded",
+        reasonCode: "CALLMESH_MAPPING_STORE_FAILED",
+        activeMappingCount: 0,
+        provisionState: "invalid",
+      },
+      mappings: [],
+    });
+    database.close();
+  });
+
   it("refuses upstream sync when a durable snapshot has lost its history high-water", async () => {
     const database = new GatewayDatabase(":memory:");
     const initial = new CallMeshClient(
@@ -990,7 +1362,6 @@ function wireMapping(callsignBase: string, meshId = "!0000002a") {
     callsign_base: callsignBase,
     ssid: -7,
     enabled: true,
-    effective_at: "2026-07-18T00:00:00.000Z",
   };
 }
 
