@@ -55,6 +55,8 @@ enum Command {
         offline_maintenance: bool,
         #[arg(long, hide = true, default_value = "success")]
         test_mode: TestMaintenanceMode,
+        #[arg(long, hide = true)]
+        test_marker: Option<PathBuf>,
     },
 }
 
@@ -87,6 +89,8 @@ enum TestMaintenanceMode {
     Malformed,
     Oversize,
     Timeout,
+    DescendantExit,
+    DelayedMarker,
 }
 
 fn main() -> ExitCode {
@@ -111,7 +115,8 @@ fn main() -> ExitCode {
         Command::TestMaintenance {
             offline_maintenance,
             test_mode,
-        } => test_maintenance(offline_maintenance, test_mode),
+            test_marker,
+        } => test_maintenance(offline_maintenance, test_mode, test_marker),
     }
 }
 
@@ -183,7 +188,11 @@ fn migrate_product(
     }
 }
 
-fn test_maintenance(offline_maintenance: bool, mode: TestMaintenanceMode) -> ExitCode {
+fn test_maintenance(
+    offline_maintenance: bool,
+    mode: TestMaintenanceMode,
+    test_marker: Option<PathBuf>,
+) -> ExitCode {
     if !cfg!(debug_assertions) || !offline_maintenance {
         return migration_error(MigrationError::MaintenanceCommandInvalid);
     }
@@ -202,6 +211,42 @@ fn test_maintenance(offline_maintenance: bool, mode: TestMaintenanceMode) -> Exi
         TestMaintenanceMode::Timeout => loop {
             thread::sleep(Duration::from_secs(1));
         },
+        TestMaintenanceMode::DescendantExit => {
+            let Some(marker) = test_marker.filter(|path| path.is_absolute()) else {
+                return migration_error(MigrationError::MaintenanceCommandInvalid);
+            };
+            let executable = match std::env::current_exe() {
+                Ok(executable) => executable,
+                Err(_) => return migration_error(MigrationError::MaintenanceFailed),
+            };
+            if std::process::Command::new(executable)
+                .args([
+                    "__test-maintenance",
+                    "--offline-maintenance",
+                    "--test-mode",
+                    "delayed-marker",
+                    "--test-marker",
+                ])
+                .arg(marker)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .is_err()
+            {
+                return migration_error(MigrationError::MaintenanceFailed);
+            }
+            return ExitCode::from(2);
+        }
+        TestMaintenanceMode::DelayedMarker => {
+            let Some(marker) = test_marker.filter(|path| path.is_absolute()) else {
+                return migration_error(MigrationError::MaintenanceCommandInvalid);
+            };
+            thread::sleep(Duration::from_secs(2));
+            let _ = fs::write(marker, b"descendant survived maintenance parent exit");
+            thread::sleep(Duration::from_millis(700));
+            return ExitCode::SUCCESS;
+        }
         TestMaintenanceMode::Success => {}
     }
 

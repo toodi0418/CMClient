@@ -871,6 +871,7 @@ dependencies = [
  "cmclient-agent-core",
  "cmclient-runtime-primitives",
  "libc",
+ "process-wrap",
  "same-file",
  "serde",
  "serde_json",

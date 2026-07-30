@@ -518,18 +518,27 @@ impl GatewaySupervisor {
     }
 
     pub fn poll_heartbeat(&mut self) -> Result<SupervisorEvent, SupervisorError> {
-        let Some(child) = self.child.as_mut() else {
-            return Ok(SupervisorEvent::Stopped);
-        };
-        let result = child
-            .try_wait()
-            .map_err(|_| SupervisorError::ProcessIoFailed)?;
         let observed_at = Instant::now();
+        let result = match self.child.as_mut() {
+            Some(child) => child.try_wait(),
+            None => return Ok(SupervisorEvent::Stopped),
+        };
         let survived_stable_window = self
             .started_at
             .is_some_and(|started_at| observed_at.duration_since(started_at) >= self.stable_window);
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                self.force_cleanup_after_process_io_failure(observed_at);
+                return Err(SupervisorError::ProcessIoFailed);
+            }
+        };
         match result {
             None => {
+                let child = self
+                    .child
+                    .as_ref()
+                    .ok_or(SupervisorError::ProcessIoFailed)?;
                 let pid = child.id();
                 if survived_stable_window {
                     self.failed_attempts = 0;
@@ -573,7 +582,7 @@ impl GatewaySupervisor {
             self.reset_tracking();
             return Ok(SupervisorEvent::Stopped);
         };
-        if terminate_child(&mut child).is_err() {
+        if terminate_child(&mut child).is_err() && force_terminate_child(&mut child).is_err() {
             self.child = Some(child);
             return Err(SupervisorError::ProcessIoFailed);
         }
@@ -655,6 +664,24 @@ impl GatewaySupervisor {
         } else {
             self.child = Some(child);
             self.bootstrap_reader = reader;
+            self.started_at = Some(observed_at);
+        }
+    }
+
+    fn force_cleanup_after_process_io_failure(&mut self, observed_at: Instant) {
+        self.ready = None;
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if force_terminate_child(&mut child).is_ok() {
+            self.finish_bootstrap_reader();
+            self.finish_output_capture();
+            self.register_failure(observed_at);
+        } else {
+            // Keep an unkillable child owned and prevent a concurrent restart.
+            // The next tick/explicit stop retries cleanup rather than allowing
+            // a second Gateway to claim the same database or listener.
+            self.child = Some(child);
             self.started_at = Some(observed_at);
         }
     }
@@ -1113,7 +1140,18 @@ fn force_terminate_child(child: &mut Box<dyn ChildWrapper>) -> std::io::Result<(
     match child.start_kill() {
         Ok(()) => {}
         Err(error) if matches!(error.kind(), ErrorKind::InvalidInput | ErrorKind::NotFound) => {}
-        Err(error) => return Err(error),
+        Err(error) => match child.try_wait() {
+            // A Windows Job Object completion can be consumed by try_wait().
+            // Waiting again after that observation can block for a completion
+            // event that has already been drained.
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(_) => return Err(error),
+        },
+    }
+    // Do not call wait after try_wait has consumed a Windows Job Object
+    // completion. A successful termination can be visible immediately here.
+    if child.try_wait()?.is_some() {
+        return Ok(());
     }
     child.wait()?;
     Ok(())
@@ -1174,8 +1212,9 @@ mod tests {
         probe_gateway_ownership, read_private_frame, validate_gateway_ready,
         validate_gateway_ready_or_failure,
     };
+    use process_wrap::std::ChildWrapper;
     #[cfg(windows)]
-    use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper, JobObject};
+    use process_wrap::std::{CommandWrap, CommandWrapper, JobObject};
     #[cfg(windows)]
     use std::sync::{
         Arc,
@@ -1197,6 +1236,34 @@ mod tests {
         ) -> std::io::Result<Box<dyn ChildWrapper>> {
             self.observed_pid.store(child.id(), Ordering::Release);
             Err(std::io::Error::other("injected child wrap failure"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TryWaitFailureChild {
+        inner: process::Child,
+        fail_next_wait: bool,
+    }
+
+    impl ChildWrapper for TryWaitFailureChild {
+        fn inner(&self) -> &dyn ChildWrapper {
+            &self.inner
+        }
+
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            &mut self.inner
+        }
+
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            Box::new(self.inner)
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            if self.fail_next_wait {
+                self.fail_next_wait = false;
+                return Err(std::io::Error::other("injected child status failure"));
+            }
+            self.inner.try_wait()
         }
     }
 
@@ -1515,6 +1582,7 @@ mod tests {
     const FIXTURE_MODE: &str = "CMCLIENT_SUPERVISOR_TEST_MODE";
     const FIXTURE_DELAY_MS: &str = "CMCLIENT_SUPERVISOR_TEST_DELAY_MS";
     const FIXTURE_MARKER: &str = "CMCLIENT_SUPERVISOR_TEST_MARKER";
+    const FIXTURE_PARENT_READY_MARKER: &str = "CMCLIENT_SUPERVISOR_PARENT_READY_MARKER";
     #[cfg(target_os = "windows")]
     const FIXTURE_CALLMESH_API_KEY: &str = "fixture-private-callmesh-key";
 
@@ -1838,6 +1906,52 @@ mod tests {
     }
 
     #[test]
+    fn status_io_failure_forces_cleanup_before_backoff_can_restart() {
+        let mut supervisor = fixture_supervisor(
+            "ignore-shutdown",
+            Duration::ZERO,
+            BackoffPolicy {
+                initial_delay: Duration::from_millis(20),
+                maximum_delay: Duration::from_millis(20),
+            },
+            Duration::from_secs(1),
+            None,
+        );
+        let child = process::Command::new(&supervisor.command.program)
+            .args(&supervisor.command.arguments)
+            .env_clear()
+            .envs(&supervisor.environment)
+            .stdin(process::Stdio::piped())
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
+            .spawn()
+            .expect("fixture child should spawn");
+        supervisor.child = Some(Box::new(TryWaitFailureChild {
+            inner: child,
+            fail_next_wait: true,
+        }));
+        supervisor.started_at = Some(Instant::now());
+
+        assert_eq!(
+            supervisor.poll_heartbeat(),
+            Err(SupervisorError::ProcessIoFailed)
+        );
+        assert_eq!(
+            supervisor.status(),
+            GatewayStatus::Backoff {
+                attempt: 1,
+                delay: Duration::from_millis(20),
+            },
+            "a status I/O failure must reap the old owner before a restart is eligible"
+        );
+        thread::sleep(Duration::from_millis(25));
+        supervisor
+            .tick()
+            .expect("a reaped child should permit one bounded restart");
+        supervisor.stop().expect("replacement child should stop");
+    }
+
+    #[test]
     fn unexpected_parent_exit_terminates_descendant_tree_before_joining_capture() {
         let log_dir = unique_marker("descendant-stdout-log");
         let marker = unique_marker("descendant-survived");
@@ -1873,6 +1987,70 @@ mod tests {
             "descendant escaped supervised process tree"
         );
         fs::remove_dir_all(log_dir).expect("fixture log directory should remove");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hard_killing_the_supervisor_parent_closes_the_gateway_pipe_without_an_orphan() {
+        let parent_ready = unique_marker("hard-kill-parent-ready");
+        let gateway_shutdown = unique_marker("hard-kill-gateway-shutdown");
+        let mut parent =
+            process::Command::new(env::current_exe().expect("test executable should resolve"))
+                .args([
+                    "--ignored",
+                    "--nocapture",
+                    "--exact",
+                    "tests::supervisor_hard_kill_parent_fixture",
+                ])
+                .env(FIXTURE_MODE, "parent-eof-shutdown")
+                .env(FIXTURE_DELAY_MS, "0")
+                .env(FIXTURE_MARKER, &gateway_shutdown)
+                .env(FIXTURE_PARENT_READY_MARKER, &parent_ready)
+                .stdin(process::Stdio::null())
+                .stdout(process::Stdio::null())
+                .stderr(process::Stdio::null())
+                .spawn()
+                .expect("supervisor parent fixture should spawn");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let gateway_pid = loop {
+            if let Ok(value) = fs::read_to_string(&parent_ready) {
+                break value
+                    .trim()
+                    .parse::<u32>()
+                    .expect("gateway PID should be numeric");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "supervisor parent did not publish its child PID"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        parent.kill().expect("parent hard kill should succeed");
+        parent.wait().expect("parent should reap");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !gateway_shutdown.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "Gateway did not observe the dead parent pipe"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            fs::read(&gateway_shutdown).expect("Gateway shutdown marker should read"),
+            b"parent EOF"
+        );
+        thread::sleep(Duration::from_millis(100));
+        let powershell = PathBuf::from(
+            env::var("SystemRoot").expect("Windows system root should be configured"),
+        )
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        assert!(
+            !windows_process_exists(&powershell, gateway_pid),
+            "hard-killed Agent parent left its Gateway child running"
+        );
+        fs::remove_file(parent_ready).expect("parent ready marker should remove");
+        fs::remove_file(gateway_shutdown).expect("Gateway shutdown marker should remove");
     }
 
     #[cfg(target_os = "windows")]
@@ -3008,6 +3186,20 @@ switch ($mode) {
                     .expect("shutdown command should read");
                 thread::sleep(Duration::from_secs(30));
             }
+            "parent-eof-shutdown" => {
+                let mut command = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut command)
+                    .expect("supervisor input should read");
+                if command.is_empty() {
+                    fs::write(
+                        env::var(FIXTURE_MARKER).expect("fixture marker should be configured"),
+                        b"parent EOF",
+                    )
+                    .expect("parent EOF marker should write");
+                }
+            }
             "spawn-descendant-exit" => {
                 process::Command::new(
                     env::current_exe().expect("fixture executable should resolve"),
@@ -3057,6 +3249,31 @@ switch ($mode) {
             }
             _ => process::exit(64),
         }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn supervisor_hard_kill_parent_fixture() {
+        let mode = env::var(FIXTURE_MODE).expect("fixture mode should be configured");
+        let marker =
+            PathBuf::from(env::var(FIXTURE_MARKER).expect("fixture marker should be configured"));
+        let parent_ready = PathBuf::from(
+            env::var(FIXTURE_PARENT_READY_MARKER)
+                .expect("parent ready marker should be configured"),
+        );
+        let mut supervisor = fixture_supervisor(
+            &mode,
+            Duration::ZERO,
+            BackoffPolicy::default(),
+            Duration::from_secs(1),
+            Some(&marker),
+        );
+        let event = supervisor.start().expect("fixture Gateway should start");
+        let SupervisorEvent::Started { pid } = event else {
+            panic!("fixture Gateway did not start: {event:?}");
+        };
+        fs::write(parent_ready, pid.to_string()).expect("parent ready marker should write");
+        thread::sleep(Duration::from_secs(30));
     }
 
     fn write_log_fixture_output() {

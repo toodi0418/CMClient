@@ -313,16 +313,22 @@ fn discovery_is_bounded_to_known_state() {
 }
 
 fn maintenance_runner(mode: &str, timeout: Duration) -> ChildGatewayMaintenanceRunner {
-    ChildGatewayMaintenanceRunner::with_prefix_and_timeout(
-        binary(),
-        vec![
-            OsString::from("__test-maintenance"),
-            OsString::from("--test-mode"),
-            OsString::from(mode),
-        ],
-        timeout,
-    )
-    .expect("test maintenance runner should be valid")
+    maintenance_runner_with_arguments(mode, timeout, Vec::new())
+}
+
+fn maintenance_runner_with_arguments(
+    mode: &str,
+    timeout: Duration,
+    additional_arguments: Vec<OsString>,
+) -> ChildGatewayMaintenanceRunner {
+    let mut arguments = vec![
+        OsString::from("__test-maintenance"),
+        OsString::from("--test-mode"),
+        OsString::from(mode),
+    ];
+    arguments.extend(additional_arguments);
+    ChildGatewayMaintenanceRunner::with_prefix_and_timeout(binary(), arguments, timeout)
+        .expect("test maintenance runner should be valid")
 }
 
 #[test]
@@ -359,6 +365,40 @@ fn child_maintenance_contract_is_strict_retryable_and_bounded() {
         maintenance_runner("timeout", Duration::from_millis(150))
             .migrate_database(&source, &root.join("timeout.sqlite")),
         Err(MigrationError::MaintenanceTimedOut)
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn maintenance_parent_exit_cannot_leave_a_stdout_holding_descendant() {
+    let root = temporary_directory("maintenance-descendant");
+    fs::create_dir_all(&root).expect("fixture root should be created");
+    let source = root.join("source.sqlite");
+    let staged = root.join("staged.sqlite");
+    let marker = root.join("descendant-survived");
+    fs::write(&source, b"fixture-database").expect("source should be written");
+
+    let started_at = Instant::now();
+    assert_eq!(
+        maintenance_runner_with_arguments(
+            "descendant-exit",
+            Duration::from_secs(5),
+            vec![
+                OsString::from("--test-marker"),
+                marker.clone().into_os_string(),
+            ],
+        )
+        .migrate_database(&source, &staged),
+        Err(MigrationError::MaintenanceFailed)
+    );
+    assert!(
+        started_at.elapsed() < Duration::from_millis(1500),
+        "a descendant retaining stdout must not delay maintenance cleanup"
+    );
+    thread::sleep(Duration::from_millis(2200));
+    assert!(
+        !marker.exists(),
+        "maintenance descendant escaped its process tree after the parent exited"
     );
     fs::remove_dir_all(root).expect("fixture should be removed");
 }

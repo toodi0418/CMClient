@@ -3562,6 +3562,39 @@ impl AgentController {
         Ok(true)
     }
 
+    /// Caller holds `gateway_transition`, preventing a setup-state change from
+    /// racing a new Gateway spawn while the existing owner is being drained.
+    fn stop_supervisor_for_setup_block_locked(&self) -> Result<bool, ControlError> {
+        let route_was_active = self.gateway_session.snapshot().is_some();
+        self.gateway_session.clear();
+        let (result, log_health) = {
+            let mut supervisor = self
+                .supervisor
+                .lock()
+                .map_err(|_| ControlError::CommandFailed)?;
+            let Some(supervisor) = supervisor.as_mut() else {
+                return Ok(route_was_active);
+            };
+            if matches!(supervisor.status(), GatewayStatus::Stopped) {
+                (Ok(false), supervisor.take_log_health_update())
+            } else {
+                (
+                    supervisor.stop().map(|_| true),
+                    supervisor.take_log_health_update(),
+                )
+            }
+        };
+        self.apply_gateway_log_health(log_health);
+        let stopped = result.map_err(|error| {
+            self.remember_error_code(error.code());
+            ControlError::CommandFailed
+        })?;
+        if stopped {
+            self.log_agent_code(LogLevel::Info, "GATEWAY_SUPERVISOR_STOPPED");
+        }
+        Ok(route_was_active || stopped)
+    }
+
     fn start_supervisor(&self) -> Result<bool, ControlError> {
         self.start_supervisor_inner(false)
     }
@@ -3571,23 +3604,12 @@ impl AgentController {
     }
 
     fn start_supervisor_inner(&self, allow_validating: bool) -> Result<bool, ControlError> {
-        if self.setup_blocked()?
-            && !(allow_validating
-                && matches!(
-                    self.setup
-                        .status()
-                        .map_err(|_| ControlError::CommandFailed)?
-                        .phase,
-                    SetupPhase::Validating
-                ))
-        {
-            self.remember_error_code("SETUP_REQUIRED");
-            return Err(ControlError::CommandFailed);
-        }
+        self.ensure_setup_start_allowed(allow_validating)?;
         let _transition = self
             .gateway_transition
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
+        self.ensure_setup_start_allowed(allow_validating)?;
         self.ensure_resource_start_allowed()?;
         let (result, ready, log_health) = {
             let mut supervisor = self
@@ -3599,7 +3621,14 @@ impl AgentController {
                 return Ok(false);
             };
             self.synchronize_supervisor_setup_generation(supervisor)?;
-            let result = supervisor.start();
+            // A manual Start must not turn a crash-loop backoff into an
+            // unbounded restart source. `tick` resumes only after its owned
+            // deadline, while stopped and already-running supervisors retain
+            // the normal Start semantics.
+            let result = match supervisor.status() {
+                GatewayStatus::Backoff { .. } => supervisor.tick(),
+                GatewayStatus::Stopped | GatewayStatus::Running { .. } => supervisor.start(),
+            };
             let ready = supervisor.gateway_ready().cloned();
             let log_health = supervisor.take_log_health_update();
             (result, ready, log_health)
@@ -3641,16 +3670,21 @@ impl AgentController {
         Ok(true)
     }
 
-    fn tick_supervisor(&self) -> Result<bool, ControlError> {
+    fn start_resident_supervisor(&self) -> Result<bool, ControlError> {
         if self.setup_blocked()? {
-            let changed = self.gateway_session.snapshot().is_some();
-            self.gateway_session.clear();
-            return Ok(changed);
+            return Ok(false);
         }
+        self.start_supervisor()
+    }
+
+    fn tick_supervisor(&self) -> Result<bool, ControlError> {
         let _transition = self
             .gateway_transition
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
+        if self.setup_blocked()? {
+            return self.stop_supervisor_for_setup_block_locked();
+        }
         if self.is_shutdown_requested() {
             return Ok(false);
         }
@@ -3747,6 +3781,23 @@ impl AgentController {
             .map_err(|_| ControlError::CommandFailed)
     }
 
+    fn ensure_setup_start_allowed(&self, allow_validating: bool) -> Result<(), ControlError> {
+        if !self.setup_gate_required {
+            return Ok(());
+        }
+        let status = self
+            .setup
+            .status()
+            .map_err(|_| ControlError::CommandFailed)?;
+        if !status.setup_required
+            || (allow_validating && matches!(status.phase, SetupPhase::Validating))
+        {
+            return Ok(());
+        }
+        self.remember_error_code("SETUP_REQUIRED");
+        Err(ControlError::CommandFailed)
+    }
+
     fn publish_verified_gateway(&self, ready: Option<GatewayReady>) -> Result<(), ControlError> {
         let result = ready
             .ok_or(ControlError::CommandFailed)
@@ -3759,12 +3810,13 @@ impl AgentController {
             }
             Err(error) => {
                 self.gateway_session.clear();
-                if let Ok(mut supervisor) = self.supervisor.lock() {
-                    if let Some(supervisor) = supervisor.as_mut() {
-                        let _ = supervisor.stop();
-                    }
-                }
+                // Start and tick both hold `gateway_transition` while calling
+                // this method, so the verified route and child teardown share
+                // one ownership transition. Never leave a failed identity
+                // check with a live, un-routable Gateway.
+                let cleanup = self.stop_supervisor_locked();
                 self.remember_error_code("GATEWAY_SUPERVISOR_IDENTITY_VERIFICATION_FAILED");
+                cleanup?;
                 Err(error)
             }
         }
@@ -4823,6 +4875,12 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
+    // The resident Agent owns the private Gateway whenever setup is ready.
+    // A startup failure remains supervised by the worker's bounded backoff;
+    // it must not turn the control plane itself into a one-shot process.
+    if let Err(error) = controller.start_resident_supervisor() {
+        controller.remember_error(&error);
+    }
     let mut agent_tray = tray::AgentTray::start(endpoint, config.paths.desktop_process_file());
     let serve_error = loop {
         if controller.is_shutdown_requested() {
@@ -4896,20 +4954,20 @@ mod tests {
         AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState, ControlCommand,
         ControlHandler, FactoryResetBackupBehavior, FactoryResetFixtureConfirmation,
         FactoryResetFixtureJob, FactoryResetFixturePhase, GatewayLogHealthUpdate, GatewayRoute,
-        GatewaySessionHandle, InternalComponent, LogLevel, LogPolicy, ManagementWebConfig,
-        ManagementWebError, ManagementWebService, ResetKind, SecretKind, SetupApplyError,
-        SetupCancellationToken, SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState,
-        SetupStore, StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
-        apply_physical_qualification_environment, bridge_gateway_event_stream,
-        compiled_component_identity, disable_proxy_for_setup, ensure_runtime_directories,
-        gateway_json_projection, legacy_state_candidates, load_agent_config_after_migration_with,
-        management_agent_events, management_web_profile, normalize_runtime_process_path,
-        push_legacy_source_candidate, recover_interrupted_reset, recover_interrupted_setup,
-        remove_setup_transaction, reset_completion_file, reset_transaction_file,
-        resolve_gateway_maintenance_program, setup_apply_error_response, setup_error_response,
-        setup_gate_required_with_profile, setup_transaction_file, validate_setup_request,
-        verified_gateway_route, write_reset_transaction, write_setup_configuration,
-        write_setup_transaction,
+        GatewaySessionHandle, GatewayStatus, InternalComponent, LogLevel, LogPolicy,
+        ManagementWebConfig, ManagementWebError, ManagementWebService, ResetKind, SecretKind,
+        SetupApplyError, SetupCancellationToken, SetupConfigureRequest, SetupError, SetupPhase,
+        SetupRollbackState, SetupStore, StructuredLogSink, SupervisorWorker, agent_web_router,
+        apply_aprs_environment, apply_physical_qualification_environment,
+        bridge_gateway_event_stream, compiled_component_identity, disable_proxy_for_setup,
+        ensure_runtime_directories, gateway_json_projection, legacy_state_candidates,
+        load_agent_config_after_migration_with, management_agent_events, management_web_profile,
+        normalize_runtime_process_path, push_legacy_source_candidate, recover_interrupted_reset,
+        recover_interrupted_setup, remove_setup_transaction, reset_completion_file,
+        reset_transaction_file, resolve_gateway_maintenance_program, setup_apply_error_response,
+        setup_error_response, setup_gate_required_with_profile, setup_transaction_file,
+        validate_setup_request, verified_gateway_route, write_reset_transaction,
+        write_setup_configuration, write_setup_transaction,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -4948,7 +5006,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         io::{Read, Write},
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -4960,7 +5018,6 @@ mod tests {
     use std::{
         io::Cursor,
         net::{TcpListener, TcpStream},
-        path::PathBuf,
         sync::{Mutex, atomic::AtomicUsize, mpsc},
     };
 
@@ -4968,6 +5025,32 @@ mod tests {
     #[ignore = "child-process fixture"]
     fn long_running_gateway_fixture() {
         thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    #[ignore = "child-process fixture"]
+    fn agent_gateway_fixture() {
+        let mode = std::env::var("CMCLIENT_AGENT_TEST_MODE")
+            .expect("Gateway fixture mode should be configured");
+        let marker = std::env::var("CMCLIENT_AGENT_TEST_MARKER")
+            .expect("Gateway fixture marker should be configured");
+        let mut marker = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(marker)
+            .expect("Gateway fixture marker should open");
+        marker
+            .write_all(b"x")
+            .expect("Gateway fixture marker should write");
+        drop(marker);
+        match mode.as_str() {
+            "wait" => {
+                let mut stdin = std::io::stdin();
+                let _ = stdin.read(&mut [0_u8; 1]);
+            }
+            "crash" => {}
+            _ => panic!("unsupported Gateway fixture mode"),
+        }
     }
 
     #[test]
@@ -4980,9 +5063,83 @@ mod tests {
         assert_eq!(cancelled.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn wait_for_fixture_marker(marker: &Path, expected: &str, timeout: Duration) -> String {
         wait_for_fixture_marker_with(expected, timeout, || std::fs::read_to_string(marker))
+    }
+
+    fn ready_supervised_controller(
+        name: &str,
+        gateway_command: Vec<String>,
+    ) -> (PathBuf, Arc<AgentController>) {
+        let sequence = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should follow epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("test directory should exist");
+        let paths = RuntimePaths {
+            data_dir: directory.clone(),
+            config_dir: directory.clone(),
+            cache_dir: directory.join("cache"),
+            log_dir: directory.join("logs"),
+        };
+        let setup = SetupStore::open(&paths).expect("setup state should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let fence = setup.begin_validation().expect("validation should begin");
+        setup.mark_ready(fence).expect("setup should become ready");
+        drop(setup);
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-callmesh-api-key")
+            .expect("fixture secret should store");
+        let config = AgentConfig {
+            paths,
+            config_file: directory.join("agent.toml"),
+            runtime_profile: AgentRuntimeProfile::Native,
+            gateway_command: Some(gateway_command),
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = Arc::new(
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize"),
+        );
+        (directory, controller)
+    }
+
+    fn gateway_fixture_command() -> Vec<String> {
+        let executable = std::env::current_exe().expect("test executable should resolve");
+        vec![
+            executable.to_string_lossy().into_owned(),
+            String::from("--ignored"),
+            String::from("--exact"),
+            String::from("tests::agent_gateway_fixture"),
+        ]
+    }
+
+    fn configure_gateway_fixture(controller: &AgentController, mode: &str, marker: &Path) {
+        controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_mut()
+            .expect("supervisor should exist")
+            .set_environment(BTreeMap::from([
+                (String::from("CMCLIENT_AGENT_TEST_MODE"), String::from(mode)),
+                (
+                    String::from("CMCLIENT_AGENT_TEST_MARKER"),
+                    marker.to_string_lossy().into_owned(),
+                ),
+            ]));
     }
 
     fn wait_for_fixture_marker_with(
@@ -8084,6 +8241,240 @@ mod tests {
         );
         assert!(real_canary.is_file());
         std::fs::remove_dir_all(real_root).expect("real-root canary should clean up");
+    }
+
+    #[test]
+    fn resident_start_starts_ready_gateway_once_while_worker_is_running() {
+        let (directory, controller) =
+            ready_supervised_controller("resident-start", gateway_fixture_command());
+        let marker = directory.join("gateway-start");
+        configure_gateway_fixture(&controller, "wait", &marker);
+        let mut worker =
+            SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
+
+        assert!(
+            controller
+                .start_resident_supervisor()
+                .expect("ready setup should start the resident Gateway")
+        );
+        assert_eq!(
+            wait_for_fixture_marker(&marker, "x", Duration::from_secs(2)),
+            "x"
+        );
+        let first_pid = match controller
+            .supervisor
+            .lock()
+            .expect("supervisor should lock")
+            .as_ref()
+            .expect("supervisor should exist")
+            .status()
+        {
+            GatewayStatus::Running { pid } => pid,
+            status => panic!("resident Gateway should be running, got {status:?}"),
+        };
+
+        assert!(
+            controller
+                .start_resident_supervisor()
+                .expect("a repeated resident start should be a heartbeat")
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("start marker should read"),
+            "x",
+            "the resident worker must retain one Gateway owner"
+        );
+        assert_eq!(
+            controller
+                .supervisor
+                .lock()
+                .expect("supervisor should lock")
+                .as_ref()
+                .expect("supervisor should exist")
+                .status(),
+            GatewayStatus::Running { pid: first_pid }
+        );
+
+        worker.stop();
+        controller
+            .stop_supervisor()
+            .expect("resident Gateway should stop");
+        drop(controller);
+        std::fs::remove_file(marker).expect("start marker should remove");
+        std::fs::remove_dir_all(directory).expect("test directory should remove");
+    }
+
+    #[test]
+    fn setup_block_tick_stops_existing_gateway_and_revokes_its_route() {
+        let (directory, controller) =
+            ready_supervised_controller("setup-block", gateway_fixture_command());
+        let marker = directory.join("gateway-start");
+        configure_gateway_fixture(&controller, "wait", &marker);
+        controller
+            .start_resident_supervisor()
+            .expect("ready setup should start the Gateway");
+        assert_eq!(
+            wait_for_fixture_marker(&marker, "x", Duration::from_secs(2)),
+            "x"
+        );
+        let route_listener = TcpListener::bind("127.0.0.1:0").expect("route fixture should bind");
+        controller.gateway_session.set(
+            GatewayRoute::new(
+                route_listener
+                    .local_addr()
+                    .expect("route address should resolve"),
+                "a".repeat(64),
+            )
+            .expect("route should be valid"),
+        );
+        drop(route_listener);
+
+        controller
+            .setup
+            .require_credentials()
+            .expect("setup should become blocked");
+        assert!(
+            controller
+                .tick_supervisor()
+                .expect("setup block should drain the existing child")
+        );
+        assert!(controller.gateway_session.snapshot().is_none());
+        assert!(matches!(
+            controller
+                .supervisor
+                .lock()
+                .expect("supervisor should lock")
+                .as_ref()
+                .expect("supervisor should exist")
+                .status(),
+            GatewayStatus::Stopped
+        ));
+
+        drop(controller);
+        std::fs::remove_file(marker).expect("start marker should remove");
+        std::fs::remove_dir_all(directory).expect("test directory should remove");
+    }
+
+    #[test]
+    fn failed_gateway_identity_verification_stops_the_unroutable_child() {
+        let (directory, controller) =
+            ready_supervised_controller("identity-stop", gateway_fixture_command());
+        let marker = directory.join("gateway-start");
+        configure_gateway_fixture(&controller, "wait", &marker);
+        controller
+            .start_resident_supervisor()
+            .expect("ready setup should start the Gateway");
+        assert_eq!(
+            wait_for_fixture_marker(&marker, "x", Duration::from_secs(2)),
+            "x"
+        );
+        let route_listener = TcpListener::bind("127.0.0.1:0").expect("route fixture should bind");
+        controller.gateway_session.set(
+            GatewayRoute::new(
+                route_listener
+                    .local_addr()
+                    .expect("route address should resolve"),
+                "b".repeat(64),
+            )
+            .expect("route should be valid"),
+        );
+        drop(route_listener);
+
+        let transition = controller
+            .gateway_transition
+            .lock()
+            .expect("transition should lock");
+        assert_eq!(
+            controller.publish_verified_gateway(None),
+            Err(ControlError::CommandFailed)
+        );
+        drop(transition);
+
+        assert!(controller.gateway_session.snapshot().is_none());
+        assert!(matches!(
+            controller
+                .supervisor
+                .lock()
+                .expect("supervisor should lock")
+                .as_ref()
+                .expect("supervisor should exist")
+                .status(),
+            GatewayStatus::Stopped
+        ));
+        assert_eq!(
+            controller
+                .latest_error_code
+                .lock()
+                .expect("identity failure should be recorded")
+                .as_deref(),
+            Some("GATEWAY_SUPERVISOR_IDENTITY_VERIFICATION_FAILED")
+        );
+
+        drop(controller);
+        std::fs::remove_file(marker).expect("start marker should remove");
+        std::fs::remove_dir_all(directory).expect("test directory should remove");
+    }
+
+    #[test]
+    fn explicit_start_respects_an_active_gateway_crash_backoff() {
+        let (directory, controller) =
+            ready_supervised_controller("start-backoff", gateway_fixture_command());
+        let marker = directory.join("gateway-start");
+        configure_gateway_fixture(&controller, "crash", &marker);
+        controller
+            .start_resident_supervisor()
+            .expect("first Gateway start should succeed");
+        assert_eq!(
+            wait_for_fixture_marker(&marker, "x", Duration::from_secs(2)),
+            "x"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            controller
+                .tick_supervisor()
+                .expect("Gateway exit should enter backoff");
+            if matches!(
+                controller
+                    .supervisor
+                    .lock()
+                    .expect("supervisor should lock")
+                    .as_ref()
+                    .expect("supervisor should exist")
+                    .status(),
+                GatewayStatus::Backoff { attempt: 1, .. }
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Gateway did not enter backoff");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        controller
+            .start_resident_supervisor()
+            .expect("manual start must retain the active backoff deadline");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("start marker should read"),
+            "x",
+            "manual Start bypassed the supervisor crash backoff"
+        );
+        assert!(matches!(
+            controller
+                .supervisor
+                .lock()
+                .expect("supervisor should lock")
+                .as_ref()
+                .expect("supervisor should exist")
+                .status(),
+            GatewayStatus::Backoff { attempt: 1, .. }
+        ));
+
+        controller
+            .stop_supervisor()
+            .expect("backoff supervisor should reset during cleanup");
+        drop(controller);
+        std::fs::remove_file(marker).expect("start marker should remove");
+        std::fs::remove_dir_all(directory).expect("test directory should remove");
     }
 
     #[tokio::test]

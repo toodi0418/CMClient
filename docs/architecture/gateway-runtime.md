@@ -57,12 +57,19 @@ deadline. If an active handler ignores cancellation, shutdown fails with a
 stable code and deliberately leaves SQLite for process teardown instead of
 closing it underneath live work.
 
+The std process wrapper does not rely on a drop-triggered kill: explicit stop,
+bootstrap rejection, and observed child exit terminate the Windows Job Object
+or Unix process group and reap it where the wrapper permits. A hard Agent exit
+is fenced by the inherited private stdin EOF, so Gateway shutdown is not
+dependent on implicit process-wrapper drop behavior.
+
 The complete wait-for-startup and Gateway cleanup sequence has a 30-second outer
 deadline. On expiry the process exits with `GATEWAY_SHUTDOWN_FAILED`; this is
-intentionally below the Supervisor's 40-second graceful-child deadline, which
-in turn is below the Windows Service Host's 50-second Agent deadline. The
-decreasing inner budgets give each owner time to observe failure and reap its
-child before its own fallback termination fires.
+intentionally below the Supervisor's 40-second graceful-child deadline. When
+the transitional Windows Service Host is exercised, its 50-second Agent deadline
+remains above this boundary; standard native runtime does not require SCM or a
+system service. The decreasing inner budgets give each owner time to observe
+failure and reap its child before its own fallback termination fires.
 
 When Meshtastic is enabled, the single framed transport path decodes
 `FromRadio`, persists the observation, and writes NodeInfo, strict text,

@@ -5,6 +5,11 @@ use cmclient_agent_core::{
 use cmclient_runtime_primitives::{
     DocumentFormat, DurableDocument, ExclusiveFileLock, LockError, TypedDocument,
 };
+#[cfg(unix)]
+use process_wrap::std::ProcessGroup;
+use process_wrap::std::{ChildWrapper, CommandWrap};
+#[cfg(windows)]
+use process_wrap::std::{CommandWrapper, JobObject};
 use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -253,29 +258,50 @@ impl GatewayMaintenanceRunner for ChildGatewayMaintenanceRunner {
         if request_bytes.len() > MAX_MAINTENANCE_REQUEST_BYTES {
             return Err(MigrationError::MaintenanceCommandInvalid);
         }
-        let mut child = Command::new(&self.program)
+        let mut raw_command = Command::new(&self.program);
+        raw_command
             .args(&self.prefix_arguments)
             .arg("--offline-maintenance")
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        let mut command = CommandWrap::from(raw_command);
+        #[cfg(windows)]
+        {
+            // JobObject starts suspended. Keep a cleanup owner around until the
+            // job wrapper is installed so an injected/OS wrapper failure cannot
+            // strand that suspended child.
+            command.wrap(MaintenanceSpawnFailureCleanup);
+            command.wrap(JobObject);
+        }
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        let mut child = command
             .spawn()
             .map_err(|_| MigrationError::MaintenanceFailed)?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or(MigrationError::MaintenanceFailed)?;
+        let stdin = match child.stdin().take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = terminate_maintenance_child_tree(&mut child);
+                return Err(MigrationError::MaintenanceFailed);
+            }
+        };
+        let stdout = match child.stdout().take() {
+            Some(stdout) => stdout,
+            None => {
+                drop(stdin);
+                let _ = terminate_maintenance_child_tree(&mut child);
+                return Err(MigrationError::MaintenanceFailed);
+            }
+        };
         let writer = thread::spawn(move || {
+            let mut stdin = stdin;
             stdin
                 .write_all(&request_bytes)
                 .and_then(|_| stdin.flush())
                 .map_err(|_| MigrationError::MaintenanceFailed)
         });
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(MigrationError::MaintenanceFailed)?;
         let reader = thread::spawn(move || {
             let mut stdout = stdout;
             let mut bytes = Vec::new();
@@ -303,21 +329,27 @@ impl GatewayMaintenanceRunner for ChildGatewayMaintenanceRunner {
                     thread::sleep(Duration::from_millis(20));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = terminate_maintenance_child_tree(&mut child);
                     let _ = writer.join();
                     let _ = reader.join();
                     return Err(MigrationError::MaintenanceTimedOut);
                 }
                 Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = terminate_maintenance_child_tree(&mut child);
                     let _ = writer.join();
                     let _ = reader.join();
                     return Err(MigrationError::MaintenanceFailed);
                 }
             }
         };
+        // The top-level maintenance command may have exited while a descendant
+        // inherited stdout. Kill and reap the contained tree before joining the
+        // output reader so stale descendants cannot block migration forever.
+        if terminate_observed_maintenance_child_tree(&mut child).is_err() {
+            let _ = writer.join();
+            let _ = reader.join();
+            return Err(MigrationError::MaintenanceFailed);
+        }
         let write_result = writer
             .join()
             .map_err(|_| MigrationError::MaintenanceFailed)?;
@@ -341,6 +373,97 @@ impl GatewayMaintenanceRunner for ChildGatewayMaintenanceRunner {
             return Err(MigrationError::MaintenanceReportInvalid);
         }
         Ok(report)
+    }
+}
+
+fn terminate_maintenance_child_tree(child: &mut Box<dyn ChildWrapper>) -> std::io::Result<()> {
+    child.stdin().take();
+    match child.start_kill() {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(error) => return Err(error),
+    }
+    child.wait().map(|_| ())
+}
+
+fn terminate_observed_maintenance_child_tree(
+    child: &mut Box<dyn ChildWrapper>,
+) -> std::io::Result<()> {
+    child.stdin().take();
+    match child.start_kill() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct MaintenanceSpawnFailureCleanup;
+
+#[cfg(windows)]
+impl CommandWrapper for MaintenanceSpawnFailureCleanup {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn ChildWrapper>,
+        _core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn ChildWrapper>> {
+        Ok(Box::new(MaintenanceSpawnFailureCleanupChild {
+            child: Some(child),
+        }))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct MaintenanceSpawnFailureCleanupChild {
+    child: Option<Box<dyn ChildWrapper>>,
+}
+
+#[cfg(windows)]
+impl ChildWrapper for MaintenanceSpawnFailureCleanupChild {
+    fn inner(&self) -> &dyn ChildWrapper {
+        self.child
+            .as_deref()
+            .expect("maintenance spawn cleanup child must remain available")
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("maintenance spawn cleanup child must remain available")
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+        self.child
+            .take()
+            .expect("maintenance spawn cleanup child must remain available")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MaintenanceSpawnFailureCleanupChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        child.stdin().take();
+        if child.start_kill().is_ok() {
+            let _ = child.wait();
+        } else {
+            let _ = child.try_wait();
+        }
     }
 }
 

@@ -45,7 +45,7 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `d6c325b5ec6909c44214c797be933050cc0f28a8c3b2221c936009ea2410de68`.
+  `ee798cd9fddcc233b20cef8e05873677161bf231d411a2d0ff0950cb90383a9f`.
 - Cargo license inventory: 622 registry packages, 13 workspace packages, zero
   Git sources, zero unknown source classifications, and zero unknown licenses;
   inventory SHA-256
@@ -69,7 +69,10 @@ The promotion baseline is CMClient commit
   canonical inventory digest remained unchanged.
   P13-T10 then adopted exact Axum/Tower Web ingress dependencies. P14-T01
   added the Agent-owned `mdns-sd` discovery dependency and its bounded
-  transitive graph. The Windows Agent tray lifecycle later added `sysinfo` for
+  transitive graph. P14-T05 makes the already-resolved `process-wrap` crate a
+  direct dependency of both Gateway supervision and migration maintenance so
+  their Windows Job Object and Unix process-group containment use the same
+  audited primitive. The Windows Agent tray lifecycle later added `sysinfo` for
   bounded executable-image verification, plus `tao` and `tray-icon` for the
   Windows-only native event loop and icon/menu boundary. Exact PID, creation
   time, and session validation remains in the system process object rather than
@@ -126,6 +129,7 @@ notices remain part of the target-specific packaging inventory.
 | `interprocess` | `2.4.2` | `https://github.com/kotauskas/interprocess` | 0BSD OR Apache-2.0 | `069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b` | 1.75 |
 | `libc` | `0.2.186` | `https://github.com/rust-lang/libc` | MIT OR Apache-2.0 | `68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66` | 1.65 |
 | `mdns-sd` | `0.20.2` | `https://github.com/keepsimple1/mdns-sd` | Apache-2.0 OR MIT | `f18d8ec9d1869796fb2910d95f4d957072df0b6a22e247a1d760d8b4c805e17a` | 1.70 |
+| `process-wrap` | `9.1.0` | `https://github.com/watchexec/process-wrap` | Apache-2.0 OR MIT | `2e842efad9119158434d193c6682e2ebee4b44d6ad801d7b349623b3f57cdf55` | 1.87.0 |
 | `same-file` | `1.0.6` | `https://github.com/BurntSushi/same-file` | Unlicense/MIT | `93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502` | Not declared |
 | `sysinfo` | `0.35.2` | `https://github.com/GuillaumeGomez/sysinfo` | MIT | `3c3ffa3e4ff2b324a57f7aeb3c349656c7b127c3c189520251a648102a92496e` | 1.75 |
 | `tao` | `0.35.3` | `https://github.com/tauri-apps/tao` | Apache-2.0 | `d1c93047acf68669466a34690ac58cca7010bd1b201e1ec86f1fd0a75d3dd4a9` | 1.74 |

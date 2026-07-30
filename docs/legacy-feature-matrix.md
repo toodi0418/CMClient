@@ -21,7 +21,7 @@ the legacy Node.js/Electron implementation.
 | Browser management UI and realtime updates | Retain and rebuild | Vue 3/Vite/Pinia UI over Fastify APIs and durable SSE contracts (P03/P06) |
 | Offline map presentation | Retain capability without the Legacy asset corpus | The Leaflet positions page renders a deterministic coordinate grid without a network dependency. The unlicensed committed tiles/fonts were removed in P11 (P06/P11) |
 | Legacy user data (SQLite, JSON, JSONL) | Retain data through explicit migration | Versioned import, dry-run report, backup, verification, and rollback; no in-place implicit conversion (P11) |
-| Headless, service, and container deployment | Retain and rebuild | Agent-owned systemd/Windows Service/launchd installers and a capability-restricted Docker image (P10) |
+| Headless, service, and container deployment | Retain through the unified resident Agent | Standard native launch is current-user resident Agent plus private Gateway; systemd and Windows Service remain transitional qualification paths, while Docker uses its constrained Agent composition (P10) |
 | Cross-platform packaging | Retain and rebuild | CI build matrix for Agent, Gateway, CLI, Web, and Desktop artifacts with checksums, provenance, and signatures (P10) |
 | Legacy test observations and packet examples | Retain as characterization input | Sanitized fixtures, contract tests, deterministic replay, E2E and packaging smoke tests (P00/P04/P05/P12) |
 
