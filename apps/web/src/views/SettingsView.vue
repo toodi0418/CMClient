@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
-import { Languages, Monitor, Moon, Sun } from "@lucide/vue";
+import { computed, onMounted, ref } from "vue";
+import { Languages, Monitor, Moon, RotateCcw, Sun } from "@lucide/vue";
 import Button from "primevue/button";
+import Dialog from "primevue/dialog";
+import InputText from "primevue/inputtext";
 import { useI18n } from "vue-i18n";
 
 import CapabilityStatus from "@/components/CapabilityStatus.vue";
@@ -9,10 +11,17 @@ import ProblemNotice from "@/components/ProblemNotice.vue";
 import { isSupportedLocale, type ThemePreference } from "@/preferences";
 import { useGatewayStore } from "@/stores/gateway";
 import { usePreferencesStore } from "@/stores/preferences";
+import { useSetupStore } from "@/stores/setup";
 
 const gateway = useGatewayStore();
 const preferences = usePreferencesStore();
+const setup = useSetupStore();
 const { t } = useI18n();
+const operationalResetDialogVisible = ref(false);
+const operationalResetConfirmation = ref("");
+const canOperationalReset = computed(
+  () => setup.status?.ready === true && !setup.loading,
+);
 
 const themeOptions = [
   {
@@ -62,6 +71,24 @@ function setLocale(event: Event) {
   const locale = (event.target as HTMLSelectElement).value;
   if (isSupportedLocale(locale)) {
     preferences.setLocale(locale);
+  }
+}
+
+function openOperationalResetDialog() {
+  operationalResetConfirmation.value = "";
+  operationalResetDialogVisible.value = true;
+}
+
+async function confirmOperationalReset() {
+  if (operationalResetConfirmation.value !== "RESET") {
+    return;
+  }
+  try {
+    await setup.operationalReset();
+    operationalResetDialogVisible.value = false;
+    operationalResetConfirmation.value = "";
+  } catch {
+    // The setup store retains the stable Agent error code for the next view.
   }
 }
 </script>
@@ -142,5 +169,61 @@ function setLocale(event: Event) {
         </div>
       </div>
     </div>
+
+    <div v-if="setup.status?.ready" class="status-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-placeholder__eyebrow">
+            {{ t("settings.operationalReset.title") }}
+          </p>
+          <h2>{{ t("settings.operationalReset.title") }}</h2>
+        </div>
+      </div>
+      <Button
+        severity="danger"
+        type="button"
+        :disabled="!canOperationalReset"
+        @click="openOperationalResetDialog"
+      >
+        <RotateCcw :size="16" aria-hidden="true" />
+        <span>{{ t("settings.operationalReset.action") }}</span>
+      </Button>
+    </div>
+
+    <Dialog
+      v-model:visible="operationalResetDialogVisible"
+      modal
+      :closable="!setup.loading"
+      :header="t('settings.operationalReset.title')"
+    >
+      <p>{{ t("settings.operationalReset.description") }}</p>
+      <label class="settings-control">
+        <span>{{ t("settings.operationalReset.confirmationLabel") }}</span>
+        <InputText
+          v-model="operationalResetConfirmation"
+          autocomplete="off"
+          :disabled="setup.loading"
+        />
+      </label>
+      <template #footer>
+        <Button
+          severity="secondary"
+          type="button"
+          :disabled="setup.loading"
+          @click="operationalResetDialogVisible = false"
+        >
+          {{ t("settings.operationalReset.cancel") }}
+        </Button>
+        <Button
+          severity="danger"
+          type="button"
+          :disabled="operationalResetConfirmation !== 'RESET' || setup.loading"
+          @click="confirmOperationalReset"
+        >
+          <RotateCcw :size="16" aria-hidden="true" />
+          <span>{{ t("settings.operationalReset.confirm") }}</span>
+        </Button>
+      </template>
+    </Dialog>
   </section>
 </template>

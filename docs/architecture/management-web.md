@@ -24,8 +24,9 @@ generation while Agent and local Control IPC remain available.
 
 Agent-owned routes are handled before the private Gateway proxy:
 `GET /api/v1/auth/session` bootstraps a local browser session only for a
-loopback peer using an exact local Host. Setup status/terms/reset and setup
-events, lifecycle status/events, and update status/events remain Agent-owned;
+loopback peer using an exact local Host. Setup status/terms/reset, the separate
+ready-state operational reset, and setup events, lifecycle status/events, and
+update status/events remain Agent-owned;
 the three event streams use independent Axum SSE namespaces even while Gateway
 is stopped. Until setup is ready, the static setup shell and those allowed
 Agent surfaces remain reachable while every proxied Gateway route returns the

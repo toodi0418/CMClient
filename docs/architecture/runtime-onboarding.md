@@ -30,8 +30,16 @@ setup, lifecycle, and update event streams. While the authoritative setup state
 is not ready, Management Web serves the setup shell and Agent-owned setup
 surface but rejects every Gateway proxy route with `SETUP_REQUIRED`. The
 setup-phase reset endpoint may rotate generation only while external Gateway
-work is already fenced; the complete ready-state operational/factory reset,
-including secret/config clearing and staged recovery, remains P14-T04.
+work is already fenced. Ready-state `POST /api/v1/reset/operational` persists
+its target generation before stopping the supervised Gateway, clears the
+Gateway route and CallMesh key, removes operational configuration and every
+runtime secret, publishes the new generation to revoke Management Web sessions,
+and then returns to `terms_required`. Restart recovery replays that same
+generation before migration so no legacy source can repopulate the reset root.
+The fixture-only factory worker has no production route: it requires both
+confirmation strings and an explicit backup disposition, accepts only a
+nonce-marked temporary fixture root, clears only a fixed direct-child allowlist,
+and replays every interrupted phase to a newly initialized setup root.
 
 The supervised private bootstrap frame is schema version 2 and carries the
 current positive JavaScript-safe setup generation beside the memory-only

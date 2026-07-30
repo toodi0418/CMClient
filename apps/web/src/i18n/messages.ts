@@ -406,6 +406,14 @@ export const messages = {
       display: "顯示偏好",
       runtime: "執行環境",
       capabilities: "能力狀態",
+      operationalReset: {
+        title: "重設 CMClient",
+        action: "重設",
+        description: "這會停止本機服務、清除執行設定與憑證，並回到初始設定。",
+        confirmationLabel: "輸入 RESET 以繼續",
+        cancel: "取消",
+        confirm: "重設並回到設定",
+      },
     },
     diagnostics: {
       integrityCheck: "資料庫完整性檢查",
@@ -888,6 +896,15 @@ export const messages = {
       display: "Display preferences",
       runtime: "Runtime",
       capabilities: "Capability state",
+      operationalReset: {
+        title: "Reset CMClient",
+        action: "Reset",
+        description:
+          "This stops local services, clears operational settings and credentials, then returns to setup.",
+        confirmationLabel: "Type RESET to continue",
+        cancel: "Cancel",
+        confirm: "Reset and return to setup",
+      },
     },
     diagnostics: {
       integrityCheck: "Database integrity check",

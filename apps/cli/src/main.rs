@@ -42,6 +42,10 @@ enum Command {
     Start,
     Stop,
     Restart,
+    Reset {
+        #[arg(long)]
+        confirm: String,
+    },
     Version,
     Logs {
         #[arg(long)]
@@ -153,6 +157,17 @@ fn run(cli: Cli) -> ProcessExitCode {
         Command::Start => print_control_result(client.start(), json, quiet, style),
         Command::Stop => print_control_result(client.stop(), json, quiet, style),
         Command::Restart => print_control_result(client.restart(), json, quiet, style),
+        Command::Reset { confirm } => {
+            if confirm != "operational-reset" {
+                if json {
+                    let _ = print_json(&json!({"code": "CLI_RESET_CONFIRMATION_INVALID"}));
+                    return ProcessExitCode::from(ExitCode::Validation.as_u8());
+                }
+                eprintln!("CLI_RESET_CONFIRMATION_INVALID");
+                return ProcessExitCode::from(ExitCode::Validation.as_u8());
+            }
+            print_control_result(client.operational_reset(), json, quiet, style)
+        }
         Command::Logs { follow } => {
             events_command(&client, follow, EventOutput::Logs, json, quiet, style)
         }

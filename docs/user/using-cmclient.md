@@ -50,6 +50,7 @@ cmclient status
 cmclient start
 cmclient stop
 cmclient restart
+cmclient reset --confirm operational-reset
 cmclient doctor
 cmclient logs --follow
 cmclient events --follow
@@ -63,6 +64,10 @@ Global options are `--json`, `--quiet`, `--no-color`, `--timeout`, and
 `--endpoint`. `--json` is a stable projection, not a dump of internal rows.
 Follow commands reconnect with bounded SSE state and stop cleanly on Ctrl+C.
 Exit codes are documented in the [CLI contract](../api/cli.md).
+
+The reset command is deliberately explicit. It stops the local Gateway, clears
+operational configuration and credentials, preserves history/backups/update
+state, and returns the product to setup.
 
 `events` displays current domain events. `logs` only selects the reserved
 `log.entry` event type, which has no production publisher in this RC; use

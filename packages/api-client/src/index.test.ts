@@ -121,7 +121,7 @@ describe("gateway API client", () => {
     setManagementCsrfToken(undefined);
   });
 
-  it("uses the Agent-owned setup status, terms, reset, and lifecycle contracts", async () => {
+  it("uses the Agent-owned setup status, terms, reset, lifecycle, and operational reset contracts", async () => {
     const requests: Array<{ body: unknown; method: string; url: string }> = [];
     const client = new GatewayApiClient({
       fetch: async (input, init) => {
@@ -170,6 +170,9 @@ describe("gateway API client", () => {
     await expect(
       client.setup.reset("operational_reset"),
     ).resolves.toMatchObject({ phase: "credentials_required" });
+    await expect(
+      client.setup.operationalReset("operational_reset"),
+    ).resolves.toMatchObject({ phase: "credentials_required" });
     await expect(client.lifecycle.status()).resolves.toMatchObject({
       gateway: "stopped",
     });
@@ -185,6 +188,11 @@ describe("gateway API client", () => {
         body: { confirmation: "operational_reset" },
         method: "POST",
         url: "/api/v1/setup/reset",
+      },
+      {
+        body: { confirmation: "operational_reset" },
+        method: "POST",
+        url: "/api/v1/reset/operational",
       },
       { body: undefined, method: "GET", url: "/api/v1/lifecycle/status" },
     ]);
@@ -204,6 +212,9 @@ describe("gateway API client", () => {
     ).rejects.toMatchObject({ code: "CLIENT_INPUT_INVALID" });
     await expect(
       client.setup.reset("wrong" as "operational_reset"),
+    ).rejects.toMatchObject({ code: "CLIENT_INPUT_INVALID" });
+    await expect(
+      client.setup.operationalReset("wrong" as "operational_reset"),
     ).rejects.toMatchObject({ code: "CLIENT_INPUT_INVALID" });
     expect(requests).toBe(0);
   });

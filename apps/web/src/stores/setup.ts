@@ -262,6 +262,23 @@ export function createSetupStore(client: SetupClient = defaultClient()) {
           this.loading = false;
         }
       },
+      async operationalReset() {
+        this.loading = true;
+        try {
+          this.applyStatus(
+            await client.setup.operationalReset("operational_reset"),
+          );
+          this.errorCode = undefined;
+          return this.status;
+        } catch (error) {
+          this.errorCode = isGatewayApiError(error)
+            ? error.code
+            : "AGENT_OPERATIONAL_RESET_FAILED";
+          throw error;
+        } finally {
+          this.loading = false;
+        }
+      },
     },
   });
 }

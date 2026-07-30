@@ -155,6 +155,26 @@ const AGENT_MANAGEMENT_PATHS: Record<string, JsonValue> = {
       },
     },
   },
+  "/api/v1/reset/operational": {
+    post: {
+      security: AGENT_SESSION_SECURITY,
+      parameters: [CSRF_PARAMETER],
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/SetupResetRequest" },
+          },
+        },
+      },
+      responses: {
+        "200": agentJsonResponse("SetupStatus"),
+        "400": AGENT_ERROR_RESPONSE,
+        "409": AGENT_ERROR_RESPONSE,
+        "503": AGENT_ERROR_RESPONSE,
+      },
+    },
+  },
   "/api/v1/setup/events": {
     get: agentSseOperation("AgentSetupEvent"),
   },

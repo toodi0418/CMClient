@@ -85,7 +85,17 @@ const SETUP_COMMIT_START_ENVIRONMENT_NAME: &str = "CMCLIENT_SETUP_COMMIT_START";
 const PROXY_ENABLED_ENVIRONMENT_NAME: &str = "CMCLIENT_PROXY_ENABLED";
 const SETUP_TRANSACTION_FILE_NAME: &str = "setup-transaction.json";
 const SETUP_TRANSACTION_VERSION: u8 = 1;
+const RESET_TRANSACTION_FILE_NAME: &str = "reset-transaction.json";
+const RESET_TRANSACTION_VERSION: u8 = 1;
 const MAX_SETUP_CONFIGURATION_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+const FACTORY_RESET_FIXTURE_VERSION: u8 = 1;
+#[cfg(test)]
+const FACTORY_RESET_FIXTURE_MARKER_FILE_NAME: &str = ".factory-reset-fixture.json";
+#[cfg(test)]
+const FACTORY_RESET_FIXTURE_JOURNAL_FILE_NAME: &str = ".factory-reset-journal.json";
+#[cfg(test)]
+const FACTORY_RESET_FIXTURE_COMPLETION_FILE_NAME: &str = ".factory-reset-completed.json";
 
 #[derive(Clone)]
 struct AgentWebEvent {
@@ -406,6 +416,90 @@ struct SetupResetRequest {
     confirmation: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResetKind {
+    Operational,
+    Factory,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResetTransactionJournal {
+    version: u8,
+    kind: ResetKind,
+    target_generation: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResetCompletionMarker {
+    version: u8,
+    kind: ResetKind,
+}
+
+// This worker is test-only by design. It provides the destructive-reset
+// recovery contract without creating a production path to a user's root.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FactoryResetFixturePhase {
+    Prepared,
+    Quiesced,
+    MutableStateCleared,
+    RootRecreated,
+    Completed,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FactoryResetBackupBehavior {
+    RetainExisting,
+    EraseAll,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct FactoryResetFixtureConfirmation {
+    backup_behavior: FactoryResetBackupBehavior,
+    first_confirmation: &'static str,
+    final_confirmation: &'static str,
+}
+
+#[cfg(test)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FactoryResetFixtureMarker {
+    version: u8,
+    nonce: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FactoryResetFixtureJournal {
+    version: u8,
+    nonce: String,
+    backup_behavior: FactoryResetBackupBehavior,
+    phase: FactoryResetFixturePhase,
+}
+
+#[cfg(test)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FactoryResetFixtureCompletion {
+    version: u8,
+    nonce: String,
+    backup_behavior: FactoryResetBackupBehavior,
+}
+
+#[cfg(test)]
+struct FactoryResetFixtureJob {
+    paths: RuntimePaths,
+    nonce: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetupConfigureRequest {
@@ -561,6 +655,8 @@ type SetupApplyHandler = Arc<
         + Sync,
 >;
 
+type SetupResetHandler = Arc<dyn Fn() -> Result<SetupStatus, SetupApplyError> + Send + Sync>;
+
 const CALLMESH_PRODUCTION_URL: &str = "https://callmesh.tmmarc.org";
 const DEFAULT_APRS_HOST: &str = "asia.aprs2.net";
 const DEFAULT_APRS_PORT: u16 = 14_580;
@@ -575,6 +671,7 @@ struct AgentWebState {
     management_setup_state: Mutex<Option<ManagementSetupState>>,
     management_access: Option<Arc<ManagementAccessController>>,
     setup_apply: Mutex<Option<SetupApplyHandler>>,
+    operational_reset: Mutex<Option<SetupResetHandler>>,
     migrated_meshtastic: Option<MeshtasticCandidate>,
     discovery_gate: Mutex<()>,
     audit: Mutex<VecDeque<ManagementAuditEntry>>,
@@ -633,6 +730,7 @@ impl AgentWebState {
             management_setup_state: Mutex::new(None),
             management_access,
             setup_apply: Mutex::new(None),
+            operational_reset: Mutex::new(None),
             migrated_meshtastic,
             discovery_gate: Mutex::new(()),
             audit: Mutex::new(VecDeque::new()),
@@ -646,6 +744,40 @@ impl AgentWebState {
             .lock()
             .map_err(|_| ControlError::CommandFailed)? = Some(handler);
         Ok(())
+    }
+
+    fn install_operational_reset(&self, handler: SetupResetHandler) -> Result<(), ControlError> {
+        *self
+            .operational_reset
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)? = Some(handler);
+        Ok(())
+    }
+
+    fn reset_setup(&self) -> Result<SetupStatus, SetupApplyError> {
+        let current = self.setup.status()?;
+        if !self.setup_gate_required
+            || !current.setup_required
+            || matches!(current.phase, SetupPhase::Validating)
+        {
+            return Err(SetupError::TransitionInvalid.into());
+        }
+        let status = self.setup.reset()?;
+        self.publish_setup_status(&status)
+            .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        self.record_audit("setup_reset", "allowed", "SETUP_RESET_COMPLETED");
+        self.record_audit("setup_generation", "changed", "SETUP_GENERATION_CHANGED");
+        Ok(status)
+    }
+
+    fn reset_operational(&self) -> Result<SetupStatus, SetupApplyError> {
+        let handler = self
+            .operational_reset
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?
+            .clone()
+            .ok_or(SetupApplyError::SupervisorUnavailable)?;
+        handler()
     }
 
     fn attach_management_setup_state(
@@ -762,6 +894,10 @@ fn agent_web_router(state: Arc<AgentWebState>) -> Router {
         .route("/api/v1/setup/configure", post(management_setup_configure))
         .route("/api/v1/setup/terms", post(management_setup_terms))
         .route("/api/v1/setup/reset", post(management_setup_reset))
+        .route(
+            "/api/v1/reset/operational",
+            post(management_operational_reset),
+        )
         .route("/api/v1/setup/events", get(management_setup_events))
         .route("/api/v1/lifecycle/status", get(management_lifecycle_status))
         .route("/api/v1/lifecycle/events", get(management_lifecycle_events))
@@ -983,6 +1119,548 @@ fn remove_setup_transaction(path: &Path) -> Result<(), SetupApplyError> {
     }
 }
 
+fn reset_transaction_file(paths: &RuntimePaths) -> PathBuf {
+    paths.state_dir().join(RESET_TRANSACTION_FILE_NAME)
+}
+
+fn reset_completion_file(paths: &RuntimePaths) -> PathBuf {
+    paths.state_dir().join("reset-completed.json")
+}
+
+fn write_reset_transaction(
+    paths: &RuntimePaths,
+    kind: ResetKind,
+    target_generation: u64,
+) -> Result<(), SetupApplyError> {
+    if target_generation == 0 {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let bytes = serde_json::to_vec(&ResetTransactionJournal {
+        version: RESET_TRANSACTION_VERSION,
+        kind,
+        target_generation,
+    })
+    .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    write_atomic_configuration(&reset_transaction_file(paths), &bytes)
+}
+
+fn read_reset_transaction(
+    paths: &RuntimePaths,
+) -> Result<Option<ResetTransactionJournal>, SetupApplyError> {
+    let path = reset_transaction_file(paths);
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(SetupApplyError::ConfigWriteFailed),
+    };
+    if bytes.len() > MAX_SETUP_CONFIGURATION_BYTES {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let journal: ResetTransactionJournal =
+        serde_json::from_slice(&bytes).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    if journal.version != RESET_TRANSACTION_VERSION || journal.target_generation == 0 {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    Ok(Some(journal))
+}
+
+fn remove_reset_transaction(paths: &RuntimePaths) -> Result<(), SetupApplyError> {
+    match fs::remove_file(reset_transaction_file(paths)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SetupApplyError::ConfigWriteFailed),
+    }
+}
+
+fn write_reset_completion_marker(
+    paths: &RuntimePaths,
+    kind: ResetKind,
+) -> Result<(), SetupApplyError> {
+    let bytes = serde_json::to_vec(&ResetCompletionMarker {
+        version: RESET_TRANSACTION_VERSION,
+        kind,
+    })
+    .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    write_atomic_configuration(&reset_completion_file(paths), &bytes)
+}
+
+fn reset_completion_marker_exists(paths: &RuntimePaths) -> Result<bool, SetupApplyError> {
+    let bytes = match fs::read(reset_completion_file(paths)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(SetupApplyError::ConfigWriteFailed),
+    };
+    if bytes.len() > MAX_SETUP_CONFIGURATION_BYTES {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let marker: ResetCompletionMarker =
+        serde_json::from_slice(&bytes).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    if marker.version != RESET_TRANSACTION_VERSION {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    Ok(true)
+}
+
+fn validate_reset_paths(paths: &RuntimePaths, config_file: &Path) -> Result<(), SetupApplyError> {
+    if !paths.root_dir().is_absolute()
+        || paths
+            .root_dir()
+            .file_name()
+            .is_none_or(|name| name != ".cmclient")
+        || config_file != paths.config_file()
+    {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    Ok(())
+}
+
+fn complete_operational_reset(
+    paths: &RuntimePaths,
+    config_file: &Path,
+    secrets: &AgentSecretStore,
+    setup: &SetupStore,
+    target_generation: u64,
+) -> Result<SetupStatus, SetupApplyError> {
+    validate_reset_paths(paths, config_file)?;
+    let status = setup.reset_to_generation(target_generation)?;
+    secrets
+        .clear_for_reset()
+        .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    restore_setup_configuration(config_file, None)?;
+    remove_setup_transaction(&setup_transaction_file(paths))?;
+    write_reset_completion_marker(paths, ResetKind::Operational)?;
+    Ok(status)
+}
+
+fn recover_interrupted_reset(paths: &RuntimePaths) -> Result<bool, SetupApplyError> {
+    let Some(journal) = read_reset_transaction(paths)? else {
+        return reset_completion_marker_exists(paths);
+    };
+    if journal.kind != ResetKind::Operational {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let secrets = AgentSecretStore::runtime(paths.root_dir())
+        .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    let setup = SetupStore::open(paths)?;
+    complete_operational_reset(
+        paths,
+        &paths.config_file(),
+        &secrets,
+        &setup,
+        journal.target_generation,
+    )?;
+    remove_reset_transaction(paths)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+impl FactoryResetFixtureConfirmation {
+    fn for_backup_behavior(backup_behavior: FactoryResetBackupBehavior) -> Self {
+        let final_confirmation = match backup_behavior {
+            FactoryResetBackupBehavior::RetainExisting => "retain-existing-backups",
+            FactoryResetBackupBehavior::EraseAll => "erase-all-backups",
+        };
+        Self {
+            backup_behavior,
+            first_confirmation: "factory-reset-fixture",
+            final_confirmation,
+        }
+    }
+
+    fn validate(self) -> Result<(), SetupApplyError> {
+        let expected_final_confirmation = match self.backup_behavior {
+            FactoryResetBackupBehavior::RetainExisting => "retain-existing-backups",
+            FactoryResetBackupBehavior::EraseAll => "erase-all-backups",
+        };
+        if self.first_confirmation != "factory-reset-fixture"
+            || self.final_confirmation != expected_final_confirmation
+        {
+            return Err(SetupApplyError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl FactoryResetFixtureJob {
+    fn create(paths: RuntimePaths) -> Result<Self, SetupApplyError> {
+        validate_factory_reset_fixture_paths(&paths)?;
+        ensure_runtime_directories(&paths).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        let nonce = format!(
+            "fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| SetupApplyError::ConfigWriteFailed)?
+                .as_nanos()
+        );
+        let job = Self { paths, nonce };
+        job.write_marker()?;
+        job.validate()?;
+        Ok(job)
+    }
+
+    fn run<F>(
+        &self,
+        confirmation: FactoryResetFixtureConfirmation,
+        quiesce: F,
+    ) -> Result<(), SetupApplyError>
+    where
+        F: FnMut() -> Result<(), SetupApplyError>,
+    {
+        confirmation.validate()?;
+        self.validate()?;
+        let journal = match self.read_journal()? {
+            Some(journal) => {
+                if journal.backup_behavior != confirmation.backup_behavior {
+                    return Err(SetupApplyError::InvalidInput);
+                }
+                journal
+            }
+            None if self.completion_matches(confirmation.backup_behavior)? => return Ok(()),
+            None => {
+                let journal = FactoryResetFixtureJournal {
+                    version: FACTORY_RESET_FIXTURE_VERSION,
+                    nonce: self.nonce.clone(),
+                    backup_behavior: confirmation.backup_behavior,
+                    phase: FactoryResetFixturePhase::Prepared,
+                };
+                self.write_journal(&journal)?;
+                journal
+            }
+        };
+        self.run_journal(journal, quiesce, None)
+    }
+
+    fn recover(&self) -> Result<(), SetupApplyError> {
+        self.validate()?;
+        let Some(journal) = self.read_journal()? else {
+            return if self.completion_matches_any()? {
+                Ok(())
+            } else {
+                Err(SetupApplyError::ConfigWriteFailed)
+            };
+        };
+        self.run_journal(journal, || Ok(()), None)
+    }
+
+    fn run_until<F>(
+        &self,
+        confirmation: FactoryResetFixtureConfirmation,
+        quiesce: F,
+        interrupt_after: FactoryResetFixturePhase,
+    ) -> Result<(), SetupApplyError>
+    where
+        F: FnMut() -> Result<(), SetupApplyError>,
+    {
+        confirmation.validate()?;
+        self.validate()?;
+        let journal = FactoryResetFixtureJournal {
+            version: FACTORY_RESET_FIXTURE_VERSION,
+            nonce: self.nonce.clone(),
+            backup_behavior: confirmation.backup_behavior,
+            phase: FactoryResetFixturePhase::Prepared,
+        };
+        self.write_journal(&journal)?;
+        self.run_journal(journal, quiesce, Some(interrupt_after))
+    }
+
+    fn run_journal<F>(
+        &self,
+        mut journal: FactoryResetFixtureJournal,
+        mut quiesce: F,
+        interrupt_after: Option<FactoryResetFixturePhase>,
+    ) -> Result<(), SetupApplyError>
+    where
+        F: FnMut() -> Result<(), SetupApplyError>,
+    {
+        loop {
+            if interrupt_after == Some(journal.phase) {
+                return Err(SetupApplyError::Cancelled);
+            }
+            match journal.phase {
+                FactoryResetFixturePhase::Prepared => {
+                    quiesce()?;
+                    journal.phase = FactoryResetFixturePhase::Quiesced;
+                    self.write_journal(&journal)?;
+                }
+                FactoryResetFixturePhase::Quiesced => {
+                    clear_factory_reset_fixture_state(&self.paths, journal.backup_behavior)?;
+                    journal.phase = FactoryResetFixturePhase::MutableStateCleared;
+                    self.write_journal(&journal)?;
+                }
+                FactoryResetFixturePhase::MutableStateCleared => {
+                    ensure_runtime_directories(&self.paths)
+                        .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+                    let setup = SetupStore::open(&self.paths)?;
+                    if setup.status()?.phase != SetupPhase::TermsRequired {
+                        return Err(SetupApplyError::ConfigWriteFailed);
+                    }
+                    journal.phase = FactoryResetFixturePhase::RootRecreated;
+                    self.write_journal(&journal)?;
+                }
+                FactoryResetFixturePhase::RootRecreated => {
+                    self.write_completion(journal.backup_behavior)?;
+                    journal.phase = FactoryResetFixturePhase::Completed;
+                    self.write_journal(&journal)?;
+                }
+                FactoryResetFixturePhase::Completed => {
+                    self.write_completion(journal.backup_behavior)?;
+                    remove_factory_reset_fixture_file(&self.journal_file())?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn marker_file(&self) -> PathBuf {
+        self.paths
+            .root_dir()
+            .join(FACTORY_RESET_FIXTURE_MARKER_FILE_NAME)
+    }
+
+    fn journal_file(&self) -> PathBuf {
+        self.paths
+            .root_dir()
+            .join(FACTORY_RESET_FIXTURE_JOURNAL_FILE_NAME)
+    }
+
+    fn completion_file(&self) -> PathBuf {
+        self.paths
+            .root_dir()
+            .join(FACTORY_RESET_FIXTURE_COMPLETION_FILE_NAME)
+    }
+
+    fn write_marker(&self) -> Result<(), SetupApplyError> {
+        validate_factory_reset_fixture_output_file(&self.marker_file())?;
+        let bytes = serde_json::to_vec(&FactoryResetFixtureMarker {
+            version: FACTORY_RESET_FIXTURE_VERSION,
+            nonce: self.nonce.clone(),
+        })
+        .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        write_atomic_configuration(&self.marker_file(), &bytes)
+    }
+
+    fn write_journal(&self, journal: &FactoryResetFixtureJournal) -> Result<(), SetupApplyError> {
+        validate_factory_reset_fixture_output_file(&self.journal_file())?;
+        let bytes = serde_json::to_vec(journal).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        write_atomic_configuration(&self.journal_file(), &bytes)
+    }
+
+    fn read_journal(&self) -> Result<Option<FactoryResetFixtureJournal>, SetupApplyError> {
+        read_factory_reset_fixture_document(&self.journal_file()).and_then(|document| {
+            let Some(bytes) = document else {
+                return Ok(None);
+            };
+            let journal = serde_json::from_slice::<FactoryResetFixtureJournal>(&bytes)
+                .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+            if journal.version != FACTORY_RESET_FIXTURE_VERSION || journal.nonce != self.nonce {
+                return Err(SetupApplyError::ConfigWriteFailed);
+            }
+            Ok(Some(journal))
+        })
+    }
+
+    fn write_completion(
+        &self,
+        backup_behavior: FactoryResetBackupBehavior,
+    ) -> Result<(), SetupApplyError> {
+        validate_factory_reset_fixture_output_file(&self.completion_file())?;
+        let bytes = serde_json::to_vec(&FactoryResetFixtureCompletion {
+            version: FACTORY_RESET_FIXTURE_VERSION,
+            nonce: self.nonce.clone(),
+            backup_behavior,
+        })
+        .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        write_atomic_configuration(&self.completion_file(), &bytes)
+    }
+
+    fn completion_matches(
+        &self,
+        backup_behavior: FactoryResetBackupBehavior,
+    ) -> Result<bool, SetupApplyError> {
+        let Some(bytes) = read_factory_reset_fixture_document(&self.completion_file())? else {
+            return Ok(false);
+        };
+        let completion = serde_json::from_slice::<FactoryResetFixtureCompletion>(&bytes)
+            .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        Ok(completion.version == FACTORY_RESET_FIXTURE_VERSION
+            && completion.nonce == self.nonce
+            && completion.backup_behavior == backup_behavior)
+    }
+
+    fn completion_matches_any(&self) -> Result<bool, SetupApplyError> {
+        let Some(bytes) = read_factory_reset_fixture_document(&self.completion_file())? else {
+            return Ok(false);
+        };
+        let completion = serde_json::from_slice::<FactoryResetFixtureCompletion>(&bytes)
+            .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        Ok(completion.version == FACTORY_RESET_FIXTURE_VERSION && completion.nonce == self.nonce)
+    }
+
+    fn validate(&self) -> Result<(), SetupApplyError> {
+        validate_factory_reset_fixture_paths(&self.paths)?;
+        let marker_path = self.marker_file();
+        let Some(bytes) = read_factory_reset_fixture_document(&marker_path)? else {
+            return Err(SetupApplyError::ConfigWriteFailed);
+        };
+        let marker = serde_json::from_slice::<FactoryResetFixtureMarker>(&bytes)
+            .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        if marker.version != FACTORY_RESET_FIXTURE_VERSION || marker.nonce != self.nonce {
+            return Err(SetupApplyError::ConfigWriteFailed);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn validate_factory_reset_fixture_paths(paths: &RuntimePaths) -> Result<(), SetupApplyError> {
+    let root = paths.root_dir();
+    if !root.is_absolute()
+        || root.file_name().is_none_or(|name| name != ".cmclient")
+        || paths.config_dir != *root
+        || paths.cache_dir != root.join("cache")
+        || paths.log_dir != root.join("logs")
+    {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let parent = root.parent().ok_or(SetupApplyError::ConfigWriteFailed)?;
+    let parent_name = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SetupApplyError::ConfigWriteFailed)?;
+    if !parent_name.starts_with("cmclient-factory-reset-fixture-") {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let metadata = fs::symlink_metadata(root).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    if !metadata.file_type().is_dir() || factory_reset_fixture_is_reparse_point(&metadata) {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let canonical_root = fs::canonicalize(root).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    let canonical_temp =
+        fs::canonicalize(std::env::temp_dir()).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    if canonical_root.parent() != Some(canonical_parent.as_path())
+        || !canonical_parent.starts_with(canonical_temp)
+    {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+fn factory_reset_fixture_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes() & 0x0400 != 0
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+fn factory_reset_fixture_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+fn read_factory_reset_fixture_document(path: &Path) -> Result<Option<Vec<u8>>, SetupApplyError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(SetupApplyError::ConfigWriteFailed),
+    };
+    if !metadata.file_type().is_file() || factory_reset_fixture_is_reparse_point(&metadata) {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    let bytes = fs::read(path).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    if bytes.len() > MAX_SETUP_CONFIGURATION_BYTES {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(test)]
+fn validate_factory_reset_fixture_output_file(path: &Path) -> Result<(), SetupApplyError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(SetupApplyError::ConfigWriteFailed),
+    };
+    if !metadata.file_type().is_file() || factory_reset_fixture_is_reparse_point(&metadata) {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn clear_factory_reset_fixture_state(
+    paths: &RuntimePaths,
+    backup_behavior: FactoryResetBackupBehavior,
+) -> Result<(), SetupApplyError> {
+    validate_factory_reset_fixture_paths(paths)?;
+    for name in [
+        "config.toml",
+        "secrets.json",
+        "cmclient.db",
+        "cmclient.db-shm",
+        "cmclient.db-wal",
+    ] {
+        remove_factory_reset_fixture_file(&paths.root_dir().join(name))?;
+    }
+    for name in ["cache", "logs", "run", "state", "updates"] {
+        remove_factory_reset_fixture_directory(&paths.root_dir().join(name))?;
+    }
+    if backup_behavior == FactoryResetBackupBehavior::EraseAll {
+        remove_factory_reset_fixture_directory(&paths.backups_dir())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn remove_factory_reset_fixture_file(path: &Path) -> Result<(), SetupApplyError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(SetupApplyError::ConfigWriteFailed),
+    };
+    if !metadata.file_type().is_file() || factory_reset_fixture_is_reparse_point(&metadata) {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    fs::remove_file(path).map_err(|_| SetupApplyError::ConfigWriteFailed)
+}
+
+#[cfg(test)]
+fn remove_factory_reset_fixture_directory(path: &Path) -> Result<(), SetupApplyError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(SetupApplyError::ConfigWriteFailed),
+    };
+    if !metadata.file_type().is_dir() || factory_reset_fixture_is_reparse_point(&metadata) {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    validate_factory_reset_fixture_tree(path)?;
+    fs::remove_dir_all(path).map_err(|_| SetupApplyError::ConfigWriteFailed)
+}
+
+#[cfg(test)]
+fn validate_factory_reset_fixture_tree(path: &Path) -> Result<(), SetupApplyError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+    if factory_reset_fixture_is_reparse_point(&metadata) {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    if metadata.file_type().is_file() {
+        return Ok(());
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(SetupApplyError::ConfigWriteFailed);
+    }
+    for entry in fs::read_dir(path).map_err(|_| SetupApplyError::ConfigWriteFailed)? {
+        let entry = entry.map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        validate_factory_reset_fixture_tree(&entry.path())?;
+    }
+    Ok(())
+}
+
 fn recover_interrupted_setup(
     paths: &RuntimePaths,
     config_file: &Path,
@@ -1088,30 +1766,33 @@ async fn management_setup_reset(
         )
             .into_response();
     }
-    let operation = tokio::task::spawn_blocking(move || {
-        if !state.setup_gate_required {
-            return Err(cmclient_agent_core::setup::SetupError::TransitionInvalid);
-        }
-        let current = state.setup.status()?;
-        if !current.setup_required || matches!(current.phase, SetupPhase::Validating) {
-            return Err(cmclient_agent_core::setup::SetupError::TransitionInvalid);
-        }
-        let previous_generation = state.setup.generation()?.generation();
-        let status = state.setup.reset()?;
-        let next_generation = state.setup.generation()?.generation();
-        state.record_audit("setup_reset", "allowed", "SETUP_RESET_COMPLETED");
-        if next_generation != previous_generation {
-            state.record_audit("setup_generation", "changed", "SETUP_GENERATION_CHANGED");
-        }
-        state
-            .publish_setup_status(&status)
-            .map_err(|_| cmclient_agent_core::setup::SetupError::WriteFailed)?;
-        Ok::<_, cmclient_agent_core::setup::SetupError>(status)
-    })
-    .await;
+    let operation = tokio::task::spawn_blocking(move || state.reset_setup()).await;
     match operation {
         Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
-        Ok(Err(error)) => setup_error_response(error),
+        Ok(Err(error)) => setup_apply_error_response(error),
+        Err(_) => management_control_failed_response(),
+    }
+}
+
+async fn management_operational_reset(
+    State(state): State<Arc<AgentWebState>>,
+    request: Result<Json<SetupResetRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(_) => return setup_request_invalid_response(),
+    };
+    if request.confirmation != "operational_reset" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"code": "SETUP_RESET_CONFIRMATION_INVALID"})),
+        )
+            .into_response();
+    }
+    let operation = tokio::task::spawn_blocking(move || state.reset_operational()).await;
+    match operation {
+        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(Err(error)) => setup_apply_error_response(error),
         Err(_) => management_control_failed_response(),
     }
 }
@@ -1375,6 +2056,7 @@ struct AgentController {
     management_web_config: ManagementWebConfig,
     management_access: Option<Arc<ManagementAccessController>>,
     control_endpoint: ControlEndpoint,
+    paths: RuntimePaths,
     config_file: PathBuf,
     setup_transaction_file: PathBuf,
     secrets: AgentSecretStore,
@@ -1559,6 +2241,16 @@ impl AgentController {
                     .ok_or(SetupApplyError::SupervisorUnavailable)?;
                 controller.apply_setup(request, cancellation)
             }))
+    }
+
+    fn install_operational_reset(self: &Arc<Self>) -> Result<(), ControlError> {
+        let weak = Arc::downgrade(self);
+        self.web_state.install_operational_reset(Arc::new(move || {
+            let controller = weak
+                .upgrade()
+                .ok_or(SetupApplyError::SupervisorUnavailable)?;
+            controller.operational_reset()
+        }))
     }
 
     fn apply_setup(
@@ -2365,6 +3057,7 @@ impl AgentController {
             management_web_config,
             management_access,
             control_endpoint,
+            paths: config.paths.clone(),
             config_file: config.config_file.clone(),
             setup_transaction_file: setup_transaction_file(&config.paths),
             secrets,
@@ -2773,11 +3466,80 @@ impl AgentController {
         }
     }
 
+    fn operational_reset(&self) -> Result<SetupStatus, SetupApplyError> {
+        let _reset_transaction = self
+            .setup_transaction
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        if !self.setup_gate_required {
+            return Err(SetupError::TransitionInvalid.into());
+        }
+        let current = self.setup.status()?;
+        if matches!(current.phase, SetupPhase::Validating) {
+            return Err(SetupError::TransitionInvalid.into());
+        }
+        validate_reset_paths(&self.paths, &self.config_file)?;
+        let target_generation = self.setup.next_reset_generation()?;
+        write_reset_transaction(&self.paths, ResetKind::Operational, target_generation)?;
+
+        // Hold the transition lock across the child stop and generation change
+        // so the supervisor worker cannot revive the old external owner.
+        let _gateway_transition = self
+            .gateway_transition
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        self.stop_supervisor_locked()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
+        if let Some(supervisor) = self
+            .supervisor
+            .lock()
+            .map_err(|_| SetupApplyError::SupervisorUnavailable)?
+            .as_mut()
+        {
+            supervisor.clear_callmesh_api_key();
+        }
+
+        let result = complete_operational_reset(
+            &self.paths,
+            &self.config_file,
+            &self.secrets,
+            &self.setup,
+            target_generation,
+        );
+        let committed_status = self.setup.status().ok().filter(|status| {
+            status.terms_required
+                && self
+                    .setup
+                    .generation()
+                    .ok()
+                    .is_some_and(|generation| generation.generation() == target_generation)
+        });
+        if let Some(status) = committed_status.as_ref() {
+            self.web_state
+                .publish_setup_status(status)
+                .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
+        }
+        let status = result?;
+        remove_reset_transaction(&self.paths)?;
+        self.web_state.record_audit(
+            "operational_reset",
+            "allowed",
+            "OPERATIONAL_RESET_COMPLETED",
+        );
+        self.web_state
+            .record_audit("setup_generation", "changed", "SETUP_GENERATION_CHANGED");
+        Ok(status)
+    }
+
     fn stop_supervisor(&self) -> Result<bool, ControlError> {
         let _transition = self
             .gateway_transition
             .lock()
             .map_err(|_| ControlError::CommandFailed)?;
+        self.stop_supervisor_locked()
+    }
+
+    fn stop_supervisor_locked(&self) -> Result<bool, ControlError> {
         self.gateway_session.clear();
         let (result, log_health) = {
             let mut supervisor = self
@@ -3064,6 +3826,11 @@ impl ControlHandler for AgentController {
                 self.start_supervisor()?
                     .then_some(())
                     .ok_or(ControlError::CommandFailed)?;
+                self.status()
+            }
+            ControlCommand::OperationalReset => {
+                self.operational_reset()
+                    .map_err(|_| ControlError::CommandFailed)?;
                 self.status()
             }
             ControlCommand::ShutdownAgent => {
@@ -3692,8 +4459,12 @@ fn load_agent_config_after_migration_with(
     candidates: &[ProductMigrationSourceSet],
     maintenance: &dyn GatewayMaintenanceRunner,
 ) -> Result<AgentConfig, String> {
-    migrate_detected_product_source_sets(paths.root_dir(), candidates, maintenance)
-        .map_err(|error| String::from(error.code()))?;
+    let reset_completed = recover_interrupted_reset(paths)
+        .map_err(|_| String::from("SETUP_CONFIGURATION_WRITE_FAILED"))?;
+    if !reset_completed {
+        migrate_detected_product_source_sets(paths.root_dir(), candidates, maintenance)
+            .map_err(|error| String::from(error.code()))?;
+    }
     let secrets =
         AgentSecretStore::runtime(paths.root_dir()).map_err(|error| String::from(error.code()))?;
     recover_interrupted_setup(paths, &paths.config_file(), &secrets)
@@ -4017,6 +4788,11 @@ fn serve() -> ExitCode {
         eprintln!("{}", error.code());
         return ExitCode::from(EX_CONFIG);
     }
+    if let Err(error) = controller.install_operational_reset() {
+        controller.remember_error(&error);
+        eprintln!("{}", error.code());
+        return ExitCode::from(EX_CONFIG);
+    }
     let endpoint = match default_local_endpoint(config.paths.root_dir()) {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -4118,19 +4894,22 @@ mod tests {
         AGENT_EVENT_REPLAY_BUFFER, AGENT_EVENT_SUBSCRIBER_LIMIT, AgentConfig, AgentController,
         AgentEventHub, AgentEventHubError, AgentEventSubscription, AgentLifecycleStatus,
         AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState, ControlCommand,
-        ControlHandler, GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle,
-        InternalComponent, LogLevel, LogPolicy, ManagementWebConfig, ManagementWebError,
-        ManagementWebService, SecretKind, SetupApplyError, SetupCancellationToken,
-        SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState, SetupStore,
-        StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
+        ControlHandler, FactoryResetBackupBehavior, FactoryResetFixtureConfirmation,
+        FactoryResetFixtureJob, FactoryResetFixturePhase, GatewayLogHealthUpdate, GatewayRoute,
+        GatewaySessionHandle, InternalComponent, LogLevel, LogPolicy, ManagementWebConfig,
+        ManagementWebError, ManagementWebService, ResetKind, SecretKind, SetupApplyError,
+        SetupCancellationToken, SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState,
+        SetupStore, StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
         apply_physical_qualification_environment, bridge_gateway_event_stream,
-        compiled_component_identity, disable_proxy_for_setup, gateway_json_projection,
-        legacy_state_candidates, load_agent_config_after_migration_with, management_agent_events,
-        management_web_profile, normalize_runtime_process_path, push_legacy_source_candidate,
-        recover_interrupted_setup, remove_setup_transaction, resolve_gateway_maintenance_program,
-        setup_apply_error_response, setup_error_response, setup_gate_required_with_profile,
-        setup_transaction_file, validate_setup_request, verified_gateway_route,
-        write_setup_configuration, write_setup_transaction,
+        compiled_component_identity, disable_proxy_for_setup, ensure_runtime_directories,
+        gateway_json_projection, legacy_state_candidates, load_agent_config_after_migration_with,
+        management_agent_events, management_web_profile, normalize_runtime_process_path,
+        push_legacy_source_candidate, recover_interrupted_reset, recover_interrupted_setup,
+        remove_setup_transaction, reset_completion_file, reset_transaction_file,
+        resolve_gateway_maintenance_program, setup_apply_error_response, setup_error_response,
+        setup_gate_required_with_profile, setup_transaction_file, validate_setup_request,
+        verified_gateway_route, write_reset_transaction, write_setup_configuration,
+        write_setup_transaction,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -4172,7 +4951,7 @@ mod tests {
         path::Path,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -6499,6 +7278,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operational_reset_route_requires_confirmation_and_dispatches_the_agent_owner() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-operational-reset-route-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let state = test_agent_web_state(&directory);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_setup = Arc::clone(&state.setup);
+        let handler_calls = Arc::clone(&calls);
+        state
+            .install_operational_reset(Arc::new(move || {
+                handler_calls.fetch_add(1, Ordering::AcqRel);
+                handler_setup.reset().map_err(Into::into)
+            }))
+            .expect("operational reset handler should install");
+        let router = agent_web_router(Arc::clone(&state));
+
+        let invalid = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/reset/operational")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirmation":"wrong"}"#))
+                    .expect("invalid request should build"),
+            )
+            .await
+            .expect("invalid reset should respond");
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let reset = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/reset/operational")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirmation":"operational_reset"}"#))
+                    .expect("reset request should build"),
+            )
+            .await
+            .expect("operational reset should respond");
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        std::fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[tokio::test]
     async fn agent_event_namespaces_bound_replay_subscribers_and_slow_consumers() {
         for (stream, event_type, epoch, foreign_cursor) in [
             ("setup", "setup.status", 11, "agent:lifecycle:12-1"),
@@ -6802,6 +7633,457 @@ mod tests {
         );
         let _ = controller.stop_supervisor();
         std::fs::remove_dir_all(directory).expect("temporary directory should remove");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn operational_reset_from_ready_stops_gateway_and_preserves_user_history() {
+        let fixture = std::env::temp_dir().join(format!(
+            "cmclient-agent-operational-reset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should follow epoch")
+                .as_nanos(),
+        ));
+        let home = fixture.join("home");
+        let root = home.join(".cmclient");
+        let _ = std::fs::remove_dir_all(&fixture);
+        std::fs::create_dir_all(&root).expect("fixture root should create");
+        let paths = RuntimePaths {
+            data_dir: root.clone(),
+            config_dir: root.clone(),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+        };
+        ensure_runtime_directories(&paths).expect("runtime directories should create");
+        let config_file = paths.config_file();
+        write_setup_configuration(
+            &config_file,
+            "127.0.0.1",
+            4_403,
+            "fixture-network",
+            "fixture-gateway",
+        )
+        .expect("setup configuration should write");
+        std::fs::write(paths.database_file(), b"database-canary")
+            .expect("database canary should write");
+        std::fs::write(paths.backups_dir().join("backup-canary"), b"backup-canary")
+            .expect("backup canary should write");
+        std::fs::write(paths.updates_dir().join("update-canary"), b"update-canary")
+            .expect("update canary should write");
+        std::fs::write(paths.log_dir.join("log-canary"), b"log-canary")
+            .expect("log canary should write");
+
+        let setup = SetupStore::open(&paths).expect("setup should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let fence = setup.begin_validation().expect("validation should begin");
+        setup.mark_ready(fence).expect("setup should become ready");
+        let initial_generation = setup
+            .generation()
+            .expect("generation should load")
+            .generation();
+        drop(setup);
+
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-callmesh-api-key")
+            .expect("CallMesh key should store");
+        secrets
+            .store(SecretKind::AprsPasscode, "fixture-aprs-passcode")
+            .expect("APRS passcode should store");
+        let powershell = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows SystemRoot should exist"),
+        )
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let config = AgentConfig {
+            paths: paths.clone(),
+            config_file: config_file.clone(),
+            runtime_profile: AgentRuntimeProfile::Native,
+            gateway_command: Some(vec![
+                powershell.to_string_lossy().into_owned(),
+                String::from("-NoLogo"),
+                String::from("-NoProfile"),
+                String::from("-NonInteractive"),
+                String::from("-Command"),
+                String::from("Start-Sleep -Seconds 30"),
+            ]),
+            callmesh: None,
+            meshtastic: None,
+            aprs: None,
+            proxy: None,
+            management_web_enabled: false,
+            management_lan: None,
+        };
+        let controller = AgentController::from_config_with_secrets_without_private_bootstrap(
+            &config,
+            secrets.clone(),
+        )
+        .expect("controller should initialize");
+        controller
+            .handle(ControlCommand::Start)
+            .expect("Gateway fixture should start");
+        controller.gateway_session.set(
+            GatewayRoute::new(
+                "127.0.0.1:44031"
+                    .parse()
+                    .expect("route address should parse"),
+                "a".repeat(64),
+            )
+            .expect("route should initialize"),
+        );
+        assert!(matches!(
+            controller
+                .supervisor
+                .lock()
+                .expect("supervisor should lock")
+                .as_ref()
+                .expect("supervisor should exist")
+                .status(),
+            cmclient_supervisor::GatewayStatus::Running { .. }
+        ));
+
+        let reset = controller
+            .operational_reset()
+            .expect("operational reset should complete");
+        assert!(reset.terms_required && reset.setup_required);
+        assert_eq!(
+            controller
+                .setup
+                .generation()
+                .expect("generation should load")
+                .generation(),
+            initial_generation + 1,
+        );
+        assert!(controller.gateway_session.snapshot().is_none());
+        assert!(matches!(
+            controller
+                .supervisor
+                .lock()
+                .expect("supervisor should lock")
+                .as_ref()
+                .expect("supervisor should exist")
+                .status(),
+            cmclient_supervisor::GatewayStatus::Stopped
+        ));
+        assert!(!config_file.exists(), "operational config must be removed");
+        for kind in SecretKind::ALL {
+            assert!(
+                secrets
+                    .read(kind)
+                    .expect("secret state should read")
+                    .is_none(),
+                "operational reset must clear {kind:?}",
+            );
+        }
+        assert_eq!(
+            std::fs::read(paths.database_file()).expect("database should be retained"),
+            b"database-canary",
+        );
+        assert_eq!(
+            std::fs::read(paths.backups_dir().join("backup-canary"))
+                .expect("backup should be retained"),
+            b"backup-canary",
+        );
+        assert_eq!(
+            std::fs::read(paths.updates_dir().join("update-canary"))
+                .expect("update state should be retained"),
+            b"update-canary",
+        );
+        assert_eq!(
+            std::fs::read(paths.log_dir.join("log-canary")).expect("log should be retained"),
+            b"log-canary",
+        );
+        assert!(reset_completion_file(&paths).is_file());
+        assert!(!reset_transaction_file(&paths).exists());
+        assert_eq!(
+            controller.start_supervisor(),
+            Err(ControlError::CommandFailed),
+            "setup-required state must fence the old supervisor from restarting",
+        );
+        let audit = controller.web_state.audit_snapshot();
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.action == "operational_reset")
+        );
+        assert!(audit.iter().any(|entry| entry.action == "setup_generation"));
+
+        drop(controller);
+        std::fs::remove_dir_all(fixture).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn interrupted_operational_reset_replays_to_the_same_fence_without_restoring_secrets() {
+        let fixture = std::env::temp_dir().join(format!(
+            "cmclient-agent-reset-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should follow epoch")
+                .as_nanos(),
+        ));
+        let root = fixture.join(".cmclient");
+        std::fs::create_dir_all(&root).expect("fixture root should create");
+        let paths = RuntimePaths {
+            data_dir: root.clone(),
+            config_dir: root.clone(),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+        };
+        ensure_runtime_directories(&paths).expect("runtime directories should create");
+        let config_file = paths.config_file();
+        write_setup_configuration(
+            &config_file,
+            "127.0.0.1",
+            4_403,
+            "recovery-network",
+            "recovery-gateway",
+        )
+        .expect("configuration should write");
+        std::fs::write(paths.database_file(), b"database-canary")
+            .expect("database canary should write");
+
+        let setup = SetupStore::open(&paths).expect("setup should initialize");
+        setup
+            .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let fence = setup.begin_validation().expect("validation should begin");
+        setup.mark_ready(fence).expect("setup should become ready");
+        let target_generation = setup
+            .next_reset_generation()
+            .expect("reset generation should allocate");
+        write_setup_transaction(
+            &setup_transaction_file(&paths),
+            setup
+                .generation()
+                .expect("generation should load")
+                .generation(),
+            Some(&std::fs::read(&config_file).expect("configuration snapshot should read")),
+        )
+        .expect("stale setup transaction should write");
+        write_reset_transaction(&paths, ResetKind::Operational, target_generation)
+            .expect("reset journal should write");
+        drop(setup);
+
+        let secrets = AgentSecretStore::runtime(&root).expect("secret store should initialize");
+        secrets
+            .store(SecretKind::CallMeshApiKey, "fixture-prior-key")
+            .expect("prior key should store");
+        secrets
+            .stage_callmesh_setup("fixture-staged-key")
+            .expect("staged key should store");
+        drop(secrets);
+
+        assert!(recover_interrupted_reset(&paths).expect("reset recovery should finish"));
+        let recovered_setup = SetupStore::open(&paths).expect("setup should reopen");
+        assert_eq!(
+            recovered_setup
+                .generation()
+                .expect("generation should load")
+                .generation(),
+            target_generation,
+        );
+        assert_eq!(
+            recovered_setup
+                .status()
+                .expect("setup status should load")
+                .phase,
+            SetupPhase::TermsRequired,
+        );
+        let recovered_secrets =
+            AgentSecretStore::runtime(&root).expect("secret store should reopen");
+        for kind in SecretKind::ALL {
+            assert!(
+                recovered_secrets
+                    .read(kind)
+                    .expect("secret should remain readable")
+                    .is_none(),
+                "recovery must not restore {kind:?}",
+            );
+        }
+        assert!(!config_file.exists());
+        assert!(!setup_transaction_file(&paths).exists());
+        assert!(!reset_transaction_file(&paths).exists());
+        assert!(reset_completion_file(&paths).is_file());
+        assert_eq!(
+            std::fs::read(paths.database_file()).expect("database should remain retained"),
+            b"database-canary",
+        );
+
+        std::fs::remove_dir_all(fixture).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn factory_reset_fixture_is_confirmed_allowlisted_and_recovers_every_stage() {
+        let phases = [
+            FactoryResetFixturePhase::Prepared,
+            FactoryResetFixturePhase::Quiesced,
+            FactoryResetFixturePhase::MutableStateCleared,
+            FactoryResetFixturePhase::RootRecreated,
+            FactoryResetFixturePhase::Completed,
+        ];
+        for (index, phase) in phases.into_iter().enumerate() {
+            let base = std::env::temp_dir().join(format!(
+                "cmclient-factory-reset-fixture-{}-{}-{index}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock should follow epoch")
+                    .as_nanos(),
+            ));
+            let root = base.join(".cmclient");
+            std::fs::create_dir_all(&root).expect("fixture root should create");
+            let paths = RuntimePaths {
+                data_dir: root.clone(),
+                config_dir: root.clone(),
+                cache_dir: root.join("cache"),
+                log_dir: root.join("logs"),
+            };
+            let job = FactoryResetFixtureJob::create(paths.clone())
+                .expect("validated fixture job should initialize");
+            write_setup_configuration(
+                &paths.config_file(),
+                "127.0.0.1",
+                4_403,
+                "fixture-network",
+                "fixture-gateway",
+            )
+            .expect("fixture configuration should write");
+            std::fs::write(paths.secrets_file(), b"fixture-secret-document")
+                .expect("fixture secret should write");
+            std::fs::write(paths.database_file(), b"fixture-database")
+                .expect("fixture database should write");
+            std::fs::write(paths.cache_dir.join("cache-canary"), b"cache")
+                .expect("fixture cache should write");
+            std::fs::write(paths.log_dir.join("log-canary"), b"log")
+                .expect("fixture log should write");
+            std::fs::write(paths.backups_dir().join("backup-canary"), b"backup")
+                .expect("fixture backup should write");
+            std::fs::write(root.join("unmanaged-canary"), b"unmanaged")
+                .expect("unmanaged canary should write");
+            let sibling = base.join("sibling-canary");
+            std::fs::write(&sibling, b"sibling").expect("sibling canary should write");
+
+            let quiesced = Arc::new(AtomicBool::new(false));
+            let quiesced_for_job = quiesced.clone();
+            let confirmation = FactoryResetFixtureConfirmation::for_backup_behavior(
+                FactoryResetBackupBehavior::RetainExisting,
+            );
+            assert_eq!(
+                job.run_until(
+                    confirmation,
+                    move || {
+                        quiesced_for_job.store(true, Ordering::Release);
+                        Ok(())
+                    },
+                    phase,
+                ),
+                Err(SetupApplyError::Cancelled),
+            );
+            assert_eq!(
+                quiesced.load(Ordering::Acquire),
+                phase != FactoryResetFixturePhase::Prepared,
+                "the phase journal must precede any destructive work",
+            );
+            assert!(sibling.is_file());
+            assert!(root.join("unmanaged-canary").is_file());
+
+            job.recover()
+                .expect("interrupted factory reset should recover");
+            assert!(root.join(".factory-reset-completed.json").is_file());
+            assert!(!root.join(".factory-reset-journal.json").exists());
+            assert!(!paths.config_file().exists());
+            assert!(!paths.secrets_file().exists());
+            assert!(!paths.database_file().exists());
+            assert!(!paths.cache_dir.join("cache-canary").exists());
+            assert!(!paths.log_dir.join("log-canary").exists());
+            assert!(
+                paths.backups_dir().join("backup-canary").is_file(),
+                "the first confirmation explicitly retained backups",
+            );
+            assert!(root.join("unmanaged-canary").is_file());
+            assert!(sibling.is_file());
+            assert_eq!(
+                SetupStore::open(&paths)
+                    .expect("fresh setup should open")
+                    .status()
+                    .expect("fresh setup status should load")
+                    .phase,
+                SetupPhase::TermsRequired,
+            );
+            std::fs::remove_dir_all(base).expect("fixture should clean up");
+        }
+
+        let erase_base = std::env::temp_dir().join(format!(
+            "cmclient-factory-reset-fixture-{}-erase-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should follow epoch")
+                .as_nanos(),
+        ));
+        let erase_root = erase_base.join(".cmclient");
+        std::fs::create_dir_all(&erase_root).expect("erase fixture root should create");
+        let erase_paths = RuntimePaths {
+            data_dir: erase_root.clone(),
+            config_dir: erase_root.clone(),
+            cache_dir: erase_root.join("cache"),
+            log_dir: erase_root.join("logs"),
+        };
+        let erase_job = FactoryResetFixtureJob::create(erase_paths.clone())
+            .expect("erase fixture job should initialize");
+        std::fs::write(erase_paths.backups_dir().join("backup-canary"), b"backup")
+            .expect("erase backup should write");
+        assert_eq!(
+            erase_job.run(
+                FactoryResetFixtureConfirmation {
+                    backup_behavior: FactoryResetBackupBehavior::EraseAll,
+                    first_confirmation: "not-the-factory-confirmation",
+                    final_confirmation: "erase-all-backups",
+                },
+                || Ok(()),
+            ),
+            Err(SetupApplyError::InvalidInput),
+        );
+        assert!(erase_paths.backups_dir().join("backup-canary").is_file());
+        erase_job
+            .run(
+                FactoryResetFixtureConfirmation::for_backup_behavior(
+                    FactoryResetBackupBehavior::EraseAll,
+                ),
+                || Ok(()),
+            )
+            .expect("explicit erase-all reset should complete");
+        assert!(!erase_paths.backups_dir().join("backup-canary").exists());
+        assert!(erase_root.join(".factory-reset-completed.json").is_file());
+        std::fs::remove_dir_all(erase_base).expect("erase fixture should clean up");
+
+        let real_root = std::env::temp_dir().join(format!(
+            "cmclient-reset-real-root-canary-{}",
+            std::process::id(),
+        ));
+        let real_data_root = real_root.join(".cmclient");
+        std::fs::create_dir_all(&real_data_root).expect("real-root canary should create");
+        let real_canary = real_data_root.join("must-not-delete");
+        std::fs::write(&real_canary, b"canary").expect("real-root canary should write");
+        let real_paths = RuntimePaths {
+            data_dir: real_data_root.clone(),
+            config_dir: real_data_root.clone(),
+            cache_dir: real_data_root.join("cache"),
+            log_dir: real_data_root.join("logs"),
+        };
+        assert!(
+            matches!(
+                FactoryResetFixtureJob::create(real_paths),
+                Err(SetupApplyError::ConfigWriteFailed)
+            ),
+            "a normal-looking root must not become a factory target",
+        );
+        assert!(real_canary.is_file());
+        std::fs::remove_dir_all(real_root).expect("real-root canary should clean up");
     }
 
     #[tokio::test]

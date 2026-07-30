@@ -210,6 +210,13 @@ export class GatewayApiClient {
         SetupResetRequestSchema,
         { confirmation },
       ),
+    operationalReset: (confirmation: SetupResetRequest["confirmation"]) =>
+      this.requestBody<SetupStatus, SetupResetRequest>(
+        "/reset/operational",
+        SetupStatusSchema,
+        SetupResetRequestSchema,
+        { confirmation },
+      ),
   };
 
   readonly lifecycle = {
@@ -408,6 +415,9 @@ export type AgentSetupApi = {
   configure: (request: SetupConfigureRequest) => Promise<SetupStatus>;
   acceptTerms: (termsVersion: string) => Promise<SetupStatus>;
   reset: (
+    confirmation: SetupResetRequest["confirmation"],
+  ) => Promise<SetupStatus>;
+  operationalReset: (
     confirmation: SetupResetRequest["confirmation"],
   ) => Promise<SetupStatus>;
 };

@@ -87,6 +87,7 @@ trait SecretBackend: Send + Sync {
     fn set(&self, kind: SecretKind, value: &str) -> Result<(), SecretStoreError>;
     fn get(&self, kind: SecretKind) -> Result<Option<SecretValue>, SecretStoreError>;
     fn delete(&self, kind: SecretKind) -> Result<bool, SecretStoreError>;
+    fn clear_for_reset(&self) -> Result<(), SecretStoreError>;
     fn stage_callmesh_setup(&self, candidate: &str) -> Result<(), SecretStoreError>;
     fn promote_callmesh_setup(&self) -> Result<(), SecretStoreError>;
     fn rollback_callmesh_setup(&self) -> Result<bool, SecretStoreError>;
@@ -390,6 +391,26 @@ impl SecretBackend for PlaintextSecretBackend {
         Ok(true)
     }
 
+    fn clear_for_reset(&self) -> Result<(), SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        for kind in SecretKind::ALL {
+            if let Some(mut value) = document.take(kind) {
+                value.zeroize();
+            }
+        }
+        if let Some(mut transaction) = document.setup_callmesh_transaction.take() {
+            transaction.candidate.zeroize();
+            if let Some(previous) = transaction.previous.as_mut() {
+                previous.zeroize();
+            }
+        }
+        self.save(&document)
+    }
+
     fn stage_callmesh_setup(&self, candidate: &str) -> Result<(), SecretStoreError> {
         let _guard = self
             .lock
@@ -529,6 +550,16 @@ impl SecretBackend for MemorySecretBackend {
         Ok(state.values.remove(&kind).is_some())
     }
 
+    fn clear_for_reset(&self) -> Result<(), SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        for value in state.values.values_mut() {
+            value.zeroize();
+        }
+        state.values.clear();
+        state.setup_callmesh_transaction = None;
+        Ok(())
+    }
+
     fn stage_callmesh_setup(&self, candidate: &str) -> Result<(), SecretStoreError> {
         let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
         if state.setup_callmesh_transaction.is_some() {
@@ -643,6 +674,12 @@ impl AgentSecretStore {
 
     pub fn remove(&self, kind: SecretKind) -> Result<bool, SecretStoreError> {
         self.backend.delete(kind)
+    }
+
+    /// Remove every runtime secret and any interrupted setup transaction as one
+    /// reset operation. This never restores a previous setup credential.
+    pub fn clear_for_reset(&self) -> Result<(), SecretStoreError> {
+        self.backend.clear_for_reset()
     }
 
     pub fn stage_callmesh_setup(&self, candidate: &str) -> Result<(), SecretStoreError> {
@@ -1062,6 +1099,46 @@ mod tests {
                 .expect("cleared state should read"),
             super::CallMeshSetupSecretState::None,
         );
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn reset_clear_removes_active_and_staged_secrets_without_rollback() {
+        let root = fixture("reset-clear");
+        let store = AgentSecretStore::runtime(&root).expect("runtime store should initialize");
+        store
+            .store(SecretKind::CallMeshApiKey, "fixture-previous-key")
+            .expect("previous key should store");
+        store
+            .store(SecretKind::AprsPasscode, "fixture-aprs-passcode")
+            .expect("APRS passcode should store");
+        store
+            .stage_callmesh_setup("fixture-candidate-key")
+            .expect("candidate should stage");
+
+        store
+            .clear_for_reset()
+            .expect("reset should clear every secret state");
+        for kind in SecretKind::ALL {
+            assert!(
+                store
+                    .read(kind)
+                    .expect("cleared secret should be readable")
+                    .is_none(),
+                "reset must not retain {kind:?}",
+            );
+        }
+        assert_eq!(
+            store
+                .callmesh_setup_state()
+                .expect("transaction state should read"),
+            super::CallMeshSetupSecretState::None,
+        );
+        let serialized =
+            fs::read_to_string(root.join("secrets.json")).expect("cleared document should persist");
+        assert!(!serialized.contains("fixture-previous-key"));
+        assert!(!serialized.contains("fixture-aprs-passcode"));
+        assert!(!serialized.contains("fixture-candidate-key"));
         fs::remove_dir_all(root).expect("fixture should clean up");
     }
 

@@ -36,6 +36,7 @@ describe("Gateway OpenAPI contract", () => {
       "/api/v1/nodes",
       "/api/v1/positions",
       "/api/v1/proxy",
+      "/api/v1/reset/operational",
       "/api/v1/setup/configure",
       "/api/v1/setup/discovery",
       "/api/v1/setup/events",
@@ -151,7 +152,7 @@ describe("Gateway OpenAPI contract", () => {
       '"unconfirmedStationSubmissions"',
     );
     expect(gatewayOpenApiDocumentDigest(document)).toBe(
-      "fc9647213ea65dd4eff3e8484baee6ad308e88cd68a471e462a4e5875d7aa818",
+      "0c40a0b22d204f94ca7d70f84e9c9aed3e57180e713f87f52c3f3c023edf94f6",
     );
 
     await app.close();

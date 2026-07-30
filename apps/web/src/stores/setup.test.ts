@@ -26,6 +26,15 @@ const credentialsStatus: SetupStatus = {
   reasonCode: "SETUP_CREDENTIALS_REQUIRED",
 };
 
+const readyStatus: SetupStatus = {
+  ...credentialsStatus,
+  phase: "ready",
+  setupRequired: false,
+  credentialsRequired: false,
+  ready: true,
+  reasonCode: "SETUP_READY",
+};
+
 describe("setup store", () => {
   beforeEach(() => setActivePinia(createPinia()));
 
@@ -47,6 +56,7 @@ describe("setup store", () => {
         acceptTerms: async () => credentialsStatus,
         configure: async () => credentialsStatus,
         reset: async () => termsStatus,
+        operationalReset: async () => termsStatus,
       },
     };
     const setup = createSetupStore(client)();
@@ -79,6 +89,7 @@ describe("setup store", () => {
         acceptTerms: async () => credentialsStatus,
         configure: async () => credentialsStatus,
         reset: async () => termsStatus,
+        operationalReset: async () => termsStatus,
       },
       subscribe: (registered) => {
         listener = registered;
@@ -127,6 +138,7 @@ describe("setup store", () => {
         },
         configure: async () => credentialsStatus,
         reset: async () => termsStatus,
+        operationalReset: async () => termsStatus,
       },
     };
     const setup = createSetupStore(client)();
@@ -135,6 +147,35 @@ describe("setup store", () => {
     await setup.acceptTerms();
 
     expect(acceptedVersion).toBe(CURRENT_TERMS_VERSION);
+  });
+
+  it("uses the dedicated confirmed operational reset command", async () => {
+    let confirmation = "";
+    const client: SetupClient = {
+      setup: {
+        status: async () => readyStatus,
+        discovery: async () => ({
+          schemaVersion: 1,
+          candidates: [],
+          callmeshUrl: "https://callmesh.tmmarc.org",
+        }),
+        acceptTerms: async () => credentialsStatus,
+        configure: async () => readyStatus,
+        reset: async () => termsStatus,
+        operationalReset: async (value) => {
+          confirmation = value;
+          return termsStatus;
+        },
+      },
+    };
+    const setup = createSetupStore(client)();
+    setup.applyStatus(readyStatus);
+
+    await setup.operationalReset();
+
+    expect(confirmation).toBe("operational_reset");
+    expect(setup.phase).toBe("terms_required");
+    expect(setup.required).toBe(true);
   });
 
   it("does not synthesize a loopback candidate when LAN discovery is empty", async () => {
@@ -149,6 +190,7 @@ describe("setup store", () => {
         acceptTerms: async () => credentialsStatus,
         configure: async () => credentialsStatus,
         reset: async () => termsStatus,
+        operationalReset: async () => termsStatus,
       },
     };
     const setup = createSetupStore(client)();
@@ -184,6 +226,7 @@ describe("setup store", () => {
           } satisfies SetupStatus;
         },
         reset: async () => termsStatus,
+        operationalReset: async () => termsStatus,
       },
     };
     const setup = createSetupStore(client)();
@@ -224,6 +267,7 @@ describe("setup store", () => {
         acceptTerms: async () => termsStatus,
         configure: async () => termsStatus,
         reset: async () => termsStatus,
+        operationalReset: async () => termsStatus,
       },
       subscribe: (registered) => {
         listener = registered;
@@ -262,6 +306,7 @@ describe("setup store", () => {
             throw new GatewayApiError({ code, status, retryable });
           },
           reset: async () => termsStatus,
+          operationalReset: async () => termsStatus,
         },
       };
       const setup = createSetupStore(client)();

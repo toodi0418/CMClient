@@ -74,6 +74,7 @@ The request operation, rather than an HTTP method/path pair, selects behavior:
 | `Start` | Start Gateway and return updated lifecycle status |
 | `Stop` | Stop Gateway and return updated lifecycle status |
 | `Restart` | Restart Gateway and return updated lifecycle status |
+| `OperationalReset` | Confirmed ready-state reset that fences the old generation, stops Gateway activity, clears operational configuration and runtime secrets, and returns setup status |
 | `ShutdownAgent` | Terminal local Agent teardown status |
 | `EnableManagementWeb` | Enable the optional Web listener and return updated lifecycle status |
 | `DisableManagementWeb` | Disable the optional Web listener and return updated lifecycle status |
@@ -100,6 +101,14 @@ acknowledgement before Control teardown. Agent stops the supervisor worker, coop
 Gateway, and closes Management Web before exiting. Once teardown begins,
 resource-starting operations fail with `CONTROL_COMMAND_FAILED`; status and
 resource-draining operations remain safe while teardown completes.
+
+`OperationalReset` is the command-mode equivalent of the Management Web reset.
+The CLI requires its separate `--confirm operational-reset` acknowledgement
+before it sends this operation. The Agent records the new setup generation
+before it stops the supervised Gateway, so old jobs, routes, events, and child
+callbacks are fenced before configuration or secrets are cleared. Reset recovery
+replays the same generation after interruption and never restores an earlier
+credential.
 
 Gateway projections are Agent-owned bridges. Agent calls its private loopback
 Gateway with bounded timeouts and returns schema-backed JSON or a stable Control

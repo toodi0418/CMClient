@@ -198,6 +198,7 @@ pub enum ControlCommand {
     Start,
     Stop,
     Restart,
+    OperationalReset,
     ShutdownAgent,
     EnableManagementWeb,
     DisableManagementWeb,
@@ -868,6 +869,10 @@ impl ControlClient {
 
     pub fn restart(&self) -> Result<ControlStatus, ControlError> {
         self.command(ControlCommand::Restart)
+    }
+
+    pub fn operational_reset(&self) -> Result<ControlStatus, ControlError> {
+        self.command(ControlCommand::OperationalReset)
     }
 
     pub fn shutdown_agent(&self) -> Result<ControlStatus, ControlError> {
@@ -1736,7 +1741,7 @@ mod tests {
         let handler = Arc::new(RecordingHandler::new());
         let server = ControlServer::bind(endpoint.clone(), handler.clone()).unwrap();
         let server_thread = thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 server.serve_once_inline().unwrap();
             }
         });
@@ -1745,6 +1750,7 @@ mod tests {
         assert_eq!(client.start().unwrap(), status());
         assert_eq!(client.stop().unwrap(), status());
         assert_eq!(client.restart().unwrap(), status());
+        assert_eq!(client.operational_reset().unwrap(), status());
         server_thread.join().unwrap();
         assert_eq!(
             *handler.commands.lock().unwrap(),
@@ -1753,6 +1759,7 @@ mod tests {
                 ControlCommand::Start,
                 ControlCommand::Stop,
                 ControlCommand::Restart,
+                ControlCommand::OperationalReset,
             ]
         );
     }

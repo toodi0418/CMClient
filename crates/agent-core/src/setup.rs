@@ -315,8 +315,24 @@ impl SetupStore {
     }
 
     pub fn reset(&self) -> Result<SetupStatus, SetupError> {
+        self.reset_to_generation(self.next_reset_generation()?)
+    }
+
+    pub fn next_reset_generation(&self) -> Result<u64, SetupError> {
+        self.lock_state()
+            .and_then(|state| next_generation(state.setup_generation))
+    }
+
+    /// Reset to a durable generation selected by a staged owner workflow.
+    ///
+    /// This makes recovery idempotent: replaying an interrupted reset restores
+    /// the same setup fence rather than allocating an extra generation.
+    pub fn reset_to_generation(&self, generation: u64) -> Result<SetupStatus, SetupError> {
         self.mutate(|state| {
-            state.setup_generation = next_generation(state.setup_generation)?;
+            if generation < state.setup_generation || generation > MAX_SETUP_GENERATION {
+                return Err(SetupError::StaleGeneration);
+            }
+            state.setup_generation = generation;
             state.phase = SetupPhase::TermsRequired;
             state.terms_version = None;
             Ok(())
@@ -717,6 +733,41 @@ mod tests {
                 .generation(),
             fence.generation() + 1
         );
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn staged_reset_replay_reuses_its_preselected_generation() {
+        let root = fixture_path("staged-reset-replay");
+        let store =
+            SetupStore::open_file(root.join("state/setup.json")).expect("state should initialize");
+        store
+            .accept_terms(CURRENT_TERMS_VERSION)
+            .expect("terms should be accepted");
+        let fence = store.begin_validation().expect("validation should begin");
+        store.mark_ready(fence).expect("setup should become ready");
+
+        let target_generation = fence.generation() + 1;
+        let first = store
+            .reset_to_generation(target_generation)
+            .expect("first staged reset should succeed");
+        let replay = store
+            .reset_to_generation(target_generation)
+            .expect("replaying the same staged reset should succeed");
+
+        assert!(first.terms_required && replay.terms_required);
+        assert_eq!(
+            store
+                .generation()
+                .expect("generation should load")
+                .generation(),
+            target_generation,
+            "an interrupted reset must not allocate a second generation during recovery",
+        );
+        assert!(matches!(
+            store.reset_to_generation(target_generation - 1),
+            Err(SetupError::StaleGeneration)
+        ));
         fs::remove_dir_all(root).expect("fixture should clean up");
     }
 

@@ -66,7 +66,8 @@ proxies the remaining `/api/*` requests to loopback Gateway:
 | `GET /api/v1/setup/discovery` | Bounded passive Meshtastic discovery candidates and fixed CallMesh endpoint |
 | `POST /api/v1/setup/terms` | Accept the exact current terms version during setup |
 | `POST /api/v1/setup/configure` | Validate and atomically apply the first-run Meshtastic/CallMesh configuration |
-| `POST /api/v1/setup/reset` | Confirm a setup-phase reset; full ready-state operational reset is owned by the reset workflow |
+| `POST /api/v1/setup/reset` | Confirm a setup-phase reset while setup is already required |
+| `POST /api/v1/reset/operational` | Confirm a ready-state operational reset; it fences the old generation, stops Gateway activity, clears operational configuration and secrets, and returns the Agent to setup |
 | `GET /api/v1/setup/events` | Agent-owned setup SSE with an immediate snapshot |
 | `GET /api/v1/lifecycle/status` | Redacted Agent/Gateway/Management Web lifecycle projection |
 | `GET /api/v1/lifecycle/events` | Agent-owned lifecycle SSE with an immediate snapshot |

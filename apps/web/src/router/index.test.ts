@@ -105,6 +105,7 @@ describe("management web router", () => {
         acceptTerms: async () => termsStatus,
         configure: async () => termsStatus,
         reset: async () => termsStatus,
+        operationalReset: async () => termsStatus,
       },
     })();
     const guardedRouter = createManagementRouter(createMemoryHistory(), {
@@ -137,6 +138,7 @@ function setupStore(initialStatus: SetupStatus) {
       acceptTerms: async () => initialStatus,
       configure: async () => initialStatus,
       reset: async () => initialStatus,
+      operationalReset: async () => initialStatus,
     },
   };
   const setup = createSetupStore(client)();
