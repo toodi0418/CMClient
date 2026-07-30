@@ -402,6 +402,7 @@ export function createConfiguredAprsGatewayRuntime(
       connect: (
         onLine: (line: string) => void,
         onLineError?: (error: unknown) => void,
+        onActivity?: () => void,
       ): Promise<AprsIsRxSession> =>
         new AprsIsRxClient({
           host,
@@ -410,7 +411,7 @@ export function createConfiguredAprsGatewayRuntime(
           provisionFingerprint: provisionFingerprint ?? "",
           filterExpression,
           timeoutMs,
-        }).connect(onLine, onLineError),
+        }).connect(onLine, onLineError, onActivity),
     }),
     flushIntervalMs: parsePositiveInteger(
       environment.CMCLIENT_APRS_FLUSH_INTERVAL_MS,

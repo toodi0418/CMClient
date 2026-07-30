@@ -77,7 +77,9 @@ Before high-water/APRS use, validation requires `precisionBits === 32` and
 both integer coordinates. GPS source time must be after 2000, no more than five
 minutes ahead of local time, and may be quarantined when a supplied trusted
 baseline shows a forward jump over the configured limit. MSL altitude is used
-only when explicitly present, including zero; HAE is retained as observation
-data but never substituted for MSL. Speed and ground track are emitted only as
-a pair. A partial pair is omitted, while an impossible speed or track produces
+when explicitly present, including zero. HAE plus geoidal separation is
+converted to MSL; HAE-only remains available to the Legacy-compatible APRS
+encoder as an explicit fallback so existing Meshtastic source altitude is not
+silently removed. Speed and ground track are emitted only as a pair. A partial
+pair is omitted, while an impossible speed or track produces
 `POSITION_SPEED_ANOMALY`.

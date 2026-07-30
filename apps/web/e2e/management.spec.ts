@@ -662,8 +662,10 @@ async function mockGateway(page: Page): Promise<void> {
         mappedCallsigns: 1,
         pendingOutbox: 1,
         failedOutbox: 0,
+        unconfirmedOutbox: 0,
         pendingStationSubmissions: 0,
         failedStationSubmissions: 0,
+        unconfirmedStationSubmissions: 0,
       }),
     }),
   );

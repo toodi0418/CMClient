@@ -71,6 +71,15 @@ mapping-scoped sequence epoch/number. It is never advanced by socket success.
 An unobserved submission becomes `observation_expired` after three hours and
 does not gain a delivery watermark or automatic duplicate-producing retry.
 
+The independent station iGate family has one narrow periodic exception. A
+beacon, status, or telemetry definition that completed a local write may be
+sent again after the 30-second local exact-duplicate window so its normal
+cadence survives an absent observer echo. The original three-hour observer
+window and its delivery state remain intact; the repeat records a new local
+write completion but does not manufacture observer confirmation. A
+`transmission_uncertain` station intent never takes this path. Tracker outbox
+entries have no such exception and remain fail-closed.
+
 Observer-confirmed outbox rows may be deleted after the configured 90-day
 default only when their watermark proves that exact event or an ordered
 successor. The proof survives outbox retention and blocks re-enqueue after a

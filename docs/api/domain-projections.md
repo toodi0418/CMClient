@@ -65,7 +65,10 @@ transport status of `sent` means only that the socket write completed. Only
 destination, and information match. `observation_expired` is terminal and does
 not create a delivery high-water proof. The projection never returns APRS Data.
 APRS upload requires `precisionBits === 32`, valid coordinates, and provably
-new position state.
+new position state. Runtime counts distinguish `failedOutbox` (a true Tracker
+transmit failure) from `unconfirmedOutbox` (a completed local write whose
+observer window expired), so lack of observer confirmation is not presented as
+a socket-write failure.
 
 `GET /api/v1/aprs/station-submissions?limit=100` returns the station packet
 kind, durable delivery state, and bounded lifecycle timestamps. Its state is
@@ -76,7 +79,10 @@ reconciliation instead of being resent blindly. `localWriteCompletedAt` is
 present only after the current process's transport write completes; an
 observer-only confirmation never creates it. The projection excludes
 callsign, destination, information field, provision fingerprint, coordinates,
-and comment.
+and comment. Runtime counts distinguish `failedStationSubmissions` (uncertain
+local writes) from `unconfirmedStationSubmissions` (completed writes whose
+observer window expired), so lack of observer confirmation is not presented as
+a socket-write failure.
 
 ## CallMesh mapping
 

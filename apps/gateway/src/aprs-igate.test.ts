@@ -454,11 +454,16 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     );
     expect(intent).toMatchObject({
       created: true,
+      writeRequired: true,
       submission: { deliveryStatus: "sending", attemptedAt },
     });
     expect(
       repository.beginTransmission(packet, PROVISION_FINGERPRINT, submittedAt),
-    ).toEqual({ created: false, submission: intent.submission });
+    ).toEqual({
+      created: false,
+      writeRequired: false,
+      submission: intent.submission,
+    });
     const submitted = repository.markSubmitted(
       intent.submission.id,
       submittedAt,
@@ -540,6 +545,104 @@ describe("Legacy-compatible APRS iGate packet family", () => {
         )
         .get(intent.callsign, intent.info),
     ).toEqual({ destination: "APTMAG", transmitted_at: submittedAt });
+    database.close();
+  });
+
+  it("repeats a fixed submitted station packet after its durable local cache window", () => {
+    const database = new GatewayDatabase(":memory:");
+    const repository = new AprsIgateRepository(database.connection);
+    const packet = encodeAprsIgateBeacon(provision);
+    const attemptedAt = new Date(START).toISOString();
+    const firstCompletedAt = new Date(START + 1).toISOString();
+    const repeatReservedAt = new Date(START + 31_001).toISOString();
+    const repeatCompletedAt = new Date(START + 31_002).toISOString();
+    const first = repository.beginTransmission(
+      packet,
+      PROVISION_FINGERPRINT,
+      attemptedAt,
+    );
+    expect(first).toMatchObject({ created: true, writeRequired: true });
+    repository.markSubmitted(first.submission.id, firstCompletedAt);
+
+    const repeat = new AprsIgateRepository(
+      database.connection,
+    ).beginTransmission(packet, PROVISION_FINGERPRINT, repeatReservedAt);
+    expect(repeat).toMatchObject({
+      created: false,
+      writeRequired: true,
+      repeatReservationAt: repeatReservedAt,
+      submission: {
+        id: first.submission.id,
+        deliveryStatus: "submitted",
+        submittedAt: firstCompletedAt,
+      },
+    });
+    const parsed = parseCmClientAprsLine(packet.data)!;
+    expect(
+      database.connection
+        .prepare(
+          "SELECT transmitted_at FROM aprs_local_transmissions WHERE callsign = ? AND destination = ? AND info = ?",
+        )
+        .get(parsed.callsign, parsed.destination, parsed.info),
+    ).toEqual({ transmitted_at: repeatReservedAt });
+    expect(
+      new AprsIgateRepository(database.connection).beginTransmission(
+        packet,
+        PROVISION_FINGERPRINT,
+        new Date(Date.parse(repeatReservedAt) + 1).toISOString(),
+      ),
+    ).toMatchObject({ created: false, writeRequired: false });
+
+    expect(
+      repository.markRepeatedSubmitted(
+        first.submission.id,
+        repeatReservedAt,
+        repeatCompletedAt,
+      ),
+    ).toMatchObject({
+      id: first.submission.id,
+      deliveryStatus: "submitted",
+      submittedAt: firstCompletedAt,
+      localWriteCompletedAt: repeatCompletedAt,
+    });
+    expect(repository.list()).toHaveLength(1);
+    expect(repository.deliveryCounts(PROVISION_FINGERPRINT)).toEqual({
+      pending: 1,
+      uncertain: 0,
+      unconfirmed: 0,
+    });
+    database.close();
+  });
+
+  it("does not retry a transmission whose local write outcome is uncertain", () => {
+    const database = new GatewayDatabase(":memory:");
+    const repository = new AprsIgateRepository(database.connection);
+    const packet = encodeAprsIgateBeacon(provision);
+    const attemptedAt = new Date(START).toISOString();
+    const intent = repository.beginTransmission(
+      packet,
+      PROVISION_FINGERPRINT,
+      attemptedAt,
+    );
+    repository.markTransmissionUncertain(
+      intent.submission.id,
+      new Date(START + 1).toISOString(),
+    );
+
+    expect(
+      repository.beginTransmission(
+        packet,
+        PROVISION_FINGERPRINT,
+        new Date(START + 60_000).toISOString(),
+      ),
+    ).toMatchObject({
+      created: false,
+      writeRequired: false,
+      submission: {
+        id: intent.submission.id,
+        deliveryStatus: "transmission_uncertain",
+      },
+    });
     database.close();
   });
 
@@ -733,7 +836,8 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     ).toContain(":T#044,");
     expect(repository.deliveryCounts(PROVISION_FINGERPRINT)).toEqual({
       pending: 0,
-      failed: 0,
+      uncertain: 0,
+      unconfirmed: 0,
     });
     database.close();
   });
@@ -823,7 +927,11 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       observationExpiresAt: expiresAt,
       updatedAt: expiresAt,
     });
-    expect(repository.deliveryCounts()).toEqual({ pending: 0, failed: 1 });
+    expect(repository.deliveryCounts()).toEqual({
+      pending: 0,
+      uncertain: 0,
+      unconfirmed: 1,
+    });
     database.close();
   });
 

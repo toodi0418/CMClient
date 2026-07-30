@@ -69,6 +69,15 @@ Socket error, EOF, or close instead terminates the session, clears its connected
 state, and starts a fresh verified login and filter restore. A dead session is
 never relabelled `connected` by the periodic refresh loop.
 
+After verified login, every valid inbound APRS line and APRS-IS `#` comment
+keepalive refreshes observer activity. Comment keepalives are transport control
+only: they are never parsed as APRS packets, persisted, published, or used as
+delivery proof. A connected socket with no verified inbound activity for five
+minutes is treated as stale, fenced before any TX, reported as
+`APRS_MONITOR_ACTIVITY_TIMEOUT`, and replaced with a fresh verified observer
+session. A later local socket write cannot restore that state; only the new
+verified inbound activity can do so.
+
 Remote records live in `aprs_remote_high_water`, keyed by Mesh network, node,
 callsign, and mapping version. They intentionally do not write a synthetic
 `position_events` or `node_position_state` row: an APRS marker is a compact

@@ -53,7 +53,7 @@ describe("legacy-compatible APRS Tracker position encoder", () => {
     );
   });
 
-  it("prefers position altitude and fills a missing course with zero", () => {
+  it("preserves a negative position altitude and fills a missing course with zero", () => {
     const position = event({
       altitudeMslMeters: -20,
       groundTrackDegrees: undefined,
@@ -65,8 +65,40 @@ describe("legacy-compatible APRS Tracker position encoder", () => {
         mappingAltitudeMeters: 500,
       }).data,
     ).toBe(
-      "N0CALL-7>APTMAG,MESHD*,qAO,N1GATE-10:!2500.00N/12130.00E>000/009/A=000000",
+      "N0CALL-7>APTMAG,MESHD*,qAO,N1GATE-10:!2500.00N/12130.00E>000/009/A=-00066",
     );
+  });
+
+  it("resolves MSL, HAE/geoid, and legacy HAE-only source altitude", () => {
+    expect(
+      encodeAprsPosition(
+        event({
+          altitudeMslMeters: undefined,
+          altitudeHaeMeters: 43,
+        }),
+        { ...optionsWithoutComment, mappingAltitudeMeters: 500 },
+      ).data,
+    ).toContain("/A=000141");
+    expect(
+      encodeAprsPosition(
+        event({
+          altitudeMslMeters: undefined,
+          altitudeHaeMeters: 43,
+          altitudeGeoidalSeparationMeters: 31,
+        }),
+        { ...optionsWithoutComment, mappingAltitudeMeters: 500 },
+      ).data,
+    ).toContain("/A=000039");
+    expect(
+      encodeAprsPosition(
+        event({
+          altitudeMslMeters: 7,
+          altitudeHaeMeters: 43,
+          altitudeGeoidalSeparationMeters: 31,
+        }),
+        { ...optionsWithoutComment, mappingAltitudeMeters: 500 },
+      ).data,
+    ).toContain("/A=000023");
   });
 
   it("carries rounded minutes while retaining modern coordinate bounds", () => {

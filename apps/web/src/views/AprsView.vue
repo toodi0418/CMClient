@@ -111,12 +111,26 @@ onMounted(() => void aprs.refresh());
               <dd>{{ aprs.status.failedOutbox }}</dd>
             </div>
             <div>
+              <dt>{{ t("aprs.outboxUnconfirmed") }}</dt>
+              <dd>{{ aprs.status.unconfirmedOutbox }}</dd>
+            </div>
+            <div>
               <dt>{{ t("aprs.stationPending") }}</dt>
               <dd>{{ aprs.status.pendingStationSubmissions }}</dd>
             </div>
             <div>
               <dt>{{ t("aprs.stationFailed") }}</dt>
               <dd>{{ aprs.status.failedStationSubmissions }}</dd>
+            </div>
+            <div>
+              <dt>{{ t("aprs.stationUnconfirmed") }}</dt>
+              <dd>{{ aprs.status.unconfirmedStationSubmissions }}</dd>
+            </div>
+            <div v-if="aprs.status.monitorLastActivityAt">
+              <dt>{{ t("aprs.monitorActivityAt") }}</dt>
+              <dd>
+                <time>{{ aprs.status.monitorLastActivityAt }}</time>
+              </dd>
             </div>
             <div>
               <dt>{{ t("aprs.configured") }}</dt>
@@ -274,6 +288,10 @@ onMounted(() => void aprs.refresh());
               <template v-if="submission.observerConfirmedAt">
                 <span>{{ t("aprs.observerConfirmedAt") }}</span>
                 <time>{{ submission.observerConfirmedAt }}</time>
+              </template>
+              <template v-else-if="submission.localWriteCompletedAt">
+                <span>{{ t("aprs.lastLocalWriteAt") }}</span>
+                <time>{{ submission.localWriteCompletedAt }}</time>
               </template>
               <template v-else-if="submission.submittedAt">
                 <span>{{ t("aprs.submittedAt") }}</span>

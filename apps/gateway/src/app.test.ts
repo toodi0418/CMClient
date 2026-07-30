@@ -169,8 +169,10 @@ describe("GatewayRuntime", () => {
       mappedCallsigns: 0,
       pendingOutbox: 0,
       failedOutbox: 0,
+      unconfirmedOutbox: 0,
       pendingStationSubmissions: 0,
       failedStationSubmissions: 0,
+      unconfirmedStationSubmissions: 0,
     });
     await app.close();
   });
@@ -359,8 +361,10 @@ describe("GatewayRuntime", () => {
           mappedCallsigns: 1,
           pendingOutbox: 0,
           failedOutbox: 0,
+          unconfirmedOutbox: 0,
           pendingStationSubmissions: 1,
           failedStationSubmissions: 0,
+          unconfirmedStationSubmissions: 0,
         }),
         listStationSubmissions: (limit) => {
           limits.push(limit);

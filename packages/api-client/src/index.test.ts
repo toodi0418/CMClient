@@ -286,8 +286,10 @@ describe("gateway API client", () => {
               mappedCallsigns: 2,
               pendingOutbox: 1,
               failedOutbox: 0,
+              unconfirmedOutbox: 0,
               pendingStationSubmissions: 1,
               failedStationSubmissions: 0,
+              unconfirmedStationSubmissions: 0,
             });
       },
     });

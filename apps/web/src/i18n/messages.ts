@@ -161,6 +161,9 @@ export const messages = {
       aprsProvisionTitle: "APRS 傳送暫停",
       aprsProvisionMessage:
         "目前沒有可驗證的 APRS 授權資料。CMClient 會在取得有效資料後自動恢復。",
+      aprsMonitorActivityTitle: "APRS RX observer 暫時沒有收到資料",
+      aprsMonitorActivityMessage:
+        "CMClient 已暫停 APRS 傳送並重新建立 observer 連線；恢復可驗證的 RX 活動後會自動繼續。",
       proxyConfigurationTitle: "TCP Proxy 尚未設定",
       proxyConfigurationMessage:
         "這個選用功能尚未為此安裝啟用；Meshtastic 的主要連線不受影響。",
@@ -280,6 +283,7 @@ export const messages = {
       nextAttemptAt: "下次嘗試時間",
       attemptedAt: "開始寫入時間",
       submittedAt: "提交時間",
+      lastLocalWriteAt: "最後一次本機 socket 寫入完成",
       observerConfirmedAt: "觀察確認時間",
       observationExpiresAt: "觀察期限",
       configured: "已設定",
@@ -289,8 +293,11 @@ export const messages = {
       mappedCallsigns: "監看 callsigns",
       pending: "待傳送",
       failed: "失敗項目",
+      outboxUnconfirmed: "Tracker 未在觀察窗口確認",
       stationPending: "站台待確認",
-      stationFailed: "站台未確認",
+      stationFailed: "站台寫入結果不確定",
+      stationUnconfirmed: "站台未在觀察窗口確認",
+      monitorActivityAt: "RX 最後活動",
       monitorStatus: {
         stopped: "已停止",
         idle: "閒置",
@@ -310,14 +317,14 @@ export const messages = {
         failed: "提交失敗",
         submitted: "已寫入本機 socket，等待觀察",
         observer_confirmed: "已由 APRS-IS 觀察確認",
-        observation_expired: "觀察期限已過",
+        observation_expired: "本機寫入完成，但觀察窗口內未由 APRS-IS 確認",
       },
       stationDeliveryStatus: {
         sending: "正在寫入本機 socket",
         transmission_uncertain: "寫入結果不確定，等待觀察",
         submitted: "已寫入本機 socket，等待觀察",
         observer_confirmed: "已由 APRS-IS 觀察確認",
-        observation_expired: "觀察期限已過，未確認",
+        observation_expired: "本機寫入完成，但觀察窗口內未由 APRS-IS 確認",
       },
       stationPacketKind: {
         beacon: "站台信標",
@@ -631,6 +638,9 @@ export const messages = {
       aprsProvisionTitle: "APRS sending is paused",
       aprsProvisionMessage:
         "No verified APRS authorization is currently available. CMClient resumes automatically after valid data is received.",
+      aprsMonitorActivityTitle: "The APRS RX observer is not receiving data",
+      aprsMonitorActivityMessage:
+        "CMClient paused APRS transmission and is rebuilding the observer connection. It resumes automatically after verified RX activity returns.",
       proxyConfigurationTitle: "TCP Proxy is not configured",
       proxyConfigurationMessage:
         "This optional feature is not enabled for this installation. The primary Meshtastic connection is unaffected.",
@@ -753,6 +763,7 @@ export const messages = {
       nextAttemptAt: "Next attempt",
       attemptedAt: "Local write started",
       submittedAt: "Submitted at",
+      lastLocalWriteAt: "Last local socket write completed",
       observerConfirmedAt: "Observer confirmed at",
       observationExpiresAt: "Observation deadline",
       configured: "Configured",
@@ -762,8 +773,11 @@ export const messages = {
       mappedCallsigns: "Monitored callsigns",
       pending: "Pending",
       failed: "Failed entries",
+      outboxUnconfirmed: "Tracker unconfirmed in observation window",
       stationPending: "Station awaiting observation",
-      stationFailed: "Station unconfirmed",
+      stationFailed: "Station write uncertain",
+      stationUnconfirmed: "Station unconfirmed in observation window",
+      monitorActivityAt: "RX last activity",
       monitorStatus: {
         stopped: "Stopped",
         idle: "Idle",
@@ -783,14 +797,16 @@ export const messages = {
         failed: "Submission failed",
         submitted: "Written to local socket, awaiting observation",
         observer_confirmed: "Observed on APRS-IS",
-        observation_expired: "Observation window expired",
+        observation_expired:
+          "Local socket write completed; not observed by APRS-IS in the window",
       },
       stationDeliveryStatus: {
         sending: "Writing to local socket",
         transmission_uncertain: "Write result uncertain, awaiting observation",
         submitted: "Written to local socket, awaiting observation",
         observer_confirmed: "Observed on APRS-IS",
-        observation_expired: "Observation window expired unconfirmed",
+        observation_expired:
+          "Local socket write completed; not observed by APRS-IS in the window",
       },
       stationPacketKind: {
         beacon: "Station beacon",

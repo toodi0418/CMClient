@@ -18,8 +18,10 @@ describe("APRS store", () => {
           mappedCallsigns: 1,
           pendingOutbox: 1,
           failedOutbox: 0,
+          unconfirmedOutbox: 0,
           pendingStationSubmissions: 1,
           failedStationSubmissions: 0,
+          unconfirmedStationSubmissions: 0,
         }),
         outbox: async () => ({
           items: [
@@ -77,8 +79,10 @@ describe("APRS store", () => {
           mappedCallsigns: 1,
           pendingOutbox: 0,
           failedOutbox: 1,
+          unconfirmedOutbox: 0,
           pendingStationSubmissions: 0,
           failedStationSubmissions: 1,
+          unconfirmedStationSubmissions: 0,
           lastErrorCode: "APRS_MONITOR_CONNECT_FAILED",
         }),
         outbox: async () => {
@@ -107,8 +111,10 @@ describe("APRS store", () => {
           mappedCallsigns: 1,
           pendingOutbox: 0,
           failedOutbox: 0,
+          unconfirmedOutbox: 0,
           pendingStationSubmissions: 0,
           failedStationSubmissions: 0,
+          unconfirmedStationSubmissions: 0,
         }),
         outbox: async () => ({ items: [] }),
         stationSubmissions: async () => {

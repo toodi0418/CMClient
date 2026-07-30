@@ -266,6 +266,52 @@ describe("AprsIsRxClient", () => {
     await close(server);
   });
 
+  it("counts verified APRS comment keepalives as socket activity without exposing them as packets", async () => {
+    let peer: Socket | undefined;
+    const received: string[] = [];
+    let activities = 0;
+    const server = net.createServer((socket) => {
+      peer = socket;
+      socket.once("data", () => {
+        socket.write("# logresp TEST01-CM verified, fixture\r\n");
+      });
+    });
+    server.listen({ host: "127.0.0.1", port: 0 });
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("fixture APRS server did not bind");
+    }
+    const client = new AprsIsRxClient({
+      host: "127.0.0.1",
+      port: address.port,
+      authorizationProvider: authorization(
+        "user TEST01-CM pass 17602 vers CMClient 2.0",
+      ),
+      provisionFingerprint: PROVISION_FINGERPRINT,
+      filterExpression: APRS_RX_FILTER_EXPRESSION,
+    });
+
+    const session = await client.connect(
+      (line) => received.push(line),
+      undefined,
+      () => {
+        activities += 1;
+      },
+    );
+    if (!peer) {
+      throw new Error("fixture APRS peer was not established");
+    }
+    peer.write(
+      "# server keepalive\r\n# logresp TEST01-CM verified, still here\r\n",
+    );
+    await waitFor(() => activities === 2);
+
+    expect(received).toEqual([]);
+    await session.close();
+    await close(server);
+  });
+
   it.each(["end", "reset", "destroy"] as const)(
     "signals one post-login termination when the peer uses %s",
     async (terminationMode) => {

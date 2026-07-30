@@ -417,8 +417,10 @@ export function createGatewayApp(
           mappedCallsigns: 0,
           pendingOutbox: 0,
           failedOutbox: 0,
+          unconfirmedOutbox: 0,
           pendingStationSubmissions: 0,
           failedStationSubmissions: 0,
+          unconfirmedStationSubmissions: 0,
         },
     );
     app.get(

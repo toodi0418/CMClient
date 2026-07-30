@@ -216,8 +216,13 @@ export const AprsRuntimeStatusSchema = Type.Object(
     mappedCallsigns: Type.Integer({ minimum: 0 }),
     pendingOutbox: Type.Integer({ minimum: 0 }),
     failedOutbox: Type.Integer({ minimum: 0 }),
+    unconfirmedOutbox: Type.Integer({ minimum: 0 }),
     pendingStationSubmissions: Type.Integer({ minimum: 0 }),
     failedStationSubmissions: Type.Integer({ minimum: 0 }),
+    unconfirmedStationSubmissions: Type.Integer({ minimum: 0 }),
+    monitorLastActivityAt: Type.Optional(
+      Type.String({ pattern: UTC_ISO_TIMESTAMP }),
+    ),
     lastErrorCode: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
   },
   { additionalProperties: false },

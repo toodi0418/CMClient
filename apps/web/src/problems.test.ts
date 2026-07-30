@@ -23,6 +23,15 @@ describe("user-facing problem catalog", () => {
     );
   });
 
+  it("explains an inactive APRS observer without implying that transmission continued", () => {
+    expect(problemForCode("APRS_MONITOR_ACTIVITY_TIMEOUT")).toEqual({
+      severity: "warning",
+      titleKey: "problems.aprsMonitorActivityTitle",
+      messageKey: "problems.aprsMonitorActivityMessage",
+      retryable: false,
+    });
+  });
+
   it("maps capability and update internals to user-facing labels", () => {
     expect(capabilityReasonKey("owned_by_agent")).toBe(
       "capabilityReason.ownedByAgent",

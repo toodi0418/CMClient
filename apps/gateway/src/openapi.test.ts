@@ -144,8 +144,14 @@ describe("Gateway OpenAPI contract", () => {
       },
     );
     expect(JSON.stringify(document)).not.toContain(capability);
+    expect(JSON.stringify(document.paths["/api/v1/aprs"])).toContain(
+      '"unconfirmedOutbox"',
+    );
+    expect(JSON.stringify(document.paths["/api/v1/aprs"])).toContain(
+      '"unconfirmedStationSubmissions"',
+    );
     expect(gatewayOpenApiDocumentDigest(document)).toBe(
-      "116a9b5a3c95cbf37582fa234c97e17eb5fb687d3653f69ea38857b26578469f",
+      "fc9647213ea65dd4eff3e8484baee6ad308e88cd68a471e462a4e5875d7aa818",
     );
 
     await app.close();

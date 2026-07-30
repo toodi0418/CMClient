@@ -118,6 +118,169 @@ describe("AprsGatewayRuntime", () => {
     database.close();
   });
 
+  it("repeats a fixed station beacon on schedule when a live observer has no packet echo", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const state = aprsState("a", "N0CALL-7", 42);
+    const transmitted: string[] = [];
+    let now = new Date("2026-07-18T00:00:10.000Z");
+    let onActivity: (() => void) | undefined;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: new DomainEventBus({ eventIdFactory: sequentialFactory() }),
+      stateProvider: () => state,
+      clock: () => now,
+      version: "2.0.0-test",
+      outbox: { flush: async () => [] },
+      stationTransport: {
+        send: async (data, provisionFingerprint) => {
+          expect(provisionFingerprint).toBe(state.provisionFingerprint);
+          transmitted.push(data);
+        },
+      },
+      monitorClientFactory: () => ({
+        connect: async (_listener, _onLineError, activity) => {
+          onActivity = activity;
+          return { close: async () => undefined };
+        },
+      }),
+    });
+
+    await runtime.refreshMonitor();
+    await runtime.igateNow();
+    const initialBeaconInfo = parseCmClientAprsLine(transmitted[0]!)?.info;
+    expect(initialBeaconInfo).toMatch(/^!/u);
+
+    now = new Date("2026-07-18T00:11:10.000Z");
+    onActivity?.();
+    await runtime.igateNow();
+
+    expect(transmitted).toHaveLength(8);
+    expect(parseCmClientAprsLine(transmitted[6]!)?.info).toBe(
+      initialBeaconInfo,
+    );
+    expect(parseCmClientAprsLine(transmitted[7]!)?.info).toBe(
+      "T#002,0,0,0,0,0,00000000",
+    );
+    expect(
+      database.connection
+        .prepare(
+          "SELECT submitted_at, local_write_completed_at FROM aprs_igate_submissions WHERE packet_kind = 'beacon'",
+        )
+        .all(),
+    ).toEqual([
+      {
+        submitted_at: "2026-07-18T00:00:10.000Z",
+        local_write_completed_at: "2026-07-18T00:11:10.000Z",
+      },
+    ]);
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "connected",
+      monitorLastActivityAt: now.toISOString(),
+    });
+
+    await runtime.stop();
+    database.close();
+  });
+
+  it("fences APRS work after observer silence and reconnects before resuming", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const state = aprsState("a", "N0CALL-7", 42);
+    const events = new DomainEventBus({ eventIdFactory: sequentialFactory() });
+    const errorCodes: string[] = [];
+    events.subscribe((event) => {
+      if (
+        event.type === "aprs.monitor.error" &&
+        typeof event.payload.code === "string"
+      ) {
+        errorCodes.push(event.payload.code);
+      }
+    });
+    const replacement = deferred<AprsIsRxSession>();
+    const replacementStarted = deferred<void>();
+    let now = new Date("2026-07-18T00:00:00.000Z");
+    let connections = 0;
+    let closes = 0;
+    let flushes = 0;
+    let sends = 0;
+    let firstActivity: (() => void) | undefined;
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: events,
+      stateProvider: () => state,
+      clock: () => now,
+      monitorRefreshIntervalMs: 100,
+      monitorActivityTimeoutMs: 100,
+      outbox: {
+        flush: async () => {
+          flushes += 1;
+          return [];
+        },
+      },
+      stationTransport: {
+        send: async () => {
+          sends += 1;
+        },
+      },
+      monitorClientFactory: () => ({
+        connect: async (_listener, _onLineError, activity) => {
+          connections += 1;
+          if (connections === 1) {
+            firstActivity = activity;
+            return {
+              close: async () => {
+                closes += 1;
+              },
+            };
+          }
+          replacementStarted.resolve();
+          return replacement.promise;
+        },
+      }),
+    });
+
+    await runtime.refreshMonitor();
+    await runtime.flushNow();
+    await runtime.igateNow();
+    const initialFlushes = flushes;
+    const initialSends = sends;
+    expect(initialFlushes).toBeGreaterThanOrEqual(1);
+    expect(initialSends).toBe(6);
+
+    now = new Date("2026-07-18T00:00:00.099Z");
+    firstActivity?.();
+    now = new Date("2026-07-18T00:00:00.198Z");
+    await runtime.refreshMonitor();
+    expect(connections).toBe(1);
+
+    now = new Date("2026-07-18T00:00:00.199Z");
+    const reconnect = runtime.refreshMonitor();
+    await replacementStarted.promise;
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "connecting",
+      lastErrorCode: "APRS_MONITOR_ACTIVITY_TIMEOUT",
+    });
+    await Promise.all([runtime.flushNow(), runtime.igateNow()]);
+    expect(flushes).toBe(initialFlushes);
+    expect(sends).toBe(initialSends);
+    expect(closes).toBe(1);
+
+    replacement.resolve({ close: async () => undefined });
+    await reconnect;
+    await waitFor(() => flushes === initialFlushes + 1);
+    expect(connections).toBe(2);
+    expect(sends).toBe(initialSends);
+    expect(errorCodes).toContain("APRS_MONITOR_ACTIVITY_TIMEOUT");
+    expect(runtime.status()).toMatchObject({
+      monitorStatus: "connected",
+      monitorLastActivityAt: now.toISOString(),
+    });
+
+    firstActivity?.();
+    expect(runtime.status().monitorLastActivityAt).toBe(now.toISOString());
+    await runtime.stop();
+    database.close();
+  });
+
   it("attributes a cached observer race only after the local write completes", async () => {
     const database = new GatewayDatabase(":memory:");
     const state = aprsState("a", "N0CALL-7", 42);
@@ -585,6 +748,7 @@ describe("AprsGatewayRuntime", () => {
       mappedCallsigns: 2,
       pendingOutbox: 0,
       failedOutbox: 0,
+      unconfirmedOutbox: 0,
     });
     expect(types).toEqual(
       expect.arrayContaining([
@@ -604,6 +768,81 @@ describe("AprsGatewayRuntime", () => {
     expect(closes).toBe(0);
     await runtime.stop();
     expect(closes).toBe(1);
+    database.close();
+  });
+
+  it("separates expired observer confirmation from a Tracker transmit failure", () => {
+    const database = new GatewayDatabase(":memory:");
+    const timestamp = "2026-07-18T00:00:00.000Z";
+    database.connection
+      .prepare(
+        "INSERT INTO mesh_observations (id, schema_version, transport, session_connected_at, ingested_at, server_ingested_at, backlog_classification, normalized_from_radio) VALUES (?, 1, 'simulator', ?, ?, ?, 'live', '{}')",
+      )
+      .run("observation", timestamp, timestamp, timestamp);
+    database.connection
+      .prepare(
+        "INSERT INTO position_observations (id, mesh_network_id, node_num, mesh_observation_id, gateway_id, transport, session_connected_at, ingested_at, server_ingested_at, backlog_classification, payload_hash, position) VALUES (?, 'fixture-network', 1, 'observation', 'gateway', 'simulator', ?, ?, ?, 'live', 'fixture-hash', '{}')",
+      )
+      .run("position-observation", timestamp, timestamp, timestamp);
+    database.connection
+      .prepare(
+        "INSERT INTO position_events (id, canonical_key, mesh_network_id, node_num, source_observation_id, payload_hash, event_time, event_time_source, position, created_at) VALUES ('event', 'fixture-event', 'fixture-network', 1, 'position-observation', 'fixture-hash', ?, 'position_time', '{}', ?)",
+      )
+      .run(timestamp, timestamp);
+    const insertOutbox = database.connection.prepare(
+      "INSERT INTO aprs_outbox (id, callsign, canonical_event_id, data, status, delivery_status, attempts, next_attempt_at, created_at, updated_at) VALUES (?, ?, 'event', 'N0CALL>APTMAG:fixture', ?, ?, 0, ?, ?, ?)",
+    );
+    insertOutbox.run(
+      "pending",
+      "N0CALL-1",
+      "queued",
+      "queued",
+      timestamp,
+      timestamp,
+      timestamp,
+    );
+    insertOutbox.run(
+      "submitted",
+      "N0CALL-2",
+      "sent",
+      "submitted",
+      timestamp,
+      timestamp,
+      timestamp,
+    );
+    insertOutbox.run(
+      "failed",
+      "N0CALL-3",
+      "failed",
+      "failed",
+      timestamp,
+      timestamp,
+      timestamp,
+    );
+    insertOutbox.run(
+      "unconfirmed",
+      "N0CALL-4",
+      "sent",
+      "observation_expired",
+      timestamp,
+      timestamp,
+      timestamp,
+    );
+    const runtime = new AprsGatewayRuntime({
+      database,
+      eventBus: new DomainEventBus({ eventIdFactory: sequentialFactory() }),
+      outbox: { flush: async () => [] },
+      monitorClientFactory: () => ({
+        connect: async () => ({ close: async () => undefined }),
+      }),
+    });
+
+    expect(runtime.status()).toMatchObject({
+      pendingOutbox: 2,
+      failedOutbox: 1,
+      unconfirmedOutbox: 1,
+    });
+
     database.close();
   });
 

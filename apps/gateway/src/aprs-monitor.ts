@@ -270,6 +270,7 @@ export class AprsIsRxClient {
   async connect(
     onLine: (line: string) => void,
     onLineError: (error: unknown) => void = () => undefined,
+    onActivity: () => void = () => undefined,
   ): Promise<AprsIsRxSession> {
     const authorization = resolveAuthorization(
       this.options.authorizationProvider,
@@ -291,6 +292,7 @@ export class AprsIsRxClient {
       this.options.timeoutMs ?? 10_000,
       onLine,
       onLineError,
+      onActivity,
     );
     try {
       await onceConnected(socket, this.options.timeoutMs ?? 10_000);
@@ -522,6 +524,7 @@ function attachVerifiedLineReader(
   timeoutMs: number,
   onLine: (line: string) => void,
   onLineError: (error: unknown) => void,
+  onActivity: () => void,
 ): {
   verified: Promise<void>;
   terminated: Promise<void>;
@@ -585,10 +588,16 @@ function attachVerifiedLineReader(
         state = "verified";
         clearTimeout(timer);
         resolveVerified();
+      } else if (state === "verified") {
+        notifyActivity();
       }
       return;
     }
-    if (state !== "verified" || line.startsWith("#")) {
+    if (state !== "verified") {
+      return;
+    }
+    notifyActivity();
+    if (line.startsWith("#")) {
       return;
     }
     try {
@@ -599,6 +608,13 @@ function attachVerifiedLineReader(
       } catch {
         // Keep callback failures isolated from the socket EventEmitter.
       }
+    }
+  };
+  const notifyActivity = () => {
+    try {
+      onActivity();
+    } catch {
+      // Activity accounting must not alter a verified socket reader.
     }
   };
   const onData = (chunk: Buffer) => {

@@ -51,13 +51,7 @@ export function encodeAprsPosition(
   const symbolTable =
     options.mappingSymbolOverlay ?? options.mappingSymbolTable;
   const courseSpeed = formatCourseSpeed(position);
-  const altitude = formatAltitude(
-    position.altitudeMslMeters ??
-      options.mappingAltitudeMeters ??
-      (options.mappingCallsign === options.provisionIgateCallsign
-        ? options.provisionAltitudeMeters
-        : undefined),
-  );
+  const altitude = formatAltitude(resolveAltitudeMeters(position, options));
   const mandatory = `${options.mappingCallsign}>${APRS_DESTINATION},${APRS_TRACKER_PATH},${options.provisionIgateCallsign}:!${latitude}${symbolTable}${longitude}${options.mappingSymbolCode}${courseSpeed}${altitude}`;
   const comment = truncateOptionalComment(
     sanitizeComment(options.mappingComment),
@@ -137,6 +131,30 @@ function formatCourseSpeed(
   return `${pad(course, 3)}/${pad(knots, 3)}`;
 }
 
+function resolveAltitudeMeters(
+  position: PositionCanonicalEvent["position"],
+  options: AprsPositionEncodingOptions,
+): number | undefined {
+  if (position.altitudeMslMeters !== undefined) {
+    return position.altitudeMslMeters;
+  }
+  if (position.altitudeHaeMeters !== undefined) {
+    if (position.altitudeGeoidalSeparationMeters !== undefined) {
+      return (
+        position.altitudeHaeMeters - position.altitudeGeoidalSeparationMeters
+      );
+    }
+    // Meshtastic permits HAE when MSL is absent. Retain legacy wire behavior.
+    return position.altitudeHaeMeters;
+  }
+  return (
+    options.mappingAltitudeMeters ??
+    (options.mappingCallsign === options.provisionIgateCallsign
+      ? options.provisionAltitudeMeters
+      : undefined)
+  );
+}
+
 function formatAltitude(altitudeMeters: number | undefined): string {
   if (altitudeMeters === undefined) {
     return "";
@@ -148,7 +166,10 @@ function formatAltitude(altitudeMeters: number | undefined): string {
   if (!Number.isFinite(feet)) {
     throw new AprsPositionEncodingError();
   }
-  return `/A=${pad(clamp(feet, 0, 999_999), 6)}`;
+  const boundedFeet = clamp(feet, -99_999, 999_999);
+  return boundedFeet < 0
+    ? `/A=-${pad(Math.abs(boundedFeet), 5)}`
+    : `/A=${pad(boundedFeet, 6)}`;
 }
 
 function sanitizeComment(comment: string | undefined): string {

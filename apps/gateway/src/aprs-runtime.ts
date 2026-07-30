@@ -32,6 +32,7 @@ import { selectActiveMapping } from "./mesh-runtime.js";
 import { GatewayDatabase } from "./persistence/database.js";
 
 const MONITOR_SESSION_CLOSE_TIMEOUT_MS = 10_000;
+const DEFAULT_MONITOR_ACTIVITY_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_IGATE_TICK_INTERVAL_MS = 1_000;
 const DEFAULT_IGATE_RETRY_INITIAL_MS = 1_000;
 const DEFAULT_IGATE_RETRY_MAXIMUM_MS = 60_000;
@@ -48,6 +49,7 @@ export interface AprsMonitorClient {
   connect(
     onLine: (line: string) => void,
     onLineError?: (error: unknown) => void,
+    onActivity?: () => void,
   ): Promise<AprsIsRxSession>;
 }
 
@@ -68,6 +70,7 @@ export interface AprsGatewayRuntimeOptions {
   igateRetryInitialMs?: number;
   igateRetryMaximumMs?: number;
   monitorRefreshIntervalMs?: number;
+  monitorActivityTimeoutMs?: number;
 }
 
 export class AprsGatewayRuntimeError extends Error {
@@ -113,6 +116,7 @@ export class AprsGatewayRuntime {
   private readonly igateRetryInitialMs: number;
   private readonly igateRetryMaximumMs: number;
   private readonly monitorRefreshIntervalMs: number;
+  private readonly monitorActivityTimeoutMs: number;
   private readonly igateRepository: AprsIgateRepository;
   private flushTimer: NodeJS.Timeout | undefined;
   private igateTimer: NodeJS.Timeout | undefined;
@@ -124,6 +128,7 @@ export class AprsGatewayRuntime {
   private monitorConfigurationKey: string | undefined;
   private monitorMappingsFingerprint: string | undefined;
   private monitorNextMappingEffectiveAt: number | undefined;
+  private monitorLastActivityAt: number | undefined;
   private flushOperation: Promise<void> | undefined;
   private igateOperation: Promise<void> | undefined;
   private monitorRefreshOperation: Promise<void> | undefined;
@@ -163,6 +168,12 @@ export class AprsGatewayRuntime {
     this.monitorRefreshIntervalMs = positiveInterval(
       options.monitorRefreshIntervalMs ?? 60_000,
     );
+    this.monitorActivityTimeoutMs = positiveInterval(
+      options.monitorActivityTimeoutMs ?? DEFAULT_MONITOR_ACTIVITY_TIMEOUT_MS,
+    );
+    if (this.monitorActivityTimeoutMs < this.monitorRefreshIntervalMs) {
+      throw new AprsGatewayRuntimeError();
+    }
     this.igateRepository = new AprsIgateRepository(options.database.connection);
   }
 
@@ -237,6 +248,7 @@ export class AprsGatewayRuntime {
     this.monitorConfigurationKey = undefined;
     this.monitorMappingsFingerprint = undefined;
     this.monitorNextMappingEffectiveAt = undefined;
+    this.monitorLastActivityAt = undefined;
     this.monitorStatus = "stopped";
     this.mappedCallsigns = 0;
 
@@ -280,9 +292,19 @@ export class AprsGatewayRuntime {
       monitorStatus: this.monitorStatus,
       mappedCallsigns: this.mappedCallsigns,
       pendingOutbox: count(["queued", "sending", "submitted"]),
-      failedOutbox: count(["failed", "observation_expired"]),
+      failedOutbox: count(["failed"]),
+      unconfirmedOutbox: count(["observation_expired"]),
       pendingStationSubmissions: stationCounts.pending,
-      failedStationSubmissions: stationCounts.failed,
+      failedStationSubmissions: stationCounts.uncertain,
+      unconfirmedStationSubmissions: stationCounts.unconfirmed,
+      ...(this.monitorLastActivityAt !== undefined &&
+      Number.isFinite(this.monitorLastActivityAt)
+        ? {
+            monitorLastActivityAt: new Date(
+              this.monitorLastActivityAt,
+            ).toISOString(),
+          }
+        : {}),
       ...(this.lastErrorCode ? { lastErrorCode: this.lastErrorCode } : {}),
     };
   }
@@ -297,6 +319,10 @@ export class AprsGatewayRuntime {
     }
     if (!this.canTransmit()) {
       this.flushPendingUntilMonitor = true;
+      const refresh = this.refreshStaleMonitorForTransmission();
+      if (refresh) {
+        return refresh.then(() => this.flushOperation ?? Promise.resolve());
+      }
       return this.flushOperation ?? Promise.resolve();
     }
     if (this.flushOperation) {
@@ -381,6 +407,10 @@ export class AprsGatewayRuntime {
     }
     if (!this.canTransmit()) {
       this.igatePendingUntilMonitor = true;
+      const refresh = this.refreshStaleMonitorForTransmission();
+      if (refresh) {
+        return refresh.then(() => this.igateOperation ?? Promise.resolve());
+      }
       return this.igateOperation ?? Promise.resolve();
     }
     if (this.clock().getTime() < this.igateRetryNotBefore) {
@@ -446,14 +476,16 @@ export class AprsGatewayRuntime {
           }
           let submissionId: string | undefined;
           let completedSubmission: AprsIgateSubmission | undefined;
+          let intent:
+            ReturnType<AprsIgateRepository["beginTransmission"]> | undefined;
           try {
             const attemptedAt = this.clock().toISOString();
-            const intent = this.igateRepository.beginTransmission(
+            intent = this.igateRepository.beginTransmission(
               packet,
               state.provisionFingerprint,
               attemptedAt,
             );
-            if (!intent.created) {
+            if (!intent.writeRequired) {
               return true;
             }
             submissionId = intent.submission.id;
@@ -463,13 +495,23 @@ export class AprsGatewayRuntime {
               transportSession,
               () => this.canTransmit(generation),
             );
-            completedSubmission = this.igateRepository.markSubmitted(
-              submissionId,
-              this.clock().toISOString(),
-            );
+            completedSubmission = intent.repeatReservationAt
+              ? this.igateRepository.markRepeatedSubmitted(
+                  submissionId,
+                  intent.repeatReservationAt,
+                  this.clock().toISOString(),
+                )
+              : this.igateRepository.markSubmitted(
+                  submissionId,
+                  this.clock().toISOString(),
+                );
           } catch (error) {
             let failure = error;
-            if (error instanceof AprsTransmissionFencedError && submissionId) {
+            if (
+              error instanceof AprsTransmissionFencedError &&
+              submissionId &&
+              intent?.created
+            ) {
               try {
                 this.igateRepository.cancelUnwritten(submissionId);
                 batchFenced = true;
@@ -478,7 +520,7 @@ export class AprsGatewayRuntime {
                 failure = persistenceError;
               }
             }
-            if (submissionId) {
+            if (submissionId && intent?.created) {
               try {
                 this.igateRepository.markTransmissionUncertain(
                   submissionId,
@@ -496,7 +538,10 @@ export class AprsGatewayRuntime {
             return false;
           }
           if (this.isGenerationActive(generation)) {
-            this.publish("aprs.igate.submitted", { kind: packet.kind });
+            this.publish("aprs.igate.submitted", {
+              kind: packet.kind,
+              ...(intent?.repeatReservationAt ? { periodic: true } : {}),
+            });
             if (completedSubmission?.deliveryStatus === "observer_confirmed") {
               this.publish("aprs.igate.observer_confirmed", {
                 submissionId: completedSubmission.id,
@@ -559,6 +604,7 @@ export class AprsGatewayRuntime {
 
   private async runMonitorRefresh(generation: number): Promise<void> {
     let pendingSession: AprsIsRxSession | undefined;
+    let preserveIgateCadence = false;
     try {
       const earlyPlan = this.createMonitorPlan();
       if (
@@ -570,13 +616,21 @@ export class AprsGatewayRuntime {
         this.monitorConfigurationKey === earlyPlan.connectionKey
       ) {
         this.applyMonitorPlan(this.monitor, earlyPlan);
-        if (this.monitorStatus === "connected") {
+        if (this.monitorStatus !== "connected") {
+          return;
+        }
+        if (this.hasFreshMonitorActivity()) {
           this.lastErrorCode = undefined;
           this.activateTransmitters(generation, this.monitorToken);
+          return;
         }
-        return;
+        this.fenceTransmitters(true, false);
+        preserveIgateCadence = true;
+        this.monitorStatus = "error";
+        this.lastErrorCode = "APRS_MONITOR_ACTIVITY_TIMEOUT";
+        this.publish("aprs.monitor.error", { code: this.lastErrorCode });
       }
-      this.fenceTransmitters(true);
+      this.fenceTransmitters(true, !preserveIgateCadence);
       this.monitorStatus = "connecting";
       const previous = this.monitorSession;
       this.monitor = undefined;
@@ -585,6 +639,7 @@ export class AprsGatewayRuntime {
       this.monitorConfigurationKey = undefined;
       this.monitorMappingsFingerprint = undefined;
       this.monitorNextMappingEffectiveAt = undefined;
+      this.monitorLastActivityAt = undefined;
       if (previous) {
         await closeMonitorSession(previous);
       }
@@ -626,6 +681,7 @@ export class AprsGatewayRuntime {
         callbackFailed = true;
         this.fenceTransmitters(true);
         this.monitorStatus = "error";
+        this.monitorLastActivityAt = undefined;
         this.lastErrorCode = stableErrorCode(
           error,
           "APRS_MONITOR_CALLBACK_FAILED",
@@ -636,111 +692,116 @@ export class AprsGatewayRuntime {
           // This callback may run inside a socket EventEmitter.
         }
       };
-      const session = await client.connect((line) => {
-        if (
-          !this.isGenerationActive(generation) ||
-          this.monitorToken !== token
-        ) {
-          return;
-        }
-        let observationState = this.readState();
-        if (
-          this.options.stateProvider &&
-          (!observationState ||
-            observationState.provisionFingerprint !==
-              plan.state?.provisionFingerprint)
-        ) {
-          this.invalidateMonitorState(generation, token);
-          return;
-        }
-        try {
-          const receivedAtDate = this.clock();
+      const session = await client.connect(
+        (line) => {
           if (
-            (observationState &&
-              observationState.mappingsFingerprint !==
-                this.monitorMappingsFingerprint) ||
-            (this.monitorNextMappingEffectiveAt !== undefined &&
-              receivedAtDate.getTime() >= this.monitorNextMappingEffectiveAt)
+            !this.isGenerationActive(generation) ||
+            this.monitorToken !== token
           ) {
-            const currentPlan = this.createMonitorPlan(
-              observationState,
-              receivedAtDate,
-            );
-            if (
-              !currentPlan ||
-              currentPlan.connectionKey !== plan.connectionKey
-            ) {
-              this.invalidateMonitorState(generation, token);
-              return;
-            }
-            this.applyMonitorPlan(monitor, currentPlan);
-            observationState = currentPlan.state;
+            return;
           }
-          const receivedAt = receivedAtDate.toISOString();
-          const result = monitor.observeLine(line, receivedAt);
-          const confirmed =
-            result.remote && observationState
-              ? this.options.database.aprsOutbox.confirmObserved(
-                  result.remote.callsign,
-                  result.remote.destination,
-                  result.remote.info,
-                  receivedAt,
-                  observationState.provisionFingerprint,
-                )
-              : [];
-          const stationConfirmed =
-            result.remote && observationState
-              ? this.igateRepository.confirmObserved(
-                  observationState.provisionFingerprint,
-                  result.remote.callsign,
-                  result.remote.destination,
-                  result.remote.info,
-                  receivedAt,
-                )
-              : [];
-          if (result.kind !== "ignored") {
-            this.publish("aprs.monitor.observed", {
-              kind: result.kind,
-              ...(result.remote
-                ? {
-                    packetDigest: result.remote.infoDigest,
-                  }
-                : {}),
-            });
-          }
-          for (const entry of confirmed) {
-            this.publish("aprs.outbox.observer_confirmed", {
-              outboxId: entry.id,
-              canonicalEventId: entry.canonicalEventId,
-              callsign: entry.callsign,
-              status: entry.deliveryStatus,
-            });
-          }
-          for (const entry of stationConfirmed) {
-            this.publish("aprs.igate.observer_confirmed", {
-              submissionId: entry.id,
-              kind: entry.packetKind,
-            });
-          }
+          this.recordMonitorActivity(generation, token);
+          let observationState = this.readState();
           if (
-            callbackFailed &&
-            result.kind !== "ignored" &&
-            (!this.options.stateProvider ||
-              observationState?.provisionFingerprint ===
+            this.options.stateProvider &&
+            (!observationState ||
+              observationState.provisionFingerprint !==
                 plan.state?.provisionFingerprint)
           ) {
-            callbackFailed = false;
-            this.monitorStatus = "connected";
-            this.lastErrorCode = undefined;
-            this.publish("aprs.monitor.connected", {
-              mappedCallsigns: this.mappedCallsigns,
-            });
-            this.activateTransmitters(generation, token);
+            this.invalidateMonitorState(generation, token);
+            return;
           }
-        } catch (error) {
-          onLineError(error);
-        }
-      }, onLineError);
+          try {
+            const receivedAtDate = this.clock();
+            if (
+              (observationState &&
+                observationState.mappingsFingerprint !==
+                  this.monitorMappingsFingerprint) ||
+              (this.monitorNextMappingEffectiveAt !== undefined &&
+                receivedAtDate.getTime() >= this.monitorNextMappingEffectiveAt)
+            ) {
+              const currentPlan = this.createMonitorPlan(
+                observationState,
+                receivedAtDate,
+              );
+              if (
+                !currentPlan ||
+                currentPlan.connectionKey !== plan.connectionKey
+              ) {
+                this.invalidateMonitorState(generation, token);
+                return;
+              }
+              this.applyMonitorPlan(monitor, currentPlan);
+              observationState = currentPlan.state;
+            }
+            const receivedAt = receivedAtDate.toISOString();
+            const result = monitor.observeLine(line, receivedAt);
+            const confirmed =
+              result.remote && observationState
+                ? this.options.database.aprsOutbox.confirmObserved(
+                    result.remote.callsign,
+                    result.remote.destination,
+                    result.remote.info,
+                    receivedAt,
+                    observationState.provisionFingerprint,
+                  )
+                : [];
+            const stationConfirmed =
+              result.remote && observationState
+                ? this.igateRepository.confirmObserved(
+                    observationState.provisionFingerprint,
+                    result.remote.callsign,
+                    result.remote.destination,
+                    result.remote.info,
+                    receivedAt,
+                  )
+                : [];
+            if (result.kind !== "ignored") {
+              this.publish("aprs.monitor.observed", {
+                kind: result.kind,
+                ...(result.remote
+                  ? {
+                      packetDigest: result.remote.infoDigest,
+                    }
+                  : {}),
+              });
+            }
+            for (const entry of confirmed) {
+              this.publish("aprs.outbox.observer_confirmed", {
+                outboxId: entry.id,
+                canonicalEventId: entry.canonicalEventId,
+                callsign: entry.callsign,
+                status: entry.deliveryStatus,
+              });
+            }
+            for (const entry of stationConfirmed) {
+              this.publish("aprs.igate.observer_confirmed", {
+                submissionId: entry.id,
+                kind: entry.packetKind,
+              });
+            }
+            if (
+              callbackFailed &&
+              result.kind !== "ignored" &&
+              (!this.options.stateProvider ||
+                observationState?.provisionFingerprint ===
+                  plan.state?.provisionFingerprint)
+            ) {
+              callbackFailed = false;
+              this.monitorStatus = "connected";
+              this.lastErrorCode = undefined;
+              this.publish("aprs.monitor.connected", {
+                mappedCallsigns: this.mappedCallsigns,
+              });
+              this.activateTransmitters(generation, token);
+            }
+          } catch (error) {
+            onLineError(error);
+          }
+        },
+        onLineError,
+        () => this.recordMonitorActivity(generation, token),
+      );
       pendingSession = session;
       if (!this.isGenerationActive(generation) || this.monitorToken !== token) {
         await closeMonitorSession(session);
@@ -756,6 +817,7 @@ export class AprsGatewayRuntime {
         this.monitorToken = undefined;
         this.monitorMappingsFingerprint = undefined;
         this.monitorNextMappingEffectiveAt = undefined;
+        this.monitorLastActivityAt = undefined;
         await closeMonitorSession(session);
         pendingSession = undefined;
         if (this.isGenerationActive(generation)) {
@@ -797,6 +859,7 @@ export class AprsGatewayRuntime {
         return;
       }
       this.monitorStatus = "connected";
+      this.recordMonitorActivity(generation, token);
       this.lastErrorCode = undefined;
       for (const entry of reconciledOutbox) {
         this.publish("aprs.outbox.observer_confirmed", {
@@ -831,6 +894,7 @@ export class AprsGatewayRuntime {
       this.monitorConfigurationKey = undefined;
       this.monitorMappingsFingerprint = undefined;
       this.monitorNextMappingEffectiveAt = undefined;
+      this.monitorLastActivityAt = undefined;
       let failure = error;
       if (activeSession) {
         try {
@@ -1000,6 +1064,7 @@ export class AprsGatewayRuntime {
     this.monitorConfigurationKey = undefined;
     this.monitorMappingsFingerprint = undefined;
     this.monitorNextMappingEffectiveAt = undefined;
+    this.monitorLastActivityAt = undefined;
     this.monitorStatus = "idle";
     this.mappedCallsigns = 0;
     this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";
@@ -1051,6 +1116,7 @@ export class AprsGatewayRuntime {
     this.monitorConfigurationKey = undefined;
     this.monitorMappingsFingerprint = undefined;
     this.monitorNextMappingEffectiveAt = undefined;
+    this.monitorLastActivityAt = undefined;
     this.monitorStatus = "error";
     this.lastErrorCode = "APRS_MONITOR_CONNECTION_LOST";
     try {
@@ -1092,6 +1158,7 @@ export class AprsGatewayRuntime {
     this.monitorConfigurationKey = undefined;
     this.monitorMappingsFingerprint = undefined;
     this.monitorNextMappingEffectiveAt = undefined;
+    this.monitorLastActivityAt = undefined;
     this.monitorStatus = "idle";
     this.mappedCallsigns = 0;
     this.lastErrorCode = "APRS_PROVISION_UNAVAILABLE";
@@ -1111,13 +1178,16 @@ export class AprsGatewayRuntime {
       this.txReady &&
       this.monitorStatus === "connected" &&
       this.monitorSession !== undefined &&
-      this.monitorToken !== undefined
+      this.monitorToken !== undefined &&
+      this.hasFreshMonitorActivity()
     );
   }
 
-  private fenceTransmitters(queueWork: boolean): void {
+  private fenceTransmitters(queueWork: boolean, disconnectIgate = true): void {
     this.txReady = false;
-    this.igateFamily?.onDisconnected();
+    if (disconnectIgate) {
+      this.igateFamily?.onDisconnected();
+    }
     if (queueWork) {
       this.flushPendingUntilMonitor = true;
       this.igatePendingUntilMonitor =
@@ -1130,7 +1200,8 @@ export class AprsGatewayRuntime {
       !this.isGenerationActive(generation) ||
       this.monitorToken !== token ||
       !this.monitorSession ||
-      this.monitorStatus !== "connected"
+      this.monitorStatus !== "connected" ||
+      !this.hasFreshMonitorActivity()
     ) {
       return;
     }
@@ -1161,6 +1232,33 @@ export class AprsGatewayRuntime {
   private resetIgateRetry(): void {
     this.igateRetryFailures = 0;
     this.igateRetryNotBefore = 0;
+  }
+
+  private refreshStaleMonitorForTransmission(): Promise<void> | undefined {
+    if (this.monitorStatus === "connected" && !this.hasFreshMonitorActivity()) {
+      return this.refreshMonitor();
+    }
+    return undefined;
+  }
+
+  private recordMonitorActivity(generation: number, token: object): void {
+    if (!this.isGenerationActive(generation) || this.monitorToken !== token) {
+      return;
+    }
+    const activityAt = this.clock().getTime();
+    if (Number.isFinite(activityAt)) {
+      this.monitorLastActivityAt = activityAt;
+    }
+  }
+
+  private hasFreshMonitorActivity(now = this.clock().getTime()): boolean {
+    return (
+      this.monitorLastActivityAt !== undefined &&
+      Number.isFinite(this.monitorLastActivityAt) &&
+      Number.isFinite(now) &&
+      now >= this.monitorLastActivityAt &&
+      now - this.monitorLastActivityAt < this.monitorActivityTimeoutMs
+    );
   }
 
   private publish(type: string, payload: Record<string, unknown>): void {

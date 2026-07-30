@@ -103,12 +103,17 @@ export interface AprsIgateSubmission {
 
 export interface AprsIgateTransmissionIntent {
   created: boolean;
+  /** Whether the caller must perform an APRS socket write for this intent. */
+  writeRequired: boolean;
+  /** Durable local-cache reservation for a periodic write of a fixed packet. */
+  repeatReservationAt?: string;
   submission: AprsIgateSubmission;
 }
 
 export interface AprsIgateDeliveryCounts {
   pending: number;
-  failed: number;
+  uncertain: number;
+  unconfirmed: number;
 }
 
 export interface AprsIgateWriteOutcome {
@@ -228,6 +233,9 @@ export class AprsIgateRepository {
       this.database.exec("BEGIN IMMEDIATE");
       transactionOpen = true;
       this.expireActiveInsideTransaction(attemptedAt);
+      const localCutoff = new Date(
+        Date.parse(attemptedAt) - LOCAL_REPEAT_WINDOW_MS,
+      ).toISOString();
       const existing = this.database
         .prepare(
           "SELECT * FROM aprs_igate_submissions WHERE provision_fingerprint = ? AND callsign = ? AND destination = ? AND info = ? AND delivery_status IN ('sending', 'transmission_uncertain', 'submitted') ORDER BY attempted_at ASC, id ASC",
@@ -243,13 +251,52 @@ export class AprsIgateRepository {
       }
       if (existing.length === 1) {
         const submission = toSubmission(existing[0] as Record<string, unknown>);
+        if (submission.deliveryStatus === "submitted") {
+          const local = this.database
+            .prepare(
+              "SELECT transmitted_at FROM aprs_local_transmissions WHERE callsign = ? AND destination = ? AND info = ?",
+            )
+            .get(
+              submission.callsign,
+              submission.destination,
+              submission.info,
+            ) as Record<string, unknown> | undefined;
+          const transmittedAt =
+            typeof local?.transmitted_at === "string"
+              ? local.transmitted_at
+              : undefined;
+          if (local && !isTimestamp(transmittedAt ?? "")) {
+            throw new AprsIgatePersistenceError();
+          }
+          if (
+            !transmittedAt ||
+            (Date.parse(transmittedAt) < Date.parse(localCutoff) &&
+              Date.parse(transmittedAt) <= Date.parse(attemptedAt))
+          ) {
+            this.database
+              .prepare(
+                "INSERT INTO aprs_local_transmissions (callsign, destination, info, transmitted_at) VALUES (?, ?, ?, ?) ON CONFLICT(callsign, destination, info) DO UPDATE SET transmitted_at = excluded.transmitted_at",
+              )
+              .run(
+                submission.callsign,
+                submission.destination,
+                submission.info,
+                attemptedAt,
+              );
+            this.database.exec("COMMIT");
+            transactionOpen = false;
+            return {
+              created: false,
+              writeRequired: true,
+              repeatReservationAt: attemptedAt,
+              submission,
+            };
+          }
+        }
         this.database.exec("COMMIT");
         transactionOpen = false;
-        return { created: false, submission };
+        return { created: false, writeRequired: false, submission };
       }
-      const localCutoff = new Date(
-        Date.parse(attemptedAt) - LOCAL_REPEAT_WINDOW_MS,
-      ).toISOString();
       const recent = this.database
         .prepare(
           "SELECT submission.* FROM aprs_igate_submissions AS submission JOIN aprs_local_transmissions AS local ON local.callsign = submission.callsign AND local.destination = submission.destination AND local.info = submission.info WHERE submission.provision_fingerprint = ? AND submission.callsign = ? AND submission.destination = ? AND submission.info = ? AND local.transmitted_at >= ? AND local.transmitted_at <= ? ORDER BY local.transmitted_at DESC, submission.updated_at DESC, submission.id ASC LIMIT 1",
@@ -266,7 +313,7 @@ export class AprsIgateRepository {
         const submission = toSubmission(recent as Record<string, unknown>);
         this.database.exec("COMMIT");
         transactionOpen = false;
-        return { created: false, submission };
+        return { created: false, writeRequired: false, submission };
       }
       const observerProven = this.database
         .prepare(
@@ -286,7 +333,7 @@ export class AprsIgateRepository {
         );
         this.database.exec("COMMIT");
         transactionOpen = false;
-        return { created: false, submission };
+        return { created: false, writeRequired: false, submission };
       }
       const id = `aprs-igate-${randomUUID()}`;
       this.database
@@ -307,7 +354,7 @@ export class AprsIgateRepository {
       const submission = this.requiredSubmission(id);
       this.database.exec("COMMIT");
       transactionOpen = false;
-      return { created: true, submission };
+      return { created: true, writeRequired: true, submission };
     } catch {
       if (transactionOpen) {
         rollback(this.database);
@@ -435,6 +482,72 @@ export class AprsIgateRepository {
       const sequence = telemetrySequence(current);
       if (sequence !== undefined) {
         this.persistSequenceInsideTransaction(current, sequence, submittedAt);
+      }
+      const submitted = this.requiredSubmission(id);
+      this.database.exec("COMMIT");
+      transactionOpen = false;
+      return submitted;
+    } catch {
+      if (transactionOpen) {
+        rollback(this.database);
+      }
+      throw new AprsIgatePersistenceError();
+    }
+  }
+
+  markRepeatedSubmitted(
+    id: string,
+    reservedAt: string,
+    completedAt: string,
+  ): AprsIgateSubmission {
+    validateSubmissionId(id);
+    if (!isTimestamp(reservedAt) || !isTimestamp(completedAt)) {
+      throw new AprsIgatePersistenceError();
+    }
+    let transactionOpen = false;
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const current = this.requiredSubmission(id);
+      if (
+        !["submitted", "observer_confirmed"].includes(current.deliveryStatus) ||
+        !current.localWriteCompletedAt ||
+        Date.parse(reservedAt) < Date.parse(current.localWriteCompletedAt) ||
+        Date.parse(completedAt) < Date.parse(reservedAt) ||
+        Date.parse(completedAt) > Date.parse(current.observationExpiresAt)
+      ) {
+        throw new AprsIgatePersistenceError();
+      }
+      const local = this.database
+        .prepare(
+          "SELECT transmitted_at FROM aprs_local_transmissions WHERE callsign = ? AND destination = ? AND info = ?",
+        )
+        .get(current.callsign, current.destination, current.info) as
+        Record<string, unknown> | undefined;
+      if (local?.transmitted_at !== reservedAt) {
+        throw new AprsIgatePersistenceError();
+      }
+      const submissionResult = this.database
+        .prepare(
+          "UPDATE aprs_igate_submissions SET local_write_completed_at = ?, updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END WHERE id = ? AND delivery_status IN ('submitted', 'observer_confirmed')",
+        )
+        .run(completedAt, completedAt, completedAt, id);
+      if (Number(submissionResult.changes) !== 1) {
+        throw new AprsIgatePersistenceError();
+      }
+      const localResult = this.database
+        .prepare(
+          "UPDATE aprs_local_transmissions SET transmitted_at = ? WHERE callsign = ? AND destination = ? AND info = ? AND transmitted_at = ?",
+        )
+        .run(
+          completedAt,
+          current.callsign,
+          current.destination,
+          current.info,
+          reservedAt,
+        );
+      if (Number(localResult.changes) !== 1) {
+        throw new AprsIgatePersistenceError();
       }
       const submitted = this.requiredSubmission(id);
       this.database.exec("COMMIT");
@@ -650,7 +763,8 @@ export class AprsIgateRepository {
           .reduce((total, row) => total + Number(row.count), 0);
       return {
         pending: count(["sending", "transmission_uncertain", "submitted"]),
-        failed: count(["transmission_uncertain", "observation_expired"]),
+        uncertain: count(["transmission_uncertain"]),
+        unconfirmed: count(["observation_expired"]),
       };
     } catch {
       throw new AprsIgatePersistenceError();
@@ -1387,7 +1501,9 @@ function toSubmission(row: Record<string, unknown>): AprsIgateSubmission {
     (hasLocalWrite &&
       (!hasSubmission ||
         !isTimestamp(localWriteCompletedAt) ||
-        Date.parse(localWriteCompletedAt) !== Date.parse(submittedAt))) ||
+        Date.parse(localWriteCompletedAt) < Date.parse(submittedAt) ||
+        Date.parse(localWriteCompletedAt) >
+          Date.parse(observationExpiresAt))) ||
     (hasConfirmation &&
       (!isTimestamp(observerConfirmedAt) ||
         Date.parse(observerConfirmedAt) < Date.parse(attemptedAt) ||

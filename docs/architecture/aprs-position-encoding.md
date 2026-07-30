@@ -5,12 +5,17 @@ mapping-derived source callsign, destination, symbol, and optional comment. It
 does not accept gateway ID, transport, receive time, RSSI, SNR, hop count, or
 APRS path, so those local observations cannot affect APRS Data.
 
-It emits a fixed `SOURCE>DEST:/DDHHMMz...` line using UTC source event time,
-uncompressed hundredths-minute coordinates, explicit MSL meters-to-feet
-altitude, and paired course/knots. MSL zero is encoded; HAE is never used as a
-substitute. Missing speed or track omits the pair rather than creating
-`000/000`.
+It emits the Legacy-compatible untimestamped
+`SOURCE>APTMAG,MESHD*,qAO,IGATE:!...` line, with uncompressed
+hundredths-minute coordinates and paired course/knots. It never includes a
+gateway name, receive time, RSSI, SNR, hop count, or CMClient marker. Missing
+speed or track omits the pair rather than creating `000/000`.
 
-Each line ends with `CM2/<canonical-key-prefix>`. The marker is derived only
-from the canonical event key and lets APRS monitoring reconcile remote uploads
-without a central election. Golden tests lock the exact byte sequence.
+The optional `/A=xxxxxx` field is placed before the free-form comment and is
+expressed in rounded feet. Its altitude selection order is explicit MSL
+(including zero), HAE minus geoidal separation when both source fields are
+present, then HAE-only as a Legacy/Meshtastic compatibility fallback, followed
+by mapping or self-provision altitude. HAE-only data is retained because older
+CMClient uploads use that Meshtastic source convention; it is not a substitute
+for a measured MSL reference. Negative values use the widely supported
+six-character `/A=-12345` form. Golden tests lock the exact byte sequence.

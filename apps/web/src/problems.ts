@@ -49,6 +49,13 @@ const APRS_PROVISION_PROBLEM: UserProblem = {
   retryable: false,
 };
 
+const APRS_MONITOR_ACTIVITY_PROBLEM: UserProblem = {
+  severity: "warning",
+  titleKey: "problems.aprsMonitorActivityTitle",
+  messageKey: "problems.aprsMonitorActivityMessage",
+  retryable: false,
+};
+
 const PROXY_CONFIGURATION_PROBLEM: UserProblem = {
   severity: "info",
   titleKey: "problems.proxyConfigurationTitle",
@@ -89,6 +96,9 @@ export function problemForCode(code: string | null | undefined): UserProblem {
   }
   if (code === "APRS_PROVISION_UNAVAILABLE") {
     return APRS_PROVISION_PROBLEM;
+  }
+  if (code === "APRS_MONITOR_ACTIVITY_TIMEOUT") {
+    return APRS_MONITOR_ACTIVITY_PROBLEM;
   }
   if (code === "PROXY_RUNTIME_UNAVAILABLE") {
     return PROXY_CONFIGURATION_PROBLEM;
