@@ -33,6 +33,7 @@ pub enum CMCloudEnrollmentError {
     Protocol,
     Rejected,
     StaleEnrollment,
+    RecoveryRequired,
 }
 
 impl CMCloudEnrollmentError {
@@ -43,6 +44,7 @@ impl CMCloudEnrollmentError {
             Self::Protocol => "CMCLOUD_ENROLLMENT_PROTOCOL_INVALID",
             Self::Rejected => "CMCLOUD_ENROLLMENT_REJECTED",
             Self::StaleEnrollment => "CMCLOUD_ENROLLMENT_STALE",
+            Self::RecoveryRequired => "CMCLOUD_ENROLLMENT_RECOVERY_REQUIRED",
         }
     }
 }
@@ -64,20 +66,8 @@ pub async fn enroll_cmcloud(
     pairing_code: &str,
     client_version: &str,
 ) -> Result<CMCloudInstallationIdentity, CMCloudEnrollmentError> {
+    let attempt = prepare_cmcloud_enrollment(secrets, endpoint, pairing_code, client_version)?;
     let result = async {
-        let attempt = match secrets.cmcloud_enrollment_attempt()? {
-            Some(attempt) => {
-                if attempt.endpoint() != endpoint
-                    || attempt.client_version() != client_version
-                    || attempt.pairing_code().expose_secret() != pairing_code
-                {
-                    return Err(CMCloudEnrollmentError::StaleEnrollment);
-                }
-                attempt
-            }
-            None => secrets.begin_cmcloud_enrollment(endpoint, pairing_code, client_version)?,
-        };
-
         if let Some(identity) = recover_active_enrollment(secrets, &attempt).await? {
             return Ok(identity);
         }
@@ -131,13 +121,57 @@ pub async fn enroll_cmcloud(
     match result {
         Ok(identity) => Ok(identity),
         Err(error) => {
-            discard_terminal_unissued_enrollment(secrets, error);
-            Err(error)
+            discard_terminal_enrollment(secrets, error);
+            if matches!(
+                error,
+                CMCloudEnrollmentError::Protocol | CMCloudEnrollmentError::Rejected
+            ) && secrets
+                .cmcloud_enrollment_attempt()
+                .ok()
+                .flatten()
+                .is_some_and(|attempt| attempt.issued().is_some())
+            {
+                Err(CMCloudEnrollmentError::RecoveryRequired)
+            } else {
+                Err(error)
+            }
         }
     }
 }
 
-fn discard_terminal_unissued_enrollment(secrets: &AgentSecretStore, error: CMCloudEnrollmentError) {
+/// Persist or resume the Agent-only transaction before Gateway quiescence.
+///
+/// A pending issued credential is the only proof the Agent can use to recover
+/// an ambiguous acknowledgement. It must survive both a changed pairing code
+/// and a rejected response; replacing it requires a separate explicit recovery
+/// action, not an implicit retry.
+pub fn prepare_cmcloud_enrollment(
+    secrets: &AgentSecretStore,
+    endpoint: &str,
+    pairing_code: &str,
+    client_version: &str,
+) -> Result<CMCloudEnrollmentAttempt, CMCloudEnrollmentError> {
+    match secrets.cmcloud_enrollment_attempt()? {
+        Some(attempt) if attempt.endpoint() != endpoint => {
+            Err(CMCloudEnrollmentError::StaleEnrollment)
+        }
+        Some(attempt) if attempt.pairing_code().expose_secret() == pairing_code => Ok(attempt),
+        Some(attempt) if attempt.issued().is_some() => {
+            Err(CMCloudEnrollmentError::RecoveryRequired)
+        }
+        Some(_) => {
+            secrets.discard_cmcloud_enrollment()?;
+            secrets
+                .begin_cmcloud_enrollment(endpoint, pairing_code, client_version)
+                .map_err(Into::into)
+        }
+        None => secrets
+            .begin_cmcloud_enrollment(endpoint, pairing_code, client_version)
+            .map_err(Into::into),
+    }
+}
+
+fn discard_terminal_enrollment(secrets: &AgentSecretStore, error: CMCloudEnrollmentError) {
     if !matches!(
         error,
         CMCloudEnrollmentError::Protocol | CMCloudEnrollmentError::Rejected
@@ -313,10 +347,36 @@ fn validate_server_hello(hello: &ServerHello) -> Result<(), CMCloudEnrollmentErr
             .bytes()
             .any(|byte| byte.is_ascii_control())
         || !matches!(hello.aprs_mode.as_str(), "disabled" | "shadow" | "enabled")
+        || hello.direct_aprs.as_ref().is_some_and(|capability| {
+            !capability.verified || !valid_direct_aprs_callsign(&capability.callsign)
+        })
     {
         return Err(CMCloudEnrollmentError::Protocol);
     }
     Ok(())
+}
+
+fn valid_direct_aprs_callsign(value: &str) -> bool {
+    let mut pieces = value.split('-');
+    let Some(base) = pieces.next() else {
+        return false;
+    };
+    let ssid = pieces.next();
+    if pieces.next().is_some()
+        || !(3..=6).contains(&base.len())
+        || !base
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    match ssid {
+        None => true,
+        Some(value) => value
+            .parse::<u8>()
+            .ok()
+            .is_some_and(|number| (1..=15).contains(&number) && value == number.to_string()),
+    }
 }
 
 struct CMCloudChannel {
@@ -402,9 +462,18 @@ struct ServerHello {
     minimum_client_version: String,
     aprs_mode: String,
     #[serde(default)]
+    direct_aprs: Option<DirectAprsCapability>,
+    #[serde(default)]
     enrollment_ack_required: bool,
     #[serde(default)]
     issued_device_credential: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DirectAprsCapability {
+    callsign: String,
+    verified: bool,
 }
 
 #[derive(Deserialize)]
@@ -473,8 +542,8 @@ fn parse_server_frame(value: &str) -> Result<ServerFrame, CMCloudEnrollmentError
 #[cfg(test)]
 mod tests {
     use super::{
-        CMCloudEnrollmentError, ServerFrame, discard_terminal_unissued_enrollment,
-        parse_server_frame, validate_pairing_hello, validate_server_hello,
+        CMCloudEnrollmentError, ServerFrame, discard_terminal_enrollment, parse_server_frame,
+        prepare_cmcloud_enrollment, validate_pairing_hello, validate_server_hello,
     };
     use cmclient_agent_core::secrets::AgentSecretStore;
 
@@ -491,6 +560,16 @@ mod tests {
             validate_server_hello(&hello).expect("server hello fence should validate");
             validate_pairing_hello(&hello).expect("pairing hello should validate");
         }
+
+        let ServerFrame::ServerHello(hello) = parse_server_frame(
+            r#"{"type":"server_hello","protocolVersion":1,"connectionEpoch":4,"installationGeneration":0,"credentialVersion":1,"heartbeatIntervalMs":30000,"minimumClientVersion":"2.0.0-rc.1","aprsMode":"shadow","directAprs":{"callsign":"BM5GSV-5","verified":true},"enrollmentAckRequired":true,"issuedDeviceCredential":"abcdefghijklmnopqrstuvwxyz012345"}"#,
+        )
+        .expect("verified direct APRS capability should parse")
+        else {
+            panic!("expected server hello");
+        };
+        validate_server_hello(&hello).expect("direct APRS capability should validate");
+        validate_pairing_hello(&hello).expect("pairing hello should validate");
     }
 
     #[test]
@@ -527,6 +606,28 @@ mod tests {
             validate_pairing_hello(&hello),
             Err(CMCloudEnrollmentError::Protocol)
         ));
+        let ServerFrame::ServerHello(hello) = parse_server_frame(
+            r#"{"type":"server_hello","protocolVersion":1,"connectionEpoch":4,"installationGeneration":0,"credentialVersion":1,"heartbeatIntervalMs":30000,"minimumClientVersion":"2.0.0-rc.1","aprsMode":"enabled","directAprs":{"callsign":"BM5GSV-5","verified":false},"enrollmentAckRequired":true,"issuedDeviceCredential":"abcdefghijklmnopqrstuvwxyz012345"}"#,
+        )
+        .expect("direct APRS payload should remain syntactically parseable")
+        else {
+            panic!("expected server hello");
+        };
+        assert!(matches!(
+            validate_server_hello(&hello),
+            Err(CMCloudEnrollmentError::Protocol)
+        ));
+        let ServerFrame::ServerHello(hello) = parse_server_frame(
+            r#"{"type":"server_hello","protocolVersion":1,"connectionEpoch":4,"installationGeneration":0,"credentialVersion":1,"heartbeatIntervalMs":30000,"minimumClientVersion":"2.0.0-rc.1","aprsMode":"enabled","directAprs":{"callsign":"bm5gsv-5","verified":true},"enrollmentAckRequired":true,"issuedDeviceCredential":"abcdefghijklmnopqrstuvwxyz012345"}"#,
+        )
+        .expect("noncanonical direct APRS payload should remain syntactically parseable")
+        else {
+            panic!("expected server hello");
+        };
+        assert!(matches!(
+            validate_server_hello(&hello),
+            Err(CMCloudEnrollmentError::Protocol)
+        ));
     }
 
     #[test]
@@ -537,7 +638,7 @@ mod tests {
         store
             .begin_cmcloud_enrollment(endpoint, code, "2.0.0-rc.1")
             .expect("pending pairing should persist");
-        discard_terminal_unissued_enrollment(&store, CMCloudEnrollmentError::Rejected);
+        discard_terminal_enrollment(&store, CMCloudEnrollmentError::Rejected);
         assert!(
             store
                 .cmcloud_enrollment_attempt()
@@ -552,7 +653,7 @@ mod tests {
         store
             .record_cmcloud_issued_credential(0, 1, 4, "device-credential-fixture-0123456789")
             .expect("issued credential should persist");
-        discard_terminal_unissued_enrollment(&store, CMCloudEnrollmentError::Protocol);
+        discard_terminal_enrollment(&store, CMCloudEnrollmentError::Protocol);
         assert!(
             store
                 .cmcloud_enrollment_attempt()
@@ -560,7 +661,7 @@ mod tests {
                 .is_some(),
             "an issued credential must remain recoverable",
         );
-        discard_terminal_unissued_enrollment(&store, CMCloudEnrollmentError::Transport);
+        discard_terminal_enrollment(&store, CMCloudEnrollmentError::Transport);
         assert!(
             store
                 .cmcloud_enrollment_attempt()
@@ -568,5 +669,74 @@ mod tests {
                 .is_some(),
             "a transport failure must remain retryable",
         );
+        discard_terminal_enrollment(&store, CMCloudEnrollmentError::Rejected);
+        assert!(
+            store
+                .cmcloud_enrollment_attempt()
+                .expect("pending enrollment lookup should work")
+                .is_some(),
+            "a rejected issued credential must remain recoverable",
+        );
+    }
+
+    #[test]
+    fn replaces_only_an_unissued_pairing_when_the_code_changes() {
+        let endpoint = "wss://cmcloud.example.invalid/agent/v1";
+        let store = AgentSecretStore::memory();
+        let initial = prepare_cmcloud_enrollment(
+            &store,
+            endpoint,
+            "first-pairing-code-fixture-0123456789",
+            "2.0.0-rc.1",
+        )
+        .expect("initial pairing should persist");
+        let replacement = prepare_cmcloud_enrollment(
+            &store,
+            endpoint,
+            "replacement-code-fixture-0123456789",
+            "2.0.0-rc.1",
+        )
+        .expect("unissued pairing may be replaced");
+        assert_ne!(replacement.boot_id(), initial.boot_id());
+        assert_eq!(
+            replacement.pairing_code().expose_secret(),
+            "replacement-code-fixture-0123456789"
+        );
+    }
+
+    #[test]
+    fn preserves_an_issued_pairing_when_a_different_code_is_supplied() {
+        let endpoint = "wss://cmcloud.example.invalid/agent/v1";
+        let store = AgentSecretStore::memory();
+        let initial = prepare_cmcloud_enrollment(
+            &store,
+            endpoint,
+            "first-pairing-code-fixture-0123456789",
+            "2.0.0-rc.1",
+        )
+        .expect("initial pairing should persist");
+        store
+            .record_cmcloud_issued_credential(0, 1, 4, "device-credential-fixture-0123456789")
+            .expect("issued credential should persist");
+
+        assert!(matches!(
+            prepare_cmcloud_enrollment(
+                &store,
+                endpoint,
+                "replacement-code-fixture-0123456789",
+                "2.0.0-rc.1",
+            ),
+            Err(CMCloudEnrollmentError::RecoveryRequired)
+        ));
+        let retained = store
+            .cmcloud_enrollment_attempt()
+            .expect("pending pairing lookup should work")
+            .expect("issued pairing must remain available for recovery");
+        assert_eq!(retained.boot_id(), initial.boot_id());
+        assert_eq!(
+            retained.pairing_code().expose_secret(),
+            "first-pairing-code-fixture-0123456789"
+        );
+        assert!(retained.issued().is_some());
     }
 }

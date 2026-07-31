@@ -87,3 +87,15 @@ durably save an issued device credential before the Gateway sends
 `enrollment_ack` on the same socket. Until that private Agent bridge is present,
 the Gateway deliberately stops with `CMCLOUD_ENROLLMENT_REQUIRES_AGENT` rather
 than retaining an issued credential only in Node process memory.
+
+Re-pairing an active endpoint retains its installation ID and requests the
+active installation generation; CMCloud advances that installation rather than
+creating a fresh raw lane at sequence zero. The Agent performs this local
+transaction preflight while an already-active Gateway remains running. An
+unissued transaction may be replaced by a different pairing code, but an issued
+credential is retained for recovery and returns
+`CMCLOUD_ENROLLMENT_RECOVERY_REQUIRED` instead of being discarded. Once the
+Agent sends a new pairing `client_hello`, CMCloud must keep the active device
+credential and live session provisional until it receives the matching durable
+`enrollment_ack`; the Agent cannot safely restore a credential that the server
+has already revoked.

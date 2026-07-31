@@ -331,12 +331,28 @@ struct CMCloudEnrollmentTransaction {
 }
 
 impl CMCloudEnrollmentTransaction {
-    fn new(endpoint: &str, pairing_code: &str, client_version: &str) -> Self {
+    fn new(
+        endpoint: &str,
+        pairing_code: &str,
+        client_version: &str,
+        active: Option<&CMCloudActiveDeviceSecret>,
+    ) -> Self {
+        // Re-pairing the same CMCloud installation must preserve its lane
+        // cursor. The server advances generation and credential version.
+        let (installation_id, requested_installation_generation) = active
+            .filter(|credential| credential.endpoint == endpoint)
+            .map(|credential| {
+                (
+                    credential.installation_id.clone(),
+                    credential.installation_generation,
+                )
+            })
+            .unwrap_or_else(|| (Uuid::new_v4().to_string(), 0));
         Self {
             endpoint: endpoint.to_owned(),
             pairing_code: pairing_code.to_owned(),
-            installation_id: Uuid::new_v4().to_string(),
-            requested_installation_generation: 0,
+            installation_id,
+            requested_installation_generation,
             boot_id: Uuid::new_v4().to_string(),
             client_version: client_version.to_owned(),
             issued_device_credential: None,
@@ -595,12 +611,14 @@ impl PlaintextSecretDocument {
             transaction
                 .validate()
                 .map_err(|_| SecretStoreError::Unavailable)?;
-            if self
-                .cmcloud_active_device
-                .as_ref()
-                .is_some_and(|active| active.installation_id == transaction.installation_id)
-            {
-                return Err(SecretStoreError::Unavailable);
+            if let Some(active) = self.cmcloud_active_device.as_ref() {
+                if active.installation_id == transaction.installation_id
+                    && (active.endpoint != transaction.endpoint
+                        || active.installation_generation
+                            != transaction.requested_installation_generation)
+                {
+                    return Err(SecretStoreError::Unavailable);
+                }
             }
         }
         Ok(())
@@ -908,7 +926,12 @@ impl SecretBackend for PlaintextSecretBackend {
         if document.cmcloud_enrollment_transaction.is_some() {
             return Err(SecretStoreError::Unavailable);
         }
-        let transaction = CMCloudEnrollmentTransaction::new(endpoint, pairing_code, client_version);
+        let transaction = CMCloudEnrollmentTransaction::new(
+            endpoint,
+            pairing_code,
+            client_version,
+            document.cmcloud_active_device.as_ref(),
+        );
         transaction.validate()?;
         let attempt = transaction.clone().into_attempt();
         document.cmcloud_enrollment_transaction = Some(transaction);
@@ -1163,7 +1186,12 @@ impl SecretBackend for MemorySecretBackend {
         if state.cmcloud_enrollment_transaction.is_some() {
             return Err(SecretStoreError::Unavailable);
         }
-        let transaction = CMCloudEnrollmentTransaction::new(endpoint, pairing_code, client_version);
+        let transaction = CMCloudEnrollmentTransaction::new(
+            endpoint,
+            pairing_code,
+            client_version,
+            state.cmcloud_active_device.as_ref(),
+        );
         transaction.validate()?;
         let attempt = transaction.clone().into_attempt();
         state.cmcloud_enrollment_transaction = Some(transaction);
@@ -1810,6 +1838,44 @@ mod tests {
             store.record_cmcloud_issued_credential(0, 1, 4, "different-credential-value-123456"),
             Err(SecretStoreError::Unavailable),
         );
+    }
+
+    #[test]
+    fn cmcloud_reenrollment_reuses_the_active_installation_and_generation_fence() {
+        let store = AgentSecretStore::memory();
+        let endpoint = "wss://cmcloud.example.invalid/agent/v1";
+        store
+            .begin_cmcloud_enrollment(endpoint, "pairing-code-fixture-0123456789", "2.0.0-rc.1")
+            .expect("initial pairing should begin");
+        store
+            .record_cmcloud_issued_credential(0, 1, 1, "device-credential-fixture-0123456789")
+            .expect("initial credential should persist");
+        let initial = store
+            .activate_cmcloud_credential(0, 1, 1)
+            .expect("initial credential should activate");
+
+        let retry = store
+            .begin_cmcloud_enrollment(
+                endpoint,
+                "replacement-code-fixture-0123456789",
+                "2.0.0-rc.1",
+            )
+            .expect("re-pairing should begin");
+        assert_eq!(retry.installation_id(), initial.installation_id());
+        assert_eq!(
+            retry.requested_installation_generation(),
+            initial.installation_generation(),
+            "the server advances this existing installation rather than creating a lane with cursor zero",
+        );
+        store
+            .record_cmcloud_issued_credential(1, 2, 2, "replacement-device-credential-0123456789")
+            .expect("replacement credential should persist");
+        let replacement = store
+            .activate_cmcloud_credential(1, 2, 2)
+            .expect("replacement credential should activate");
+        assert_eq!(replacement.installation_id(), initial.installation_id());
+        assert_eq!(replacement.installation_generation(), 1);
+        assert_eq!(replacement.credential_version(), 2);
     }
 
     #[test]

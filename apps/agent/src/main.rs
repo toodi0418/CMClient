@@ -605,6 +605,9 @@ impl CMCloudEnrollmentControlError {
                 | cmcloud_enrollment::CMCloudEnrollmentError::Rejected
                 | cmcloud_enrollment::CMCloudEnrollmentError::StaleEnrollment,
             ) => StatusCode::BAD_GATEWAY,
+            Self::Enrollment(cmcloud_enrollment::CMCloudEnrollmentError::RecoveryRequired) => {
+                StatusCode::CONFLICT
+            }
         }
     }
 }
@@ -2552,6 +2555,15 @@ impl AgentController {
             }
         };
         self.ensure_cmcloud_enrollment_setup_allowed()?;
+        // This only writes or resumes Agent-owned recovery material. A local
+        // preflight rejection must not interrupt a working CMCloud Gateway.
+        cmcloud_enrollment::prepare_cmcloud_enrollment(
+            &self.secrets,
+            endpoint,
+            &request.pairing_code,
+            &self.identity.identity.version,
+        )
+        .map_err(CMCloudEnrollmentControlError::Enrollment)?;
         self.quiesce_cmcloud_gateway_for_enrollment()?;
         cmcloud_enrollment::enroll_cmcloud_blocking(
             &self.secrets,
@@ -2562,6 +2574,8 @@ impl AgentController {
         .map_err(CMCloudEnrollmentControlError::Enrollment)?;
         self.configure_active_cmcloud_gateway_credential()?;
         self.mark_cmcloud_enrollment_ready()?;
+        self.start_supervisor()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
         self.web_state.record_audit(
             "cmcloud_enrollment",
             "allowed",
@@ -5447,14 +5461,15 @@ mod tests {
         AGENT_EVENT_REPLAY_BUFFER, AGENT_EVENT_SUBSCRIBER_LIMIT, AgentConfig, AgentController,
         AgentEventHub, AgentEventHubError, AgentEventSubscription, AgentLifecycleStatus,
         AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState,
-        CMCloudEnrollmentState, CMCloudEnrollmentStatus, ControlCommand, ControlHandler,
-        FactoryResetBackupBehavior, FactoryResetFixtureConfirmation, FactoryResetFixtureJob,
-        FactoryResetFixturePhase, GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle,
-        GatewayStatus, InternalComponent, LogLevel, LogPolicy, ManagementWebConfig,
-        ManagementWebError, ManagementWebService, ResetKind, SecretKind, SetupApplyError,
-        SetupCancellationToken, SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState,
-        SetupStore, StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
-        apply_physical_qualification_environment, bridge_gateway_event_stream,
+        CMCloudEnrollmentControlError, CMCloudEnrollmentState, CMCloudEnrollmentStatus,
+        ControlCommand, ControlHandler, FactoryResetBackupBehavior,
+        FactoryResetFixtureConfirmation, FactoryResetFixtureJob, FactoryResetFixturePhase,
+        GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle, GatewayStatus,
+        InternalComponent, LogLevel, LogPolicy, ManagementWebConfig, ManagementWebError,
+        ManagementWebService, ResetKind, SecretKind, SetupApplyError, SetupCancellationToken,
+        SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState, SetupStore,
+        StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
+        apply_physical_qualification_environment, bridge_gateway_event_stream, cmcloud_enrollment,
         cmcloud_gateway_environment, compiled_component_identity, disable_proxy_for_setup,
         ensure_runtime_directories, gateway_json_projection, legacy_state_candidates,
         load_agent_config_after_migration_with, management_agent_events, management_web_profile,
@@ -6652,6 +6667,15 @@ mod tests {
 
         drop(state);
         std::fs::remove_dir_all(&directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn cmcloud_enrollment_recovery_conflict_has_a_stable_client_status() {
+        let error = CMCloudEnrollmentControlError::Enrollment(
+            cmcloud_enrollment::CMCloudEnrollmentError::RecoveryRequired,
+        );
+        assert_eq!(error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "CMCLOUD_ENROLLMENT_RECOVERY_REQUIRED");
     }
 
     #[tokio::test]

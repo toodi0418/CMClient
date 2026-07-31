@@ -611,20 +611,8 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       this.closeCurrentSocket(1011, "socket error");
     });
     socket.on("close", () => {
-      if (!this.isActiveSocket(generation, socket)) return;
-      this.socket = undefined;
-      this.session = undefined;
-      this.clearSessionTimers();
-      this.inFlight = undefined;
-      this.pendingAprsDispatchId = undefined;
-      void this.options.directAprsEgress?.configure(undefined);
-      if (this.running && !this.terminalCode) {
-        this.scheduleReconnect();
-      } else if (this.terminalCode) {
-        this.state = "blocked";
-      } else {
-        this.state = "stopped";
-      }
+      if (generation !== this.socketGeneration) return;
+      this.detachSocket(socket);
     });
   }
 
@@ -724,10 +712,6 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
         directAprs = parseCmCloudDirectAprsCapability(control.directAprs);
       }
     } catch {
-      this.failTerminal("CMCLOUD_SERVER_HELLO_INVALID");
-      return;
-    }
-    if (directAprs && control.aprsMode !== "enabled") {
       this.failTerminal("CMCLOUD_SERVER_HELLO_INVALID");
       return;
     }
@@ -863,7 +847,11 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       }
     }
     const acknowledgement = toAprsDispatchAck(dispatchId, result);
-    this.cacheAprsDispatchAck(acknowledgement);
+    // CMCloud owns retry scheduling. A retryable result proves no APRS write
+    // occurred, so the same dispatch ID must remain eligible for a later send.
+    if (acknowledgement.outcome !== "retryable_failure") {
+      this.cacheAprsDispatchAck(acknowledgement);
+    }
     if (this.socket !== socket || this.session !== session) {
       return;
     }
@@ -1024,6 +1012,9 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
   private closeCurrentSocket(code: number, reason: string): void {
     const socket = this.socket;
     if (!socket) return;
+    // A WebSocket close handshake is asynchronous. Revoke the session before
+    // requesting it so an already-buffered control frame cannot reach APRS.
+    this.detachSocket(socket);
     try {
       socket.close(code, reason);
     } catch {
@@ -1041,6 +1032,23 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     this.clearTimers();
     this.closeCurrentSocket(4409, this.terminalCode);
     if (!this.socket) this.state = "blocked";
+  }
+
+  private detachSocket(socket: CmCloudSocket): void {
+    if (this.socket !== socket) return;
+    this.socket = undefined;
+    this.session = undefined;
+    this.clearSessionTimers();
+    this.inFlight = undefined;
+    this.pendingAprsDispatchId = undefined;
+    void this.options.directAprsEgress?.configure(undefined);
+    if (this.running && !this.terminalCode) {
+      this.scheduleReconnect();
+    } else if (this.terminalCode) {
+      this.state = "blocked";
+    } else {
+      this.state = "stopped";
+    }
   }
 
   private recordConnectionError(code: string): void {

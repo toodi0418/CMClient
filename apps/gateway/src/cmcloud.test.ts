@@ -307,6 +307,113 @@ describe("CMCloud raw outbox", () => {
     database.close();
   });
 
+  it("retries a retryable APRS dispatch with the same dispatch ID", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const egress = new FixtureDirectAprsEgress({
+      outcome: "retryable_failure",
+      errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
+    });
+    const client = createClient(database, () => socket, egress);
+    const data = "BM5GSV-5>APTMAG:!2404.57N/12032.42Ek";
+
+    client.start();
+    socket.open();
+    socket.message(
+      serverHello(7, {
+        aprsMode: "enabled",
+        directAprs: { callsign: "BM5GSV-5", verified: true },
+      }),
+    );
+    await settle();
+
+    socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+    await settle();
+    socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+    await settle();
+
+    expect(egress.submissions).toEqual([data, data]);
+    expect(latestControl(socket, "aprs_dispatch_ack")).toEqual({
+      type: "aprs_dispatch_ack",
+      dispatchId: DISPATCH_ID,
+      outcome: "retryable_failure",
+      errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
+    });
+
+    await client.stop();
+    database.close();
+  });
+
+  it("keeps the CMCloud session alive while a non-enabled APRS policy disables direct egress", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const egress = new FixtureDirectAprsEgress();
+    const client = createClient(database, () => socket, egress);
+
+    client.start();
+    socket.open();
+    socket.message(
+      serverHello(7, {
+        aprsMode: "shadow",
+        directAprs: { callsign: "BM5GSV-5", verified: true },
+      }),
+    );
+    await settle();
+
+    expect(client.status()).toMatchObject({ state: "ready" });
+    expect(egress.capability).toBeUndefined();
+    expect(latestControl(socket, "client_heartbeat")).toMatchObject({
+      directAprsReady: false,
+    });
+
+    await client.stop();
+    database.close();
+  });
+
+  it("synchronously fences direct APRS when a terminal CMCloud error starts a deferred socket close", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket(true);
+    const egress = new FixtureDirectAprsEgress();
+    const client = createClient(database, () => socket, egress);
+    const data = "BM5GSV-5>APTMAG:!2404.57N/12032.42Ek";
+
+    client.start();
+    socket.open();
+    socket.message(
+      serverHello(7, {
+        aprsMode: "enabled",
+        directAprs: { callsign: "BM5GSV-5", verified: true },
+      }),
+    );
+    await settle();
+    expect(egress.capability).toEqual({
+      callsign: "BM5GSV-5",
+      verified: true,
+    });
+
+    socket.message({
+      type: "error",
+      code: "CLIENT_UPGRADE_REQUIRED",
+      message: "upgrade required",
+    });
+    await settle();
+    const sentBeforeDispatch = socket.sent.length;
+
+    expect(client.status()).toMatchObject({
+      state: "blocked",
+      terminalCode: "CLIENT_UPGRADE_REQUIRED",
+    });
+    expect(egress.capability).toBeUndefined();
+
+    socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+    await settle();
+    expect(egress.submissions).toEqual([]);
+    expect(socket.sent).toHaveLength(sentBeforeDispatch);
+
+    await client.stop();
+    database.close();
+  });
+
   it("fails closed without a verified direct capability", async () => {
     const database = new GatewayDatabase(":memory:");
     const socket = new FixtureSocket();
@@ -459,6 +566,8 @@ class FixtureSocket implements CmCloudSocket {
     error: new Set<(error: Error) => void>(),
   };
 
+  constructor(private readonly deferClose = false) {}
+
   on(event: "open", listener: () => void): unknown;
   on(
     event: "message",
@@ -508,7 +617,9 @@ class FixtureSocket implements CmCloudSocket {
   }
 
   close(code = 1000, reason = ""): void {
-    this.emitClose(code, reason);
+    if (!this.deferClose) {
+      this.emitClose(code, reason);
+    }
   }
 
   open(): void {

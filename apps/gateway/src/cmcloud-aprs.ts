@@ -153,7 +153,7 @@ export class CmCloudDirectAprsEgressRuntime implements CmCloudDirectAprsEgress {
         errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
       };
     }
-    const outcome = await writeOnce(session.socket, data);
+    const outcome = await writeOnce(session.socket, data, this.timeoutMs);
     if (outcome.outcome !== "submitted") {
       this.invalidateSession(session);
     }
@@ -339,7 +339,9 @@ function validTnc2Data(value: unknown): value is string {
   }
   for (const character of value) {
     const code = character.codePointAt(0) ?? 0;
-    if (code < 0x20 || code === 0x7f) return false;
+    if (code < 0x20 || code === 0x7f || (code >= 0xd800 && code <= 0xdfff)) {
+      return false;
+    }
   }
   return true;
 }
@@ -347,6 +349,7 @@ function validTnc2Data(value: unknown): value is string {
 async function writeOnce(
   socket: Socket,
   data: string,
+  timeoutMs: number,
 ): Promise<CmCloudDirectAprsDispatchResult> {
   if (socket.destroyed || !socket.writable) {
     return {
@@ -358,9 +361,14 @@ async function writeOnce(
   return new Promise((resolve) => {
     let writeStarted = false;
     let settled = false;
+    let deadline: NodeJS.Timeout | undefined;
     const finish = (result: CmCloudDirectAprsDispatchResult): void => {
       if (settled) return;
       settled = true;
+      if (deadline) {
+        clearTimeout(deadline);
+        deadline = undefined;
+      }
       socket.off("close", onClose);
       socket.off("error", onError);
       resolve(result);
@@ -376,10 +384,24 @@ async function writeOnce(
     const onError = (): void => {
       if (writeStarted) ambiguous();
     };
+    const onDeadline = (): void => {
+      if (!writeStarted || settled) return;
+      // A late write callback cannot be allowed to share a still-writable
+      // socket with the next CMCloud dispatch.
+      try {
+        socket.destroy();
+      } catch {
+        // The result is still uncertain even if this best-effort teardown
+        // races with a peer close.
+      }
+      ambiguous();
+    };
     socket.once("close", onClose);
     socket.once("error", onError);
     try {
       writeStarted = true;
+      deadline = setTimeout(onDeadline, timeoutMs);
+      deadline.unref();
       socket.write(wire, (error) => {
         if (error) {
           ambiguous();
