@@ -23,9 +23,35 @@ The device credential is never an environment variable, command-line argument,
 browser value, log field, or SQLite field. The Rust Agent must inject it only
 as `cmCloudDeviceCredential` in the bounded private Gateway bootstrap frame.
 Cloud mode fails before transport startup when that private credential is absent,
-when a credential is supplied through the environment, or when local APRS or
+when a credential is supplied through the environment, or when legacy APRS or
 Proxy enablement is requested. Legacy mode remains explicit by leaving
 `CMCLIENT_CMCLOUD_MODE` disabled.
+
+## Direct APRS Egress
+
+CMCloud-required mode does not start the legacy mapping-driven APRS runtime.
+It may instead maintain one narrow APRS-IS egress solely for a CMCloud-selected
+dispatch. A client receives that capability only in `server_hello`:
+
+```json
+{
+  "directAprs": { "callsign": "BM5GSV-5", "verified": true }
+}
+```
+
+CMCloud emits this optional field only after an administrator has verified the
+station's callsign claim. Its absence, `shadow`/`disabled` APRS policy, a failed
+APRS-IS login, or a disconnected socket all force `directAprsReady: false` on
+the next heartbeat. CMClient has no environment setting for an APRS callsign or
+passcode in this mode; a static identity remains rejected. The standard
+APRS-IS endpoint settings may be used, and
+`CMCLIENT_CMCLOUD_DIRECT_APRS_ENABLED=false` explicitly disables this egress.
+
+For `aprs_dispatch`, CMClient writes the supplied TNC2 `data` unchanged (other
+than the required wire CRLF) exactly once. It returns `submitted` only after
+the local socket write completes, `retryable_failure` when it can prove the
+write never started, and `uncertain` for a write/connection outcome that cannot
+be proven. An uncertain dispatch is never retried locally.
 
 ## Delivery
 

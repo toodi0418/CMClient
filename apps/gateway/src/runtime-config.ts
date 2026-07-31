@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 import { AprsIsRxClient, type AprsIsRxSession } from "./aprs-monitor.js";
 import { AprsIsTcpClient, AprsOutboxWorker } from "./aprs-outbox.js";
 import { AprsGatewayRuntime } from "./aprs-runtime.js";
+import { CmCloudDirectAprsEgressRuntime } from "./cmcloud-aprs.js";
 import {
   CmCloudAgentClient,
   parseCmCloudRuntimeConfiguration,
@@ -62,13 +63,25 @@ export function createConfiguredCmCloudAgentClient(
     );
   }
   assertCmCloudAuthorityConfiguration(environment);
+  const directAprsEgress = createConfiguredCmCloudDirectAprsEgress(environment);
   return new CmCloudAgentClient({
     ...configuration,
     clientVersion,
     deviceCredential,
     events: eventBus,
     outbox: database.cmcloudRawOutbox,
+    ...(directAprsEgress ? { directAprsEgress } : {}),
   });
+}
+
+export function createConfiguredCmCloudDirectAprsEgress(
+  environment: Record<string, string | undefined>,
+): CmCloudDirectAprsEgressRuntime | undefined {
+  if (!parseCmCloudDirectAprsEnabled(environment)) {
+    return undefined;
+  }
+  const { host, port, timeoutMs } = parseAprsEndpointOptions(environment);
+  return new CmCloudDirectAprsEgressRuntime({ host, port, timeoutMs });
 }
 
 const SETUP_MESHTASTIC_VALIDATION_TIMEOUT_MS = 8_000;
@@ -279,6 +292,7 @@ function assertCmCloudAuthorityConfiguration(
   if (parseOptionalBoolean(environment.CMCLIENT_PROXY_ENABLED) === true) {
     throw new GatewayRuntimeConfigurationError("CMCLOUD_PROXY_FORBIDDEN");
   }
+  rejectStaticAprsIdentity(environment);
 }
 
 /**
@@ -558,6 +572,25 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   }
   throw new GatewayRuntimeConfigurationError(
     "APRS_ENABLED_CONFIGURATION_INVALID",
+  );
+}
+
+function parseCmCloudDirectAprsEnabled(
+  environment: Record<string, string | undefined>,
+): boolean {
+  const value = environment.CMCLIENT_CMCLOUD_DIRECT_APRS_ENABLED;
+  if (value === undefined || value.trim() === "") {
+    return true;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  throw new GatewayRuntimeConfigurationError(
+    "CMCLOUD_DIRECT_APRS_ENABLED_CONFIGURATION_INVALID",
   );
 }
 

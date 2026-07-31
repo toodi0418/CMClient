@@ -3,6 +3,12 @@ import type { DatabaseSync } from "node:sqlite";
 
 import WebSocket from "ws";
 
+import {
+  parseCmCloudDirectAprsCapability,
+  type CmCloudDirectAprsCapability,
+  type CmCloudDirectAprsDispatchResult,
+  type CmCloudDirectAprsEgress,
+} from "./cmcloud-aprs.js";
 import type { DomainEventBus } from "./events.js";
 
 export const CMCLOUD_AGENT_SUBPROTOCOL = "cmcloud.agent.v1";
@@ -17,6 +23,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 1_000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 60_000;
 const MAX_CONTROL_MESSAGE_BYTES = 64 * 1024;
+const MAX_CACHED_APRS_DISPATCH_ACKS = 1_024;
 const TERMINAL_SERVER_ERROR_CODES = new Set([
   "CLIENT_UPGRADE_REQUIRED",
   "INVALID_DEVICE_CREDENTIAL",
@@ -387,6 +394,11 @@ export interface CmCloudAgentClientOptions extends CmCloudRuntimeConfiguration {
   readonly handshakeTimeoutMs?: number;
   readonly reconnectInitialDelayMs?: number;
   readonly reconnectMaximumDelayMs?: number;
+  /**
+   * This egress is intentionally capability-driven. It never receives a
+   * CallMesh mapping or a locally configured APRS callsign.
+   */
+  readonly directAprsEgress?: CmCloudDirectAprsEgress;
 }
 
 export interface CmCloudAgentStatus {
@@ -404,6 +416,15 @@ interface CmCloudSession {
   readonly installationGeneration: number;
   readonly credentialVersion: number;
   readonly heartbeatIntervalMs: number;
+  readonly aprsMode: "disabled" | "shadow" | "enabled";
+  readonly directAprs?: CmCloudDirectAprsCapability;
+}
+
+interface CmCloudAprsDispatchAck {
+  readonly type: "aprs_dispatch_ack";
+  readonly dispatchId: string;
+  readonly outcome: "submitted" | "retryable_failure" | "uncertain";
+  readonly errorCode?: string;
 }
 
 /**
@@ -435,6 +456,11 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
   private ackTimer: NodeJS.Timeout | undefined;
   private flushPromise: Promise<void> | undefined;
   private flushRequested = false;
+  private pendingAprsDispatchId: string | undefined;
+  private readonly completedAprsDispatches = new Map<
+    string,
+    CmCloudAprsDispatchAck
+  >();
 
   constructor(private readonly options: CmCloudAgentClientOptions) {
     this.endpoint = parseCmCloudEndpoint(options.url);
@@ -481,6 +507,9 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
         "CMCLOUD_RECONNECT_CONFIGURATION_INVALID",
       );
     }
+    options.directAprsEgress?.setReadinessListener(() => {
+      this.onDirectAprsReadinessChanged();
+    });
   }
 
   start(): void {
@@ -495,6 +524,7 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     this.clearTimers();
     this.session = undefined;
     this.inFlight = undefined;
+    this.pendingAprsDispatchId = undefined;
     const socket = this.socket;
     this.socket = undefined;
     this.state = "stopped";
@@ -505,6 +535,7 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
         // The socket is already terminal. The outbox is intentionally retained.
       }
     }
+    await this.options.directAprsEgress?.stop();
   }
 
   enqueueRawFrame(body: Uint8Array, capturedAt: string): CmCloudRawOutboxEntry {
@@ -585,6 +616,8 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       this.session = undefined;
       this.clearSessionTimers();
       this.inFlight = undefined;
+      this.pendingAprsDispatchId = undefined;
+      void this.options.directAprsEgress?.configure(undefined);
       if (this.running && !this.terminalCode) {
         this.scheduleReconnect();
       } else if (this.terminalCode) {
@@ -630,6 +663,9 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
           this.failTerminal("CMCLOUD_HEARTBEAT_ACK_INVALID");
         }
         return;
+      case "aprs_dispatch":
+        void this.acceptAprsDispatch(socket, control);
+        return;
       case "error":
         this.handleServerError(control);
         return;
@@ -664,7 +700,7 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       typeof control.minimumClientVersion !== "string" ||
       control.minimumClientVersion.length === 0 ||
       control.minimumClientVersion.length > 512 ||
-      control.aprsMode !== "disabled"
+      !validAprsMode(control.aprsMode)
     ) {
       this.failTerminal("CMCLOUD_SERVER_HELLO_INVALID");
       return;
@@ -682,11 +718,26 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       this.failTerminal("CMCLOUD_ENROLLMENT_REQUIRES_AGENT");
       return;
     }
+    let directAprs: CmCloudDirectAprsCapability | undefined;
+    try {
+      if (control.directAprs !== undefined) {
+        directAprs = parseCmCloudDirectAprsCapability(control.directAprs);
+      }
+    } catch {
+      this.failTerminal("CMCLOUD_SERVER_HELLO_INVALID");
+      return;
+    }
+    if (directAprs && control.aprsMode !== "enabled") {
+      this.failTerminal("CMCLOUD_SERVER_HELLO_INVALID");
+      return;
+    }
     this.session = {
       connectionEpoch: control.connectionEpoch,
       installationGeneration: control.installationGeneration,
       credentialVersion: control.credentialVersion,
       heartbeatIntervalMs: control.heartbeatIntervalMs,
+      aprsMode: control.aprsMode,
+      ...(directAprs ? { directAprs } : {}),
     };
     this.reconnectAttempt = 0;
     this.state = "ready";
@@ -697,12 +748,7 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     this.heartbeatTimer = setInterval(() => {
       const session = this.session;
       if (!session || this.socket !== socket) return;
-      void this.sendControl(socket, {
-        type: "client_heartbeat",
-        connectionEpoch: session.connectionEpoch,
-        installationGeneration: session.installationGeneration,
-        credentialVersion: session.credentialVersion,
-      }).catch(() => {
+      void this.sendHeartbeat(socket).catch(() => {
         this.recordConnectionError("CMCLOUD_HEARTBEAT_SEND_FAILED");
         this.closeCurrentSocket(1011, "heartbeat send failed");
       });
@@ -712,7 +758,143 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       connectionEpoch: this.session.connectionEpoch,
       pendingOutbox: this.options.outbox.pendingCount(),
     });
+    void this.sendHeartbeat(socket).catch(() => {
+      this.recordConnectionError("CMCLOUD_HEARTBEAT_SEND_FAILED");
+      this.closeCurrentSocket(1011, "heartbeat send failed");
+    });
+    void this.configureDirectAprs(socket, this.session);
     void this.flush();
+  }
+
+  private async configureDirectAprs(
+    socket: CmCloudSocket,
+    session: CmCloudSession,
+  ): Promise<void> {
+    const egress = this.options.directAprsEgress;
+    if (!egress) return;
+    try {
+      await egress.configure(
+        session.aprsMode === "enabled" ? session.directAprs : undefined,
+      );
+    } catch {
+      this.recordConnectionError("CMCLOUD_DIRECT_APRS_CONFIGURATION_FAILED");
+    }
+    if (this.socket === socket && this.session === session) {
+      void this.sendHeartbeat(socket).catch(() => {
+        this.recordConnectionError("CMCLOUD_HEARTBEAT_SEND_FAILED");
+        this.closeCurrentSocket(1011, "heartbeat send failed");
+      });
+    }
+  }
+
+  private onDirectAprsReadinessChanged(): void {
+    const socket = this.socket;
+    if (!socket || !this.session) return;
+    void this.sendHeartbeat(socket).catch(() => {
+      this.recordConnectionError("CMCLOUD_HEARTBEAT_SEND_FAILED");
+      this.closeCurrentSocket(1011, "heartbeat send failed");
+    });
+  }
+
+  private sendHeartbeat(socket: CmCloudSocket): Promise<void> {
+    const session = this.session;
+    if (!session || this.socket !== socket) return Promise.resolve();
+    return this.sendControl(socket, {
+      type: "client_heartbeat",
+      connectionEpoch: session.connectionEpoch,
+      installationGeneration: session.installationGeneration,
+      credentialVersion: session.credentialVersion,
+      directAprsReady: this.directAprsReady(session),
+    });
+  }
+
+  private directAprsReady(session: CmCloudSession): boolean {
+    return Boolean(
+      session.aprsMode === "enabled" &&
+      session.directAprs &&
+      this.options.directAprsEgress?.ready(),
+    );
+  }
+
+  private async acceptAprsDispatch(
+    socket: CmCloudSocket,
+    control: Record<string, unknown>,
+  ): Promise<void> {
+    if (!isUuid(control.dispatchId) || typeof control.data !== "string") {
+      this.failTerminal("CMCLOUD_APRS_DISPATCH_INVALID");
+      return;
+    }
+    const dispatchId = control.dispatchId;
+    const cached = this.completedAprsDispatches.get(dispatchId);
+    if (cached) {
+      await this.sendAprsDispatchAck(socket, cached);
+      return;
+    }
+    if (this.pendingAprsDispatchId) {
+      if (this.pendingAprsDispatchId === dispatchId) return;
+      await this.sendAprsDispatchAck(socket, {
+        type: "aprs_dispatch_ack",
+        dispatchId,
+        outcome: "retryable_failure",
+        errorCode: "CMCLOUD_APRS_DISPATCH_BUSY",
+      });
+      return;
+    }
+    const session = this.session;
+    const egress = this.options.directAprsEgress;
+    let result: CmCloudDirectAprsDispatchResult;
+    if (!session || !egress || !this.directAprsReady(session)) {
+      result = {
+        outcome: "retryable_failure",
+        errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
+      };
+    } else {
+      this.pendingAprsDispatchId = dispatchId;
+      try {
+        result = await egress.submit(control.data);
+      } catch {
+        // A throw cannot prove the write remained before the APRS socket.
+        result = {
+          outcome: "uncertain",
+          errorCode: "CMCLOUD_DIRECT_APRS_WRITE_UNCERTAIN",
+        };
+      } finally {
+        this.pendingAprsDispatchId = undefined;
+      }
+    }
+    const acknowledgement = toAprsDispatchAck(dispatchId, result);
+    this.cacheAprsDispatchAck(acknowledgement);
+    if (this.socket !== socket || this.session !== session) {
+      return;
+    }
+    await this.sendAprsDispatchAck(socket, acknowledgement);
+  }
+
+  private async sendAprsDispatchAck(
+    socket: CmCloudSocket,
+    acknowledgement: CmCloudAprsDispatchAck,
+  ): Promise<void> {
+    try {
+      await this.sendControl(socket, acknowledgement);
+    } catch {
+      this.recordConnectionError("CMCLOUD_APRS_DISPATCH_ACK_SEND_FAILED");
+      this.closeCurrentSocket(
+        1011,
+        "APRS dispatch acknowledgement send failed",
+      );
+    }
+  }
+
+  private cacheAprsDispatchAck(acknowledgement: CmCloudAprsDispatchAck): void {
+    this.completedAprsDispatches.set(
+      acknowledgement.dispatchId,
+      acknowledgement,
+    );
+    while (this.completedAprsDispatches.size > MAX_CACHED_APRS_DISPATCH_ACKS) {
+      const oldest = this.completedAprsDispatches.keys().next().value;
+      if (typeof oldest !== "string") return;
+      this.completedAprsDispatches.delete(oldest);
+    }
   }
 
   private acceptRawAcknowledgement(control: Record<string, unknown>): void {
@@ -1181,6 +1363,37 @@ function validateStableErrorCode(value: string): string {
 
 function stableErrorCode(value: string): boolean {
   return /^[A-Z][A-Z0-9_]{0,127}$/.test(value);
+}
+
+function validAprsMode(
+  value: unknown,
+): value is "disabled" | "shadow" | "enabled" {
+  return value === "disabled" || value === "shadow" || value === "enabled";
+}
+
+function toAprsDispatchAck(
+  dispatchId: string,
+  result: CmCloudDirectAprsDispatchResult,
+): CmCloudAprsDispatchAck {
+  if (
+    (result.outcome !== "submitted" &&
+      result.outcome !== "retryable_failure" &&
+      result.outcome !== "uncertain") ||
+    (result.errorCode !== undefined && !stableErrorCode(result.errorCode))
+  ) {
+    return {
+      type: "aprs_dispatch_ack",
+      dispatchId,
+      outcome: "uncertain",
+      errorCode: "CMCLOUD_DIRECT_APRS_WRITE_UNCERTAIN",
+    };
+  }
+  return {
+    type: "aprs_dispatch_ack",
+    dispatchId,
+    outcome: result.outcome,
+    ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+  };
 }
 
 function validPositiveInteger(value: unknown): value is number {

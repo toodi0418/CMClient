@@ -8,12 +8,18 @@ import {
   parseCmCloudRuntimeConfiguration,
   type CmCloudSocket,
 } from "./cmcloud";
+import type {
+  CmCloudDirectAprsCapability,
+  CmCloudDirectAprsDispatchResult,
+  CmCloudDirectAprsEgress,
+} from "./cmcloud-aprs";
 import { GatewayDatabase } from "./persistence/database";
 
 const INSTALLATION_ID = "00000000-0000-4000-8000-000000000001";
 const RECEIPT_ID = "00000000-0000-4000-8000-000000000002";
 const BOOT_ID = "00000000-0000-4000-8000-000000000003";
 const MESSAGE_ID = "00000000-0000-4000-8000-000000000004";
+const DISPATCH_ID = "00000000-0000-4000-8000-000000000006";
 const DEVICE_CREDENTIAL = "credential_value_that_is_long_enough";
 const CAPTURED_AT = "2026-07-31T00:00:00.000Z";
 
@@ -252,11 +258,125 @@ describe("CMCloud raw outbox", () => {
     await client.stop();
     database.close();
   });
+
+  it("advertises direct APRS only after a verified capability is locally ready and acknowledges an exact dispatch once", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const egress = new FixtureDirectAprsEgress();
+    const client = createClient(database, () => socket, egress);
+    const data =
+      "BM5GSV-5>APTMAG,MESHD*,qAR,BM3FFG-2:!2404.57N/12032.42Ek/A=000141";
+
+    client.start();
+    socket.open();
+    socket.message(
+      serverHello(7, {
+        aprsMode: "enabled",
+        directAprs: { callsign: "BM5GSV-5", verified: true },
+      }),
+    );
+    await settle();
+
+    expect(egress.capability).toEqual({
+      callsign: "BM5GSV-5",
+      verified: true,
+    });
+    expect(latestControl(socket, "client_heartbeat")).toMatchObject({
+      directAprsReady: true,
+    });
+
+    socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+    await settle();
+    expect(egress.submissions).toEqual([data]);
+    expect(latestControl(socket, "aprs_dispatch_ack")).toEqual({
+      type: "aprs_dispatch_ack",
+      dispatchId: DISPATCH_ID,
+      outcome: "submitted",
+    });
+
+    socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+    await settle();
+    expect(egress.submissions).toEqual([data]);
+    expect(latestControl(socket, "aprs_dispatch_ack")).toEqual({
+      type: "aprs_dispatch_ack",
+      dispatchId: DISPATCH_ID,
+      outcome: "submitted",
+    });
+
+    await client.stop();
+    database.close();
+  });
+
+  it("fails closed without a verified direct capability", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const egress = new FixtureDirectAprsEgress();
+    const client = createClient(database, () => socket, egress);
+
+    client.start();
+    socket.open();
+    socket.message(serverHello(7, { aprsMode: "enabled" }));
+    await settle();
+    expect(egress.capability).toBeUndefined();
+    expect(latestControl(socket, "client_heartbeat")).toMatchObject({
+      directAprsReady: false,
+    });
+
+    socket.message({
+      type: "aprs_dispatch",
+      dispatchId: DISPATCH_ID,
+      data: "BM5GSV-5>APTMAG:!2404.57N/12032.42Ek",
+    });
+    await settle();
+    expect(egress.submissions).toEqual([]);
+    expect(latestControl(socket, "aprs_dispatch_ack")).toMatchObject({
+      outcome: "retryable_failure",
+      errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
+    });
+
+    await client.stop();
+    database.close();
+  });
+
+  it("forwards an uncertain APRS write once and does not synthesize a retry", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const egress = new FixtureDirectAprsEgress({
+      outcome: "uncertain",
+      errorCode: "CMCLOUD_DIRECT_APRS_WRITE_UNCERTAIN",
+    });
+    const client = createClient(database, () => socket, egress);
+    const data = "BM5GSV-5>APTMAG:!2404.57N/12032.42Ek";
+
+    client.start();
+    socket.open();
+    socket.message(
+      serverHello(7, {
+        aprsMode: "enabled",
+        directAprs: { callsign: "BM5GSV-5", verified: true },
+      }),
+    );
+    await settle();
+    socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+    await settle();
+
+    expect(egress.submissions).toEqual([data]);
+    expect(latestControl(socket, "aprs_dispatch_ack")).toEqual({
+      type: "aprs_dispatch_ack",
+      dispatchId: DISPATCH_ID,
+      outcome: "uncertain",
+      errorCode: "CMCLOUD_DIRECT_APRS_WRITE_UNCERTAIN",
+    });
+
+    await client.stop();
+    database.close();
+  });
 });
 
 function createClient(
   database: GatewayDatabase,
   socketFactory: () => FixtureSocket,
+  directAprsEgress?: CmCloudDirectAprsEgress,
 ): CmCloudAgentClient {
   return new CmCloudAgentClient({
     url: "wss://cmcloud.tmmarc.org/agent/v1",
@@ -275,10 +395,14 @@ function createClient(
     },
     reconnectInitialDelayMs: 10,
     reconnectMaximumDelayMs: 10,
+    ...(directAprsEgress ? { directAprsEgress } : {}),
   });
 }
 
-function serverHello(connectionEpoch: number): Record<string, unknown> {
+function serverHello(
+  connectionEpoch: number,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
   return {
     type: "server_hello",
     protocolVersion: 1,
@@ -288,7 +412,19 @@ function serverHello(connectionEpoch: number): Record<string, unknown> {
     heartbeatIntervalMs: 30_000,
     minimumClientVersion: "2.0.0",
     aprsMode: "disabled",
+    ...overrides,
   };
+}
+
+function latestControl(
+  socket: FixtureSocket,
+  type: string,
+): Record<string, unknown> | undefined {
+  return socket.sent
+    .filter((entry) => !entry.binary && typeof entry.data === "string")
+    .map((entry) => JSON.parse(entry.data as string) as Record<string, unknown>)
+    .filter((entry) => entry.type === type)
+    .at(-1);
 }
 
 function decodeRawFrame(frame: Buffer): {
@@ -398,5 +534,40 @@ class FixtureSocket implements CmCloudSocket {
     for (const listener of this.listeners.close) {
       listener(code, Buffer.from(reason, "utf8"));
     }
+  }
+}
+
+class FixtureDirectAprsEgress implements CmCloudDirectAprsEgress {
+  capability: CmCloudDirectAprsCapability | undefined;
+  readonly submissions: string[] = [];
+  private listener: (() => void) | undefined;
+
+  constructor(
+    private readonly result: CmCloudDirectAprsDispatchResult = {
+      outcome: "submitted",
+    },
+  ) {}
+
+  setReadinessListener(listener: () => void): void {
+    this.listener = listener;
+  }
+
+  async configure(capability?: CmCloudDirectAprsCapability): Promise<void> {
+    this.capability = capability;
+    this.listener?.();
+  }
+
+  ready(): boolean {
+    return this.capability !== undefined;
+  }
+
+  async submit(data: string): Promise<CmCloudDirectAprsDispatchResult> {
+    this.submissions.push(data);
+    return this.result;
+  }
+
+  async stop(): Promise<void> {
+    this.capability = undefined;
+    this.listener?.();
   }
 }

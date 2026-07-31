@@ -9,6 +9,7 @@ import {
   GatewayRuntimeConfigurationError,
   createConfiguredAprsGatewayRuntime,
   createConfiguredCmCloudAgentClient,
+  createConfiguredCmCloudDirectAprsEgress,
   createConfiguredGatewayMaintenanceRuntime,
   createConfiguredMeshGatewayRuntime,
   parseAprsEncodingOptions,
@@ -73,6 +74,17 @@ describe("Gateway production runtime configuration", () => {
     ).toThrowError(
       expect.objectContaining({ code: "CMCLOUD_PROXY_FORBIDDEN" }),
     );
+    expect(() =>
+      createConfiguredCmCloudAgentClient(
+        { ...cloudEnvironment, CMCLIENT_APRS_LOGIN_CALLSIGN: "BM5GSV-5" },
+        database,
+        events,
+        "2.0.0",
+        "credential_value_that_is_long_enough",
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "APRS_STATIC_IDENTITY_FORBIDDEN" }),
+    );
     expect(
       createConfiguredCmCloudAgentClient(
         cloudEnvironment,
@@ -83,6 +95,24 @@ describe("Gateway production runtime configuration", () => {
       )?.status(),
     ).toMatchObject({ configured: true, state: "stopped", pendingOutbox: 0 });
     database.close();
+  });
+
+  it("constructs CMCloud direct APRS egress without a local callsign and validates its opt-out", () => {
+    expect(createConfiguredCmCloudDirectAprsEgress({})).toBeDefined();
+    expect(
+      createConfiguredCmCloudDirectAprsEgress({
+        CMCLIENT_CMCLOUD_DIRECT_APRS_ENABLED: "false",
+      }),
+    ).toBeUndefined();
+    expect(() =>
+      createConfiguredCmCloudDirectAprsEgress({
+        CMCLIENT_CMCLOUD_DIRECT_APRS_ENABLED: "maybe",
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "CMCLOUD_DIRECT_APRS_ENABLED_CONFIGURATION_INVALID",
+      }),
+    );
   });
 
   it("rejects invalid bounded maintenance retention settings", () => {
