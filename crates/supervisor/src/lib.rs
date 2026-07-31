@@ -35,6 +35,8 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_COMMAND: &[u8] = b"CMCLIENT_SHUTDOWN\n";
 pub const GATEWAY_PRIVATE_FRAME_MAX_BYTES: usize = 16 * 1024;
 pub const GATEWAY_CALLMESH_API_KEY_MAX_BYTES: usize = 4096;
+pub const GATEWAY_CMCLOUD_DEVICE_CREDENTIAL_MAX_BYTES: usize = 512;
+pub const GATEWAY_CMCLOUD_ENDPOINT_MAX_BYTES: usize = 2_048;
 pub const DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(30);
 const GATEWAY_OWNERSHIP_RESPONSE_MAX_BYTES: usize = 4096;
 const GATEWAY_OWNERSHIP_PATH: &str = "/_cmclient/bootstrap/ownership";
@@ -43,6 +45,7 @@ const GATEWAY_OWNERSHIP_PROOF_HEADER: &str = "x-cmclient-gateway-ownership-proof
 const GATEWAY_OWNERSHIP_PROTOCOL: &str = "cmclient-bootstrap-ownership-v1";
 const GATEWAY_OWNERSHIP_DOMAIN: &str = "cmclient.gateway.bootstrap-ownership.v1";
 const CALLMESH_API_KEY_ENVIRONMENT_NAME: &str = "CMCLIENT_CALLMESH_API_KEY";
+const MAX_SAFE_JAVASCRIPT_INTEGER: u64 = 9_007_199_254_740_991;
 const INHERITED_RUNTIME_ENVIRONMENT_NAMES: [&str; 3] = ["SystemRoot", "WINDIR", "ComSpec"];
 
 #[cfg(windows)]
@@ -139,6 +142,15 @@ struct GatewayBootstrapFrame<'a> {
     setup_generation: u64,
     #[serde(rename = "callMeshApiKey", skip_serializing_if = "Option::is_none")]
     callmesh_api_key: Option<&'a str>,
+    #[serde(
+        rename = "cmCloudDeviceCredential",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cmcloud_device_credential: Option<&'a str>,
+}
+
+struct CMCloudBootstrapCredential {
+    device_credential: Zeroizing<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +288,7 @@ pub struct GatewaySupervisor {
     private_bootstrap: bool,
     setup_generation: u64,
     callmesh_api_key: Option<Zeroizing<String>>,
+    cmcloud_credential: Option<CMCloudBootstrapCredential>,
     bootstrap_deadline: Duration,
     ready: Option<GatewayReady>,
 }
@@ -323,6 +336,7 @@ impl GatewaySupervisor {
             private_bootstrap: false,
             setup_generation: 1,
             callmesh_api_key: None,
+            cmcloud_credential: None,
             bootstrap_deadline: DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE,
             ready: None,
         })
@@ -381,6 +395,38 @@ impl GatewaySupervisor {
 
     pub fn clear_callmesh_api_key(&mut self) {
         self.callmesh_api_key = None;
+    }
+
+    /// Set the active CMCloud device credential for the next private Gateway
+    /// bootstrap. The Agent validates the full fence before calling this
+    /// method; pairing codes stay in the Agent-only enrollment transaction.
+    pub fn set_cmcloud_device_credential(
+        &mut self,
+        endpoint: &str,
+        installation_id: &str,
+        installation_generation: u64,
+        credential_version: u64,
+        device_credential: &str,
+    ) -> Result<(), SupervisorError> {
+        if !self.private_bootstrap
+            || self.child.is_some()
+            || !is_cmcloud_endpoint(endpoint)
+            || !is_uuid(installation_id)
+            || installation_generation > MAX_SAFE_JAVASCRIPT_INTEGER
+            || credential_version == 0
+            || credential_version > MAX_SAFE_JAVASCRIPT_INTEGER
+            || !is_cmcloud_device_credential(device_credential)
+        {
+            return Err(SupervisorError::BootstrapInvalid);
+        }
+        self.cmcloud_credential = Some(CMCloudBootstrapCredential {
+            device_credential: Zeroizing::new(device_credential.to_owned()),
+        });
+        Ok(())
+    }
+
+    pub fn clear_cmcloud_device_credential(&mut self) {
+        self.cmcloud_credential = None;
     }
 
     pub fn gateway_ready(&self) -> Option<&GatewayReady> {
@@ -479,6 +525,7 @@ impl GatewaySupervisor {
                 self.bootstrap_deadline,
                 self.setup_generation,
                 self.callmesh_api_key.as_deref().map(String::as_str),
+                self.cmcloud_credential.as_ref(),
             );
             match result {
                 Ok(ready) => {
@@ -635,6 +682,9 @@ impl GatewaySupervisor {
         if let Some(api_key) = self.callmesh_api_key.as_deref() {
             secrets.push(api_key.to_owned());
         }
+        if let Some(cmcloud) = self.cmcloud_credential.as_ref() {
+            secrets.push(cmcloud.device_credential.to_string());
+        }
         secrets
     }
 
@@ -751,11 +801,37 @@ fn is_capture_log_error_code(code: &str) -> bool {
     )
 }
 
+fn is_cmcloud_endpoint(value: &str) -> bool {
+    value.starts_with("wss://")
+        && value.len() <= GATEWAY_CMCLOUD_ENDPOINT_MAX_BYTES
+        && value.len() > "wss://".len()
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                .then_some(byte == b'-')
+                .unwrap_or_else(|| byte.is_ascii_hexdigit())
+        })
+}
+
+fn is_cmcloud_device_credential(value: &str) -> bool {
+    (16..=GATEWAY_CMCLOUD_DEVICE_CREDENTIAL_MAX_BYTES).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn perform_private_bootstrap(
     child: &mut Box<dyn ChildWrapper>,
     deadline: Duration,
     setup_generation: u64,
     callmesh_api_key: Option<&str>,
+    cmcloud_credential: Option<&CMCloudBootstrapCredential>,
 ) -> (
     Result<GatewayReady, SupervisorError>,
     Option<thread::JoinHandle<()>>,
@@ -781,6 +857,8 @@ fn perform_private_bootstrap(
             capability: capability.clone(),
             setup_generation,
             callmesh_api_key,
+            cmcloud_device_credential: cmcloud_credential
+                .map(|credential| credential.device_credential.as_str()),
         };
         let encoded = Zeroizing::new(encode_private_frame(&bootstrap)?);
         child
@@ -1272,6 +1350,7 @@ mod tests {
         let nonce = "a".repeat(32);
         let capability = "b".repeat(64);
         let api_key = "fixture-private-callmesh-key";
+        let cmcloud_credential = "fixture-cmcloud-device-credential";
         let encoded = encode_private_frame(&GatewayBootstrapFrame {
             schema_version: 2,
             frame_type: "gateway.bootstrap",
@@ -1279,6 +1358,7 @@ mod tests {
             capability: capability.clone(),
             setup_generation: 7,
             callmesh_api_key: Some(api_key),
+            cmcloud_device_credential: Some(cmcloud_credential),
         })
         .expect("bootstrap should encode");
         assert_eq!(
@@ -1292,6 +1372,8 @@ mod tests {
         assert_eq!(decoded["setupGeneration"], 7);
         assert_eq!(decoded["callMeshApiKey"], api_key);
         assert!(decoded.get("callmeshApiKey").is_none());
+        assert_eq!(decoded["cmCloudDeviceCredential"], cmcloud_credential);
+        assert!(decoded.get("cmCloud").is_none());
         let maximum_escaped_key = "\\".repeat(GATEWAY_CALLMESH_API_KEY_MAX_BYTES);
         let maximum_frame = encode_private_frame(&GatewayBootstrapFrame {
             schema_version: 2,
@@ -1300,6 +1382,7 @@ mod tests {
             capability: capability.clone(),
             setup_generation: 7,
             callmesh_api_key: Some(&maximum_escaped_key),
+            cmcloud_device_credential: None,
         })
         .expect("maximum escaped API key should fit the bounded frame");
         assert!(maximum_frame.len() <= GATEWAY_PRIVATE_FRAME_MAX_BYTES + 4);
@@ -1409,6 +1492,61 @@ mod tests {
             supervisor.child_output_redaction_secrets(None),
             vec![String::from("fixture-private-callmesh-key")]
         );
+    }
+
+    #[test]
+    fn cmcloud_device_credential_requires_private_bootstrap_and_is_redacted() {
+        let mut supervisor = GatewaySupervisor::new(fixture_command(), BackoffPolicy::default())
+            .expect("supervisor should initialize");
+        let endpoint = "wss://cmcloud.example.invalid/agent/v1";
+        let installation_id = "00000000-0000-4000-8000-000000000001";
+        let credential = "fixture-cmcloud-device-credential";
+        assert_eq!(
+            supervisor.set_cmcloud_device_credential(endpoint, installation_id, 0, 1, credential),
+            Err(SupervisorError::BootstrapInvalid)
+        );
+        supervisor
+            .enable_private_bootstrap()
+            .expect("private bootstrap should enable");
+        for (invalid_endpoint, invalid_installation_id, generation, version, invalid_credential) in [
+            (
+                "https://cmcloud.example.invalid/agent/v1",
+                installation_id,
+                0,
+                1,
+                credential,
+            ),
+            (endpoint, "not-a-uuid", 0, 1, credential),
+            (
+                endpoint,
+                installation_id,
+                9_007_199_254_740_992,
+                1,
+                credential,
+            ),
+            (endpoint, installation_id, 0, 0, credential),
+            (endpoint, installation_id, 0, 1, "pairing code with spaces"),
+        ] {
+            assert_eq!(
+                supervisor.set_cmcloud_device_credential(
+                    invalid_endpoint,
+                    invalid_installation_id,
+                    generation,
+                    version,
+                    invalid_credential,
+                ),
+                Err(SupervisorError::BootstrapInvalid)
+            );
+        }
+        supervisor
+            .set_cmcloud_device_credential(endpoint, installation_id, 0, 1, credential)
+            .expect("active device credential should be accepted");
+        assert_eq!(
+            supervisor.child_output_redaction_secrets(None),
+            vec![String::from(credential)]
+        );
+        supervisor.clear_cmcloud_device_credential();
+        assert!(supervisor.child_output_redaction_secrets(None).is_empty());
     }
 
     #[test]

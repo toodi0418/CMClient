@@ -16,11 +16,13 @@ cmclient-runtime-logging = { path = "../../crates/runtime-logging" }
 cmclient-supervisor = { path = "../../crates/supervisor" }
 cmclient-updater = { path = "../../crates/updater" }
 ctrlc = { version = "3.5", features = ["termination"] }
+futures-util = { version = "=0.3.33", default-features = false, features = ["async-await", "sink"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde = "1"
 serde_json = "1"
 tokio.workspace = true
 tokio-stream = { version = "=0.1.18", features = ["sync"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 zeroize = "1.8"
 
 [dev-dependencies]

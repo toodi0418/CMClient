@@ -11,13 +11,16 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-#[cfg(unix)]
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 const PLAINTEXT_DOCUMENT_VERSION: u8 = 1;
 const MAX_SECRET_BYTES: usize = 4_096;
 const MAX_PLAINTEXT_FILE_BYTES: usize = 32 * 1_024;
+const MAX_CMCLOUD_ENDPOINT_BYTES: usize = 2_048;
+const MAX_CMCLOUD_CLIENT_VERSION_BYTES: usize = 64;
+const MAX_CMCLOUD_DEVICE_CREDENTIAL_BYTES: usize = 512;
+const MAX_SAFE_JAVASCRIPT_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SecretKind {
@@ -61,6 +64,124 @@ impl SecretValue {
     }
 }
 
+/// The non-secret fence associated with one CMCloud device credential.
+///
+/// The endpoint is retained with the credential so an Agent cannot accidentally
+/// hand a credential issued by one CMCloud deployment to another deployment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CMCloudInstallationIdentity {
+    endpoint: String,
+    installation_id: String,
+    installation_generation: u64,
+    credential_version: u64,
+}
+
+impl CMCloudInstallationIdentity {
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    pub const fn installation_generation(&self) -> u64 {
+        self.installation_generation
+    }
+
+    pub const fn credential_version(&self) -> u64 {
+        self.credential_version
+    }
+}
+
+/// The sole CMCloud credential eligible for a Gateway private bootstrap.
+///
+/// Pairing codes and pending enrollment credentials are deliberately not
+/// represented by this type.
+pub struct CMCloudActiveDeviceCredential {
+    identity: CMCloudInstallationIdentity,
+    device_credential: SecretValue,
+}
+
+impl CMCloudActiveDeviceCredential {
+    pub fn identity(&self) -> &CMCloudInstallationIdentity {
+        &self.identity
+    }
+
+    pub fn device_credential(&self) -> &SecretValue {
+        &self.device_credential
+    }
+}
+
+/// A durable, Agent-only CMCloud pairing attempt.
+///
+/// It retains the original boot and installation fences so a process restart
+/// can complete the server's ten-minute pairing recovery protocol without
+/// asking the Gateway to see a pairing credential.
+pub struct CMCloudEnrollmentAttempt {
+    endpoint: String,
+    pairing_code: SecretValue,
+    installation_id: String,
+    requested_installation_generation: u64,
+    boot_id: String,
+    client_version: String,
+    issued: Option<CMCloudIssuedDeviceCredential>,
+}
+
+impl CMCloudEnrollmentAttempt {
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn pairing_code(&self) -> &SecretValue {
+        &self.pairing_code
+    }
+
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    pub const fn requested_installation_generation(&self) -> u64 {
+        self.requested_installation_generation
+    }
+
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+
+    pub fn client_version(&self) -> &str {
+        &self.client_version
+    }
+
+    pub fn issued(&self) -> Option<&CMCloudIssuedDeviceCredential> {
+        self.issued.as_ref()
+    }
+}
+
+/// A pending device credential issued by CMCloud but not yet acknowledged.
+///
+/// This remains Agent-only until CMCloud confirms `enrollment_ack`; then the
+/// store atomically promotes it to [`CMCloudActiveDeviceCredential`].
+pub struct CMCloudIssuedDeviceCredential {
+    identity: CMCloudInstallationIdentity,
+    connection_epoch: u64,
+    device_credential: SecretValue,
+}
+
+impl CMCloudIssuedDeviceCredential {
+    pub fn identity(&self) -> &CMCloudInstallationIdentity {
+        &self.identity
+    }
+
+    pub const fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
+    }
+
+    pub fn device_credential(&self) -> &SecretValue {
+        &self.device_credential
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretStoreError {
     InvalidValue,
@@ -93,6 +214,32 @@ trait SecretBackend: Send + Sync {
     fn rollback_callmesh_setup(&self) -> Result<bool, SecretStoreError>;
     fn finalize_callmesh_setup(&self) -> Result<bool, SecretStoreError>;
     fn callmesh_setup_state(&self) -> Result<CallMeshSetupSecretState, SecretStoreError>;
+    fn begin_cmcloud_enrollment(
+        &self,
+        endpoint: &str,
+        pairing_code: &str,
+        client_version: &str,
+    ) -> Result<CMCloudEnrollmentAttempt, SecretStoreError>;
+    fn cmcloud_enrollment_attempt(
+        &self,
+    ) -> Result<Option<CMCloudEnrollmentAttempt>, SecretStoreError>;
+    fn discard_cmcloud_enrollment(&self) -> Result<bool, SecretStoreError>;
+    fn record_cmcloud_issued_credential(
+        &self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+        device_credential: &str,
+    ) -> Result<(), SecretStoreError>;
+    fn activate_cmcloud_credential(
+        &self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+    ) -> Result<CMCloudInstallationIdentity, SecretStoreError>;
+    fn cmcloud_active_device_credential(
+        &self,
+    ) -> Result<Option<CMCloudActiveDeviceCredential>, SecretStoreError>;
 
     #[cfg(test)]
     fn kind(&self) -> SecretBackendKind;
@@ -119,6 +266,216 @@ struct CallMeshSetupSecretTransaction {
     candidate: String,
     previous: Option<String>,
     promoted: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudActiveDeviceSecret {
+    endpoint: String,
+    installation_id: String,
+    installation_generation: u64,
+    credential_version: u64,
+    device_credential: String,
+}
+
+impl CMCloudActiveDeviceSecret {
+    fn identity(&self) -> CMCloudInstallationIdentity {
+        CMCloudInstallationIdentity {
+            endpoint: self.endpoint.clone(),
+            installation_id: self.installation_id.clone(),
+            installation_generation: self.installation_generation,
+            credential_version: self.credential_version,
+        }
+    }
+
+    fn into_active_credential(mut self) -> CMCloudActiveDeviceCredential {
+        CMCloudActiveDeviceCredential {
+            identity: CMCloudInstallationIdentity {
+                endpoint: std::mem::take(&mut self.endpoint),
+                installation_id: std::mem::take(&mut self.installation_id),
+                installation_generation: self.installation_generation,
+                credential_version: self.credential_version,
+            },
+            device_credential: SecretValue::new(std::mem::take(&mut self.device_credential)),
+        }
+    }
+
+    fn validate(&self) -> Result<(), SecretStoreError> {
+        validate_cmcloud_endpoint(&self.endpoint)?;
+        validate_uuid(&self.installation_id)?;
+        validate_generation(self.installation_generation)?;
+        validate_credential_version(self.credential_version)?;
+        validate_cmcloud_bearer(&self.device_credential)
+    }
+}
+
+impl Drop for CMCloudActiveDeviceSecret {
+    fn drop(&mut self) {
+        self.device_credential.zeroize();
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudEnrollmentTransaction {
+    endpoint: String,
+    pairing_code: String,
+    installation_id: String,
+    requested_installation_generation: u64,
+    boot_id: String,
+    client_version: String,
+    issued_device_credential: Option<String>,
+    issued_installation_generation: Option<u64>,
+    issued_credential_version: Option<u64>,
+    issued_connection_epoch: Option<u64>,
+}
+
+impl CMCloudEnrollmentTransaction {
+    fn new(endpoint: &str, pairing_code: &str, client_version: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_owned(),
+            pairing_code: pairing_code.to_owned(),
+            installation_id: Uuid::new_v4().to_string(),
+            requested_installation_generation: 0,
+            boot_id: Uuid::new_v4().to_string(),
+            client_version: client_version.to_owned(),
+            issued_device_credential: None,
+            issued_installation_generation: None,
+            issued_credential_version: None,
+            issued_connection_epoch: None,
+        }
+    }
+
+    fn into_attempt(mut self) -> CMCloudEnrollmentAttempt {
+        let endpoint = std::mem::take(&mut self.endpoint);
+        let installation_id = std::mem::take(&mut self.installation_id);
+        let issued = match (
+            self.issued_device_credential.take(),
+            self.issued_installation_generation.take(),
+            self.issued_credential_version.take(),
+            self.issued_connection_epoch.take(),
+        ) {
+            (
+                Some(device_credential),
+                Some(installation_generation),
+                Some(credential_version),
+                Some(connection_epoch),
+            ) => Some(CMCloudIssuedDeviceCredential {
+                identity: CMCloudInstallationIdentity {
+                    endpoint: endpoint.clone(),
+                    installation_id: installation_id.clone(),
+                    installation_generation,
+                    credential_version,
+                },
+                connection_epoch,
+                device_credential: SecretValue::new(device_credential),
+            }),
+            _ => None,
+        };
+        CMCloudEnrollmentAttempt {
+            endpoint,
+            pairing_code: SecretValue::new(std::mem::take(&mut self.pairing_code)),
+            installation_id,
+            requested_installation_generation: self.requested_installation_generation,
+            boot_id: std::mem::take(&mut self.boot_id),
+            client_version: std::mem::take(&mut self.client_version),
+            issued,
+        }
+    }
+
+    fn validate(&self) -> Result<(), SecretStoreError> {
+        validate_cmcloud_endpoint(&self.endpoint)?;
+        validate_cmcloud_bearer(&self.pairing_code)?;
+        validate_uuid(&self.installation_id)?;
+        validate_generation(self.requested_installation_generation)?;
+        validate_uuid(&self.boot_id)?;
+        validate_cmcloud_client_version(&self.client_version)?;
+        match (
+            self.issued_device_credential.as_deref(),
+            self.issued_installation_generation,
+            self.issued_credential_version,
+            self.issued_connection_epoch,
+        ) {
+            (None, None, None, None) => Ok(()),
+            (
+                Some(device_credential),
+                Some(installation_generation),
+                Some(credential_version),
+                Some(connection_epoch),
+            ) => {
+                validate_cmcloud_bearer(device_credential)?;
+                validate_generation(installation_generation)?;
+                validate_credential_version(credential_version)?;
+                validate_connection_epoch(connection_epoch)
+            }
+            _ => Err(SecretStoreError::Unavailable),
+        }
+    }
+
+    fn record_issued(
+        &mut self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+        device_credential: &str,
+    ) -> Result<(), SecretStoreError> {
+        validate_generation(installation_generation)?;
+        validate_credential_version(credential_version)?;
+        validate_connection_epoch(connection_epoch)?;
+        validate_cmcloud_bearer(device_credential)?;
+        if let Some(previous) = self.issued_device_credential.as_deref() {
+            if previous != device_credential
+                || self.issued_installation_generation != Some(installation_generation)
+                || self.issued_credential_version != Some(credential_version)
+            {
+                return Err(SecretStoreError::Unavailable);
+            }
+        }
+        if let Some(mut previous) = self
+            .issued_device_credential
+            .replace(device_credential.to_owned())
+        {
+            previous.zeroize();
+        }
+        self.issued_installation_generation = Some(installation_generation);
+        self.issued_credential_version = Some(credential_version);
+        self.issued_connection_epoch = Some(connection_epoch);
+        Ok(())
+    }
+
+    fn activate(
+        mut self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+    ) -> Result<CMCloudActiveDeviceSecret, SecretStoreError> {
+        if self.issued_installation_generation != Some(installation_generation)
+            || self.issued_credential_version != Some(credential_version)
+            || self.issued_connection_epoch != Some(connection_epoch)
+        {
+            return Err(SecretStoreError::Unavailable);
+        }
+        let device_credential = self
+            .issued_device_credential
+            .take()
+            .ok_or(SecretStoreError::Unavailable)?;
+        Ok(CMCloudActiveDeviceSecret {
+            endpoint: std::mem::take(&mut self.endpoint),
+            installation_id: std::mem::take(&mut self.installation_id),
+            installation_generation,
+            credential_version,
+            device_credential,
+        })
+    }
+}
+
+impl Drop for CMCloudEnrollmentTransaction {
+    fn drop(&mut self) {
+        self.pairing_code.zeroize();
+        if let Some(issued) = self.issued_device_credential.as_mut() {
+            issued.zeroize();
+        }
+    }
 }
 
 impl Drop for CallMeshSetupSecretTransaction {
@@ -152,6 +509,18 @@ struct PlaintextSecretDocument {
         skip_serializing_if = "Option::is_none"
     )]
     setup_callmesh_transaction: Option<CallMeshSetupSecretTransaction>,
+    #[serde(
+        rename = "cmcloud-active-device",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    cmcloud_active_device: Option<CMCloudActiveDeviceSecret>,
+    #[serde(
+        rename = "cmcloud-enrollment-transaction",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    cmcloud_enrollment_transaction: Option<CMCloudEnrollmentTransaction>,
 }
 
 impl PlaintextSecretDocument {
@@ -161,6 +530,8 @@ impl PlaintextSecretDocument {
             callmesh_api_key: None,
             aprs_passcode: None,
             setup_callmesh_transaction: None,
+            cmcloud_active_device: None,
+            cmcloud_enrollment_transaction: None,
         }
     }
 
@@ -215,6 +586,23 @@ impl PlaintextSecretDocument {
         {
             return Err(SecretStoreError::Unavailable);
         }
+        if let Some(active) = self.cmcloud_active_device.as_ref() {
+            active
+                .validate()
+                .map_err(|_| SecretStoreError::Unavailable)?;
+        }
+        if let Some(transaction) = self.cmcloud_enrollment_transaction.as_ref() {
+            transaction
+                .validate()
+                .map_err(|_| SecretStoreError::Unavailable)?;
+            if self
+                .cmcloud_active_device
+                .as_ref()
+                .is_some_and(|active| active.installation_id == transaction.installation_id)
+            {
+                return Err(SecretStoreError::Unavailable);
+            }
+        }
         Ok(())
     }
 }
@@ -251,6 +639,8 @@ impl Drop for PlaintextSecretDocument {
                 value.zeroize();
             }
         }
+        self.cmcloud_active_device = None;
+        self.cmcloud_enrollment_transaction = None;
     }
 }
 
@@ -408,6 +798,8 @@ impl SecretBackend for PlaintextSecretBackend {
                 previous.zeroize();
             }
         }
+        document.cmcloud_active_device = None;
+        document.cmcloud_enrollment_transaction = None;
         self.save(&document)
     }
 
@@ -502,6 +894,125 @@ impl SecretBackend for PlaintextSecretBackend {
         })
     }
 
+    fn begin_cmcloud_enrollment(
+        &self,
+        endpoint: &str,
+        pairing_code: &str,
+        client_version: &str,
+    ) -> Result<CMCloudEnrollmentAttempt, SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        if document.cmcloud_enrollment_transaction.is_some() {
+            return Err(SecretStoreError::Unavailable);
+        }
+        let transaction = CMCloudEnrollmentTransaction::new(endpoint, pairing_code, client_version);
+        transaction.validate()?;
+        let attempt = transaction.clone().into_attempt();
+        document.cmcloud_enrollment_transaction = Some(transaction);
+        self.save(&document)?;
+        Ok(attempt)
+    }
+
+    fn cmcloud_enrollment_attempt(
+        &self,
+    ) -> Result<Option<CMCloudEnrollmentAttempt>, SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        Ok(document
+            .cmcloud_enrollment_transaction
+            .take()
+            .map(CMCloudEnrollmentTransaction::into_attempt))
+    }
+
+    fn discard_cmcloud_enrollment(&self) -> Result<bool, SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        let discarded = document.cmcloud_enrollment_transaction.take().is_some();
+        if discarded {
+            self.save(&document)?;
+        }
+        Ok(discarded)
+    }
+
+    fn record_cmcloud_issued_credential(
+        &self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+        device_credential: &str,
+    ) -> Result<(), SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        document
+            .cmcloud_enrollment_transaction
+            .as_mut()
+            .ok_or(SecretStoreError::Unavailable)?
+            .record_issued(
+                installation_generation,
+                credential_version,
+                connection_epoch,
+                device_credential,
+            )?;
+        self.save(&document)
+    }
+
+    fn activate_cmcloud_credential(
+        &self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+    ) -> Result<CMCloudInstallationIdentity, SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        let transaction = document
+            .cmcloud_enrollment_transaction
+            .as_ref()
+            .cloned()
+            .ok_or(SecretStoreError::Unavailable)?;
+        let active = transaction.activate(
+            installation_generation,
+            credential_version,
+            connection_epoch,
+        )?;
+        let identity = active.identity();
+        document.cmcloud_enrollment_transaction = None;
+        document.cmcloud_active_device = Some(active);
+        self.save(&document)?;
+        Ok(identity)
+    }
+
+    fn cmcloud_active_device_credential(
+        &self,
+    ) -> Result<Option<CMCloudActiveDeviceCredential>, SecretStoreError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| SecretStoreError::Unavailable)?;
+        let mut document = self.load()?;
+        if document.cmcloud_enrollment_transaction.is_some() {
+            return Ok(None);
+        }
+        Ok(document
+            .cmcloud_active_device
+            .take()
+            .map(CMCloudActiveDeviceSecret::into_active_credential))
+    }
+
     #[cfg(test)]
     fn kind(&self) -> SecretBackendKind {
         SecretBackendKind::Plaintext
@@ -513,6 +1024,8 @@ impl SecretBackend for PlaintextSecretBackend {
 struct MemorySecretState {
     values: std::collections::BTreeMap<SecretKind, String>,
     setup_callmesh_transaction: Option<CallMeshSetupSecretTransaction>,
+    cmcloud_active_device: Option<CMCloudActiveDeviceSecret>,
+    cmcloud_enrollment_transaction: Option<CMCloudEnrollmentTransaction>,
     fail_next_setup_finalize: bool,
 }
 
@@ -557,6 +1070,8 @@ impl SecretBackend for MemorySecretBackend {
         }
         state.values.clear();
         state.setup_callmesh_transaction = None;
+        state.cmcloud_active_device = None;
+        state.cmcloud_enrollment_transaction = None;
         Ok(())
     }
 
@@ -638,6 +1153,94 @@ impl SecretBackend for MemorySecretBackend {
         })
     }
 
+    fn begin_cmcloud_enrollment(
+        &self,
+        endpoint: &str,
+        pairing_code: &str,
+        client_version: &str,
+    ) -> Result<CMCloudEnrollmentAttempt, SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        if state.cmcloud_enrollment_transaction.is_some() {
+            return Err(SecretStoreError::Unavailable);
+        }
+        let transaction = CMCloudEnrollmentTransaction::new(endpoint, pairing_code, client_version);
+        transaction.validate()?;
+        let attempt = transaction.clone().into_attempt();
+        state.cmcloud_enrollment_transaction = Some(transaction);
+        Ok(attempt)
+    }
+
+    fn cmcloud_enrollment_attempt(
+        &self,
+    ) -> Result<Option<CMCloudEnrollmentAttempt>, SecretStoreError> {
+        let state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        Ok(state
+            .cmcloud_enrollment_transaction
+            .clone()
+            .map(CMCloudEnrollmentTransaction::into_attempt))
+    }
+
+    fn discard_cmcloud_enrollment(&self) -> Result<bool, SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        Ok(state.cmcloud_enrollment_transaction.take().is_some())
+    }
+
+    fn record_cmcloud_issued_credential(
+        &self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+        device_credential: &str,
+    ) -> Result<(), SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        state
+            .cmcloud_enrollment_transaction
+            .as_mut()
+            .ok_or(SecretStoreError::Unavailable)?
+            .record_issued(
+                installation_generation,
+                credential_version,
+                connection_epoch,
+                device_credential,
+            )
+    }
+
+    fn activate_cmcloud_credential(
+        &self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+    ) -> Result<CMCloudInstallationIdentity, SecretStoreError> {
+        let mut state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        let transaction = state
+            .cmcloud_enrollment_transaction
+            .as_ref()
+            .cloned()
+            .ok_or(SecretStoreError::Unavailable)?;
+        let active = transaction.activate(
+            installation_generation,
+            credential_version,
+            connection_epoch,
+        )?;
+        let identity = active.identity();
+        state.cmcloud_enrollment_transaction = None;
+        state.cmcloud_active_device = Some(active);
+        Ok(identity)
+    }
+
+    fn cmcloud_active_device_credential(
+        &self,
+    ) -> Result<Option<CMCloudActiveDeviceCredential>, SecretStoreError> {
+        let state = self.0.lock().map_err(|_| SecretStoreError::Unavailable)?;
+        if state.cmcloud_enrollment_transaction.is_some() {
+            return Ok(None);
+        }
+        Ok(state
+            .cmcloud_active_device
+            .clone()
+            .map(CMCloudActiveDeviceSecret::into_active_credential))
+    }
+
     #[cfg(test)]
     fn kind(&self) -> SecretBackendKind {
         SecretBackendKind::Memory
@@ -701,6 +1304,84 @@ impl AgentSecretStore {
 
     pub fn callmesh_setup_state(&self) -> Result<CallMeshSetupSecretState, SecretStoreError> {
         self.backend.callmesh_setup_state()
+    }
+
+    /// Start a fresh CMCloud pairing transaction. The pairing code never becomes
+    /// a general-purpose secret and is never available to Gateway bootstrap.
+    pub fn begin_cmcloud_enrollment(
+        &self,
+        endpoint: &str,
+        pairing_code: &str,
+        client_version: &str,
+    ) -> Result<CMCloudEnrollmentAttempt, SecretStoreError> {
+        validate_cmcloud_endpoint(endpoint)?;
+        validate_cmcloud_bearer(pairing_code)?;
+        validate_cmcloud_client_version(client_version)?;
+        self.backend
+            .begin_cmcloud_enrollment(endpoint, pairing_code, client_version)
+    }
+
+    /// Read the durable Agent-only enrollment transaction for a restart-safe
+    /// recovery attempt.
+    pub fn cmcloud_enrollment_attempt(
+        &self,
+    ) -> Result<Option<CMCloudEnrollmentAttempt>, SecretStoreError> {
+        self.backend.cmcloud_enrollment_attempt()
+    }
+
+    /// Discard an unissued enrollment transaction after a terminal rejection.
+    /// Callers must retain any transaction that already has an issued credential
+    /// so CMCloud's bounded enrollment recovery remains possible.
+    pub fn discard_cmcloud_enrollment(&self) -> Result<bool, SecretStoreError> {
+        self.backend.discard_cmcloud_enrollment()
+    }
+
+    /// Persist an issued credential before the Agent acknowledges enrollment to
+    /// CMCloud. Repeated recovery responses must carry the exact same issued
+    /// credential and identity fence.
+    pub fn record_cmcloud_issued_credential(
+        &self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+        device_credential: &str,
+    ) -> Result<(), SecretStoreError> {
+        validate_generation(installation_generation)?;
+        validate_credential_version(credential_version)?;
+        validate_connection_epoch(connection_epoch)?;
+        validate_cmcloud_bearer(device_credential)?;
+        self.backend.record_cmcloud_issued_credential(
+            installation_generation,
+            credential_version,
+            connection_epoch,
+            device_credential,
+        )
+    }
+
+    /// Atomically promote the pending CMCloud credential only after a matching
+    /// `enrollment_acknowledged` reply was received from CMCloud.
+    pub fn activate_cmcloud_credential(
+        &self,
+        installation_generation: u64,
+        credential_version: u64,
+        connection_epoch: u64,
+    ) -> Result<CMCloudInstallationIdentity, SecretStoreError> {
+        validate_generation(installation_generation)?;
+        validate_credential_version(credential_version)?;
+        validate_connection_epoch(connection_epoch)?;
+        self.backend.activate_cmcloud_credential(
+            installation_generation,
+            credential_version,
+            connection_epoch,
+        )
+    }
+
+    /// Return an active CMCloud credential only when no pairing transaction is
+    /// outstanding. This is the sole credential Gateway may receive.
+    pub fn cmcloud_active_device_credential(
+        &self,
+    ) -> Result<Option<CMCloudActiveDeviceCredential>, SecretStoreError> {
+        self.backend.cmcloud_active_device_credential()
     }
 
     #[cfg(test)]
@@ -920,6 +1601,71 @@ fn validate_secret(value: &str) -> Result<(), SecretStoreError> {
     Ok(())
 }
 
+fn validate_cmcloud_endpoint(value: &str) -> Result<(), SecretStoreError> {
+    if value.is_empty()
+        || value.len() > MAX_CMCLOUD_ENDPOINT_BYTES
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || !value.starts_with("wss://")
+        || value[6..].is_empty()
+    {
+        return Err(SecretStoreError::InvalidValue);
+    }
+    Ok(())
+}
+
+fn validate_cmcloud_bearer(value: &str) -> Result<(), SecretStoreError> {
+    if value.len() < 16
+        || value.len() > MAX_CMCLOUD_DEVICE_CREDENTIAL_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(SecretStoreError::InvalidValue);
+    }
+    Ok(())
+}
+
+fn validate_cmcloud_client_version(value: &str) -> Result<(), SecretStoreError> {
+    if value.is_empty()
+        || value.len() > MAX_CMCLOUD_CLIENT_VERSION_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'v'))
+    {
+        return Err(SecretStoreError::InvalidValue);
+    }
+    Ok(())
+}
+
+fn validate_uuid(value: &str) -> Result<(), SecretStoreError> {
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| SecretStoreError::Unavailable)
+}
+
+fn validate_generation(value: u64) -> Result<(), SecretStoreError> {
+    if value > MAX_SAFE_JAVASCRIPT_INTEGER {
+        return Err(SecretStoreError::InvalidValue);
+    }
+    Ok(())
+}
+
+fn validate_credential_version(value: u64) -> Result<(), SecretStoreError> {
+    if value == 0 || value > MAX_SAFE_JAVASCRIPT_INTEGER {
+        return Err(SecretStoreError::InvalidValue);
+    }
+    Ok(())
+}
+
+fn validate_connection_epoch(value: u64) -> Result<(), SecretStoreError> {
+    if value == 0 || value > MAX_SAFE_JAVASCRIPT_INTEGER {
+        return Err(SecretStoreError::InvalidValue);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -965,6 +1711,105 @@ mod tests {
                 Err(SecretStoreError::InvalidValue)
             );
         }
+    }
+
+    #[test]
+    fn cmcloud_pairing_is_restart_safe_and_gateway_gated_until_acknowledged() {
+        let root = fixture("cmcloud-pairing");
+        let store = AgentSecretStore::runtime(&root).expect("runtime store should initialize");
+        let attempt = store
+            .begin_cmcloud_enrollment(
+                "wss://cmcloud.example.invalid/agent/v1",
+                "abcdefghijklmnopqrstuvwxyz012345",
+                "2.0.0-rc.1",
+            )
+            .expect("pairing transaction should persist before connecting");
+        let installation_id = attempt.installation_id().to_owned();
+        let boot_id = attempt.boot_id().to_owned();
+        assert!(
+            store
+                .cmcloud_active_device_credential()
+                .expect("active credential lookup should work")
+                .is_none(),
+            "pairing credentials must not reach Gateway bootstrap",
+        );
+        drop(store);
+
+        let reopened = AgentSecretStore::runtime(&root).expect("runtime store should reopen");
+        let recovered = reopened
+            .cmcloud_enrollment_attempt()
+            .expect("pending enrollment should load")
+            .expect("pending enrollment should remain durable");
+        assert_eq!(recovered.installation_id(), installation_id);
+        assert_eq!(recovered.boot_id(), boot_id);
+        assert_eq!(
+            recovered.pairing_code().expose_secret(),
+            "abcdefghijklmnopqrstuvwxyz012345"
+        );
+        reopened
+            .record_cmcloud_issued_credential(7, 1, 4, "abcdefghijklmno_pqrstuvwxyz012345")
+            .expect("issued credential should persist before ACK");
+        assert!(
+            reopened
+                .cmcloud_active_device_credential()
+                .expect("active credential lookup should work")
+                .is_none(),
+            "an issued-but-unacknowledged credential must remain Agent-only",
+        );
+        assert_eq!(
+            reopened.activate_cmcloud_credential(7, 1, 5),
+            Err(SecretStoreError::Unavailable),
+            "a mismatched enrollment ACK fence must not promote a credential",
+        );
+        let identity = reopened
+            .activate_cmcloud_credential(7, 1, 4)
+            .expect("matching enrollment acknowledgement should promote atomically");
+        assert_eq!(identity.installation_id(), installation_id);
+        assert_eq!(identity.installation_generation(), 7);
+        assert_eq!(identity.credential_version(), 1);
+        let active = reopened
+            .cmcloud_active_device_credential()
+            .expect("active credential should load")
+            .expect("active credential should exist");
+        assert_eq!(active.identity(), &identity);
+        assert_eq!(
+            active.device_credential().expose_secret(),
+            "abcdefghijklmno_pqrstuvwxyz012345"
+        );
+        assert!(
+            reopened
+                .cmcloud_enrollment_attempt()
+                .expect("pending enrollment lookup should work")
+                .is_none(),
+            "activation must clear the pairing code and boot recovery material",
+        );
+        let serialized =
+            fs::read_to_string(root.join("secrets.json")).expect("secrets document should read");
+        assert!(serialized.contains("cmcloud-active-device"));
+        assert!(!serialized.contains("abcdefghijklmnopqrstuvwxyz012345"));
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn cmcloud_recovery_rejects_a_substituted_issued_credential() {
+        let store = AgentSecretStore::memory();
+        store
+            .begin_cmcloud_enrollment(
+                "wss://cmcloud.example.invalid/agent/v1",
+                "abcdefghijklmnopqrstuvwxyz012345",
+                "2.0.0-rc.1",
+            )
+            .expect("pairing transaction should begin");
+        store
+            .record_cmcloud_issued_credential(0, 1, 2, "abcdefghijklmno_pqrstuvwxyz012345")
+            .expect("first issued credential should persist");
+        store
+            .record_cmcloud_issued_credential(0, 1, 3, "abcdefghijklmno_pqrstuvwxyz012345")
+            .expect("recovery may advance only the connection epoch");
+        assert_eq!(
+            store.record_cmcloud_issued_credential(0, 1, 4, "different-credential-value-123456"),
+            Err(SecretStoreError::Unavailable),
+        );
     }
 
     #[test]

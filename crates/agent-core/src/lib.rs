@@ -285,6 +285,7 @@ pub struct AgentConfig {
     pub runtime_profile: AgentRuntimeProfile,
     pub gateway_command: Option<Vec<String>>,
     pub callmesh: Option<CallMeshConfig>,
+    pub cmcloud: Option<CMCloudConfig>,
     pub meshtastic: Option<MeshtasticConfig>,
     pub aprs: Option<AprsConfig>,
     pub proxy: Option<ProxyConfig>,
@@ -311,6 +312,14 @@ impl AgentRuntimeProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallMeshConfig {
     pub url: String,
+}
+
+/// CMCloud's dedicated Agent WebSocket endpoint. Cloud mode replaces direct
+/// CallMesh, APRS, and Proxy runtime traffic while retaining local Meshtastic
+/// receive ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CMCloudConfig {
+    pub agent_websocket_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +397,7 @@ pub enum ConfigError {
     InvalidConfig,
     EmptyGatewayCommand,
     InvalidCallMesh,
+    InvalidCMCloud,
     InvalidMeshtastic,
     InvalidAprs,
     InvalidProxy,
@@ -429,6 +439,7 @@ impl ConfigError {
             Self::InvalidConfig => "AGENT_CONFIG_INVALID",
             Self::EmptyGatewayCommand => "AGENT_CONFIG_GATEWAY_COMMAND_EMPTY",
             Self::InvalidCallMesh => "AGENT_CONFIG_CALLMESH_INVALID",
+            Self::InvalidCMCloud => "AGENT_CONFIG_CMCLOUD_INVALID",
             Self::InvalidMeshtastic => "AGENT_CONFIG_MESHTASTIC_INVALID",
             Self::InvalidAprs => "AGENT_CONFIG_APRS_INVALID",
             Self::InvalidProxy => "AGENT_CONFIG_PROXY_INVALID",
@@ -450,6 +461,7 @@ impl std::error::Error for ConfigError {}
 struct FileConfig {
     agent: Option<AgentSection>,
     callmesh: Option<CallMeshSection>,
+    cmcloud: Option<CMCloudSection>,
     meshtastic: Option<MeshtasticSection>,
     aprs: Option<AprsSection>,
     proxy: Option<ProxySection>,
@@ -460,6 +472,12 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct CallMeshSection {
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CMCloudSection {
+    agent_websocket_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,6 +530,7 @@ struct AgentSection {
 struct ValidatedFileConfig {
     gateway_command: Option<Vec<String>>,
     callmesh: Option<CallMeshConfig>,
+    cmcloud: Option<CMCloudConfig>,
     meshtastic: Option<MeshtasticConfig>,
     aprs: Option<AprsConfig>,
     proxy: Option<ProxyConfig>,
@@ -562,6 +581,7 @@ impl AgentConfig {
             runtime_profile,
             gateway_command: validated.gateway_command,
             callmesh: validated.callmesh,
+            cmcloud: validated.cmcloud,
             meshtastic: validated.meshtastic,
             aprs: validated.aprs,
             proxy: validated.proxy,
@@ -780,16 +800,32 @@ fn validate_file_config(file_config: FileConfig) -> Result<ValidatedFileConfig, 
             })
         })
         .transpose()?;
+    let cmcloud = file_config
+        .cmcloud
+        .map(|cmcloud| {
+            let agent_websocket_url = cmcloud.agent_websocket_url.trim();
+            if !is_cmcloud_agent_websocket_url(agent_websocket_url) {
+                return Err(ConfigError::InvalidCMCloud);
+            }
+            Ok(CMCloudConfig {
+                agent_websocket_url: agent_websocket_url.to_owned(),
+            })
+        })
+        .transpose()?;
     let meshtastic = file_config
         .meshtastic
         .map(parse_meshtastic_config)
         .transpose()?;
     let aprs = file_config.aprs.map(parse_aprs_config).transpose()?;
     let proxy = file_config.proxy.map(parse_proxy_config).transpose()?;
+    if cmcloud.is_some() && (callmesh.is_some() || aprs.is_some() || proxy.is_some()) {
+        return Err(ConfigError::InvalidCMCloud);
+    }
 
     Ok(ValidatedFileConfig {
         gateway_command: agent.gateway_command,
         callmesh,
+        cmcloud,
         meshtastic,
         aprs,
         proxy,
@@ -927,6 +963,16 @@ fn is_https_origin(value: &str) -> bool {
         && !authority.contains('\\')
         && !authority.contains(char::is_whitespace)
         && (suffix.is_empty() || suffix == "/")
+}
+
+fn is_cmcloud_agent_websocket_url(value: &str) -> bool {
+    let Some(authority) = value
+        .strip_prefix("wss://")
+        .and_then(|remainder| remainder.strip_suffix("/agent/v1"))
+    else {
+        return false;
+    };
+    is_https_origin(&format!("https://{authority}"))
 }
 
 fn home_directory(environment: &BTreeMap<String, String>) -> Result<PathBuf, ConfigError> {
@@ -1482,6 +1528,55 @@ mod tests {
             AgentConfig::from_environment(&environment),
             Err(ConfigError::InvalidCallMesh)
         );
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn cmcloud_mode_uses_the_exact_agent_websocket_and_excludes_direct_egress() {
+        let (directory, environment, config_file) = config_fixture("cmcloud");
+        fs::write(
+            &config_file,
+            "[cmcloud]\nagent_websocket_url = \"wss://cmcloud.example.invalid/agent/v1\"\n",
+        )
+        .expect("configuration should be written");
+
+        let config = AgentConfig::from_environment(&environment)
+            .expect("CMCloud WebSocket configuration should load");
+        assert_eq!(
+            config
+                .cmcloud
+                .expect("CMCloud configuration should exist")
+                .agent_websocket_url,
+            "wss://cmcloud.example.invalid/agent/v1"
+        );
+
+        fs::write(
+            &config_file,
+            "[cmcloud]\nagent_websocket_url = \"https://cmcloud.example.invalid/agent/v1\"\n",
+        )
+        .expect("configuration should be written");
+        assert_eq!(
+            AgentConfig::from_environment(&environment),
+            Err(ConfigError::InvalidCMCloud)
+        );
+
+        fs::write(
+            &config_file,
+            concat!(
+                "[cmcloud]\n",
+                "agent_websocket_url = \"wss://cmcloud.example.invalid/agent/v1\"\n\n",
+                "[aprs]\n",
+                "host = \"asia.aprs2.net\"\n",
+                "port = 14580\n",
+                "destination = \"APCM20\"\n",
+            ),
+        )
+        .expect("configuration should be written");
+        assert_eq!(
+            AgentConfig::from_environment(&environment),
+            Err(ConfigError::InvalidCMCloud)
+        );
+
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 

@@ -12,7 +12,8 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use cmclient_agent_core::access::{ManagementAccessController, ManagementAuditEntry};
 use cmclient_agent_core::secrets::{
-    AgentSecretStore, CallMeshSetupSecretState, SecretKind, SecretStoreError,
+    AgentSecretStore, CMCloudActiveDeviceCredential, CallMeshSetupSecretState, SecretKind,
+    SecretStoreError,
 };
 use cmclient_agent_core::setup::{
     DiscoveryError, DiscoverySource, MAX_DISCOVERY_CANDIDATES, MAX_MDNS_TIMEOUT,
@@ -64,6 +65,7 @@ use std::{
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use zeroize::Zeroize;
 
+mod cmcloud_enrollment;
 mod tray;
 
 const EX_USAGE: u8 = 2;
@@ -83,6 +85,12 @@ const MAX_GATEWAY_IDENTITY_BYTES: u64 = 64 * 1024;
 const SETUP_VALIDATION_ONLY_ENVIRONMENT_NAME: &str = "CMCLIENT_SETUP_VALIDATION_ONLY";
 const SETUP_COMMIT_START_ENVIRONMENT_NAME: &str = "CMCLIENT_SETUP_COMMIT_START";
 const PROXY_ENABLED_ENVIRONMENT_NAME: &str = "CMCLIENT_PROXY_ENABLED";
+const CMCLOUD_MODE_ENVIRONMENT_NAME: &str = "CMCLIENT_CMCLOUD_MODE";
+const CMCLOUD_URL_ENVIRONMENT_NAME: &str = "CMCLIENT_CMCLOUD_URL";
+const CMCLOUD_INSTALLATION_ID_ENVIRONMENT_NAME: &str = "CMCLIENT_CMCLOUD_INSTALLATION_ID";
+const CMCLOUD_INSTALLATION_GENERATION_ENVIRONMENT_NAME: &str =
+    "CMCLIENT_CMCLOUD_INSTALLATION_GENERATION";
+const CMCLOUD_CREDENTIAL_VERSION_ENVIRONMENT_NAME: &str = "CMCLIENT_CMCLOUD_CREDENTIAL_VERSION";
 const SETUP_TRANSACTION_FILE_NAME: &str = "setup-transaction.json";
 const SETUP_TRANSACTION_VERSION: u8 = 1;
 const RESET_TRANSACTION_FILE_NAME: &str = "reset-transaction.json";
@@ -524,6 +532,83 @@ impl Drop for SetupConfigureRequest {
     }
 }
 
+/// A management-only pairing code. This request is consumed by the Agent and
+/// zeroized before it can cross the Gateway supervisor boundary.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudEnrollmentRequest {
+    pairing_code: String,
+}
+
+impl Drop for CMCloudEnrollmentRequest {
+    fn drop(&mut self) {
+        self.pairing_code.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CMCloudEnrollmentState {
+    NotConfigured,
+    CredentialsRequired,
+    PendingEnrollment,
+    Active,
+}
+
+/// Redacted enrollment state exposed to the authenticated management UI.
+///
+/// Device credentials, pairing codes, installation IDs, boot IDs, and session
+/// epochs deliberately have no representation in this response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CMCloudEnrollmentStatus {
+    schema_version: u8,
+    state: CMCloudEnrollmentState,
+    endpoint: Option<String>,
+    installation_generation: Option<u64>,
+    credential_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CMCloudEnrollmentControlError {
+    InvalidInput,
+    NotConfigured,
+    SetupRequired,
+    InProgress,
+    Unavailable,
+    Enrollment(cmcloud_enrollment::CMCloudEnrollmentError),
+}
+
+impl CMCloudEnrollmentControlError {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "CMCLOUD_ENROLLMENT_REQUEST_INVALID",
+            Self::NotConfigured => "CMCLOUD_ENROLLMENT_NOT_CONFIGURED",
+            Self::SetupRequired => "CMCLOUD_ENROLLMENT_SETUP_REQUIRED",
+            Self::InProgress => "CMCLOUD_ENROLLMENT_IN_PROGRESS",
+            Self::Unavailable => "CMCLOUD_ENROLLMENT_UNAVAILABLE",
+            Self::Enrollment(error) => error.code(),
+        }
+    }
+
+    const fn status_code(self) -> StatusCode {
+        match self {
+            Self::InvalidInput => StatusCode::BAD_REQUEST,
+            Self::NotConfigured | Self::SetupRequired | Self::InProgress => StatusCode::CONFLICT,
+            Self::Unavailable
+            | Self::Enrollment(cmcloud_enrollment::CMCloudEnrollmentError::SecretStore)
+            | Self::Enrollment(cmcloud_enrollment::CMCloudEnrollmentError::Transport) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::Enrollment(
+                cmcloud_enrollment::CMCloudEnrollmentError::Protocol
+                | cmcloud_enrollment::CMCloudEnrollmentError::Rejected
+                | cmcloud_enrollment::CMCloudEnrollmentError::StaleEnrollment,
+            ) => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SetupDiscoveryResponse {
@@ -657,6 +742,17 @@ type SetupApplyHandler = Arc<
 
 type SetupResetHandler = Arc<dyn Fn() -> Result<SetupStatus, SetupApplyError> + Send + Sync>;
 
+type CMCloudEnrollmentHandler = Arc<
+    dyn Fn(
+            CMCloudEnrollmentRequest,
+        ) -> Result<CMCloudEnrollmentStatus, CMCloudEnrollmentControlError>
+        + Send
+        + Sync,
+>;
+
+type CMCloudEnrollmentStatusHandler =
+    Arc<dyn Fn() -> Result<CMCloudEnrollmentStatus, CMCloudEnrollmentControlError> + Send + Sync>;
+
 const CALLMESH_PRODUCTION_URL: &str = "https://callmesh.tmmarc.org";
 const DEFAULT_APRS_HOST: &str = "asia.aprs2.net";
 const DEFAULT_APRS_PORT: u16 = 14_580;
@@ -672,6 +768,8 @@ struct AgentWebState {
     management_access: Option<Arc<ManagementAccessController>>,
     setup_apply: Mutex<Option<SetupApplyHandler>>,
     operational_reset: Mutex<Option<SetupResetHandler>>,
+    cmcloud_enrollment: Mutex<Option<CMCloudEnrollmentHandler>>,
+    cmcloud_enrollment_status: Mutex<Option<CMCloudEnrollmentStatusHandler>>,
     migrated_meshtastic: Option<MeshtasticCandidate>,
     discovery_gate: Mutex<()>,
     audit: Mutex<VecDeque<ManagementAuditEntry>>,
@@ -731,6 +829,8 @@ impl AgentWebState {
             management_access,
             setup_apply: Mutex::new(None),
             operational_reset: Mutex::new(None),
+            cmcloud_enrollment: Mutex::new(None),
+            cmcloud_enrollment_status: Mutex::new(None),
             migrated_meshtastic,
             discovery_gate: Mutex::new(()),
             audit: Mutex::new(VecDeque::new()),
@@ -751,6 +851,22 @@ impl AgentWebState {
             .operational_reset
             .lock()
             .map_err(|_| ControlError::CommandFailed)? = Some(handler);
+        Ok(())
+    }
+
+    fn install_cmcloud_enrollment(
+        &self,
+        enrollment: CMCloudEnrollmentHandler,
+        status: CMCloudEnrollmentStatusHandler,
+    ) -> Result<(), ControlError> {
+        *self
+            .cmcloud_enrollment
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)? = Some(enrollment);
+        *self
+            .cmcloud_enrollment_status
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)? = Some(status);
         Ok(())
     }
 
@@ -899,6 +1015,10 @@ fn agent_web_router(state: Arc<AgentWebState>) -> Router {
             post(management_operational_reset),
         )
         .route("/api/v1/setup/events", get(management_setup_events))
+        .route(
+            "/api/v1/cmcloud/enrollment",
+            get(management_cmcloud_enrollment_status).post(management_cmcloud_enrollment),
+        )
         .route("/api/v1/lifecycle/status", get(management_lifecycle_status))
         .route("/api/v1/lifecycle/events", get(management_lifecycle_events))
         .route("/api/v1/updates", get(management_update_status))
@@ -977,6 +1097,94 @@ async fn management_setup_configure(
         Ok(Err(error)) => setup_apply_error_response(error),
         Err(_) => management_control_failed_response(),
     }
+}
+
+async fn management_cmcloud_enrollment_status(State(state): State<Arc<AgentWebState>>) -> Response {
+    let handler = match state.cmcloud_enrollment_status.lock() {
+        Ok(handler) => handler.clone(),
+        Err(_) => return management_control_failed_response(),
+    };
+    let Some(handler) = handler else {
+        return cmcloud_enrollment_error_response(CMCloudEnrollmentControlError::Unavailable);
+    };
+    match tokio::task::spawn_blocking(move || handler()).await {
+        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(Err(error)) => cmcloud_enrollment_error_response(error),
+        Err(_) => cmcloud_enrollment_error_response(CMCloudEnrollmentControlError::Unavailable),
+    }
+}
+
+async fn management_cmcloud_enrollment(
+    State(state): State<Arc<AgentWebState>>,
+    request: Result<Json<CMCloudEnrollmentRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) if valid_cmcloud_pairing_code(&request.pairing_code) => request,
+        Ok(_) | Err(_) => {
+            return cmcloud_enrollment_error_response(CMCloudEnrollmentControlError::InvalidInput);
+        }
+    };
+    let handler = match state.cmcloud_enrollment.lock() {
+        Ok(handler) => handler.clone(),
+        Err(_) => return management_control_failed_response(),
+    };
+    let Some(handler) = handler else {
+        return cmcloud_enrollment_error_response(CMCloudEnrollmentControlError::Unavailable);
+    };
+    match tokio::task::spawn_blocking(move || handler(request)).await {
+        Ok(Ok(status)) => (StatusCode::OK, Json(status)).into_response(),
+        Ok(Err(error)) => cmcloud_enrollment_error_response(error),
+        Err(_) => cmcloud_enrollment_error_response(CMCloudEnrollmentControlError::Unavailable),
+    }
+}
+
+fn valid_cmcloud_pairing_code(value: &str) -> bool {
+    (16..=512).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn cmcloud_gateway_environment(
+    endpoint: &str,
+    credential: &CMCloudActiveDeviceCredential,
+) -> BTreeMap<String, String> {
+    debug_assert_eq!(credential.identity().endpoint(), endpoint);
+    BTreeMap::from([
+        (
+            String::from(CMCLOUD_MODE_ENVIRONMENT_NAME),
+            String::from("required"),
+        ),
+        (
+            String::from(CMCLOUD_URL_ENVIRONMENT_NAME),
+            endpoint.to_owned(),
+        ),
+        (
+            String::from(CMCLOUD_INSTALLATION_ID_ENVIRONMENT_NAME),
+            credential.identity().installation_id().to_owned(),
+        ),
+        (
+            String::from(CMCLOUD_INSTALLATION_GENERATION_ENVIRONMENT_NAME),
+            credential.identity().installation_generation().to_string(),
+        ),
+        (
+            String::from(CMCLOUD_CREDENTIAL_VERSION_ENVIRONMENT_NAME),
+            credential.identity().credential_version().to_string(),
+        ),
+        (String::from("CMCLIENT_APRS_ENABLED"), String::from("false")),
+        (
+            String::from(PROXY_ENABLED_ENVIRONMENT_NAME),
+            String::from("false"),
+        ),
+    ])
+}
+
+fn cmcloud_enrollment_error_response(error: CMCloudEnrollmentControlError) -> Response {
+    (
+        error.status_code(),
+        Json(serde_json::json!({"code": error.code()})),
+    )
+        .into_response()
 }
 
 fn validate_setup_request(request: &SetupConfigureRequest) -> Result<(), SetupApplyError> {
@@ -2046,6 +2254,7 @@ struct AgentController {
     supervisor: Mutex<Option<GatewaySupervisor>>,
     gateway_transition: Mutex<()>,
     setup_transaction: Mutex<()>,
+    cmcloud_enrollment_transition: Mutex<()>,
     private_gateway_bootstrap: bool,
     runtime_log: Option<StructuredLogSink>,
     agent_log_error_code: Mutex<Option<String>>,
@@ -2059,6 +2268,7 @@ struct AgentController {
     paths: RuntimePaths,
     config_file: PathBuf,
     setup_transaction_file: PathBuf,
+    cmcloud_endpoint: Option<String>,
     secrets: AgentSecretStore,
     setup: Arc<SetupStore>,
     setup_gate_required: bool,
@@ -2251,6 +2461,217 @@ impl AgentController {
                 .ok_or(SetupApplyError::SupervisorUnavailable)?;
             controller.operational_reset()
         }))
+    }
+
+    fn install_cmcloud_enrollment(self: &Arc<Self>) -> Result<(), ControlError> {
+        let enrollment_controller = Arc::downgrade(self);
+        let status_controller = Arc::downgrade(self);
+        self.web_state.install_cmcloud_enrollment(
+            Arc::new(move |request| {
+                let controller = enrollment_controller
+                    .upgrade()
+                    .ok_or(CMCloudEnrollmentControlError::Unavailable)?;
+                controller.enroll_cmcloud(request)
+            }),
+            Arc::new(move || {
+                let controller = status_controller
+                    .upgrade()
+                    .ok_or(CMCloudEnrollmentControlError::Unavailable)?;
+                controller.cmcloud_enrollment_status()
+            }),
+        )
+    }
+
+    fn cmcloud_enrollment_status(
+        &self,
+    ) -> Result<CMCloudEnrollmentStatus, CMCloudEnrollmentControlError> {
+        let Some(endpoint) = self.cmcloud_endpoint.as_ref() else {
+            return Ok(CMCloudEnrollmentStatus {
+                schema_version: 1,
+                state: CMCloudEnrollmentState::NotConfigured,
+                endpoint: None,
+                installation_generation: None,
+                credential_version: None,
+            });
+        };
+        let pending = self
+            .secrets
+            .cmcloud_enrollment_attempt()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        if pending.is_some_and(|attempt| attempt.endpoint() == endpoint) {
+            return Ok(CMCloudEnrollmentStatus {
+                schema_version: 1,
+                state: CMCloudEnrollmentState::PendingEnrollment,
+                endpoint: Some(endpoint.clone()),
+                installation_generation: None,
+                credential_version: None,
+            });
+        }
+        let active = self
+            .secrets
+            .cmcloud_active_device_credential()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?
+            .filter(|credential| credential.identity().endpoint() == endpoint);
+        match active {
+            Some(credential) => Ok(CMCloudEnrollmentStatus {
+                schema_version: 1,
+                state: CMCloudEnrollmentState::Active,
+                endpoint: Some(endpoint.clone()),
+                installation_generation: Some(credential.identity().installation_generation()),
+                credential_version: Some(credential.identity().credential_version()),
+            }),
+            None => Ok(CMCloudEnrollmentStatus {
+                schema_version: 1,
+                state: CMCloudEnrollmentState::CredentialsRequired,
+                endpoint: Some(endpoint.clone()),
+                installation_generation: None,
+                credential_version: None,
+            }),
+        }
+    }
+
+    fn enroll_cmcloud(
+        &self,
+        request: CMCloudEnrollmentRequest,
+    ) -> Result<CMCloudEnrollmentStatus, CMCloudEnrollmentControlError> {
+        let Some(endpoint) = self.cmcloud_endpoint.as_deref() else {
+            return Err(CMCloudEnrollmentControlError::NotConfigured);
+        };
+        if !valid_cmcloud_pairing_code(&request.pairing_code) {
+            return Err(CMCloudEnrollmentControlError::InvalidInput);
+        }
+        self.ensure_resource_start_allowed()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        let _enrollment = match self.cmcloud_enrollment_transition.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(CMCloudEnrollmentControlError::InProgress);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(CMCloudEnrollmentControlError::Unavailable);
+            }
+        };
+        self.ensure_cmcloud_enrollment_setup_allowed()?;
+        self.quiesce_cmcloud_gateway_for_enrollment()?;
+        cmcloud_enrollment::enroll_cmcloud_blocking(
+            &self.secrets,
+            endpoint,
+            &request.pairing_code,
+            &self.identity.identity.version,
+        )
+        .map_err(CMCloudEnrollmentControlError::Enrollment)?;
+        self.configure_active_cmcloud_gateway_credential()?;
+        self.mark_cmcloud_enrollment_ready()?;
+        self.web_state.record_audit(
+            "cmcloud_enrollment",
+            "allowed",
+            "CMCLOUD_ENROLLMENT_COMPLETED",
+        );
+        self.log_agent_code(LogLevel::Info, "CMCLOUD_ENROLLMENT_COMPLETED");
+        self.cmcloud_enrollment_status()
+    }
+
+    fn ensure_cmcloud_enrollment_setup_allowed(&self) -> Result<(), CMCloudEnrollmentControlError> {
+        if !self.setup_gate_required {
+            return Ok(());
+        }
+        let status = self
+            .setup
+            .status()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        if matches!(
+            status.phase,
+            SetupPhase::CredentialsRequired | SetupPhase::Ready
+        ) {
+            Ok(())
+        } else {
+            Err(CMCloudEnrollmentControlError::SetupRequired)
+        }
+    }
+
+    fn quiesce_cmcloud_gateway_for_enrollment(&self) -> Result<(), CMCloudEnrollmentControlError> {
+        let _gateway_transition = self
+            .gateway_transition
+            .lock()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        self.stop_supervisor_locked()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        let mut supervisor = self
+            .supervisor
+            .lock()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        if let Some(supervisor) = supervisor.as_mut() {
+            supervisor.clear_cmcloud_device_credential();
+        }
+        Ok(())
+    }
+
+    fn configure_active_cmcloud_gateway_credential(
+        &self,
+    ) -> Result<(), CMCloudEnrollmentControlError> {
+        if !self.private_gateway_bootstrap {
+            return Err(CMCloudEnrollmentControlError::Unavailable);
+        }
+        let Some(endpoint) = self.cmcloud_endpoint.as_deref() else {
+            return Err(CMCloudEnrollmentControlError::NotConfigured);
+        };
+        let credential = self
+            .secrets
+            .cmcloud_active_device_credential()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?
+            .filter(|credential| credential.identity().endpoint() == endpoint)
+            .ok_or(CMCloudEnrollmentControlError::Unavailable)?;
+        let _gateway_transition = self
+            .gateway_transition
+            .lock()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        self.stop_supervisor_locked()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        let mut supervisor = self
+            .supervisor
+            .lock()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        let Some(supervisor) = supervisor.as_mut() else {
+            return Ok(());
+        };
+        supervisor.set_environment(cmcloud_gateway_environment(endpoint, &credential));
+        supervisor
+            .set_cmcloud_device_credential(
+                credential.identity().endpoint(),
+                credential.identity().installation_id(),
+                credential.identity().installation_generation(),
+                credential.identity().credential_version(),
+                credential.device_credential().expose_secret(),
+            )
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)
+    }
+
+    fn mark_cmcloud_enrollment_ready(&self) -> Result<(), CMCloudEnrollmentControlError> {
+        if !self.setup_gate_required {
+            return Ok(());
+        }
+        let phase = self
+            .setup
+            .status()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?
+            .phase;
+        if matches!(phase, SetupPhase::Ready) {
+            return Ok(());
+        }
+        if !matches!(phase, SetupPhase::CredentialsRequired) {
+            return Err(CMCloudEnrollmentControlError::SetupRequired);
+        }
+        let fence = self
+            .setup
+            .begin_validation()
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        let status = self
+            .setup
+            .mark_ready(fence)
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
+        self.web_state
+            .publish_setup_status(&status)
+            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)
     }
 
     fn apply_setup(
@@ -2707,16 +3128,36 @@ impl AgentController {
         secrets: AgentSecretStore,
         private_bootstrap: bool,
     ) -> Result<Self, ControlError> {
+        if config.cmcloud.is_some()
+            && (config.callmesh.is_some() || config.aprs.is_some() || config.proxy.is_some())
+        {
+            return Err(ControlError::CommandFailed);
+        }
         let identity = compiled_component_identity(InternalComponent::Agent)
             .map_err(|_| ControlError::CommandFailed)?;
         let setup =
             Arc::new(SetupStore::open(&config.paths).map_err(|_| ControlError::CommandFailed)?);
         let setup_gate_required = setup_gate_required(config);
-        if setup_gate_required
-            && secrets
+        let cmcloud_active_credential = if let Some(cmcloud) = config.cmcloud.as_ref() {
+            secrets
+                .cmcloud_active_device_credential()
+                .map_err(control_secret_error)?
+                .filter(|credential| {
+                    credential.identity().endpoint() == cmcloud.agent_websocket_url
+                })
+        } else {
+            None
+        };
+        let credentials_ready = if config.cmcloud.is_some() {
+            cmcloud_active_credential.is_some()
+        } else {
+            secrets
                 .read(SecretKind::CallMeshApiKey)
                 .map_err(control_secret_error)?
-                .is_none()
+                .is_some()
+        };
+        if setup_gate_required
+            && !credentials_ready
             && matches!(
                 setup
                     .snapshot()
@@ -2824,6 +3265,32 @@ impl AgentController {
                 if let Some(callmesh) = &config.callmesh {
                     environment.insert(String::from("CMCLIENT_CALLMESH_URL"), callmesh.url.clone());
                 }
+                if let Some(cmcloud) = config.cmcloud.as_ref() {
+                    environment.insert(
+                        String::from(CMCLOUD_MODE_ENVIRONMENT_NAME),
+                        String::from("required"),
+                    );
+                    environment.insert(
+                        String::from(CMCLOUD_URL_ENVIRONMENT_NAME),
+                        cmcloud.agent_websocket_url.clone(),
+                    );
+                    environment
+                        .insert(String::from("CMCLIENT_APRS_ENABLED"), String::from("false"));
+                    if let Some(credential) = cmcloud_active_credential.as_ref() {
+                        environment.insert(
+                            String::from(CMCLOUD_INSTALLATION_ID_ENVIRONMENT_NAME),
+                            credential.identity().installation_id().to_owned(),
+                        );
+                        environment.insert(
+                            String::from(CMCLOUD_INSTALLATION_GENERATION_ENVIRONMENT_NAME),
+                            credential.identity().installation_generation().to_string(),
+                        );
+                        environment.insert(
+                            String::from(CMCLOUD_CREDENTIAL_VERSION_ENVIRONMENT_NAME),
+                            credential.identity().credential_version().to_string(),
+                        );
+                    }
+                }
                 if let Some(meshtastic) = &config.meshtastic {
                     environment.insert(
                         String::from("CMCLIENT_MESH_NETWORK_ID"),
@@ -2862,36 +3329,41 @@ impl AgentController {
                         }
                     }
                 }
-                apply_aprs_environment(&mut environment, config.aprs.as_ref());
+                if config.cmcloud.is_none() {
+                    apply_aprs_environment(&mut environment, config.aprs.as_ref());
+                }
                 environment.insert(
                     String::from(PROXY_ENABLED_ENVIRONMENT_NAME),
                     String::from("false"),
                 );
-                if let Some(proxy) = &config.proxy {
-                    environment.insert(
-                        String::from(PROXY_ENABLED_ENVIRONMENT_NAME),
-                        String::from("true"),
-                    );
-                    environment.insert(String::from("CMCLIENT_PROXY_HOST"), proxy.host.clone());
-                    environment.insert(String::from("CMCLIENT_PROXY_PORT"), proxy.port.to_string());
-                    environment.insert(
-                        String::from("CMCLIENT_PROXY_UPSTREAM_HOST"),
-                        proxy.upstream_host.clone(),
-                    );
-                    environment.insert(
-                        String::from("CMCLIENT_PROXY_UPSTREAM_PORT"),
-                        proxy.upstream_port.to_string(),
-                    );
-                    environment.insert(String::from("CMCLIENT_PROXY_MODE"), proxy.mode.clone());
-                    environment.insert(
-                        String::from("CMCLIENT_PROXY_ALLOW_LAN"),
-                        proxy.allow_lan.to_string(),
-                    );
-                    if !proxy.allowlist.is_empty() {
+                if config.cmcloud.is_none() {
+                    if let Some(proxy) = &config.proxy {
                         environment.insert(
-                            String::from("CMCLIENT_PROXY_ALLOWLIST"),
-                            proxy.allowlist.join(","),
+                            String::from(PROXY_ENABLED_ENVIRONMENT_NAME),
+                            String::from("true"),
                         );
+                        environment.insert(String::from("CMCLIENT_PROXY_HOST"), proxy.host.clone());
+                        environment
+                            .insert(String::from("CMCLIENT_PROXY_PORT"), proxy.port.to_string());
+                        environment.insert(
+                            String::from("CMCLIENT_PROXY_UPSTREAM_HOST"),
+                            proxy.upstream_host.clone(),
+                        );
+                        environment.insert(
+                            String::from("CMCLIENT_PROXY_UPSTREAM_PORT"),
+                            proxy.upstream_port.to_string(),
+                        );
+                        environment.insert(String::from("CMCLIENT_PROXY_MODE"), proxy.mode.clone());
+                        environment.insert(
+                            String::from("CMCLIENT_PROXY_ALLOW_LAN"),
+                            proxy.allow_lan.to_string(),
+                        );
+                        if !proxy.allowlist.is_empty() {
+                            environment.insert(
+                                String::from("CMCLIENT_PROXY_ALLOWLIST"),
+                                proxy.allowlist.join(","),
+                            );
+                        }
                     }
                 }
                 supervisor.set_environment(environment);
@@ -2902,12 +3374,25 @@ impl AgentController {
                     supervisor
                         .enable_private_bootstrap()
                         .map_err(|_| ControlError::CommandFailed)?;
-                    if let Some(api_key) = secrets
-                        .read(SecretKind::CallMeshApiKey)
-                        .map_err(control_secret_error)?
-                    {
+                    if config.callmesh.is_some() {
+                        if let Some(api_key) = secrets
+                            .read(SecretKind::CallMeshApiKey)
+                            .map_err(control_secret_error)?
+                        {
+                            supervisor
+                                .set_callmesh_api_key(api_key.expose_secret())
+                                .map_err(|_| ControlError::CommandFailed)?;
+                        }
+                    }
+                    if let Some(credential) = cmcloud_active_credential.as_ref() {
                         supervisor
-                            .set_callmesh_api_key(api_key.expose_secret())
+                            .set_cmcloud_device_credential(
+                                credential.identity().endpoint(),
+                                credential.identity().installation_id(),
+                                credential.identity().installation_generation(),
+                                credential.identity().credential_version(),
+                                credential.device_credential().expose_secret(),
+                            )
                             .map_err(|_| ControlError::CommandFailed)?;
                     }
                 }
@@ -3044,6 +3529,7 @@ impl AgentController {
             supervisor: Mutex::new(supervisor),
             gateway_transition: Mutex::new(()),
             setup_transaction: Mutex::new(()),
+            cmcloud_enrollment_transition: Mutex::new(()),
             private_gateway_bootstrap: private_bootstrap,
             runtime_log,
             agent_log_error_code: Mutex::new(initial_agent_log_error_code),
@@ -3060,6 +3546,10 @@ impl AgentController {
             paths: config.paths.clone(),
             config_file: config.config_file.clone(),
             setup_transaction_file: setup_transaction_file(&config.paths),
+            cmcloud_endpoint: config
+                .cmcloud
+                .as_ref()
+                .map(|cmcloud| cmcloud.agent_websocket_url.clone()),
             secrets,
             setup,
             setup_gate_required,
@@ -4845,6 +5335,11 @@ fn serve() -> ExitCode {
         eprintln!("{}", error.code());
         return ExitCode::from(EX_CONFIG);
     }
+    if let Err(error) = controller.install_cmcloud_enrollment() {
+        controller.remember_error(&error);
+        eprintln!("{}", error.code());
+        return ExitCode::from(EX_CONFIG);
+    }
     let endpoint = match default_local_endpoint(config.paths.root_dir()) {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -4951,23 +5446,24 @@ mod tests {
     use super::{
         AGENT_EVENT_REPLAY_BUFFER, AGENT_EVENT_SUBSCRIBER_LIMIT, AgentConfig, AgentController,
         AgentEventHub, AgentEventHubError, AgentEventSubscription, AgentLifecycleStatus,
-        AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState, ControlCommand,
-        ControlHandler, FactoryResetBackupBehavior, FactoryResetFixtureConfirmation,
-        FactoryResetFixtureJob, FactoryResetFixturePhase, GatewayLogHealthUpdate, GatewayRoute,
-        GatewaySessionHandle, GatewayStatus, InternalComponent, LogLevel, LogPolicy,
-        ManagementWebConfig, ManagementWebError, ManagementWebService, ResetKind, SecretKind,
-        SetupApplyError, SetupCancellationToken, SetupConfigureRequest, SetupError, SetupPhase,
-        SetupRollbackState, SetupStore, StructuredLogSink, SupervisorWorker, agent_web_router,
-        apply_aprs_environment, apply_physical_qualification_environment,
-        bridge_gateway_event_stream, compiled_component_identity, disable_proxy_for_setup,
+        AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState,
+        CMCloudEnrollmentState, CMCloudEnrollmentStatus, ControlCommand, ControlHandler,
+        FactoryResetBackupBehavior, FactoryResetFixtureConfirmation, FactoryResetFixtureJob,
+        FactoryResetFixturePhase, GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle,
+        GatewayStatus, InternalComponent, LogLevel, LogPolicy, ManagementWebConfig,
+        ManagementWebError, ManagementWebService, ResetKind, SecretKind, SetupApplyError,
+        SetupCancellationToken, SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState,
+        SetupStore, StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
+        apply_physical_qualification_environment, bridge_gateway_event_stream,
+        cmcloud_gateway_environment, compiled_component_identity, disable_proxy_for_setup,
         ensure_runtime_directories, gateway_json_projection, legacy_state_candidates,
         load_agent_config_after_migration_with, management_agent_events, management_web_profile,
         normalize_runtime_process_path, push_legacy_source_candidate, recover_interrupted_reset,
         recover_interrupted_setup, remove_setup_transaction, reset_completion_file,
         reset_transaction_file, resolve_gateway_maintenance_program, setup_apply_error_response,
         setup_error_response, setup_gate_required_with_profile, setup_transaction_file,
-        validate_setup_request, verified_gateway_route, write_reset_transaction,
-        write_setup_configuration, write_setup_transaction,
+        valid_cmcloud_pairing_code, validate_setup_request, verified_gateway_route,
+        write_reset_transaction, write_setup_configuration, write_setup_transaction,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -5103,6 +5599,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(gateway_command),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -5232,6 +5729,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -6000,6 +6498,162 @@ mod tests {
         )
     }
 
+    #[test]
+    fn cmcloud_gateway_environment_keeps_pairing_and_device_credentials_off_environment() {
+        let endpoint = "wss://cmcloud.example.invalid/agent/v1";
+        let pairing_code = "pairing-code-fixture-0123456789";
+        let device_credential = "device-credential-fixture-0123456789";
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .begin_cmcloud_enrollment(endpoint, pairing_code, "2.0.0-rc.1")
+            .expect("pairing transaction should persist");
+        secrets
+            .record_cmcloud_issued_credential(0, 1, 4, device_credential)
+            .expect("issued credential should persist");
+        secrets
+            .activate_cmcloud_credential(0, 1, 4)
+            .expect("credential should activate");
+        let credential = secrets
+            .cmcloud_active_device_credential()
+            .expect("active credential lookup should work")
+            .expect("active credential should exist");
+
+        let environment = cmcloud_gateway_environment(endpoint, &credential);
+        assert_eq!(
+            environment.get("CMCLIENT_CMCLOUD_MODE"),
+            Some(&String::from("required"))
+        );
+        assert_eq!(
+            environment.get("CMCLIENT_CMCLOUD_URL"),
+            Some(&endpoint.to_owned())
+        );
+        assert!(!environment.contains_key("CMCLIENT_CMCLOUD_DEVICE_CREDENTIAL"));
+        assert!(!environment.keys().any(|key| key.contains("PAIRING")));
+        assert!(!environment.values().any(|value| value == pairing_code));
+        assert!(!environment.values().any(|value| value == device_credential));
+    }
+
+    #[tokio::test]
+    async fn cmcloud_enrollment_control_validates_input_and_returns_only_redacted_state() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-cmcloud-enrollment-control-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let state = test_agent_web_state(&directory);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let status = CMCloudEnrollmentStatus {
+            schema_version: 1,
+            state: CMCloudEnrollmentState::Active,
+            endpoint: Some(String::from("wss://cmcloud.example.invalid/agent/v1")),
+            installation_generation: Some(7),
+            credential_version: Some(3),
+        };
+        let enrollment_calls = Arc::clone(&calls);
+        let enrollment_status = status.clone();
+        let status_handler = status.clone();
+        state
+            .install_cmcloud_enrollment(
+                Arc::new(move |request| {
+                    assert!(valid_cmcloud_pairing_code(&request.pairing_code));
+                    enrollment_calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(enrollment_status.clone())
+                }),
+                Arc::new(move || Ok(status_handler.clone())),
+            )
+            .expect("enrollment handler should install");
+        let router = agent_web_router(Arc::clone(&state));
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cmcloud/enrollment")
+                    .body(Body::empty())
+                    .expect("status request should build"),
+            )
+            .await
+            .expect("status request should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("status body should read");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("status response should be JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "state": "active",
+                "endpoint": "wss://cmcloud.example.invalid/agent/v1",
+                "installationGeneration": 7,
+                "credentialVersion": 3,
+            }),
+        );
+        let status_text = String::from_utf8(body.to_vec()).expect("status should be UTF-8");
+        for forbidden in [
+            "pairingCode",
+            "deviceCredential",
+            "installationId",
+            "bootId",
+        ] {
+            assert!(
+                !status_text.contains(forbidden),
+                "redacted status must not expose {forbidden}",
+            );
+        }
+
+        for invalid_body in [
+            r#"{"pairingCode":"short"}"#,
+            r#"{"pairingCode":"pairing-code-fixture-0123456789/"}"#,
+            r#"{"pairingCode":"pairing-code-fixture-0123456789","extra":true}"#,
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/cmcloud/enrollment")
+                        .header("content-type", "application/json")
+                        .body(Body::from(invalid_body))
+                        .expect("invalid enrollment request should build"),
+                )
+                .await
+                .expect("invalid enrollment request should respond");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &to_bytes(response.into_body(), 1_024)
+                        .await
+                        .expect("invalid response body should read"),
+                )
+                .expect("invalid response should be JSON"),
+                serde_json::json!({"code": "CMCLOUD_ENROLLMENT_REQUEST_INVALID"}),
+            );
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/cmcloud/enrollment")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"pairingCode":"pairing-code-fixture-0123456789"}"#,
+                    ))
+                    .expect("valid enrollment request should build"),
+            )
+            .await
+            .expect("valid enrollment request should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        drop(state);
+        std::fs::remove_dir_all(&directory).expect("temporary directory should be removed");
+    }
+
     #[tokio::test]
     async fn aborted_setup_http_request_cancels_spawn_blocking_transaction() {
         let directory = std::env::temp_dir().join(format!(
@@ -6098,6 +6752,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![String::from("cmclient-gateway-fixture")]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: Some(MeshtasticConfig {
                 mesh_network_id: String::from("fixture"),
                 gateway_id: String::from("fixture-gateway"),
@@ -6381,6 +7036,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -6537,6 +7193,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -6736,6 +7393,7 @@ mod tests {
                 gateway_entry.to_string_lossy().into_owned(),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -7014,6 +7672,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -7066,6 +7725,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -7747,6 +8407,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![missing_gateway.to_string_lossy().into_owned()]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -7868,6 +8529,7 @@ mod tests {
                 String::from("Start-Sleep -Seconds 30"),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -8514,6 +9176,7 @@ mod tests {
                 String::from("tests::long_running_gateway_fixture"),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -8664,6 +9327,7 @@ mod tests {
                 String::from("Start-Sleep -Milliseconds 750; exit 7"),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -8757,6 +9421,7 @@ mod tests {
             callmesh: Some(CallMeshConfig {
                 url: String::from("https://callmesh.example.invalid"),
             }),
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -8820,6 +9485,7 @@ mod tests {
                 ),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: Some(AprsConfig {
                 host: Some(String::from("asia.aprs2.net")),
@@ -8889,6 +9555,7 @@ mod tests {
                 String::from("read _"),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -8946,6 +9613,7 @@ mod tests {
                 format!("printf x >> '{}'; exit 7", marker.display()),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -9009,6 +9677,7 @@ mod tests {
                 String::from("exit 0"),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -9075,6 +9744,7 @@ mod tests {
                 String::from("sleep 5"),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -9150,6 +9820,7 @@ mod tests {
                 format!("read _; printf x > '{}'; exec sleep 5", marker.display()),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -9225,6 +9896,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: None,
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -9289,6 +9961,7 @@ mod tests {
                 String::from("read _"),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -9383,6 +10056,7 @@ mod tests {
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![missing_program.to_string_lossy().into_owned()]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -9454,6 +10128,7 @@ mod tests {
                 String::from("read _"),
             ]),
             callmesh: None,
+            cmcloud: None,
             meshtastic: None,
             aprs: None,
             proxy: None,
