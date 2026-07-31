@@ -45,10 +45,10 @@ The promotion baseline is CMClient commit
 `0a647c1f814a98b563bf9ebc1dcd26219afffaaa`.
 
 - Current `Cargo.lock` SHA-256:
-  `ee798cd9fddcc233b20cef8e05873677161bf231d411a2d0ff0950cb90383a9f`.
-- Cargo license inventory: 622 registry packages, 13 workspace packages, zero
-  Git sources, zero unknown source classifications, and zero unknown licenses;
-  inventory SHA-256
+  `baba0d8a23b8c6d0ba61331baf1e7892aff01f61a6792080a2103604f2a4fc24`.
+- The P14 baseline Cargo license inventory had 622 registry packages and 13
+  workspace packages, zero Git sources, zero unknown source classifications,
+  and zero unknown licenses; its historical inventory SHA-256 is
   `c10fdd67646c652354e7fe910359596b4ea4553b85f464c34be9a4c63437da8c`.
   Its `canonical-json-v2` input is a UTF-8 JSON array with object keys in the
   exact order `name`, `version`, `source`, `checksum`, and `license`.
@@ -76,10 +76,14 @@ The promotion baseline is CMClient commit
   bounded executable-image verification, plus `tao` and `tray-icon` for the
   Windows-only native event loop and icon/menu boundary. Exact PID, creation
   time, and session validation remains in the system process object rather than
-  in a package-provided PID-only kill helper. The current inventory includes
+  in a package-provided PID-only kill helper. The historical baseline inventory included
   those direct rows and all packages in Cargo's resolved graph; the canonical
   input was regenerated from structured `cargo metadata` and `Cargo.lock` data
-  after the package set stabilized.
+  after that package set stabilized. CMCloud enrollment subsequently added the
+  exact, registry-pinned `futures-util` and `tokio-tungstenite` client path
+  described below. The current lock resolves 628 registry and 13 workspace
+  packages; a fresh canonical inventory/SBOM scan is a required P15 release
+  gate before these development bytes may be published.
   The superseded P13-T10 snapshot retained lock digest
   `d6bfadfa028ad4d128249dc6446f29102039dce5af6fb79e96761de2f2d8706f`
   and inventory digest
@@ -126,6 +130,7 @@ notices remain part of the target-specific packaging inventory.
 | `axum-server` | `0.8.0` | `https://github.com/programatik29/axum-server` | MIT | `b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc` | 1.82 |
 | `bytes` | `1.12.1` | `https://github.com/tokio-rs/bytes` | MIT | `fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04` | 1.57 |
 | `fs4` | `1.1.0` | `https://github.com/al8n/fs4` | MIT OR Apache-2.0 | `7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5` | 1.75.0 |
+| `futures-util` | `0.3.33` | `https://github.com/rust-lang/futures-rs` | MIT OR Apache-2.0 | `a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa` | Not declared |
 | `interprocess` | `2.4.2` | `https://github.com/kotauskas/interprocess` | 0BSD OR Apache-2.0 | `069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b` | 1.75 |
 | `libc` | `0.2.186` | `https://github.com/rust-lang/libc` | MIT OR Apache-2.0 | `68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66` | 1.65 |
 | `mdns-sd` | `0.20.2` | `https://github.com/keepsimple1/mdns-sd` | Apache-2.0 OR MIT | `f18d8ec9d1869796fb2910d95f4d957072df0b6a22e247a1d760d8b4c805e17a` | 1.70 |
@@ -134,6 +139,7 @@ notices remain part of the target-specific packaging inventory.
 | `sysinfo` | `0.35.2` | `https://github.com/GuillaumeGomez/sysinfo` | MIT | `3c3ffa3e4ff2b324a57f7aeb3c349656c7b127c3c189520251a648102a92496e` | 1.75 |
 | `tao` | `0.35.3` | `https://github.com/tauri-apps/tao` | Apache-2.0 | `d1c93047acf68669466a34690ac58cca7010bd1b201e1ec86f1fd0a75d3dd4a9` | 1.74 |
 | `time` | `0.3.45` | `https://github.com/time-rs/time` | MIT OR Apache-2.0 | `f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd` | 1.83.0 |
+| `tokio-tungstenite` | `0.30.0` | `https://github.com/snapview/tokio-tungstenite` | MIT | `17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71` | Not declared |
 | `tower-http` | `0.7.0` | `https://github.com/tower-rs/tower-http` | MIT | `b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233` | 1.65 |
 | `tower-sessions` | `0.15.0` | `https://github.com/maxcountryman/tower-sessions` | MIT | `518dca34b74a17cadfcee06e616a09d2bd0c3984eff1769e1e76d58df978fc78` | Not declared |
 | `tower_governor` | `0.8.0` | `https://github.com/benwis/tower-governor` | MIT OR Apache-2.0 | `44de9b94d849d3c46e06a883d72d408c2de6403367b39df2b1c9d9e7b6736fe6` | Not declared |

@@ -945,6 +945,16 @@ export function extractAgentRoutes(agentSource) {
     // `any` is reserved for proxy and deny fallbacks, not a concrete route contract.
     if (method !== "ANY") addRoute(method, match[1]);
   }
+  for (const match of productionSource.matchAll(
+    /\.route\(\s*"(\/api\/v1\/[^"\s]+)"\s*,\s*([\s\S]*?)\)(?=\s*\.route\(|\s*\.with_state\(|\s*;)/g,
+  )) {
+    for (const handler of match[2].matchAll(
+      /\b(get|post|put|patch|delete|head|options|any)\s*\(/g,
+    )) {
+      const method = handler[1].toUpperCase();
+      if (method !== "ANY") addRoute(method, match[1]);
+    }
+  }
   return [...routes.values()];
 }
 

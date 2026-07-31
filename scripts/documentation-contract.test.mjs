@@ -128,6 +128,19 @@ test("extracts concrete Axum Agent routes and excludes any fallbacks", () => {
   ]);
 });
 
+test("extracts chained Axum route methods", () => {
+  assert.deepEqual(
+    extractAgentRoutes(`
+      Router::new()
+        .route("/api/v1/cmcloud/enrollment", get(status).post(enroll));
+    `),
+    [
+      { method: "GET", path: "/api/v1/cmcloud/enrollment" },
+      { method: "POST", path: "/api/v1/cmcloud/enrollment" },
+    ],
+  );
+});
+
 test("rejects altered GPL license bytes and manifest license drift", async () => {
   await withFixture(async (root) => {
     const licensePath = join(root, "LICENSE");
