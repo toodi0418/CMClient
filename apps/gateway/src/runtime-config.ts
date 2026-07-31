@@ -5,6 +5,10 @@ import { AprsIsRxClient, type AprsIsRxSession } from "./aprs-monitor.js";
 import { AprsIsTcpClient, AprsOutboxWorker } from "./aprs-outbox.js";
 import { AprsGatewayRuntime } from "./aprs-runtime.js";
 import {
+  CmCloudAgentClient,
+  parseCmCloudRuntimeConfiguration,
+} from "./cmcloud.js";
+import {
   connectionAuthorization,
   deriveAprsRuntimeState,
   observerConnectionAuthorization,
@@ -40,6 +44,32 @@ export class GatewayRuntimeConfigurationError extends Error {
 }
 
 export type AprsStateProvider = () => AprsRuntimeState | undefined;
+
+export function createConfiguredCmCloudAgentClient(
+  environment: Record<string, string | undefined>,
+  database: GatewayDatabase,
+  eventBus: DomainEventBus,
+  clientVersion: string,
+  deviceCredential?: string,
+): CmCloudAgentClient | undefined {
+  const configuration = parseCmCloudRuntimeConfiguration(environment);
+  if (!configuration) {
+    return undefined;
+  }
+  if (!deviceCredential) {
+    throw new GatewayRuntimeConfigurationError(
+      "CMCLOUD_CREDENTIAL_BOOTSTRAP_REQUIRED",
+    );
+  }
+  assertCmCloudAuthorityConfiguration(environment);
+  return new CmCloudAgentClient({
+    ...configuration,
+    clientVersion,
+    deviceCredential,
+    events: eventBus,
+    outbox: database.cmcloudRawOutbox,
+  });
+}
 
 const SETUP_MESHTASTIC_VALIDATION_TIMEOUT_MS = 8_000;
 
@@ -94,6 +124,16 @@ export function createConfiguredGatewayMaintenanceRuntime(
       1_000,
       "APRS_OUTBOX_RETENTION_CONFIGURATION_INVALID",
     ),
+    cmCloudRawOutboxRetentionDays: parsePositiveInteger(
+      environment.CMCLIENT_CMCLOUD_OUTBOX_RETENTION_DAYS,
+      7,
+      "CMCLOUD_OUTBOX_RETENTION_CONFIGURATION_INVALID",
+    ),
+    cmCloudRawOutboxBatchSize: parsePositiveInteger(
+      environment.CMCLIENT_CMCLOUD_OUTBOX_RETENTION_BATCH_SIZE,
+      1_000,
+      "CMCLOUD_OUTBOX_RETENTION_CONFIGURATION_INVALID",
+    ),
     jobRetentionDays: parsePositiveInteger(
       environment.CMCLIENT_JOB_RETENTION_DAYS,
       90,
@@ -137,6 +177,7 @@ export async function createConfiguredMeshGatewayRuntime(
   eventBus: DomainEventBus,
   aprsStateProvider?: () => CallMeshAprsState | undefined,
   aprsRuntime?: Pick<AprsGatewayRuntime, "recordDecodedSummary">,
+  cmCloud?: CmCloudAgentClient,
 ): Promise<MeshGatewayRuntime | undefined> {
   const kind =
     environment.CMCLIENT_MESHTASTIC_TRANSPORT?.trim().toLowerCase() ||
@@ -200,6 +241,7 @@ export async function createConfiguredMeshGatewayRuntime(
     gatewayId,
     meshNetworkId,
     transport,
+    ...(cmCloud ? { cmCloud } : {}),
     ...(physicalGuard
       ? {
           packetRecorder: new PacketRecorder({
@@ -226,6 +268,17 @@ export async function createConfiguredMeshGatewayRuntime(
         : {}),
     },
   });
+}
+
+function assertCmCloudAuthorityConfiguration(
+  environment: Record<string, string | undefined>,
+): void {
+  if (parseOptionalBoolean(environment.CMCLIENT_APRS_ENABLED) === true) {
+    throw new GatewayRuntimeConfigurationError("CMCLOUD_DIRECT_APRS_FORBIDDEN");
+  }
+  if (parseOptionalBoolean(environment.CMCLIENT_PROXY_ENABLED) === true) {
+    throw new GatewayRuntimeConfigurationError("CMCLOUD_PROXY_FORBIDDEN");
+  }
 }
 
 /**

@@ -131,6 +131,81 @@ describe("MeshGatewayRuntime", () => {
     database.close();
   });
 
+  it("queues byte-identical FromRadio before decoding and leaves APRS authority to CMCloud", async () => {
+    const database = new GatewayDatabase(":memory:");
+    database.callmeshMappings.replace([
+      {
+        version: "mapping-v1",
+        effectiveAt: "2026-07-18T00:00:00.000Z",
+        meshNetworkId: "fixture-network",
+        nodeNum: 42,
+        callsign: "N0CALL-7",
+      },
+    ]);
+    const schema = await loadMeshtasticSchema();
+    const forwarded: Array<{ body: Uint8Array; capturedAt: string }> = [];
+    const runtime = new MeshGatewayRuntime({
+      applicationDecoder: new MeshtasticApplicationDecoder(schema),
+      codec: new MeshtasticProtobufCodec(schema),
+      database,
+      eventBus: new DomainEventBus(),
+      gatewayId: "fixture-gateway",
+      meshNetworkId: "fixture-network",
+      transport: new FixtureTransport(),
+      cmCloud: {
+        enqueueRawFrame: (body, capturedAt) => {
+          forwarded.push({ body: new Uint8Array(body), capturedAt });
+          return {
+            messageId: "00000000-0000-4000-8000-000000000001",
+            lane: "live",
+            laneSequence: forwarded.length,
+            capturedAt,
+            body: new Uint8Array(body),
+            bodySha256: "a".repeat(64),
+            attempts: 0,
+            createdAt: capturedAt,
+            updatedAt: capturedAt,
+          };
+        },
+      },
+      clock: () => new Date("2026-07-18T00:00:10.000Z"),
+      idFactory: sequentialFactory("cloud-observation"),
+    });
+    const frame = positionFrame(schema, 32);
+    const result = runtime.ingestFrame({
+      kind: "frame",
+      frame,
+      receivedAt: "2026-07-18T00:00:05.000Z",
+      sessionConnectedAt: "2026-07-18T00:00:01.000Z",
+    });
+
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]).toMatchObject({
+      capturedAt: "2026-07-18T00:00:05.000Z",
+    });
+    expect(forwarded[0]?.body).toEqual(new Uint8Array(frame));
+    expect(result.payload).toMatchObject({ kind: "position" });
+    expect(result.position).toBeUndefined();
+    expect(database.aprsOutbox.list(10)).toEqual([]);
+    expect(
+      database.connection.prepare("SELECT * FROM node_position_state").all(),
+    ).toEqual([]);
+
+    const malformed = new Uint8Array([0xff]);
+    expect(() =>
+      runtime.ingestFrame({
+        kind: "frame",
+        frame: malformed,
+        receivedAt: "2026-07-18T00:00:06.000Z",
+      }),
+    ).toThrow();
+    expect(forwarded[1]).toMatchObject({
+      capturedAt: "2026-07-18T00:00:06.000Z",
+    });
+    expect(forwarded[1]?.body).toEqual(malformed);
+    database.close();
+  });
+
   it("captures and seals the bounded sanitizer from the same product ingest path", async () => {
     const database = new GatewayDatabase(":memory:");
     const schema = await loadMeshtasticSchema();

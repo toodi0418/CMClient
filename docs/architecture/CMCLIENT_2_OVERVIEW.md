@@ -41,6 +41,12 @@ the Meshtastic session, CallMesh, APRS-IS, protocol-aware Proxy, domain Jobs,
 events, and application persistence. UI modes never access SQLite, secrets, or
 Meshtastic directly.
 
+When `CMCLIENT_CMCLOUD_MODE=required`, CMCloud becomes the sole upstream raw
+transport authority for CMClient 2.0. The Gateway durably forwards exact
+`FromRadio` protobuf bytes over one authenticated WebSocket and does not invoke
+local CallMesh mapping synchronization or local APRS/Proxy delivery. See
+[CMCloud Raw Transport](cmcloud-transport.md).
+
 Before setup is ready, Agent may run Gateway only in `setup_safe` mode. That
 mode exposes bounded setup RPC and starts no operational Job, Proxy listener,
 APRS session, mutable radio action, or background CallMesh heartbeat. Secrets

@@ -85,7 +85,7 @@ advances and a running process whose private health route fails becomes
 Each bounded retention cycle emits `telemetry.retention.completed`. Its payload
 reports `deleted` telemetry rows, `observationsDeleted` orphan observations,
 `messagesDeleted`, `terminalJobsDeleted`, `sentAprsOutboxDeleted`,
-`supersededAprsOutboxDeleted`, and the
+`supersededAprsOutboxDeleted`, `acknowledgedCmCloudRawOutboxDeleted`, and the
 `positionObservationsDeleted`, `positionEventsDeleted`, and
 `positionDecisionsDeleted` history counts. Resource-specific cutoff and batch
 fields make every deletion bound auditable. `observationBatchSize` is at least
@@ -127,6 +127,12 @@ position.decision
 callmesh.status
 callmesh.error
 callmesh.mapping.conflict
+cmcloud.connection.ready
+cmcloud.connection.reconnecting
+cmcloud.connection.error
+cmcloud.connection.blocked
+cmcloud.raw.queued
+cmcloud.raw.acknowledged
 aprs.outbox.queued
 aprs.outbox.submitted
 aprs.outbox.observer_confirmed
@@ -163,6 +169,13 @@ The iGate-family equivalents carry only the station packet kind or a stable
 error code. They never expose the packet line, provision identity, coordinates,
 or comment. `aprs.igate.submitted` is likewise transport-only;
 `aprs.igate.observer_confirmed` is the corresponding exact receive observation.
+
+CMCloud connection events carry only a connection epoch, reconnect attempt and
+delay, pending-row count, or stable error code. `cmcloud.raw.queued` and
+`cmcloud.raw.acknowledged` carry a message UUID, lane, lane sequence, byte
+count, receipt disposition, and pending-row count as applicable. They never
+contain the raw protobuf body, device credential, installation identity, APRS
+data, mapping, or location.
 
 `GET /api/v1/jobs/:jobId/events` filters the same stream to that Job's
 `job.created` and `job.status_changed` events. It does not send an initial Job

@@ -6,6 +6,7 @@ import type { Readable, Writable } from "node:stream";
 export const GATEWAY_CAPABILITY_HEADER = "x-cmclient-gateway-capability";
 export const GATEWAY_PRIVATE_FRAME_MAX_BYTES = 16 * 1024;
 export const GATEWAY_CALLMESH_API_KEY_MAX_BYTES = 4096;
+export const GATEWAY_CMCLOUD_DEVICE_CREDENTIAL_MAX_BYTES = 512;
 export const GATEWAY_BOOTSTRAP_DEADLINE_MS = 5000;
 export const GATEWAY_OWNERSHIP_PATH = "/_cmclient/bootstrap/ownership";
 export const GATEWAY_OWNERSHIP_CHALLENGE_HEADER =
@@ -22,6 +23,7 @@ export interface GatewayBootstrapFrame {
   readonly capability: string;
   readonly setupGeneration: number;
   readonly callMeshApiKey?: string;
+  readonly cmCloudDeviceCredential?: string;
 }
 
 export interface GatewayReadyFrame {
@@ -81,6 +83,14 @@ export async function readGatewayBootstrap(
   ) {
     exactKeys.push("callMeshApiKey");
   }
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.hasOwn(value, "cmCloudDeviceCredential")
+  ) {
+    exactKeys.push("cmCloudDeviceCredential");
+  }
   if (!isExactObject(value, exactKeys)) {
     throw new GatewayBootstrapError("GATEWAY_BOOTSTRAP_FRAME_INVALID");
   }
@@ -92,7 +102,9 @@ export async function readGatewayBootstrap(
     !Number.isSafeInteger(value.setupGeneration) ||
     (value.setupGeneration as number) < 1 ||
     (value.callMeshApiKey !== undefined &&
-      !isCallMeshApiKey(value.callMeshApiKey))
+      !isCallMeshApiKey(value.callMeshApiKey)) ||
+    (value.cmCloudDeviceCredential !== undefined &&
+      !isCmCloudDeviceCredential(value.cmCloudDeviceCredential))
   ) {
     throw new GatewayBootstrapError("GATEWAY_BOOTSTRAP_FRAME_INVALID");
   }
@@ -432,4 +444,13 @@ function isCallMeshApiKey(value: unknown): value is string {
     }
   }
   return true;
+}
+
+function isCmCloudDeviceCredential(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 16 &&
+    value.length <= GATEWAY_CMCLOUD_DEVICE_CREDENTIAL_MAX_BYTES &&
+    /^[A-Za-z0-9_-]+$/.test(value)
+  );
 }

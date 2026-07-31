@@ -80,6 +80,8 @@ const DOMAIN_TABLES = Object.freeze([
   { name: "aprs_legacy_submission_barriers", migration: 19 },
   { name: "aprs_igate_state", migration: 20 },
   { name: "aprs_igate_submissions", migration: 20 },
+  { name: "cmcloud_lane_state", migration: 22 },
+  { name: "cmcloud_raw_outbox", migration: 22 },
 ] as const);
 
 export interface OfflineMaintenanceRequest {

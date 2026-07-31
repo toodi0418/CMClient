@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import {
   GATEWAY_CAPABILITY_HEADER,
   GATEWAY_CALLMESH_API_KEY_MAX_BYTES,
+  GATEWAY_CMCLOUD_DEVICE_CREDENTIAL_MAX_BYTES,
   GatewayBootstrapError,
   encodePrivateFrame,
   gatewayCapabilityMatches,
@@ -29,16 +30,20 @@ const bootstrap = {
   setupGeneration: 7,
   callMeshApiKey: " fixture-private-callmesh-key ",
 };
+const cloudBootstrap = {
+  ...bootstrap,
+  cmCloudDeviceCredential: "cmcloud_device_credential_value",
+};
 
 describe("private Gateway bootstrap", () => {
   it("reads a bounded fragmented frame and writes an exact ready frame", async () => {
     const input = new PassThrough();
-    const encoded = encodePrivateFrame(bootstrap);
+    const encoded = encodePrivateFrame(cloudBootstrap);
     const pending = readGatewayBootstrap(input);
     input.write(encoded.subarray(0, 3));
     input.write(encoded.subarray(3, 11));
     input.write(encoded.subarray(11));
-    await expect(pending).resolves.toEqual(bootstrap);
+    await expect(pending).resolves.toEqual(cloudBootstrap);
 
     const withoutCallMeshKey = {
       schemaVersion: bootstrap.schemaVersion,
@@ -73,6 +78,9 @@ describe("private Gateway bootstrap", () => {
       port: 49152,
     });
     expect(ready.includes(Buffer.from(bootstrap.callMeshApiKey))).toBe(false);
+    expect(
+      ready.includes(Buffer.from(cloudBootstrap.cmCloudDeviceCredential)),
+    ).toBe(false);
   });
 
   it("does not publish ready until external startup succeeds", async () => {
@@ -258,6 +266,19 @@ describe("private Gateway bootstrap", () => {
       const input = new PassThrough();
       const pending = readGatewayBootstrap(input, 100);
       input.end(encodePrivateFrame({ ...bootstrap, callMeshApiKey }));
+      await expect(pending).rejects.toThrow("GATEWAY_BOOTSTRAP_FRAME_INVALID");
+    }
+
+    for (const cmCloudDeviceCredential of [
+      null,
+      42,
+      "x".repeat(15),
+      "not a device credential",
+      "x".repeat(GATEWAY_CMCLOUD_DEVICE_CREDENTIAL_MAX_BYTES + 1),
+    ]) {
+      const input = new PassThrough();
+      const pending = readGatewayBootstrap(input, 100);
+      input.end(encodePrivateFrame({ ...bootstrap, cmCloudDeviceCredential }));
       await expect(pending).rejects.toThrow("GATEWAY_BOOTSTRAP_FRAME_INVALID");
     }
 

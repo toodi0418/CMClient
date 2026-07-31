@@ -9,8 +9,14 @@ import {
   callMeshOptionsFromRuntime,
   CallMeshClient,
   CallMeshClientError,
+  type CallMeshClientOptions,
+  type CallMeshSnapshotStore,
 } from "./callmesh.js";
 import type { AprsGatewayRuntime } from "./aprs-runtime.js";
+import {
+  parseCmCloudRuntimeConfiguration,
+  type CmCloudAgentClient,
+} from "./cmcloud.js";
 import type { MeshGatewayRuntime } from "./mesh-runtime.js";
 import type { GatewayMaintenanceRuntime } from "./maintenance.js";
 import { MeshtasticProtobufCodec } from "./protobuf/protobuf.js";
@@ -20,6 +26,7 @@ import { ProxyRuntime, ProxyRuntimeError } from "./proxy/runtime.js";
 import { ProxyConfigCache, ProxyUpstreamManager } from "./proxy/upstream.js";
 import {
   createConfiguredAprsGatewayRuntime,
+  createConfiguredCmCloudAgentClient,
   createConfiguredGatewayMaintenanceRuntime,
   createConfiguredMeshGatewayRuntime,
   validateConfiguredMeshtasticEndpoint,
@@ -43,8 +50,10 @@ import { gatewayRuntimePaths } from "./runtime-paths.js";
 
 export interface GatewayExternalStartupCallbacks {
   readonly validateMeshtastic: () => Promise<void>;
-  readonly validateCallMesh: () => Promise<void>;
-  readonly synchronizeCallMesh: () => Promise<void>;
+  readonly validateCallMesh?: () => Promise<void>;
+  readonly synchronizeCallMesh?: () => Promise<void>;
+  readonly startCmCloud?: () => void;
+  readonly useCmCloud?: boolean;
   readonly startProxy: () => Promise<void>;
   readonly startMaintenance: () => void;
   readonly startAprs: () => void;
@@ -64,10 +73,25 @@ export async function startGatewayExternalRuntimes(
   if (validationOnly) {
     await callbacks.validateMeshtastic();
     callbacks.throwIfShutdownRequested();
-    await callbacks.validateCallMesh();
+    if (!callbacks.useCmCloud) {
+      if (!callbacks.validateCallMesh) {
+        throw new GatewayBootstrapError("GATEWAY_EXTERNAL_START_FAILED");
+      }
+      await callbacks.validateCallMesh();
+    }
     return;
   }
-  await callbacks.synchronizeCallMesh();
+  if (callbacks.useCmCloud) {
+    if (!callbacks.startCmCloud) {
+      throw new GatewayBootstrapError("CMCLOUD_START_CONFIGURATION_INVALID");
+    }
+    callbacks.startCmCloud();
+  } else {
+    if (!callbacks.synchronizeCallMesh) {
+      throw new GatewayBootstrapError("GATEWAY_EXTERNAL_START_FAILED");
+    }
+    await callbacks.synchronizeCallMesh();
+  }
   callbacks.throwIfShutdownRequested();
   await callbacks.startProxy();
   callbacks.throwIfShutdownRequested();
@@ -77,6 +101,40 @@ export async function startGatewayExternalRuntimes(
   callbacks.throwIfShutdownRequested();
   callbacks.startMesh();
   callbacks.throwIfShutdownRequested();
+}
+
+export type GatewayCallMeshClientFactory = (
+  options: CallMeshClientOptions,
+  snapshotStore?: CallMeshSnapshotStore,
+) => CallMeshClient;
+
+/**
+ * CMCloud is the only upstream authority in required mode. Keep this decision
+ * ahead of CallMesh option construction so a cloud-only installation never
+ * needs a CallMesh URL, bootstrap secret, client instance, or request path.
+ */
+export function createConfiguredGatewayCallMeshClient(
+  useCmCloud: boolean,
+  environment: NodeJS.ProcessEnv,
+  version: string,
+  callMeshApiKey: string | undefined,
+  snapshotStore: CallMeshSnapshotStore | undefined,
+  clientFactory: GatewayCallMeshClientFactory = (options, store) =>
+    new CallMeshClient(options, store),
+): CallMeshClient | undefined {
+  if (useCmCloud) {
+    return undefined;
+  }
+  return clientFactory(
+    callMeshOptionsFromRuntime(environment, version, callMeshApiKey),
+    snapshotStore,
+  );
+}
+
+export function isCmCloudAuthorityRequired(
+  environment: Record<string, string | undefined>,
+): boolean {
+  return parseCmCloudRuntimeConfiguration(environment) !== undefined;
 }
 
 export async function runGateway(): Promise<void> {
@@ -98,6 +156,7 @@ export async function runGateway(): Promise<void> {
   let proxy: ProxyRuntime | undefined;
   let mesh: MeshGatewayRuntime | undefined;
   let aprs: AprsGatewayRuntime | undefined;
+  let cmCloud: CmCloudAgentClient | undefined;
   let maintenance: GatewayMaintenanceRuntime | undefined;
   let runtime: GatewayRuntime | undefined;
   let callmeshTimer: NodeJS.Timeout | undefined;
@@ -122,7 +181,12 @@ export async function runGateway(): Promise<void> {
         () => runtime?.close(),
         () => callmeshRefresh.stopAndDrain(),
       ],
-      [() => mesh?.stop(), () => aprs?.stop(), () => proxy?.stop()],
+      [
+        () => mesh?.stop(),
+        () => cmCloud?.stop(),
+        () => aprs?.stop(),
+        () => proxy?.stop(),
+      ],
       [
         async () => {
           try {
@@ -204,19 +268,35 @@ export async function runGateway(): Promise<void> {
     activeJobs.recover();
     context.throwIfShutdownRequested();
 
-    const callmesh = new CallMeshClient(
-      callMeshOptionsFromRuntime(
-        process.env,
-        compiledGatewayBuildVersion(),
-        bootstrap.callMeshApiKey,
-      ),
+    const cmCloudRequired = isCmCloudAuthorityRequired(process.env);
+    const activeCmCloud = setupValidationOnly
+      ? undefined
+      : createConfiguredCmCloudAgentClient(
+          process.env,
+          activeDatabase,
+          activeEvents,
+          compiledGatewayBuildVersion(),
+          bootstrap.cmCloudDeviceCredential,
+        );
+    cmCloud = activeCmCloud;
+    context.throwIfShutdownRequested();
+
+    const callmesh = createConfiguredGatewayCallMeshClient(
+      cmCloudRequired,
+      process.env,
+      compiledGatewayBuildVersion(),
+      bootstrap.callMeshApiKey,
       setupValidationOnly ? undefined : activeDatabase.callmeshMappings,
     );
     context.throwIfShutdownRequested();
-    const verifiedAprsState = () => callmesh.getAprsState();
+    const verifiedAprsState = callmesh
+      ? () => callmesh.getAprsState()
+      : undefined;
 
     if (!setupValidationOnly) {
-      proxy = await createConfiguredProxyRuntime(process.env, activeEvents);
+      proxy = cmCloudRequired
+        ? undefined
+        : await createConfiguredProxyRuntime(process.env, activeEvents);
       context.throwIfShutdownRequested();
       maintenance = createConfiguredGatewayMaintenanceRuntime(
         process.env,
@@ -224,12 +304,14 @@ export async function runGateway(): Promise<void> {
         activeEvents,
       );
       context.throwIfShutdownRequested();
-      aprs = createConfiguredAprsGatewayRuntime(
-        process.env,
-        activeDatabase,
-        activeEvents,
-        verifiedAprsState,
-      );
+      aprs = cmCloudRequired
+        ? undefined
+        : createConfiguredAprsGatewayRuntime(
+            process.env,
+            activeDatabase,
+            activeEvents,
+            verifiedAprsState,
+          );
       context.throwIfShutdownRequested();
       mesh = await createConfiguredMeshGatewayRuntime(
         process.env,
@@ -237,6 +319,7 @@ export async function runGateway(): Promise<void> {
         activeEvents,
         verifiedAprsState,
         aprs,
+        activeCmCloud,
       );
       context.throwIfShutdownRequested();
     }
@@ -310,32 +393,55 @@ export async function runGateway(): Promise<void> {
             throw new GatewayBootstrapError("SETUP_MESHTASTIC_UNREACHABLE");
           }
         },
-        validateCallMesh: async () => {
-          try {
-            // The key exists only in the private bootstrap and this in-memory
-            // client until the Agent commits the setup transaction.
-            await callmesh.validateCredentials();
-          } catch (error) {
-            if (error instanceof CallMeshClientError) {
-              if (error.code === "CALLMESH_CREDENTIAL_REJECTED") {
-                throw new GatewayBootstrapError("CALLMESH_CREDENTIAL_REJECTED");
-              }
-              if (error.code === "CALLMESH_UNAVAILABLE") {
-                throw new GatewayBootstrapError("CALLMESH_UNAVAILABLE");
-              }
+        ...(cmCloudRequired
+          ? {
+              useCmCloud: true,
+              ...(activeCmCloud
+                ? { startCmCloud: () => activeCmCloud.start() }
+                : {}),
             }
-            throw new GatewayBootstrapError("GATEWAY_EXTERNAL_START_FAILED");
-          }
-        },
-        synchronizeCallMesh: async () => {
-          const overview = await synchronizeCallMesh(callmesh, activeEvents);
-          if (callMeshCredentialRejected(overview)) {
-            throw new GatewayBootstrapError("CALLMESH_CREDENTIAL_REJECTED");
-          }
-          if (setupCommitStart && !callMeshReadyForSetupCommit(overview)) {
-            throw new GatewayBootstrapError("CALLMESH_UNAVAILABLE");
-          }
-        },
+          : callmesh
+            ? {
+                validateCallMesh: async () => {
+                  try {
+                    // The key exists only in the private bootstrap and this
+                    // in-memory client until the Agent commits setup.
+                    await callmesh.validateCredentials();
+                  } catch (error) {
+                    if (error instanceof CallMeshClientError) {
+                      if (error.code === "CALLMESH_CREDENTIAL_REJECTED") {
+                        throw new GatewayBootstrapError(
+                          "CALLMESH_CREDENTIAL_REJECTED",
+                        );
+                      }
+                      if (error.code === "CALLMESH_UNAVAILABLE") {
+                        throw new GatewayBootstrapError("CALLMESH_UNAVAILABLE");
+                      }
+                    }
+                    throw new GatewayBootstrapError(
+                      "GATEWAY_EXTERNAL_START_FAILED",
+                    );
+                  }
+                },
+                synchronizeCallMesh: async () => {
+                  const overview = await synchronizeCallMesh(
+                    callmesh,
+                    activeEvents,
+                  );
+                  if (callMeshCredentialRejected(overview)) {
+                    throw new GatewayBootstrapError(
+                      "CALLMESH_CREDENTIAL_REJECTED",
+                    );
+                  }
+                  if (
+                    setupCommitStart &&
+                    !callMeshReadyForSetupCommit(overview)
+                  ) {
+                    throw new GatewayBootstrapError("CALLMESH_UNAVAILABLE");
+                  }
+                },
+              }
+            : {}),
         startProxy: async () => {
           await proxy?.start();
         },
@@ -361,10 +467,14 @@ export async function runGateway(): Promise<void> {
       startExternalRuntimes,
     );
 
-    if (!setupValidationOnly) {
+    if (!setupValidationOnly && callmesh) {
+      const legacyCallmesh = callmesh;
       callmeshTimer = setInterval(() => {
         void callmeshRefresh.run(async () => {
-          const overview = await synchronizeCallMesh(callmesh, activeEvents);
+          const overview = await synchronizeCallMesh(
+            legacyCallmesh,
+            activeEvents,
+          );
           if (callMeshCredentialRejected(overview)) {
             terminateAfterShutdown();
             return;

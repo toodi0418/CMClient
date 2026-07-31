@@ -10,6 +10,8 @@ export interface GatewayMaintenanceRuntimeOptions {
   eventBus: DomainEventBus;
   aprsOutboxRetentionDays?: number;
   aprsOutboxBatchSize?: number;
+  cmCloudRawOutboxRetentionDays?: number;
+  cmCloudRawOutboxBatchSize?: number;
   jobRetentionDays?: number;
   jobBatchSize?: number;
   messageRetentionDays?: number;
@@ -36,6 +38,8 @@ export class GatewayMaintenanceRuntime {
   private readonly clock: () => Date;
   private readonly aprsOutboxRetentionDays: number;
   private readonly aprsOutboxBatchSize: number;
+  private readonly cmCloudRawOutboxRetentionDays: number;
+  private readonly cmCloudRawOutboxBatchSize: number;
   private readonly jobRetentionDays: number;
   private readonly jobBatchSize: number;
   private readonly messageRetentionDays: number;
@@ -59,6 +63,14 @@ export class GatewayMaintenanceRuntime {
     );
     this.aprsOutboxBatchSize = positiveInteger(
       options.aprsOutboxBatchSize ?? 1_000,
+      10_000,
+    );
+    this.cmCloudRawOutboxRetentionDays = positiveInteger(
+      options.cmCloudRawOutboxRetentionDays ?? 7,
+      3_650,
+    );
+    this.cmCloudRawOutboxBatchSize = positiveInteger(
+      options.cmCloudRawOutboxBatchSize ?? 1_000,
       10_000,
     );
     this.jobRetentionDays = positiveInteger(
@@ -162,6 +174,14 @@ export class GatewayMaintenanceRuntime {
       aprsOutboxCutoff,
       this.aprsOutboxBatchSize,
     );
+    const cmCloudRawOutboxCutoff = new Date(
+      now.getTime() - this.cmCloudRawOutboxRetentionDays * 24 * 60 * 60 * 1_000,
+    ).toISOString();
+    const acknowledgedCmCloudRawOutboxDeleted =
+      this.options.database.cmcloudRawOutbox.deleteAcknowledgedBefore(
+        cmCloudRawOutboxCutoff,
+        this.cmCloudRawOutboxBatchSize,
+      );
     const positionCutoff = new Date(
       now.getTime() - this.positionRetentionDays * 24 * 60 * 60 * 1_000,
     ).toISOString();
@@ -202,6 +222,9 @@ export class GatewayMaintenanceRuntime {
         supersededAprsOutboxDeleted,
         igateSubmissionsDeleted,
         aprsOutboxBatchSize: this.aprsOutboxBatchSize,
+        cmCloudRawOutboxCutoff,
+        acknowledgedCmCloudRawOutboxDeleted,
+        cmCloudRawOutboxBatchSize: this.cmCloudRawOutboxBatchSize,
         positionCutoff,
         positionDecisionsDeleted: positionRetention.decisionsDeleted,
         positionEventsDeleted: positionRetention.eventsDeleted,

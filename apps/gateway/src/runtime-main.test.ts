@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { dispatchGatewayEntrypoint } from "./entrypoint";
 import {
+  createConfiguredGatewayCallMeshClient,
+  isCmCloudAuthorityRequired,
   runGateway,
   startGatewayExternalRuntimes,
   validateProxyUpstreamConfiguration,
@@ -71,6 +73,51 @@ describe("Gateway production runtime", () => {
     expect(callmeshValidated).toBe(false);
   });
 
+  it("does not validate CallMesh during CMCloud setup validation", async () => {
+    const calls: string[] = [];
+    await startGatewayExternalRuntimes(true, {
+      useCmCloud: true,
+      validateMeshtastic: async () => {
+        calls.push("meshtastic");
+      },
+      startProxy: async () => undefined,
+      startMaintenance: () => undefined,
+      startAprs: () => undefined,
+      startMesh: () => undefined,
+      throwIfShutdownRequested: () => calls.push("fence"),
+    });
+
+    expect(calls).toEqual(["meshtastic", "fence"]);
+  });
+
+  it("does not construct a CallMesh client in required CMCloud mode", () => {
+    const environment = {
+      CMCLIENT_CMCLOUD_MODE: "required",
+      CMCLIENT_CMCLOUD_URL: "wss://cmcloud.tmmarc.org/agent/v1",
+      CMCLIENT_CMCLOUD_INSTALLATION_ID: "00000000-0000-4000-8000-000000000001",
+      CMCLIENT_CMCLOUD_INSTALLATION_GENERATION: "0",
+      CMCLIENT_CMCLOUD_CREDENTIAL_VERSION: "1",
+      CMCLIENT_CALLMESH_URL: "not-a-valid-callmesh-url",
+    };
+    const factory = vi.fn(() => {
+      throw new Error("CallMesh client must not be constructed");
+    });
+
+    const useCmCloud = isCmCloudAuthorityRequired(environment);
+    const client = createConfiguredGatewayCallMeshClient(
+      useCmCloud,
+      environment,
+      "2.0.0",
+      undefined,
+      undefined,
+      factory,
+    );
+
+    expect(useCmCloud).toBe(true);
+    expect(client).toBeUndefined();
+    expect(factory).not.toHaveBeenCalled();
+  });
+
   it("starts normal transports after synchronization without setup revalidation", async () => {
     const calls: string[] = [];
     await startGatewayExternalRuntimes(false, {
@@ -104,6 +151,51 @@ describe("Gateway production runtime", () => {
       "mesh",
       "fence",
     ]);
+  });
+
+  it("starts the CMCloud upstream instead of synchronizing CallMesh", async () => {
+    const calls: string[] = [];
+    await startGatewayExternalRuntimes(false, {
+      validateMeshtastic: async () => undefined,
+      startCmCloud: () => calls.push("cmcloud"),
+      useCmCloud: true,
+      startProxy: async () => {
+        calls.push("proxy");
+      },
+      startMaintenance: () => calls.push("maintenance"),
+      startAprs: () => calls.push("aprs"),
+      startMesh: () => calls.push("mesh"),
+      throwIfShutdownRequested: () => calls.push("fence"),
+    });
+
+    expect(calls).toEqual([
+      "cmcloud",
+      "fence",
+      "proxy",
+      "fence",
+      "maintenance",
+      "fence",
+      "aprs",
+      "fence",
+      "mesh",
+      "fence",
+    ]);
+  });
+
+  it("fails closed when CMCloud mode has no transport starter", async () => {
+    await expect(
+      startGatewayExternalRuntimes(false, {
+        validateMeshtastic: async () => undefined,
+        validateCallMesh: async () => undefined,
+        synchronizeCallMesh: async () => undefined,
+        useCmCloud: true,
+        startProxy: async () => undefined,
+        startMaintenance: () => undefined,
+        startAprs: () => undefined,
+        startMesh: () => undefined,
+        throwIfShutdownRequested: () => undefined,
+      }),
+    ).rejects.toMatchObject({ code: "CMCLOUD_START_CONFIGURATION_INVALID" });
   });
 
   it.each(["tcp", "serial"])(

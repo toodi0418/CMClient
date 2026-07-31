@@ -17,6 +17,7 @@ import {
 import { PositionRepository } from "../position.js";
 import { AprsOutboxRepository } from "../aprs-outbox.js";
 import { CallMeshMappingRepository } from "../callmesh.js";
+import { CmCloudRawOutboxRepository } from "../cmcloud.js";
 import {
   gatewayMigrations,
   validateMigrationManifest,
@@ -96,6 +97,7 @@ export class GatewayDatabase {
   readonly positions: PositionRepository;
   readonly aprsOutbox: AprsOutboxRepository;
   readonly callmeshMappings: CallMeshMappingRepository;
+  readonly cmcloudRawOutbox: CmCloudRawOutboxRepository;
   readonly settings: SettingsRepository;
 
   constructor(
@@ -137,6 +139,7 @@ export class GatewayDatabase {
     this.positions = new PositionRepository(this.connection);
     this.aprsOutbox = new AprsOutboxRepository(this.connection);
     this.callmeshMappings = new CallMeshMappingRepository(this.connection);
+    this.cmcloudRawOutbox = new CmCloudRawOutboxRepository(this.connection);
     this.settings = new SettingsRepository(this.connection);
   }
 

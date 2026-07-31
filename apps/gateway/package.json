@@ -20,6 +20,10 @@
     "fastify": "^5.10.0",
     "p-queue": "9.3.2",
     "protobufjs": "^8.7.1",
-    "serialport": "^13.0.0"
+    "serialport": "^13.0.0",
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "8.5.14"
   }
 }

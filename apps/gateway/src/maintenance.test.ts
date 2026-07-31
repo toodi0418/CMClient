@@ -60,6 +60,9 @@ describe("GatewayMaintenanceRuntime", () => {
         supersededAprsOutboxDeleted: 0,
         igateSubmissionsDeleted: 0,
         aprsOutboxBatchSize: 1_000,
+        cmCloudRawOutboxCutoff: "2026-07-11T00:00:00.000Z",
+        acknowledgedCmCloudRawOutboxDeleted: 0,
+        cmCloudRawOutboxBatchSize: 1_000,
         positionCutoff: "2026-06-18T00:00:00.000Z",
         positionDecisionsDeleted: 0,
         positionEventsDeleted: 0,
@@ -85,6 +88,9 @@ describe("GatewayMaintenanceRuntime", () => {
         supersededAprsOutboxDeleted: 0,
         igateSubmissionsDeleted: 0,
         aprsOutboxBatchSize: 1_000,
+        cmCloudRawOutboxCutoff: "2026-07-11T00:00:00.000Z",
+        acknowledgedCmCloudRawOutboxDeleted: 0,
+        cmCloudRawOutboxBatchSize: 1_000,
         positionCutoff: "2026-06-18T00:00:00.000Z",
         positionDecisionsDeleted: 0,
         positionEventsDeleted: 0,
@@ -94,6 +100,52 @@ describe("GatewayMaintenanceRuntime", () => {
         walCheckpoint: { busy: 0, checkpointedFrames: -1, logFrames: -1 },
       },
     ]);
+    database.close();
+  });
+
+  it("retains pending CMCloud raw frames and bounds acknowledged rows", () => {
+    const database = new GatewayDatabase(":memory:");
+    const acknowledged = database.cmcloudRawOutbox.enqueue({
+      body: new Uint8Array([1]),
+      capturedAt: "2026-07-01T00:00:00.000Z",
+    });
+    database.cmcloudRawOutbox.recordAttempt(
+      acknowledged.messageId,
+      "2026-07-01T00:00:01.000Z",
+    );
+    database.cmcloudRawOutbox.acknowledge({
+      messageId: acknowledged.messageId,
+      lane: acknowledged.lane,
+      laneSequence: acknowledged.laneSequence,
+      receiptId: "00000000-0000-4000-8000-000000000001",
+      acknowledgedAt: "2026-07-02T00:00:00.000Z",
+    });
+    const pending = database.cmcloudRawOutbox.enqueue({
+      body: new Uint8Array([2]),
+      capturedAt: "2026-07-01T00:00:00.000Z",
+    });
+    const events = new DomainEventBus();
+    const runtime = new GatewayMaintenanceRuntime({
+      database,
+      eventBus: events,
+      cmCloudRawOutboxRetentionDays: 7,
+      cmCloudRawOutboxBatchSize: 1,
+      clock: () => new Date("2026-07-18T00:00:00.000Z"),
+    });
+
+    runtime.runCycle();
+
+    expect(
+      database.cmcloudRawOutbox.find(acknowledged.messageId),
+    ).toBeUndefined();
+    expect(database.cmcloudRawOutbox.find(pending.messageId)).toMatchObject({
+      messageId: pending.messageId,
+    });
+    expect(events.recent(1)[0]?.payload).toMatchObject({
+      cmCloudRawOutboxCutoff: "2026-07-11T00:00:00.000Z",
+      acknowledgedCmCloudRawOutboxDeleted: 1,
+      cmCloudRawOutboxBatchSize: 1,
+    });
     database.close();
   });
 

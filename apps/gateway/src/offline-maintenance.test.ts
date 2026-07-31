@@ -153,6 +153,8 @@ describe("Gateway offline maintenance", { timeout: 20_000 }, () => {
         aprs_local_transmissions: 0,
         aprs_igate_state: 0,
         aprs_igate_submissions: 0,
+        cmcloud_lane_state: 0,
+        cmcloud_raw_outbox: 0,
       },
     });
     expect(report.schemaHistory).toEqual(

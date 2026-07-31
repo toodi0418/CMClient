@@ -38,6 +38,7 @@ const EXPECTED_SHA256 = [
   "a0e68a9f124b7aa1ea84e00486574dcc445c5d09ac8e922d55d6df4d85424475",
   "b5da29496eafe700ec3b42c8ecdeaebd9b72fb58afaf8d5a0138f56d6f9255e1",
   "fd513da2362821593ff6a3e83b042b8624c317ea73783920be5f1581165d331c",
+  "2053740d792d9a6b352148a2956958f96f79bf3e4f4eb15dbe4fbf35a8805652",
 ] as const;
 
 function migration(
@@ -220,6 +221,12 @@ export const gatewayMigrations: readonly SqlMigration[] = Object.freeze([
   migration(21, "aprs_igate_local_write_completion", [
     "ALTER TABLE aprs_igate_submissions ADD COLUMN local_write_completed_at TEXT",
     "UPDATE aprs_igate_submissions SET local_write_completed_at = submitted_at WHERE delivery_status = 'submitted' AND submitted_at IS NOT NULL",
+  ]),
+  migration(22, "cmcloud_raw_outbox", [
+    "CREATE TABLE cmcloud_lane_state (lane TEXT PRIMARY KEY CHECK (lane = 'live'), next_sequence INTEGER NOT NULL CHECK (next_sequence >= 1 AND next_sequence <= 9007199254740991))",
+    "CREATE TABLE cmcloud_raw_outbox (message_id TEXT PRIMARY KEY, lane TEXT NOT NULL CHECK (lane = 'live'), lane_sequence INTEGER NOT NULL CHECK (lane_sequence >= 1 AND lane_sequence <= 9007199254740991), captured_at TEXT NOT NULL, body BLOB NOT NULL CHECK (length(body) >= 1 AND length(body) <= 524288), body_sha256 TEXT NOT NULL CHECK (length(body_sha256) = 64 AND body_sha256 NOT GLOB '*[^a-f0-9]*'), status TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged')), attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0), last_attempt_at TEXT, last_error_code TEXT, receipt_id TEXT, acknowledged_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (lane, lane_sequence), CHECK ((status = 'pending' AND receipt_id IS NULL AND acknowledged_at IS NULL) OR (status = 'acknowledged' AND receipt_id IS NOT NULL AND acknowledged_at IS NOT NULL)))",
+    "CREATE INDEX cmcloud_raw_outbox_pending_sequence_index ON cmcloud_raw_outbox (lane_sequence ASC) WHERE status = 'pending'",
+    "CREATE INDEX cmcloud_raw_outbox_acknowledged_retention_index ON cmcloud_raw_outbox (acknowledged_at ASC, lane_sequence ASC) WHERE status = 'acknowledged'",
   ]),
 ]);
 

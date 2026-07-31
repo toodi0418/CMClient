@@ -8,6 +8,7 @@ import { GatewayDatabase } from "./persistence/database";
 import {
   GatewayRuntimeConfigurationError,
   createConfiguredAprsGatewayRuntime,
+  createConfiguredCmCloudAgentClient,
   createConfiguredGatewayMaintenanceRuntime,
   createConfiguredMeshGatewayRuntime,
   parseAprsEncodingOptions,
@@ -27,6 +28,63 @@ const aprsState = {
 };
 
 describe("Gateway production runtime configuration", () => {
+  it("requires an Agent-private CMCloud credential and fences local APRS and Proxy", () => {
+    const database = new GatewayDatabase(":memory:");
+    const events = new DomainEventBus();
+    const cloudEnvironment = {
+      CMCLIENT_CMCLOUD_MODE: "required",
+      CMCLIENT_CMCLOUD_URL: "wss://cmcloud.tmmarc.org/agent/v1",
+      CMCLIENT_CMCLOUD_INSTALLATION_ID: "00000000-0000-4000-8000-000000000001",
+      CMCLIENT_CMCLOUD_INSTALLATION_GENERATION: "0",
+      CMCLIENT_CMCLOUD_CREDENTIAL_VERSION: "1",
+    };
+
+    expect(() =>
+      createConfiguredCmCloudAgentClient(
+        cloudEnvironment,
+        database,
+        events,
+        "2.0.0",
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "CMCLOUD_CREDENTIAL_BOOTSTRAP_REQUIRED",
+      }),
+    );
+    expect(() =>
+      createConfiguredCmCloudAgentClient(
+        { ...cloudEnvironment, CMCLIENT_APRS_ENABLED: "true" },
+        database,
+        events,
+        "2.0.0",
+        "credential_value_that_is_long_enough",
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "CMCLOUD_DIRECT_APRS_FORBIDDEN" }),
+    );
+    expect(() =>
+      createConfiguredCmCloudAgentClient(
+        { ...cloudEnvironment, CMCLIENT_PROXY_ENABLED: "true" },
+        database,
+        events,
+        "2.0.0",
+        "credential_value_that_is_long_enough",
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "CMCLOUD_PROXY_FORBIDDEN" }),
+    );
+    expect(
+      createConfiguredCmCloudAgentClient(
+        cloudEnvironment,
+        database,
+        events,
+        "2.0.0",
+        "credential_value_that_is_long_enough",
+      )?.status(),
+    ).toMatchObject({ configured: true, state: "stopped", pendingOutbox: 0 });
+    database.close();
+  });
+
   it("rejects invalid bounded maintenance retention settings", () => {
     const database = new GatewayDatabase(":memory:");
     const events = new DomainEventBus();
@@ -73,6 +131,17 @@ describe("Gateway production runtime configuration", () => {
     ).toThrowError(
       expect.objectContaining({
         code: "POSITION_RETENTION_CONFIGURATION_INVALID",
+      }),
+    );
+    expect(() =>
+      createConfiguredGatewayMaintenanceRuntime(
+        { CMCLIENT_CMCLOUD_OUTBOX_RETENTION_DAYS: "0" },
+        database,
+        events,
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "CMCLOUD_OUTBOX_RETENTION_CONFIGURATION_INVALID",
       }),
     );
     expect(() =>

@@ -31,6 +31,13 @@ APRS, Proxy, maintenance, or mapping synchronization. Agent stops that launch,
 commits setup, records the recoverable ready marker, and starts a normal Gateway;
 the Web receives ready only after normal startup succeeds. Any failure rolls the
 marker, config, and secret back to the credentials phase.
+
+CMCloud-required operation is a separate authority path. It starts one
+authenticated CMCloud WebSocket and forwards durable raw `FromRadio` bytes
+before decode; it does not synchronize CallMesh or start the local APRS and
+Proxy runtimes. The private bootstrap carries the device credential rather than
+an environment variable. Details, replay guarantees, and the Agent pairing
+transaction are defined in [CMCloud Raw Transport](cmcloud-transport.md).
 Agent still withholds the session and the capability from ordinary HTTP until
 listener ownership is proven. Gateway accepts only the exact HTTP/1.1 Upgrade
 request on `/_cmclient/bootstrap/ownership`, with a fresh 64-character

@@ -13,6 +13,7 @@ import type {
 import { AprsRemoteHighWaterStore } from "./aprs-monitor.js";
 import type { AprsRuntimeState } from "./aprs-identity.js";
 import { encodeAprsPosition } from "./aprs-position.js";
+import type { CmCloudRawFrameSink } from "./cmcloud.js";
 import { DomainEventBus } from "./events.js";
 import {
   MeshDomainStore,
@@ -48,6 +49,12 @@ export interface MeshGatewayRuntimeOptions {
     stateProvider?: () => AprsRuntimeState | undefined;
     onDecodedSummary?: (type: string, timestampMs: number) => void;
   };
+  /**
+   * Presence selects the CMCloud authority path. Exact FromRadio bytes are
+   * durably queued before protobuf normalization, while local CallMesh/APRS
+   * mapping and upload decisions remain disabled.
+   */
+  cmCloud?: CmCloudRawFrameSink;
   clock?: () => Date;
   idFactory?: () => string;
   stopTimeoutMs?: number;
@@ -250,6 +257,13 @@ export class MeshGatewayRuntime {
   }
 
   ingestFrame(frame: TransportFrameEvent): MeshIngestResult {
+    try {
+      this.options.cmCloud?.enqueueRawFrame(frame.frame, frame.receivedAt);
+    } catch (error) {
+      throw new MeshGatewayRuntimeError(
+        stableErrorCode(error, "CMCLOUD_OUTBOX_STORE_FAILED"),
+      );
+    }
     const normalizedFromRadio = this.options.codec.normalizeFromRadio(
       frame.frame,
     );
@@ -298,7 +312,7 @@ export class MeshGatewayRuntime {
       kind: normalizedFromRadio.kind,
     });
     this.publishDomainPayload(payload);
-    if (payload.kind !== "position") {
+    if (payload.kind !== "position" || this.options.cmCloud) {
       return { observationId: observation.id, payload };
     }
 
