@@ -2564,7 +2564,10 @@ impl AgentController {
             &self.identity.identity.version,
         )
         .map_err(CMCloudEnrollmentControlError::Enrollment)?;
-        self.quiesce_cmcloud_gateway_for_enrollment()?;
+        // Keep an established Gateway running while the Agent obtains and
+        // acknowledges a provisional credential. CMCloud does not revoke the
+        // active credential/session until that ACK commits, so transport or
+        // pairing failures here cannot interrupt the current station.
         cmcloud_enrollment::enroll_cmcloud_blocking(
             &self.secrets,
             endpoint,
@@ -2601,23 +2604,6 @@ impl AgentController {
         } else {
             Err(CMCloudEnrollmentControlError::SetupRequired)
         }
-    }
-
-    fn quiesce_cmcloud_gateway_for_enrollment(&self) -> Result<(), CMCloudEnrollmentControlError> {
-        let _gateway_transition = self
-            .gateway_transition
-            .lock()
-            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
-        self.stop_supervisor_locked()
-            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
-        let mut supervisor = self
-            .supervisor
-            .lock()
-            .map_err(|_| CMCloudEnrollmentControlError::Unavailable)?;
-        if let Some(supervisor) = supervisor.as_mut() {
-            supervisor.clear_cmcloud_device_credential();
-        }
-        Ok(())
     }
 
     fn configure_active_cmcloud_gateway_credential(
