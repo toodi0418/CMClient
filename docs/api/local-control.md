@@ -85,6 +85,8 @@ The request operation, rather than an HTTP method/path pair, selects behavior:
 | `SubscribeGatewayEvents` | Typed events bridged from the bounded Gateway stream |
 | `StoreSecret` | Store the bounded CallMesh API key and return only `stored: true` |
 | `RemoveSecret` | Remove a supported or legacy-removal secret kind |
+| `CmCloudEnrollmentStatus` | Agent-owned redacted CMCloud enrollment state, endpoint, installation generation, and credential version |
+| `EnrollCmCloud` | Submit one bounded CMCloud pairing code to the Agent and return only the redacted enrollment state |
 
 Lifecycle status schema v3 returns component identity/state, Gateway lifecycle,
 Management Web listener state and its URL only when running, uptime, and the
@@ -140,6 +142,12 @@ settable runtime kind. `aprs-passcode` and `management-admin-token` are
 removal-only compatibility names: attempts to store them return
 `CONTROL_SECRET_KIND_DEPRECATED` without dispatching the value, while removal
 deletes any value left by an older installation.
+
+CMCloud pairing codes also travel only through local Control IPC. `EnrollCmCloud`
+accepts the bounded single-use code, clears the request material after dispatch,
+and returns no pairing code or device credential. `CmCloudEnrollmentStatus` and
+the enrollment response expose only the redacted endpoint, state, installation
+generation, and credential version needed by Desktop, CLI, and Management Web.
 
 Agent is the only owner of secret persistence. It atomically writes the sole
 backend, root-level `~/.cmclient/secrets.json` (or

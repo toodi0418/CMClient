@@ -102,6 +102,15 @@ test("scanner rejects retired package dependencies and scripts", () => {
   );
 });
 
+test("scanner scopes the CMCloud WebSocket client dependency to the Gateway", () => {
+  const manifest = Buffer.from(
+    JSON.stringify({ dependencies: { ws: "fixture" } }),
+  );
+
+  assert.deepEqual(scanEntry("apps/gateway/package.json", manifest), []);
+  assert.notDeepEqual(scanEntry("apps/other/package.json", manifest), []);
+});
+
 test("scanner does not confuse workspace package names with the retired command", () => {
   assert.deepEqual(
     scanEntry(

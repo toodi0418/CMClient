@@ -84,6 +84,42 @@ describe("gateway API client", () => {
     expect(url).toBe("/api/v1/callmesh");
   });
 
+  it("reads and submits the redacted CMCloud enrollment contract", async () => {
+    const requests: Array<{ body?: string; method: string; url: string }> = [];
+    const client = new GatewayApiClient({
+      fetch: async (input, init) => {
+        requests.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          ...(typeof init?.body === "string" ? { body: init.body } : {}),
+        });
+        return jsonResponse({
+          schemaVersion: 1,
+          state: "active",
+          endpoint: "wss://cmcloud.example.invalid/agent/v1",
+          installationGeneration: 2,
+          credentialVersion: 4,
+        });
+      },
+    });
+
+    await expect(client.cmcloud.status()).resolves.toMatchObject({
+      state: "active",
+      credentialVersion: 4,
+    });
+    await expect(
+      client.cmcloud.enroll({ pairingCode: "pairing-code-1234" }),
+    ).resolves.toMatchObject({ state: "active" });
+    expect(requests).toEqual([
+      { url: "/api/v1/cmcloud/enrollment", method: "GET" },
+      {
+        url: "/api/v1/cmcloud/enrollment",
+        method: "POST",
+        body: JSON.stringify({ pairingCode: "pairing-code-1234" }),
+      },
+    ]);
+  });
+
   it("submits diagnostics with a client-generated idempotency key", async () => {
     let headers: Headers | undefined;
     let body: BodyInit | null | undefined;

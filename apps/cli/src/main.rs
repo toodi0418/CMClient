@@ -73,6 +73,10 @@ enum Command {
         command: SecretCommand,
     },
     Database,
+    Cmcloud {
+        #[command(subcommand)]
+        command: CmCloudCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -84,6 +88,23 @@ enum SecretCommand {
     Remove {
         kind: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum CmCloudCommand {
+    Status,
+    Enroll {
+        #[arg(value_name = "PAIRING_CODE")]
+        pairing_code: String,
+    },
+}
+
+impl Drop for CmCloudCommand {
+    fn drop(&mut self) {
+        if let Self::Enroll { pairing_code } = self {
+            pairing_code.zeroize();
+        }
+    }
 }
 
 enum ClientSetupError {
@@ -235,6 +256,7 @@ fn run(cli: Cli) -> ProcessExitCode {
             quiet,
             style,
         ),
+        Command::Cmcloud { command } => cmcloud(&client, command, json, quiet, style),
         Command::Version => ProcessExitCode::SUCCESS,
     }
 }
@@ -926,6 +948,66 @@ fn follow_update_events(
     ProcessExitCode::SUCCESS
 }
 
+fn cmcloud(
+    client: &ControlClient,
+    command: CmCloudCommand,
+    json_output: bool,
+    quiet: bool,
+    style: OutputStyle,
+) -> ProcessExitCode {
+    let result = match command {
+        CmCloudCommand::Status => client.cmcloud_enrollment_status(),
+        CmCloudCommand::Enroll { ref pairing_code } => {
+            if !valid_cmcloud_pairing_code(&pairing_code) {
+                eprintln!("CMCLOUD_ENROLLMENT_REQUEST_INVALID");
+                return ProcessExitCode::from(ExitCode::Validation.as_u8());
+            }
+            client.enroll_cmcloud(&pairing_code)
+        }
+    };
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => return control_error_exit(error),
+    };
+    if json_output {
+        return print_json(&value);
+    }
+    if !quiet {
+        println!("{}: {}", style.heading("cmcloud"), cmcloud_summary(&value));
+    }
+    ProcessExitCode::SUCCESS
+}
+
+fn cmcloud_summary(value: &Value) -> String {
+    let state = value
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    let endpoint = value
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("unconfigured");
+    let generation = value
+        .get("installationGeneration")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "--".to_owned(), |value| value.to_string());
+    let credential_version = value
+        .get("credentialVersion")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "--".to_owned(), |value| value.to_string());
+    format!(
+        "state={state}; endpoint={endpoint}; generation={generation}; credentialVersion={credential_version}"
+    )
+}
+
+fn valid_cmcloud_pairing_code(value: &str) -> bool {
+    value.len() >= 16
+        && value.len() <= 512
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn control_error_exit(error: ControlError) -> ProcessExitCode {
     eprintln!("{}", error.code());
     let code = match error {
@@ -938,7 +1020,8 @@ fn control_error_exit(error: ControlError) -> ProcessExitCode {
         ControlError::CommandFailed
         | ControlError::ResourceExhausted
         | ControlError::SecretStoreUnavailable
-        | ControlError::SecretValueInvalid => ExitCode::OperationFailed,
+        | ControlError::SecretValueInvalid
+        | ControlError::Application(_) => ExitCode::OperationFailed,
         ControlError::InvalidEnvelope
         | ControlError::ProtocolVersionUnsupported
         | ControlError::ResponseTooLarge => ExitCode::OperationFailed,

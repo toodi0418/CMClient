@@ -3,6 +3,8 @@ import {
   AprsIgateSubmissionListSchema,
   AprsOutboxEntryListSchema,
   AprsRuntimeStatusSchema,
+  CMCloudEnrollmentRequestSchema,
+  CMCloudEnrollmentStatusSchema,
   ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
   JobAcceptedSchema,
@@ -28,6 +30,8 @@ import {
   type AprsIgateSubmissionList,
   type AprsOutboxEntryList,
   type AprsRuntimeStatus,
+  type CMCloudEnrollmentRequest,
+  type CMCloudEnrollmentStatus,
   type JobAccepted,
   type JobDetail,
   type MeshMessageList,
@@ -288,6 +292,21 @@ export class GatewayApiClient {
       this.request<CallMeshOverview>("/callmesh", CallMeshOverviewSchema),
   };
 
+  readonly cmcloud = {
+    status: () =>
+      this.request<CMCloudEnrollmentStatus>(
+        "/cmcloud/enrollment",
+        CMCloudEnrollmentStatusSchema,
+      ),
+    enroll: (request: CMCloudEnrollmentRequest) =>
+      this.requestBody<CMCloudEnrollmentStatus, CMCloudEnrollmentRequest>(
+        "/cmcloud/enrollment",
+        CMCloudEnrollmentStatusSchema,
+        CMCloudEnrollmentRequestSchema,
+        request,
+      ),
+  };
+
   readonly proxy = {
     status: () => this.request<ProxyStatus>("/proxy", ProxyStatusSchema),
   };
@@ -428,6 +447,13 @@ export type AgentLifecycleApi = {
 
 export type GatewayProxyApi = {
   status: () => Promise<ProxyStatus>;
+};
+
+export type AgentCmCloudApi = {
+  status: () => Promise<CMCloudEnrollmentStatus>;
+  enroll: (
+    request: CMCloudEnrollmentRequest,
+  ) => Promise<CMCloudEnrollmentStatus>;
 };
 
 export type GatewayMeshtasticApi = {

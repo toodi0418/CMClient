@@ -4473,6 +4473,27 @@ impl ControlHandler for AgentController {
             .remove(secret_kind(kind))
             .map_err(control_secret_error)
     }
+
+    fn cmcloud_enrollment_status(&self) -> Result<serde_json::Value, ControlError> {
+        let status =
+            AgentController::cmcloud_enrollment_status(self).map_err(cmcloud_control_error)?;
+        serde_json::to_value(status).map_err(|_| ControlError::InvalidEnvelope)
+    }
+
+    fn enroll_cmcloud(&self, pairing_code: &str) -> Result<serde_json::Value, ControlError> {
+        let status = AgentController::enroll_cmcloud(
+            self,
+            CMCloudEnrollmentRequest {
+                pairing_code: pairing_code.to_owned(),
+            },
+        )
+        .map_err(cmcloud_control_error)?;
+        serde_json::to_value(status).map_err(|_| ControlError::InvalidEnvelope)
+    }
+}
+
+fn cmcloud_control_error(error: CMCloudEnrollmentControlError) -> ControlError {
+    ControlError::Application(error.code().to_owned())
 }
 
 fn verified_gateway_route(

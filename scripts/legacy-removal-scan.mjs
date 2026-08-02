@@ -167,6 +167,13 @@ const FORBIDDEN_PACKAGE_DEPENDENCIES = new Set([
   "yargs",
 ]);
 
+// Node 22's standard WebSocket client does not expose handshake headers. The
+// CMCloud client must send its Agent-owned credential in Authorization, so the
+// only permitted `ws` dependency is this client-side Gateway transport.
+const SCOPED_PACKAGE_DEPENDENCY_ALLOWANCES = new Map([
+  ["apps/gateway/package.json", new Set(["ws"])],
+]);
+
 const FORBIDDEN_PACKAGE_SCRIPT =
   /(?:electron(?:-packager)?|@yao-pkg\/pkg|node\s+src\/index\.js|scripts\/(?:build-(?:linux|win)|run-electron)\.js)/i;
 
@@ -244,11 +251,13 @@ function packageManifestViolations(path, bytes) {
     "optionalDependencies",
     "peerDependencies",
   ];
+  const allowances = SCOPED_PACKAGE_DEPENDENCY_ALLOWANCES.get(path);
   for (const section of dependencySections) {
     for (const dependency of Object.keys(manifest[section] ?? {})) {
       if (
-        FORBIDDEN_PACKAGE_DEPENDENCIES.has(dependency) ||
-        dependency.startsWith("@electron/")
+        (FORBIDDEN_PACKAGE_DEPENDENCIES.has(dependency) ||
+          dependency.startsWith("@electron/")) &&
+        !allowances?.has(dependency)
       ) {
         violations.push({
           path,

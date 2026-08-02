@@ -79,6 +79,7 @@ const primaryNavigation = [
   { labelKey: "navigation.telemetry", to: "/telemetry", icon: Gauge },
   { labelKey: "navigation.aprs", to: "/aprs", icon: Satellite },
   { labelKey: "navigation.callmesh", to: "/callmesh", icon: Cloud },
+  { labelKey: "navigation.cmcloud", to: "/cmcloud", icon: Cloud },
 ];
 
 const visiblePrimaryNavigation = computed(() =>

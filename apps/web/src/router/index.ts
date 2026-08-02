@@ -67,6 +67,12 @@ export function createManagementRouter(
         meta: { labelKey: "navigation.callmesh", group: "operations" },
       },
       {
+        path: "/cmcloud",
+        name: "cmcloud",
+        component: () => import("@/views/CMCloudView.vue"),
+        meta: { labelKey: "navigation.cmcloud", group: "operations" },
+      },
+      {
         path: "/logs",
         name: "logs",
         component: () => import("@/views/LogsView.vue"),

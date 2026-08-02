@@ -40,6 +40,7 @@ describe("management web router", () => {
     expect(router.resolve("/meshtastic").name).toBe("meshtastic");
     expect(router.resolve("/aprs").name).toBe("aprs");
     expect(router.resolve("/callmesh").name).toBe("callmesh");
+    expect(router.resolve("/cmcloud").name).toBe("cmcloud");
     expect(router.resolve("/logs").name).toBe("logs");
     expect(router.resolve("/updates").name).toBe("updates");
     expect(router.resolve("/settings").name).toBe("settings");

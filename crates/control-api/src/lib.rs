@@ -243,6 +243,14 @@ pub trait ControlHandler: Send + Sync {
     fn remove_secret(&self, _kind: ControlSecretKind) -> Result<bool, ControlError> {
         Err(ControlError::CommandFailed)
     }
+
+    fn cmcloud_enrollment_status(&self) -> Result<serde_json::Value, ControlError> {
+        Err(ControlError::CommandFailed)
+    }
+
+    fn enroll_cmcloud(&self, _pairing_code: &str) -> Result<serde_json::Value, ControlError> {
+        Err(ControlError::CommandFailed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +285,7 @@ pub enum ControlError {
     SecretStoreUnavailable,
     SecretValueInvalid,
     CommandFailed,
+    Application(String),
 }
 
 impl ControlError {
@@ -295,11 +304,12 @@ impl ControlError {
             "AGENT_SECRET_STORE_UNAVAILABLE" => Some(Self::SecretStoreUnavailable),
             "AGENT_SECRET_VALUE_INVALID" => Some(Self::SecretValueInvalid),
             "CONTROL_COMMAND_FAILED" => Some(Self::CommandFailed),
+            _ if valid_error_code(code) => Some(Self::Application(code.to_owned())),
             _ => None,
         }
     }
 
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             Self::EndpointAlreadyInUse => "CONTROL_ENDPOINT_ALREADY_IN_USE",
             Self::UnsupportedEndpoint => "CONTROL_ENDPOINT_UNSUPPORTED",
@@ -314,6 +324,7 @@ impl ControlError {
             Self::SecretStoreUnavailable => "AGENT_SECRET_STORE_UNAVAILABLE",
             Self::SecretValueInvalid => "AGENT_SECRET_VALUE_INVALID",
             Self::CommandFailed => "CONTROL_COMMAND_FAILED",
+            Self::Application(code) => code.as_str(),
         }
     }
 }
@@ -346,14 +357,24 @@ enum WireRequest {
         value: String,
     },
     RemoveSecret(ControlSecretKind),
+    CmCloudEnrollmentStatus,
+    EnrollCmCloud {
+        pairing_code: String,
+    },
     SubscribeUpdateEvents,
     SubscribeGatewayEvents,
 }
 
 impl WireRequest {
     fn zeroize_sensitive(&mut self) {
-        if let Self::StoreSecret { value, .. } = self {
-            value.zeroize();
+        match self {
+            Self::StoreSecret { value, .. }
+            | Self::EnrollCmCloud {
+                pairing_code: value,
+            } => {
+                value.zeroize();
+            }
+            _ => {}
         }
     }
 }
@@ -392,6 +413,7 @@ enum WireResponse {
     DiagnosticsBundle(DiagnosticsControlBundle),
     GatewayProjection(serde_json::Value),
     SecretReceipt(ControlSecretReceipt),
+    CmCloudEnrollmentStatus(serde_json::Value),
     SubscriptionAccepted,
 }
 
@@ -463,6 +485,14 @@ fn dispatch_request(
         WireRequest::RemoveSecret(kind) => handler
             .remove_secret(*kind)
             .map(|stored| WireResponse::SecretReceipt(ControlSecretReceipt { stored }))
+            .map(DispatchOutcome::response),
+        WireRequest::CmCloudEnrollmentStatus => handler
+            .cmcloud_enrollment_status()
+            .map(WireResponse::CmCloudEnrollmentStatus)
+            .map(DispatchOutcome::response),
+        WireRequest::EnrollCmCloud { pairing_code } => handler
+            .enroll_cmcloud(pairing_code)
+            .map(WireResponse::CmCloudEnrollmentStatus)
             .map(DispatchOutcome::response),
         WireRequest::SubscribeUpdateEvents => handler
             .subscribe_update_events()
@@ -941,6 +971,22 @@ impl ControlClient {
 
     pub fn subscribe_gateway_events(&self) -> Result<ControlUpdateEventStream, ControlError> {
         self.subscribe(WireRequest::SubscribeGatewayEvents)
+    }
+
+    pub fn cmcloud_enrollment_status(&self) -> Result<serde_json::Value, ControlError> {
+        match self.exchange(WireRequest::CmCloudEnrollmentStatus)? {
+            WireResponse::CmCloudEnrollmentStatus(value) => Ok(value),
+            _ => Err(ControlError::InvalidEnvelope),
+        }
+    }
+
+    pub fn enroll_cmcloud(&self, pairing_code: &str) -> Result<serde_json::Value, ControlError> {
+        match self.exchange(WireRequest::EnrollCmCloud {
+            pairing_code: pairing_code.to_owned(),
+        })? {
+            WireResponse::CmCloudEnrollmentStatus(value) => Ok(value),
+            _ => Err(ControlError::InvalidEnvelope),
+        }
     }
 
     fn command(&self, command: ControlCommand) -> Result<ControlStatus, ControlError> {
@@ -1529,6 +1575,14 @@ fn valid_event_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
+fn valid_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 pub fn is_local_endpoint(endpoint: &ControlEndpoint) -> bool {
     match endpoint {
         #[cfg(unix)]
@@ -2016,6 +2070,67 @@ mod tests {
             !encoded
                 .windows("secret-marker-must-not-return".len())
                 .any(|window| window == b"secret-marker-must-not-return")
+        );
+        server_thread.join().unwrap();
+    }
+
+    struct RejectingCMCloudEnrollmentHandler;
+
+    impl ControlHandler for RejectingCMCloudEnrollmentHandler {
+        fn handle(&self, _command: ControlCommand) -> Result<ControlStatus, ControlError> {
+            Ok(status())
+        }
+
+        fn enroll_cmcloud(&self, pairing_code: &str) -> Result<serde_json::Value, ControlError> {
+            assert_eq!(pairing_code, "pairing-marker-must-not-return");
+            Err(ControlError::Application(String::from(
+                "CMCLOUD_ENROLLMENT_REJECTED",
+            )))
+        }
+    }
+
+    #[test]
+    fn cmcloud_enrollment_failures_preserve_stable_codes_without_pairing_material() {
+        let root = TestRoot::new("cmcloud-enrollment-error");
+        let endpoint = root.endpoint();
+        let server = ControlServer::bind(
+            endpoint.clone(),
+            Arc::new(RejectingCMCloudEnrollmentHandler),
+        )
+        .unwrap();
+        let server_thread = thread::spawn(move || server.serve_once_inline().unwrap());
+        let mut stream = connect_for_test(&endpoint);
+        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        write_json_frame(
+            &mut stream,
+            &RequestEnvelope {
+                version: CONTROL_PROTOCOL_VERSION,
+                request_id: request_id.clone(),
+                request: WireRequest::EnrollCmCloud {
+                    pairing_code: String::from("pairing-marker-must-not-return"),
+                },
+            },
+            deadline_after(Duration::from_secs(2)).unwrap(),
+        )
+        .unwrap();
+        let mut reader = FrameReader::new();
+        let response = reader
+            .read_json::<ServerEnvelope>(
+                &mut stream,
+                deadline_after(Duration::from_secs(2)).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(matches!(
+            response,
+            ServerEnvelope::Error { request_id: id, code, .. }
+                if id == request_id && code == "CMCLOUD_ENROLLMENT_REJECTED"
+        ));
+        assert!(
+            !encoded
+                .windows("pairing-marker-must-not-return".len())
+                .any(|window| window == b"pairing-marker-must-not-return")
         );
         server_thread.join().unwrap();
     }

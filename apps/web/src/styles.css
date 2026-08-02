@@ -564,10 +564,15 @@ h2 {
 }
 
 .diagnostics-command,
-.settings-controls {
+.settings-controls,
+.cmcloud-enrollment {
   display: grid;
   gap: 16px;
   padding: 18px;
+}
+
+.cmcloud-enrollment__hint {
+  padding: 0;
 }
 
 .diagnostics-command {

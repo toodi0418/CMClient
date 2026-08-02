@@ -24,6 +24,7 @@ export const messages = {
       updates: "更新",
       settings: "設定",
       diagnostics: "診斷",
+      cmcloud: "CMCloud",
     },
     gateway: {
       checking: "連線檢查中",
@@ -350,6 +351,25 @@ export const messages = {
         degraded: "降級",
       },
     },
+    cmcloud: {
+      status: "CMCloud 連線狀態",
+      state: "狀態",
+      endpoint: "服務端點",
+      installationGeneration: "安裝世代",
+      credentialVersion: "憑證版本",
+      enrollment: "裝置註冊",
+      pairDevice: "配對 CMCloud",
+      pairingCode: "配對碼",
+      pairingCodePlaceholder: "輸入 CMCloud 配對碼",
+      pairingCodeHint: "配對碼只會送至本機 Agent，完成後不會保留在此頁面。",
+      enroll: "開始配對",
+      stateLabel: {
+        not_configured: "未設定",
+        credentials_required: "需要憑證",
+        pending_enrollment: "等待註冊",
+        active: "已啟用",
+      },
+    },
     proxy: {
       title: "TCP Proxy",
       listener: "Listener",
@@ -505,6 +525,7 @@ export const messages = {
       updates: "Updates",
       settings: "Settings",
       diagnostics: "Diagnostics",
+      cmcloud: "CMCloud",
     },
     gateway: {
       checking: "Checking",
@@ -838,6 +859,26 @@ export const messages = {
         checking: "Checking",
         ready: "Ready",
         degraded: "Degraded",
+      },
+    },
+    cmcloud: {
+      status: "CMCloud connection status",
+      state: "State",
+      endpoint: "Service endpoint",
+      installationGeneration: "Installation generation",
+      credentialVersion: "Credential version",
+      enrollment: "Device enrollment",
+      pairDevice: "Pair with CMCloud",
+      pairingCode: "Pairing code",
+      pairingCodePlaceholder: "Enter the CMCloud pairing code",
+      pairingCodeHint:
+        "The pairing code is sent only to the local Agent and is cleared after the request.",
+      enroll: "Pair device",
+      stateLabel: {
+        not_configured: "Not configured",
+        credentials_required: "Credentials required",
+        pending_enrollment: "Pending enrollment",
+        active: "Active",
       },
     },
     proxy: {
