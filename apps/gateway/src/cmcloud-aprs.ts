@@ -8,7 +8,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const MAX_APRS_LOGIN_LINE_BYTES = 512;
 const MAX_APRS_GREETING_BYTES = 4 * 1024;
-const APRS_CALLSIGN = /^([A-Z0-9]{3,6})(?:-([1-9]|1[0-5]))?$/u;
+const APRS_CALLSIGN = /^([A-Z0-9]{3,6})(?:-([0-9]|1[0-5]))?$/u;
 
 export interface CmCloudDirectAprsCapability {
   readonly callsign: string;

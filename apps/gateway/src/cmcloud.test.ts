@@ -131,6 +131,39 @@ describe("CMCloud raw outbox", () => {
     database.close();
   });
 
+  it("settles the durable raw outbox when CMCloud drops an MQTT packet", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const client = createClient(database, () => socket);
+
+    client.start();
+    socket.open();
+    socket.message(serverHello(7));
+    const queued = client.enqueueRawFrame(
+      new Uint8Array([0, 9, 0xfe]),
+      CAPTURED_AT,
+    );
+    await settle();
+
+    socket.message({
+      type: "raw_ack",
+      messageId: queued.messageId,
+      receiptId: RECEIPT_ID,
+      lane: "live",
+      laneSequence: queued.laneSequence,
+      disposition: "dropped_mqtt",
+    });
+    await settle();
+
+    expect(client.status()).toMatchObject({ state: "ready", pendingOutbox: 0 });
+    expect(database.cmcloudRawOutbox.find(queued.messageId)).toMatchObject({
+      receiptId: RECEIPT_ID,
+      acknowledgedAt: expect.any(String),
+    });
+    await client.stop();
+    database.close();
+  });
+
   it("replays the exact stored body with a new epoch after reconnect", async () => {
     const database = new GatewayDatabase(":memory:");
     const sockets: FixtureSocket[] = [];

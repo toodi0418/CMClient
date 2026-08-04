@@ -895,7 +895,8 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       control.laneSequence !== inFlight.laneSequence ||
       !isUuid(control.receiptId) ||
       (control.disposition !== "received" &&
-        control.disposition !== "duplicate")
+        control.disposition !== "duplicate" &&
+        control.disposition !== "dropped_mqtt")
     ) {
       this.failTerminal("CMCLOUD_RAW_ACK_INVALID");
       return;

@@ -7,8 +7,53 @@ import {
   CmCloudDirectAprsEgressRuntime,
   parseCmCloudDirectAprsCapability,
 } from "./cmcloud-aprs";
+import { deriveAprsPasscode } from "./aprs-identity";
 
 describe("CMCloud direct APRS egress", () => {
+  it.each(["BU2GE", "BU2GE-0", "BU2GE-15"])(
+    "accepts the unsigned APRS SSID identity %s",
+    (callsign) => {
+      expect(
+        parseCmCloudDirectAprsCapability({ callsign, verified: true }),
+      ).toEqual({ callsign, verified: true });
+    },
+  );
+
+  it("rejects an APRS SSID above 15", () => {
+    expect(() =>
+      parseCmCloudDirectAprsCapability({
+        callsign: "BU2GE-16",
+        verified: true,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "CMCLOUD_DIRECT_APRS_CAPABILITY_INVALID",
+      }),
+    );
+  });
+
+  it.each(["BU2GE", "BU2GE-0"])(
+    "uses the CMCloud-granted zero-SSID identity %s in its APRS-IS login",
+    async (callsign) => {
+      const fixture = await startAprsFixture("verified", callsign);
+      const egress = new CmCloudDirectAprsEgressRuntime({
+        host: "127.0.0.1",
+        port: fixture.port,
+        timeoutMs: 1_000,
+        reconnectDelayMs: 100,
+      });
+      try {
+        await egress.configure({ callsign, verified: true });
+        expect(fixture.lines[0]).toBe(
+          `user ${callsign} pass ${deriveAprsPasscode("BU2GE")} vers CMClient 2.0`,
+        );
+      } finally {
+        await egress.stop();
+        await fixture.close();
+      }
+    },
+  );
+
   it("writes the CMCloud TNC2 payload byte-for-byte after verified APRS-IS login", async () => {
     const fixture = await startAprsFixture("verified");
     const egress = new CmCloudDirectAprsEgressRuntime({
@@ -161,7 +206,10 @@ class HangingAprsSocket extends EventEmitter {
   }
 }
 
-async function startAprsFixture(status: "verified" | "unverified"): Promise<{
+async function startAprsFixture(
+  status: "verified" | "unverified",
+  callsign = "BM5GSV-5",
+): Promise<{
   readonly port: number;
   readonly lines: string[];
   readonly wire: Buffer[];
@@ -174,7 +222,7 @@ async function startAprsFixture(status: "verified" | "unverified"): Promise<{
       lines.push(line);
       wire.push(raw);
       if (lines.length === 1) {
-        socket.write(`# logresp BM5GSV-5 ${status}, fixture\r\n`);
+        socket.write(`# logresp ${callsign} ${status}, fixture\r\n`);
       }
     });
   });
