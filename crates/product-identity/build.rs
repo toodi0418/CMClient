@@ -1,5 +1,9 @@
 use sha2::{Digest, Sha256};
-use std::{env, fs, path::Path, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() {
     for name in [
@@ -18,6 +22,7 @@ fn main() {
         .ancestors()
         .nth(2)
         .expect("product identity crate must be inside the repository");
+    emit_git_rerun_inputs(repository);
     let commit = input_or_git("CMCLIENT_BUILD_COMMIT", repository, "HEAD");
     let tree =
         env::var("CMCLIENT_BUILD_TREE").unwrap_or_else(|_| workspace_tree_identity(repository));
@@ -37,6 +42,43 @@ fn main() {
     emit("PACKAGE_PROFILE", &package_profile);
     emit("TARGET_ARCHITECTURE", &architecture);
     emit("TARGET_OS", &target_os);
+}
+
+// The identity deliberately includes Git state, but Cargo only watches paths
+// named by the build script. Watch both a detached HEAD and its symbolic ref,
+// plus the index for clean/dirty tree transitions.
+fn emit_git_rerun_inputs(repository: &Path) {
+    emit_git_rerun_if_present(repository, "HEAD");
+    emit_git_rerun_if_present(repository, "index");
+    emit_git_rerun_if_present(repository, "packed-refs");
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .expect("git is required to derive workspace product identity");
+    if output.status.success() {
+        let reference = String::from_utf8(output.stdout)
+            .expect("Git symbolic ref must be UTF-8")
+            .trim()
+            .to_owned();
+        if !reference.is_empty() {
+            emit_git_rerun_if_present(repository, &reference);
+        }
+    }
+}
+
+fn emit_git_rerun_if_present(repository: &Path, pathspec: &str) {
+    let output = git(repository, &["rev-parse", "--git-path", pathspec]);
+    let path = PathBuf::from(
+        String::from_utf8(output)
+            .expect("Git path must be UTF-8")
+            .trim(),
+    );
+    if path.is_file() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }
 
 fn workspace_tree_identity(repository: &Path) -> String {
