@@ -206,6 +206,42 @@ export const APRS_MONITOR_STATUSES = [
   "connected",
   "error",
 ] as const;
+
+export const CMCLOUD_DIRECT_APRS_CAPABILITY_STATES = [
+  "not_granted",
+  "granted",
+] as const;
+export const CMCLOUD_DIRECT_APRS_PROFILE_STATES = [
+  "missing",
+  "invalid",
+  "configured",
+] as const;
+export const CMCLOUD_DIRECT_APRS_BEACON_STATES = [
+  "missing_profile",
+  "waiting_for_aprs_is",
+  "active",
+  "error",
+  "stopped",
+] as const;
+
+export const CmCloudDirectAprsRuntimeStatusSchema = Type.Object(
+  {
+    capabilityState: Type.Union(
+      CMCLOUD_DIRECT_APRS_CAPABILITY_STATES.map((state) => Type.Literal(state)),
+    ),
+    profileState: Type.Union(
+      CMCLOUD_DIRECT_APRS_PROFILE_STATES.map((state) => Type.Literal(state)),
+    ),
+    // True only after APRS-IS returned a verified login for CMCloud's grant.
+    directAprsReady: Type.Boolean(),
+    beaconState: Type.Union(
+      CMCLOUD_DIRECT_APRS_BEACON_STATES.map((state) => Type.Literal(state)),
+    ),
+    lastErrorCode: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  },
+  { additionalProperties: false },
+);
+
 export const AprsRuntimeStatusSchema = Type.Object(
   {
     configured: Type.Boolean(),
@@ -223,6 +259,9 @@ export const AprsRuntimeStatusSchema = Type.Object(
     monitorLastActivityAt: Type.Optional(
       Type.String({ pattern: UTC_ISO_TIMESTAMP }),
     ),
+    // Present only when CMCloud owns direct APRS-IS egress. No endpoint or
+    // credential material is exposed through this management status.
+    directAprs: Type.Optional(CmCloudDirectAprsRuntimeStatusSchema),
     lastErrorCode: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
   },
   { additionalProperties: false },
@@ -298,6 +337,15 @@ export type AprsIgateSubmissionList = Static<
   typeof AprsIgateSubmissionListSchema
 >;
 export type AprsMonitorStatus = (typeof APRS_MONITOR_STATUSES)[number];
+export type CmCloudDirectAprsCapabilityState =
+  (typeof CMCLOUD_DIRECT_APRS_CAPABILITY_STATES)[number];
+export type CmCloudDirectAprsProfileState =
+  (typeof CMCLOUD_DIRECT_APRS_PROFILE_STATES)[number];
+export type CmCloudDirectAprsBeaconState =
+  (typeof CMCLOUD_DIRECT_APRS_BEACON_STATES)[number];
+export type CmCloudDirectAprsRuntimeStatus = Static<
+  typeof CmCloudDirectAprsRuntimeStatusSchema
+>;
 export type AprsRuntimeStatus = Static<typeof AprsRuntimeStatusSchema>;
 export type PositionDecision = Static<typeof PositionDecisionSchema>;
 export type NodePositionState = Static<typeof NodePositionStateSchema>;

@@ -13,6 +13,7 @@ import type {
   CmCloudDirectAprsDispatchResult,
   CmCloudDirectAprsEgress,
 } from "./cmcloud-aprs";
+import { CmCloudDirectAprsIgateRuntime } from "./cmcloud-igate";
 import { GatewayDatabase } from "./persistence/database";
 
 const INSTALLATION_ID = "00000000-0000-4000-8000-000000000001";
@@ -340,6 +341,57 @@ describe("CMCloud raw outbox", () => {
     database.close();
   });
 
+  it("starts the CMCloud-granted station family after the same direct egress verifies", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const egress = new FixtureDirectAprsEgress();
+    const directAprsIgate = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      tickIntervalMs: 60_000,
+    });
+    const client = createClient(
+      database,
+      () => socket,
+      egress,
+      directAprsIgate,
+    );
+
+    try {
+      client.start();
+      socket.open();
+      socket.message(
+        serverHello(7, {
+          aprsMode: "enabled",
+          directAprs: {
+            callsign: "BU2GE-4",
+            verified: true,
+            provision: {
+              callsignBase: "BU2GE",
+              ssid: 4,
+              symbolTable: "/",
+              symbolCode: "I",
+              latitude: 25.079_166_666_666_666,
+              longitude: 121.473_666_666_666_66,
+            },
+          },
+        }),
+      );
+      await waitUntil(() => egress.submissions.length === 6);
+
+      expect(egress.submissions[0]).toMatch(/^BU2GE-4>APTMAG,TCPIP\*:/u);
+      expect(client.status().directAprs).toMatchObject({
+        configured: true,
+        directAprsReady: true,
+        beaconState: "active",
+      });
+    } finally {
+      await client.stop();
+      database.close();
+    }
+  });
+
   it("retries a retryable APRS dispatch with the same dispatch ID", async () => {
     const database = new GatewayDatabase(":memory:");
     const socket = new FixtureSocket();
@@ -517,6 +569,7 @@ function createClient(
   database: GatewayDatabase,
   socketFactory: () => FixtureSocket,
   directAprsEgress?: CmCloudDirectAprsEgress,
+  directAprsIgate?: CmCloudDirectAprsIgateRuntime,
 ): CmCloudAgentClient {
   return new CmCloudAgentClient({
     url: "wss://cmcloud.tmmarc.org/agent/v1",
@@ -536,6 +589,7 @@ function createClient(
     reconnectInitialDelayMs: 10,
     reconnectMaximumDelayMs: 10,
     ...(directAprsEgress ? { directAprsEgress } : {}),
+    ...(directAprsIgate ? { directAprsIgate } : {}),
   });
 }
 
@@ -588,6 +642,16 @@ async function settle(): Promise<void> {
 
 async function delay(milliseconds: number): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error("fixture condition timed out");
+    }
+    await delay(5);
+  }
 }
 
 class FixtureSocket implements CmCloudSocket {

@@ -5,6 +5,7 @@ import { AprsIsRxClient, type AprsIsRxSession } from "./aprs-monitor.js";
 import { AprsIsTcpClient, AprsOutboxWorker } from "./aprs-outbox.js";
 import { AprsGatewayRuntime } from "./aprs-runtime.js";
 import { CmCloudDirectAprsEgressRuntime } from "./cmcloud-aprs.js";
+import { CmCloudDirectAprsIgateRuntime } from "./cmcloud-igate.js";
 import {
   CmCloudAgentClient,
   parseCmCloudRuntimeConfiguration,
@@ -64,6 +65,14 @@ export function createConfiguredCmCloudAgentClient(
   }
   assertCmCloudAuthorityConfiguration(environment);
   const directAprsEgress = createConfiguredCmCloudDirectAprsEgress(environment);
+  const directAprsIgate = directAprsEgress
+    ? new CmCloudDirectAprsIgateRuntime({
+        database: database.connection,
+        egress: directAprsEgress,
+        eventBus,
+        version: clientVersion,
+      })
+    : undefined;
   return new CmCloudAgentClient({
     ...configuration,
     clientVersion,
@@ -71,6 +80,7 @@ export function createConfiguredCmCloudAgentClient(
     events: eventBus,
     outbox: database.cmcloudRawOutbox,
     ...(directAprsEgress ? { directAprsEgress } : {}),
+    ...(directAprsIgate ? { directAprsIgate } : {}),
   });
 }
 

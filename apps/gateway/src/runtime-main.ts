@@ -279,6 +279,7 @@ export async function runGateway(): Promise<void> {
           bootstrap.cmCloudDeviceCredential,
         );
     cmCloud = activeCmCloud;
+    const directAprsIgate = activeCmCloud?.directAprsIgate();
     context.throwIfShutdownRequested();
 
     const callmesh = createConfiguredGatewayCallMeshClient(
@@ -318,7 +319,7 @@ export async function runGateway(): Promise<void> {
         activeDatabase,
         activeEvents,
         verifiedAprsState,
-        aprs,
+        aprs ?? directAprsIgate,
         activeCmCloud,
       );
       context.throwIfShutdownRequested();
@@ -364,9 +365,12 @@ export async function runGateway(): Promise<void> {
       },
       {
         listStationSubmissions: (limit) =>
-          aprs?.listStationSubmissions(limit) ?? [],
+          aprs?.listStationSubmissions(limit) ??
+          directAprsIgate?.listStationSubmissions(limit) ??
+          [],
         status: () =>
-          aprs?.status() ?? {
+          aprs?.status() ??
+          directAprsIgate?.aprsRuntimeStatus() ?? {
             configured: false,
             running: false,
             monitorStatus: "stopped",

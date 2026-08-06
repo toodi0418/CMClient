@@ -9,6 +9,7 @@ import {
   type CmCloudDirectAprsDispatchResult,
   type CmCloudDirectAprsEgress,
 } from "./cmcloud-aprs.js";
+import type { CmCloudDirectAprsIgateRuntime } from "./cmcloud-igate.js";
 import type { DomainEventBus } from "./events.js";
 
 export const CMCLOUD_AGENT_SUBPROTOCOL = "cmcloud.agent.v1";
@@ -399,6 +400,8 @@ export interface CmCloudAgentClientOptions extends CmCloudRuntimeConfiguration {
    * CallMesh mapping or a locally configured APRS callsign.
    */
   readonly directAprsEgress?: CmCloudDirectAprsEgress;
+  /** Schedules only CMCloud-granted station self-identification packets. */
+  readonly directAprsIgate?: CmCloudDirectAprsIgateRuntime;
 }
 
 export interface CmCloudAgentStatus {
@@ -407,6 +410,7 @@ export interface CmCloudAgentStatus {
     "stopped" | "connecting" | "awaiting_hello" | "ready" | "blocked";
   readonly pendingOutbox: number;
   readonly reconnectAttempt: number;
+  readonly directAprs?: ReturnType<CmCloudDirectAprsIgateRuntime["status"]>;
   readonly terminalCode?: string;
   readonly lastErrorCode?: string;
 }
@@ -508,6 +512,7 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       );
     }
     options.directAprsEgress?.setReadinessListener(() => {
+      options.directAprsIgate?.onEgressReadinessChanged();
       this.onDirectAprsReadinessChanged();
     });
   }
@@ -535,7 +540,16 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
         // The socket is already terminal. The outbox is intentionally retained.
       }
     }
+    await this.options.directAprsIgate?.stop();
     await this.options.directAprsEgress?.stop();
+  }
+
+  /**
+   * CMCloud-only mesh ingest uses this to feed decoded counters to the direct
+   * station telemetry family without constructing a legacy APRS runtime.
+   */
+  directAprsIgate(): CmCloudDirectAprsIgateRuntime | undefined {
+    return this.options.directAprsIgate;
   }
 
   enqueueRawFrame(body: Uint8Array, capturedAt: string): CmCloudRawOutboxEntry {
@@ -556,6 +570,9 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       state: this.state,
       pendingOutbox: this.options.outbox.pendingCount(),
       reconnectAttempt: this.reconnectAttempt,
+      ...(this.options.directAprsIgate
+        ? { directAprs: this.options.directAprsIgate.status() }
+        : {}),
       ...(this.terminalCode ? { terminalCode: this.terminalCode } : {}),
       ...(this.lastErrorCode ? { lastErrorCode: this.lastErrorCode } : {}),
     };
@@ -755,11 +772,11 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     session: CmCloudSession,
   ): Promise<void> {
     const egress = this.options.directAprsEgress;
-    if (!egress) return;
+    const capability =
+      session.aprsMode === "enabled" ? session.directAprs : undefined;
     try {
-      await egress.configure(
-        session.aprsMode === "enabled" ? session.directAprs : undefined,
-      );
+      await egress?.configure(capability);
+      await this.options.directAprsIgate?.configure(capability);
     } catch {
       this.recordConnectionError("CMCLOUD_DIRECT_APRS_CONFIGURATION_FAILED");
     }
@@ -1042,7 +1059,10 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     this.clearSessionTimers();
     this.inFlight = undefined;
     this.pendingAprsDispatchId = undefined;
-    void this.options.directAprsEgress?.configure(undefined);
+    void Promise.all([
+      this.options.directAprsIgate?.configure(undefined),
+      this.options.directAprsEgress?.configure(undefined),
+    ]).catch(() => undefined);
     if (this.running && !this.terminalCode) {
       this.scheduleReconnect();
     } else if (this.terminalCode) {

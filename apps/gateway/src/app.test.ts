@@ -177,6 +177,60 @@ describe("GatewayRuntime", () => {
     await app.close();
   });
 
+  it("serves CMCloud direct APRS readiness without treating its absent RX monitor as an outage", async () => {
+    const app = createGatewayApp(
+      new MemoryLogger(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        status: () => ({
+          configured: true,
+          running: true,
+          monitorStatus: "stopped" as const,
+          mappedCallsigns: 0,
+          pendingOutbox: 0,
+          failedOutbox: 0,
+          unconfirmedOutbox: 0,
+          pendingStationSubmissions: 1,
+          failedStationSubmissions: 0,
+          unconfirmedStationSubmissions: 0,
+          directAprs: {
+            capabilityState: "granted" as const,
+            profileState: "configured" as const,
+            directAprsReady: true,
+            beaconState: "active" as const,
+          },
+        }),
+        listStationSubmissions: () => [],
+      },
+    );
+
+    try {
+      const response = await app.inject("/api/v1/aprs");
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        configured: true,
+        running: true,
+        monitorStatus: "stopped",
+        pendingStationSubmissions: 1,
+      });
+      expect(response.json().directAprs).toEqual({
+        capabilityState: "granted",
+        profileState: "configured",
+        directAprsReady: true,
+        beaconState: "active",
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("normalizes Fastify validation, routing, and SSE negotiation errors", async () => {
     const app = createGatewayApp(new MemoryLogger());
     const responses = await Promise.all([

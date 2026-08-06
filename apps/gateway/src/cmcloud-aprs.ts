@@ -1,5 +1,11 @@
 import net, { type Socket } from "node:net";
 
+import { Value } from "@sinclair/typebox/value";
+import {
+  CallMeshProvisionSchema,
+  type CallMeshProvision,
+} from "@cmclient/contracts";
+
 import { deriveAprsPasscode } from "./aprs-identity.js";
 
 export const CMCLOUD_APRS_MAX_TNC2_BYTES = 510;
@@ -13,6 +19,12 @@ const APRS_CALLSIGN = /^([A-Z0-9]{3,6})(?:-([0-9]|1[0-5]))?$/u;
 export interface CmCloudDirectAprsCapability {
   readonly callsign: string;
   readonly verified: true;
+  /**
+   * A CMCloud-granted static iGate profile. It remains optional so an older
+   * server can still use direct centrally-selected dispatch, but a local
+   * station beacon is never emitted without this complete central profile.
+   */
+  readonly provision?: CallMeshProvision;
 }
 
 export interface CmCloudDirectAprsDispatchResult {
@@ -299,11 +311,79 @@ export function parseCmCloudDirectAprsCapability(
   if (candidate.verified !== true || typeof candidate.callsign !== "string") {
     throw new CmCloudDirectAprsError("CMCLOUD_DIRECT_APRS_CAPABILITY_INVALID");
   }
-  const callsign = candidate.callsign;
-  if (!APRS_CALLSIGN.test(callsign)) {
+  const callsign = normalizeCmCloudDirectAprsCallsign(candidate.callsign);
+  if (!callsign) {
     throw new CmCloudDirectAprsError("CMCLOUD_DIRECT_APRS_CAPABILITY_INVALID");
   }
-  return { callsign, verified: true };
+  let provision: CallMeshProvision | undefined;
+  if (candidate.provision !== undefined) {
+    provision = parseCmCloudDirectAprsProvision(candidate.provision, callsign);
+  }
+  return {
+    callsign,
+    verified: true,
+    ...(provision ? { provision } : {}),
+  };
+}
+
+function normalizeCmCloudDirectAprsCallsign(
+  value: unknown,
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const parsed = APRS_CALLSIGN.exec(value);
+  if (!parsed) return undefined;
+  const base = parsed[1]!;
+  const ssid = parsed[2] === undefined ? 0 : Number(parsed[2]);
+  return ssid === 0 ? base : `${base}-${ssid}`;
+}
+
+function parseCmCloudDirectAprsProvision(
+  value: unknown,
+  callsign: string,
+): CallMeshProvision {
+  if (!Value.Check(CallMeshProvisionSchema, value)) {
+    throw new CmCloudDirectAprsError("CMCLOUD_DIRECT_APRS_CAPABILITY_INVALID");
+  }
+  const candidate = value as CallMeshProvision;
+  if (
+    !Number.isInteger(candidate.ssid) ||
+    candidate.ssid < 0 ||
+    candidate.ssid > 15 ||
+    (candidate.ssid === 0
+      ? candidate.callsignBase
+      : `${candidate.callsignBase}-${candidate.ssid}`) !== callsign
+  ) {
+    throw new CmCloudDirectAprsError("CMCLOUD_DIRECT_APRS_CAPABILITY_INVALID");
+  }
+  return {
+    callsignBase: candidate.callsignBase,
+    ssid: candidate.ssid,
+    symbolTable: candidate.symbolTable,
+    symbolCode: candidate.symbolCode,
+    ...(candidate.symbolOverlay === undefined
+      ? {}
+      : { symbolOverlay: candidate.symbolOverlay }),
+    ...(candidate.comment === undefined ? {} : { comment: candidate.comment }),
+    ...(candidate.latitude === undefined
+      ? {}
+      : { latitude: candidate.latitude }),
+    ...(candidate.longitude === undefined
+      ? {}
+      : { longitude: candidate.longitude }),
+    ...(candidate.txPowerW === undefined
+      ? {}
+      : { txPowerW: candidate.txPowerW }),
+    ...(candidate.antennaGainDbi === undefined
+      ? {}
+      : { antennaGainDbi: candidate.antennaGainDbi }),
+    ...(candidate.antennaHeightM === undefined
+      ? {}
+      : { antennaHeightM: candidate.antennaHeightM }),
+    ...(candidate.altitudeMeters === undefined
+      ? {}
+      : { altitudeMeters: candidate.altitudeMeters }),
+    ...(candidate.phg === undefined ? {} : { phg: candidate.phg }),
+  };
 }
 
 function sameCapability(

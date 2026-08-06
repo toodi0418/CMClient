@@ -736,6 +736,23 @@ export class AprsIgateRepository {
     return this.list(limit).map(publicSubmission);
   }
 
+  listPublicForProvision(
+    provisionFingerprint: string,
+    limit = 200,
+  ): PublicAprsIgateSubmission[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw new AprsIgatePersistenceError();
+    }
+    validateFingerprint(provisionFingerprint);
+    try {
+      return this.listInternal(limit, provisionFingerprint).map(
+        publicSubmission,
+      );
+    } catch {
+      throw new AprsIgatePersistenceError();
+    }
+  }
+
   deliveryCounts(provisionFingerprint?: string): AprsIgateDeliveryCounts {
     if (provisionFingerprint !== undefined) {
       validateFingerprint(provisionFingerprint);

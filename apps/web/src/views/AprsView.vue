@@ -74,20 +74,92 @@ onMounted(() => void aprs.refresh());
                 <span
                   class="status-badge"
                   :data-state="
-                    aprs.status.running ? 'available' : 'unavailable'
+                    aprs.status.directAprs
+                      ? aprs.status.directAprs.beaconState
+                      : aprs.status.running
+                        ? 'available'
+                        : 'unavailable'
                   "
                 >
                   {{
-                    aprs.status.running
-                      ? t("aprs.running")
-                      : aprs.status.configured
-                        ? t("aprs.stopped")
-                        : t("common.notConfigured")
+                    aprs.status.directAprs
+                      ? t(
+                          `aprs.directBeaconState.${aprs.status.directAprs.beaconState}`,
+                        )
+                      : aprs.status.running
+                        ? t("aprs.running")
+                        : aprs.status.configured
+                          ? t("aprs.stopped")
+                          : t("common.notConfigured")
                   }}
                 </span>
               </dd>
             </div>
-            <div>
+            <div v-if="aprs.status.directAprs">
+              <dt>{{ t("aprs.directCapability") }}</dt>
+              <dd>
+                <span
+                  class="status-badge"
+                  :data-state="aprs.status.directAprs.capabilityState"
+                >
+                  {{
+                    t(
+                      `aprs.directCapabilityState.${aprs.status.directAprs.capabilityState}`,
+                    )
+                  }}
+                </span>
+              </dd>
+            </div>
+            <div v-if="aprs.status.directAprs">
+              <dt>{{ t("aprs.directProfile") }}</dt>
+              <dd>
+                <span
+                  class="status-badge"
+                  :data-state="aprs.status.directAprs.profileState"
+                >
+                  {{
+                    t(
+                      `aprs.directProfileState.${aprs.status.directAprs.profileState}`,
+                    )
+                  }}
+                </span>
+              </dd>
+            </div>
+            <div v-if="aprs.status.directAprs">
+              <dt>{{ t("aprs.directConnection") }}</dt>
+              <dd>
+                <span
+                  class="status-badge"
+                  :data-state="
+                    aprs.status.directAprs.directAprsReady
+                      ? 'available'
+                      : 'connecting'
+                  "
+                >
+                  {{
+                    aprs.status.directAprs.directAprsReady
+                      ? t("aprs.directReady")
+                      : t("aprs.directWaiting")
+                  }}
+                </span>
+              </dd>
+            </div>
+            <div v-if="aprs.status.directAprs">
+              <dt>{{ t("aprs.directBeacon") }}</dt>
+              <dd>
+                <span
+                  class="status-badge"
+                  :data-state="aprs.status.directAprs.beaconState"
+                >
+                  {{
+                    t(
+                      `aprs.directBeaconState.${aprs.status.directAprs.beaconState}`,
+                    )
+                  }}
+                </span>
+              </dd>
+            </div>
+            <div v-else>
               <dt>{{ t("aprs.monitor") }}</dt>
               <dd>
                 <span
@@ -98,7 +170,7 @@ onMounted(() => void aprs.refresh());
                 </span>
               </dd>
             </div>
-            <div>
+            <div v-if="!aprs.status.directAprs">
               <dt>{{ t("aprs.mappedCallsigns") }}</dt>
               <dd>{{ aprs.status.mappedCallsigns }}</dd>
             </div>
@@ -126,13 +198,17 @@ onMounted(() => void aprs.refresh());
               <dt>{{ t("aprs.stationUnconfirmed") }}</dt>
               <dd>{{ aprs.status.unconfirmedStationSubmissions }}</dd>
             </div>
-            <div v-if="aprs.status.monitorLastActivityAt">
+            <div
+              v-if="
+                !aprs.status.directAprs && aprs.status.monitorLastActivityAt
+              "
+            >
               <dt>{{ t("aprs.monitorActivityAt") }}</dt>
               <dd>
                 <time>{{ aprs.status.monitorLastActivityAt }}</time>
               </dd>
             </div>
-            <div>
+            <div v-if="!aprs.status.directAprs">
               <dt>{{ t("aprs.configured") }}</dt>
               <dd>
                 {{

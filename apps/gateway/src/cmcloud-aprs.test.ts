@@ -10,12 +10,16 @@ import {
 import { deriveAprsPasscode } from "./aprs-identity";
 
 describe("CMCloud direct APRS egress", () => {
-  it.each(["BU2GE", "BU2GE-0", "BU2GE-15"])(
-    "accepts the unsigned APRS SSID identity %s",
-    (callsign) => {
+  it.each([
+    ["BU2GE", "BU2GE"],
+    ["BU2GE-0", "BU2GE"],
+    ["BU2GE-15", "BU2GE-15"],
+  ])(
+    "normalizes the CMCloud direct APRS identity %s to %s",
+    (callsign, expected) => {
       expect(
         parseCmCloudDirectAprsCapability({ callsign, verified: true }),
-      ).toEqual({ callsign, verified: true });
+      ).toEqual({ callsign: expected, verified: true });
     },
   );
 
@@ -32,10 +36,13 @@ describe("CMCloud direct APRS egress", () => {
     );
   });
 
-  it.each(["BU2GE", "BU2GE-0"])(
-    "uses the CMCloud-granted zero-SSID identity %s in its APRS-IS login",
-    async (callsign) => {
-      const fixture = await startAprsFixture("verified", callsign);
+  it.each([
+    ["BU2GE", "BU2GE"],
+    ["BU2GE-0", "BU2GE"],
+  ])(
+    "uses the normalized zero-SSID identity %s as %s in its APRS-IS login",
+    async (callsign, expected) => {
+      const fixture = await startAprsFixture("verified", expected);
       const egress = new CmCloudDirectAprsEgressRuntime({
         host: "127.0.0.1",
         port: fixture.port,
@@ -45,7 +52,7 @@ describe("CMCloud direct APRS egress", () => {
       try {
         await egress.configure({ callsign, verified: true });
         expect(fixture.lines[0]).toBe(
-          `user ${callsign} pass ${deriveAprsPasscode("BU2GE")} vers CMClient 2.0`,
+          `user ${expected} pass ${deriveAprsPasscode("BU2GE")} vers CMClient 2.0`,
         );
       } finally {
         await egress.stop();
