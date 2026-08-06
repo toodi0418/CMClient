@@ -42,6 +42,7 @@ enum Command {
     Start,
     Stop,
     Restart,
+    Shutdown,
     Reset {
         #[arg(long)]
         confirm: String,
@@ -178,6 +179,7 @@ fn run(cli: Cli) -> ProcessExitCode {
         Command::Start => print_control_result(client.start(), json, quiet, style),
         Command::Stop => print_control_result(client.stop(), json, quiet, style),
         Command::Restart => print_control_result(client.restart(), json, quiet, style),
+        Command::Shutdown => print_control_result(client.shutdown_agent(), json, quiet, style),
         Command::Reset { confirm } => {
             if confirm != "operational-reset" {
                 if json {
@@ -1032,19 +1034,130 @@ fn control_error_exit(error: ControlError) -> ProcessExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, EventOutput, control_error_exit, doctor_is_degraded, event_matches_output,
-        normalize_secret_input, parse_secret_kind, parse_secret_kind_for_set, secret_kind_error,
-        update_summary,
+        Cli, Command, EventOutput, control_error_exit, doctor_is_degraded, event_matches_output,
+        normalize_secret_input, parse_secret_kind, parse_secret_kind_for_set, run,
+        secret_kind_error, update_summary,
     };
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
     use cmclient_cli_client::ExitCode;
     use cmclient_control_api::{
-        ControlError, ControlStatus, DiagnosticsControlBundle, GatewayControlStatus,
-        InternalComponent, ManagementWebControlStatus, UpdateControlJob, UpdateControlStatus,
-        compiled_component_identity,
+        ControlCommand, ControlEndpoint, ControlError, ControlHandler, ControlServer,
+        ControlStatus, DiagnosticsControlBundle, GatewayControlStatus, InternalComponent,
+        ManagementWebControlStatus, UpdateControlJob, UpdateControlStatus,
+        compiled_component_identity, default_local_endpoint,
     };
     use serde_json::json;
-    use std::process::ExitCode as ProcessExitCode;
+    use std::{
+        process::ExitCode as ProcessExitCode,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    struct ShutdownRecordingHandler {
+        commands: Mutex<Vec<ControlCommand>>,
+        response_sent: AtomicBool,
+    }
+
+    impl ShutdownRecordingHandler {
+        fn status() -> ControlStatus {
+            ControlStatus {
+                schema_version: 3,
+                agent: String::from("running"),
+                identity: compiled_component_identity(InternalComponent::Agent).unwrap(),
+                gateway: GatewayControlStatus::Running,
+                management_web: ManagementWebControlStatus::Disabled,
+                management_web_url: None,
+                uptime_seconds: 1,
+                latest_error_code: None,
+            }
+        }
+    }
+
+    impl ControlHandler for ShutdownRecordingHandler {
+        fn handle(&self, command: ControlCommand) -> Result<ControlStatus, ControlError> {
+            self.commands.lock().unwrap().push(command);
+            Ok(Self::status())
+        }
+
+        fn prepare_command(&self, command: ControlCommand) -> Result<ControlStatus, ControlError> {
+            self.commands.lock().unwrap().push(command);
+            Ok(Self::status())
+        }
+
+        fn command_response_sent(&self, command: ControlCommand) {
+            if command == ControlCommand::ShutdownAgent {
+                self.response_sent.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[test]
+    fn parses_shutdown_with_global_json_output() {
+        let cli = Cli::try_parse_from(["cmclient", "--json", "shutdown"])
+            .expect("shutdown command should parse");
+
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Shutdown));
+    }
+
+    #[test]
+    fn shutdown_command_dispatches_the_agent_shutdown_control_request() {
+        let root = std::env::temp_dir().join(format!(
+            "cmclient-cli-shutdown-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("test state root should create");
+        let endpoint = default_local_endpoint(&root).expect("endpoint should derive");
+        let endpoint_argument = match &endpoint {
+            ControlEndpoint::UnixSocket(path) => format!("unix://{}", path.display()),
+            ControlEndpoint::NamedPipe(name) => name.clone(),
+        };
+        let handler = Arc::new(ShutdownRecordingHandler {
+            commands: Mutex::new(Vec::new()),
+            response_sent: AtomicBool::new(false),
+        });
+        let server =
+            ControlServer::bind(endpoint, handler.clone()).expect("control server should bind");
+        let server_handler = handler.clone();
+        let server_thread = thread::spawn(move || {
+            while !server.poll_once().expect("server should poll") {}
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !server_handler.response_sent.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "shutdown response was not acknowledged"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let exit = run(Cli {
+            json: false,
+            quiet: true,
+            no_color: true,
+            timeout: 2,
+            endpoint: endpoint_argument,
+            command: Command::Shutdown,
+        });
+
+        assert_eq!(exit, ProcessExitCode::SUCCESS);
+        server_thread
+            .join()
+            .expect("control server should finish after shutdown response");
+        assert_eq!(
+            *handler.commands.lock().unwrap(),
+            vec![ControlCommand::ShutdownAgent]
+        );
+        std::fs::remove_dir_all(root).expect("test state root should remove");
+    }
 
     #[test]
     fn renders_an_idle_update_status_without_a_gateway_projection() {
