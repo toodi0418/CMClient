@@ -5292,6 +5292,21 @@ fn install_shutdown_signal_handler(controller: Arc<AgentController>) -> Result<(
         .map_err(|_| ControlError::CommandFailed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSignalRegistration {
+    Registered,
+    Unavailable,
+}
+
+fn classify_shutdown_signal_registration(
+    registration: Result<(), ControlError>,
+) -> ShutdownSignalRegistration {
+    match registration {
+        Ok(()) => ShutdownSignalRegistration::Registered,
+        Err(_) => ShutdownSignalRegistration::Unavailable,
+    }
+}
+
 fn serve() -> ExitCode {
     let environment = env::vars().collect::<BTreeMap<_, _>>();
     let paths = match RuntimePaths::from_environment(&environment) {
@@ -5378,10 +5393,15 @@ fn serve() -> ExitCode {
             return ExitCode::from(EX_CONFIG);
         }
     };
-    if let Err(error) = install_shutdown_signal_handler(Arc::clone(&controller)) {
-        controller.remember_error(&error);
-        eprintln!("{}", error.code());
-        return ExitCode::from(EX_CONFIG);
+    // Control IPC remains the authoritative shutdown mechanism. A headless
+    // Windows parent can legitimately reject console Ctrl-C registration, so
+    // that optional integration must not prevent the resident Agent from
+    // serving its control plane and Gateway.
+    if classify_shutdown_signal_registration(install_shutdown_signal_handler(Arc::clone(
+        &controller,
+    ))) == ShutdownSignalRegistration::Unavailable
+    {
+        eprintln!("AGENT_SHUTDOWN_SIGNAL_UNAVAILABLE");
     }
     let mut supervisor_worker = match SupervisorWorker::start(Arc::clone(&controller)) {
         Ok(worker) => worker,
@@ -5475,8 +5495,9 @@ mod tests {
         InternalComponent, LogLevel, LogPolicy, ManagementWebConfig, ManagementWebError,
         ManagementWebService, ResetKind, SecretKind, SetupApplyError, SetupCancellationToken,
         SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState, SetupStore,
-        StructuredLogSink, SupervisorWorker, agent_web_router, apply_aprs_environment,
-        apply_physical_qualification_environment, bridge_gateway_event_stream, cmcloud_enrollment,
+        ShutdownSignalRegistration, StructuredLogSink, SupervisorWorker, agent_web_router,
+        apply_aprs_environment, apply_physical_qualification_environment,
+        bridge_gateway_event_stream, classify_shutdown_signal_registration, cmcloud_enrollment,
         cmcloud_gateway_environment, compiled_component_identity, disable_proxy_for_setup,
         ensure_runtime_directories, gateway_json_projection, legacy_state_candidates,
         load_agent_config_after_migration_with, management_agent_events, management_web_profile,
@@ -10688,5 +10709,13 @@ mod tests {
             assert!(Instant::now() < deadline, "{message}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn shutdown_signal_registration_failure_is_nonfatal() {
+        assert_eq!(
+            classify_shutdown_signal_registration(Err(ControlError::CommandFailed)),
+            ShutdownSignalRegistration::Unavailable,
+        );
     }
 }
