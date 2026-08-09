@@ -775,6 +775,10 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     const capability =
       session.aprsMode === "enabled" ? session.directAprs : undefined;
     try {
+      // Stop the old family before the APRS socket can change identity. This
+      // prevents a readiness callback from emitting old station telemetry on
+      // a newly configured APRS-IS session.
+      this.options.directAprsIgate?.suspend();
       await egress?.configure(capability);
       await this.options.directAprsIgate?.configure(capability);
     } catch {
@@ -851,8 +855,16 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       };
     } else {
       this.pendingAprsDispatchId = dispatchId;
+      const recordTrackerForward =
+        this.options.directAprsIgate?.captureTrackerForwardRecorder();
       try {
         result = await egress.submit(control.data);
+        if (result.outcome === "submitted") {
+          // The central dispatch is a Tracker forward. Count it at the same
+          // successful socket-write boundary used by the legacy APRS outbox,
+          // against the station family that owned this dispatch at submission.
+          recordTrackerForward?.(this.clock().getTime());
+        }
       } catch {
         // A throw cannot prove the write remained before the APRS socket.
         result = {
@@ -1058,9 +1070,8 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     this.session = undefined;
     this.clearSessionTimers();
     this.inFlight = undefined;
-    this.pendingAprsDispatchId = undefined;
     void Promise.all([
-      this.options.directAprsIgate?.configure(undefined),
+      Promise.resolve(this.options.directAprsIgate?.suspend()),
       this.options.directAprsEgress?.configure(undefined),
     ]).catch(() => undefined);
     if (this.running && !this.terminalCode) {

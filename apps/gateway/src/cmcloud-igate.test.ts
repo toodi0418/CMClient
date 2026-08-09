@@ -138,6 +138,114 @@ describe("CMCloud direct APRS iGate family", () => {
     }
   });
 
+  it("includes successfully written CMCloud Tracker forwards in the next telemetry window", async () => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const database = new GatewayDatabase(":memory:");
+    const egress = new FixtureDirectAprsEgress();
+    const runtime = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      clock: () => now,
+      tickIntervalMs: 60_000,
+    });
+
+    try {
+      await runtime.configure(DIRECT_CAPABILITY);
+      egress.readyState = true;
+      await runtime.tick();
+      expect(egress.submissions).toContain(
+        "BU2GE-4>APTMAG,TCPIP*:T#001,0,0,0,0,0,00000000",
+      );
+
+      now = new Date("2026-08-06T12:01:00.000Z");
+      runtime.recordTrackerForward();
+      now = new Date("2026-08-06T12:10:00.000Z");
+      await runtime.tick();
+
+      expect(egress.submissions).toContain(
+        "BU2GE-4>APTMAG,TCPIP*:T#002,0,1,0,0,0,00000000",
+      );
+    } finally {
+      await runtime.stop();
+      database.close();
+    }
+  });
+
+  it("retains a captured Tracker forward through a transient CMCloud reconnect", async () => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const database = new GatewayDatabase(":memory:");
+    const egress = new FixtureDirectAprsEgress();
+    const runtime = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      clock: () => now,
+      tickIntervalMs: 60_000,
+    });
+
+    try {
+      await runtime.configure(DIRECT_CAPABILITY);
+      egress.readyState = true;
+      await runtime.tick();
+      const recordTrackerForward = runtime.captureTrackerForwardRecorder();
+      expect(recordTrackerForward).toBeTypeOf("function");
+
+      now = new Date("2026-08-06T12:01:00.000Z");
+      runtime.suspend();
+      recordTrackerForward?.(now.getTime());
+      await runtime.configure(DIRECT_CAPABILITY);
+
+      now = new Date("2026-08-06T12:10:00.000Z");
+      await runtime.tick();
+      expect(egress.submissions).toContain(
+        "BU2GE-4>APTMAG,TCPIP*:T#002,0,1,0,0,0,00000000",
+      );
+    } finally {
+      await runtime.stop();
+      database.close();
+    }
+  });
+
+  it("does not assign a captured Tracker forward to a replacement station profile", async () => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const database = new GatewayDatabase(":memory:");
+    const egress = new FixtureDirectAprsEgress();
+    const runtime = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      clock: () => now,
+      tickIntervalMs: 60_000,
+    });
+
+    try {
+      await runtime.configure({
+        ...DIRECT_CAPABILITY,
+        provision: { ...DIRECT_PROVISION, comment: "first" },
+      });
+      egress.readyState = true;
+      await runtime.tick();
+      const recordTrackerForward = runtime.captureTrackerForwardRecorder();
+      expect(recordTrackerForward).toBeTypeOf("function");
+
+      runtime.suspend();
+      now = new Date("2026-08-06T12:01:00.000Z");
+      await runtime.configure({
+        ...DIRECT_CAPABILITY,
+        provision: { ...DIRECT_PROVISION, comment: "replacement" },
+      });
+      recordTrackerForward?.(now.getTime());
+
+      expect(egress.submissions).toContain(
+        "BU2GE-4>APTMAG,TCPIP*:T#002,0,0,0,0,0,00000000",
+      );
+    } finally {
+      await runtime.stop();
+      database.close();
+    }
+  });
+
   it("uses the base callsign for a centrally granted zero SSID", async () => {
     const database = new GatewayDatabase(":memory:");
     const egress = new FixtureDirectAprsEgress();

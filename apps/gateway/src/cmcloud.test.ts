@@ -341,6 +341,231 @@ describe("CMCloud raw outbox", () => {
     database.close();
   });
 
+  it("records each successfully submitted CMCloud dispatch once for station telemetry", async () => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const egress = new FixtureDirectAprsEgress();
+    const directAprsIgate = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      clock: () => now,
+      tickIntervalMs: 60_000,
+    });
+    const client = createClient(
+      database,
+      () => socket,
+      egress,
+      directAprsIgate,
+      () => now,
+    );
+    const data = 'BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:!2353.32N/12042.60E"';
+
+    try {
+      client.start();
+      socket.open();
+      socket.message(
+        serverHello(7, {
+          aprsMode: "enabled",
+          directAprs: {
+            callsign: "BU2GE-4",
+            verified: true,
+            provision: {
+              callsignBase: "BU2GE",
+              ssid: 4,
+              symbolTable: "/",
+              symbolCode: "I",
+              latitude: 25.079_166_666_666_666,
+              longitude: 121.473_666_666_666_66,
+            },
+          },
+        }),
+      );
+      await waitUntil(() => egress.submissions.length === 6);
+      const submissionsBeforeDispatch = egress.submissions.length;
+
+      now = new Date("2026-08-06T12:01:00.000Z");
+      socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+      await settle();
+      expect(egress.submissions.slice(submissionsBeforeDispatch)).toEqual([
+        data,
+      ]);
+      expect(latestControl(socket, "aprs_dispatch_ack")).toEqual({
+        type: "aprs_dispatch_ack",
+        dispatchId: DISPATCH_ID,
+        outcome: "submitted",
+      });
+
+      socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+      await settle();
+      expect(egress.submissions.slice(submissionsBeforeDispatch)).toEqual([
+        data,
+      ]);
+
+      now = new Date("2026-08-06T12:10:00.000Z");
+      await directAprsIgate.tick();
+      expect(egress.submissions).toContain(
+        "BU2GE-4>APTMAG,TCPIP*:T#002,0,1,0,0,0,00000000",
+      );
+    } finally {
+      await client.stop();
+      database.close();
+    }
+  });
+
+  it("keeps a submitted dispatch single-counted through CMCloud reconnect", async () => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const database = new GatewayDatabase(":memory:");
+    const sockets: FixtureSocket[] = [];
+    const data = 'BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:!2353.32N/12042.60E"';
+    const egress = new DeferredDispatchEgress(data);
+    const directAprsIgate = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      clock: () => now,
+      tickIntervalMs: 60_000,
+    });
+    const client = createClient(
+      database,
+      () => {
+        const socket = new FixtureSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      egress,
+      directAprsIgate,
+      () => now,
+    );
+
+    try {
+      client.start();
+      const firstSocket = sockets[0];
+      if (!firstSocket) throw new Error("first fixture socket missing");
+      firstSocket.open();
+      firstSocket.message(directAprsHello(7));
+      await waitUntil(() => egress.submissions.length === 6);
+
+      now = new Date("2026-08-06T12:01:00.000Z");
+      firstSocket.message({
+        type: "aprs_dispatch",
+        dispatchId: DISPATCH_ID,
+        data,
+      });
+      await waitUntil(
+        () =>
+          egress.submissions.filter((submission) => submission === data)
+            .length === 1,
+      );
+      firstSocket.remoteClose();
+      await waitUntil(() => sockets.length === 2);
+      const secondSocket = sockets[1];
+      if (!secondSocket) throw new Error("second fixture socket missing");
+      secondSocket.open();
+      secondSocket.message(directAprsHello(8));
+      await settle();
+
+      secondSocket.message({
+        type: "aprs_dispatch",
+        dispatchId: DISPATCH_ID,
+        data,
+      });
+      await settle();
+      expect(
+        egress.submissions.filter((submission) => submission === data),
+      ).toHaveLength(1);
+      expect(latestControl(secondSocket, "aprs_dispatch_ack")).toBeUndefined();
+
+      egress.resolveDispatch();
+      await settle();
+      secondSocket.message({
+        type: "aprs_dispatch",
+        dispatchId: DISPATCH_ID,
+        data,
+      });
+      await settle();
+      expect(
+        egress.submissions.filter((submission) => submission === data),
+      ).toHaveLength(1);
+      expect(latestControl(secondSocket, "aprs_dispatch_ack")).toEqual({
+        type: "aprs_dispatch_ack",
+        dispatchId: DISPATCH_ID,
+        outcome: "submitted",
+      });
+
+      now = new Date("2026-08-06T12:10:00.000Z");
+      await directAprsIgate.tick();
+      expect(egress.submissions).toContain(
+        "BU2GE-4>APTMAG,TCPIP*:T#002,0,1,0,0,0,00000000",
+      );
+    } finally {
+      await client.stop();
+      database.close();
+    }
+  });
+
+  it.each([
+    [
+      "retryable failure",
+      {
+        outcome: "retryable_failure" as const,
+        errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
+      },
+    ],
+    [
+      "uncertain write",
+      {
+        outcome: "uncertain" as const,
+        errorCode: "CMCLOUD_DIRECT_APRS_WRITE_UNCERTAIN",
+      },
+    ],
+  ])("does not count a %s as a Tracker forward", async (_label, outcome) => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const data = 'BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:!2353.32N/12042.60E"';
+    const egress = new DeferredDispatchEgress(data, outcome);
+    const directAprsIgate = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      clock: () => now,
+      tickIntervalMs: 60_000,
+    });
+    const client = createClient(
+      database,
+      () => socket,
+      egress,
+      directAprsIgate,
+      () => now,
+    );
+
+    try {
+      client.start();
+      socket.open();
+      socket.message(directAprsHello(7));
+      await waitUntil(() => egress.submissions.length === 6);
+
+      now = new Date("2026-08-06T12:01:00.000Z");
+      socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
+      await settle();
+      expect(latestControl(socket, "aprs_dispatch_ack")).toMatchObject({
+        dispatchId: DISPATCH_ID,
+        outcome: outcome.outcome,
+      });
+
+      now = new Date("2026-08-06T12:10:00.000Z");
+      await directAprsIgate.tick();
+      expect(egress.submissions).toContain(
+        "BU2GE-4>APTMAG,TCPIP*:T#002,0,0,0,0,0,00000000",
+      );
+    } finally {
+      await client.stop();
+      database.close();
+    }
+  });
+
   it("starts the CMCloud-granted station family after the same direct egress verifies", async () => {
     const database = new GatewayDatabase(":memory:");
     const socket = new FixtureSocket();
@@ -570,6 +795,7 @@ function createClient(
   socketFactory: () => FixtureSocket,
   directAprsEgress?: CmCloudDirectAprsEgress,
   directAprsIgate?: CmCloudDirectAprsIgateRuntime,
+  clock?: () => Date,
 ): CmCloudAgentClient {
   return new CmCloudAgentClient({
     url: "wss://cmcloud.tmmarc.org/agent/v1",
@@ -588,8 +814,27 @@ function createClient(
     },
     reconnectInitialDelayMs: 10,
     reconnectMaximumDelayMs: 10,
+    ...(clock ? { clock } : {}),
     ...(directAprsEgress ? { directAprsEgress } : {}),
     ...(directAprsIgate ? { directAprsIgate } : {}),
+  });
+}
+
+function directAprsHello(connectionEpoch: number): Record<string, unknown> {
+  return serverHello(connectionEpoch, {
+    aprsMode: "enabled",
+    directAprs: {
+      callsign: "BU2GE-4",
+      verified: true,
+      provision: {
+        callsignBase: "BU2GE",
+        ssid: 4,
+        symbolTable: "/",
+        symbolCode: "I",
+        latitude: 25.079_166_666_666_666,
+        longitude: 121.473_666_666_666_66,
+      },
+    },
   });
 }
 
@@ -772,6 +1017,57 @@ class FixtureDirectAprsEgress implements CmCloudDirectAprsEgress {
   async submit(data: string): Promise<CmCloudDirectAprsDispatchResult> {
     this.submissions.push(data);
     return this.result;
+  }
+
+  async stop(): Promise<void> {
+    this.capability = undefined;
+    this.listener?.();
+  }
+}
+
+class DeferredDispatchEgress implements CmCloudDirectAprsEgress {
+  capability: CmCloudDirectAprsCapability | undefined;
+  readonly submissions: string[] = [];
+  private listener: (() => void) | undefined;
+  private resolvePending:
+    ((result: CmCloudDirectAprsDispatchResult) => void) | undefined;
+
+  constructor(
+    private readonly deferredData: string,
+    private readonly dispatchOutcome?: CmCloudDirectAprsDispatchResult,
+  ) {}
+
+  setReadinessListener(listener: () => void): void {
+    this.listener = listener;
+  }
+
+  async configure(capability?: CmCloudDirectAprsCapability): Promise<void> {
+    this.capability = capability;
+    this.listener?.();
+  }
+
+  ready(): boolean {
+    return this.capability !== undefined;
+  }
+
+  submit(data: string): Promise<CmCloudDirectAprsDispatchResult> {
+    this.submissions.push(data);
+    if (data !== this.deferredData) {
+      return Promise.resolve({ outcome: "submitted" });
+    }
+    if (this.dispatchOutcome) {
+      return Promise.resolve(this.dispatchOutcome);
+    }
+    return new Promise((resolve) => {
+      this.resolvePending = resolve;
+    });
+  }
+
+  resolveDispatch(): void {
+    const resolve = this.resolvePending;
+    this.resolvePending = undefined;
+    if (!resolve) throw new Error("deferred APRS dispatch missing");
+    resolve({ outcome: "submitted" });
   }
 
   async stop(): Promise<void> {
