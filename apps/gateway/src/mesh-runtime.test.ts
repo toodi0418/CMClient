@@ -131,6 +131,90 @@ describe("MeshGatewayRuntime", () => {
     database.close();
   });
 
+  it("counts only direct RF packets in APRS telemetry summaries", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const schema = await loadMeshtasticSchema();
+    const transport = new FixtureTransport();
+    const summaries: string[] = [];
+    const runtime = createRuntime(
+      database,
+      schema,
+      transport,
+      new DomainEventBus(),
+      undefined,
+      undefined,
+      (type) => summaries.push(type),
+    );
+    const frameEvent = (frame: Uint8Array) => ({
+      kind: "frame" as const,
+      frame,
+      receivedAt: "2026-07-18T00:00:05.000Z",
+      sessionConnectedAt: "2026-07-18T00:00:01.000Z",
+    });
+
+    runtime.start();
+    transport.emit(
+      frameEvent(schema.fromRadio.encode({ configCompleteId: 12 }).finish()),
+    );
+    transport.emit(frameEvent(schema.fromRadio.encode({}).finish()));
+    const directRfMechanisms: ReadonlyArray<readonly [number, number]> = [
+      [201, 1],
+      [202, 2],
+      [203, 3],
+      [204, 4],
+    ];
+    for (const [packetId, transportMechanism] of directRfMechanisms) {
+      transport.emit(
+        frameEvent(positionFrame(schema, 32, { packetId, transportMechanism })),
+      );
+    }
+    transport.emit(
+      frameEvent(
+        positionFrame(schema, 32, {
+          packetId: 205,
+          viaMqtt: true,
+          transportMechanism: 1,
+        }),
+      ),
+    );
+    transport.emit(
+      frameEvent(
+        positionFrame(schema, 32, {
+          packetId: 206,
+          transportMechanism: 5,
+        }),
+      ),
+    );
+    transport.emit(
+      frameEvent(
+        positionFrame(schema, 32, {
+          packetId: 207,
+          transportMechanism: 6,
+        }),
+      ),
+    );
+    transport.emit(
+      frameEvent(
+        positionFrame(schema, 32, {
+          packetId: 208,
+          transportMechanism: 7,
+        }),
+      ),
+    );
+    transport.emit(frameEvent(positionFrame(schema, 32, { packetId: 209 })));
+
+    expect(summaries).toEqual([
+      "position",
+      "position",
+      "position",
+      "position",
+      "position",
+    ]);
+
+    await runtime.stop();
+    database.close();
+  });
+
   it("queues byte-identical FromRadio before decoding and leaves APRS authority to CMCloud", async () => {
     const database = new GatewayDatabase(":memory:");
     database.callmeshMappings.replace([
@@ -1091,7 +1175,12 @@ function tableCount(database: GatewayDatabase, table: string): number {
 function positionFrame(
   schema: MeshtasticSchema,
   precisionBits: number,
-  options: { packetId?: number; sequenceNumber?: number } = {},
+  options: {
+    packetId?: number;
+    sequenceNumber?: number;
+    transportMechanism?: number;
+    viaMqtt?: boolean;
+  } = {},
 ): Uint8Array {
   const payload = schema.position
     .encode({
@@ -1116,6 +1205,10 @@ function positionFrame(
         rxRssi: -80,
         hopLimit: 3,
         hopStart: 4,
+        ...(options.transportMechanism === undefined
+          ? {}
+          : { transportMechanism: options.transportMechanism }),
+        ...(options.viaMqtt === undefined ? {} : { viaMqtt: options.viaMqtt }),
         decoded: { portnum: schema.portNum.values.POSITION_APP, payload },
       },
     })

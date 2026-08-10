@@ -23,7 +23,7 @@ import { DomainEventBus } from "./events";
 import { GatewayDatabase } from "./persistence/database";
 
 describe("AprsGatewayRuntime", () => {
-  it("submits and independently confirms the complete initial station family", async () => {
+  it("submits and confirms the initial station family before telemetry is due", async () => {
     const database = new GatewayDatabase(":memory:");
     const state = aprsState("a", "N0CALL-7", 42);
     const transmitted: string[] = [];
@@ -57,28 +57,23 @@ describe("AprsGatewayRuntime", () => {
       },
     });
 
-    runtime.recordDecodedSummary(
-      "position",
-      Date.parse("2026-07-18T00:00:09.000Z"),
-    );
     await runtime.refreshMonitor();
     await runtime.igateNow();
 
     const infos = transmitted.map((line) => parseCmClientAprsLine(line)?.info);
-    expect(infos).toHaveLength(6);
+    expect(infos).toHaveLength(5);
     expect(infos[0]).toMatch(/^!/u);
     expect(infos[1]).toContain(":PARM.ALL_PKTS_10M");
     expect(infos[2]).toContain(":UNIT.cnt,cnt,cnt,cnt,cnt");
     expect(infos[3]).toContain(":EQNS.0,1,0");
-    expect(infos[4]).toBe("T#001,1,0,1,0,0,00000000");
-    expect(infos[5]).toBe(">TMAG Client v2.0.0-test");
+    expect(infos[4]).toBe(">TMAG Client v2.0.0-test");
     expect(
       database.connection
         .prepare(
           "SELECT delivery_status, COUNT(*) AS count FROM aprs_igate_submissions GROUP BY delivery_status",
         )
         .all(),
-    ).toEqual([{ delivery_status: "submitted", count: 6 }]);
+    ).toEqual([{ delivery_status: "submitted", count: 5 }]);
 
     expect(filter).toBe(APRS_RX_FILTER_EXPRESSION);
     for (const line of transmitted) {
@@ -91,7 +86,32 @@ describe("AprsGatewayRuntime", () => {
           "SELECT delivery_status, COUNT(*) AS count FROM aprs_igate_submissions GROUP BY delivery_status",
         )
         .all(),
-    ).toEqual([{ delivery_status: "observer_confirmed", count: 6 }]);
+    ).toEqual([{ delivery_status: "observer_confirmed", count: 5 }]);
+    expect(
+      database.connection
+        .prepare(
+          "SELECT last_successful_telemetry_sequence AS sequence FROM aprs_igate_state",
+        )
+        .get(),
+    ).toBeUndefined();
+    expect(
+      eventTypes.filter((type) => type === "aprs.igate.submitted"),
+    ).toHaveLength(5);
+    expect(
+      eventTypes.filter((type) => type === "aprs.igate.observer_confirmed"),
+    ).toHaveLength(5);
+
+    runtime.recordDecodedSummary(
+      "position",
+      Date.parse("2026-07-18T00:01:10.000Z"),
+    );
+    now = new Date("2026-07-18T00:10:10.000Z");
+    await runtime.igateNow();
+    expect(transmitted).toHaveLength(7);
+    expect(parseCmClientAprsLine(transmitted[5]!)?.info).toBe(infos[0]);
+    expect(parseCmClientAprsLine(transmitted[6]!)?.info).toBe(
+      "T#001,1,0,1,0,0,00000000",
+    );
     expect(
       database.connection
         .prepare(
@@ -99,20 +119,6 @@ describe("AprsGatewayRuntime", () => {
         )
         .get(),
     ).toEqual({ sequence: 1 });
-    expect(
-      eventTypes.filter((type) => type === "aprs.igate.submitted"),
-    ).toHaveLength(6);
-    expect(
-      eventTypes.filter((type) => type === "aprs.igate.observer_confirmed"),
-    ).toHaveLength(6);
-
-    now = new Date("2026-07-18T00:11:10.000Z");
-    await runtime.igateNow();
-    expect(transmitted).toHaveLength(8);
-    expect(parseCmClientAprsLine(transmitted[6]!)?.info).toBe(infos[0]);
-    expect(parseCmClientAprsLine(transmitted[7]!)?.info).toBe(
-      "T#002,0,0,0,0,0,00000000",
-    );
 
     await runtime.stop();
     database.close();
@@ -154,12 +160,12 @@ describe("AprsGatewayRuntime", () => {
     onActivity?.();
     await runtime.igateNow();
 
-    expect(transmitted).toHaveLength(8);
-    expect(parseCmClientAprsLine(transmitted[6]!)?.info).toBe(
+    expect(transmitted).toHaveLength(7);
+    expect(parseCmClientAprsLine(transmitted[5]!)?.info).toBe(
       initialBeaconInfo,
     );
-    expect(parseCmClientAprsLine(transmitted[7]!)?.info).toBe(
-      "T#002,0,0,0,0,0,00000000",
+    expect(parseCmClientAprsLine(transmitted[6]!)?.info).toBe(
+      "T#001,0,0,0,0,0,00000000",
     );
     expect(
       database.connection
@@ -244,7 +250,7 @@ describe("AprsGatewayRuntime", () => {
     const initialFlushes = flushes;
     const initialSends = sends;
     expect(initialFlushes).toBeGreaterThanOrEqual(1);
-    expect(initialSends).toBe(6);
+    expect(initialSends).toBe(5);
 
     now = new Date("2026-07-18T00:00:00.099Z");
     firstActivity?.();
@@ -317,13 +323,13 @@ describe("AprsGatewayRuntime", () => {
           "SELECT delivery_status, COUNT(*) AS count FROM aprs_igate_submissions WHERE local_write_completed_at IS NOT NULL AND observer_confirmed_at >= local_write_completed_at GROUP BY delivery_status",
         )
         .all(),
-    ).toEqual([{ delivery_status: "observer_confirmed", count: 6 }]);
+    ).toEqual([{ delivery_status: "observer_confirmed", count: 5 }]);
     expect(
       eventTypes.filter((type) => type === "aprs.igate.submitted"),
-    ).toHaveLength(6);
+    ).toHaveLength(5);
     expect(
       eventTypes.filter((type) => type === "aprs.igate.observer_confirmed"),
-    ).toHaveLength(6);
+    ).toHaveLength(5);
 
     await runtime.stop();
     database.close();
@@ -363,7 +369,7 @@ describe("AprsGatewayRuntime", () => {
 
     await runtime.refreshMonitor();
     await runtime.igateNow();
-    expect(transmitted).toHaveLength(6);
+    expect(transmitted).toHaveLength(5);
     for (const line of transmitted) {
       onLine?.(line.replace("TCPIP*:", "TCPIP*,qAC,T2TEST:"));
     }
@@ -371,17 +377,17 @@ describe("AprsGatewayRuntime", () => {
     sessionGeneration = 2;
     now = new Date("2026-07-18T00:11:10.000Z");
     await runtime.igateNow();
-    expect(transmitted).toHaveLength(7);
-    expect(parseCmClientAprsLine(transmitted[6]!)?.info).toBe(
-      "T#002,0,0,0,0,0,00000000",
+    expect(transmitted).toHaveLength(6);
+    expect(parseCmClientAprsLine(transmitted[5]!)?.info).toBe(
+      "T#001,0,0,0,0,0,00000000",
     );
 
     now = new Date("2026-07-18T00:21:10.000Z");
     await runtime.igateNow();
-    expect(transmitted).toHaveLength(9);
-    expect(parseCmClientAprsLine(transmitted[7]!)?.info).toMatch(/^!/u);
-    expect(parseCmClientAprsLine(transmitted[8]!)?.info).toBe(
-      "T#003,0,0,0,0,0,00000000",
+    expect(transmitted).toHaveLength(8);
+    expect(parseCmClientAprsLine(transmitted[6]!)?.info).toMatch(/^!/u);
+    expect(parseCmClientAprsLine(transmitted[7]!)?.info).toBe(
+      "T#002,0,0,0,0,0,00000000",
     );
 
     await runtime.stop();
@@ -428,7 +434,7 @@ describe("AprsGatewayRuntime", () => {
     expect(sends).toBe(0);
 
     session.resolve({ close: async () => undefined });
-    await waitFor(() => flushes === 1 && sends === 6);
+    await waitFor(() => flushes === 1 && sends === 5);
 
     await runtime.stop();
     database.close();
@@ -639,7 +645,7 @@ describe("AprsGatewayRuntime", () => {
 
     await runtime.refreshMonitor();
     await runtime.igateNow();
-    expect(sends).toBe(6);
+    expect(sends).toBe(5);
     expect(flushes).toBe(1);
 
     terminated.resolve();
@@ -647,7 +653,7 @@ describe("AprsGatewayRuntime", () => {
     now = new Date("2026-07-18T00:11:00.000Z");
     await runtime.igateNow();
     await runtime.flushNow();
-    expect(sends).toBe(6);
+    expect(sends).toBe(5);
     expect(flushes).toBe(1);
 
     await runtime.stop();

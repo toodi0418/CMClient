@@ -382,7 +382,7 @@ describe("CMCloud raw outbox", () => {
           },
         }),
       );
-      await waitUntil(() => egress.submissions.length === 6);
+      await waitUntil(() => egress.submissions.length === 5);
       const submissionsBeforeDispatch = egress.submissions.length;
 
       now = new Date("2026-08-06T12:01:00.000Z");
@@ -406,7 +406,7 @@ describe("CMCloud raw outbox", () => {
       now = new Date("2026-08-06T12:10:00.000Z");
       await directAprsIgate.tick();
       expect(egress.submissions).toContain(
-        "BU2GE-4>APTMAG,TCPIP*:T#002,0,1,0,0,0,00000000",
+        "BU2GE-4>APTMAG,TCPIP*:T#001,0,1,0,0,0,00000000",
       );
     } finally {
       await client.stop();
@@ -445,7 +445,7 @@ describe("CMCloud raw outbox", () => {
       if (!firstSocket) throw new Error("first fixture socket missing");
       firstSocket.open();
       firstSocket.message(directAprsHello(7));
-      await waitUntil(() => egress.submissions.length === 6);
+      await waitUntil(() => egress.submissions.length === 5);
 
       now = new Date("2026-08-06T12:01:00.000Z");
       firstSocket.message({
@@ -497,7 +497,7 @@ describe("CMCloud raw outbox", () => {
       now = new Date("2026-08-06T12:10:00.000Z");
       await directAprsIgate.tick();
       expect(egress.submissions).toContain(
-        "BU2GE-4>APTMAG,TCPIP*:T#002,0,1,0,0,0,00000000",
+        "BU2GE-4>APTMAG,TCPIP*:T#001,0,1,0,0,0,00000000",
       );
     } finally {
       await client.stop();
@@ -545,7 +545,7 @@ describe("CMCloud raw outbox", () => {
       client.start();
       socket.open();
       socket.message(directAprsHello(7));
-      await waitUntil(() => egress.submissions.length === 6);
+      await waitUntil(() => egress.submissions.length === 5);
 
       now = new Date("2026-08-06T12:01:00.000Z");
       socket.message({ type: "aprs_dispatch", dispatchId: DISPATCH_ID, data });
@@ -558,7 +558,7 @@ describe("CMCloud raw outbox", () => {
       now = new Date("2026-08-06T12:10:00.000Z");
       await directAprsIgate.tick();
       expect(egress.submissions).toContain(
-        "BU2GE-4>APTMAG,TCPIP*:T#002,0,0,0,0,0,00000000",
+        "BU2GE-4>APTMAG,TCPIP*:T#001,0,0,0,0,0,00000000",
       );
     } finally {
       await client.stop();
@@ -603,7 +603,7 @@ describe("CMCloud raw outbox", () => {
           },
         }),
       );
-      await waitUntil(() => egress.submissions.length === 6);
+      await waitUntil(() => egress.submissions.length === 5);
 
       expect(egress.submissions[0]).toMatch(/^BU2GE-4>APTMAG,TCPIP\*:/u);
       expect(client.status().directAprs).toMatchObject({

@@ -150,7 +150,7 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     );
   });
 
-  it("classifies every Legacy packet type into rolling one-minute buckets", async () => {
+  it("classifies direct packet types after one full telemetry window", async () => {
     const family = new AprsIgateFamily({ provision, version: "2.0.0" });
     const positionTypes = [
       "position",
@@ -174,28 +174,32 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       "neighborinfo",
       "keyverification",
     ];
-    for (const type of [
-      ...positionTypes,
-      ...messageTypes,
-      ...controlTypes,
-      "unknown",
-    ]) {
-      family.recordDecodedSummary(type, START - 9 * MINUTE_MS);
-    }
-    family.recordTrackerForward(START - 2 * MINUTE_MS);
-
     const writes = await family.onVerifiedLogin(START, successfulWriter());
     expect(writes.map((write) => write.packet.kind)).toEqual([
       "beacon",
       "telemetry-parm",
       "telemetry-unit",
       "telemetry-eqns",
-      "telemetry-data",
       "status",
     ]);
-    expect(writes[4]?.packet.data.endsWith(":T#001,22,1,6,4,11,00000000")).toBe(
-      true,
+    for (const type of [
+      ...positionTypes,
+      ...messageTypes,
+      ...controlTypes,
+      "unknown",
+    ]) {
+      family.recordDecodedSummary(type, START + MINUTE_MS);
+    }
+    family.recordTrackerForward(START + 2 * MINUTE_MS);
+
+    const telemetry = await family.runDue(
+      START + APRS_IGATE_TELEMETRY_INTERVAL_MS,
+      successfulWriter(),
     );
+    expect(
+      telemetry.find((write) => write.packet.kind === "telemetry-data")?.packet
+        .data,
+    ).toContain(":T#001,22,1,6,4,11,00000000");
     expect(family.persistentState()).toEqual({
       lastSuccessfulTelemetrySequence: 1,
     });
@@ -203,12 +207,40 @@ describe("Legacy-compatible APRS iGate packet family", () => {
 
   it("excludes a bucket at the exact preceding-window boundary", async () => {
     const family = new AprsIgateFamily({ provision, version: "2.0.0" });
-    family.recordDecodedSummary("position", START - 10 * MINUTE_MS);
-    family.recordDecodedSummary("message", START - 10 * MINUTE_MS - 1);
-    const writes = await family.onVerifiedLogin(START, successfulWriter());
-    expect(writes[4]?.packet.data.endsWith(":T#001,1,0,1,0,0,00000000")).toBe(
-      true,
+    await family.onVerifiedLogin(START, successfulWriter());
+    family.recordDecodedSummary("position", START);
+    family.recordDecodedSummary("message", START - 1);
+    const writes = await family.runDue(
+      START + APRS_IGATE_TELEMETRY_INTERVAL_MS,
+      successfulWriter(),
     );
+    expect(
+      writes.find((write) => write.packet.kind === "telemetry-data")?.packet
+        .data,
+    ).toContain(":T#001,1,0,1,0,0,00000000");
+  });
+
+  it("emits zero telemetry only after a quiet full observation window", async () => {
+    const family = new AprsIgateFamily({ provision, version: "2.0.0" });
+    const initial = await family.onVerifiedLogin(START, successfulWriter());
+    expect(initial.map((write) => write.packet.kind)).not.toContain(
+      "telemetry-data",
+    );
+    const beforeWindow = await family.runDue(
+      START + APRS_IGATE_TELEMETRY_INTERVAL_MS - 1,
+      successfulWriter(),
+    );
+    expect(beforeWindow.map((write) => write.packet.kind)).not.toContain(
+      "telemetry-data",
+    );
+    const atBoundary = await family.runDue(
+      START + APRS_IGATE_TELEMETRY_INTERVAL_MS,
+      successfulWriter(),
+    );
+    expect(
+      atBoundary.find((write) => write.packet.kind === "telemetry-data")?.packet
+        .data,
+    ).toContain(":T#001,0,0,0,0,0,00000000");
   });
 
   it("emits only after verification and at exact successful-write boundaries", async () => {
@@ -218,7 +250,17 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       beaconIntervalMs: 1,
     });
     expect(await family.runDue(START, successfulWriter())).toEqual([]);
-    await family.onVerifiedLogin(START, successfulWriter());
+    expect(
+      (await family.onVerifiedLogin(START, successfulWriter())).map(
+        (write) => write.packet.kind,
+      ),
+    ).toEqual([
+      "beacon",
+      "telemetry-parm",
+      "telemetry-unit",
+      "telemetry-eqns",
+      "status",
+    ]);
     expect(
       await family.runDue(START + MINUTE_MS - 1, successfulWriter()),
     ).toEqual([]);
@@ -306,14 +348,9 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     );
   });
 
-  it("retries a family with no successful anchor on verified reconnect", async () => {
+  it("does not pull telemetry forward on reconnect before the initial window", async () => {
     const family = new AprsIgateFamily({ provision, version: "2.0.0" });
-    const first = await family.onVerifiedLogin(
-      START,
-      writerFailing("telemetry-data"),
-    );
-    expect(first[4]?.packet.data).toContain(":T#001,");
-    expect(first[4]?.successful).toBe(false);
+    await family.onVerifiedLogin(START, successfulWriter());
     expect(family.persistentState().lastSuccessfulTelemetrySequence).toBe(0);
 
     family.onDisconnected();
@@ -321,10 +358,26 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       START + MINUTE_MS,
       successfulWriter(),
     );
-    expect(reconnect.map((write) => write.packet.kind)).toEqual([
-      "telemetry-data",
-    ]);
-    expect(reconnect[0]?.packet.data).toContain(":T#002,");
+    expect(reconnect.map((write) => write.packet.kind)).toEqual([]);
+
+    const failed = await family.runDue(
+      START + APRS_IGATE_TELEMETRY_INTERVAL_MS,
+      writerFailing("telemetry-data"),
+    );
+    expect(
+      failed.find((write) => write.packet.kind === "telemetry-data"),
+    ).toMatchObject({
+      packet: { data: expect.stringContaining(":T#001,") },
+      successful: false,
+    });
+
+    family.onDisconnected();
+    const retry = await family.onVerifiedLogin(
+      START + APRS_IGATE_TELEMETRY_INTERVAL_MS + MINUTE_MS,
+      successfulWriter(),
+    );
+    expect(retry.map((write) => write.packet.kind)).toEqual(["telemetry-data"]);
+    expect(retry[0]?.packet.data).toContain(":T#002,");
     expect(family.persistentState().lastSuccessfulTelemetrySequence).toBe(2);
   });
 
@@ -350,7 +403,7 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       lastSuccessfulTelemetrySequence: 41,
     });
     await family.onVerifiedLogin(START, successfulWriter());
-    expect(family.persistentState().lastSuccessfulTelemetrySequence).toBe(42);
+    expect(family.persistentState().lastSuccessfulTelemetrySequence).toBe(41);
 
     const failed = await family.runDue(
       START + APRS_IGATE_TELEMETRY_INTERVAL_MS,
@@ -360,8 +413,8 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       packet: { kind: "telemetry-data" },
       successful: false,
     });
-    expect(failed.at(-1)?.packet.data).toContain(":T#043,");
-    expect(family.persistentState().lastSuccessfulTelemetrySequence).toBe(42);
+    expect(failed.at(-1)?.packet.data).toContain(":T#042,");
+    expect(family.persistentState().lastSuccessfulTelemetrySequence).toBe(41);
 
     const retried = await family.runDue(
       START + 2 * APRS_IGATE_TELEMETRY_INTERVAL_MS,
@@ -370,20 +423,23 @@ describe("Legacy-compatible APRS iGate packet family", () => {
     const telemetry = retried.find(
       (write) => write.packet.kind === "telemetry-data",
     );
-    expect(telemetry?.packet.data).toContain(":T#044,");
-    expect(family.persistentState().lastSuccessfulTelemetrySequence).toBe(44);
+    expect(telemetry?.packet.data).toContain(":T#043,");
+    expect(family.persistentState().lastSuccessfulTelemetrySequence).toBe(43);
 
     const restarted = new AprsIgateFamily({
       provision,
       version: "2.0.0",
-      lastSuccessfulTelemetrySequence: 42,
+      lastSuccessfulTelemetrySequence: 41,
     });
-    const restartWrites = await restarted.onVerifiedLogin(
-      START,
+    await restarted.onVerifiedLogin(START, successfulWriter());
+    const restartWrites = await restarted.runDue(
+      START + APRS_IGATE_TELEMETRY_INTERVAL_MS,
       successfulWriter(),
     );
     expect(
-      restartWrites[4]?.packet.data.endsWith(":T#043,0,0,0,0,0,00000000"),
+      restartWrites
+        .find((write) => write.packet.kind === "telemetry-data")
+        ?.packet.data.endsWith(":T#042,0,0,0,0,0,00000000"),
     ).toBe(true);
   });
 
@@ -415,6 +471,10 @@ describe("Legacy-compatible APRS iGate packet family", () => {
 
     const first = new AprsIgateFamily({ provision, version: "2.0.0" });
     await first.onVerifiedLogin(START, successfulWriter());
+    await first.runDue(
+      START + APRS_IGATE_TELEMETRY_INTERVAL_MS,
+      successfulWriter(),
+    );
     const firstSequence =
       first.persistentState().lastSuccessfulTelemetrySequence;
     repository.persistLastSuccessfulSequence(
@@ -432,11 +492,15 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       lastSuccessfulTelemetrySequence:
         restoredRepository.loadLastSuccessfulSequence("N1GATE-10"),
     });
-    const restartWrites = await restarted.onVerifiedLogin(
-      START + MINUTE_MS,
+    await restarted.onVerifiedLogin(START + MINUTE_MS, successfulWriter());
+    const restartWrites = await restarted.runDue(
+      START + MINUTE_MS + APRS_IGATE_TELEMETRY_INTERVAL_MS,
       successfulWriter(),
     );
-    expect(restartWrites[4]?.packet.data).toContain(":T#002,");
+    expect(
+      restartWrites.find((write) => write.packet.kind === "telemetry-data")
+        ?.packet.data,
+    ).toContain(":T#002,");
     database.close();
   });
 
@@ -826,8 +890,10 @@ describe("Legacy-compatible APRS iGate packet family", () => {
       lastSuccessfulTelemetrySequence:
         restartedRepository.loadLastSuccessfulSequence("N1GATE-10"),
     });
-    const restartWrites = await restartedFamily.onVerifiedLogin(
-      Date.parse(observedAt) + 2,
+    const restartedAt = Date.parse(observedAt) + 2;
+    await restartedFamily.onVerifiedLogin(restartedAt, () => true);
+    const restartWrites = await restartedFamily.runDue(
+      restartedAt + APRS_IGATE_TELEMETRY_INTERVAL_MS,
       () => true,
     );
     expect(

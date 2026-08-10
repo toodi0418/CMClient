@@ -973,6 +973,7 @@ export class AprsIgateFamily {
   private nextDefinitionAt = Number.NEGATIVE_INFINITY;
   private nextTelemetryAt = Number.NEGATIVE_INFINITY;
   private nextStatusAt = Number.NEGATIVE_INFINITY;
+  private firstTelemetryReadyAt: number | undefined;
   private telemetrySequence: number;
   private lastSuccessfulTelemetrySequence: number;
 
@@ -1032,7 +1033,8 @@ export class AprsIgateFamily {
     if (!reconnect) {
       this.nextBeaconAt = nowMs;
       this.nextDefinitionAt = nowMs;
-      this.nextTelemetryAt = nowMs;
+      this.firstTelemetryReadyAt = nowMs + APRS_IGATE_TELEMETRY_INTERVAL_MS;
+      this.nextTelemetryAt = this.firstTelemetryReadyAt;
       this.nextStatusAt = nowMs;
     } else {
       this.nextBeaconAt =
@@ -1042,11 +1044,14 @@ export class AprsIgateFamily {
         APRS_IGATE_DEFINITION_INTERVAL_MS,
         nowMs,
       );
-      this.nextTelemetryAt = dueFromSuccessfulAnchor(
-        this.lastTelemetryAt,
-        APRS_IGATE_TELEMETRY_INTERVAL_MS,
-        nowMs,
-      );
+      this.nextTelemetryAt =
+        this.lastTelemetryAt === undefined
+          ? this.nextInitialTelemetryAttemptAt(nowMs)
+          : dueFromSuccessfulAnchor(
+              this.lastTelemetryAt,
+              APRS_IGATE_TELEMETRY_INTERVAL_MS,
+              nowMs,
+            );
       this.nextStatusAt = this.statusSuccessfullyWritten
         ? nowMs + APRS_IGATE_STATUS_INTERVAL_MS
         : nowMs;
@@ -1145,6 +1150,13 @@ export class AprsIgateFamily {
       this.nextTelemetryAt,
       this.nextStatusAt,
     );
+  }
+
+  private nextInitialTelemetryAttemptAt(nowMs: number): number {
+    return this.firstTelemetryReadyAt !== undefined &&
+      nowMs < this.firstTelemetryReadyAt
+      ? this.firstTelemetryReadyAt
+      : nowMs;
   }
 
   private bucket(timestampMs: number): TelemetryBucket {

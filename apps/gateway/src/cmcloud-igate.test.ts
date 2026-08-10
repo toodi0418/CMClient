@@ -27,7 +27,7 @@ const DIRECT_CAPABILITY: CmCloudDirectAprsCapability = {
 };
 
 describe("CMCloud direct APRS iGate family", () => {
-  it("emits the initial beacon, status, and telemetry through the one verified direct egress", async () => {
+  it("emits the initial beacon, status, and definitions while deferring telemetry", async () => {
     const database = new GatewayDatabase(":memory:");
     const egress = new FixtureDirectAprsEgress();
     const runtime = new CmCloudDirectAprsIgateRuntime({
@@ -43,16 +43,14 @@ describe("CMCloud direct APRS iGate family", () => {
       egress.readyState = true;
       await runtime.tick();
 
-      expect(egress.submissions).toHaveLength(6);
+      expect(egress.submissions).toHaveLength(5);
       expect(egress.submissions[0]).toBe(
         "BU2GE-4>APTMAG,TCPIP*:!2504.75N/12128.42EI/A=000033",
       );
       expect(egress.submissions).toContain(
         "BU2GE-4>APTMAG,TCPIP*:>TMAG Client v2.0.0",
       );
-      expect(egress.submissions).toContain(
-        "BU2GE-4>APTMAG,TCPIP*:T#001,0,0,0,0,0,00000000",
-      );
+      expect(egress.submissions).not.toContain(expect.stringContaining(":T#"));
       expect(
         database.connection
           .prepare(
@@ -71,18 +69,13 @@ describe("CMCloud direct APRS iGate family", () => {
             packet_kind: "status",
             delivery_status: "submitted",
           }),
-          expect.objectContaining({
-            callsign: "BU2GE-4",
-            packet_kind: "telemetry-data",
-            delivery_status: "submitted",
-          }),
         ]),
       );
       expect(runtime.aprsRuntimeStatus()).toMatchObject({
         configured: true,
         running: true,
         monitorStatus: "stopped",
-        pendingStationSubmissions: 6,
+        pendingStationSubmissions: 5,
         failedStationSubmissions: 0,
         unconfirmedStationSubmissions: 0,
         directAprs: {
@@ -98,7 +91,7 @@ describe("CMCloud direct APRS iGate family", () => {
         directAprsReady: true,
         beaconState: "active",
       });
-      expect(runtime.listStationSubmissions()).toHaveLength(6);
+      expect(runtime.listStationSubmissions()).toHaveLength(5);
     } finally {
       await runtime.stop();
       database.close();
@@ -154,9 +147,7 @@ describe("CMCloud direct APRS iGate family", () => {
       await runtime.configure(DIRECT_CAPABILITY);
       egress.readyState = true;
       await runtime.tick();
-      expect(egress.submissions).toContain(
-        "BU2GE-4>APTMAG,TCPIP*:T#001,0,0,0,0,0,00000000",
-      );
+      expect(egress.submissions).not.toContain(expect.stringContaining(":T#"));
 
       now = new Date("2026-08-06T12:01:00.000Z");
       runtime.recordTrackerForward();
@@ -164,7 +155,7 @@ describe("CMCloud direct APRS iGate family", () => {
       await runtime.tick();
 
       expect(egress.submissions).toContain(
-        "BU2GE-4>APTMAG,TCPIP*:T#002,0,1,0,0,0,00000000",
+        "BU2GE-4>APTMAG,TCPIP*:T#001,0,1,0,0,0,00000000",
       );
     } finally {
       await runtime.stop();
@@ -199,7 +190,7 @@ describe("CMCloud direct APRS iGate family", () => {
       now = new Date("2026-08-06T12:10:00.000Z");
       await runtime.tick();
       expect(egress.submissions).toContain(
-        "BU2GE-4>APTMAG,TCPIP*:T#002,0,1,0,0,0,00000000",
+        "BU2GE-4>APTMAG,TCPIP*:T#001,0,1,0,0,0,00000000",
       );
     } finally {
       await runtime.stop();
@@ -237,8 +228,10 @@ describe("CMCloud direct APRS iGate family", () => {
       });
       recordTrackerForward?.(now.getTime());
 
+      now = new Date("2026-08-06T12:11:00.000Z");
+      await runtime.tick();
       expect(egress.submissions).toContain(
-        "BU2GE-4>APTMAG,TCPIP*:T#002,0,0,0,0,0,00000000",
+        "BU2GE-4>APTMAG,TCPIP*:T#001,0,0,0,0,0,00000000",
       );
     } finally {
       await runtime.stop();
@@ -300,9 +293,9 @@ describe("CMCloud direct APRS iGate family", () => {
         provision: { ...DIRECT_PROVISION, comment: "second" },
       });
 
-      expect(egress.submissions).toHaveLength(12);
-      expect(runtime.listStationSubmissions()).toHaveLength(6);
-      expect(runtime.aprsRuntimeStatus().pendingStationSubmissions).toBe(6);
+      expect(egress.submissions).toHaveLength(10);
+      expect(runtime.listStationSubmissions()).toHaveLength(5);
+      expect(runtime.aprsRuntimeStatus().pendingStationSubmissions).toBe(5);
     } finally {
       await runtime.stop();
       database.close();

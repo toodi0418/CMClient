@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 import type {
   CallMeshMapping,
   MeshtasticRuntimeStatus,
+  NormalizedFromRadio,
   PositionCanonicalEvent,
   PositionDecision,
   PositionDecisionCode,
@@ -36,6 +37,13 @@ import type {
   TransportEvent,
   TransportFrameEvent,
 } from "./transport/types.js";
+
+const RF_TRANSPORT_MECHANISMS = new Set([
+  "TRANSPORT_LORA",
+  "TRANSPORT_LORA_ALT1",
+  "TRANSPORT_LORA_ALT2",
+  "TRANSPORT_LORA_ALT3",
+]);
 
 export interface MeshGatewayRuntimeOptions {
   applicationDecoder: MeshtasticApplicationDecoder;
@@ -296,15 +304,17 @@ export class MeshGatewayRuntime {
       this.options.meshNetworkId,
       observation,
     );
-    try {
-      this.options.aprs?.onDecodedSummary?.(
-        aprsSummaryType(normalizedFromRadio.packet?.portNum, payload.kind),
-        Date.parse(serverIngestedAt),
-      );
-    } catch (error) {
-      this.publish("aprs.igate.counter.error", {
-        code: stableErrorCode(error, "APRS_IGATE_COUNTER_FAILED"),
-      });
+    if (isDirectRfPacketForAprsTelemetry(normalizedFromRadio)) {
+      try {
+        this.options.aprs?.onDecodedSummary?.(
+          aprsSummaryType(normalizedFromRadio.packet?.portNum, payload.kind),
+          Date.parse(serverIngestedAt),
+        );
+      } catch (error) {
+        this.publish("aprs.igate.counter.error", {
+          code: stableErrorCode(error, "APRS_IGATE_COUNTER_FAILED"),
+        });
+      }
     }
     this.publish("mesh.observation.persisted", {
       observationId: observation.id,
@@ -721,6 +731,20 @@ export class MeshGatewayRuntime {
     }
     return `${prefix}-${value}`;
   }
+}
+
+function isDirectRfPacketForAprsTelemetry(
+  normalizedFromRadio: NormalizedFromRadio,
+): boolean {
+  if (normalizedFromRadio.kind !== "packet" || !normalizedFromRadio.packet) {
+    return false;
+  }
+  const { transportMechanism, viaMqtt } = normalizedFromRadio.packet;
+  return (
+    viaMqtt !== true &&
+    (transportMechanism === undefined ||
+      RF_TRANSPORT_MECHANISMS.has(transportMechanism))
+  );
 }
 
 function aprsSummaryType(
