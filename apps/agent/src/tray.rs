@@ -157,7 +157,7 @@ fn run(stop: Arc<AtomicBool>, endpoint: ControlEndpoint, desktop_process_file: P
         .with_menu(Box::new(menu))
         .with_tooltip(tray_tooltip(&endpoint))
         .with_menu_on_left_click(false);
-    if let Ok(icon) = Icon::from_rgba(tray_rgba(), 16, 16) {
+    if let Ok(icon) = Icon::from_rgba(tray_rgba(), TRAY_ICON_SIZE, TRAY_ICON_SIZE) {
         tray_builder = tray_builder.with_icon(icon);
     }
     let tray = match tray_builder.build() {
@@ -287,20 +287,16 @@ fn tooltip_for_status(
 }
 
 #[cfg(target_os = "windows")]
+const TRAY_ICON_SIZE: u32 = 32;
+
+// The tray uses the same transparent logo as the Desktop bundle. The pixels
+// are embedded so the headless Agent does not need a filesystem asset.
+#[cfg(target_os = "windows")]
+const TRAY_ICON_RGBA: &[u8; 32 * 32 * 4] = include_bytes!("../assets/tray-icon-32.rgba");
+
+#[cfg(target_os = "windows")]
 fn tray_rgba() -> Vec<u8> {
-    let mut pixels = vec![0_u8; 16 * 16 * 4];
-    for y in 0..16 {
-        for x in 0..16 {
-            let offset = (y * 16 + x) * 4;
-            let border = x == 0 || y == 0 || x == 15 || y == 15;
-            pixels[offset..offset + 4].copy_from_slice(if border {
-                &[20, 91, 99, 255]
-            } else {
-                &[240, 249, 247, 255]
-            });
-        }
-    }
-    pixels
+    TRAY_ICON_RGBA.to_vec()
 }
 
 #[cfg(target_os = "windows")]
@@ -597,10 +593,25 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn generated_icon_is_bounded_and_opaque() {
+    fn tray_icon_uses_the_transparent_logo() {
         let pixels = super::tray_rgba();
-        assert_eq!(pixels.len(), 16 * 16 * 4);
-        assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert_eq!(pixels.len(), 32 * 32 * 4);
+        assert!(
+            pixels.chunks_exact(4).any(|pixel| pixel[3] == 0),
+            "logo corners should remain transparent",
+        );
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel[1] > pixel[0] && pixel[1] > pixel[2]),
+            "logo should retain its green network mark",
+        );
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel[2] > pixel[0] && pixel[1] > pixel[0]),
+            "logo should retain its cyan ring",
+        );
     }
 
     #[cfg(target_os = "windows")]
