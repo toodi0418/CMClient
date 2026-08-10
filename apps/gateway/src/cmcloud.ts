@@ -460,6 +460,10 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
   private ackTimer: NodeJS.Timeout | undefined;
   private flushPromise: Promise<void> | undefined;
   private flushRequested = false;
+  // Fences asynchronous APRS-IS reconfiguration from a prior CMCloud socket.
+  // The scheduler must be restored immediately on a new hello even while the
+  // APRS-IS login is still in progress.
+  private directAprsConfigurationGeneration = 0;
   private pendingAprsDispatchId: string | undefined;
   private readonly completedAprsDispatches = new Map<
     string,
@@ -526,6 +530,7 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
 
   async stop(): Promise<void> {
     this.running = false;
+    this.directAprsConfigurationGeneration += 1;
     this.clearTimers();
     this.session = undefined;
     this.inFlight = undefined;
@@ -774,22 +779,56 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     const egress = this.options.directAprsEgress;
     const capability =
       session.aprsMode === "enabled" ? session.directAprs : undefined;
+
+    const generation = ++this.directAprsConfigurationGeneration;
+    let egressConfiguration: Promise<void> | undefined;
     try {
-      // Stop the old family before the APRS socket can change identity. This
-      // prevents a readiness callback from emitting old station telemetry on
-      // a newly configured APRS-IS session.
-      this.options.directAprsIgate?.suspend();
-      await egress?.configure(capability);
+      // `configure()` synchronously revokes the previous egress identity,
+      // then may wait for a TCP/APRS-IS login. Do not hold the station
+      // scheduler behind that network operation: it must remain running and
+      // wait for the readiness callback so reconnects cannot leave it stopped.
+      egressConfiguration = egress?.configure(capability);
+    } catch {
+      this.recordConnectionError("CMCLOUD_DIRECT_APRS_CONFIGURATION_FAILED");
+    }
+    try {
+      if (!this.isCurrentDirectAprsConfiguration(generation, socket, session)) {
+        return;
+      }
       await this.options.directAprsIgate?.configure(capability);
     } catch {
       this.recordConnectionError("CMCLOUD_DIRECT_APRS_CONFIGURATION_FAILED");
     }
-    if (this.socket === socket && this.session === session) {
+    if (egressConfiguration) {
+      void egressConfiguration.catch(() => {
+        if (
+          this.isCurrentDirectAprsConfiguration(generation, socket, session)
+        ) {
+          this.recordConnectionError(
+            "CMCLOUD_DIRECT_APRS_CONFIGURATION_FAILED",
+          );
+        }
+      });
+    }
+    if (this.isCurrentDirectAprsConfiguration(generation, socket, session)) {
       void this.sendHeartbeat(socket).catch(() => {
         this.recordConnectionError("CMCLOUD_HEARTBEAT_SEND_FAILED");
         this.closeCurrentSocket(1011, "heartbeat send failed");
       });
     }
+  }
+
+  private isCurrentDirectAprsConfiguration(
+    generation: number,
+    socket: CmCloudSocket,
+    session: CmCloudSession,
+  ): boolean {
+    return (
+      this.directAprsConfigurationGeneration === generation &&
+      this.socket === socket &&
+      this.session === session &&
+      !this.terminalCode
+    );
   }
 
   private onDirectAprsReadinessChanged(): void {
@@ -1066,14 +1105,20 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
 
   private detachSocket(socket: CmCloudSocket): void {
     if (this.socket !== socket) return;
+    this.directAprsConfigurationGeneration += 1;
     this.socket = undefined;
     this.session = undefined;
     this.clearSessionTimers();
     this.inFlight = undefined;
-    void Promise.all([
-      Promise.resolve(this.options.directAprsIgate?.suspend()),
-      this.options.directAprsEgress?.configure(undefined),
-    ]).catch(() => undefined);
+    this.options.directAprsIgate?.suspend();
+    try {
+      void this.options.directAprsEgress?.configure(undefined).catch(() => {
+        // The socket is already fenced. A later CMCloud hello will establish
+        // a fresh egress configuration.
+      });
+    } catch {
+      // An egress implementation must not prevent the CMCloud reconnect.
+    }
     if (this.running && !this.terminalCode) {
       this.scheduleReconnect();
     } else if (this.terminalCode) {

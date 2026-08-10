@@ -617,6 +617,109 @@ describe("CMCloud raw outbox", () => {
     }
   });
 
+  it("keeps the CMCloud station scheduler running while APRS-IS login is pending", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const egress = new DeferredConfigurationEgress();
+    const directAprsIgate = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      tickIntervalMs: 60_000,
+    });
+    const client = createClient(
+      database,
+      () => socket,
+      egress,
+      directAprsIgate,
+    );
+
+    try {
+      client.start();
+      socket.open();
+      socket.message(directAprsHello(7));
+      await settle();
+
+      expect(client.status().directAprs).toMatchObject({
+        configured: true,
+        running: true,
+        directAprsReady: false,
+        beaconState: "waiting_for_aprs_is",
+      });
+
+      egress.resolveReady();
+      await waitUntil(() => egress.submissions.length === 5);
+      expect(client.status().directAprs).toMatchObject({
+        configured: true,
+        running: true,
+        directAprsReady: true,
+        beaconState: "active",
+      });
+    } finally {
+      await client.stop();
+      database.close();
+    }
+  });
+
+  it("restores the CMCloud station scheduler after reconnect while APRS-IS login is pending", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const sockets: FixtureSocket[] = [];
+    const egress = new DeferredConfigurationEgress();
+    const directAprsIgate = new CmCloudDirectAprsIgateRuntime({
+      database: database.connection,
+      egress,
+      version: "2.0.0",
+      tickIntervalMs: 60_000,
+    });
+    const client = createClient(
+      database,
+      () => {
+        const socket = new FixtureSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      egress,
+      directAprsIgate,
+    );
+
+    try {
+      client.start();
+      const firstSocket = sockets[0];
+      if (!firstSocket) throw new Error("first fixture socket missing");
+      firstSocket.open();
+      firstSocket.message(directAprsHello(7));
+      await settle();
+      expect(client.status().directAprs?.running).toBe(true);
+
+      firstSocket.remoteClose();
+      await waitUntil(() => sockets.length === 2);
+      const secondSocket = sockets[1];
+      if (!secondSocket) throw new Error("second fixture socket missing");
+      secondSocket.open();
+      secondSocket.message(directAprsHello(8));
+      await settle();
+
+      expect(client.status().directAprs).toMatchObject({
+        configured: true,
+        running: true,
+        directAprsReady: false,
+        beaconState: "waiting_for_aprs_is",
+      });
+
+      egress.resolveReady();
+      await waitUntil(() => egress.submissions.length === 5);
+      expect(client.status().directAprs).toMatchObject({
+        configured: true,
+        running: true,
+        directAprsReady: true,
+        beaconState: "active",
+      });
+    } finally {
+      await client.stop();
+      database.close();
+    }
+  });
+
   it("retries a retryable APRS dispatch with the same dispatch ID", async () => {
     const database = new GatewayDatabase(":memory:");
     const socket = new FixtureSocket();
@@ -1073,5 +1176,53 @@ class DeferredDispatchEgress implements CmCloudDirectAprsEgress {
   async stop(): Promise<void> {
     this.capability = undefined;
     this.listener?.();
+  }
+}
+
+class DeferredConfigurationEgress implements CmCloudDirectAprsEgress {
+  capability: CmCloudDirectAprsCapability | undefined;
+  readonly submissions: string[] = [];
+  private readyState = false;
+  private listener: (() => void) | undefined;
+  private readonly pendingConfigurations: Array<() => void> = [];
+
+  setReadinessListener(listener: () => void): void {
+    this.listener = listener;
+  }
+
+  configure(capability?: CmCloudDirectAprsCapability): Promise<void> {
+    this.capability = capability;
+    this.readyState = false;
+    this.listener?.();
+    if (!capability) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.pendingConfigurations.push(resolve);
+    });
+  }
+
+  ready(): boolean {
+    return this.readyState;
+  }
+
+  async submit(data: string): Promise<CmCloudDirectAprsDispatchResult> {
+    this.submissions.push(data);
+    return { outcome: "submitted" };
+  }
+
+  async stop(): Promise<void> {
+    this.capability = undefined;
+    this.readyState = false;
+    this.resolvePendingConfigurations();
+    this.listener?.();
+  }
+
+  resolveReady(): void {
+    this.readyState = true;
+    this.listener?.();
+    this.resolvePendingConfigurations();
+  }
+
+  private resolvePendingConfigurations(): void {
+    for (const resolve of this.pendingConfigurations.splice(0)) resolve();
   }
 }
