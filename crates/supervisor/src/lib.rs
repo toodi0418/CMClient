@@ -37,7 +37,10 @@ pub const GATEWAY_PRIVATE_FRAME_MAX_BYTES: usize = 16 * 1024;
 pub const GATEWAY_CALLMESH_API_KEY_MAX_BYTES: usize = 4096;
 pub const GATEWAY_CMCLOUD_DEVICE_CREDENTIAL_MAX_BYTES: usize = 512;
 pub const GATEWAY_CMCLOUD_ENDPOINT_MAX_BYTES: usize = 2_048;
-pub const DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(30);
+/// Covers a cold private-Node/Gateway startup plus the mandatory local
+/// ownership proof. The supervisor still rejects unbounded bootstrap waits.
+pub const DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(45);
+const MAX_GATEWAY_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(60);
 const GATEWAY_OWNERSHIP_RESPONSE_MAX_BYTES: usize = 4096;
 const GATEWAY_OWNERSHIP_PATH: &str = "/_cmclient/bootstrap/ownership";
 const GATEWAY_OWNERSHIP_CHALLENGE_HEADER: &str = "x-cmclient-gateway-ownership-challenge";
@@ -838,7 +841,7 @@ fn perform_private_bootstrap(
 ) {
     let mut reader = None;
     let result = (|| {
-        if deadline.is_zero() || deadline > Duration::from_secs(30) {
+        if deadline.is_zero() || deadline > MAX_GATEWAY_BOOTSTRAP_DEADLINE {
             return Err(SupervisorError::BootstrapInvalid);
         }
         let bootstrap_deadline = Instant::now()
@@ -1283,10 +1286,11 @@ mod tests {
     #[cfg(windows)]
     use super::SpawnFailureCleanup;
     use super::{
-        BackoffPolicy, GATEWAY_CALLMESH_API_KEY_MAX_BYTES, GATEWAY_OWNERSHIP_CHALLENGE_HEADER,
-        GATEWAY_OWNERSHIP_PATH, GATEWAY_OWNERSHIP_PROOF_HEADER, GATEWAY_PRIVATE_FRAME_MAX_BYTES,
-        GatewayBootstrapFrame, GatewayCommand, GatewayReady, GatewayStatus, GatewaySupervisor,
-        SupervisorError, SupervisorEvent, encode_private_frame, inherited_runtime_environment_from,
+        BackoffPolicy, DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE, GATEWAY_CALLMESH_API_KEY_MAX_BYTES,
+        GATEWAY_OWNERSHIP_CHALLENGE_HEADER, GATEWAY_OWNERSHIP_PATH, GATEWAY_OWNERSHIP_PROOF_HEADER,
+        GATEWAY_PRIVATE_FRAME_MAX_BYTES, GatewayBootstrapFrame, GatewayCommand, GatewayReady,
+        GatewayStatus, GatewaySupervisor, MAX_GATEWAY_BOOTSTRAP_DEADLINE, SupervisorError,
+        SupervisorEvent, encode_private_frame, inherited_runtime_environment_from,
         probe_gateway_ownership, read_private_frame, validate_gateway_ready,
         validate_gateway_ready_or_failure,
     };
@@ -1733,6 +1737,13 @@ mod tests {
         assert_eq!(policy.delay_for_attempt(1), Duration::from_secs(1));
         assert_eq!(policy.delay_for_attempt(3), Duration::from_secs(4));
         assert_eq!(policy.delay_for_attempt(10), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn bootstrap_deadline_leaves_room_for_cold_start_ownership_proof() {
+        assert_eq!(DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE, Duration::from_secs(45));
+        assert_eq!(MAX_GATEWAY_BOOTSTRAP_DEADLINE, Duration::from_secs(60));
+        assert!(DEFAULT_GATEWAY_BOOTSTRAP_DEADLINE < MAX_GATEWAY_BOOTSTRAP_DEADLINE);
     }
 
     #[test]
@@ -2396,7 +2407,7 @@ mod tests {
                 .expect("private bootstrap should enable");
             // PowerShell cold starts can exceed five seconds when unit tests
             // spawn several fixtures concurrently. The production default is
-            // thirty seconds; keep this fixture below that bound while the
+            // forty-five seconds; keep this fixture below that bound while the
             // actual timeout mode continues to exercise the five-second path.
             supervisor.bootstrap_deadline = deadline;
 
