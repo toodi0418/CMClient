@@ -5557,7 +5557,7 @@ mod tests {
     use std::{
         io::Cursor,
         net::{TcpListener, TcpStream},
-        sync::{Mutex, atomic::AtomicUsize, mpsc},
+        sync::{Mutex, mpsc},
     };
 
     #[test]
