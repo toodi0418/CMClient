@@ -515,7 +515,6 @@ struct SetupConfigureRequest {
     meshtastic_port: u16,
     mesh_network_id: Option<String>,
     gateway_id: Option<String>,
-    callmesh_api_key: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -524,12 +523,6 @@ struct SetupTransactionJournal {
     version: u8,
     generation: u64,
     previous_configuration: Option<Vec<u8>>,
-}
-
-impl Drop for SetupConfigureRequest {
-    fn drop(&mut self) {
-        self.callmesh_api_key.zeroize();
-    }
 }
 
 /// A management-only pairing code. This request is consumed by the Agent and
@@ -617,7 +610,7 @@ impl CMCloudEnrollmentControlError {
 struct SetupDiscoveryResponse {
     schema_version: u8,
     candidates: Vec<MeshtasticCandidate>,
-    callmesh_url: &'static str,
+    cmcloud_url: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,9 +749,7 @@ type CMCloudEnrollmentHandler = Arc<
 type CMCloudEnrollmentStatusHandler =
     Arc<dyn Fn() -> Result<CMCloudEnrollmentStatus, CMCloudEnrollmentControlError> + Send + Sync>;
 
-const CALLMESH_PRODUCTION_URL: &str = "https://callmesh.tmmarc.org";
-const DEFAULT_APRS_HOST: &str = "asia.aprs2.net";
-const DEFAULT_APRS_PORT: u16 = 14_580;
+const CMCLOUD_PRODUCTION_URL: &str = "wss://cmcloud.tmmarc.org/agent/v1";
 
 struct AgentWebState {
     updates: Arc<AgentUpdateService>,
@@ -1058,7 +1049,7 @@ async fn management_setup_discovery(State(state): State<Arc<AgentWebState>>) -> 
             Json(SetupDiscoveryResponse {
                 schema_version: 1,
                 candidates,
-                callmesh_url: CALLMESH_PRODUCTION_URL,
+                cmcloud_url: CMCLOUD_PRODUCTION_URL,
             }),
         )
             .into_response(),
@@ -1199,12 +1190,6 @@ fn validate_setup_request(request: &SetupConfigureRequest) -> Result<(), SetupAp
         || host.contains('/')
         || host.contains(['"', '\\', '\r', '\n'])
         || request.meshtastic_port != 4_403
-        || request.callmesh_api_key.is_empty()
-        || request.callmesh_api_key.len() > 4_096
-        || request
-            .callmesh_api_key
-            .bytes()
-            .any(|byte| byte.is_ascii_control())
     {
         return Err(SetupApplyError::InvalidInput);
     }
@@ -1235,7 +1220,7 @@ fn write_setup_configuration(
     gateway_id: &str,
 ) -> Result<(), SetupApplyError> {
     let contents = format!(
-        "[agent]\nmanagement_web_enabled = true\n\n[callmesh]\nurl = \"{CALLMESH_PRODUCTION_URL}\"\n\n[meshtastic]\ntransport = \"tcp\"\nmesh_network_id = \"{mesh_network_id}\"\ngateway_id = \"{gateway_id}\"\ntcp_host = \"{host}\"\ntcp_port = {port}\n\n[aprs]\nhost = \"{DEFAULT_APRS_HOST}\"\nport = {DEFAULT_APRS_PORT}\n"
+        "[agent]\nmanagement_web_enabled = true\n\n[cmcloud]\nagent_websocket_url = \"{CMCLOUD_PRODUCTION_URL}\"\n\n[meshtastic]\ntransport = \"tcp\"\nmesh_network_id = \"{mesh_network_id}\"\ngateway_id = \"{gateway_id}\"\ntcp_host = \"{host}\"\ntcp_port = {port}\n"
     );
     write_atomic_configuration(path, contents.as_bytes())
 }
@@ -2772,23 +2757,6 @@ impl AgentController {
             SetupRollbackState::Validating,
         )?;
 
-        if self
-            .secrets
-            .stage_callmesh_setup(&request.callmesh_api_key)
-            .is_err()
-        {
-            return Err(self.rollback_setup_error(
-                previous_configuration.as_deref(),
-                false,
-                SetupApplyError::ConfigWriteFailed,
-            ));
-        }
-        self.check_setup_cancellation(
-            &cancellation,
-            previous_configuration.as_deref(),
-            SetupRollbackState::Validating,
-        )?;
-
         if let Err(error) = write_setup_configuration(
             &self.config_file,
             request.meshtastic_host.trim(),
@@ -2797,18 +2765,6 @@ impl AgentController {
             gateway_id,
         ) {
             return Err(self.rollback_setup_error(previous_configuration.as_deref(), true, error));
-        }
-        self.check_setup_cancellation(
-            &cancellation,
-            previous_configuration.as_deref(),
-            SetupRollbackState::Persistent,
-        )?;
-        if self.secrets.promote_callmesh_setup().is_err() {
-            return Err(self.rollback_setup_error(
-                previous_configuration.as_deref(),
-                true,
-                SetupApplyError::ConfigWriteFailed,
-            ));
         }
         self.check_setup_cancellation(
             &cancellation,
@@ -2890,6 +2846,8 @@ impl AgentController {
         // the journal is still recoverable: Ready plus a promoted secret is
         // finalized by startup recovery.
         remove_setup_transaction(&self.setup_transaction_file)?;
+        // Finalize any legacy transaction left by an interrupted pre-CMCloud
+        // setup, but never create or promote a CallMesh credential here.
         self.secrets
             .finalize_callmesh_setup()
             .map_err(|_| SetupApplyError::ConfigWriteFailed)?;
@@ -3047,8 +3005,12 @@ impl AgentController {
         }
         let mut environment = BTreeMap::new();
         environment.insert(
-            String::from("CMCLIENT_CALLMESH_URL"),
-            String::from(CALLMESH_PRODUCTION_URL),
+            String::from(CMCLOUD_MODE_ENVIRONMENT_NAME),
+            String::from("required"),
+        );
+        environment.insert(
+            String::from(CMCLOUD_URL_ENVIRONMENT_NAME),
+            String::from(CMCLOUD_PRODUCTION_URL),
         );
         environment.insert(
             String::from("CMCLIENT_MESHTASTIC_TRANSPORT"),
@@ -3067,15 +3029,7 @@ impl AgentController {
             mesh_network_id.into(),
         );
         environment.insert(String::from("CMCLIENT_GATEWAY_ID"), gateway_id.into());
-        environment.insert(String::from("CMCLIENT_APRS_ENABLED"), String::from("true"));
-        environment.insert(
-            String::from("CMCLIENT_APRS_HOST"),
-            String::from(DEFAULT_APRS_HOST),
-        );
-        environment.insert(
-            String::from("CMCLIENT_APRS_PORT"),
-            DEFAULT_APRS_PORT.to_string(),
-        );
+        environment.insert(String::from("CMCLIENT_APRS_ENABLED"), String::from("false"));
         environment.insert(
             String::from(SETUP_VALIDATION_ONLY_ENVIRONMENT_NAME),
             String::from("true"),
@@ -3096,9 +3050,6 @@ impl AgentController {
         supervisor.set_environment(environment);
         supervisor
             .set_setup_generation(generation)
-            .map_err(|_| SetupApplyError::SupervisorUnavailable)?;
-        supervisor
-            .set_callmesh_api_key(&request.callmesh_api_key)
             .map_err(|_| SetupApplyError::SupervisorUnavailable)
     }
 
@@ -3546,10 +3497,10 @@ impl AgentController {
             paths: config.paths.clone(),
             config_file: config.config_file.clone(),
             setup_transaction_file: setup_transaction_file(&config.paths),
-            cmcloud_endpoint: config
-                .cmcloud
-                .as_ref()
-                .map(|cmcloud| cmcloud.agent_websocket_url.clone()),
+            cmcloud_endpoint: Some(config.cmcloud.as_ref().map_or_else(
+                || CMCLOUD_PRODUCTION_URL.to_owned(),
+                |cmcloud| cmcloud.agent_websocket_url.clone(),
+            )),
             secrets,
             setup,
             setup_gate_required,
@@ -5704,27 +5655,37 @@ mod tests {
 
     #[test]
     fn setup_configuration_validation_rejects_injection_and_non_meshtastic_ports() {
-        let request = |host: &str, port: u16, key: &str| SetupConfigureRequest {
+        let request = |host: &str, port: u16| SetupConfigureRequest {
             meshtastic_host: String::from(host),
             meshtastic_port: port,
             mesh_network_id: Some(String::from("default")),
             gateway_id: Some(String::from("cmclient-gateway")),
-            callmesh_api_key: String::from(key),
         };
-        let valid = request("172.16.8.88", 4_403, "fixture-key");
+        let valid = request("172.16.8.88", 4_403);
         assert!(validate_setup_request(&valid).is_ok());
 
         for invalid in [
-            request("172.16.8.88\n", 4_403, "fixture-key"),
-            request("172.16.8.88\"", 4_403, "fixture-key"),
-            request("172.16.8.88", 80, "fixture-key"),
-            request("172.16.8.88", 4_403, "fixture\nkey"),
+            request("172.16.8.88\n", 4_403),
+            request("172.16.8.88\"", 4_403),
+            request("172.16.8.88", 80),
         ] {
             assert_eq!(
                 validate_setup_request(&invalid),
                 Err(SetupApplyError::InvalidInput)
             );
         }
+    }
+
+    #[test]
+    fn setup_request_rejects_legacy_callmesh_credentials() {
+        let legacy = serde_json::json!({
+            "meshtasticHost": "172.16.8.88",
+            "meshtasticPort": 4403,
+            "meshNetworkId": "default",
+            "gatewayId": "cmclient-gateway",
+            "callmeshApiKey": "must-not-be-accepted"
+        });
+        assert!(serde_json::from_value::<SetupConfigureRequest>(legacy).is_err());
     }
 
     #[test]
@@ -5739,8 +5700,11 @@ mod tests {
             .expect("setup config should commit");
         let contents = std::fs::read_to_string(&path).expect("setup config should read");
         assert!(contents.contains("tcp_host = \"172.16.8.88\""));
-        assert!(contents.contains("url = \"https://callmesh.tmmarc.org\""));
-        assert!(!contents.contains("CMCLIENT_CALLMESH_API_KEY"));
+        assert!(contents.contains("agent_websocket_url = \"wss://cmcloud.tmmarc.org/agent/v1\""));
+        assert!(contents.contains("[cmcloud]"));
+        assert!(!contents.contains("[callmesh]"));
+        assert!(!contents.contains("[aprs]"));
+        assert!(!contents.contains("callmesh.tmmarc.org"));
         assert!(!contents.contains("CMCLIENT_APRS_DESTINATION"));
         assert!(!contents.contains("APCM20"));
         std::fs::remove_dir_all(root).expect("setup config fixture should clean up");
@@ -6738,7 +6702,7 @@ mod tests {
                         .uri("/api/v1/setup/configure")
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            r#"{"meshtasticHost":"127.0.0.1","meshtasticPort":4403,"meshNetworkId":"default","gatewayId":"cmclient-gateway","callmeshApiKey":"fixture-key"}"#,
+                            r#"{"meshtasticHost":"127.0.0.1","meshtasticPort":4403,"meshNetworkId":"default","gatewayId":"cmclient-gateway"}"#,
                         ))
                         .expect("setup request should build"),
                 )
