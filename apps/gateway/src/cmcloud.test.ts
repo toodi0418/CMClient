@@ -299,21 +299,33 @@ describe("CMCloud raw outbox", () => {
     const egress = new FixtureDirectAprsEgress();
     const client = createClient(database, () => socket, egress);
     const data =
-      "BM5GSV-5>APTMAG,MESHD*,qAR,BM3FFG-2:!2404.57N/12032.42Ek/A=000141";
+      "BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:!2404.57N/12032.42Ek/A=000141";
 
     client.start();
     socket.open();
     socket.message(
       serverHello(7, {
         aprsMode: "enabled",
-        directAprs: { callsign: "BM5GSV-5", verified: true },
+        directAprs: {
+          callsign: "BU2GE-4",
+          verified: true,
+          provision: {
+            callsignBase: "BU2GE",
+            ssid: 4,
+            symbolTable: "/",
+            symbolCode: "I",
+            latitude: 25.079166666666666,
+            longitude: 121.47366666666666,
+          },
+        },
       }),
     );
     await settle();
 
-    expect(egress.capability).toEqual({
-      callsign: "BM5GSV-5",
+    expect(egress.capability).toMatchObject({
+      callsign: "BU2GE-4",
       verified: true,
+      provision: { callsignBase: "BU2GE", ssid: 4 },
     });
     expect(latestControl(socket, "client_heartbeat")).toMatchObject({
       directAprsReady: true,
@@ -340,6 +352,64 @@ describe("CMCloud raw outbox", () => {
     await client.stop();
     database.close();
   });
+
+  it.each([
+    ["a malformed Tracker line", "BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:"],
+    [
+      "an observer collision",
+      "BX4ACP-7>APTMAG,TCPIP*,qAC,BU2GE-CC:!2404.57N/12032.42Ek",
+    ],
+    [
+      "an iGate station packet",
+      "BU2GE-4>APTMAG,TCPIP*:T#001,0,1,0,0,0,00000000",
+    ],
+  ])(
+    "rejects %s without closing the CMCloud session",
+    async (_label, invalidData) => {
+      const database = new GatewayDatabase(":memory:");
+      const socket = new FixtureSocket();
+      const egress = new FixtureDirectAprsEgress();
+      const client = createClient(database, () => socket, egress);
+      const validData =
+        "BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:!2404.57N/12032.42Ek";
+      const invalidDispatchId = "00000000-0000-4000-8000-000000000007";
+      const validDispatchId = "00000000-0000-4000-8000-000000000008";
+
+      client.start();
+      socket.open();
+      socket.message(directAprsHello(7));
+      await settle();
+
+      socket.message({
+        type: "aprs_dispatch",
+        dispatchId: invalidDispatchId,
+        data: invalidData,
+      });
+      await settle();
+      expect(egress.submissions).toEqual([]);
+      expect(latestControl(socket, "aprs_dispatch_ack")).toMatchObject({
+        dispatchId: invalidDispatchId,
+        outcome: "retryable_failure",
+        errorCode: "CMCLOUD_APRS_DISPATCH_INVALID",
+      });
+      expect(client.status().state).toBe("ready");
+
+      socket.message({
+        type: "aprs_dispatch",
+        dispatchId: validDispatchId,
+        data: validData,
+      });
+      await settle();
+      expect(egress.submissions).toEqual([validData]);
+      expect(latestControl(socket, "aprs_dispatch_ack")).toMatchObject({
+        dispatchId: validDispatchId,
+        outcome: "submitted",
+      });
+
+      await client.stop();
+      database.close();
+    },
+  );
 
   it("records each successfully submitted CMCloud dispatch once for station telemetry", async () => {
     let now = new Date("2026-08-06T12:00:00.000Z");
@@ -728,14 +798,25 @@ describe("CMCloud raw outbox", () => {
       errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
     });
     const client = createClient(database, () => socket, egress);
-    const data = "BM5GSV-5>APTMAG:!2404.57N/12032.42Ek";
+    const data = "BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:!2404.57N/12032.42Ek";
 
     client.start();
     socket.open();
     socket.message(
       serverHello(7, {
         aprsMode: "enabled",
-        directAprs: { callsign: "BM5GSV-5", verified: true },
+        directAprs: {
+          callsign: "BU2GE-4",
+          verified: true,
+          provision: {
+            callsignBase: "BU2GE",
+            ssid: 4,
+            symbolTable: "/",
+            symbolCode: "I",
+            latitude: 25.079166666666666,
+            longitude: 121.47366666666666,
+          },
+        },
       }),
     );
     await settle();
@@ -788,20 +869,32 @@ describe("CMCloud raw outbox", () => {
     const socket = new FixtureSocket(true);
     const egress = new FixtureDirectAprsEgress();
     const client = createClient(database, () => socket, egress);
-    const data = "BM5GSV-5>APTMAG:!2404.57N/12032.42Ek";
+    const data = "BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:!2404.57N/12032.42Ek";
 
     client.start();
     socket.open();
     socket.message(
       serverHello(7, {
         aprsMode: "enabled",
-        directAprs: { callsign: "BM5GSV-5", verified: true },
+        directAprs: {
+          callsign: "BU2GE-4",
+          verified: true,
+          provision: {
+            callsignBase: "BU2GE",
+            ssid: 4,
+            symbolTable: "/",
+            symbolCode: "I",
+            latitude: 25.079166666666666,
+            longitude: 121.47366666666666,
+          },
+        },
       }),
     );
     await settle();
-    expect(egress.capability).toEqual({
-      callsign: "BM5GSV-5",
+    expect(egress.capability).toMatchObject({
+      callsign: "BU2GE-4",
       verified: true,
+      provision: { callsignBase: "BU2GE", ssid: 4 },
     });
 
     socket.message({
@@ -866,14 +959,25 @@ describe("CMCloud raw outbox", () => {
       errorCode: "CMCLOUD_DIRECT_APRS_WRITE_UNCERTAIN",
     });
     const client = createClient(database, () => socket, egress);
-    const data = "BM5GSV-5>APTMAG:!2404.57N/12032.42Ek";
+    const data = "BX4ACP-7>APTMAG,MESHD*,qAO,BU2GE-4:!2404.57N/12032.42Ek";
 
     client.start();
     socket.open();
     socket.message(
       serverHello(7, {
         aprsMode: "enabled",
-        directAprs: { callsign: "BM5GSV-5", verified: true },
+        directAprs: {
+          callsign: "BU2GE-4",
+          verified: true,
+          provision: {
+            callsignBase: "BU2GE",
+            ssid: 4,
+            symbolTable: "/",
+            symbolCode: "I",
+            latitude: 25.079166666666666,
+            longitude: 121.47366666666666,
+          },
+        },
       }),
     );
     await settle();

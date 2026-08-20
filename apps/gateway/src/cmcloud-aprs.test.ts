@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CmCloudDirectAprsEgressRuntime,
+  isValidCmCloudTrackerDispatch,
   parseCmCloudDirectAprsCapability,
 } from "./cmcloud-aprs";
 import { deriveAprsPasscode } from "./aprs-identity";
@@ -70,9 +71,9 @@ describe("CMCloud direct APRS egress", () => {
       reconnectDelayMs: 100,
     });
     const data =
-      "BM5GSV-5>APTMAG,MESHD*,qAR,BM3FFG-2:!2404.57N/12032.42Ek/A=000141 家有大狗狗";
+      "BM5GSV-5>APTMAG,MESHD*,qAO,BM5GSV-5:!2404.57N/12032.42Ek/A=000141 家有大狗狗";
     try {
-      await egress.configure({ callsign: "BM5GSV-5", verified: true });
+      await egress.configure(trackerCapability());
       expect(egress.ready()).toBe(true);
 
       await expect(egress.submit(data)).resolves.toEqual({
@@ -89,6 +90,51 @@ describe("CMCloud direct APRS egress", () => {
     }
   });
 
+  it("allows a valid iGate station packet through the shared APRS writer", async () => {
+    const fixture = await startAprsFixture("verified");
+    const egress = new CmCloudDirectAprsEgressRuntime({
+      host: "127.0.0.1",
+      port: fixture.port,
+      timeoutMs: 1_000,
+      reconnectDelayMs: 100,
+    });
+    const data = "BM5GSV-5>APTMAG,TCPIP*:T#001,0,1,0,0,0,00000000";
+    try {
+      await egress.configure(trackerCapability());
+
+      await expect(egress.submit(data)).resolves.toEqual({
+        outcome: "submitted",
+      });
+      await waitUntil(() => fixture.lines.length === 2);
+      expect(fixture.wire[1]).toEqual(Buffer.from(`${data}\r\n`, "utf8"));
+    } finally {
+      await egress.stop();
+      await fixture.close();
+    }
+  });
+
+  it("accepts only the provisioned Tracker path and rejects observer traffic", () => {
+    const capability = trackerCapability();
+    const valid = "BX4ACP-7>APTMAG,MESHD*,qAO,BM5GSV-5:!2404.57N/12032.42Ek";
+
+    expect(isValidCmCloudTrackerDispatch(valid, capability)).toBe(true);
+    expect(
+      isValidCmCloudTrackerDispatch(
+        "BX4ACP-7>APTMAG,MESHD*,qAO,OTHER-1:!2404.57N/12032.42Ek",
+        capability,
+      ),
+    ).toBe(false);
+    expect(
+      isValidCmCloudTrackerDispatch(
+        "BX4ACP-7>APTMAG,TCPIP*,qAC,BU2GE-CC:!2404.57N/12032.42Ek",
+        capability,
+      ),
+    ).toBe(false);
+    expect(isValidCmCloudTrackerDispatch("not a TNC2 line", capability)).toBe(
+      false,
+    );
+  });
+
   it("never becomes ready for an unverified APRS-IS login or an absent CMCloud capability", async () => {
     const fixture = await startAprsFixture("unverified");
     const egress = new CmCloudDirectAprsEgressRuntime({
@@ -98,10 +144,12 @@ describe("CMCloud direct APRS egress", () => {
       reconnectDelayMs: 100,
     });
     try {
-      await egress.configure({ callsign: "BM5GSV-5", verified: true });
+      await egress.configure(trackerCapability());
       expect(egress.ready()).toBe(false);
       await expect(
-        egress.submit("BM5GSV-5>APTMAG:!2404.57N/12032.42Ek"),
+        egress.submit(
+          "BM5GSV-5>APTMAG,MESHD*,qAO,BM5GSV-5:!2404.57N/12032.42Ek",
+        ),
       ).resolves.toEqual({
         outcome: "retryable_failure",
         errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
@@ -131,9 +179,11 @@ describe("CMCloud direct APRS egress", () => {
       reconnectDelayMs: 100,
     });
     try {
-      await egress.configure({ callsign: "BM5GSV-5", verified: true });
+      await egress.configure(trackerCapability());
       await expect(
-        egress.submit("BM5GSV-5>APTMAG:!2404.57N/12032.42Ek\uD800"),
+        egress.submit(
+          "BM5GSV-5>APTMAG,MESHD*,qAO,BM5GSV-5:!2404.57N/12032.42Ek\uD800",
+        ),
       ).resolves.toEqual({
         outcome: "retryable_failure",
         errorCode: "CMCLOUD_APRS_DISPATCH_INVALID",
@@ -155,9 +205,11 @@ describe("CMCloud direct APRS egress", () => {
       socketFactory: () => socket as unknown as Socket,
     });
     try {
-      await egress.configure({ callsign: "BM5GSV-5", verified: true });
+      await egress.configure(trackerCapability());
       await expect(
-        egress.submit("BM5GSV-5>APTMAG:!2404.57N/12032.42Ek"),
+        egress.submit(
+          "BM5GSV-5>APTMAG,MESHD*,qAO,BM5GSV-5:!2404.57N/12032.42Ek",
+        ),
       ).resolves.toEqual({
         outcome: "uncertain",
         errorCode: "CMCLOUD_DIRECT_APRS_WRITE_UNCERTAIN",
@@ -170,6 +222,19 @@ describe("CMCloud direct APRS egress", () => {
     }
   });
 });
+
+function trackerCapability() {
+  return {
+    callsign: "BM5GSV-5",
+    verified: true as const,
+    provision: {
+      callsignBase: "BM5GSV",
+      ssid: 5,
+      symbolTable: "/",
+      symbolCode: "I",
+    },
+  };
+}
 
 class HangingAprsSocket extends EventEmitter {
   connecting = false;

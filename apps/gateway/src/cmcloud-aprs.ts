@@ -326,6 +326,25 @@ export function parseCmCloudDirectAprsCapability(
   };
 }
 
+/**
+ * CMCloud dispatches only Tracker packets. The server payload is already the
+ * canonical wire representation and must be rejected when it does not carry
+ * the provisioned iGate tail; the client never repairs untrusted bytes.
+ */
+export function isValidCmCloudTrackerDispatch(
+  value: unknown,
+  capability: CmCloudDirectAprsCapability | undefined,
+): value is string {
+  if (!validTnc2Data(value) || !capability?.provision) return false;
+  const expectedTail = provisionCallsign(capability.provision);
+  if (!expectedTail) return false;
+  const match =
+    /^([A-Z0-9]{3,6}(?:-(?:[0-9]|1[0-5]))?)>APTMAG,MESHD\*,qAO,([A-Z0-9]{3,6}(?:-(?:[0-9]|1[0-5]))?):(.+)$/u.exec(
+      value,
+    );
+  return Boolean(match && match[2] === expectedTail);
+}
+
 function normalizeCmCloudDirectAprsCallsign(
   value: unknown,
 ): string | undefined {
@@ -335,6 +354,19 @@ function normalizeCmCloudDirectAprsCallsign(
   const base = parsed[1]!;
   const ssid = parsed[2] === undefined ? 0 : Number(parsed[2]);
   return ssid === 0 ? base : `${base}-${ssid}`;
+}
+
+function provisionCallsign(provision: CallMeshProvision): string | undefined {
+  if (
+    !Number.isInteger(provision.ssid) ||
+    provision.ssid < 0 ||
+    provision.ssid > 15
+  ) {
+    return undefined;
+  }
+  return provision.ssid === 0
+    ? provision.callsignBase
+    : `${provision.callsignBase}-${provision.ssid}`;
 }
 
 function parseCmCloudDirectAprsProvision(
@@ -391,7 +423,9 @@ function sameCapability(
   right: CmCloudDirectAprsCapability | undefined,
 ): boolean {
   return (
-    left?.callsign === right?.callsign && left?.verified === right?.verified
+    left?.callsign === right?.callsign &&
+    left?.verified === right?.verified &&
+    JSON.stringify(left?.provision) === JSON.stringify(right?.provision)
   );
 }
 

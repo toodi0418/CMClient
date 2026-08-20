@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import WebSocket from "ws";
 
 import {
+  isValidCmCloudTrackerDispatch,
   parseCmCloudDirectAprsCapability,
   type CmCloudDirectAprsCapability,
   type CmCloudDirectAprsDispatchResult,
@@ -869,6 +870,7 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       return;
     }
     const dispatchId = control.dispatchId;
+    const session = this.session;
     const cached = this.completedAprsDispatches.get(dispatchId);
     if (cached) {
       await this.sendAprsDispatchAck(socket, cached);
@@ -884,13 +886,19 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       });
       return;
     }
-    const session = this.session;
     const egress = this.options.directAprsEgress;
     let result: CmCloudDirectAprsDispatchResult;
     if (!session || !egress || !this.directAprsReady(session)) {
       result = {
         outcome: "retryable_failure",
         errorCode: "CMCLOUD_DIRECT_APRS_NOT_READY",
+      };
+    } else if (
+      !isValidCmCloudTrackerDispatch(control.data, session.directAprs)
+    ) {
+      result = {
+        outcome: "retryable_failure",
+        errorCode: "CMCLOUD_APRS_DISPATCH_INVALID",
       };
     } else {
       this.pendingAprsDispatchId = dispatchId;
