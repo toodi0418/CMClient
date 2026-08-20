@@ -32,6 +32,20 @@ describe("user-facing problem catalog", () => {
     });
   });
 
+  it("maps CMCloud projection failures to stable retryable problems", () => {
+    expect(problemForCode("ACCOUNT_PROJECTION_UNAVAILABLE")).toMatchObject({
+      severity: "warning",
+      titleKey: "problems.accountProjectionUnavailableTitle",
+      retryable: true,
+    });
+    expect(problemForCode("ACCOUNT_PROJECTION_STALE").messageKey).toBe(
+      "problems.accountProjectionStaleMessage",
+    );
+    expect(problemForCode("ACCOUNT_PROJECTION_AMBIGUOUS").messageKey).toBe(
+      "problems.accountProjectionAmbiguousMessage",
+    );
+  });
+
   it("maps capability and update internals to user-facing labels", () => {
     expect(capabilityReasonKey("owned_by_agent")).toBe(
       "capabilityReason.ownedByAgent",

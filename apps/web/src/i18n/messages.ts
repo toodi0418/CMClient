@@ -165,6 +165,15 @@ export const messages = {
       aprsMonitorActivityTitle: "APRS RX observer 暫時沒有收到資料",
       aprsMonitorActivityMessage:
         "CMClient 已暫停 APRS 傳送並重新建立 observer 連線；恢復可驗證的 RX 活動後會自動繼續。",
+      accountProjectionUnavailableTitle: "CMCloud 帳號資料暫時無法取得",
+      accountProjectionUnavailableMessage:
+        "CMCloud 帳號投影尚未可用。請稍後重試，既有的連線狀態仍可使用。",
+      accountProjectionStaleTitle: "CMCloud 帳號資料已過期",
+      accountProjectionStaleMessage:
+        "CMCloud 尚未提供足夠新的帳號投影；請稍後重試。",
+      accountProjectionAmbiguousTitle: "CMCloud 帳號資料無法確認",
+      accountProjectionAmbiguousMessage:
+        "CMCloud 回傳的帳號投影無法安全辨識；請稍後重試。",
       proxyConfigurationTitle: "TCP Proxy 尚未設定",
       proxyConfigurationMessage:
         "這個選用功能尚未為此安裝啟用；Meshtastic 的主要連線不受影響。",
@@ -385,6 +394,35 @@ export const messages = {
       pairingCodePlaceholder: "輸入 CMCloud 配對碼",
       pairingCodeHint: "配對碼只會送至本機 Agent，完成後不會保留在此頁面。",
       enroll: "開始配對",
+      accountProjection: "CMCloud 帳號投影",
+      account: "帳號",
+      tenant: "租戶",
+      tenantId: "租戶 ID",
+      accountName: "顯示名稱",
+      role: "角色",
+      accountState: "帳號狀態",
+      mappingFreezeEpoch: "Mapping 凍結世代",
+      authority: "權威來源",
+      authorityEpoch: "世代",
+      authorityRevision: "版本",
+      projectedAt: "投影時間",
+      stations: "站台",
+      stationsEmpty: "目前沒有可用站台。",
+      stationState: "站台狀態",
+      callsign: "呼號",
+      roleLabel: { member: "成員", operator: "操作員", admin: "管理員" },
+      accountStateLabel: {
+        pending: "待審核",
+        approved: "已核准",
+        suspended: "已停權",
+      },
+      stationKind: { cmclient: "CMClient", mqtt_only: "僅 MQTT" },
+      stationStateLabel: {
+        online: "線上",
+        offline: "離線",
+        pending: "待啟用",
+        suspended: "已停權",
+      },
       stateLabel: {
         not_configured: "未設定",
         credentials_required: "需要憑證",
@@ -692,6 +730,16 @@ export const messages = {
       aprsMonitorActivityTitle: "The APRS RX observer is not receiving data",
       aprsMonitorActivityMessage:
         "CMClient paused APRS transmission and is rebuilding the observer connection. It resumes automatically after verified RX activity returns.",
+      accountProjectionUnavailableTitle: "CMCloud account data is unavailable",
+      accountProjectionUnavailableMessage:
+        "The CMCloud account projection is not available yet. Retry shortly; the connection status remains usable.",
+      accountProjectionStaleTitle: "CMCloud account data is stale",
+      accountProjectionStaleMessage:
+        "CMCloud has not provided a sufficiently fresh account projection. Retry shortly.",
+      accountProjectionAmbiguousTitle:
+        "CMCloud account data cannot be verified",
+      accountProjectionAmbiguousMessage:
+        "CMCloud returned an account projection that cannot be safely identified. Retry shortly.",
       proxyConfigurationTitle: "TCP Proxy is not configured",
       proxyConfigurationMessage:
         "This optional feature is not enabled for this installation. The primary Meshtastic connection is unaffected.",
@@ -918,6 +966,39 @@ export const messages = {
       pairingCodeHint:
         "The pairing code is sent only to the local Agent and is cleared after the request.",
       enroll: "Pair device",
+      accountProjection: "CMCloud account projection",
+      account: "Account",
+      tenant: "Tenant",
+      tenantId: "Tenant ID",
+      accountName: "Display name",
+      role: "Role",
+      accountState: "Account state",
+      mappingFreezeEpoch: "Mapping freeze epoch",
+      authority: "Authority",
+      authorityEpoch: "Epoch",
+      authorityRevision: "Revision",
+      projectedAt: "Projected at",
+      stations: "Stations",
+      stationsEmpty: "No stations are available.",
+      stationState: "Station state",
+      callsign: "Callsign",
+      roleLabel: {
+        member: "Member",
+        operator: "Operator",
+        admin: "Administrator",
+      },
+      accountStateLabel: {
+        pending: "Pending",
+        approved: "Approved",
+        suspended: "Suspended",
+      },
+      stationKind: { cmclient: "CMClient", mqtt_only: "MQTT only" },
+      stationStateLabel: {
+        online: "Online",
+        offline: "Offline",
+        pending: "Pending",
+        suspended: "Suspended",
+      },
       stateLabel: {
         not_configured: "Not configured",
         credentials_required: "Credentials required",

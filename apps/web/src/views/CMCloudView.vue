@@ -81,6 +81,112 @@ onMounted(() => void cmcloud.refresh());
       <div class="panel-heading">
         <div>
           <p class="section-placeholder__eyebrow">
+            {{ t("cmcloud.accountProjection") }}
+          </p>
+          <h2>{{ t("cmcloud.account") }}</h2>
+        </div>
+      </div>
+      <p v-if="cmcloud.projectionStatus === 'loading'" class="status-message">
+        {{ t("common.loading") }}
+      </p>
+      <ProblemNotice
+        v-else-if="cmcloud.projectionStatus === 'unavailable'"
+        :code="cmcloud.projectionErrorCode"
+        show-retry
+        @retry="cmcloud.refresh"
+      />
+      <template v-else-if="cmcloud.projection">
+        <ProblemNotice
+          v-if="cmcloud.projectionStatus === 'degraded'"
+          :code="cmcloud.projectionErrorCode"
+          compact
+        />
+        <dl class="facts-grid">
+          <div>
+            <dt>{{ t("cmcloud.tenant") }}</dt>
+            <dd>{{ cmcloud.projection.tenant.name }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("cmcloud.tenantId") }}</dt>
+            <dd>
+              <code>{{ cmcloud.projection.tenant.id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("cmcloud.accountName") }}</dt>
+            <dd>{{ cmcloud.projection.account.displayName }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("cmcloud.role") }}</dt>
+            <dd>
+              {{ t(`cmcloud.roleLabel.${cmcloud.projection.account.role}`) }}
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("cmcloud.accountState") }}</dt>
+            <dd>
+              {{
+                t(
+                  `cmcloud.accountStateLabel.${cmcloud.projection.account.state}`,
+                )
+              }}
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("cmcloud.mappingFreezeEpoch") }}</dt>
+            <dd>{{ cmcloud.projection.account.mappingFreezeEpoch }}</dd>
+          </div>
+          <div>
+            <dt>{{ t("cmcloud.authority") }}</dt>
+            <dd>
+              {{ t("cmcloud.authorityEpoch") }}
+              {{ cmcloud.projection.authority.epoch }} ·
+              {{ t("cmcloud.authorityRevision") }}
+              {{ cmcloud.projection.authority.revision }}
+            </dd>
+          </div>
+          <div>
+            <dt>{{ t("cmcloud.projectedAt") }}</dt>
+            <dd>
+              <time>{{ cmcloud.projection.freshness.projectedAt }}</time>
+            </dd>
+          </div>
+        </dl>
+        <div class="panel-heading cmcloud-stations-heading">
+          <h3>{{ t("cmcloud.stations") }}</h3>
+        </div>
+        <p v-if="!cmcloud.projection.stations.length" class="status-message">
+          {{ t("cmcloud.stationsEmpty") }}
+        </p>
+        <div v-else class="record-list">
+          <article
+            v-for="station in cmcloud.projection.stations"
+            :key="station.id"
+            class="record-row"
+          >
+            <div>
+              <strong>{{ station.label }}</strong>
+              <span>{{ t(`cmcloud.stationKind.${station.kind}`) }}</span>
+            </div>
+            <div>
+              <span>{{ t("cmcloud.stationState") }}</span>
+              <span class="status-badge" :data-state="station.state">
+                {{ t(`cmcloud.stationStateLabel.${station.state}`) }}
+              </span>
+            </div>
+            <div v-if="station.callsign">
+              <span>{{ t("cmcloud.callsign") }}</span>
+              <code>{{ station.callsign }}</code>
+            </div>
+          </article>
+        </div>
+      </template>
+    </div>
+
+    <div class="status-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-placeholder__eyebrow">
             {{ t("cmcloud.enrollment") }}
           </p>
           <h2>{{ t("cmcloud.pairDevice") }}</h2>

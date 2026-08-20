@@ -120,6 +120,48 @@ describe("gateway API client", () => {
     ]);
   });
 
+  it("reads the fenced CMCloud account projection contract", async () => {
+    let url: string | undefined;
+    const client = new GatewayApiClient({
+      fetch: async (input) => {
+        url = String(input);
+        return jsonResponse(accountProjectionFixture());
+      },
+    });
+
+    await expect(client.cmcloud.accountProjection()).resolves.toMatchObject({
+      account: { displayName: "Fixture operator" },
+      stations: [],
+    });
+    expect(url).toBe("/api/v1/cmcloud/account-projection");
+  });
+
+  it.each(["2026-02-31T00:00:00Z", "2026-08-20T00:00:00"])(
+    "rejects invalid RFC3339 projection timestamp %s",
+    async (projectedAt) => {
+      const client = new GatewayApiClient({
+        fetch: async () => jsonResponse(accountProjectionFixture(projectedAt)),
+      });
+
+      await expect(client.cmcloud.accountProjection()).rejects.toMatchObject({
+        code: "GATEWAY_RESPONSE_INVALID",
+      });
+    },
+  );
+
+  it.each(["2026-08-20T00:00:00Z", "2026-08-20T08:00:00+08:00"])(
+    "accepts valid RFC3339 projection timestamp %s",
+    async (projectedAt) => {
+      const client = new GatewayApiClient({
+        fetch: async () => jsonResponse(accountProjectionFixture(projectedAt)),
+      });
+
+      await expect(client.cmcloud.accountProjection()).resolves.toMatchObject({
+        freshness: { projectedAt },
+      });
+    },
+  );
+
   it("submits diagnostics with a client-generated idempotency key", async () => {
     let headers: Headers | undefined;
     let body: BodyInit | null | undefined;
@@ -459,5 +501,30 @@ function proxyStatus() {
         transport: "tcp",
       },
     },
+  };
+}
+
+function accountProjectionFixture(projectedAt = "2026-08-20T00:00:00.000Z") {
+  return {
+    type: "account_projection",
+    schemaVersion: 1,
+    revision: 4,
+    generation: 2,
+    tenant: {
+      id: "9660bc4b-bc0a-4d6f-b1a6-2278630b1a4b",
+      name: "Fixture tenant",
+    },
+    account: {
+      issuer: "https://callmesh.example.invalid/oidc",
+      subject: "subject-1",
+      displayName: "Fixture operator",
+      role: "operator",
+      state: "approved",
+      mappingFreezeEpoch: 1,
+    },
+    stations: [],
+    authority: { cmcloud: true, epoch: 1, revision: 4 },
+    freshness: { projectedAt, staleAfterMs: 60_000 },
+    errorState: null,
   };
 }

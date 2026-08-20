@@ -53,7 +53,61 @@ import {
   type SystemStatus,
 } from "@cmclient/contracts";
 import type { TSchema } from "@sinclair/typebox";
+import { FormatRegistry } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
+
+FormatRegistry.Set("uuid", (value) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value,
+  ),
+);
+FormatRegistry.Set("date-time", (value) => {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(
+      value,
+    );
+  if (!match) {
+    return false;
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const timezone = match[7]!;
+  const daysInMonth = [
+    31,
+    year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ][month - 1];
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > (daysInMonth ?? 0) ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return false;
+  }
+  if (timezone === "Z") {
+    return true;
+  }
+  const offsetHours = Number(timezone.slice(1, 3));
+  const offsetMinutes = Number(timezone.slice(4, 6));
+  return offsetHours <= 23 && offsetMinutes <= 59;
+});
 
 export const DEFAULT_GATEWAY_API_BASE_URL = "/api/v1";
 
@@ -461,6 +515,7 @@ export type AgentCmCloudApi = {
   enroll: (
     request: CMCloudEnrollmentRequest,
   ) => Promise<CMCloudEnrollmentStatus>;
+  accountProjection: () => Promise<CMCloudAccountProjection>;
 };
 
 export type GatewayMeshtasticApi = {

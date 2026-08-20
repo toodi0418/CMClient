@@ -56,6 +56,27 @@ const APRS_MONITOR_ACTIVITY_PROBLEM: UserProblem = {
   retryable: false,
 };
 
+const ACCOUNT_PROJECTION_PROBLEMS: Record<string, UserProblem> = {
+  ACCOUNT_PROJECTION_UNAVAILABLE: {
+    severity: "warning",
+    titleKey: "problems.accountProjectionUnavailableTitle",
+    messageKey: "problems.accountProjectionUnavailableMessage",
+    retryable: true,
+  },
+  ACCOUNT_PROJECTION_STALE: {
+    severity: "warning",
+    titleKey: "problems.accountProjectionStaleTitle",
+    messageKey: "problems.accountProjectionStaleMessage",
+    retryable: true,
+  },
+  ACCOUNT_PROJECTION_AMBIGUOUS: {
+    severity: "warning",
+    titleKey: "problems.accountProjectionAmbiguousTitle",
+    messageKey: "problems.accountProjectionAmbiguousMessage",
+    retryable: true,
+  },
+};
+
 const PROXY_CONFIGURATION_PROBLEM: UserProblem = {
   severity: "info",
   titleKey: "problems.proxyConfigurationTitle",
@@ -99,6 +120,9 @@ export function problemForCode(code: string | null | undefined): UserProblem {
   }
   if (code === "APRS_MONITOR_ACTIVITY_TIMEOUT") {
     return APRS_MONITOR_ACTIVITY_PROBLEM;
+  }
+  if (code in ACCOUNT_PROJECTION_PROBLEMS) {
+    return ACCOUNT_PROJECTION_PROBLEMS[code]!;
   }
   if (code === "PROXY_RUNTIME_UNAVAILABLE") {
     return PROXY_CONFIGURATION_PROBLEM;
