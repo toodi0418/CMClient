@@ -148,7 +148,7 @@
       "sequenceNumber": 3,
       "latitudeI": 250000500,
       "longitudeI": 1215000500,
-      "precisionBits": 31,
+      "precisionBits": 27,
       "payloadHashCharacter": "2",
       "backlogClassification": "live",
       "sessionConnectedAt": "2030-01-02T03:00:00.000Z",

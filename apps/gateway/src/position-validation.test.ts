@@ -7,10 +7,28 @@ import { validatePositionForAprs } from "./position-validation";
 const NOW = new Date("2026-07-18T00:10:00.000Z");
 
 describe("position APRS validation", () => {
-  it("requires exactly 32-bit precision and complete coordinates", () => {
-    expect(
-      validatePositionForAprs(event({ precisionBits: 31 }), { now: NOW }),
-    ).toEqual({ accepted: false, code: "POSITION_PRECISION_INSUFFICIENT" });
+  it.each([27, 16])(
+    "rejects %i-bit precision for APRS upload",
+    (precisionBits) => {
+      expect(
+        validatePositionForAprs(event({ precisionBits }), { now: NOW }),
+      ).toEqual({
+        accepted: false,
+        code: "POSITION_PRECISION_INSUFFICIENT",
+      });
+    },
+  );
+
+  it.each([28, 30, 32])(
+    "accepts %i-bit precision for APRS upload",
+    (precisionBits) => {
+      expect(
+        validatePositionForAprs(event({ precisionBits }), { now: NOW }),
+      ).toMatchObject({ accepted: true });
+    },
+  );
+
+  it("requires APRS-eligible precision and complete coordinates", () => {
     const missingLatitude = event({});
     missingLatitude.position = { ...missingLatitude.position };
     delete missingLatitude.position.latitudeI;

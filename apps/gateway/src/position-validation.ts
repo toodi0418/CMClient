@@ -1,7 +1,8 @@
-import type {
-  PositionCanonicalEvent,
-  PositionDecisionCode,
-  PositionSample,
+import {
+  APRS_POSITION_MIN_PRECISION_BITS,
+  type PositionCanonicalEvent,
+  type PositionDecisionCode,
+  type PositionSample,
 } from "@cmclient/contracts";
 
 const EARLIEST_GPS_TIME_MS = Date.parse("2000-01-01T00:00:00.000Z");
@@ -28,7 +29,8 @@ export function validatePositionForAprs(
 ): PositionValidationResult {
   const position = event.position;
   if (
-    position.precisionBits !== 32 ||
+    position.precisionBits === undefined ||
+    position.precisionBits < APRS_POSITION_MIN_PRECISION_BITS ||
     position.latitudeI === undefined ||
     position.longitudeI === undefined
   ) {

@@ -135,10 +135,19 @@ describe("legacy-compatible APRS Tracker position encoder", () => {
     ).toContain("360/000");
   });
 
-  it("fails closed without full precision or a trusted event time", () => {
-    expect(() =>
-      encodeAprsPosition(event({ precisionBits: 31 }), options),
-    ).toThrow(AprsPositionEncodingError);
+  it.each([27, 16])("rejects %i-bit precision", (precisionBits) => {
+    expect(() => encodeAprsPosition(event({ precisionBits }), options)).toThrow(
+      AprsPositionEncodingError,
+    );
+  });
+
+  it.each([28, 30, 32])("encodes %i-bit precision", (precisionBits) => {
+    expect(encodeAprsPosition(event({ precisionBits }), options)).toMatchObject(
+      { data: expect.stringContaining("N0CALL-7>APTMAG") },
+    );
+  });
+
+  it("fails closed without APRS-eligible precision or a trusted event time", () => {
     const missingTime = event();
     delete missingTime.eventTime;
     expect(() => encodeAprsPosition(missingTime, options)).toThrow(

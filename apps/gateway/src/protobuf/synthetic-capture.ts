@@ -165,8 +165,8 @@ function projectApplicationPayload(
       );
       return encodeProjectedMessage(
         schema.position,
-        Object.keys(shape).length > 0 ? shape : { precisionBits: 1 },
-        { precisionBits: 1 },
+        Object.keys(shape).length > 0 ? shape : { precisionBits: 32 },
+        { precisionBits: 32 },
       );
     }
   }

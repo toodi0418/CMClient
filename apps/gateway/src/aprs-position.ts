@@ -1,4 +1,7 @@
-import type { PositionCanonicalEvent } from "@cmclient/contracts";
+import {
+  APRS_POSITION_MIN_PRECISION_BITS,
+  type PositionCanonicalEvent,
+} from "@cmclient/contracts";
 
 const APRS_DESTINATION = "APTMAG";
 const APRS_TRACKER_PATH = "MESHD*,qAO";
@@ -38,7 +41,8 @@ export function encodeAprsPosition(
   validateOptions(options);
   const position = event.position;
   if (
-    position.precisionBits !== 32 ||
+    position.precisionBits === undefined ||
+    position.precisionBits < APRS_POSITION_MIN_PRECISION_BITS ||
     position.latitudeI === undefined ||
     position.longitudeI === undefined ||
     !isTimestamp(event.eventTime)

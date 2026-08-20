@@ -9,6 +9,10 @@ const UTC_ISO_TIMESTAMP =
   "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z$";
 const NodeNumberSchema = Type.Integer({ minimum: 0, maximum: 4_294_967_295 });
 const PayloadHashSchema = Type.String({ pattern: "^[a-f0-9]{64}$" });
+
+/** Minimum precision eligible for APRS position upload; storage accepts 0..32. */
+export const APRS_POSITION_MIN_PRECISION_BITS = 28;
+
 const CoordinatesSchema = Type.Object(
   {
     latitudeI: Type.Optional(
@@ -24,6 +28,7 @@ const CoordinatesSchema = Type.Object(
     positionTimestampMillisAdjust: Type.Optional(Type.Integer()),
     positionTimeSeconds: Type.Optional(NodeNumberSchema),
     sequenceNumber: Type.Optional(NodeNumberSchema),
+    // General position storage/display range. APRS upload requires >= 28 bits.
     precisionBits: Type.Optional(Type.Integer({ minimum: 0, maximum: 32 })),
     groundSpeedMetersPerSecond: Type.Optional(Type.Number({ minimum: 0 })),
     groundTrackDegrees: Type.Optional(
