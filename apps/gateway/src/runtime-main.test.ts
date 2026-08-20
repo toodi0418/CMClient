@@ -8,6 +8,7 @@ import {
   startGatewayExternalRuntimes,
   validateProxyUpstreamConfiguration,
 } from "./runtime-main";
+import { CMCLOUD_AUTHORITY_REQUIRED } from "./error-codes";
 
 describe("Gateway production runtime", () => {
   afterEach(() => {
@@ -31,11 +32,9 @@ describe("Gateway production runtime", () => {
   it("authenticates setup without starting operational transports", async () => {
     const calls: string[] = [];
     await startGatewayExternalRuntimes(true, {
+      useCmCloud: true,
       validateMeshtastic: async () => {
         calls.push("meshtastic");
-      },
-      validateCallMesh: async () => {
-        calls.push("validate");
       },
       synchronizeCallMesh: async () => {
         calls.push("synchronize");
@@ -49,13 +48,14 @@ describe("Gateway production runtime", () => {
       throwIfShutdownRequested: () => calls.push("fence"),
     });
 
-    expect(calls).toEqual(["meshtastic", "fence", "validate"]);
+    expect(calls).toEqual(["meshtastic", "fence"]);
   });
 
   it("does not transmit a CallMesh credential when Meshtastic validation fails", async () => {
     let callmeshValidated = false;
     await expect(
       startGatewayExternalRuntimes(true, {
+        useCmCloud: true,
         validateMeshtastic: async () => {
           throw new Error("fixture endpoint is not Meshtastic");
         },
@@ -116,6 +116,19 @@ describe("Gateway production runtime", () => {
     expect(useCmCloud).toBe(true);
     expect(client).toBeUndefined();
     expect(factory).not.toHaveBeenCalled();
+
+    const legacyClient = createConfiguredGatewayCallMeshClient(
+      false,
+      {
+        CMCLIENT_CALLMESH_URL: "https://callmesh.tmmarc.org",
+      },
+      "2.0.0",
+      "legacy-key",
+      undefined,
+      factory,
+    );
+    expect(legacyClient).toBeUndefined();
+    expect(factory).not.toHaveBeenCalled();
   });
 
   it("starts normal transports after synchronization without setup revalidation", async () => {
@@ -124,12 +137,8 @@ describe("Gateway production runtime", () => {
       validateMeshtastic: async () => {
         throw new Error("normal runtime must not use setup validation");
       },
-      validateCallMesh: async () => {
-        throw new Error("normal runtime must not use setup validation");
-      },
-      synchronizeCallMesh: async () => {
-        calls.push("synchronize");
-      },
+      useCmCloud: true,
+      startCmCloud: () => calls.push("cmcloud"),
       startProxy: async () => {
         calls.push("proxy");
       },
@@ -140,7 +149,7 @@ describe("Gateway production runtime", () => {
     });
 
     expect(calls).toEqual([
-      "synchronize",
+      "cmcloud",
       "fence",
       "proxy",
       "fence",
@@ -186,8 +195,6 @@ describe("Gateway production runtime", () => {
     await expect(
       startGatewayExternalRuntimes(false, {
         validateMeshtastic: async () => undefined,
-        validateCallMesh: async () => undefined,
-        synchronizeCallMesh: async () => undefined,
         useCmCloud: true,
         startProxy: async () => undefined,
         startMaintenance: () => undefined,
@@ -196,6 +203,22 @@ describe("Gateway production runtime", () => {
         throwIfShutdownRequested: () => undefined,
       }),
     ).rejects.toMatchObject({ code: "CMCLOUD_START_CONFIGURATION_INVALID" });
+  });
+
+  it("rejects legacy non-CMCloud startup before any upstream is started", async () => {
+    await expect(
+      startGatewayExternalRuntimes(false, {
+        validateMeshtastic: async () => undefined,
+        synchronizeCallMesh: async () => {
+          throw new Error("legacy CallMesh must not run");
+        },
+        startProxy: async () => undefined,
+        startMaintenance: () => undefined,
+        startAprs: () => undefined,
+        startMesh: () => undefined,
+        throwIfShutdownRequested: () => undefined,
+      }),
+    ).rejects.toMatchObject({ code: CMCLOUD_AUTHORITY_REQUIRED });
   });
 
   it.each(["tcp", "serial"])(

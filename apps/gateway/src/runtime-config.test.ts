@@ -15,6 +15,10 @@ import {
   parseAprsEncodingOptions,
   parseAprsEndpointOptions,
 } from "./runtime-config";
+import {
+  CMCLOUD_AUTHORITY_REQUIRED,
+  CMCLOUD_LEGACY_APRS_DISABLED,
+} from "./error-codes";
 
 const aprsState = {
   mappings: [],
@@ -276,37 +280,47 @@ describe("Gateway production runtime configuration", () => {
     }
   });
 
-  it("requires CallMesh APRS state and rejects static identity settings", () => {
+  it("rejects legacy APRS runtime without CMCloud authority", () => {
     const database = new GatewayDatabase(":memory:");
     const events = new DomainEventBus();
 
-    expect(
-      createConfiguredAprsGatewayRuntime({}, database, events),
-    ).toBeUndefined();
+    expect(createConfiguredAprsGatewayRuntime({}, database, events)).toBeUndefined();
     expect(() =>
-      createConfiguredAprsGatewayRuntime(
-        { CMCLIENT_APRS_ENABLED: "true" },
-        database,
-        events,
-      ),
-    ).toThrowError(
-      expect.objectContaining({
-        code: "APRS_PROVISION_CONFIGURATION_REQUIRED",
-      }),
-    );
-    expect(
       createConfiguredAprsGatewayRuntime(
         {
           CMCLIENT_APRS_ENABLED: "true",
         },
         database,
         events,
-        () => aprsState,
       ),
-    ).toBeDefined();
+    ).toThrowError(
+      expect.objectContaining({ code: CMCLOUD_AUTHORITY_REQUIRED }),
+    );
     expect(() =>
       createConfiguredAprsGatewayRuntime(
         {
+          CMCLIENT_CMCLOUD_MODE: "required",
+          CMCLIENT_CMCLOUD_URL: "wss://cmcloud.tmmarc.org/agent/v1",
+          CMCLIENT_CMCLOUD_INSTALLATION_ID: "00000000-0000-4000-8000-000000000001",
+          CMCLIENT_CMCLOUD_INSTALLATION_GENERATION: "0",
+          CMCLIENT_CMCLOUD_CREDENTIAL_VERSION: "1",
+          CMCLIENT_APRS_ENABLED: "true",
+        },
+        database,
+        events,
+        () => aprsState,
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: CMCLOUD_LEGACY_APRS_DISABLED }),
+    );
+    expect(() =>
+      createConfiguredAprsGatewayRuntime(
+        {
+          CMCLIENT_CMCLOUD_MODE: "required",
+          CMCLIENT_CMCLOUD_URL: "wss://cmcloud.tmmarc.org/agent/v1",
+          CMCLIENT_CMCLOUD_INSTALLATION_ID: "00000000-0000-4000-8000-000000000001",
+          CMCLIENT_CMCLOUD_INSTALLATION_GENERATION: "0",
+          CMCLIENT_CMCLOUD_CREDENTIAL_VERSION: "1",
           CMCLIENT_APRS_ENABLED: "false",
           CMCLIENT_APRS_LOGIN_CALLSIGN: "N0CALL-7",
         },

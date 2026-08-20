@@ -1,8 +1,6 @@
 import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-import { AprsIsRxClient, type AprsIsRxSession } from "./aprs-monitor.js";
-import { AprsIsTcpClient, AprsOutboxWorker } from "./aprs-outbox.js";
 import { AprsGatewayRuntime } from "./aprs-runtime.js";
 import { CmCloudDirectAprsEgressRuntime } from "./cmcloud-aprs.js";
 import { CmCloudDirectAprsIgateRuntime } from "./cmcloud-igate.js";
@@ -11,9 +9,7 @@ import {
   parseCmCloudRuntimeConfiguration,
 } from "./cmcloud.js";
 import {
-  connectionAuthorization,
   deriveAprsRuntimeState,
-  observerConnectionAuthorization,
   type AprsRuntimeState,
 } from "./aprs-identity.js";
 import type { CallMeshAprsState } from "./callmesh.js";
@@ -37,9 +33,14 @@ import {
 } from "./transport/serial.js";
 import { TcpMeshtasticTransport } from "./transport/tcp.js";
 import { PhysicalWriteGuard } from "./transport/physical-guard.js";
+import {
+  CMCLOUD_AUTHORITY_REQUIRED,
+  CMCLOUD_LEGACY_APRS_DISABLED,
+  type GatewayRuntimeConfigurationErrorCode,
+} from "./error-codes.js";
 
 export class GatewayRuntimeConfigurationError extends Error {
-  constructor(readonly code: string) {
+  constructor(readonly code: GatewayRuntimeConfigurationErrorCode) {
     super(code);
     this.name = "GatewayRuntimeConfigurationError";
   }
@@ -446,61 +447,10 @@ export function createConfiguredAprsGatewayRuntime(
   if (!enabled) {
     return undefined;
   }
-  if (!aprsStateProvider) {
-    throw new GatewayRuntimeConfigurationError(
-      "APRS_PROVISION_CONFIGURATION_REQUIRED",
-    );
+  if (!parseCmCloudRuntimeConfiguration(environment)) {
+    throw new GatewayRuntimeConfigurationError(CMCLOUD_AUTHORITY_REQUIRED);
   }
-  const stateProvider = createAprsRuntimeStateProvider(aprsStateProvider);
-  const authorizationProvider = connectionAuthorization(stateProvider);
-  const monitorAuthorizationProvider =
-    observerConnectionAuthorization(stateProvider);
-  const { host, port, timeoutMs } = parseAprsEndpointOptions(environment);
-  const transport = new AprsIsTcpClient({
-    host,
-    port,
-    authorizationProvider,
-    timeoutMs,
-  });
-  const worker = new AprsOutboxWorker(database.aprsOutbox, transport, {
-    authorizationProvider: () => stateProvider()?.provisionFingerprint,
-    clock: () => new Date(),
-    initialDelayMs: 1_000,
-    maximumDelayMs: 60_000,
-  });
-  return new AprsGatewayRuntime({
-    database,
-    eventBus,
-    stateProvider,
-    outbox: worker,
-    stationTransport: transport,
-    version: compiledGatewayBuildVersion(),
-    monitorClientFactory: (filterExpression, provisionFingerprint) => ({
-      connect: (
-        onLine: (line: string) => void,
-        onLineError?: (error: unknown) => void,
-        onActivity?: () => void,
-      ): Promise<AprsIsRxSession> =>
-        new AprsIsRxClient({
-          host,
-          port,
-          authorizationProvider: monitorAuthorizationProvider,
-          provisionFingerprint: provisionFingerprint ?? "",
-          filterExpression,
-          timeoutMs,
-        }).connect(onLine, onLineError, onActivity),
-    }),
-    flushIntervalMs: parsePositiveInteger(
-      environment.CMCLIENT_APRS_FLUSH_INTERVAL_MS,
-      5_000,
-      "APRS_INTERVAL_CONFIGURATION_INVALID",
-    ),
-    monitorRefreshIntervalMs: parsePositiveInteger(
-      environment.CMCLIENT_APRS_MONITOR_REFRESH_INTERVAL_MS,
-      60_000,
-      "APRS_INTERVAL_CONFIGURATION_INVALID",
-    ),
-  });
+  throw new GatewayRuntimeConfigurationError(CMCLOUD_LEGACY_APRS_DISABLED);
 }
 
 export function parseAprsEncodingOptions(
@@ -607,7 +557,7 @@ function parseCmCloudDirectAprsEnabled(
 function parsePort(
   value: string | undefined,
   fallback: number,
-  code: string,
+  code: GatewayRuntimeConfigurationErrorCode,
 ): number {
   const port = parsePositiveInteger(value, fallback, code);
   if (port > 65_535) {
@@ -619,7 +569,7 @@ function parsePort(
 function parsePositiveInteger(
   value: string | undefined,
   fallback: number,
-  code: string,
+  code: GatewayRuntimeConfigurationErrorCode,
 ): number {
   const source = value?.trim() || String(fallback);
   if (!/^\d+$/.test(source)) {
@@ -635,7 +585,7 @@ function parsePositiveInteger(
 function boundedText(
   value: string,
   maximumLength: number,
-  code: string,
+  code: GatewayRuntimeConfigurationErrorCode,
 ): string {
   if (
     !value ||

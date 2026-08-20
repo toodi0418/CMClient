@@ -3,6 +3,11 @@ import type { Server } from "node:http";
 import type { Duplex } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 
+import {
+  CMCLOUD_AUTHORITY_REQUIRED,
+  type GatewayBootstrapErrorCode,
+} from "./error-codes.js";
+
 export const GATEWAY_CAPABILITY_HEADER = "x-cmclient-gateway-capability";
 export const GATEWAY_PRIVATE_FRAME_MAX_BYTES = 16 * 1024;
 export const GATEWAY_CALLMESH_API_KEY_MAX_BYTES = 4096;
@@ -40,6 +45,7 @@ export interface GatewayBootstrapFailureFrame {
   readonly type: "gateway.bootstrap.failed";
   readonly startupNonce: string;
   readonly code:
+    | typeof CMCLOUD_AUTHORITY_REQUIRED
     | "CALLMESH_CREDENTIAL_REJECTED"
     | "CALLMESH_UNAVAILABLE"
     | "SETUP_MESHTASTIC_UNREACHABLE"
@@ -47,7 +53,7 @@ export interface GatewayBootstrapFailureFrame {
 }
 
 export class GatewayBootstrapError extends Error {
-  constructor(readonly code: string) {
+  constructor(readonly code: GatewayBootstrapErrorCode) {
     super(code);
   }
 }

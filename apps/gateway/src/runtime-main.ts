@@ -47,6 +47,7 @@ import {
 } from "./bootstrap.js";
 import { ConsoleStructuredLogger } from "./observability.js";
 import { gatewayRuntimePaths } from "./runtime-paths.js";
+import { CMCLOUD_AUTHORITY_REQUIRED } from "./error-codes.js";
 
 export interface GatewayExternalStartupCallbacks {
   readonly validateMeshtastic: () => Promise<void>;
@@ -70,15 +71,12 @@ export async function startGatewayExternalRuntimes(
   validationOnly: boolean,
   callbacks: GatewayExternalStartupCallbacks,
 ): Promise<void> {
+  if (!callbacks.useCmCloud) {
+    throw new GatewayBootstrapError(CMCLOUD_AUTHORITY_REQUIRED);
+  }
   if (validationOnly) {
     await callbacks.validateMeshtastic();
     callbacks.throwIfShutdownRequested();
-    if (!callbacks.useCmCloud) {
-      if (!callbacks.validateCallMesh) {
-        throw new GatewayBootstrapError("GATEWAY_EXTERNAL_START_FAILED");
-      }
-      await callbacks.validateCallMesh();
-    }
     return;
   }
   if (callbacks.useCmCloud) {
@@ -86,11 +84,6 @@ export async function startGatewayExternalRuntimes(
       throw new GatewayBootstrapError("CMCLOUD_START_CONFIGURATION_INVALID");
     }
     callbacks.startCmCloud();
-  } else {
-    if (!callbacks.synchronizeCallMesh) {
-      throw new GatewayBootstrapError("GATEWAY_EXTERNAL_START_FAILED");
-    }
-    await callbacks.synchronizeCallMesh();
   }
   callbacks.throwIfShutdownRequested();
   await callbacks.startProxy();
@@ -122,13 +115,16 @@ export function createConfiguredGatewayCallMeshClient(
   clientFactory: GatewayCallMeshClientFactory = (options, store) =>
     new CallMeshClient(options, store),
 ): CallMeshClient | undefined {
-  if (useCmCloud) {
-    return undefined;
-  }
-  return clientFactory(
-    callMeshOptionsFromRuntime(environment, version, callMeshApiKey),
-    snapshotStore,
-  );
+  // CallMesh is no longer a CMClient upstream. Mapping/provision authority is
+  // projected by CMCloud over its product-control WSS, so never construct the
+  // legacy HTTPS client even when an old environment supplies its settings.
+  void useCmCloud;
+  void environment;
+  void version;
+  void callMeshApiKey;
+  void snapshotStore;
+  void clientFactory;
+  return undefined;
 }
 
 export function isCmCloudAuthorityRequired(
@@ -269,6 +265,9 @@ export async function runGateway(): Promise<void> {
     context.throwIfShutdownRequested();
 
     const cmCloudRequired = isCmCloudAuthorityRequired(process.env);
+    if (!cmCloudRequired) {
+      throw new GatewayBootstrapError(CMCLOUD_AUTHORITY_REQUIRED);
+    }
     const activeCmCloud = setupValidationOnly
       ? undefined
       : createConfiguredCmCloudAgentClient(
