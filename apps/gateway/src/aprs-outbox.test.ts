@@ -2231,11 +2231,12 @@ function collectFixtureLines(
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
     if (predicate()) {
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error("fixture condition was not reached");
 }
