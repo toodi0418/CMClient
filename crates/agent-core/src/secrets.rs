@@ -748,7 +748,7 @@ impl PlaintextSecretBackend {
         atomic_write_private(&self.path, bytes.as_slice())?;
 
         #[cfg(unix)]
-        validate_optional_private_file(&self.path, self.owner)?;
+        return validate_optional_private_file(&self.path, self.owner);
         #[cfg(not(unix))]
         validate_optional_regular_file(&self.path)
     }
