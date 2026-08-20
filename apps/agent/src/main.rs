@@ -562,6 +562,138 @@ struct CMCloudEnrollmentStatus {
     credential_version: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CMCloudAccountRole {
+    Member,
+    Operator,
+    Admin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CMCloudAccountState {
+    Pending,
+    Approved,
+    Suspended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CMCloudStationKind {
+    #[serde(rename = "cmclient")]
+    CmClient,
+    #[serde(rename = "mqtt_only")]
+    MqttOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CMCloudStationState {
+    Online,
+    Offline,
+    Pending,
+    Suspended,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudAccountProjectionTenant {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudAccountProjectionAccount {
+    issuer: String,
+    subject: String,
+    display_name: String,
+    #[serde(default)]
+    email: Option<String>,
+    role: CMCloudAccountRole,
+    state: CMCloudAccountState,
+    mapping_freeze_epoch: u64,
+    #[serde(default)]
+    mapping_frozen_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudAccountProjectionStation {
+    id: String,
+    label: String,
+    kind: CMCloudStationKind,
+    state: CMCloudStationState,
+    #[serde(default)]
+    callsign: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudAccountProjectionAuthority {
+    cmcloud: bool,
+    epoch: u64,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudAccountProjectionFreshness {
+    projected_at: String,
+    stale_after_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudAccountProjectionErrorState {
+    code: String,
+    since: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CMCloudAccountProjection {
+    #[serde(rename = "type")]
+    projection_type: String,
+    schema_version: u8,
+    revision: u64,
+    generation: u64,
+    tenant: CMCloudAccountProjectionTenant,
+    account: CMCloudAccountProjectionAccount,
+    stations: Vec<CMCloudAccountProjectionStation>,
+    authority: CMCloudAccountProjectionAuthority,
+    freshness: CMCloudAccountProjectionFreshness,
+    #[serde(default)]
+    error_state: Option<CMCloudAccountProjectionErrorState>,
+}
+
+impl CMCloudAccountProjection {
+    fn validate(&self) -> Result<(), CMCloudAccountProjectionControlError> {
+        if self.projection_type != "account_projection"
+            || self.schema_version != 1
+            || self.tenant.id.trim().is_empty()
+            || self.tenant.name.trim().is_empty()
+            || self.account.issuer.trim().is_empty()
+            || self.account.subject.trim().is_empty()
+            || self.account.display_name.trim().is_empty()
+            || !self.authority.cmcloud
+            || self.authority.revision != self.revision
+            || self.authority.epoch != self.account.mapping_freeze_epoch
+            || self.freshness.stale_after_ms == 0
+            || self
+                .freshness
+                .projected_at
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .is_err()
+            || self.error_state.is_some()
+        {
+            return Err(CMCloudAccountProjectionControlError::Unavailable);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CMCloudEnrollmentControlError {
     InvalidInput,
@@ -570,6 +702,30 @@ enum CMCloudEnrollmentControlError {
     InProgress,
     Unavailable,
     Enrollment(cmcloud_enrollment::CMCloudEnrollmentError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CMCloudAccountProjectionControlError {
+    Unavailable,
+    Ambiguous,
+    Stale,
+}
+
+impl CMCloudAccountProjectionControlError {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Unavailable => "ACCOUNT_PROJECTION_UNAVAILABLE",
+            Self::Ambiguous => "ACCOUNT_PROJECTION_AMBIGUOUS",
+            Self::Stale => "ACCOUNT_PROJECTION_STALE",
+        }
+    }
+
+    const fn status_code(self) -> StatusCode {
+        match self {
+            Self::Unavailable | Self::Stale => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Ambiguous => StatusCode::CONFLICT,
+        }
+    }
 }
 
 impl CMCloudEnrollmentControlError {
@@ -749,6 +905,12 @@ type CMCloudEnrollmentHandler = Arc<
 type CMCloudEnrollmentStatusHandler =
     Arc<dyn Fn() -> Result<CMCloudEnrollmentStatus, CMCloudEnrollmentControlError> + Send + Sync>;
 
+type CMCloudAccountProjectionHandler = Arc<
+    dyn Fn() -> Result<CMCloudAccountProjection, CMCloudAccountProjectionControlError>
+        + Send
+        + Sync,
+>;
+
 const CMCLOUD_PRODUCTION_URL: &str = "wss://cmcloud.tmmarc.org/agent/v1";
 
 struct AgentWebState {
@@ -764,6 +926,7 @@ struct AgentWebState {
     operational_reset: Mutex<Option<SetupResetHandler>>,
     cmcloud_enrollment: Mutex<Option<CMCloudEnrollmentHandler>>,
     cmcloud_enrollment_status: Mutex<Option<CMCloudEnrollmentStatusHandler>>,
+    cmcloud_account_projection: Mutex<Option<CMCloudAccountProjectionHandler>>,
     migrated_meshtastic: Option<MeshtasticCandidate>,
     discovery_gate: Mutex<()>,
     audit: Mutex<VecDeque<ManagementAuditEntry>>,
@@ -825,6 +988,7 @@ impl AgentWebState {
             operational_reset: Mutex::new(None),
             cmcloud_enrollment: Mutex::new(None),
             cmcloud_enrollment_status: Mutex::new(None),
+            cmcloud_account_projection: Mutex::new(None),
             migrated_meshtastic,
             discovery_gate: Mutex::new(()),
             audit: Mutex::new(VecDeque::new()),
@@ -861,6 +1025,17 @@ impl AgentWebState {
             .cmcloud_enrollment_status
             .lock()
             .map_err(|_| ControlError::CommandFailed)? = Some(status);
+        Ok(())
+    }
+
+    fn install_cmcloud_account_projection(
+        &self,
+        handler: CMCloudAccountProjectionHandler,
+    ) -> Result<(), ControlError> {
+        *self
+            .cmcloud_account_projection
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)? = Some(handler);
         Ok(())
     }
 
@@ -1013,6 +1188,10 @@ fn agent_web_router(state: Arc<AgentWebState>) -> Router {
             "/api/v1/cmcloud/enrollment",
             get(management_cmcloud_enrollment_status).post(management_cmcloud_enrollment),
         )
+        .route(
+            "/api/v1/cmcloud/account-projection",
+            get(management_cmcloud_account_projection),
+        )
         .route("/api/v1/lifecycle/status", get(management_lifecycle_status))
         .route("/api/v1/lifecycle/events", get(management_lifecycle_events))
         .route("/api/v1/updates", get(management_update_status))
@@ -1132,6 +1311,27 @@ async fn management_cmcloud_enrollment(
     }
 }
 
+async fn management_cmcloud_account_projection(
+    State(state): State<Arc<AgentWebState>>,
+) -> Response {
+    let handler = match state.cmcloud_account_projection.lock() {
+        Ok(handler) => handler.clone(),
+        Err(_) => return management_control_failed_response(),
+    };
+    let Some(handler) = handler else {
+        return cmcloud_account_projection_error_response(
+            CMCloudAccountProjectionControlError::Unavailable,
+        );
+    };
+    match tokio::task::spawn_blocking(move || handler()).await {
+        Ok(Ok(projection)) => (StatusCode::OK, Json(projection)).into_response(),
+        Ok(Err(error)) => cmcloud_account_projection_error_response(error),
+        Err(_) => cmcloud_account_projection_error_response(
+            CMCloudAccountProjectionControlError::Unavailable,
+        ),
+    }
+}
+
 fn valid_cmcloud_pairing_code(value: &str) -> bool {
     (16..=512).contains(&value.len())
         && value
@@ -1174,6 +1374,16 @@ fn cmcloud_gateway_environment(
 }
 
 fn cmcloud_enrollment_error_response(error: CMCloudEnrollmentControlError) -> Response {
+    (
+        error.status_code(),
+        Json(serde_json::json!({"code": error.code()})),
+    )
+        .into_response()
+}
+
+fn cmcloud_account_projection_error_response(
+    error: CMCloudAccountProjectionControlError,
+) -> Response {
     (
         error.status_code(),
         Json(serde_json::json!({"code": error.code()})),
@@ -2467,7 +2677,15 @@ impl AgentController {
                     .ok_or(CMCloudEnrollmentControlError::Unavailable)?;
                 controller.cmcloud_enrollment_status()
             }),
-        )
+        )?;
+        let projection_controller = Arc::downgrade(self);
+        self.web_state
+            .install_cmcloud_account_projection(Arc::new(move || {
+                let controller = projection_controller
+                    .upgrade()
+                    .ok_or(CMCloudAccountProjectionControlError::Unavailable)?;
+                controller.cmcloud_account_projection()
+            }))
     }
 
     fn cmcloud_enrollment_status(
@@ -2516,6 +2734,27 @@ impl AgentController {
                 credential_version: None,
             }),
         }
+    }
+
+    fn cmcloud_account_projection(
+        &self,
+    ) -> Result<CMCloudAccountProjection, CMCloudAccountProjectionControlError> {
+        let status = self
+            .cmcloud_enrollment_status()
+            .map_err(|_| CMCloudAccountProjectionControlError::Unavailable)?;
+        if status.state != CMCloudEnrollmentState::Active {
+            return Err(CMCloudAccountProjectionControlError::Unavailable);
+        }
+        let route = self
+            .gateway_session
+            .snapshot()
+            .ok_or(CMCloudAccountProjectionControlError::Unavailable)?;
+        let projection = gateway_cmcloud_account_projection(&route)?;
+        projection.validate()?;
+        if status.installation_generation != Some(projection.generation) {
+            return Err(CMCloudAccountProjectionControlError::Stale);
+        }
+        Ok(projection)
     }
 
     fn enroll_cmcloud(
@@ -4564,6 +4803,69 @@ fn gateway_json_projection(
     Ok(projection)
 }
 
+fn gateway_cmcloud_account_projection(
+    route: &GatewayRoute,
+) -> Result<CMCloudAccountProjection, CMCloudAccountProjectionControlError> {
+    const MAX_PROJECTION_BYTES: u64 = 256 * 1024;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| CMCloudAccountProjectionControlError::Unavailable)?;
+    let active_route = route
+        .active()
+        .ok_or(CMCloudAccountProjectionControlError::Unavailable)?;
+    let response = client
+        .get(format!(
+            "http://{}/api/v1/cmcloud/account-projection",
+            active_route.address()
+        ))
+        .header("accept", "application/json")
+        .header(GATEWAY_CAPABILITY_HEADER, active_route.capability())
+        .send()
+        .map_err(|_| CMCloudAccountProjectionControlError::Unavailable)?;
+    if !route.is_active() {
+        return Err(CMCloudAccountProjectionControlError::Unavailable);
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROJECTION_BYTES)
+    {
+        return Err(CMCloudAccountProjectionControlError::Unavailable);
+    }
+    let response_status = response.status();
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_PROJECTION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CMCloudAccountProjectionControlError::Unavailable)?;
+    if bytes.len() as u64 > MAX_PROJECTION_BYTES || !route.is_active() {
+        return Err(CMCloudAccountProjectionControlError::Unavailable);
+    }
+    if !response_status.is_success() {
+        let code = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        return Err(match code {
+            Some(code) if code == "ACCOUNT_PROJECTION_AMBIGUOUS" => {
+                CMCloudAccountProjectionControlError::Ambiguous
+            }
+            Some(code) if code == "ACCOUNT_PROJECTION_STALE" => {
+                CMCloudAccountProjectionControlError::Stale
+            }
+            _ => CMCloudAccountProjectionControlError::Unavailable,
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|_| CMCloudAccountProjectionControlError::Unavailable)
+}
+
 fn gateway_health_with_route(route: &GatewayRoute) -> bool {
     const MAX_GATEWAY_HEALTH_BYTES: u64 = 4 * 1024;
     let Some(active_route) = route.active() else {
@@ -5439,15 +5741,19 @@ mod tests {
         AGENT_EVENT_REPLAY_BUFFER, AGENT_EVENT_SUBSCRIBER_LIMIT, AgentConfig, AgentController,
         AgentEventHub, AgentEventHubError, AgentEventSubscription, AgentLifecycleStatus,
         AgentRuntimeProfile, AgentSecretStore, AgentUpdateService, AgentWebState,
+        CMCloudAccountProjection, CMCloudAccountProjectionAccount,
+        CMCloudAccountProjectionAuthority, CMCloudAccountProjectionControlError,
+        CMCloudAccountProjectionFreshness, CMCloudAccountProjectionStation,
+        CMCloudAccountProjectionTenant, CMCloudAccountRole, CMCloudAccountState,
         CMCloudEnrollmentControlError, CMCloudEnrollmentState, CMCloudEnrollmentStatus,
-        ControlCommand, ControlHandler, FactoryResetBackupBehavior,
-        FactoryResetFixtureConfirmation, FactoryResetFixtureJob, FactoryResetFixturePhase,
-        GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle, GatewayStatus,
-        InternalComponent, LogLevel, LogPolicy, ManagementWebConfig, ManagementWebError,
-        ManagementWebService, ResetKind, SecretKind, SetupApplyError, SetupCancellationToken,
-        SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState, SetupStore,
-        ShutdownSignalRegistration, StructuredLogSink, SupervisorWorker, agent_web_router,
-        apply_aprs_environment, apply_physical_qualification_environment,
+        CMCloudStationKind, CMCloudStationState, ControlCommand, ControlHandler,
+        FactoryResetBackupBehavior, FactoryResetFixtureConfirmation, FactoryResetFixtureJob,
+        FactoryResetFixturePhase, GatewayLogHealthUpdate, GatewayRoute, GatewaySessionHandle,
+        GatewayStatus, InternalComponent, LogLevel, LogPolicy, ManagementWebConfig,
+        ManagementWebError, ManagementWebService, ResetKind, SecretKind, SetupApplyError,
+        SetupCancellationToken, SetupConfigureRequest, SetupError, SetupPhase, SetupRollbackState,
+        SetupStore, ShutdownSignalRegistration, StructuredLogSink, SupervisorWorker,
+        agent_web_router, apply_aprs_environment, apply_physical_qualification_environment,
         bridge_gateway_event_stream, classify_shutdown_signal_registration, cmcloud_enrollment,
         cmcloud_gateway_environment, compiled_component_identity, disable_proxy_for_setup,
         ensure_runtime_directories, gateway_json_projection, legacy_state_candidates,
@@ -6656,6 +6962,112 @@ mod tests {
             .expect("valid enrollment request should respond");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        drop(state);
+        std::fs::remove_dir_all(&directory).expect("temporary directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn active_cmcloud_enrollment_exposes_account_projection() {
+        let directory = std::env::temp_dir().join(format!(
+            "cmclient-agent-cmcloud-account-projection-control-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temporary directory should exist");
+        let state = test_agent_web_state(&directory);
+        let status = CMCloudEnrollmentStatus {
+            schema_version: 1,
+            state: CMCloudEnrollmentState::Active,
+            endpoint: Some(String::from("wss://cmcloud.example.invalid/agent/v1")),
+            installation_generation: Some(7),
+            credential_version: Some(3),
+        };
+        state
+            .install_cmcloud_enrollment(
+                Arc::new(move |_request| Ok(status.clone())),
+                Arc::new(|| {
+                    Ok(CMCloudEnrollmentStatus {
+                        schema_version: 1,
+                        state: CMCloudEnrollmentState::Active,
+                        endpoint: Some(String::from("wss://cmcloud.example.invalid/agent/v1")),
+                        installation_generation: Some(7),
+                        credential_version: Some(3),
+                    })
+                }),
+            )
+            .expect("enrollment handler should install");
+        let projection = CMCloudAccountProjection {
+            projection_type: String::from("account_projection"),
+            schema_version: 1,
+            revision: 4,
+            generation: 7,
+            tenant: CMCloudAccountProjectionTenant {
+                id: String::from("9660bc4b-bc0a-4d6f-b1a6-2278630b1a4b"),
+                name: String::from("Operations"),
+            },
+            account: CMCloudAccountProjectionAccount {
+                issuer: String::from("https://callmesh.example/oidc"),
+                subject: String::from("subject-1"),
+                display_name: String::from("Operator"),
+                email: Some(String::from("operator@example.test")),
+                role: CMCloudAccountRole::Operator,
+                state: CMCloudAccountState::Approved,
+                mapping_freeze_epoch: 1,
+                mapping_frozen_at: Some(String::from("2026-08-20T12:00:00Z")),
+            },
+            stations: vec![CMCloudAccountProjectionStation {
+                id: String::from("e83d098c-67f7-4e06-a502-6848c8e6ed65"),
+                label: String::from("Mesh gateway"),
+                kind: CMCloudStationKind::CmClient,
+                state: CMCloudStationState::Online,
+                callsign: Some(String::from("BM5GSV-5")),
+            }],
+            authority: CMCloudAccountProjectionAuthority {
+                cmcloud: true,
+                epoch: 1,
+                revision: 4,
+            },
+            freshness: CMCloudAccountProjectionFreshness {
+                projected_at: String::from("2026-08-20T12:00:00Z"),
+                stale_after_ms: 120_000,
+            },
+            error_state: None,
+        };
+        assert_eq!(projection.validate(), Ok(()));
+        let mut stale_epoch = projection.clone();
+        stale_epoch.authority.epoch = 0;
+        assert_eq!(
+            stale_epoch.validate(),
+            Err(CMCloudAccountProjectionControlError::Unavailable)
+        );
+        state
+            .install_cmcloud_account_projection(Arc::new(move || Ok(projection.clone())))
+            .expect("account projection handler should install");
+        let router = agent_web_router(Arc::clone(&state));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cmcloud/account-projection")
+                    .body(Body::empty())
+                    .expect("projection request should build"),
+            )
+            .await
+            .expect("projection request should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .expect("projection body should read");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("projection response should be JSON");
+        assert_eq!(value["account"]["displayName"], "Operator");
+        assert!(
+            !value["stations"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .is_empty()
+        );
 
         drop(state);
         std::fs::remove_dir_all(&directory).expect("temporary directory should be removed");

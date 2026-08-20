@@ -416,6 +416,53 @@ export interface CmCloudAgentStatus {
   readonly lastErrorCode?: string;
 }
 
+export interface CmCloudAccountProjection {
+  readonly type: "account_projection";
+  readonly schemaVersion: 1;
+  readonly revision: number;
+  readonly generation: number;
+  readonly tenant: { readonly id: string; readonly name: string };
+  readonly account: {
+    readonly issuer: string;
+    readonly subject: string;
+    readonly displayName: string;
+    readonly email?: string;
+    readonly role: "member" | "operator" | "admin";
+    readonly state: "pending" | "approved" | "suspended";
+    readonly mappingFreezeEpoch: number;
+    readonly mappingFrozenAt?: string;
+  };
+  readonly stations: Array<{
+    readonly id: string;
+    readonly label: string;
+    readonly kind: "cmclient" | "mqtt_only";
+    readonly state: "online" | "offline" | "pending" | "suspended";
+    readonly callsign?: string;
+  }>;
+  readonly authority: {
+    readonly cmcloud: true;
+    readonly epoch: number;
+    readonly revision: number;
+  };
+  readonly freshness: {
+    readonly projectedAt: string;
+    readonly staleAfterMs: number;
+  };
+  readonly errorState: { readonly code: string; readonly since: string } | null;
+}
+
+export class CmCloudAccountProjectionError extends Error {
+  constructor(
+    readonly code:
+      | "ACCOUNT_PROJECTION_UNAVAILABLE"
+      | "ACCOUNT_PROJECTION_AMBIGUOUS"
+      | "ACCOUNT_PROJECTION_STALE",
+  ) {
+    super(code);
+    this.name = "CmCloudAccountProjectionError";
+  }
+}
+
 interface CmCloudSession {
   readonly connectionEpoch: number;
   readonly installationGeneration: number;
@@ -470,6 +517,12 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     string,
     CmCloudAprsDispatchAck
   >();
+  private accountProjectionState: CmCloudAccountProjection | undefined;
+  private accountProjectionError:
+    | "ACCOUNT_PROJECTION_UNAVAILABLE"
+    | "ACCOUNT_PROJECTION_AMBIGUOUS"
+    | "ACCOUNT_PROJECTION_STALE"
+    | undefined;
 
   constructor(private readonly options: CmCloudAgentClientOptions) {
     this.endpoint = parseCmCloudEndpoint(options.url);
@@ -534,6 +587,8 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     this.directAprsConfigurationGeneration += 1;
     this.clearTimers();
     this.session = undefined;
+    this.accountProjectionState = undefined;
+    this.accountProjectionError = undefined;
     this.inFlight = undefined;
     this.pendingAprsDispatchId = undefined;
     const socket = this.socket;
@@ -582,6 +637,26 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       ...(this.terminalCode ? { terminalCode: this.terminalCode } : {}),
       ...(this.lastErrorCode ? { lastErrorCode: this.lastErrorCode } : {}),
     };
+  }
+
+  /** Returns only a fresh, CMCloud-authoritative projection. */
+  accountProjection(): CmCloudAccountProjection {
+    const projection = this.accountProjectionState;
+    if (!projection) {
+      throw new CmCloudAccountProjectionError(
+        this.accountProjectionError ?? "ACCOUNT_PROJECTION_UNAVAILABLE",
+      );
+    }
+    const projectedAt = Date.parse(projection.freshness.projectedAt);
+    if (
+      !Number.isFinite(projectedAt) ||
+      this.clock().getTime() - projectedAt > projection.freshness.staleAfterMs
+    ) {
+      this.accountProjectionState = undefined;
+      this.accountProjectionError = "ACCOUNT_PROJECTION_STALE";
+      throw new CmCloudAccountProjectionError("ACCOUNT_PROJECTION_STALE");
+    }
+    return projection;
   }
 
   private openSocket(): void {
@@ -674,6 +749,9 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
           this.failTerminal("CMCLOUD_HEARTBEAT_ACK_INVALID");
         }
         return;
+      case "account_projection":
+        this.acceptAccountProjection(control);
+        return;
       case "aprs_dispatch":
         void this.acceptAprsDispatch(socket, control);
         return;
@@ -694,8 +772,45 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       this.failTerminal(control.code);
       return;
     }
+    if (
+      control.code === "ACCOUNT_PROJECTION_UNAVAILABLE" ||
+      control.code === "ACCOUNT_PROJECTION_AMBIGUOUS" ||
+      control.code === "ACCOUNT_PROJECTION_STALE"
+    ) {
+      this.accountProjectionState = undefined;
+      this.accountProjectionError = control.code;
+      this.lastErrorCode = control.code;
+      return;
+    }
     this.recordConnectionError(control.code);
     this.closeCurrentSocket(4409, control.code);
+  }
+
+  private acceptAccountProjection(control: Record<string, unknown>): void {
+    const projection = parseCmCloudAccountProjection(control);
+    if (
+      !projection ||
+      projection.generation !== this.options.installationGeneration
+    ) {
+      this.accountProjectionState = undefined;
+      this.accountProjectionError = "ACCOUNT_PROJECTION_UNAVAILABLE";
+      this.lastErrorCode = "ACCOUNT_PROJECTION_UNAVAILABLE";
+      return;
+    }
+    const previous = this.accountProjectionState;
+    if (
+      previous &&
+      (projection.revision < previous.revision ||
+        projection.authority.revision < previous.authority.revision ||
+        projection.authority.epoch < previous.authority.epoch)
+    ) {
+      this.accountProjectionState = undefined;
+      this.accountProjectionError = "ACCOUNT_PROJECTION_STALE";
+      this.lastErrorCode = "ACCOUNT_PROJECTION_STALE";
+      return;
+    }
+    this.accountProjectionState = projection;
+    this.accountProjectionError = undefined;
   }
 
   private acceptServerHello(
@@ -765,6 +880,12 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
       connectionEpoch: this.session.connectionEpoch,
       pendingOutbox: this.options.outbox.pendingCount(),
     });
+    void this.sendControl(socket, { type: "account_projection_request" }).catch(
+      () => {
+        this.accountProjectionState = undefined;
+        this.accountProjectionError = "ACCOUNT_PROJECTION_UNAVAILABLE";
+      },
+    );
     void this.sendHeartbeat(socket).catch(() => {
       this.recordConnectionError("CMCLOUD_HEARTBEAT_SEND_FAILED");
       this.closeCurrentSocket(1011, "heartbeat send failed");
@@ -1116,6 +1237,8 @@ export class CmCloudAgentClient implements CmCloudRawFrameSink {
     this.directAprsConfigurationGeneration += 1;
     this.socket = undefined;
     this.session = undefined;
+    this.accountProjectionState = undefined;
+    this.accountProjectionError = "ACCOUNT_PROJECTION_UNAVAILABLE";
     this.clearSessionTimers();
     this.inFlight = undefined;
     this.options.directAprsIgate?.suspend();
@@ -1308,6 +1431,107 @@ function parseControlMessage(
   } catch {
     return undefined;
   }
+}
+
+function parseCmCloudAccountProjection(
+  value: Record<string, unknown>,
+): CmCloudAccountProjection | undefined {
+  const tenant = value.tenant;
+  const account = value.account;
+  const authority = value.authority;
+  const freshness = value.freshness;
+  const stations = value.stations;
+  if (
+    !hasOnlyKeys(value, [
+      "type",
+      "schemaVersion",
+      "revision",
+      "generation",
+      "tenant",
+      "account",
+      "stations",
+      "authority",
+      "freshness",
+      "errorState",
+    ]) ||
+    value.type !== "account_projection" ||
+    value.schemaVersion !== 1 ||
+    !validNonNegativeInteger(value.revision) ||
+    !validNonNegativeInteger(value.generation) ||
+    !isRecord(tenant) ||
+    !isRecord(account) ||
+    !isRecord(authority) ||
+    !isRecord(freshness) ||
+    !Array.isArray(stations) ||
+    authority.cmcloud !== true ||
+    !validNonNegativeInteger(authority.epoch) ||
+    !validNonNegativeInteger(authority.revision) ||
+    authority.revision !== value.revision ||
+    typeof freshness.projectedAt !== "string" ||
+    !validTimestamp(freshness.projectedAt) ||
+    !validPositiveInteger(freshness.staleAfterMs) ||
+    value.errorState !== null
+  ) {
+    return undefined;
+  }
+  if (
+    !hasOnlyKeys(tenant, ["id", "name"]) ||
+    !hasOnlyKeys(account, [
+      "issuer",
+      "subject",
+      "displayName",
+      "email",
+      "role",
+      "state",
+      "mappingFreezeEpoch",
+      "mappingFrozenAt",
+    ]) ||
+    !hasOnlyKeys(authority, ["cmcloud", "epoch", "revision"]) ||
+    !hasOnlyKeys(freshness, ["projectedAt", "staleAfterMs"]) ||
+    typeof tenant.id !== "string" ||
+    typeof tenant.name !== "string" ||
+    !tenant.name ||
+    typeof account.issuer !== "string" ||
+    typeof account.subject !== "string" ||
+    typeof account.displayName !== "string" ||
+    !account.displayName ||
+    !["member", "operator", "admin"].includes(String(account.role)) ||
+    !["pending", "approved", "suspended"].includes(String(account.state)) ||
+    !validNonNegativeInteger(account.mappingFreezeEpoch) ||
+    authority.epoch !== account.mappingFreezeEpoch
+  ) {
+    return undefined;
+  }
+  const parsedStations = stations.map((station) => {
+    if (!isRecord(station)) return undefined;
+    if (
+      !hasOnlyKeys(station, ["id", "label", "kind", "state", "callsign"]) ||
+      !isUuid(station.id) ||
+      typeof station.label !== "string" ||
+      !station.label ||
+      !["cmclient", "mqtt_only"].includes(String(station.kind)) ||
+      !["online", "offline", "pending", "suspended"].includes(
+        String(station.state),
+      )
+    ) {
+      return undefined;
+    }
+    return station as CmCloudAccountProjection["stations"][number];
+  });
+  if (parsedStations.some((station) => !station)) return undefined;
+  return value as unknown as CmCloudAccountProjection;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): boolean {
+  const keys = new Set(allowed);
+  return Object.keys(value).every((key) => keys.has(key));
 }
 
 function toCmCloudOutboxEntry(

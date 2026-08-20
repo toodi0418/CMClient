@@ -132,6 +132,75 @@ describe("CMCloud raw outbox", () => {
     database.close();
   });
 
+  it("requests and exposes only the current CMCloud account projection", async () => {
+    const database = new GatewayDatabase(":memory:");
+    const socket = new FixtureSocket();
+    const client = createClient(
+      database,
+      () => socket,
+      undefined,
+      undefined,
+      () => new Date(CAPTURED_AT),
+    );
+
+    client.start();
+    socket.open();
+    socket.message(serverHello(7));
+    await settle();
+    expect(latestControl(socket, "account_projection_request")).toEqual({
+      type: "account_projection_request",
+    });
+    const projection = {
+      type: "account_projection",
+      schemaVersion: 1,
+      revision: 4,
+      generation: 0,
+      tenant: {
+        id: "9660bc4b-bc0a-4d6f-b1a6-2278630b1a4b",
+        name: "Operations",
+      },
+      account: {
+        issuer: "https://callmesh.example/oidc",
+        subject: "subject-1",
+        displayName: "Operator",
+        role: "operator",
+        state: "approved",
+        mappingFreezeEpoch: 1,
+      },
+      stations: [
+        {
+          id: "e83d098c-67f7-4e06-a502-6848c8e6ed65",
+          label: "Mesh gateway",
+          kind: "cmclient",
+          state: "online",
+          callsign: "BM5GSV-5",
+        },
+      ],
+      authority: { cmcloud: true, epoch: 1, revision: 4 },
+      freshness: { projectedAt: CAPTURED_AT, staleAfterMs: 120_000 },
+      errorState: null,
+    } as const;
+    socket.message(projection);
+    await settle();
+    expect(client.accountProjection()).toMatchObject({
+      revision: 4,
+      account: { displayName: "Operator" },
+      stations: [{ callsign: "BM5GSV-5" }],
+    });
+    socket.message({
+      ...projection,
+      account: { ...projection.account, mappingFreezeEpoch: 0 },
+      authority: { ...projection.authority, epoch: 0 },
+    });
+    await settle();
+    expect(() => client.accountProjection()).toThrow(
+      "ACCOUNT_PROJECTION_STALE",
+    );
+
+    await client.stop();
+    database.close();
+  });
+
   it("settles the durable raw outbox when CMCloud drops an MQTT packet", async () => {
     const database = new GatewayDatabase(":memory:");
     const socket = new FixtureSocket();

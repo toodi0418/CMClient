@@ -383,6 +383,7 @@ export async function runGateway(): Promise<void> {
           },
       },
       { capability: bootstrap.capability },
+      activeCmCloud,
     );
     runtime = activeRuntime;
     context.throwIfShutdownRequested();

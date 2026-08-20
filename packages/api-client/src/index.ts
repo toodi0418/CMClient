@@ -5,6 +5,7 @@ import {
   AprsRuntimeStatusSchema,
   CMCloudEnrollmentRequestSchema,
   CMCloudEnrollmentStatusSchema,
+  CMCloudAccountProjectionSchema,
   ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
   JobAcceptedSchema,
@@ -32,6 +33,7 @@ import {
   type AprsRuntimeStatus,
   type CMCloudEnrollmentRequest,
   type CMCloudEnrollmentStatus,
+  type CMCloudAccountProjection,
   type JobAccepted,
   type JobDetail,
   type MeshMessageList,
@@ -304,6 +306,11 @@ export class GatewayApiClient {
         CMCloudEnrollmentStatusSchema,
         CMCloudEnrollmentRequestSchema,
         request,
+      ),
+    accountProjection: () =>
+      this.request<CMCloudAccountProjection>(
+        "/cmcloud/account-projection",
+        CMCloudAccountProjectionSchema,
       ),
   };
 

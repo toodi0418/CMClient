@@ -13,6 +13,7 @@ import {
   AprsIgateSubmissionListSchema,
   AprsOutboxEntryListSchema,
   AprsRuntimeStatusSchema,
+  CMCloudAccountProjectionSchema,
   ComponentIdentityReportSchema,
   CallMeshOverviewSchema,
   DomainEventSchema,
@@ -64,6 +65,10 @@ import {
   gatewayCapabilityMatches,
   isGatewayCapability,
 } from "./bootstrap.js";
+import {
+  CmCloudAccountProjectionError,
+  type CmCloudAccountProjection,
+} from "./cmcloud.js";
 
 const SSE_HTTP_HIGH_WATER_MARK_BYTES = DEFAULT_SSE_FRAME_MAX_BYTES + 4 * 1024;
 const SSE_PENDING_EVENT_MAX_BYTES = DEFAULT_SSE_FRAME_MAX_BYTES;
@@ -131,6 +136,10 @@ export interface GatewayMeshtasticReadApi {
 export interface GatewayAprsReadApi {
   status(): AprsRuntimeStatus;
   listStationSubmissions?(limit: number): AprsIgateSubmission[];
+}
+
+export interface GatewayCmCloudReadApi {
+  accountProjection(): CmCloudAccountProjection;
 }
 
 declare module "fastify" {
@@ -208,6 +217,7 @@ export class GatewayRuntime {
     meshtastic?: GatewayMeshtasticReadApi,
     aprs?: GatewayAprsReadApi,
     access?: GatewayAccessOptions,
+    cmcloud?: GatewayCmCloudReadApi,
   ) {
     if (options.host !== "127.0.0.1" || options.port !== 0) {
       throw new GatewayConfigurationError();
@@ -228,6 +238,7 @@ export class GatewayRuntime {
       proxy,
       meshtastic,
       aprs,
+      cmcloud,
     );
   }
 
@@ -269,6 +280,7 @@ export function createGatewayApp(
   proxy?: GatewayProxyReadApi,
   meshtastic?: GatewayMeshtasticReadApi,
   aprs?: GatewayAprsReadApi,
+  cmcloud?: GatewayCmCloudReadApi,
 ): FastifyInstance {
   const heartbeatIntervalMs = sseOptions.heartbeatIntervalMs ?? 15_000;
   if (!Number.isInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 1_000) {
@@ -495,6 +507,39 @@ export function createGatewayApp(
           return callmesh.getOverview();
         }
         sendCallMeshUnavailable(request, reply);
+      },
+    );
+    app.get(
+      "/api/v1/cmcloud/account-projection",
+      {
+        schema: {
+          response: {
+            200: CMCloudAccountProjectionSchema,
+            503: ApiErrorSchema,
+          },
+        },
+      },
+      (request, reply) => {
+        if (!cmcloud) {
+          reply.code(503).send(
+            gatewayErrorEnvelope(
+              request,
+              reply,
+              "ACCOUNT_PROJECTION_UNAVAILABLE",
+            ),
+          );
+          return;
+        }
+        try {
+          return cmcloud.accountProjection();
+        } catch (error) {
+          const code =
+            error instanceof CmCloudAccountProjectionError
+              ? error.code
+              : "ACCOUNT_PROJECTION_UNAVAILABLE";
+          reply.code(503).send(gatewayErrorEnvelope(request, reply, code));
+          return;
+        }
       },
     );
     app.get(
