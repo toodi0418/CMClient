@@ -446,6 +446,26 @@ class ReconcileTaskStateTests(unittest.TestCase):
         self.assertIn("log", run.call_args.args)
         self.assertIn("-z", run.call_args.args)
 
+        # Older implementation commits may carry the task ID in their subject
+        # but are not checkpoint records until they include the structured
+        # Task/Validation body markers.
+        legacy_subject = subprocess.CompletedProcess(
+            args=["git"],
+            returncode=0,
+            stdout=(
+                "e" * 40
+                + "\x00"
+                + "1" * 40
+                + "\x002026-07-20T00:00:00+00:00\x00"
+                + f"feat(gateway): [{TASK}] implementation\x00\x00"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(MODULE, "run_git", return_value=legacy_subject):
+            with self.assertRaises(MODULE.ReconcileError) as missing:
+                MODULE.find_checkpoint_commit("git", Path("repo"), TASK)
+        self.assertIn("no checkpoint commit found", str(missing.exception))
+
         duplicate = subprocess.CompletedProcess(
             args=["git"],
             returncode=0,

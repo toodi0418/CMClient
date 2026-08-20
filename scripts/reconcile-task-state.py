@@ -323,7 +323,12 @@ def find_checkpoint_commit(
         subject = SUBJECT_RE.fullmatch(commit.subject)
         subject_task = subject.group("task") if subject else None
         body_tasks = TASK_LINE_RE.findall(commit.body)
-        if subject_task == task or task in body_tasks:
+        # A checkpoint is identified by the structured body marker. Earlier
+        # feature commits used the task ID in their subject without recording
+        # checkpoint validation metadata; treating those as checkpoints makes
+        # recovery impossible once a task has several independently pushed
+        # implementation commits.
+        if body_tasks and (task in body_tasks or subject_task == task):
             implicated.append(commit)
 
     if not implicated:

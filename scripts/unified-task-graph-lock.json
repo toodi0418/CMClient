@@ -12,7 +12,11 @@
   "completedHistorySha256": "1280bdb322ce7fffefc6eb779661c32c762504b98325884cf8271f54cc25fdfa",
   "firstActivePhase": "P13",
   "taskDefinitionCount": 72,
-  "preservedDefinitions": ["P13-T01", "P13-T02", "P13-T03"],
+  "preservedDefinitions": [
+    "P13-T01",
+    "P13-T02",
+    "P13-T03"
+  ],
   "canonicalPayloadFields": [
     "tasks",
     "historicalSupersessions",
@@ -97,7 +101,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P12-T08"]
+      "dependsOn": [
+        "P12-T08"
+      ]
     },
     {
       "id": "P13-T02",
@@ -123,7 +129,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T01"]
+      "dependsOn": [
+        "P13-T01"
+      ]
     },
     {
       "id": "P13-T03",
@@ -148,7 +156,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T01"]
+      "dependsOn": [
+        "P13-T01"
+      ]
     },
     {
       "id": "P13-T04",
@@ -176,7 +186,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T03"]
+      "dependsOn": [
+        "P13-T03"
+      ]
     },
     {
       "id": "P13-T05",
@@ -204,7 +216,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T04"]
+      "dependsOn": [
+        "P13-T04"
+      ]
     },
     {
       "id": "P13-T06",
@@ -230,7 +244,13 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T05", "P13-T13", "P13-T14", "P13-T17", "P13-T18"]
+      "dependsOn": [
+        "P13-T05",
+        "P13-T13",
+        "P13-T14",
+        "P13-T17",
+        "P13-T18"
+      ]
     },
     {
       "id": "P13-T07",
@@ -256,7 +276,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T06"]
+      "dependsOn": [
+        "P13-T06"
+      ]
     },
     {
       "id": "P13-T08",
@@ -283,7 +305,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T07"]
+      "dependsOn": [
+        "P13-T07"
+      ]
     },
     {
       "id": "P13-T09",
@@ -308,7 +332,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T06", "P13-T07"]
+      "dependsOn": [
+        "P13-T06",
+        "P13-T07"
+      ]
     },
     {
       "id": "P13-T10",
@@ -334,7 +361,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T07", "P13-T08", "P13-T09"]
+      "dependsOn": [
+        "P13-T07",
+        "P13-T08",
+        "P13-T09"
+      ]
     },
     {
       "id": "P13-T11",
@@ -359,7 +390,12 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T07", "P13-T08", "P13-T09", "P13-T10"]
+      "dependsOn": [
+        "P13-T07",
+        "P13-T08",
+        "P13-T09",
+        "P13-T10"
+      ]
     },
     {
       "id": "P14-T01",
@@ -385,7 +421,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T11", "P18-T01"]
+      "dependsOn": [
+        "P13-T11",
+        "P18-T01"
+      ]
     },
     {
       "id": "P14-T02",
@@ -411,7 +450,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T01", "P18-T02"]
+      "dependsOn": [
+        "P14-T01",
+        "P18-T02"
+      ]
     },
     {
       "id": "P14-T03",
@@ -436,7 +478,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T02"]
+      "dependsOn": [
+        "P14-T02"
+      ]
     },
     {
       "id": "P14-T04",
@@ -461,7 +505,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T02", "P14-T03"]
+      "dependsOn": [
+        "P14-T02",
+        "P14-T03"
+      ]
     },
     {
       "id": "P14-T05",
@@ -486,7 +533,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T11", "P14-T02"]
+      "dependsOn": [
+        "P13-T11",
+        "P14-T02"
+      ]
     },
     {
       "id": "P14-T06",
@@ -511,7 +561,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T03", "P14-T05"]
+      "dependsOn": [
+        "P14-T03",
+        "P14-T05"
+      ]
     },
     {
       "id": "P14-T07",
@@ -537,7 +590,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T05", "P14-T06"]
+      "dependsOn": [
+        "P14-T05",
+        "P14-T06"
+      ]
     },
     {
       "id": "P14-T08",
@@ -562,7 +618,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T07", "P14-T02", "P14-T04"]
+      "dependsOn": [
+        "P13-T07",
+        "P14-T02",
+        "P14-T04"
+      ]
     },
     {
       "id": "P14-T09",
@@ -587,7 +647,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T05", "P14-T02", "P14-T06"]
+      "dependsOn": [
+        "P13-T05",
+        "P14-T02",
+        "P14-T06"
+      ]
     },
     {
       "id": "P14-T10",
@@ -612,12 +676,15 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T01", "P14-T05"]
+      "dependsOn": [
+        "P14-T01",
+        "P14-T05"
+      ]
     },
     {
       "id": "P14-T11",
       "phase": "P14",
-      "title": "Finish Legacy-compatible CallMesh mapping and verified APRS-IS transmission gates",
+      "title": "Finish CMCloud-authoritative Mapping and verified APRS-IS transmission gates",
       "required": true,
       "manualGate": false,
       "environmental": false,
@@ -629,22 +696,24 @@
       "repairOf": null,
       "supersedesPartOf": null,
       "acceptance": [
-        "The official hosted CallMesh service remains the only production provision/mapping authority for fields its validated supported schema actually supplies. Schema, atomic persistence, restart, and event-time projection retain field presence separately from value: Tracker enablement, callsign/SSID, composite symbol plus table/code/overlay aliases, comment, altitude, effective time/version; iGate callsign/SSID, position, composite symbol plus component aliases, comment, altitude, PHG, expiry, and any schema-supported APRS endpoint/beacon fields. Legacy v0.2.28 endpoint/UI and interval-setter behavior are not misrepresented as provision schema: use a validated official field when present, otherwise fixed asia.aprs2.net:14580 and ten minutes bounded one minute through 24 hours. Production exposes no local APRS server, destination, mapping, provision, or beacon-policy override; destination is fixed APTMAG and fixtures use dependency injection only.",
-        "Trusted source event time, sequence/epoch, canonical digest, and temporal high-water remain internal. Select the newest authoritative mapping with effective time less than or equal to the source event time, so equality activates the new revision; conflicting same-time content without an authoritative monotonic order fails closed. Complete valid mapping revision history is append-only across refresh/restart and has no age-only pruning; exact duplicate snapshots may coalesce and factory reset may remove it. A missing applicable revision always fails closed. Unknown Legacy APRS input never advances temporal high-water from APRS receive time.",
-        "The sole public-wire golden oracle is v0.2.28 tag 5e6c294c640766711c6251173711e8226bf8268a and its frozen formatter/client blobs. For every eligible Tracker event, output is byte-exact SOURCE>APTMAG,MESHD*,qAO,IGATE:!legacy-data plus CRLF, with fixed APTMAG and no public timestamp or CM2 marker. Golden fixtures cover latitude/longitude ECMAScript Number/toFixed ties/carry; exact composite-symbol/component precedence and absent/null/empty/explicit values; exact course modulo-before-round including 359.5 -> 360 and Legacy speed conversions; mapping-only String/CRLF/whitespace comment sanitation with no inserted separator or normalization; exact 3.28084 altitude conversion and packet/mapping/self-provision precedence; UTF-8 replacement and full-line byte budget; and disabled mapping zero-write behavior. qAO denotes receive-only translation of Meshtastic RF received through TCP or Serial and does not authorize APRS-IS-to-Meshtastic RF transmission.",
-        "iGate-owned beacon, status, telemetry data, and telemetry definitions use IGATE>APTMAG,TCPIP*:...; CMClient never injects qAC, server-observed qAC is accepted, and status is >TMAG Client v<version> without CLI/Desktop. Golden fixtures lock beacon PHG/position/symbol/comment/altitude and PHG-preserving 512-byte truncation; PARM/UNIT/EQNS/T# bytes and order; nine-character message destination padding; every explicit POS/MSG/CTRL type; rolling buckets; first fresh verified order beacon/PARM/UNIT/EQNS/T#/status; same-process reconnect; status interval anchored at verification; fresh-process timestamp/bucket reset; only last successful 001..999 sequence persistence; failed-write in-memory sequence consumption; and every Legacy cadence boundary.",
-        "A bounded provision-scoped persistent APRS session uses incremental banner/logresp parsing and explicit disconnected, connecting, login-sent, verified, and closing states. Every TX/RX session independently exact-verifies its provision-derived canonical callsign; mismatch, unverified, timeout, EOF, invalid/oversized response, error, close, half-open, rotation, expiry, reset, and stale-generation callback fence Data, trigger bounded reconnect/filter restoration, and require fresh verification. Per-outbox transient connect/login/write/close transmission is forbidden.",
-        "APRS-IS has no per-packet delivery acknowledgement: a socket write is only local-kernel submission. Durable state distinguishes queued/sending/submitted/observer_confirmed/observation_expired, never calls a socket write accepted or delivered, and advances delivery high-water only after independent filtered observation of exact source, destination, and Info. An unmatched submitted row remains unconfirmed for the persisted three-hour observer window, then expires unconfirmed without blind retry or high-water advance; disconnect after write reconciles through the exact observer/cache.",
-        "A bounded persisted normalized-source-plus-exact-Info observer cache covers Tracker and iGate-owned families for three hours and a local transmit cache suppresses exact repeats for 30 seconds across restart/crash, provision/source isolation, and expiry boundaries; qAR versus qAO path differences do not defeat the emulated APRS-IS 30-second exact-Data dedup because path is ignored.",
-        "The supported same-identity Legacy-to-2.0 migration proves the old local process/session stopped before new verification and rejects detectable local overlap; update, rollback, reset, and restart cannot interleave status or telemetry sequence ownership. Cross-host overlap remains forbidden but is not claimed as client-detectable.",
-        "Repository APRS implementation/configuration docs and regressions are updated with a negative drift check forbidding APCM20, public CM2 markers, public APRS timestamps, qAR emission, and production APRS endpoint/destination overrides. P14-T11 explicitly owns the encoder, monitor, runtime-config, Agent propagation, docs/architecture/aprs-position-encoding.md, docs/architecture/aprs-remote-monitor.md, docs/admin/configuration-security.md, docs/architecture/agent-runtime.md, and their tests.",
-        "Regression and claim tests preserve the residual mixed-generation limit: packets delayed beyond 30 seconds or with different Data can escape exact dedup and may backtrack, so neither the task nor later qualification claims mixed-generation zero rollback."
+        "CMCloud is the only production authority consumed by CMClient for account/station binding, Mapping revisions, APRS eligibility, ordering, duplicate decisions, producer selection, temporal high-water, and dispatch permits. CMClient never reads CallMesh Mapping/provision data and never uses it as an outage fallback. CallMesh remains the OIDC authority and Legacy compatibility read model; successful token issuance or exchange for an explicitly allowlisted CMCloud OIDC client, including historical issuance backfill, permanently freezes Mapping mutations for that immutable issuer/subject while authenticated CMCloud projection remains permitted. Missing, stale, or ambiguous CMCloud authority fails closed.",
+        "Every local APRS write requires a short-lived CMCloud permit bound to the exact tenant, account, station/callsign/SSID, event identity and digest, Mapping revision, sticky freeze epoch, global producer fence, installation and connection generations, authorization generation, monotonic permit sequence, precision_bits of at least 28, trusted event-time/high-water decision, and expiry. Replay, stale revision, 27-bit-or-lower precision, unknown freshness, expired authority, producer ambiguity, or an unconfirmed freeze rejects before socket write.",
+        "CMCloud applies a fixed two-second RF preference window. Any valid RF reception for an event permanently excludes Cloud fallback for that event; a selected station becoming unready, disconnecting, or failing submission never changes the producer to Cloud. Only zero valid RF receptions may select the separately authorized BU2GE-15 CMCloud APRS-IS fallback identity. Retries remain bound to the original producer and event.",
+        "Trusted source event time, sequence/epoch, canonical digest, and temporal high-water remain internal. CMCloud selects the newest Mapping revision effective at or before source event time, with equality activating the revision; conflicting same-time content without authoritative monotonic order fails closed. Complete valid Mapping history is append-only across refresh/restart, tombstones prevent resurrection, and missing applicable revisions fail closed. APRS receive time never advances source temporal high-water.",
+        "The sole public-wire golden oracle remains v0.2.28 tag 5e6c294c640766711c6251173711e8226bf8268a and its frozen formatter/client blobs. Every eligible Tracker event is byte-exact SOURCE>APTMAG,MESHD*,qAO,IGATE:!legacy-data plus CRLF, with fixed APTMAG and no public timestamp or CM2 marker. Golden fixtures retain numeric rounding/carry, symbol precedence, course/speed, sanitation, altitude, UTF-8 and byte-budget behavior. qAO is receive-only; APRS-to-Meshtastic, the removed @cm bot, all other RF transmit paths, and radio configuration mutation remain excluded.",
+        "iGate-owned beacon, status, telemetry data, and telemetry definitions use IGATE>APTMAG,TCPIP*:...; CMClient never injects qAC, server-observed qAC is accepted, and status remains >TMAG Client v<version> without CLI/Desktop. Golden fixtures lock beacon PHG/position/symbol/comment/altitude, 512-byte truncation, PARM/UNIT/EQNS/T# bytes and order, message padding, explicit packet types, rolling buckets, verified-session startup order, reconnect, intervals, process reset, and 001..999 sequence semantics.",
+        "A bounded CMCloud-permit-scoped persistent APRS session uses incremental banner/logresp parsing and explicit disconnected, connecting, login-sent, verified, and closing states. Every TX/RX session independently exact-verifies the permitted canonical callsign; mismatch, unverified response, timeout, EOF, invalid or oversized response, error, close, half-open connection, permit rotation or expiry, reset, and stale-generation callback fence Data and require fresh verification. The APRS passcode remains installation-local plaintext in ~/.cmclient/secrets.json and never enters CMCloud, CallMesh, browser, sync, logs, diagnostics, or evidence. Per-outbox transient connect/login/write/close transmission is forbidden.",
+        "APRS-IS has no per-packet delivery acknowledgement: socket.write is only local-kernel submission. Durable state distinguishes queued, sending, submitted, observer_confirmed, and observation_expired; it never calls a socket write accepted or delivered and advances delivery high-water only after independent filtered observation of exact source, destination, and Info. An unmatched submitted row remains unconfirmed for the persisted three-hour observer window, then expires without blind retry or high-water advance; uncertain writes are never reissued as known-undelivered.",
+        "A bounded persisted normalized-source-plus-exact-Info observer cache covers Tracker and iGate-owned families for three hours, and a local transmit cache suppresses exact repeats for 30 seconds across restart/crash, identity, producer-fence, and expiry boundaries. A global tenant plus station/callsign plus SSID fence, not a machine-local lock, prevents Legacy, second-host, stale-process, and delayed-retry overlap; any duplicate-producer evidence blocks authorization without automatic CallMesh unfreeze.",
+        "Repository APRS and CMCloud authority docs plus regressions forbid CallMesh consumption by CMClient, local Mapping/provision authority, precision below 28, Cloud fallback after any RF reception, producer switching, APCM20, public CM2 markers, public APRS timestamps, qAR emission, APRS-to-RF, and production APRS endpoint/destination overrides. Tests cover sticky OIDC freeze, compatibility projection without echo loops, permit replay/expiry/revision/fence failures, zero-reception BU2GE-15 fallback, observer reconciliation, and the residual limit that delayed or different Data can escape exact dedup and therefore cannot support a zero-rollback claim."
       ],
       "caseGroups": [],
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T10"]
+      "dependsOn": [
+        "P14-T10"
+      ]
     },
     {
       "id": "P14-T12",
@@ -703,7 +772,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T11", "P18-T02"]
+      "dependsOn": [
+        "P13-T11",
+        "P18-T02"
+      ]
     },
     {
       "id": "P15-T01",
@@ -728,7 +800,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T12", "P15-T00"]
+      "dependsOn": [
+        "P14-T12",
+        "P15-T00"
+      ]
     },
     {
       "id": "P15-T02",
@@ -753,7 +828,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T08", "P14-T09", "P15-T01"]
+      "dependsOn": [
+        "P14-T08",
+        "P14-T09",
+        "P15-T01"
+      ]
     },
     {
       "id": "P15-T03",
@@ -778,7 +857,12 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T06", "P14-T07", "P15-T01", "P15-T02"]
+      "dependsOn": [
+        "P14-T06",
+        "P14-T07",
+        "P15-T01",
+        "P15-T02"
+      ]
     },
     {
       "id": "P15-T04",
@@ -803,7 +887,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T03"]
+      "dependsOn": [
+        "P15-T03"
+      ]
     },
     {
       "id": "P15-T05",
@@ -828,7 +914,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T01", "P15-T15"]
+      "dependsOn": [
+        "P15-T01",
+        "P15-T15"
+      ]
     },
     {
       "id": "P15-T06",
@@ -853,7 +942,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T07", "P15-T02", "P15-T05"]
+      "dependsOn": [
+        "P14-T07",
+        "P15-T02",
+        "P15-T05"
+      ]
     },
     {
       "id": "P15-T07",
@@ -877,7 +970,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T06"]
+      "dependsOn": [
+        "P15-T06"
+      ]
     },
     {
       "id": "P15-T08",
@@ -902,7 +997,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T01", "P15-T14", "P15-T15"]
+      "dependsOn": [
+        "P15-T01",
+        "P15-T14",
+        "P15-T15"
+      ]
     },
     {
       "id": "P15-T09",
@@ -927,7 +1026,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T01", "P15-T14", "P15-T15"]
+      "dependsOn": [
+        "P15-T01",
+        "P15-T14",
+        "P15-T15"
+      ]
     },
     {
       "id": "P15-T10",
@@ -952,7 +1055,12 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T07", "P15-T02", "P15-T08", "P15-T09"]
+      "dependsOn": [
+        "P14-T07",
+        "P15-T02",
+        "P15-T08",
+        "P15-T09"
+      ]
     },
     {
       "id": "P15-T11",
@@ -976,7 +1084,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T04", "P15-T07", "P15-T10"]
+      "dependsOn": [
+        "P15-T04",
+        "P15-T07",
+        "P15-T10"
+      ]
     },
     {
       "id": "P15-T12",
@@ -1000,7 +1112,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T11"]
+      "dependsOn": [
+        "P15-T11"
+      ]
     },
     {
       "id": "P15-T13",
@@ -1024,7 +1138,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T12"]
+      "dependsOn": [
+        "P15-T12"
+      ]
     },
     {
       "id": "P16-T01",
@@ -1050,7 +1166,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T12", "P15-T01", "P18-T10"]
+      "dependsOn": [
+        "P14-T12",
+        "P15-T01",
+        "P18-T10"
+      ]
     },
     {
       "id": "P16-T02",
@@ -1076,7 +1196,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T01"]
+      "dependsOn": [
+        "P16-T01"
+      ]
     },
     {
       "id": "P16-T03",
@@ -1100,7 +1222,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T02"]
+      "dependsOn": [
+        "P16-T02"
+      ]
     },
     {
       "id": "P16-T04",
@@ -1125,7 +1249,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T02", "P16-T03"]
+      "dependsOn": [
+        "P16-T02",
+        "P16-T03"
+      ]
     },
     {
       "id": "P16-T05",
@@ -1150,7 +1277,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T04"]
+      "dependsOn": [
+        "P16-T04"
+      ]
     },
     {
       "id": "P16-T06",
@@ -1174,7 +1303,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T05"]
+      "dependsOn": [
+        "P16-T05"
+      ]
     },
     {
       "id": "P16-T07",
@@ -1198,7 +1329,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T12", "P16-T05"]
+      "dependsOn": [
+        "P15-T12",
+        "P16-T05"
+      ]
     },
     {
       "id": "P16-T08",
@@ -1223,7 +1357,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T07"]
+      "dependsOn": [
+        "P16-T07"
+      ]
     },
     {
       "id": "P16-T09",
@@ -1248,7 +1384,10 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T06", "P16-T08"]
+      "dependsOn": [
+        "P16-T06",
+        "P16-T08"
+      ]
     },
     {
       "id": "P16-T10",
@@ -1272,7 +1411,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T09"]
+      "dependsOn": [
+        "P16-T09"
+      ]
     },
     {
       "id": "P16-T11",
@@ -1296,7 +1437,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T10"]
+      "dependsOn": [
+        "P16-T10"
+      ]
     },
     {
       "id": "P16-T12",
@@ -1320,7 +1463,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P16-T11"]
+      "dependsOn": [
+        "P16-T11"
+      ]
     },
     {
       "id": "P17-T01",
@@ -1345,7 +1490,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T12", "P16-T11", "P18-T10"]
+      "dependsOn": [
+        "P15-T12",
+        "P16-T11",
+        "P18-T10"
+      ]
     },
     {
       "id": "P17-T02",
@@ -1371,7 +1520,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P17-T01"]
+      "dependsOn": [
+        "P17-T01"
+      ]
     },
     {
       "id": "P17-T03",
@@ -1396,7 +1547,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P17-T02"]
+      "dependsOn": [
+        "P17-T02"
+      ]
     },
     {
       "id": "P17-T04",
@@ -1421,7 +1574,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P17-T03"]
+      "dependsOn": [
+        "P17-T03"
+      ]
     },
     {
       "id": "P17-T05",
@@ -1446,7 +1601,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P17-T04"]
+      "dependsOn": [
+        "P17-T04"
+      ]
     },
     {
       "id": "P17-T06",
@@ -1471,7 +1628,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P17-T05"]
+      "dependsOn": [
+        "P17-T05"
+      ]
     },
     {
       "id": "P17-T07",
@@ -1496,7 +1655,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P17-T06"]
+      "dependsOn": [
+        "P17-T06"
+      ]
     },
     {
       "id": "P17-T08",
@@ -1521,7 +1682,11 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P17-T07", "P15-T13", "P16-T12"]
+      "dependsOn": [
+        "P17-T07",
+        "P15-T13",
+        "P16-T12"
+      ]
     },
     {
       "id": "P13-T16",
@@ -1549,11 +1714,16 @@
         "Scheduler trace tests select P18-T01 and the required Windows core prerequisites, then reach P14-T01 and mandatory P18-T02 before P14-T02 or P15-T00. A hardware-blocked P18-T02 blocks broad P14 and packaging rather than silently routing around the user's physical-first milestone. Tests also preserve parent lane/priority for dynamic repairs and prove no foreign/Docker/global task can run before P18-T10.",
         "A failed transaction restores exact v2 bytes; a successful transaction passes full verify and scans, checkpoints, pushes dev, and proves origin equality before another task starts."
       ],
-      "caseGroups": ["PRE", "COMP"],
+      "caseGroups": [
+        "PRE",
+        "COMP"
+      ],
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T14"]
+      "dependsOn": [
+        "P13-T14"
+      ]
     },
     {
       "id": "P13-T17",
@@ -1575,11 +1745,16 @@
         "Do not absorb the Linux hidden-updater lifecycle into this task; route it to P15-T14.",
         "Focused, adjacent, full verification and secret/license scans pass; checkpoint and push dev before P13-T06 resumes."
       ],
-      "caseGroups": ["PRE", "SRC"],
+      "caseGroups": [
+        "PRE",
+        "SRC"
+      ],
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T16"]
+      "dependsOn": [
+        "P13-T16"
+      ]
     },
     {
       "id": "P13-T18",
@@ -1601,11 +1776,17 @@
         "Wrong nonce/PID/capability, timeout, early exit, oversized frame, spoofed header, and port-takeover cases fail closed without orphan processes.",
         "Complete Agent/Gateway source smoke, full verify, secret scan, checkpoint, and dev push pass."
       ],
-      "caseGroups": ["SRC", "SEC"],
+      "caseGroups": [
+        "SRC",
+        "SEC"
+      ],
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T16", "P13-T17"]
+      "dependsOn": [
+        "P13-T16",
+        "P13-T17"
+      ]
     },
     {
       "id": "P15-T14",
@@ -1630,7 +1811,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T15"]
+      "dependsOn": [
+        "P15-T15"
+      ]
     },
     {
       "id": "P15-T15",
@@ -1656,7 +1839,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P18-T10"]
+      "dependsOn": [
+        "P18-T10"
+      ]
     },
     {
       "id": "P18-T01",
@@ -1679,7 +1864,9 @@
         "The same guarded product path can emit a bounded private quarantine for regression work; its sanitizer replaces raw/decoded/encrypted bytes, identities, messages, positions, network data, and time anchors with synthetic values and produces deterministic replay digests. Building a parallel capture application is forbidden.",
         "Fixture/property tests, containment/secret scans, and clean shutdown pass without needing the physical endpoint."
       ],
-      "caseGroups": ["PRE"],
+      "caseGroups": [
+        "PRE"
+      ],
       "caseAssertions": [
         "MESH-01",
         "MESH-07",
@@ -1691,7 +1878,9 @@
       ],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T16"]
+      "dependsOn": [
+        "P13-T16"
+      ]
     },
     {
       "id": "P18-T02",
@@ -1716,12 +1905,16 @@
         "Any launch, transport, decode, projection, surface, or shutdown defect enters the regression/repair/full-verify/checkpoint/push loop and this smoke reruns before P14-T02 or P15-T00 becomes selectable.",
         "Evidence is explicitly source-only current-host observation. It cannot pass Setup, exact-candidate final live, Serial, another platform, production, or 24-hour qualification. Missing hardware or a missing passive non-configuration event blocks this physical-first milestone; the scheduler may continue only its unmet core prerequisites and may not bypass into broad P14 or packaging."
       ],
-      "caseGroups": ["HWS"],
+      "caseGroups": [
+        "HWS"
+      ],
       "caseAssertions": [],
       "evidenceClaim": {
         "identityLevel": "hardware-source",
         "observationOnly": true,
-        "maySatisfyCaseGroups": ["HWS"],
+        "maySatisfyCaseGroups": [
+          "HWS"
+        ],
         "forbiddenClaims": [
           "V3",
           "installed candidate",
@@ -1732,7 +1925,9 @@
         ]
       },
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P14-T01"]
+      "dependsOn": [
+        "P14-T01"
+      ]
     },
     {
       "id": "P18-T03",
@@ -1754,7 +1949,11 @@
         "Web/GUI/CLI use real product paths; request interception, manual Gateway launch, system Node, default user state, and direct DB/device access cannot satisfy the cases.",
         "All PRE, SRC, SET-01 through SET-08 fixture-only, and applicable SEC assertions plus full verification and scans pass. P18-T02 proves only the earlier product/live milestone and none of its observation evidence substitutes for this completed-source gate."
       ],
-      "caseGroups": ["PRE", "SRC", "SEC"],
+      "caseGroups": [
+        "PRE",
+        "SRC",
+        "SEC"
+      ],
       "caseAssertions": [
         "SET-01",
         "SET-02",
@@ -1767,7 +1966,13 @@
       ],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P13-T11", "P13-T18", "P14-T12", "P18-T01", "P18-T02"]
+      "dependsOn": [
+        "P13-T11",
+        "P13-T18",
+        "P14-T12",
+        "P18-T01",
+        "P18-T02"
+      ]
     },
     {
       "id": "P18-T04",
@@ -1789,11 +1994,20 @@
         "Upgrade, uninstall-retain-state, reinstall, PATH/autostart repair, and exact cleanup pass without service/firewall/per-machine mutation.",
         "Every PKG assertion passes on the current Windows Server host and remains explicitly non-Windows-11/non-production."
       ],
-      "caseGroups": ["PKG", "SRC", "GUI", "CLI", "SEC"],
+      "caseGroups": [
+        "PKG",
+        "SRC",
+        "GUI",
+        "CLI",
+        "SEC"
+      ],
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P15-T04", "P18-T03"]
+      "dependsOn": [
+        "P15-T04",
+        "P18-T03"
+      ]
     },
     {
       "id": "P18-T05",
@@ -1819,7 +2033,12 @@
         "Local coexistence fixtures prove qAR/qAO path-insensitive 30-second APRS-IS exact dedup, the persisted three-hour exact-Info cache, the 30-second local transmit cache, receive-time exclusion from temporal high-water, and rejection of concurrent old/new ownership of one provision identity.",
         "Qualification records the greater-than-30-second or changed-Data mixed-generation residual risk and makes no zero-backtrack claim beyond the exact candidate's own proven decisions."
       ],
-      "caseGroups": ["CALL", "POS", "APRS", "SEC"],
+      "caseGroups": [
+        "CALL",
+        "POS",
+        "APRS",
+        "SEC"
+      ],
       "caseAssertions": [
         "SET-09",
         "SET-10",
@@ -1834,8 +2053,15 @@
         "MESH-12"
       ],
       "evidenceClaim": null,
-      "observesWithoutFinalizing": ["MESH-03", "MESH-04", "MESH-05"],
-      "dependsOn": ["P18-T01", "P18-T04"]
+      "observesWithoutFinalizing": [
+        "MESH-03",
+        "MESH-04",
+        "MESH-05"
+      ],
+      "dependsOn": [
+        "P18-T01",
+        "P18-T04"
+      ]
     },
     {
       "id": "P18-T06",
@@ -1857,11 +2083,19 @@
         "Every Web route, compact graphical control, and command catalogue assertion uses the same resident installed Agent with real API/SSE/Job paths.",
         "Repeated lifecycle operations produce no duplicate process, physical connection, event, DB write, Job, or APRS output."
       ],
-      "caseGroups": ["PX", "WEB", "GUI", "CLI", "SEC"],
+      "caseGroups": [
+        "PX",
+        "WEB",
+        "GUI",
+        "CLI",
+        "SEC"
+      ],
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P18-T05"]
+      "dependsOn": [
+        "P18-T05"
+      ]
     },
     {
       "id": "P18-T07",
@@ -1884,11 +2118,21 @@
         "The local signed update lab covers valid install, wrong target/signature/digest/size, interruption at each mutation phase, unhealthy candidate, restart recovery, and exact prior-version/state rollback.",
         "For update, rollback, operational reset, staged restore, and process restart, the old APRS TX/RX owner is closed and verification revoked before the new generation starts; APRS-13 proves there is never an interleaved status writer or telemetry-sequence owner and every new session must exact-reverify."
       ],
-      "caseGroups": ["DATA", "UPD", "SEC"],
-      "caseAssertions": ["SET-07", "SET-08", "APRS-13"],
+      "caseGroups": [
+        "DATA",
+        "UPD",
+        "SEC"
+      ],
+      "caseAssertions": [
+        "SET-07",
+        "SET-08",
+        "APRS-13"
+      ],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P18-T06"]
+      "dependsOn": [
+        "P18-T06"
+      ]
     },
     {
       "id": "P18-T08",
@@ -1912,11 +2156,20 @@
         "No Legacy process may concurrently own the candidate's provision/iGate identity; all SOAK thresholds pass with zero candidate-caused crash, orphan, second upstream, stale-generation write, accepted rollback, duplicate domain/APRS decision, unverified Data, leak, or outside-root write.",
         "The final soak evidence preserves the explicit residual risk for greater-than-30-second or changed-Data packets from separately operated Legacy stations and does not turn the candidate result into a mixed-generation zero-backtrack claim."
       ],
-      "caseGroups": ["SOAK", "SEC"],
+      "caseGroups": [
+        "SOAK",
+        "SEC"
+      ],
       "caseAssertions": [],
       "evidenceClaim": null,
-      "observesWithoutFinalizing": ["MESH-03", "MESH-04", "MESH-05"],
-      "dependsOn": ["P18-T07"]
+      "observesWithoutFinalizing": [
+        "MESH-03",
+        "MESH-04",
+        "MESH-05"
+      ],
+      "dependsOn": [
+        "P18-T07"
+      ]
     },
     {
       "id": "P18-T09",
@@ -1960,7 +2213,9 @@
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P18-T08"]
+      "dependsOn": [
+        "P18-T08"
+      ]
     },
     {
       "id": "P18-T10",
@@ -1986,66 +2241,92 @@
         "The handover separates current Windows Server source/package/live proof from pending Windows 11, Serial, macOS, Linux, Docker, signing, production, main, tag, and publication work.",
         "The scoped Goal completes and stops without executing P17 global completion or any foreign/manual-production task."
       ],
-      "caseGroups": ["PRE", "SEC", "COMP"],
+      "caseGroups": [
+        "PRE",
+        "SEC",
+        "COMP"
+      ],
       "caseAssertions": [],
       "evidenceClaim": null,
       "observesWithoutFinalizing": [],
-      "dependsOn": ["P18-T09"]
+      "dependsOn": [
+        "P18-T09"
+      ]
     }
   ],
   "historicalSupersessions": [
     {
       "graphVersion": 1,
       "old": "P12-T05",
-      "new": ["P17-T07", "P17-T08"],
+      "new": [
+        "P17-T07",
+        "P17-T08"
+      ],
       "reason": "Old release proposal is tied to the obsolete artifact and candidate model."
     },
     {
       "graphVersion": 1,
       "old": "P12-T09",
-      "new": ["P13-T05"],
+      "new": [
+        "P13-T05"
+      ],
       "reason": "Replace strict NTFS ACL qualification with the approved common plaintext backend."
     },
     {
       "graphVersion": 1,
       "old": "P12-T10",
-      "new": ["P13-T07"],
+      "new": [
+        "P13-T07"
+      ],
       "reason": "Retain same-user Control E2E without the rejected cross-principal ACL campaign."
     },
     {
       "graphVersion": 1,
       "old": "P12-T11",
-      "new": ["P14-T11"],
+      "new": [
+        "P14-T11"
+      ],
       "reason": "Retain the verified APRS login defect in the unified product graph."
     },
     {
       "graphVersion": 1,
       "old": "P12-T12",
-      "new": ["P14-T06"],
+      "new": [
+        "P14-T06"
+      ],
       "reason": "Retain graphical close/tray lifecycle in the unified product."
     },
     {
       "graphVersion": 1,
       "old": "P12-T13",
-      "new": ["P14-T07", "P15-T02"],
+      "new": [
+        "P14-T07",
+        "P15-T02"
+      ],
       "reason": "Split product update initiation from native health rollback."
     },
     {
       "graphVersion": 1,
       "old": "P12-T14",
-      "new": ["P14-T09"],
+      "new": [
+        "P14-T09"
+      ],
       "reason": "Retain the single Meshtastic upstream defect."
     },
     {
       "graphVersion": 1,
       "old": "P12-T15",
-      "new": ["P14-T10"],
+      "new": [
+        "P14-T10"
+      ],
       "reason": "Retain trusted source-event mapping selection."
     },
     {
       "graphVersion": 1,
       "old": "P12-T16",
-      "new": ["P14-T08"],
+      "new": [
+        "P14-T08"
+      ],
       "reason": "Retain operational backup restore without the rejected ACL gate."
     },
     {
@@ -2066,47 +2347,68 @@
   "v2CoverageMap": [
     {
       "legacyTask": "P12-T05",
-      "v2Tasks": ["P17-T07", "P17-T08"],
+      "v2Tasks": [
+        "P17-T07",
+        "P17-T08"
+      ],
       "reason": "Completion and production approval remain separate."
     },
     {
       "legacyTask": "P12-T09",
-      "v2Tasks": ["P13-T07"],
+      "v2Tasks": [
+        "P13-T07"
+      ],
       "reason": "The plaintext state/secret backend moved from the v1 P13-T05 definition to v2 P13-T07."
     },
     {
       "legacyTask": "P12-T10",
-      "v2Tasks": ["P13-T09"],
+      "v2Tasks": [
+        "P13-T09"
+      ],
       "reason": "Typed framed local Control replaces the v1 P13-T07 definition."
     },
     {
       "legacyTask": "P12-T11",
-      "v2Tasks": ["P14-T11"],
+      "v2Tasks": [
+        "P14-T11"
+      ],
       "reason": "Verified APRS transmission remains in the combined trusted-mapping/APRS task."
     },
     {
       "legacyTask": "P12-T12",
-      "v2Tasks": ["P14-T06"],
+      "v2Tasks": [
+        "P14-T06"
+      ],
       "reason": "Compact Desktop and resident lifecycle remain P14-T06."
     },
     {
       "legacyTask": "P12-T13",
-      "v2Tasks": ["P13-T05", "P14-T09", "P15-T02"],
+      "v2Tasks": [
+        "P13-T05",
+        "P14-T09",
+        "P15-T02"
+      ],
       "reason": "Updater feasibility, user controls, and full product health rollback are separate v2 responsibilities."
     },
     {
       "legacyTask": "P12-T14",
-      "v2Tasks": ["P14-T10"],
+      "v2Tasks": [
+        "P14-T10"
+      ],
       "reason": "The one-upstream Proxy responsibility moved from the v1 P14-T09 definition to v2 P14-T10."
     },
     {
       "legacyTask": "P12-T15",
-      "v2Tasks": ["P14-T11"],
+      "v2Tasks": [
+        "P14-T11"
+      ],
       "reason": "Trusted mapping and verified APRS are combined in v2 P14-T11."
     },
     {
       "legacyTask": "P12-T16",
-      "v2Tasks": ["P14-T08"],
+      "v2Tasks": [
+        "P14-T08"
+      ],
       "reason": "Operational backup/restore remains P14-T08."
     },
     {
@@ -2165,19 +2467,32 @@
   },
   "targetPlatforms": {
     "windows": {
-      "supported": ["x86_64-pc-windows-msvc"],
-      "unsupported": ["aarch64-pc-windows-msvc"]
+      "supported": [
+        "x86_64-pc-windows-msvc"
+      ],
+      "unsupported": [
+        "aarch64-pc-windows-msvc"
+      ]
     },
     "macos": {
-      "supported": ["x86_64-apple-darwin", "aarch64-apple-darwin"],
+      "supported": [
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin"
+      ],
       "distribution": "one Universal DMG"
     },
     "linux": {
-      "supported": ["x86_64", "aarch64"],
+      "supported": [
+        "x86_64",
+        "aarch64"
+      ],
       "distribution": "AppImage"
     },
     "docker": {
-      "supported": ["linux/amd64", "linux/arm64"]
+      "supported": [
+        "linux/amd64",
+        "linux/arm64"
+      ]
     }
   },
   "callMeshServiceModel": {
@@ -2188,9 +2503,18 @@
     "selfHosting": false,
     "productionEndpointOverride": false,
     "localMappingOverride": false,
-    "mappingAuthority": "CallMesh-only",
+    "mappingAuthority": "CMCloud-only-for-CMClient",
+    "oidcAuthority": "CallMesh",
+    "cmClientConsumesCallMesh": false,
+    "legacyMappingPolicy": "writable until first successful allowlisted CMCloud OIDC token issuance, then permanently read-only",
+    "compatibilityProjection": "CMCloud-to-CallMesh near-real-time",
+    "aprsDecisionAuthority": "CMCloud",
+    "minimumPrecisionBits": 28,
+    "rfPreferenceWindowMs": 2000,
+    "cloudFallbackPolicy": "BU2GE-15 is eligible only when zero valid RF receptions exist; any RF reception permanently excludes Cloud fallback for that event",
+    "aprsToRf": false,
     "testEndpointInjection": "Dependency injection in automated test builds only; absent from production config, UI, state and live qualification.",
-    "outagePolicy": "Use only the last atomically committed CallMesh snapshot while freshness and temporal-validity rules prove it applicable; otherwise fail closed."
+    "outagePolicy": "CMClient never falls back to CallMesh data; missing, stale, or ambiguous CMCloud authority fails closed."
   },
   "candidateIdentity": {
     "runtimeCandidate": "Exact source tree, private runtime, executable and configuration identity used by live qualification.",
@@ -2199,9 +2523,14 @@
   },
   "completionChecker": {
     "task": "P17-T07",
-    "preCheckpointArgs": ["--exclude-task", "P17-T07"],
+    "preCheckpointArgs": [
+      "--exclude-task",
+      "P17-T07"
+    ],
     "postCheckpointRequired": true,
-    "requiredEvidence": ["state/LICENSE_PROVENANCE.json"],
+    "requiredEvidence": [
+      "state/LICENSE_PROVENANCE.json"
+    ],
     "rule": "Run once excluding P17-T07 before its pushed checkpoint, then rerun without exclusion after the checkpoint."
   },
   "repairProtocol": {
@@ -2293,16 +2622,26 @@
     "global": {
       "mode": "preserve-active-root",
       "task": "P17-T07",
-      "preCheckpointArgs": ["--exclude-task", "P17-T07"],
+      "preCheckpointArgs": [
+        "--exclude-task",
+        "P17-T07"
+      ],
       "postCheckpointRequired": true,
-      "requiredEvidence": ["state/LICENSE_PROVENANCE.json"],
+      "requiredEvidence": [
+        "state/LICENSE_PROVENANCE.json"
+      ],
       "requiredActiveRoot": {
         "completionTask": "P17-T07",
         "completionChecker": {
           "task": "P17-T07",
-          "preCheckpointArgs": ["--exclude-task", "P17-T07"],
+          "preCheckpointArgs": [
+            "--exclude-task",
+            "P17-T07"
+          ],
           "postCheckpointRequired": true,
-          "requiredEvidence": ["state/LICENSE_PROVENANCE.json"],
+          "requiredEvidence": [
+            "state/LICENSE_PROVENANCE.json"
+          ],
           "rule": "Run once excluding P17-T07 before its pushed checkpoint, then rerun without exclusion after the checkpoint."
         }
       },
@@ -2340,7 +2679,9 @@
         "kind": "release",
         "scope": "windows-completion-attempt",
         "candidateReset": false,
-        "caseGroups": ["COMP"],
+        "caseGroups": [
+          "COMP"
+        ],
         "ownerRule": "Copy the P18-T10 owner.",
         "activeRule": "The attempt is the sole in_progress task only while preparing, checkpointing, and pushing its one allowlisted manifest diff."
       },
@@ -2437,7 +2778,10 @@
   "supersessions": [
     {
       "old": "P13-T15",
-      "new": ["P13-T17", "P15-T14"],
+      "new": [
+        "P13-T17",
+        "P15-T14"
+      ],
       "executionTransition": {
         "requireBefore": {
           "status": "in_progress",
@@ -2450,7 +2794,10 @@
           "commit": null
         },
         "setSkippedAtFromPromotionClock": true,
-        "setSupersededBy": ["P13-T17", "P15-T14"],
+        "setSupersededBy": [
+          "P13-T17",
+          "P15-T14"
+        ],
         "archiveCompletePreimage": true,
         "appendNote": "Superseded atomically by graph v3 after unfinished shared/Windows and Linux work was split into P13-T17 and P15-T14."
       },
@@ -2494,7 +2841,9 @@
     },
     {
       "task": "P14-T01",
-      "addDependsOn": ["P18-T01"],
+      "addDependsOn": [
+        "P18-T01"
+      ],
       "replaceAcceptance": [
         "Agent setup state is versioned, generation-fenced and survives restart; missing/invalid/revoked/reset key enters setupRequired before Gateway external CallMesh/APRS/Proxy work.",
         "Discovery checks migrated endpoint, loopback 4403, bounded _meshtastic._tcp.local browse, then manual input; there is no LAN scan.",
@@ -2505,7 +2854,9 @@
     },
     {
       "task": "P14-T02",
-      "addDependsOn": ["P18-T02"],
+      "addDependsOn": [
+        "P18-T02"
+      ],
       "reason": "Broad setup API, wizard, lifecycle, and all downstream P14 work may start only after the real CMClient source path has consumed physical Meshtastic TCP data."
     },
     {
@@ -2521,20 +2872,20 @@
     },
     {
       "task": "P14-T11",
-      "replaceTitle": "Finish Legacy-compatible CallMesh mapping and verified APRS-IS transmission gates",
+      "replaceTitle": "Finish CMCloud-authoritative Mapping and verified APRS-IS transmission gates",
       "replaceAcceptance": [
-        "The official hosted CallMesh service remains the only production provision/mapping authority for fields its validated supported schema actually supplies. Schema, atomic persistence, restart, and event-time projection retain field presence separately from value: Tracker enablement, callsign/SSID, composite symbol plus table/code/overlay aliases, comment, altitude, effective time/version; iGate callsign/SSID, position, composite symbol plus component aliases, comment, altitude, PHG, expiry, and any schema-supported APRS endpoint/beacon fields. Legacy v0.2.28 endpoint/UI and interval-setter behavior are not misrepresented as provision schema: use a validated official field when present, otherwise fixed asia.aprs2.net:14580 and ten minutes bounded one minute through 24 hours. Production exposes no local APRS server, destination, mapping, provision, or beacon-policy override; destination is fixed APTMAG and fixtures use dependency injection only.",
-        "Trusted source event time, sequence/epoch, canonical digest, and temporal high-water remain internal. Select the newest authoritative mapping with effective time less than or equal to the source event time, so equality activates the new revision; conflicting same-time content without an authoritative monotonic order fails closed. Complete valid mapping revision history is append-only across refresh/restart and has no age-only pruning; exact duplicate snapshots may coalesce and factory reset may remove it. A missing applicable revision always fails closed. Unknown Legacy APRS input never advances temporal high-water from APRS receive time.",
-        "The sole public-wire golden oracle is v0.2.28 tag 5e6c294c640766711c6251173711e8226bf8268a and its frozen formatter/client blobs. For every eligible Tracker event, output is byte-exact SOURCE>APTMAG,MESHD*,qAO,IGATE:!legacy-data plus CRLF, with fixed APTMAG and no public timestamp or CM2 marker. Golden fixtures cover latitude/longitude ECMAScript Number/toFixed ties/carry; exact composite-symbol/component precedence and absent/null/empty/explicit values; exact course modulo-before-round including 359.5 -> 360 and Legacy speed conversions; mapping-only String/CRLF/whitespace comment sanitation with no inserted separator or normalization; exact 3.28084 altitude conversion and packet/mapping/self-provision precedence; UTF-8 replacement and full-line byte budget; and disabled mapping zero-write behavior. qAO denotes receive-only translation of Meshtastic RF received through TCP or Serial and does not authorize APRS-IS-to-Meshtastic RF transmission.",
-        "iGate-owned beacon, status, telemetry data, and telemetry definitions use IGATE>APTMAG,TCPIP*:...; CMClient never injects qAC, server-observed qAC is accepted, and status is >TMAG Client v<version> without CLI/Desktop. Golden fixtures lock beacon PHG/position/symbol/comment/altitude and PHG-preserving 512-byte truncation; PARM/UNIT/EQNS/T# bytes and order; nine-character message destination padding; every explicit POS/MSG/CTRL type; rolling buckets; first fresh verified order beacon/PARM/UNIT/EQNS/T#/status; same-process reconnect; status interval anchored at verification; fresh-process timestamp/bucket reset; only last successful 001..999 sequence persistence; failed-write in-memory sequence consumption; and every Legacy cadence boundary.",
-        "A bounded provision-scoped persistent APRS session uses incremental banner/logresp parsing and explicit disconnected, connecting, login-sent, verified, and closing states. Every TX/RX session independently exact-verifies its provision-derived canonical callsign; mismatch, unverified, timeout, EOF, invalid/oversized response, error, close, half-open, rotation, expiry, reset, and stale-generation callback fence Data, trigger bounded reconnect/filter restoration, and require fresh verification. Per-outbox transient connect/login/write/close transmission is forbidden.",
-        "APRS-IS has no per-packet delivery acknowledgement: a socket write is only local-kernel submission. Durable state distinguishes queued/sending/submitted/observer_confirmed/observation_expired, never calls a socket write accepted or delivered, and advances delivery high-water only after independent filtered observation of exact source, destination, and Info. An unmatched submitted row remains unconfirmed for the persisted three-hour observer window, then expires unconfirmed without blind retry or high-water advance; disconnect after write reconciles through the exact observer/cache.",
-        "A bounded persisted normalized-source-plus-exact-Info observer cache covers Tracker and iGate-owned families for three hours and a local transmit cache suppresses exact repeats for 30 seconds across restart/crash, provision/source isolation, and expiry boundaries; qAR versus qAO path differences do not defeat the emulated APRS-IS 30-second exact-Data dedup because path is ignored.",
-        "The supported same-identity Legacy-to-2.0 migration proves the old local process/session stopped before new verification and rejects detectable local overlap; update, rollback, reset, and restart cannot interleave status or telemetry sequence ownership. Cross-host overlap remains forbidden but is not claimed as client-detectable.",
-        "Repository APRS implementation/configuration docs and regressions are updated with a negative drift check forbidding APCM20, public CM2 markers, public APRS timestamps, qAR emission, and production APRS endpoint/destination overrides. P14-T11 explicitly owns the encoder, monitor, runtime-config, Agent propagation, docs/architecture/aprs-position-encoding.md, docs/architecture/aprs-remote-monitor.md, docs/admin/configuration-security.md, docs/architecture/agent-runtime.md, and their tests.",
-        "Regression and claim tests preserve the residual mixed-generation limit: packets delayed beyond 30 seconds or with different Data can escape exact dedup and may backtrack, so neither the task nor later qualification claims mixed-generation zero rollback."
+        "CMCloud is the only production authority consumed by CMClient for account/station binding, Mapping revisions, APRS eligibility, ordering, duplicate decisions, producer selection, temporal high-water, and dispatch permits. CMClient never reads CallMesh Mapping/provision data and never uses it as an outage fallback. CallMesh remains the OIDC authority and Legacy compatibility read model; successful token issuance or exchange for an explicitly allowlisted CMCloud OIDC client, including historical issuance backfill, permanently freezes Mapping mutations for that immutable issuer/subject while authenticated CMCloud projection remains permitted. Missing, stale, or ambiguous CMCloud authority fails closed.",
+        "Every local APRS write requires a short-lived CMCloud permit bound to the exact tenant, account, station/callsign/SSID, event identity and digest, Mapping revision, sticky freeze epoch, global producer fence, installation and connection generations, authorization generation, monotonic permit sequence, precision_bits of at least 28, trusted event-time/high-water decision, and expiry. Replay, stale revision, 27-bit-or-lower precision, unknown freshness, expired authority, producer ambiguity, or an unconfirmed freeze rejects before socket write.",
+        "CMCloud applies a fixed two-second RF preference window. Any valid RF reception for an event permanently excludes Cloud fallback for that event; a selected station becoming unready, disconnecting, or failing submission never changes the producer to Cloud. Only zero valid RF receptions may select the separately authorized BU2GE-15 CMCloud APRS-IS fallback identity. Retries remain bound to the original producer and event.",
+        "Trusted source event time, sequence/epoch, canonical digest, and temporal high-water remain internal. CMCloud selects the newest Mapping revision effective at or before source event time, with equality activating the revision; conflicting same-time content without authoritative monotonic order fails closed. Complete valid Mapping history is append-only across refresh/restart, tombstones prevent resurrection, and missing applicable revisions fail closed. APRS receive time never advances source temporal high-water.",
+        "The sole public-wire golden oracle remains v0.2.28 tag 5e6c294c640766711c6251173711e8226bf8268a and its frozen formatter/client blobs. Every eligible Tracker event is byte-exact SOURCE>APTMAG,MESHD*,qAO,IGATE:!legacy-data plus CRLF, with fixed APTMAG and no public timestamp or CM2 marker. Golden fixtures retain numeric rounding/carry, symbol precedence, course/speed, sanitation, altitude, UTF-8 and byte-budget behavior. qAO is receive-only; APRS-to-Meshtastic, the removed @cm bot, all other RF transmit paths, and radio configuration mutation remain excluded.",
+        "iGate-owned beacon, status, telemetry data, and telemetry definitions use IGATE>APTMAG,TCPIP*:...; CMClient never injects qAC, server-observed qAC is accepted, and status remains >TMAG Client v<version> without CLI/Desktop. Golden fixtures lock beacon PHG/position/symbol/comment/altitude, 512-byte truncation, PARM/UNIT/EQNS/T# bytes and order, message padding, explicit packet types, rolling buckets, verified-session startup order, reconnect, intervals, process reset, and 001..999 sequence semantics.",
+        "A bounded CMCloud-permit-scoped persistent APRS session uses incremental banner/logresp parsing and explicit disconnected, connecting, login-sent, verified, and closing states. Every TX/RX session independently exact-verifies the permitted canonical callsign; mismatch, unverified response, timeout, EOF, invalid or oversized response, error, close, half-open connection, permit rotation or expiry, reset, and stale-generation callback fence Data and require fresh verification. The APRS passcode remains installation-local plaintext in ~/.cmclient/secrets.json and never enters CMCloud, CallMesh, browser, sync, logs, diagnostics, or evidence. Per-outbox transient connect/login/write/close transmission is forbidden.",
+        "APRS-IS has no per-packet delivery acknowledgement: socket.write is only local-kernel submission. Durable state distinguishes queued, sending, submitted, observer_confirmed, and observation_expired; it never calls a socket write accepted or delivered and advances delivery high-water only after independent filtered observation of exact source, destination, and Info. An unmatched submitted row remains unconfirmed for the persisted three-hour observer window, then expires without blind retry or high-water advance; uncertain writes are never reissued as known-undelivered.",
+        "A bounded persisted normalized-source-plus-exact-Info observer cache covers Tracker and iGate-owned families for three hours, and a local transmit cache suppresses exact repeats for 30 seconds across restart/crash, identity, producer-fence, and expiry boundaries. A global tenant plus station/callsign plus SSID fence, not a machine-local lock, prevents Legacy, second-host, stale-process, and delayed-retry overlap; any duplicate-producer evidence blocks authorization without automatic CallMesh unfreeze.",
+        "Repository APRS and CMCloud authority docs plus regressions forbid CallMesh consumption by CMClient, local Mapping/provision authority, precision below 28, Cloud fallback after any RF reception, producer switching, APCM20, public CM2 markers, public APRS timestamps, qAR emission, APRS-to-RF, and production APRS endpoint/destination overrides. Tests cover sticky OIDC freeze, compatibility projection without echo loops, permit replay/expiry/revision/fence failures, zero-reception BU2GE-15 fallback, observer reconciliation, and the residual limit that delayed or different Data can escape exact dedup and therefore cannot support a zero-rollback claim."
       ],
-      "reason": "Bind the owner-confirmed Legacy v0.2.28 public wire profile, receive-only qAO path, internal-only ordering metadata, coexistence safeguards, and irreducible mixed-generation risk to the implementation task."
+      "reason": "Bind the owner-approved CMCloud-only CMClient authority, sticky CallMesh OIDC freeze, near-real-time Legacy projection, universal precision_bits >= 28, two-second RF preference, zero-reception-only BU2GE-15 fallback, receive-only qAO wire profile, and global producer fencing to the implementation task."
     },
     {
       "task": "P14-T12",
@@ -2548,7 +2899,9 @@
     },
     {
       "task": "P15-T00",
-      "addDependsOn": ["P18-T02"],
+      "addDependsOn": [
+        "P18-T02"
+      ],
       "replaceTitle": "Establish the Windows target-native lane and shared candidate profile",
       "replaceAcceptance": [
         "The Windows x86-64 lane pins Rust, Node, pnpm, Tauri/NSIS and system tools and builds target-only native dependencies from the campaign.",
@@ -2579,22 +2932,32 @@
     },
     {
       "task": "P15-T05",
-      "addDependsOn": ["P15-T15"],
+      "addDependsOn": [
+        "P15-T15"
+      ],
       "reason": "Universal macOS resources begin only after the scoped Windows lane and foreign-native staging task."
     },
     {
       "task": "P15-T08",
-      "addDependsOn": ["P15-T14", "P15-T15"],
+      "addDependsOn": [
+        "P15-T14",
+        "P15-T15"
+      ],
       "reason": "Linux x86-64 packaging owns the Linux hidden updater repair."
     },
     {
       "task": "P15-T09",
-      "addDependsOn": ["P15-T14", "P15-T15"],
+      "addDependsOn": [
+        "P15-T14",
+        "P15-T15"
+      ],
       "reason": "Linux ARM64 packaging owns the Linux hidden updater repair."
     },
     {
       "task": "P17-T01",
-      "addDependsOn": ["P18-T10"],
+      "addDependsOn": [
+        "P18-T10"
+      ],
       "reason": "The later global-final lane must audit the scoped Windows candidate. If shared source changed, it must rebuild and rerun exact-candidate Windows live cases rather than reuse stale evidence."
     },
     {
@@ -2618,7 +2981,9 @@
     },
     {
       "task": "P16-T01",
-      "addDependsOn": ["P18-T10"],
+      "addDependsOn": [
+        "P18-T10"
+      ],
       "reason": "Machine-fence Docker implementation behind the explicitly scoped Windows stop; scheduler priority alone is not the only guard."
     }
   ],
@@ -2684,5 +3049,5 @@
     "sha256": "4ce95370e221ea0a3ef42ee0992d28ac44cbae9b311b7e310061d35b819bb093"
   },
   "promotionBaseCommit": "bfe4ba83e04e6f8ab1f841c81444f5a824ec5b2a",
-  "graphSha256": "4571add63e61998d655261e44d24a2e54480d6dd2584692686df899898cd506c"
+  "graphSha256": "85d43ec7a500a04aaad83309745a8060a375bdd261f1fe79afed660608341936"
 }

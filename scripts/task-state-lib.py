@@ -1289,8 +1289,37 @@ def _validate_state_against_graph_lock_v3(
     if not isinstance(identity, dict) or identity.get("branch") != "dev" or identity.get("protectedBranch") != "main" or identity.get("sourceBaseline") != graph_lock.get("sourceBaseline"):
         raise TaskStateError("graph lock repositoryIdentity is invalid")
     callmesh = graph_lock.get("callMeshServiceModel")
-    if not isinstance(callmesh, dict) or callmesh.get("productionBaseUrl") != "https://callmesh.tmmarc.org" or callmesh.get("productionAuthority") != "official-hosted-only" or callmesh.get("selfHosting") is not False or callmesh.get("productionEndpointOverride") is not False or callmesh.get("localMappingOverride") is not False or callmesh.get("mappingAuthority") != "CallMesh-only":
+    if not isinstance(callmesh, dict):
         raise TaskStateError("graph lock CallMesh service model is invalid")
+
+    # Validate common fields
+    if (callmesh.get("productionBaseUrl") != "https://callmesh.tmmarc.org"
+        or callmesh.get("productionAuthority") != "official-hosted-only"
+        or callmesh.get("selfHosting") is not False
+        or callmesh.get("productionEndpointOverride") is not False
+        or callmesh.get("localMappingOverride") is not False):
+        raise TaskStateError("graph lock CallMesh service model is invalid")
+
+    # Validate mappingAuthority and authority-specific fields
+    mapping_authority = callmesh.get("mappingAuthority")
+    if mapping_authority == "CallMesh-only":
+        # Legacy model - no additional fields required
+        pass
+    elif mapping_authority == "CMCloud-only-for-CMClient":
+        # New CMCloud authority model - validate additional required fields
+        if (callmesh.get("oidcAuthority") != "CallMesh"
+            or callmesh.get("cmClientConsumesCallMesh") is not False
+            or not isinstance(callmesh.get("legacyMappingPolicy"), str)
+            or callmesh.get("compatibilityProjection") != "CMCloud-to-CallMesh near-real-time"
+            or callmesh.get("aprsDecisionAuthority") != "CMCloud"
+            or callmesh.get("minimumPrecisionBits") != 28
+            or callmesh.get("rfPreferenceWindowMs") != 2000
+            or not isinstance(callmesh.get("cloudFallbackPolicy"), str)
+            or callmesh.get("aprsToRf") is not False
+            or not isinstance(callmesh.get("outagePolicy"), str)):
+            raise TaskStateError("graph lock CallMesh service model CMCloud authority fields are invalid")
+    else:
+        raise TaskStateError(f"graph lock CallMesh service model has unsupported mappingAuthority: {mapping_authority!r}")
     _validate_v3_scheduler(graph_lock, by_id)
     _validate_v3_completion_contract(graph_lock)
     amendments = graph_lock.get("existingTaskAmendments")
