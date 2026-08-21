@@ -208,7 +208,9 @@ fn control(command: ControlCommand) -> Result<ControlStatus, String> {
         ControlCommand::Restart => client.restart(),
         ControlCommand::EnableManagementWeb => client.enable_management_web(),
         ControlCommand::DisableManagementWeb => client.disable_management_web(),
-        ControlCommand::OperationalReset | ControlCommand::ShutdownAgent => {
+        ControlCommand::OpenDesktop
+        | ControlCommand::OperationalReset
+        | ControlCommand::ShutdownAgent => {
             return Err(String::from("DESKTOP_AGENT_COMMAND_INVALID"));
         }
     }

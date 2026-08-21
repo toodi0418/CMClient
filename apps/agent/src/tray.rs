@@ -9,6 +9,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Sender, SyncSender},
     },
     thread::{self, JoinHandle},
 };
@@ -35,7 +36,13 @@ use cmclient_control_api::{ControlClient, ControlEndpoint, GatewayControlStatus}
 /// Agent startup failure: the same Agent remains usable through Web and CLI.
 pub struct AgentTray {
     stop: Arc<AtomicBool>,
+    requests: Option<Sender<TrayRequest>>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+enum TrayRequest {
+    OpenDesktop(SyncSender<Result<(), ()>>),
 }
 
 /// Returns whether this build has the resident tray implementation enabled.
@@ -50,15 +57,27 @@ pub const fn native_tray_supported() -> bool {
 impl AgentTray {
     pub fn start(endpoint: ControlEndpoint, desktop_process_file: PathBuf) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let (request_sender, request_receiver) = mpsc::channel();
         #[cfg(target_os = "windows")]
         if !current_windows_session_id().is_some_and(session_is_interactive) {
             eprintln!("AGENT_TRAY_UNAVAILABLE");
-            return Self { stop, worker: None };
+            return Self {
+                stop,
+                requests: None,
+                worker: None,
+            };
         }
         let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
             .name(String::from("cmclient-agent-tray"))
-            .spawn(move || run(worker_stop, endpoint, desktop_process_file));
+            .spawn(move || {
+                run(
+                    worker_stop,
+                    endpoint,
+                    desktop_process_file,
+                    request_receiver,
+                )
+            });
         let worker = match worker {
             Ok(worker) => Some(worker),
             Err(_) => {
@@ -66,7 +85,23 @@ impl AgentTray {
                 None
             }
         };
-        Self { stop, worker }
+        Self {
+            stop,
+            requests: worker.as_ref().map(|_| request_sender),
+            worker,
+        }
+    }
+
+    pub fn open_desktop(&self) -> Result<(), ()> {
+        let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+        self.requests
+            .as_ref()
+            .ok_or(())?
+            .send(TrayRequest::OpenDesktop(reply_sender))
+            .map_err(|_| ())?;
+        reply_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|_| ())?
     }
 
     pub fn stop(&mut self) {
@@ -84,7 +119,12 @@ impl Drop for AgentTray {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn run(_stop: Arc<AtomicBool>, _endpoint: ControlEndpoint, _desktop_process_file: PathBuf) {
+fn run(
+    _stop: Arc<AtomicBool>,
+    _endpoint: ControlEndpoint,
+    _desktop_process_file: PathBuf,
+    _request_receiver: mpsc::Receiver<TrayRequest>,
+) {
     eprintln!("AGENT_TRAY_UNAVAILABLE");
 }
 
@@ -114,7 +154,12 @@ fn tray_menu_action(id: &str) -> Option<TrayMenuAction> {
 }
 
 #[cfg(target_os = "windows")]
-fn run(stop: Arc<AtomicBool>, endpoint: ControlEndpoint, desktop_process_file: PathBuf) {
+fn run(
+    stop: Arc<AtomicBool>,
+    endpoint: ControlEndpoint,
+    desktop_process_file: PathBuf,
+    request_receiver: mpsc::Receiver<TrayRequest>,
+) {
     use tao::{
         event::Event,
         event_loop::{ControlFlow, EventLoopBuilder},
@@ -188,6 +233,11 @@ fn run(stop: Arc<AtomicBool>, endpoint: ControlEndpoint, desktop_process_file: P
             .is_some_and(|desktop| desktop.try_wait().is_ok_and(|status| status.is_some()))
         {
             owned_desktop = None;
+        }
+        for request in request_receiver.try_iter() {
+            let TrayRequest::OpenDesktop(reply) = request;
+            let result = launch_desktop(&desktop_process_file, &mut owned_desktop).map_err(|_| ());
+            let _ = reply.send(result);
         }
         let Event::UserEvent(event) = event else {
             return;
@@ -873,6 +923,15 @@ mod tests {
         let (endpoint, root) = test_endpoint();
         let mut tray = super::AgentTray::start(endpoint, root.join("run/desktop.pid"));
         tray.stop();
+        std::fs::remove_dir_all(root).expect("test root should clean up");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn headless_open_desktop_fails_closed() {
+        let (endpoint, root) = test_endpoint();
+        let tray = super::AgentTray::start(endpoint, root.join("run/desktop.pid"));
+        assert_eq!(tray.open_desktop(), Err(()));
         std::fs::remove_dir_all(root).expect("test root should clean up");
     }
 

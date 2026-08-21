@@ -199,6 +199,7 @@ pub enum GatewayProjection {
 pub enum ControlCommand {
     Status,
     Start,
+    OpenDesktop,
     Stop,
     Restart,
     OperationalReset,
@@ -894,6 +895,10 @@ impl ControlClient {
 
     pub fn start(&self) -> Result<ControlStatus, ControlError> {
         self.command(ControlCommand::Start)
+    }
+
+    pub fn open_desktop(&self) -> Result<ControlStatus, ControlError> {
+        self.command(ControlCommand::OpenDesktop)
     }
 
     pub fn stop(&self) -> Result<ControlStatus, ControlError> {
@@ -1799,13 +1804,14 @@ mod tests {
         let handler = Arc::new(RecordingHandler::new());
         let server = ControlServer::bind(endpoint.clone(), handler.clone()).unwrap();
         let server_thread = thread::spawn(move || {
-            for _ in 0..5 {
+            for _ in 0..6 {
                 server.serve_once_inline().unwrap();
             }
         });
         let client = ControlClient::new(endpoint).unwrap();
         assert_eq!(client.status().unwrap(), status());
         assert_eq!(client.start().unwrap(), status());
+        assert_eq!(client.open_desktop().unwrap(), status());
         assert_eq!(client.stop().unwrap(), status());
         assert_eq!(client.restart().unwrap(), status());
         assert_eq!(client.operational_reset().unwrap(), status());
@@ -1815,6 +1821,7 @@ mod tests {
             vec![
                 ControlCommand::Status,
                 ControlCommand::Start,
+                ControlCommand::OpenDesktop,
                 ControlCommand::Stop,
                 ControlCommand::Restart,
                 ControlCommand::OperationalReset,

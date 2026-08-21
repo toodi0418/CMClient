@@ -1,8 +1,13 @@
 # CMClient CLI Contract
 
 `cmclient` is a Rust Agent client. It never opens the SQLite database or a
-Meshtastic device directly. Global options are `--json`, `--quiet`,
-`--no-color`, `--timeout`, and `--endpoint`.
+Meshtastic device directly. Global options are `--json`, `--quiet`, `--no-color`,
+`--background`, `--timeout`, and `--endpoint`. With no subcommand, `cmclient`
+starts or attaches the resident Agent and asks it to launch or focus Desktop.
+`cmclient --background` starts or attaches only the resident Agent. Any subcommand
+remains command mode; combining one with `--background` fails closed. Desktop
+launch is an Agent-owned Control command, so the CLI never owns a Desktop process
+or reads local state.
 
 Endpoints are local IPC (`local`, a Unix socket below `~/.cmclient/run`, or the
 root-hashed Windows named pipe). The typed client uses bounded length-delimited

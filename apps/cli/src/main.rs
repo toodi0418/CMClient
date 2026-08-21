@@ -9,7 +9,7 @@ use cmclient_control_api::{
 use serde_json::{Value, json};
 use std::{
     io::{IsTerminal, Read},
-    process::ExitCode as ProcessExitCode,
+    process::{Command as ProcessCommand, ExitCode as ProcessExitCode, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -28,12 +28,14 @@ struct Cli {
     quiet: bool,
     #[arg(long, global = true)]
     no_color: bool,
+    #[arg(long, global = true)]
+    background: bool,
     #[arg(long, global = true, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=86_400))]
     timeout: u64,
     #[arg(long, global = true, default_value = "local")]
     endpoint: String,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -116,7 +118,14 @@ enum ClientSetupError {
 fn main() -> ProcessExitCode {
     let cli = Cli::parse();
     match parse_endpoint(&cli.endpoint) {
-        Ok(_) => run(cli),
+        Ok(_) => match launcher_mode(cli.command.as_ref(), cli.background) {
+            Ok(LauncherMode::Command) => run(cli),
+            Ok(mode) => run_launcher(cli, mode),
+            Err(code) => {
+                eprintln!("{code}");
+                ProcessExitCode::from(ExitCode::Validation.as_u8())
+            }
+        },
         Err(code) => {
             eprintln!("CLI_ENDPOINT_INVALID");
             ProcessExitCode::from(code.as_u8())
@@ -125,13 +134,18 @@ fn main() -> ProcessExitCode {
 }
 
 fn run(cli: Cli) -> ProcessExitCode {
+    let Some(command) = cli.command else {
+        eprintln!("CLI_COMMAND_REQUIRED");
+        return ProcessExitCode::from(ExitCode::Validation.as_u8());
+    };
     let Cli {
         json,
         quiet,
         no_color,
+        background: _,
         timeout,
         endpoint,
-        command,
+        command: _,
     } = cli;
     let style = OutputStyle::new(no_color);
     if matches!(&command, Command::Version) {
@@ -261,6 +275,88 @@ fn run(cli: Cli) -> ProcessExitCode {
         Command::Cmcloud { command } => cmcloud(&client, command, json, quiet, style),
         Command::Version => ProcessExitCode::SUCCESS,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LauncherMode {
+    Command,
+    Gui,
+    Background,
+}
+
+fn launcher_mode(
+    command: Option<&Command>,
+    background: bool,
+) -> Result<LauncherMode, &'static str> {
+    if background && command.is_some() {
+        return Err("CLI_BACKGROUND_COMMAND_CONFLICT");
+    }
+    if background {
+        Ok(LauncherMode::Background)
+    } else if command.is_some() {
+        Ok(LauncherMode::Command)
+    } else {
+        Ok(LauncherMode::Gui)
+    }
+}
+
+fn run_launcher(cli: Cli, mode: LauncherMode) -> ProcessExitCode {
+    let style = OutputStyle::new(cli.no_color);
+    let timeout = Duration::from_secs(cli.timeout);
+    let client = match ensure_agent_client(&cli.endpoint, timeout) {
+        Ok(client) => client,
+        Err(error) => return control_error_exit(error),
+    };
+    let result = match mode {
+        LauncherMode::Background => client.status(),
+        LauncherMode::Gui => client.open_desktop(),
+        LauncherMode::Command => unreachable!(),
+    };
+    print_control_result(result, cli.json, cli.quiet, style)
+}
+
+fn ensure_agent_client(value: &str, timeout: Duration) -> Result<ControlClient, ControlError> {
+    if !matches!(
+        parse_endpoint(value),
+        Ok(cmclient_cli_client::ControlEndpointSpec::Local)
+    ) {
+        return Err(ControlError::UnsupportedEndpoint);
+    }
+    let mut last_error = match control_client(value, timeout) {
+        Ok(client) => return Ok(client),
+        Err(ClientSetupError::Control(error)) => error,
+        Err(ClientSetupError::Exit(_)) => return Err(ControlError::UnsupportedEndpoint),
+    };
+    let executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .map(|parent| {
+            let name = if cfg!(target_os = "windows") {
+                "cmclient-agent.exe"
+            } else {
+                "cmclient-agent"
+            };
+            parent.join(name)
+        })
+        .filter(|path| path.is_file())
+        .ok_or(ControlError::CommandFailed)?;
+    let mut command = ProcessCommand::new(executable);
+    command
+        .arg("--serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn().map_err(|_| ControlError::CommandFailed)?;
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match control_client(value, Duration::from_millis(250)) {
+            Ok(client) => return Ok(client),
+            Err(ClientSetupError::Control(error)) => last_error = error,
+            Err(ClientSetupError::Exit(_)) => break,
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(last_error)
 }
 
 #[derive(Clone, Copy)]
@@ -1034,9 +1130,9 @@ fn control_error_exit(error: ControlError) -> ProcessExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, EventOutput, control_error_exit, doctor_is_degraded, event_matches_output,
-        normalize_secret_input, parse_secret_kind, parse_secret_kind_for_set, run,
-        secret_kind_error, update_summary,
+        Cli, Command, EventOutput, LauncherMode, control_error_exit, doctor_is_degraded,
+        event_matches_output, launcher_mode, normalize_secret_input, parse_secret_kind,
+        parse_secret_kind_for_set, run, secret_kind_error, update_summary,
     };
     use clap::{CommandFactory, Parser};
     use cmclient_cli_client::ExitCode;
@@ -1101,7 +1197,37 @@ mod tests {
             .expect("shutdown command should parse");
 
         assert!(cli.json);
-        assert!(matches!(cli.command, Command::Shutdown));
+        assert!(matches!(cli.command, Some(Command::Shutdown)));
+    }
+
+    #[test]
+    fn classifies_public_launcher_modes_without_reinterpreting_commands() {
+        assert_eq!(launcher_mode(None, false), Ok(LauncherMode::Gui));
+        assert_eq!(launcher_mode(None, true), Ok(LauncherMode::Background));
+        assert_eq!(
+            launcher_mode(Some(&Command::Status), false),
+            Ok(LauncherMode::Command)
+        );
+        assert_eq!(
+            launcher_mode(Some(&Command::Status), true),
+            Err("CLI_BACKGROUND_COMMAND_CONFLICT")
+        );
+    }
+
+    #[test]
+    fn public_launcher_arguments_parse_without_a_subcommand() {
+        let gui = Cli::try_parse_from(["cmclient"]).expect("no-argument launcher should parse");
+        assert_eq!(
+            launcher_mode(gui.command.as_ref(), gui.background),
+            Ok(LauncherMode::Gui)
+        );
+
+        let background = Cli::try_parse_from(["cmclient", "--background"])
+            .expect("background launcher should parse");
+        assert_eq!(
+            launcher_mode(background.command.as_ref(), background.background),
+            Ok(LauncherMode::Background)
+        );
     }
 
     #[test]
@@ -1143,9 +1269,10 @@ mod tests {
             json: false,
             quiet: true,
             no_color: true,
+            background: false,
             timeout: 2,
             endpoint: endpoint_argument,
-            command: Command::Shutdown,
+            command: Some(Command::Shutdown),
         });
 
         assert_eq!(exit, ProcessExitCode::SUCCESS);

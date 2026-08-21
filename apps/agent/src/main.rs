@@ -2472,6 +2472,7 @@ struct AgentController {
     setup_gate_required: bool,
     updates: Arc<AgentUpdateService>,
     web_state: Arc<AgentWebState>,
+    desktop_tray: Mutex<Option<Arc<Mutex<tray::AgentTray>>>>,
     shutdown_requested: AtomicBool,
     started_at: Instant,
     latest_error_code: Mutex<Option<String>>,
@@ -3745,12 +3746,32 @@ impl AgentController {
             setup_gate_required,
             updates,
             web_state,
+            desktop_tray: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
             started_at,
             latest_error_code: Mutex::new(initial_log_error_code),
         };
         controller.log_agent_code(LogLevel::Info, "AGENT_RUNTIME_READY");
         Ok(controller)
+    }
+
+    fn install_desktop_tray(&self, tray: Arc<Mutex<tray::AgentTray>>) {
+        if let Ok(mut current) = self.desktop_tray.lock() {
+            *current = Some(tray);
+        }
+    }
+
+    fn open_desktop(&self) -> Result<(), ControlError> {
+        let tray = self
+            .desktop_tray
+            .lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .clone()
+            .ok_or_else(|| ControlError::Application(String::from("DESKTOP_LAUNCH_UNAVAILABLE")))?;
+        tray.lock()
+            .map_err(|_| ControlError::CommandFailed)?
+            .open_desktop()
+            .map_err(|_| ControlError::Application(String::from("DESKTOP_LAUNCH_UNAVAILABLE")))
     }
 
     fn status(&self) -> Result<ControlStatus, ControlError> {
@@ -4542,6 +4563,10 @@ impl ControlHandler for AgentController {
                 self.start_supervisor()?
                     .then_some(())
                     .ok_or(ControlError::CommandFailed)?;
+                self.status()
+            }
+            ControlCommand::OpenDesktop => {
+                self.open_desktop()?;
                 self.status()
             }
             ControlCommand::Stop => {
@@ -5671,7 +5696,11 @@ fn serve() -> ExitCode {
     if let Err(error) = controller.start_resident_supervisor() {
         controller.remember_error(&error);
     }
-    let mut agent_tray = tray::AgentTray::start(endpoint, config.paths.desktop_process_file());
+    let agent_tray = Arc::new(Mutex::new(tray::AgentTray::start(
+        endpoint,
+        config.paths.desktop_process_file(),
+    )));
+    controller.install_desktop_tray(Arc::clone(&agent_tray));
     let serve_error = loop {
         if controller.is_shutdown_requested() {
             break None;
@@ -5683,7 +5712,13 @@ fn serve() -> ExitCode {
         }
     };
     drop(server);
-    agent_tray.stop();
+    agent_tray
+        .lock()
+        .map_err(|_| ControlError::CommandFailed)
+        .map(|mut tray| {
+            tray.stop();
+        })
+        .ok();
     let shutdown_error = shutdown_agent_runtime(&controller, &mut supervisor_worker).err();
     if let Some(error) = &serve_error {
         controller.remember_error(error);
