@@ -12,7 +12,11 @@ import {
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { ComponentIdentityReport } from "@cmclient/contracts";
+import type {
+  AgentCommand,
+  ControlStatus,
+  UpdateControlStatus,
+} from "./control-contract";
 
 import { runWindowControl, type WindowControlAction } from "./window-controls";
 import {
@@ -21,35 +25,6 @@ import {
   meshtasticDetail,
   proxyDetail,
 } from "./service-status";
-
-type GatewayStatus =
-  "stopped" | "starting" | "running" | "backoff" | "degraded";
-type ManagementWebStatus = "disabled" | "running";
-type AgentCommand = "start" | "stop" | "restart" | "enable_web" | "disable_web";
-interface ControlStatus {
-  schemaVersion: number;
-  agent: string;
-  identity: ComponentIdentityReport;
-  gateway: GatewayStatus;
-  managementWeb: ManagementWebStatus;
-  managementWebUrl: string | null;
-  uptimeSeconds: number;
-  latestErrorCode: string | null;
-}
-interface UpdateControlJob {
-  id: string;
-  phase: string;
-  updatedAt: string;
-  errorCode: string | null;
-  bytesDownloaded: number | null;
-  bytesTotal: number | null;
-  bytesPerSecond: number | null;
-  recentLogCodes: string[];
-}
-interface UpdateControlStatus {
-  schemaVersion: number;
-  job: UpdateControlJob | null;
-}
 
 const status = ref<ControlStatus>();
 const errorCode = ref<string>();

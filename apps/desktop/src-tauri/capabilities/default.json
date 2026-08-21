@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Main desktop window permissions",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "notification:default"]
 }

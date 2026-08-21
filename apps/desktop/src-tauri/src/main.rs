@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
 mod service_status;
@@ -126,6 +127,10 @@ fn agent_service_status() -> Result<DesktopServiceStatus, String> {
 
 #[tauri::command]
 fn open_management_web(app: AppHandle) -> Result<(), String> {
+    open_management_web_with_app(&app)
+}
+
+fn open_management_web_with_app<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let status = control(ControlCommand::Status)?;
     let url = status
         .management_web_url
@@ -174,7 +179,13 @@ fn open_setup_wizard(app: &AppHandle) {
 
 #[tauri::command]
 fn exit_desktop(app: AppHandle) {
+    // This exits only the Desktop shell. The resident Agent remains owned by
+    // its own lifecycle and continues through the local Control boundary.
     app.exit(0);
+}
+
+fn notify<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 fn parse_command(command: &str) -> Result<ControlCommand, String> {
@@ -225,8 +236,11 @@ fn start_update_event_forwarder(app: AppHandle) {
                     continue;
                 };
                 while let Ok(Some(event)) = events.next_event() {
-                    if let Ok(status) = String::from_utf8(event.data) {
-                        let _ = app.emit(UPDATE_STATUS_EVENT, status);
+                    match String::from_utf8(event.data) {
+                        Ok(status) => {
+                            let _ = app.emit(UPDATE_STATUS_EVENT, status);
+                        }
+                        Err(_) => notify(&app, "CMClient", "DESKTOP_UPDATE_EVENT_INVALID"),
                     }
                 }
                 thread::sleep(Duration::from_millis(250));
@@ -249,10 +263,10 @@ fn main() {
             open_setup_wizard(app);
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            let registration = register_desktop_process().map_err(|error| {
+            let registration = register_desktop_process().inspect_err(|_| {
                 eprintln!("DESKTOP_PROCESS_REGISTRATION_UNAVAILABLE");
-                error
             })?;
             app.manage(registration);
             start_update_event_forwarder(app.handle().clone());
@@ -263,6 +277,8 @@ fn main() {
             if window.label() == MAIN_WINDOW_LABEL {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
+                    // The Agent owns the resident tray; closing Desktop only
+                    // hides this control surface and leaves Agent running.
                     let _ = window.hide();
                 }
             }
