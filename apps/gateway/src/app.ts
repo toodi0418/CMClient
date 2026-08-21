@@ -521,13 +521,15 @@ export function createGatewayApp(
       },
       (request, reply) => {
         if (!cmcloud) {
-          reply.code(503).send(
-            gatewayErrorEnvelope(
-              request,
-              reply,
-              "ACCOUNT_PROJECTION_UNAVAILABLE",
-            ),
-          );
+          reply
+            .code(503)
+            .send(
+              gatewayErrorEnvelope(
+                request,
+                reply,
+                "ACCOUNT_PROJECTION_UNAVAILABLE",
+              ),
+            );
           return;
         }
         try {

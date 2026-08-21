@@ -23,6 +23,7 @@ describe("Gateway OpenAPI contract", () => {
       "/api/v1/aprs/station-submissions",
       "/api/v1/backups",
       "/api/v1/callmesh",
+      "/api/v1/cmcloud/account-projection",
       "/api/v1/diagnostics/integrity-check",
       "/api/v1/events",
       "/api/v1/events/recent",
@@ -101,6 +102,45 @@ describe("Gateway OpenAPI contract", () => {
         },
       },
     });
+    expect(document.paths["/api/v1/cmcloud/account-projection"]).toMatchObject({
+      get: {
+        responses: {
+          "200": {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: expect.arrayContaining([
+                    "type",
+                    "schemaVersion",
+                    "tenant",
+                    "account",
+                    "stations",
+                    "authority",
+                    "freshness",
+                    "errorState",
+                  ]),
+                },
+              },
+            },
+          },
+          "503": {
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: expect.arrayContaining([
+                    "code",
+                    "params",
+                    "traceId",
+                  ]),
+                },
+              },
+            },
+          },
+        },
+      },
+    });
     expect(
       JSON.stringify(document.components?.schemas?.SetupDiscoveryResponse),
     ).toContain('"loopback"');
@@ -155,7 +195,7 @@ describe("Gateway OpenAPI contract", () => {
       '"directAprs"',
     );
     expect(gatewayOpenApiDocumentDigest(document)).toBe(
-      "4c896fd14c3cb4fe60b5bd70a42814ddc7b96ec26e912bb2630841cb5d741e1e",
+      "740adf0906793471324372c5db037989e5140c2c7e313b1a0ca2713220a347eb",
     );
 
     await app.close();
