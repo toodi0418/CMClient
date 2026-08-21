@@ -93,6 +93,13 @@ When an in-progress parent exposes a product defect:
 The repair never depends on its blocked parent, so the graph remains acyclic and
 the scheduler can select it.
 
+When an independently audited implementation sequence has already been pushed
+as ordinary, task-scoped commits, the task ledger may record a reconcile-audit
+advance from its previous base to the verified sequence tip before creating the
+single structured governance checkpoint. The audit note must name both full
+object IDs and the checkpoint must use that tip as its sole parent; this keeps
+the immutable repair history intact without rewriting implementation commits.
+
 ## Completion Inputs
 
 These are the P13 checker input contracts for later P17 closeout. Their presence
