@@ -5327,6 +5327,7 @@ fn legacy_state_candidates(
     candidates
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn push_single_root_legacy_candidate(
     candidates: &mut Vec<ProductMigrationSourceSet>,
     candidate: Option<PathBuf>,
@@ -5758,12 +5759,12 @@ mod tests {
         cmcloud_gateway_environment, compiled_component_identity, disable_proxy_for_setup,
         ensure_runtime_directories, gateway_json_projection, legacy_state_candidates,
         load_agent_config_after_migration_with, management_agent_events, management_web_profile,
-        normalize_runtime_process_path, push_legacy_source_candidate, recover_interrupted_reset,
-        recover_interrupted_setup, remove_setup_transaction, reset_completion_file,
-        reset_transaction_file, resolve_gateway_maintenance_program, setup_apply_error_response,
-        setup_error_response, setup_gate_required_with_profile, setup_transaction_file,
-        valid_cmcloud_pairing_code, validate_setup_request, verified_gateway_route,
-        write_reset_transaction, write_setup_configuration, write_setup_transaction,
+        push_legacy_source_candidate, recover_interrupted_reset, recover_interrupted_setup,
+        remove_setup_transaction, reset_completion_file, reset_transaction_file,
+        resolve_gateway_maintenance_program, setup_apply_error_response, setup_error_response,
+        setup_gate_required_with_profile, setup_transaction_file, valid_cmcloud_pairing_code,
+        validate_setup_request, verified_gateway_route, write_reset_transaction,
+        write_setup_configuration, write_setup_transaction,
     };
     #[cfg(not(target_os = "windows"))]
     use super::{
@@ -5779,7 +5780,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     use cmclient_agent_core::CallMeshConfig;
     use cmclient_agent_core::{
-        AprsConfig, MeshtasticConfig, MeshtasticConnectionConfig, RuntimePaths,
+        AprsConfig, CMCloudConfig, MeshtasticConfig, MeshtasticConnectionConfig, RuntimePaths,
     };
     #[cfg(not(target_os = "windows"))]
     use cmclient_control_api::UpdateControlStatus;
@@ -5811,11 +5812,7 @@ mod tests {
         time::{Duration, Instant},
     };
     #[cfg(not(target_os = "windows"))]
-    use std::{
-        io::Cursor,
-        net::{TcpListener, TcpStream},
-        sync::{Mutex, mpsc},
-    };
+    use std::{io::Cursor, net::TcpListener, sync::mpsc};
 
     #[test]
     #[ignore = "child-process fixture"]
@@ -5844,7 +5841,20 @@ mod tests {
                 let mut stdin = std::io::stdin();
                 let _ = stdin.read(&mut [0_u8; 1]);
             }
-            "crash" => {}
+            "crash" => {
+                let executable =
+                    std::env::current_exe().expect("Gateway fixture executable should resolve");
+                let keeper = std::process::Command::new(executable)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "tests::long_running_gateway_fixture",
+                    ])
+                    .spawn()
+                    .expect("Gateway fixture keeper should start");
+                std::mem::forget(keeper);
+                thread::sleep(Duration::from_millis(50));
+            }
             _ => panic!("unsupported Gateway fixture mode"),
         }
     }
@@ -5889,17 +5899,14 @@ mod tests {
         let fence = setup.begin_validation().expect("validation should begin");
         setup.mark_ready(fence).expect("setup should become ready");
         drop(setup);
-        let secrets = AgentSecretStore::memory();
-        secrets
-            .store(SecretKind::CallMeshApiKey, "fixture-callmesh-api-key")
-            .expect("fixture secret should store");
+        let (secrets, cmcloud) = cmcloud_fixture(&paths);
         let config = AgentConfig {
             paths,
             config_file: directory.join("agent.toml"),
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(gateway_command),
             callmesh: None,
-            cmcloud: None,
+            cmcloud: Some(cmcloud),
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -5911,6 +5918,42 @@ mod tests {
                 .expect("controller should initialize"),
         );
         (directory, controller)
+    }
+
+    fn cmcloud_fixture(paths: &RuntimePaths) -> (AgentSecretStore, CMCloudConfig) {
+        let setup = SetupStore::open(paths).expect("CMCloud setup state should initialize");
+        if setup
+            .status()
+            .expect("CMCloud setup status should load")
+            .setup_required
+        {
+            setup
+                .accept_terms(cmclient_agent_core::setup::CURRENT_TERMS_VERSION)
+                .expect("CMCloud terms should be accepted");
+            let fence = setup
+                .begin_validation()
+                .expect("CMCloud validation should begin");
+            setup
+                .mark_ready(fence)
+                .expect("CMCloud setup should become ready");
+        }
+        let endpoint = "wss://cmcloud.example.invalid/agent/v1";
+        let secrets = AgentSecretStore::memory();
+        secrets
+            .begin_cmcloud_enrollment(endpoint, "fixture-pairing-code-0123456789", "2.0.0-rc.1")
+            .expect("CMCloud pairing fixture should begin");
+        secrets
+            .record_cmcloud_issued_credential(0, 1, 1, "fixture-device-credential-0123456789")
+            .expect("CMCloud credential fixture should persist");
+        secrets
+            .activate_cmcloud_credential(0, 1, 1)
+            .expect("CMCloud credential fixture should activate");
+        (
+            secrets,
+            CMCloudConfig {
+                agent_websocket_url: String::from(endpoint),
+            },
+        )
     }
 
     fn gateway_fixture_command() -> Vec<String> {
@@ -9968,13 +10011,15 @@ mod tests {
                 )
                 .expect("health response should write");
         });
+        let paths = RuntimePaths {
+            data_dir: PathBuf::from("/tmp/cmclient-agent-health"),
+            config_dir: PathBuf::from("/tmp/cmclient-agent-health"),
+            cache_dir: PathBuf::from("/tmp/cmclient-agent-health/cache"),
+            log_dir: PathBuf::from("/tmp/cmclient-agent-health/logs"),
+        };
+        let (secrets, cmcloud) = cmcloud_fixture(&paths);
         let config = AgentConfig {
-            paths: RuntimePaths {
-                data_dir: PathBuf::from("/tmp/cmclient-agent-health"),
-                config_dir: PathBuf::from("/tmp/cmclient-agent-health"),
-                cache_dir: PathBuf::from("/tmp/cmclient-agent-health/cache"),
-                log_dir: PathBuf::from("/tmp/cmclient-agent-health/logs"),
-            },
+            paths,
             config_file: PathBuf::from("/tmp/cmclient-agent-health/agent.toml"),
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
@@ -9983,23 +10028,16 @@ mod tests {
                 String::from("read _"),
             ]),
             callmesh: None,
-            cmcloud: None,
+            cmcloud: Some(cmcloud),
             meshtastic: None,
             aprs: None,
             proxy: None,
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller = AgentController::from_config_with_secrets_without_private_bootstrap(
-            &config,
-            AgentSecretStore::memory(),
-        )
-        .expect("controller should build");
-        controller.gateway_session.set(
-            cmclient_agent_core::web::GatewayRoute::new(gateway_address, "a".repeat(64))
-                .expect("test route should be valid"),
-        );
-
+        let controller =
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should build");
         let diagnostics = controller
             .diagnostics_bundle()
             .expect("sanitized diagnostics should build");
@@ -10008,6 +10046,11 @@ mod tests {
         assert_eq!(diagnostics.schema_version, 2);
         assert!(!serialized.contains("/tmp/cmclient-agent-health"));
         assert!(!serialized.contains("gateway_command"));
+
+        controller.gateway_session.set(
+            cmclient_agent_core::web::GatewayRoute::new(gateway_address, "a".repeat(64))
+                .expect("test route should be valid"),
+        );
 
         let status = controller
             .handle(ControlCommand::Start)
@@ -10026,22 +10069,24 @@ mod tests {
         let marker =
             std::env::temp_dir().join(format!("cmclient-agent-supervisor-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
+        let paths = RuntimePaths {
+            data_dir: PathBuf::from("/tmp/cmclient-agent-supervisor"),
+            config_dir: PathBuf::from("/tmp/cmclient-agent-supervisor"),
+            cache_dir: PathBuf::from("/tmp/cmclient-agent-supervisor/cache"),
+            log_dir: PathBuf::from("/tmp/cmclient-agent-supervisor/logs"),
+        };
+        let (secrets, cmcloud) = cmcloud_fixture(&paths);
         let config = AgentConfig {
-            paths: RuntimePaths {
-                data_dir: PathBuf::from("/tmp/cmclient-agent-supervisor"),
-                config_dir: PathBuf::from("/tmp/cmclient-agent-supervisor"),
-                cache_dir: PathBuf::from("/tmp/cmclient-agent-supervisor/cache"),
-                log_dir: PathBuf::from("/tmp/cmclient-agent-supervisor/logs"),
-            },
+            paths,
             config_file: PathBuf::from("/tmp/cmclient-agent-supervisor/agent.toml"),
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
                 String::from("sh"),
                 String::from("-c"),
-                format!("printf x >> '{}'; exit 7", marker.display()),
+                format!("printf x >> '{}'; (sleep 10) & exit 7", marker.display()),
             ]),
             callmesh: None,
-            cmcloud: None,
+            cmcloud: Some(cmcloud),
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -10049,11 +10094,8 @@ mod tests {
             management_lan: None,
         };
         let controller = Arc::new(
-            AgentController::from_config_with_secrets_without_private_bootstrap(
-                &config,
-                AgentSecretStore::memory(),
-            )
-            .expect("controller should initialize"),
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize"),
         );
         let mut worker =
             SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
@@ -10157,13 +10199,15 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let paths = RuntimePaths {
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+            cache_dir: data_dir.join("cache"),
+            log_dir: data_dir.join("logs"),
+        };
+        let (secrets, cmcloud) = cmcloud_fixture(&paths);
         let config = AgentConfig {
-            paths: RuntimePaths {
-                data_dir: data_dir.clone(),
-                config_dir: data_dir.clone(),
-                cache_dir: data_dir.join("cache"),
-                log_dir: data_dir.join("logs"),
-            },
+            paths,
             config_file: data_dir.join("agent.toml"),
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
@@ -10172,15 +10216,17 @@ mod tests {
                 String::from("sleep 5"),
             ]),
             callmesh: None,
-            cmcloud: None,
+            cmcloud: Some(cmcloud),
             meshtastic: None,
             aprs: None,
             proxy: None,
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller =
-            Arc::new(AgentController::from_config(&config).expect("controller should initialize"));
+        let controller = Arc::new(
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize"),
+        );
         let supervisor = controller
             .supervisor
             .lock()
@@ -10374,13 +10420,15 @@ mod tests {
             std::env::temp_dir().join(format!("cmclient-agent-teardown-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).expect("test directory should exist");
+        let paths = RuntimePaths {
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+            cache_dir: data_dir.join("cache"),
+            log_dir: data_dir.join("logs"),
+        };
+        let (secrets, cmcloud) = cmcloud_fixture(&paths);
         let config = AgentConfig {
-            paths: RuntimePaths {
-                data_dir: data_dir.clone(),
-                config_dir: data_dir.clone(),
-                cache_dir: data_dir.join("cache"),
-                log_dir: data_dir.join("logs"),
-            },
+            paths,
             config_file: data_dir.join("agent.toml"),
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
@@ -10389,7 +10437,7 @@ mod tests {
                 String::from("read _"),
             ]),
             callmesh: None,
-            cmcloud: None,
+            cmcloud: Some(cmcloud),
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -10397,11 +10445,8 @@ mod tests {
             management_lan: None,
         };
         let controller = Arc::new(
-            AgentController::from_config_with_secrets_without_private_bootstrap(
-                &config,
-                AgentSecretStore::memory(),
-            )
-            .expect("controller should initialize"),
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize"),
         );
         let mut worker =
             SupervisorWorker::start(Arc::clone(&controller)).expect("worker should start");
@@ -10473,18 +10518,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).expect("test directory should exist");
         let missing_program = data_dir.join("missing-gateway");
+        let paths = RuntimePaths {
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+            cache_dir: data_dir.join("cache"),
+            log_dir: data_dir.join("logs"),
+        };
+        let (secrets, cmcloud) = cmcloud_fixture(&paths);
         let config = AgentConfig {
-            paths: RuntimePaths {
-                data_dir: data_dir.clone(),
-                config_dir: data_dir.clone(),
-                cache_dir: data_dir.join("cache"),
-                log_dir: data_dir.join("logs"),
-            },
+            paths,
             config_file: data_dir.join("agent.toml"),
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![missing_program.to_string_lossy().into_owned()]),
             callmesh: None,
-            cmcloud: None,
+            cmcloud: Some(cmcloud),
             meshtastic: None,
             aprs: None,
             proxy: None,
@@ -10492,7 +10539,8 @@ mod tests {
             management_lan: None,
         };
         let controller =
-            AgentController::from_config(&config).expect("controller should initialize");
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize");
         let mut supervisor = GatewaySupervisor::new_with_stable_window(
             GatewayCommand {
                 program: missing_program.to_string_lossy().into_owned(),
@@ -10541,13 +10589,15 @@ mod tests {
         let log_dir = data_dir.join("logs");
         std::fs::create_dir_all(log_dir.join("gateway.jsonl"))
             .expect("unsafe gateway log fixture should create");
+        let paths = RuntimePaths {
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+            cache_dir: data_dir.join("cache"),
+            log_dir: log_dir.clone(),
+        };
+        let (secrets, cmcloud) = cmcloud_fixture(&paths);
         let config = AgentConfig {
-            paths: RuntimePaths {
-                data_dir: data_dir.clone(),
-                config_dir: data_dir.clone(),
-                cache_dir: data_dir.join("cache"),
-                log_dir: log_dir.clone(),
-            },
+            paths,
             config_file: data_dir.join("agent.toml"),
             runtime_profile: AgentRuntimeProfile::Native,
             gateway_command: Some(vec![
@@ -10556,18 +10606,16 @@ mod tests {
                 String::from("read _"),
             ]),
             callmesh: None,
-            cmcloud: None,
+            cmcloud: Some(cmcloud),
             meshtastic: None,
             aprs: None,
             proxy: None,
             management_web_enabled: false,
             management_lan: None,
         };
-        let controller = AgentController::from_config_with_secrets_without_private_bootstrap(
-            &config,
-            AgentSecretStore::memory(),
-        )
-        .expect("controller should initialize");
+        let controller =
+            AgentController::from_config_with_secrets_without_private_bootstrap(&config, secrets)
+                .expect("controller should initialize");
 
         let started = controller
             .handle(ControlCommand::Start)

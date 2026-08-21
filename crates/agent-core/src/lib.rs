@@ -17,11 +17,14 @@ use std::{
     env,
     fmt::{Display, Formatter},
     fs::{self, File, Metadata, OpenOptions},
-    io::{self, Read},
+    io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(target_os = "windows")]
+use std::io;
 
 #[cfg(target_os = "windows")]
 use std::{os::windows::process::CommandExt, process::Command};

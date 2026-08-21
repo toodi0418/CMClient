@@ -960,11 +960,11 @@ fn cmcloud(
     let result = match command {
         CmCloudCommand::Status => client.cmcloud_enrollment_status(),
         CmCloudCommand::Enroll { ref pairing_code } => {
-            if !valid_cmcloud_pairing_code(&pairing_code) {
+            if !valid_cmcloud_pairing_code(pairing_code) {
                 eprintln!("CMCLOUD_ENROLLMENT_REQUEST_INVALID");
                 return ProcessExitCode::from(ExitCode::Validation.as_u8());
             }
-            client.enroll_cmcloud(&pairing_code)
+            client.enroll_cmcloud(pairing_code)
         }
     };
     let value = match result {

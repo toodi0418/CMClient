@@ -1,5 +1,10 @@
 #![cfg(unix)]
 
+use cmclient_agent_core::{
+    RuntimePaths,
+    secrets::AgentSecretStore,
+    setup::{CURRENT_TERMS_VERSION, SetupStore},
+};
 use cmclient_control_api::{
     ControlClient, ControlEndpoint, ControlSecretKind, default_local_endpoint,
 };
@@ -16,6 +21,9 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 const FIXTURE_SECRET: &str = "fixture-callmesh-value";
+const FIXTURE_CMCLOUD_ENDPOINT: &str = "wss://cmcloud.example.invalid/agent/v1";
+const FIXTURE_CMCLOUD_PAIRING_CODE: &str = "fixture-pairing-code-0123456789";
+const FIXTURE_CMCLOUD_CREDENTIAL: &str = "fixture-device-credential-0123456789";
 const INHERITED_CALLMESH_SECRET: &str = "fixture-parent-callmesh-ignored";
 const INHERITED_APRS_SECRET: &str = "fixture-parent-aprs-ignored";
 const INHERITED_CONTROL_TOKEN: &str = "fixture-parent-control-token-ignored";
@@ -44,12 +52,41 @@ impl Fixture {
             fs::create_dir(directory).expect("fixture directory should exist");
             set_private_mode(directory);
         }
+        let paths = RuntimePaths {
+            data_dir: data.clone(),
+            config_dir: data.clone(),
+            cache_dir: cache.clone(),
+            log_dir: logs.clone(),
+        };
+        let setup = SetupStore::open(&paths).expect("setup state should initialize");
+        setup
+            .accept_terms(CURRENT_TERMS_VERSION)
+            .expect("fixture terms should be accepted");
+        let fence = setup
+            .begin_validation()
+            .expect("fixture validation should begin");
+        setup
+            .mark_ready(fence)
+            .expect("fixture setup should become ready");
+        let secrets = AgentSecretStore::runtime(&data).expect("secret store should initialize");
+        secrets
+            .begin_cmcloud_enrollment(
+                FIXTURE_CMCLOUD_ENDPOINT,
+                FIXTURE_CMCLOUD_PAIRING_CODE,
+                "2.0.0-rc.1",
+            )
+            .expect("CMCloud pairing fixture should begin");
+        secrets
+            .record_cmcloud_issued_credential(0, 1, 1, FIXTURE_CMCLOUD_CREDENTIAL)
+            .expect("CMCloud credential fixture should persist");
+        secrets
+            .activate_cmcloud_credential(0, 1, 1)
+            .expect("CMCloud credential fixture should activate");
         let secret_parent = data.clone();
 
+        let marker = root.join("gateway-marker");
         let gateway_script = root.join("gateway-fixture.mjs");
-        fs::write(
-            &gateway_script,
-            r#"import { createHmac } from "node:crypto";
+        let gateway_source = r#"import { createHmac } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 
@@ -60,7 +97,7 @@ const OWNERSHIP_CHALLENGE_HEADER =
   "x-cmclient-gateway-ownership-challenge";
 const OWNERSHIP_PROOF_HEADER = "x-cmclient-gateway-ownership-proof";
 
-const marker = `${process.env.CMCLIENT_RUNTIME_ROOT}/gateway-marker`;
+const marker = "__CMCLIENT_FIXTURE_MARKER__";
 let boundaryError;
 if (Object.hasOwn(process.env, "CMCLIENT_PLAINTEXT_SECRET_FILE")) {
   boundaryError = "selector-leaked";
@@ -98,11 +135,11 @@ process.stdin.on("data", (chunk) => {
     bootstrap = JSON.parse(input.subarray(4, length + 4).toString("utf8"));
     input = input.subarray(length + 4);
     const markerState = boundaryError ?? (
-      Object.hasOwn(bootstrap, "callMeshApiKey")
-        ? bootstrap.callMeshApiKey === "fixture-callmesh-value"
-          ? "key-present"
-          : "key-unexpected"
-        : "key-absent"
+      Object.hasOwn(bootstrap, "cmCloudDeviceCredential")
+        ? bootstrap.cmCloudDeviceCredential === "fixture-device-credential-0123456789"
+          ? "credential-present"
+          : "credential-unexpected"
+        : "credential-absent"
     );
     writeFileSync(marker, markerState, { mode: 0o600 });
     startGateway();
@@ -241,14 +278,19 @@ function shutdown() {
   if (!server) return process.exit(0);
   server.close(() => process.exit(0));
 }
-"#,
-        )
-        .expect("gateway fixture should write");
+"#
+        .replace(
+            "__CMCLIENT_FIXTURE_MARKER__",
+            &marker.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""),
+        );
+        fs::write(&gateway_script, gateway_source).expect("gateway fixture should write");
         set_private_mode(&gateway_script);
 
-        let marker = data.join("gateway-marker");
         let config = data.join("config.toml");
-        fs::write(&config, "[agent]\nmanagement_web_enabled = false\n")
+        fs::write(
+            &config,
+            "[agent]\nmanagement_web_enabled = false\n\n[cmcloud]\nagent_websocket_url = \"wss://cmcloud.example.invalid/agent/v1\"\n",
+        )
             .expect("Agent config should write");
         set_private_mode(&config);
         let private_node = std::env::split_paths(
@@ -327,17 +369,20 @@ function shutdown() {
     fn wait_for_marker(&self, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok(value) = fs::read_to_string(&self.marker) {
-                if value == expected {
-                    return;
+            match fs::read_to_string(&self.marker) {
+                Ok(value) => {
+                    let value = value.trim();
+                    if value == expected {
+                        return;
+                    }
+                    panic!("gateway fixture reported unexpected marker state: {value}");
                 }
-                if !value.is_empty() {
-                    panic!("Gateway fixture reported unexpected boundary state: {value}");
-                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => panic!("gateway marker should read: {error}"),
             }
             assert!(
                 Instant::now() < deadline,
-                "Gateway fixture did not report {expected}"
+                "gateway fixture did not report marker state {expected}"
             );
             thread::sleep(Duration::from_millis(25));
         }
@@ -371,6 +416,7 @@ function shutdown() {
             if let Ok(contents) = fs::read_to_string(path) {
                 for sensitive in [
                     FIXTURE_SECRET,
+                    FIXTURE_CMCLOUD_CREDENTIAL,
                     INHERITED_CALLMESH_SECRET,
                     INHERITED_APRS_SECRET,
                     INHERITED_CONTROL_TOKEN,
@@ -430,7 +476,7 @@ fn production_plaintext_secret_survives_agent_restart_and_stays_out_of_gateway_e
 
     let mut first_agent = fixture.spawn_agent();
     let first_client = fixture.wait_for_client(&mut first_agent);
-    assert!(!fixture.secret_file.exists());
+    assert!(fixture.secret_file.exists());
     let stored = first_client
         .store_secret(ControlSecretKind::CallMeshApiKey, FIXTURE_SECRET)
         .expect("Agent should store the fixture secret through Control API");
@@ -463,10 +509,16 @@ fn production_plaintext_secret_survives_agent_restart_and_stays_out_of_gateway_e
 
     let mut second_agent = fixture.spawn_agent();
     let second_client = fixture.wait_for_client(&mut second_agent);
+    fixture.wait_for_marker("credential-present");
+    let second_lifecycle =
+        ControlClient::new_with_timeout(fixture.endpoint(), Duration::from_secs(10))
+            .expect("long-lived control client should initialize");
+    second_lifecycle.stop().expect("Gateway child should stop");
     fixture.clear_marker();
-    second_client.start().expect("Gateway child should start");
-    fixture.wait_for_marker("key-present");
-    second_client.stop().expect("Gateway child should stop");
+    second_lifecycle
+        .start()
+        .expect("Gateway child should start");
+    fixture.wait_for_marker("credential-present");
 
     let removed = second_client
         .remove_secret(ControlSecretKind::CallMeshApiKey)
@@ -476,10 +528,17 @@ fn production_plaintext_secret_survives_agent_restart_and_stays_out_of_gateway_e
 
     let mut third_agent = fixture.spawn_agent();
     let third_client = fixture.wait_for_client(&mut third_agent);
+    fixture.wait_for_marker("credential-present");
+    let third_lifecycle =
+        ControlClient::new_with_timeout(fixture.endpoint(), Duration::from_secs(10))
+            .expect("long-lived control client should initialize");
+    third_lifecycle.stop().expect("Gateway child should stop");
     fixture.clear_marker();
-    third_client.start().expect("Gateway child should restart");
-    fixture.wait_for_marker("key-absent");
-    third_client.stop().expect("Gateway child should stop");
+    third_lifecycle
+        .start()
+        .expect("Gateway child should restart");
+    fixture.wait_for_marker("credential-present");
+    third_lifecycle.stop().expect("Gateway child should stop");
     third_agent.shutdown(&third_client);
 
     let document = fs::read_to_string(&fixture.secret_file).expect("secret document should remain");

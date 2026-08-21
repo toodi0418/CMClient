@@ -28,6 +28,7 @@ use interprocess::{
     },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(windows)]
 use sha2::{Digest, Sha256};
 use std::{
     fmt::{Display, Formatter},
@@ -60,7 +61,9 @@ const CONTROL_EVENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CONTROL_IO_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const CONTROL_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CONTROL_WRITE_CHUNK_BYTES: usize = 512;
+#[cfg(windows)]
 const WINDOWS_PIPE_PREFIX: &str = r"\\.\pipe\";
+#[cfg(windows)]
 const WINDOWS_PIPE_NAME_DOMAIN: &[u8] = b"cmclient-control-v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1645,6 +1648,7 @@ pub fn default_local_endpoint(state_root: &Path) -> Result<ControlEndpoint, Cont
     }
 }
 
+#[cfg(windows)]
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
